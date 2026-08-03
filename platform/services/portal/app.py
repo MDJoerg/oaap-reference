@@ -6,6 +6,7 @@ Authentication is entirely the gateway's job: the portal trusts the
 X-OAAP-User / X-OAAP-Roles headers set after forward auth.
 """
 
+import json
 import os
 
 import requests
@@ -13,6 +14,34 @@ from flask import Flask, redirect, render_template_string, request
 
 IDENTITY = "http://identity:8000"
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
+REGISTRY = "/apps-registry/registry.json"
+
+
+def launchpad_tiles(user_roles, host):
+    """Role-filtered app tiles from the instance registry (spec 2.5).
+
+    The filter is UX only — the gateway enforces the roles on every
+    request regardless of what the portal shows.
+    """
+    try:
+        with open(REGISTRY, encoding="utf-8") as f:
+            instances = json.load(f).get("instances", {})
+    except (OSError, ValueError):
+        return []
+    tiles = []
+    for name, inst in sorted(instances.items()):
+        allowed = set(inst.get("roles") or [])
+        if allowed and "admin" not in user_roles and not user_roles & allowed:
+            continue
+        tiles.append({
+            "name": inst.get("app_name", name),
+            "instance": name,
+            "version": inst.get("version", "?"),
+            "channel": inst.get("channel", "production"),
+            "description": inst.get("description", ""),
+            "url": f"http://{host}:{inst['port']}/",
+        })
+    return tiles
 
 app = Flask(__name__)
 
@@ -33,10 +62,33 @@ DASHBOARD = STYLE + """
 <!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OAAP Portal</title>
+<style>
+  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(14rem,1fr));gap:1rem;margin:1rem 0 2rem}
+  .tile{display:block;background:#f8fafc;border:1px solid #e2e8f0;border-radius:.5rem;
+        padding:1rem;text-decoration:none;color:inherit}
+  .tile:hover{border-color:#2563eb}
+  .tile h3{margin:0 0 .25rem;font-size:1.05rem}
+  .badge{font-size:.75rem;padding:.1rem .5rem;border-radius:1rem;background:#e2e8f0}
+  .badge.test{background:#fef3c7}
+</style>
 <main>
   <h1>OAAP Portal</h1>
-  <p class="muted">Walking skeleton — administration features arrive with
-  the full <code>oaap.core.portal</code> specification.</p>
+  {% if tiles %}
+    <h2 style="font-size:1.05rem">Apps</h2>
+    <div class="tiles">
+      {% for t in tiles %}
+      <a class="tile" href="{{ t.url }}">
+        <h3>{{ t.name }}</h3>
+        {% if t.description %}<p class="muted">{{ t.description }}</p>{% endif %}
+        <span class="muted">v{{ t.version }}</span>
+        <span class="badge {{ t.channel }}">{{ t.channel }}</span>
+      </a>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="muted">No apps installed yet (or none visible for your
+    roles). Install apps with <code>oaap app install</code>.</p>
+  {% endif %}
   <dl>
     <dt>Signed in as</dt><dd>{{ user }}</dd>
     <dt>Roles</dt><dd>{{ roles }}</dd>
@@ -77,11 +129,14 @@ def setup_done() -> bool:
 
 @app.get("/")
 def dashboard():
+    roles = request.headers.get("X-OAAP-Roles", "")
     return render_template_string(
         DASHBOARD,
         user=request.headers.get("X-OAAP-User", "?"),
-        roles=request.headers.get("X-OAAP-Roles", "?"),
+        roles=roles or "?",
         version=VERSION,
+        tiles=launchpad_tiles(set(filter(None, roles.split(","))),
+                              request.host.split(":")[0]),
     )
 
 

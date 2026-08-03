@@ -214,6 +214,10 @@ def cmd_install(args):
         "app_id": app["id"], "app_name": app["name"],
         "version": app["version"], "channel": channel,
         "port": port, "image": image, "container": container,
+        "description": app.get("description", ""),
+        # roles that may see/open the app — the portal filters tiles
+        # with this; the gateway enforces it regardless (spec 2.5)
+        "roles": sorted({r for rt in m["routes"] for r in rt["roles"] if r != "public"}),
     }
     save_registry(reg)
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")

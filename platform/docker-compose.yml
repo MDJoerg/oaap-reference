@@ -31,3 +31,6 @@ services:
     restart: unless-stopped
     environment:
       OAAP_VERSION: "${OAAP_VERSION}"
+    volumes:
+      # read-only view of the app-instance registry for launchpad tiles
+      - "${OAAP_DATA_DIR}/apps:/apps-registry:ro"
