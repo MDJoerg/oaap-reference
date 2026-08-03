@@ -53,3 +53,10 @@ initial password; everything after runs key-based:
   the installer's `VERSION` variable (platform reported itself as
   "13 (trixie)").
 - Test admin on the VM: user `joerg` (password known to Jörg).
+- **Gateway-less probe deployments: always test via `http://localhost`**
+  (SSH port forward, e.g. `ssh -i ~/.ssh/oaap_test_vm -L 8090:localhost:8090
+  oaap-admin@<VM-IP>`), never via `http://<IP>:<port>`. Browsers restrict
+  secure-context APIs (`crypto.subtle`, clipboard, service workers,
+  WebAuthn) to HTTPS or localhost — plain HTTP over an IP silently breaks
+  apps that use them (found via BDT 0.188.0, whose secret vault threw).
+  Behind the real gateway with TLS the problem does not exist.
