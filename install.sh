@@ -34,10 +34,13 @@ case "$MODE" in
 esac
 
 # ---------------------------------------------------------------- os info
+# Parse os-release in subshells — sourcing it directly would clobber our
+# own variables (its VERSION overwrote the platform version once).
 OS_ID="" OS_CODENAME="" OS_LIKE=""
 if [ -r /etc/os-release ]; then
-  . /etc/os-release
-  OS_ID="${ID:-}" OS_CODENAME="${VERSION_CODENAME:-}" OS_LIKE="${ID_LIKE:-}"
+  OS_ID="$(. /etc/os-release && echo "${ID:-}")"
+  OS_CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+  OS_LIKE="$(. /etc/os-release && echo "${ID_LIKE:-}")"
 fi
 
 # ------------------------------------------- runtime provisioning (optional)
