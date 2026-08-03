@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# OAAP node CLI (oaap.core.host §2.3) — local health for technicians
+# and service partners, plus node-local uninstall. End users see health
+# in the portal.
+
+set -euo pipefail
+
+OAAP_DATA_DIR="${OAAP_DATA_DIR:-/var/lib/oaap}"
+APP_DIR="$OAAP_DATA_DIR/app"
+MARKER="$OAAP_DATA_DIR/.oaap-installed"
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+compose() { docker compose --project-directory "$APP_DIR" --project-name oaap "$@"; }
+
+version() { cat "$APP_DIR/VERSION" 2>/dev/null || echo "unknown (is OAAP installed?)"; }
+
+status() {
+  if [ ! -e "$MARKER" ]; then
+    echo "OAAP is not installed on this node ($OAAP_DATA_DIR)."
+    exit 1
+  fi
+  echo "OAAP node status"
+  echo "  Version:   $(version)"
+  echo "  Data dir:  $OAAP_DATA_DIR"
+  echo ""
+  echo "Core services:"
+  compose ps --format '  {{.Service}}: {{.State}}' 2>/dev/null \
+    || { echo "  ERROR: cannot query container runtime."; exit 1; }
+  total="$(compose ps --services | wc -l)"
+  running="$(compose ps --services --filter status=running | wc -l)"
+  echo ""
+  df -Ph "$OAAP_DATA_DIR" | awk 'NR==2 {printf "Disk: %s free of %s (%s used)\n", $4, $2, $5}'
+  echo ""
+  if [ "$running" -eq "$total" ] && [ "$total" -gt 0 ]; then
+    echo "Overall: HEALTHY ($running/$total core services running)"
+  else
+    echo "Overall: DEGRADED ($running/$total core services running)"
+    exit 1
+  fi
+}
+
+uninstall() {
+  purge=0 yes=0
+  for arg in "$@"; do
+    case "$arg" in
+      --purge) purge=1 ;;
+      --yes)   yes=1 ;;
+      *) fail "Unknown option '$arg'. Usage: oaap uninstall [--purge] [--yes]" ;;
+    esac
+  done
+
+  [ "$(id -u)" -eq 0 ] || fail "Uninstall requires root (sudo oaap uninstall)."
+  [ -e "$MARKER" ] || fail "OAAP is not installed on this node ($OAAP_DATA_DIR)."
+
+  echo "This removes the OAAP platform from this node."
+  if [ "$purge" -eq 1 ]; then
+    echo "  --purge: ALL platform data in $OAAP_DATA_DIR will be DELETED."
+  else
+    echo "  Platform data in $OAAP_DATA_DIR/data is kept (use --purge to delete it)."
+  fi
+  if [ "$yes" -ne 1 ]; then
+    read -r -p "Continue? [y/N] " answer
+    case "$answer" in y|Y|yes|YES) ;; *) echo "Aborted, nothing changed."; exit 1 ;; esac
+  fi
+
+  echo "Stopping and removing core services ..."
+  compose down --rmi local --volumes --remove-orphans 2>/dev/null \
+    || echo "WARNING: could not remove containers (runtime down?) — continuing."
+
+  rm -rf "$APP_DIR"
+  rm -f "$MARKER"
+  if [ "$purge" -eq 1 ]; then
+    rm -rf "$OAAP_DATA_DIR"
+    echo "Platform and all data removed."
+  else
+    echo "Platform removed. Data kept at $OAAP_DATA_DIR/data."
+  fi
+  echo "Run the installer again for a fresh bootstrap."
+  rm -f /usr/local/bin/oaap
+}
+
+cmd="${1:-status}"
+[ "$#" -gt 0 ] && shift
+case "$cmd" in
+  status)    status ;;
+  version)   version ;;
+  uninstall) uninstall "$@" ;;
+  update)
+    fail "'oaap update' is reserved — the platform update capability is not implemented yet. For test setups use: sudo oaap uninstall && sudo ./install.sh" ;;
+  *) echo "Usage: oaap [status|version|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+esac

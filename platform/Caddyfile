@@ -1,0 +1,26 @@
+# OAAP gateway — single entry point, default deny (RFC-0002).
+#
+# Public routes (the only ones, per spec):
+#   /auth/*  — login/logout, served by identity
+#   /setup*  — first-run wizard, protected by the one-time setup token
+# Everything else requires an authenticated session, verified by the
+# identity service via forward_auth; the verified user and roles are
+# passed to apps as trusted headers.
+
+:80 {
+	handle /auth/* {
+		reverse_proxy identity:8000
+	}
+
+	handle /setup* {
+		reverse_proxy portal:8000
+	}
+
+	handle {
+		forward_auth identity:8000 {
+			uri /verify
+			copy_headers X-OAAP-User X-OAAP-Roles
+		}
+		reverse_proxy portal:8000
+	}
+}

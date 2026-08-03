@@ -1,0 +1,30 @@
+# OAAP reference core stack — gateway, identity, portal.
+# Started by install.sh with --project-directory pointing at this file's
+# directory; configuration comes from the generated .env next to it.
+
+services:
+  gateway:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "${OAAP_HTTP_PORT}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - identity
+      - portal
+
+  identity:
+    build: ./services/identity
+    restart: unless-stopped
+    environment:
+      SESSION_SECRET: "${SESSION_SECRET}"
+      SETUP_TOKEN: "${SETUP_TOKEN}"
+    volumes:
+      - "${OAAP_DATA_DIR}/data/identity:/data"
+
+  portal:
+    build: ./services/portal
+    restart: unless-stopped
+    environment:
+      OAAP_VERSION: "${OAAP_VERSION}"
