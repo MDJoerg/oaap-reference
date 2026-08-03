@@ -253,9 +253,149 @@ def cmd_remove(args):
         print(f"Removed '{args.name}'. Data kept at {os.path.join(APPS_DIR, args.name)}.")
 
 
+# ---------------------------------------------------------------- convert
+# Compose converter (RFC-0004): import a docker-compose stack, emit one
+# wrapped-app package per HTTP service plus a conversion report for
+# human review. Compose "profiles" map to app SETS, not to apps.
+
+NON_HTTP_PORTS = {27017, 6379, 5432, 5434, 3306, 3307, 1883, 9092,
+                  9093, 29092, 2181, 9098}
+SECRET_HINT = re.compile(r"(PASS|SECRET|TOKEN|KEY)", re.I)
+ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _service_env(svc):
+    env = svc.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(e.split("=", 1) if "=" in e else (e, "") for e in env)
+    return {str(k): str(v) for k, v in env.items()}
+
+
+def _container_port(svc, warns):
+    candidates = []
+    for p in svc.get("ports") or []:
+        part = str(p).split(":")[-1].split("/")[0]
+        if part.isdigit():
+            candidates.append(int(part))
+    for p in svc.get("expose") or []:
+        part = str(p).split("/")[0]
+        if str(part).isdigit():
+            candidates.append(int(part))
+    seen = list(dict.fromkeys(candidates))
+    if not seen:
+        return None
+    if len(seen) > 1:
+        warns.append(f"multiple ports {seen} — took {seen[0]}, review")
+    return seen[0]
+
+
+def cmd_convert(args):
+    with open(args.compose, encoding="utf-8") as f:
+        compose = yaml.safe_load(f)
+    services = compose.get("services") or {}
+    out_root = os.path.abspath(args.out)
+    os.makedirs(out_root, exist_ok=True)
+    report = ["# Compose conversion report", ""]
+    converted, skipped = [], []
+
+    for sname, svc in sorted(services.items()):
+        profiles = svc.get("profiles") or []
+        if args.profile and args.profile not in profiles:
+            continue
+        warns = []
+        image = svc.get("image")
+        if not image:
+            skipped.append((sname, "no image (build-based service)"))
+            continue
+        port = _container_port(svc, warns)
+        if port is None:
+            skipped.append((sname, "no port declared"))
+            continue
+        if port in NON_HTTP_PORTS:
+            skipped.append((sname, f"port {port} is not HTTP — the gateway "
+                            "routes HTTP(S) only; TCP passthrough is future work"))
+            continue
+        if port == 8443:
+            warns.append("upstream is HTTPS — gateway->app TLS not supported in this increment")
+
+        tag = image.rsplit(":", 1)[-1] if ":" in image.split("/")[-1] else "latest"
+        version = tag if re.fullmatch(r"\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?", tag) else "0.1.0"
+        if version == "0.1.0" and tag != "0.1.0":
+            warns.append(f"image tag '{tag}' is not semver — set version manually (pin the image!)")
+
+        app_id = re.sub(r"[^a-z0-9-]", "-", sname.lower()).strip("-")
+        config, storage = [], []
+        for k, v in _service_env(svc).items():
+            m = ENV_REF.match(v)
+            key = m.group(1) if m else k
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+                warns.append(f"env '{k}' skipped (key not manifest-compatible)")
+                continue
+            entry = {"key": k, "label": k.replace("_", " ").title()}
+            if not m and v:
+                entry["default"] = v
+            if SECRET_HINT.search(k):
+                entry["secret"] = True
+            if "://" in v and not m:
+                warns.append(f"env '{k}' references another service ({v}) — "
+                             "grouped apps are not supported yet, review")
+            config.append(entry)
+
+        for vol in svc.get("volumes") or []:
+            parts = str(vol).split(":")
+            if len(parts) < 2:
+                continue
+            host, mount = parts[0], parts[1]
+            name = re.sub(r"[^a-z0-9-]", "-", os.path.basename(mount).lower()).strip("-") or "data"
+            if any(s["name"] == name for s in storage):
+                name = f"{name}-{len(storage)}"
+            storage.append({"name": name, "mount": mount})
+            if "/config" in host or host.endswith((".yml", ".yaml", ".properties", ".conf")):
+                warns.append(f"volume '{vol}' looks like a config FILE mount — "
+                             "wrapped apps should move this to env config, review")
+
+        if svc.get("depends_on"):
+            deps = list(svc["depends_on"]) if isinstance(svc["depends_on"], (list, dict)) else []
+            warns.append(f"depends_on {deps} — single-service apps only; "
+                         "install dependencies as separate apps and wire via config")
+
+        manifest = {
+            "oaap_manifest": "0.1",
+            "app": {"id": app_id, "name": sname, "version": version,
+                    "type": "wrapped",
+                    "description": f"Converted from docker-compose service '{sname}'"},
+            "services": {sname: {"image": image, "port": port}},
+            "routes": [{"path": "/", "roles": ["user", "keyuser", "admin"]}],
+            "storage": storage,
+            "config": config,
+            "health": {"path": "/"},
+        }
+        pkg = os.path.join(out_root, app_id)
+        os.makedirs(pkg, exist_ok=True)
+        with open(os.path.join(pkg, "oaap-app.yaml"), "w", encoding="utf-8") as f:
+            f.write("# Generated by 'oaap app convert' — REVIEW BEFORE INSTALL:\n"
+                    "# roles, health.path, storage and config are heuristics.\n")
+            yaml.safe_dump(manifest, f, sort_keys=False, allow_unicode=True)
+        converted.append((sname, app_id, warns))
+
+    report.append(f"Converted: {len(converted)} — Skipped: {len(skipped)}")
+    report.append("")
+    for sname, app_id, warns in converted:
+        report.append(f"## {sname} -> {app_id}/")
+        for w in warns or ["no warnings"]:
+            report.append(f"- {w}")
+        report.append("")
+    if skipped:
+        report.append("## Skipped services")
+        for sname, why in skipped:
+            report.append(f"- {sname}: {why}")
+    with open(os.path.join(out_root, "REPORT.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(report) + "\n")
+    print(f"Converted {len(converted)}, skipped {len(skipped)} services.")
+    print(f"Packages and REPORT.md written to {out_root} — review before installing.")
+
+
 def main():
-    if os.geteuid() != 0:
-        die("requires root (sudo oaap app ...)")
     p = argparse.ArgumentParser(prog="oaap app")
     sub = p.add_subparsers(dest="cmd", required=True)
     pi = sub.add_parser("install")
@@ -269,7 +409,14 @@ def main():
     pr.add_argument("name")
     pr.add_argument("--purge", action="store_true")
     pr.set_defaults(fn=cmd_remove)
+    pc = sub.add_parser("convert")
+    pc.add_argument("compose")
+    pc.add_argument("--out", default="./oaap-converted")
+    pc.add_argument("--profile")
+    pc.set_defaults(fn=cmd_convert)
     args = p.parse_args()
+    if args.cmd != "convert" and (not hasattr(os, "geteuid") or os.geteuid() != 0):
+        die("requires root (sudo oaap app ...)")
     try:
         args.fn(args)
     except subprocess.CalledProcessError as e:

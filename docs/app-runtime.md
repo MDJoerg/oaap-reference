@@ -37,6 +37,30 @@ is UX — the gateway enforces the same roles on every request anyway.
 The portal reads the registry via a read-only mount; no API between
 portal and runtime yet.
 
+## Compose converter (increment 3)
+
+```sh
+oaap app convert <docker-compose.yml> [--out DIR] [--profile NAME]
+```
+
+Generates one **wrapped**-app package per HTTP service plus `REPORT.md`
+for human review (roles, health path, storage and config are
+heuristics — review before installing). Design decisions, validated
+against a real 24-service training stack:
+
+- **Profiles map to app sets**, not to apps: `--profile aas` converts
+  that scenario's services; each service becomes its own app.
+- **Non-HTTP services are skipped** with a reason (databases, MQTT,
+  Kafka …): the gateway routes HTTP(S) only — TCP passthrough is
+  future work. Databases will later be platform capabilities
+  (`oaap.data.*`) rather than user-facing apps anyway.
+- Env vars become manifest config (secret heuristic on
+  PASS/SECRET/TOKEN/KEY); config-file mounts, `depends_on`,
+  service-to-service URLs, multiple ports, and non-semver image tags
+  are flagged in the report.
+- First converted app validated end to end: Node-RED from the training
+  stack, installed behind the gateway with login enforced.
+
 ## Limitations (tracked)
 
 - Exactly one service per app; no subpath/hostname levels yet (port
