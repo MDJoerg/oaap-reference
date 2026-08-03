@@ -7,12 +7,20 @@
 # identity service via forward_auth; the verified user and roles are
 # passed to apps as trusted headers.
 
+# Anti-spoofing guarantee (deployment contract): identity headers from
+# clients are never forwarded. On protected routes forward_auth
+# overwrites them from the auth response; on public routes we strip
+# them explicitly here.
 :80 {
 	handle /auth/* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
 		reverse_proxy identity:8000
 	}
 
 	handle /setup* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
 		reverse_proxy portal:8000
 	}
 
