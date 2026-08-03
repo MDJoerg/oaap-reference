@@ -1,6 +1,8 @@
 # Walking Skeleton — Spec Mapping & Limitations
 
-Status: first end-to-end slice, 2026-08-03. Implements
+Status: first end-to-end slice, 2026-08-03. Validated the same day on a
+Debian VM: install, setup-token recovery over SSH, first admin created,
+login successful. Implements
 `oaap.core.host` (bootstrap) against
 `oaap-spec/spec/oaap.core.host.md`, with skeleton versions of
 gateway, identity, and portal.
@@ -18,6 +20,7 @@ gateway, identity, and portal.
 | 7 | Node status | `oaap status` → HEALTHY 3/3; `docker stop oaap-portal-1` → DEGRADED, exit 1 |
 | 8 | Offline | after images are built, no internet access is needed; base images must be available locally |
 | 9 | Uninstall round-trip | `sudo oaap uninstall --yes` → `sudo ./install.sh` succeeds again; without `--purge` the data dir survives, with `--purge` it is gone |
+| 10 | Token recovery | before setup: `sudo oaap setup-token` prints URL + token (e.g. over SSH); after admin creation it refuses |
 
 ## Known limitations (deliberate, tracked)
 

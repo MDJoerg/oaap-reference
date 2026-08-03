@@ -40,6 +40,27 @@ status() {
   fi
 }
 
+setup_token() {
+  [ "$(id -u)" -eq 0 ] || fail "Requires root (sudo oaap setup-token)."
+  [ -e "$MARKER" ] || fail "OAAP is not installed on this node ($OAAP_DATA_DIR)."
+  if grep -q '"setup_done": true' "$OAAP_DATA_DIR/data/identity/state.json" 2>/dev/null; then
+    fail "Setup is already completed — the setup token is no longer valid. Sign in at the portal instead."
+  fi
+  token="$(grep '^SETUP_TOKEN=' "$APP_DIR/.env" | cut -d= -f2-)"
+  port="$(grep '^OAAP_HTTP_PORT=' "$APP_DIR/.env" | cut -d= -f2-)"
+  [ -n "$token" ] || fail "No setup token found in $APP_DIR/.env."
+  host="${OAAP_HOST:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+  [ -n "$host" ] || host="localhost"
+  suffix=""
+  [ "$port" != "80" ] && suffix=":$port"
+  echo "Finish setup in your browser (creates the first admin user):"
+  echo ""
+  echo "  URL:          http://$host$suffix/setup"
+  echo "  Setup token:  $token"
+  echo ""
+  echo "The token is valid once, until the first admin exists."
+}
+
 uninstall() {
   purge=0 yes=0
   for arg in "$@"; do
@@ -83,10 +104,11 @@ uninstall() {
 cmd="${1:-status}"
 [ "$#" -gt 0 ] && shift
 case "$cmd" in
-  status)    status ;;
-  version)   version ;;
-  uninstall) uninstall "$@" ;;
+  status)      status ;;
+  version)     version ;;
+  setup-token) setup_token ;;
+  uninstall)   uninstall "$@" ;;
   update)
     fail "'oaap update' is reserved — the platform update capability is not implemented yet. For test setups use: sudo oaap uninstall && sudo ./install.sh" ;;
-  *) echo "Usage: oaap [status|version|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac
