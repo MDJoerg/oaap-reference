@@ -8,8 +8,11 @@ services:
     restart: unless-stopped
     ports:
       - "${OAAP_HTTP_PORT}:80"
+      # RFC-0005 level 1: one gateway listener port per app instance
+      - "8100-8199:8100-8199"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./apps-caddy:/etc/caddy/apps:ro
     depends_on:
       - identity
       - portal

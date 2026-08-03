@@ -70,14 +70,23 @@ LOGIN_PAGE = """
 
 @app.get("/verify")
 def verify():
-    """Forward-auth endpoint for the gateway (RFC-0002 default deny)."""
+    """Forward-auth endpoint for the gateway (RFC-0002 default deny).
+
+    Optional ?roles=a,b restricts the route to sessions holding at
+    least one of the given roles (route-level authorization from the
+    app manifest, spec oaap.apps.runtime 2.4).
+    """
     user = session.get("user")
-    if user:
-        return "", 204, {
-            "X-OAAP-User": user["username"],
-            "X-OAAP-Roles": ",".join(user["roles"]),
-        }
-    return redirect("/auth/login", code=303)
+    if not user:
+        return redirect("/auth/login", code=303)
+    required = request.args.get("roles", "")
+    if required:
+        if not set(required.split(",")) & set(user["roles"]):
+            return "Forbidden: missing role", 403
+    return "", 204, {
+        "X-OAAP-User": user["username"],
+        "X-OAAP-Roles": ",".join(user["roles"]),
+    }
 
 
 @app.get("/auth/login")

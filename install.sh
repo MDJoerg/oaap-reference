@@ -121,9 +121,19 @@ say "Preflight OK."
 
 # ---------------------------------------------------------------- install
 APP_DIR="$OAAP_DATA_DIR/app"
-mkdir -p "$APP_DIR" "$OAAP_DATA_DIR/data/identity"
+mkdir -p "$APP_DIR" "$OAAP_DATA_DIR/data/identity" "$OAAP_DATA_DIR/apps"
 cp -r "$SCRIPT_DIR/platform/." "$APP_DIR/"
 cp "$SCRIPT_DIR/VERSION" "$APP_DIR/VERSION"
+
+# App-site directory for gateway listeners (oaap.apps.runtime); the
+# placeholder keeps Caddy's import glob happy before the first app.
+mkdir -p "$APP_DIR/apps-caddy"
+[ -f "$APP_DIR/apps-caddy/00-init.caddy" ] || echo "# app sites are generated here by appctl.py" > "$APP_DIR/apps-caddy/00-init.caddy"
+
+# appctl.py needs PyYAML (Debian/Ubuntu package; best effort elsewhere)
+if command -v apt-get >/dev/null 2>&1 && ! python3 -c "import yaml" >/dev/null 2>&1; then
+  apt-get install -y -qq python3-yaml || say "WARNING: could not install python3-yaml — 'oaap app' will not work until it is present."
+fi
 
 # Secrets: generated locally, random, unique per installation (spec 2.2 step 3).
 gen_secret() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }

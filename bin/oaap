@@ -85,6 +85,8 @@ uninstall() {
     case "$answer" in y|Y|yes|YES) ;; *) echo "Aborted, nothing changed."; exit 1 ;; esac
   fi
 
+  echo "Stopping and removing app instances ..."
+  docker ps -aq --filter "name=^oaap-app-" | xargs -r docker rm -f >/dev/null 2>&1 || true
   echo "Stopping and removing core services ..."
   compose down --rmi local --volumes --remove-orphans 2>/dev/null \
     || echo "WARNING: could not remove containers (runtime down?) — continuing."
@@ -107,8 +109,9 @@ case "$cmd" in
   status)      status ;;
   version)     version ;;
   setup-token) setup_token ;;
+  app)         exec python3 "$APP_DIR/appctl.py" "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)
     fail "'oaap update' is reserved — the platform update capability is not implemented yet. For test setups use: sudo oaap uninstall && sudo ./install.sh" ;;
-  *) echo "Usage: oaap [status|version|setup-token|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|app install|list|remove ...|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac
