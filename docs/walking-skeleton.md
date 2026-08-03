@@ -21,6 +21,7 @@ gateway, identity, and portal.
 | 8 | Offline | after images are built, no internet access is needed; base images must be available locally |
 | 9 | Uninstall round-trip | `sudo oaap uninstall --yes` → `sudo ./install.sh` succeeds again; without `--purge` the data dir survives, with `--purge` it is gone |
 | 10 | Token recovery | before setup: `sudo oaap setup-token` prints URL + token (e.g. over SSH); after admin creation it refuses |
+| 11 | Runtime provisioning | on a fresh Debian/Ubuntu without Docker: installer asks and installs Docker from the official repo (or `OAAP_INSTALL_RUNTIME=1`); declining → preflight failure, system unchanged |
 
 ## Known limitations (deliberate, tracked)
 

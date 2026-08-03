@@ -13,8 +13,10 @@ machine to a logged-in admin, with every part still minimal:
 ## Prerequisites (provider requirements)
 
 - Debian stable (Tier 1) or Ubuntu LTS (Tier 2), amd64 or arm64
-- Docker Engine with the Compose v2 plugin
 - Root access, ~2 GB free disk, port 80 free (configurable)
+- Docker Engine with the Compose v2 plugin — or let the installer
+  install it for you: it asks when Docker is missing (non-interactive:
+  `OAAP_INSTALL_RUNTIME=1`)
 
 ## Install
 

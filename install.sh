@@ -33,28 +33,66 @@ case "$MODE" in
     fail "Unknown mode '$MODE'. Supported: bootstrap (join/remote-join are reserved, see RFC-0003)." ;;
 esac
 
+# ---------------------------------------------------------------- os info
+OS_ID="" OS_CODENAME="" OS_LIKE=""
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  OS_ID="${ID:-}" OS_CODENAME="${VERSION_CODENAME:-}" OS_LIKE="${ID_LIKE:-}"
+fi
+
+# ------------------------------------------- runtime provisioning (optional)
+# Spec 2.2 step 1: the only hard prerequisite is a supported Linux with
+# root access. If Docker is missing, offer to install it — never silently.
+install_runtime() {
+  case "$OS_ID" in
+    debian|ubuntu) ;;
+    *) say "Automatic Docker installation supports Debian and Ubuntu only — please install Docker manually (see README)."; return 1 ;;
+  esac
+  say "Installing Docker Engine from Docker's official APT repository ..."
+  apt-get update -qq
+  apt-get install -y -qq ca-certificates curl
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/$OS_ID/gpg" -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$OS_ID $OS_CODENAME stable" \
+    > /etc/apt/sources.list.d/docker.list
+  apt-get update -qq
+  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  say "Docker Engine installed."
+}
+
+if [ "$(id -u)" -eq 0 ] && ! command -v docker >/dev/null 2>&1; then
+  consent="${OAAP_INSTALL_RUNTIME:-}"
+  if [ -z "$consent" ] && [ -t 0 ]; then
+    read -r -p "Docker Engine is not installed. Install it now from Docker's official repository? [y/N] " answer
+    case "$answer" in y|Y|yes|YES) consent=1 ;; esac
+  fi
+  if [ "$consent" = "1" ]; then
+    install_runtime || true
+  else
+    say "Skipped Docker installation (confirm when asked, or set OAAP_INSTALL_RUNTIME=1)."
+  fi
+fi
+
 # ---------------------------------------------------------------- preflight
-# All checks run BEFORE anything is changed on the system (spec 2.2 step 1).
+# All checks run BEFORE anything is changed on the system (spec 2.2 step 2);
+# a runtime installed above was an explicitly requested change.
 errors=()
 warnings=()
 
 [ "$(id -u)" -eq 0 ] || errors+=("Must run as root (sudo ./install.sh).")
 
-if [ -r /etc/os-release ]; then
-  . /etc/os-release
-  case "${ID:-} ${ID_LIKE:-}" in
-    *debian*) : ;;  # Tier 1 (Debian) or Tier 2 (Ubuntu et al.), see ADR-0005
-    *) warnings+=("Distribution '${ID:-unknown}' is not Debian-based — Tier 3, community support only (ADR-0005).") ;;
-  esac
-else
-  warnings+=("Cannot read /etc/os-release — unknown distribution (Tier 3, ADR-0005).")
-fi
+case "$OS_ID $OS_LIKE" in
+  *debian*) : ;;  # Tier 1 (Debian) or Tier 2 (Ubuntu et al.), see ADR-0005
+  *) warnings+=("Distribution '${OS_ID:-unknown}' is not Debian-based — Tier 3, community support only (ADR-0005).") ;;
+esac
 
 if command -v docker >/dev/null 2>&1; then
   docker info >/dev/null 2>&1 || errors+=("Docker is installed but the daemon is not reachable (is it running?).")
   docker compose version >/dev/null 2>&1 || errors+=("Docker Compose v2 plugin is missing ('docker compose' does not work).")
 else
-  errors+=("Docker Engine is not installed. It is a provider prerequisite (see README).")
+  errors+=("Docker Engine is not installed. Re-run and confirm the automatic installation, or set OAAP_INSTALL_RUNTIME=1.")
 fi
 
 free_kb="$(df -Pk "$(dirname "$OAAP_DATA_DIR")" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
