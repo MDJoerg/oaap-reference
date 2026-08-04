@@ -430,6 +430,37 @@ docker compose --project-directory "$APP_DIR" --project-name oaap up -d
 # Node CLI (spec 2.3)
 install -m 0755 "$SCRIPT_DIR/bin/oaap" /usr/local/bin/oaap
 
+# Deploy-hook worker (oaap.apps.runtime 2.5): the portal queues deploy
+# requests in the spool; a systemd path unit runs the host-side worker
+# the moment a request arrives.
+mkdir -p "$OAAP_DATA_DIR/data/deploy-spool/queue" "$OAAP_DATA_DIR/data/deploy-spool/results"
+PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  cat > /etc/systemd/system/oaap-deployd.service <<EOF
+[Unit]
+Description=OAAP deploy worker (processes queued app deployments)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py process-deploys
+EOF
+  cat > /etc/systemd/system/oaap-deployd.path <<EOF
+[Unit]
+Description=OAAP deploy queue watcher
+
+[Path]
+DirectoryNotEmpty=$OAAP_DATA_DIR/data/deploy-spool/queue
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now oaap-deployd.path >/dev/null 2>&1 || true
+else
+  say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."
+fi
+
 date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
 
 if [ "$MODE" = "restore" ]; then

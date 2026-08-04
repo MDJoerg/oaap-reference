@@ -24,6 +24,16 @@
 		reverse_proxy portal:8000
 	}
 
+	# Deploy hook (oaap.apps.runtime 2.5): authorized by a per-instance
+	# bearer token, validated by the portal — no session, no identity
+	# headers. Strip client-sent identity headers like on other public
+	# routes.
+	handle /deploy/* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		reverse_proxy portal:8000
+	}
+
 	handle {
 		forward_auth identity:8000 {
 			uri /verify

@@ -46,3 +46,6 @@ services:
       - "${OAAP_DATA_DIR}/apps:/apps-registry:ro"
       # read-only view of the gateway's external access log (health page)
       - "${OAAP_DATA_DIR}/data/gateway/logs:/gateway-logs:ro"
+      # deploy hook (runtime spec 2.5): the portal queues requests here,
+      # the host-side worker (oaap-deployd path unit) executes them
+      - "${OAAP_DATA_DIR}/data/deploy-spool:/deploy-spool"

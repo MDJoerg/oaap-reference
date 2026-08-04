@@ -97,6 +97,10 @@ uninstall() {
   compose down --rmi local --volumes --remove-orphans 2>/dev/null \
     || echo "WARNING: could not remove containers (runtime down?) — continuing."
 
+  systemctl disable --now oaap-deployd.path >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/oaap-deployd.service /etc/systemd/system/oaap-deployd.path
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   rm -rf "$APP_DIR"
   rm -f "$MARKER"
   if [ "$purge" -eq 1 ]; then

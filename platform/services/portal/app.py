@@ -318,6 +318,21 @@ HEALTH_BODY = """
   </table>
   {% else %}<p class="muted">Keine Apps installiert.</p>{% endif %}
 </div>
+{% if deploys %}
+<div class="card">
+  <h2>KI-Deployments (Deploy-Hook)</h2>
+  <table>
+    <tr><th>Zeit (UTC)</th><th>Instanz</th><th>Version</th><th>Commit</th><th>Ergebnis</th></tr>
+    {% for d in deploys %}
+    <tr><td>{{ d.when }}</td>
+        <td>{{ d.instance }}</td>
+        <td>{{ d.version }}</td>
+        <td class="muted">{{ d.revision or "–" }}</td>
+        <td><span class="dot {{ 'ok' if d.ok else 'err' }}"></span>{{ d.message }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
 {% if ext %}
 <div class="card">
   <h2>Externer Zugriff</h2>
@@ -744,7 +759,172 @@ def health():
             "state": state, "label": label, "detail": detail,
         })
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
-                core=core, apps=apps, ext=external_access())
+                core=core, apps=apps, ext=external_access(),
+                deploys=recent_deploys())
+
+
+# ---------------------------------------------------------------------------
+# Deploy hook (oaap.apps.runtime 0.2 §2.5) — the protected channel for a
+# project's AI coding agent: POST /deploy/<instance> with the instance's
+# bearer token redeploys the TEST instance from its recorded package
+# source. No session, no identity headers; the gateway strips them.
+# The portal only validates and queues — the host-side worker
+# (appctl.py process-deploys, triggered by a systemd path unit on the
+# spool directory) does the actual docker work.
+
+import hashlib
+import hmac
+import re as _re
+import time as _time
+import uuid as _uuid
+
+SPOOL_DIR = "/deploy-spool"
+SPOOL_QUEUE = os.path.join(SPOOL_DIR, "queue")
+SPOOL_RESULTS = os.path.join(SPOOL_DIR, "results")
+DEPLOY_THROTTLE = os.path.join(SPOOL_DIR, ".throttle.json")
+DEPLOY_TOKENS = "/apps-registry/deploy-tokens.json"
+DEPLOY_LOG = "/apps-registry/deploy-log.jsonl"
+DEPLOY_WAIT_SECONDS = 120
+DENIED = {"error": "unknown instance or invalid token"}
+
+
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() or request.remote_addr or "?"
+
+
+def _throttle_load():
+    try:
+        with open(DEPLOY_THROTTLE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _throttle_save(state):
+    os.makedirs(SPOOL_DIR, exist_ok=True)
+    tmp = DEPLOY_THROTTLE + f".{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, DEPLOY_THROTTLE)
+
+
+def _deploy_blocked(key):
+    entry = _throttle_load().get(key)
+    return bool(entry) and entry.get("blocked_until", 0) > _time.time()
+
+
+def _deploy_failed(key):
+    """Like login throttling: 5 failures in 5 minutes → 1 attempt/minute."""
+    state = _throttle_load()
+    now = _time.time()
+    entry = state.get(key) or {"fails": []}
+    entry["fails"] = [t for t in entry["fails"] if now - t < 300] + [now]
+    if len(entry["fails"]) >= 5:
+        entry["blocked_until"] = now + 60
+    state[key] = entry
+    _throttle_save(state)
+
+
+def _deploy_succeeded(key):
+    state = _throttle_load()
+    if key in state:
+        del state[key]
+        _throttle_save(state)
+
+
+def _valid_deploy_token(name):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    try:
+        with open(DEPLOY_TOKENS, encoding="utf-8") as f:
+            entry = json.load(f).get(name) or {}
+    except (OSError, ValueError):
+        return False
+    digest = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+    return hmac.compare_digest(entry.get("digest", ""), digest)
+
+
+def _deploy_auth(name):
+    """One indistinguishable answer for every failure (spec test 13)."""
+    key = _client_ip()
+    if _deploy_blocked(key):
+        return {"error": "too many attempts — wait a minute"}, 429
+    inst = (load_instances().get(name)
+            if _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or "") else None)
+    if not inst or inst.get("channel") != "test" or not _valid_deploy_token(name):
+        _deploy_failed(key)
+        return DENIED, 403
+    _deploy_succeeded(key)
+    return inst, None
+
+
+def _entry_url(name, inst):
+    ext = external_host()
+    if ext:
+        return f"https://{name}.{ext}/"
+    return f"http://{request.host.split(':')[0]}:{inst['port']}/"
+
+
+def recent_deploys(limit=5):
+    try:
+        with open(DEPLOY_LOG, encoding="utf-8") as f:
+            lines = f.readlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+@app.post("/deploy/<name>")
+def deploy_hook(name):
+    inst, err = _deploy_auth(name)
+    if err:
+        return inst, err
+    rid = _uuid.uuid4().hex
+    os.makedirs(SPOOL_QUEUE, exist_ok=True)
+    tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "instance": name,
+                   "requested": datetime.now(timezone.utc).isoformat()}, f)
+    os.replace(tmp, os.path.join(SPOOL_QUEUE, f"{rid}.json"))
+    res_path = os.path.join(SPOOL_RESULTS, f"{rid}.json")
+    deadline = _time.time() + DEPLOY_WAIT_SECONDS
+    while _time.time() < deadline:
+        if os.path.exists(res_path):
+            try:
+                with open(res_path, encoding="utf-8") as f:
+                    res = json.load(f)
+            finally:
+                os.remove(res_path)
+            body = {"ok": res.get("ok", False), "instance": name,
+                    "version": res.get("version", ""),
+                    "revision": res.get("revision", ""),
+                    "message": res.get("message", ""),
+                    "url": _entry_url(name, inst)}
+            return body, (200 if res.get("ok") else 502)
+        _time.sleep(2)
+    return {"ok": None, "instance": name,
+            "message": "deployment is still running — poll GET "
+                       f"/deploy/{name}/status"}, 202
+
+
+@app.get("/deploy/<name>/status")
+def deploy_status(name):
+    inst, err = _deploy_auth(name)
+    if err:
+        return inst, err
+    for entry in recent_deploys(limit=50):
+        if entry.get("instance") == name:
+            entry["url"] = _entry_url(name, inst)
+            return entry, 200
+    return {"instance": name, "message": "no deployment recorded yet"}, 200
 
 
 # ---------------------------------------------------------------------------

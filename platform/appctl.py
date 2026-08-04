@@ -33,6 +33,9 @@ CADDY_APPS_DIR = os.path.join(APP_DIR, "apps-caddy")
 REGISTRY = os.path.join(APPS_DIR, "registry.json")
 STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
 EXTERNAL_FILE = os.path.join(APPS_DIR, "external.json")
+DEPLOY_TOKENS = os.path.join(APPS_DIR, "deploy-tokens.json")
+DEPLOY_LOG = os.path.join(APPS_DIR, "deploy-log.jsonl")
+SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
 PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
@@ -187,6 +190,13 @@ def write_external_caddy():
     lines.append("\t\treverse_proxy identity:8000")
     lines.append("\t}")
     lines.append("\thandle /setup* {")
+    lines.append("\t\trequest_header -X-OAAP-User")
+    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines.append("\t\treverse_proxy portal:8000")
+    lines.append("\t}")
+    # deploy hook (runtime spec 2.5): bearer token instead of session —
+    # the portal validates the token, so no forward_auth here
+    lines.append("\thandle /deploy/* {")
     lines.append("\t\trequest_header -X-OAAP-User")
     lines.append("\t\trequest_header -X-OAAP-Roles")
     lines.append("\t\treverse_proxy portal:8000")
@@ -374,6 +384,9 @@ def _install_from_dir(pkg, args, source):
         "roles": sorted({r for rt in m["routes"] for r in rt["roles"] if r != "public"}),
     }
     save_registry(reg)
+    if channel == "production":
+        # moving to production invalidates any deploy token (spec 2.5)
+        drop_token(name, "instance is on the production channel")
     if load_external():
         write_external_caddy()
         reload_gateway()
@@ -405,6 +418,7 @@ def cmd_remove(args):
         os.remove(site)
     reload_gateway()
     save_registry(reg)
+    drop_token(args.name, "instance removed")
     if args.purge:
         import shutil
         shutil.rmtree(os.path.join(APPS_DIR, args.name), ignore_errors=True)
@@ -553,6 +567,168 @@ def cmd_convert(args):
         f.write("\n".join(report) + "\n")
     print(f"Converted {len(converted)}, skipped {len(skipped)} services.")
     print(f"Packages and REPORT.md written to {out_root} — review before installing.")
+
+
+# ----------------------- remote deployment (oaap.apps.runtime 0.2, spec 2.5)
+# A deploy token is bound to exactly one TEST instance and authorizes
+# exactly one action: redeploy that instance from its recorded package
+# source. Tokens are stored as digests only; the portal serves the HTTP
+# hook and drops a request file into the spool, a systemd path unit
+# runs 'appctl.py process-deploys' on this host.
+
+import hashlib
+
+
+def load_tokens():
+    try:
+        with open(DEPLOY_TOKENS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_tokens(tokens):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = DEPLOY_TOKENS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(tokens, f, indent=2)
+    os.replace(tmp, DEPLOY_TOKENS)
+
+
+def drop_token(name, reason):
+    tokens = load_tokens()
+    if name in tokens:
+        del tokens[name]
+        save_tokens(tokens)
+        print(f"Deploy token for '{name}' invalidated ({reason}).")
+
+
+def audit_deploy(entry):
+    import datetime
+    entry["when"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(DEPLOY_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def cmd_token(args):
+    reg = load_registry()
+    tokens = load_tokens()
+    if args.action == "list":
+        if not tokens:
+            print("No deploy tokens exist.")
+        for name, t in sorted(tokens.items()):
+            print(f"{name}: created {t.get('created', '?')} (digest only — the token itself is not stored)")
+        return
+    name = args.name or die("'token {create|revoke}' needs an instance name")
+    if args.action == "revoke":
+        if name not in tokens:
+            die(f"no deploy token exists for '{name}'")
+        drop_token(name, "revoked")
+        return
+    inst = reg["instances"].get(name)
+    if not inst:
+        die(f"no instance named '{name}'")
+    if inst["channel"] != "test":
+        die(f"'{name}' is a production instance — deploy tokens exist only for "
+            "the test channel (spec 2.5); promotion stays a human action.")
+    if not inst.get("source"):
+        die(f"'{name}' has no recorded package source — reinstall it once, then create the token.")
+    import datetime
+    token = secrets.token_urlsafe(32)
+    tokens[name] = {
+        "digest": hashlib.sha256(token.encode()).hexdigest(),
+        "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    save_tokens(tokens)
+    ext = load_external()
+    hook = (f"https://{ext}/deploy/{name}" if ext else f"http://<lan-address>/deploy/{name}")
+    print(f"Deploy token for '{name}' (shown ONCE — store it in the project's AI briefing):")
+    print("")
+    print(f"  {token}")
+    print("")
+    print("Usage (after pushing to the recorded source):")
+    print(f"  curl -X POST {hook} -H \"Authorization: Bearer <token>\"")
+    print("The token redeploys only this test instance from its recorded source.")
+
+
+def _resolve_revision(source):
+    if (source or {}).get("kind") != "git":
+        return ""
+    try:
+        out = run(["git", "ls-remote", source["url"], "HEAD"]).stdout.split()
+        return out[0][:12] if out else ""
+    except Exception:
+        return ""
+
+
+def cmd_process_deploys(_args):
+    """Run queued deploy requests (invoked by the oaap-deployd path unit)."""
+    import argparse as _argparse
+    import contextlib
+    import io
+    import time
+
+    queue = os.path.join(SPOOL_DIR, "queue")
+    results = os.path.join(SPOOL_DIR, "results")
+    os.makedirs(queue, exist_ok=True)
+    os.makedirs(results, exist_ok=True)
+    # prune stale result files (the requester picks them up within seconds)
+    now = time.time()
+    for f in os.listdir(results):
+        p = os.path.join(results, f)
+        if now - os.path.getmtime(p) > 3600:
+            os.remove(p)
+
+    for req_file in sorted(os.listdir(queue)):
+        req_path = os.path.join(queue, req_file)
+        try:
+            with open(req_path, encoding="utf-8") as f:
+                req = json.load(f)
+        except (OSError, ValueError):
+            os.remove(req_path)
+            continue
+        name = req.get("instance", "")
+        rid = req.get("id", "")
+        reg = load_registry()
+        inst = reg["instances"].get(name)
+        tokens = load_tokens()
+        ok, msg, revision = False, "", ""
+        # Re-validate on the host — the spool is data, not trust.
+        if not inst or name not in tokens:
+            msg = "unknown instance or no deploy token"
+        elif inst["channel"] != "test":
+            msg = "not a test instance"
+        elif not inst.get("source") or inst["source"].get("kind") not in ("git", "local"):
+            msg = "no usable package source recorded"
+        else:
+            src = inst["source"]
+            revision = _resolve_revision(src)
+            ns = _argparse.Namespace(
+                package=src["url"], path=src.get("path", ""),
+                name=name, channel="test")
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    cmd_install(ns)
+                ok = True
+                msg = "deployed"
+            except SystemExit:
+                msg = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else "install failed"
+            except subprocess.CalledProcessError as e:
+                msg = (e.stderr or str(e)).strip().splitlines()[-1] if (e.stderr or "").strip() else str(e)
+            except Exception as e:  # a broken deploy must never kill the worker
+                msg = str(e)
+        version = (load_registry()["instances"].get(name) or {}).get("version", "")
+        audit_deploy({"instance": name, "ok": ok, "message": msg,
+                      "revision": revision, "version": version, "via": "deploy-hook"})
+        if rid:
+            res_tmp = os.path.join(results, f"{rid}.tmp")
+            with open(res_tmp, "w", encoding="utf-8") as f:
+                json.dump({"ok": ok, "message": msg, "revision": revision,
+                           "version": version}, f)
+            os.replace(res_tmp, os.path.join(results, f"{rid}.json"))
+        os.remove(req_path)
+        print(f"deploy {name}: {'OK' if ok else 'FAILED'} — {msg}")
 
 
 # --------------------------------------------- backup & restore (oaap.data.backup)
@@ -775,6 +951,12 @@ def main():
     pc.add_argument("--out", default="./oaap-converted")
     pc.add_argument("--profile")
     pc.set_defaults(fn=cmd_convert)
+    pt = sub.add_parser("token")
+    pt.add_argument("action", choices=["create", "revoke", "list"])
+    pt.add_argument("name", nargs="?")
+    pt.set_defaults(fn=cmd_token)
+    pd = sub.add_parser("process-deploys")
+    pd.set_defaults(fn=cmd_process_deploys)
     pb = sub.add_parser("backup")
     pb.add_argument("action", choices=["create"])
     pb.add_argument("--to", default="", help="target directory or .tar.gz file (outside the data dir)")

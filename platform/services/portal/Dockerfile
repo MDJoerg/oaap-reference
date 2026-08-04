@@ -4,4 +4,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 EXPOSE 8000
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
+# --timeout above the deploy hook's synchronous wait (120s), so a
+# worker waiting for a build result is not killed mid-request
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "4", "--timeout", "150", "app:app"]
