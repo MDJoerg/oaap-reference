@@ -26,16 +26,22 @@ status() {
   echo ""
   echo "Core services:"
   compose ps --format '  {{.Service}}: {{.State}}' 2>/dev/null \
-    || { echo "  ERROR: cannot query container runtime."; exit 1; }
+    || { echo "  ERROR: cannot query container runtime (run with sudo, or add your user to the 'docker' group)."; exit 1; }
   total="$(compose ps --services | wc -l)"
   running="$(compose ps --services --filter status=running | wc -l)"
   echo ""
+  echo "Apps:"
+  apps="$(docker ps -a --filter 'name=^oaap-app-' --format '  {{.Names}}: {{.Status}}' | sed 's/  oaap-app-/  /')"
+  if [ -n "$apps" ]; then printf '%s\n' "$apps"; else echo "  (none installed)"; fi
+  apps_total="$(docker ps -aq --filter 'name=^oaap-app-' | wc -l)"
+  apps_running="$(docker ps -q --filter 'name=^oaap-app-' | wc -l)"
+  echo ""
   df -Ph "$OAAP_DATA_DIR" | awk 'NR==2 {printf "Disk: %s free of %s (%s used)\n", $4, $2, $5}'
   echo ""
-  if [ "$running" -eq "$total" ] && [ "$total" -gt 0 ]; then
-    echo "Overall: HEALTHY ($running/$total core services running)"
+  if [ "$running" -eq "$total" ] && [ "$total" -gt 0 ] && [ "$apps_running" -eq "$apps_total" ]; then
+    echo "Overall: HEALTHY ($running/$total core services, $apps_running/$apps_total apps running)"
   else
-    echo "Overall: DEGRADED ($running/$total core services running)"
+    echo "Overall: DEGRADED ($running/$total core services, $apps_running/$apps_total apps running)"
     exit 1
   fi
 }

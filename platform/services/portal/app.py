@@ -280,6 +280,17 @@ USER_NEW_BODY = """
 HEALTH_BODY = """
 <h1>Gesundheit</h1>
 <div class="card">
+  <h2>Knoten</h2>
+  <table>
+    <tr><th>Wert</th><th>Status</th><th>Details</th></tr>
+    {% for n in node %}
+    <tr><td>{{ n.name }}</td>
+        <td><span class="dot {{ n.state }}"></span>{{ n.label }}</td>
+        <td class="muted">{{ n.detail }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+<div class="card">
   <h2>Kernservices</h2>
   <table>
     <tr><th>Service</th><th>Status</th><th>Details</th></tr>
@@ -511,6 +522,61 @@ def users_password(username):
 # Health (design guidelines: visible for admin and partner) — checked
 # live from the portal over the internal container network.
 
+def _gb(n_bytes):
+    return f"{n_bytes / 1024**3:.1f}".replace(".", ",") + " GB"
+
+
+def node_values():
+    """Host-level readings, visible from inside the container.
+
+    Disk: statvfs on the registry mount — it lives on the platform's
+    data filesystem. Memory/load/uptime: /proc is not namespaced for
+    these readings, so they are host values.
+    """
+    rows = []
+    rows.append({"name": "Plattformversion", "state": "ok", "label": VERSION,
+                 "detail": ""})
+    try:
+        up = float(open("/proc/uptime").read().split()[0])
+        d, rest = divmod(int(up), 86400)
+        h, rest = divmod(rest, 3600)
+        rows.append({"name": "Betriebszeit", "state": "ok",
+                     "label": f"{d} Tage, {h} Std., {rest // 60} Min.", "detail": ""})
+    except OSError:
+        pass
+    try:
+        l1, l5, l15 = open("/proc/loadavg").read().split()[:3]
+        rows.append({"name": "CPU-Last", "state": "ok",
+                     "label": f"{l1} / {l5} / {l15}",
+                     "detail": "Durchschnitt über 1 / 5 / 15 Minuten"})
+    except OSError:
+        pass
+    try:
+        mem = {}
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":", 1)
+            mem[k] = int(v.strip().split()[0]) * 1024
+        total, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+        if total:
+            state = "warn" if avail < total * 0.1 else "ok"
+            rows.append({"name": "Arbeitsspeicher", "state": state,
+                         "label": f"{_gb(avail)} von {_gb(total)} verfügbar",
+                         "detail": "wird knapp" if state == "warn" else ""})
+    except OSError:
+        pass
+    try:
+        vs = os.statvfs("/apps-registry")
+        free, total = vs.f_frsize * vs.f_bavail, vs.f_frsize * vs.f_blocks
+        state = "warn" if free < 2 * 1024**3 else "ok"
+        rows.append({"name": "Datenträger", "state": state,
+                     "label": f"{_gb(free)} von {_gb(total)} frei",
+                     "detail": "Dateisystem des Plattform-Datenverzeichnisses"
+                               + ("; unter 2 GB frei" if state == "warn" else "")})
+    except OSError:
+        pass
+    return rows
+
+
 def _probe(url, ok_status=200):
     try:
         r = requests.get(url, timeout=2, allow_redirects=False)
@@ -557,7 +623,8 @@ def health():
             "channel_label": CHANNEL_LABELS.get(channel, channel),
             "state": state, "label": label, "detail": detail,
         })
-    return page(HEALTH_BODY, "Gesundheit", "health", core=core, apps=apps)
+    return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
+                core=core, apps=apps)
 
 
 # ---------------------------------------------------------------------------
