@@ -32,6 +32,9 @@ services:
       SETUP_TOKEN: "${SETUP_TOKEN}"
     volumes:
       - "${OAAP_DATA_DIR}/data/identity:/data"
+      # read-only: external.json — the session cookie must span the
+      # app subdomains of the registered external hostname
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
 
   portal:
     build: ./services/portal

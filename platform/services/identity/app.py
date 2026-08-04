@@ -18,6 +18,7 @@ import tempfile
 import time
 
 from flask import Flask, redirect, render_template_string, request, session
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.security import check_password_hash, generate_password_hash
 
 DATA_DIR = "/data"
@@ -36,6 +37,37 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
+
+EXTERNAL_HOST_FILE = "/platform-apps/external.json"
+
+
+def _external_host():
+    try:
+        with open(EXTERNAL_HOST_FILE, encoding="utf-8") as f:
+            return json.load(f).get("host", "").lower()
+    except (OSError, ValueError):
+        return ""
+
+
+class DomainAwareSessionInterface(SecureCookieSessionInterface):
+    """Widen the session cookie to the registered external hostname.
+
+    Externally the apps live on <instance>.<host> (RFC-0005 level 3);
+    a host-only cookie set on the portal apex would never reach them.
+    On LAN requests (IP + ports share one host) the default host-only
+    behavior remains.
+    """
+
+    def get_cookie_domain(self, app):
+        ext = _external_host()
+        if ext:
+            host = request.host.split(":")[0].lower()
+            if host == ext or host.endswith("." + ext):
+                return ext
+        return super().get_cookie_domain(app)
+
+
+app.session_interface = DomainAwareSessionInterface()
 
 
 def _load(path, default):
