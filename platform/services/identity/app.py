@@ -82,56 +82,82 @@ def other_active_admin_exists(users, username):
                for u in users)
 
 
-LOGIN_PAGE = """
-<!doctype html><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OAAP Login</title>
+# Look & feel per oaap-design/docs/design-guidelines.md v0.1 (blue,
+# hexagon mark, German UI, no external resources). Kept in sync with
+# the portal's stylesheet by hand — the guidelines file is the source
+# of truth.
+_CARD_STYLE = """
 <style>
-  body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f4f5f7}
-  form{background:#fff;padding:2rem;border-radius:.5rem;box-shadow:0 1px 4px rgba(0,0,0,.1);width:20rem}
-  h1{font-size:1.2rem;margin-top:0}
-  input{width:100%;box-sizing:border-box;margin:.25rem 0 1rem;padding:.5rem}
-  button{width:100%;padding:.6rem;border:0;border-radius:.25rem;background:#2563eb;color:#fff;font-size:1rem}
-  .err{color:#b91c1c}.hint{color:#555;font-size:.9rem}
+  :root{--blue-600:#2563eb;--blue-700:#1d4ed8;--bg:#f4f6fa;--text:#1f2937;
+        --muted:#6b7280;--border:#e5e7eb;--err:#b91c1c;--ok:#15803d}
+  *{box-sizing:border-box}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       display:grid;place-items:center;min-height:100vh;margin:0;
+       background:var(--bg);color:var(--text)}
+  .card{background:#fff;padding:2rem;border-radius:.6rem;border:1px solid var(--border);
+       box-shadow:0 1px 3px rgba(23,37,84,.06);width:min(22rem,92vw)}
+  .mark{text-align:center;margin-bottom:.4rem}
+  h1{font-size:1.2rem;margin:.2rem 0 1rem;text-align:center}
+  .wordmark{text-align:center;letter-spacing:.08em;font-weight:700;color:var(--blue-600)}
+  input{width:100%;padding:.55rem;margin:.25rem 0 1rem;border:1px solid var(--border);
+       border-radius:.4rem;font-size:.95rem}
+  button{width:100%;padding:.65rem;border:0;border-radius:.4rem;background:var(--blue-600);
+       color:#fff;font-size:1rem;cursor:pointer;min-height:44px}
+  button:hover{background:var(--blue-700)}
+  .err{color:var(--err)}.ok{color:var(--ok)}.hint{color:var(--muted);font-size:.9rem}
+  a{color:var(--blue-600)}
 </style>
-<form method="post" action="/auth/login">
-  <h1>OAAP Login</h1>
-  {% if error %}<p class="err">{{ error }}</p>{% endif %}
-  {% if not has_users %}
-    <p class="hint">No users exist yet — finish the platform setup first
-    (see the URL and token printed by the installer).</p>
-  {% endif %}
-  <label>Username <input name="username" autofocus autocomplete="username"></label>
-  <label>Password <input name="password" type="password" autocomplete="current-password"></label>
-  <button>Sign in</button>
-</form>
 """
 
-PASSWORD_PAGE = """
-<!doctype html><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Change password</title>
-<style>
-  body{font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#f4f5f7}
-  form{background:#fff;padding:2rem;border-radius:.5rem;box-shadow:0 1px 4px rgba(0,0,0,.1);width:20rem}
-  h1{font-size:1.2rem;margin-top:0}
-  input{width:100%;box-sizing:border-box;margin:.25rem 0 1rem;padding:.5rem}
-  button{width:100%;padding:.6rem;border:0;border-radius:.25rem;background:#2563eb;color:#fff;font-size:1rem}
-  .err{color:#b91c1c}.ok{color:#15803d}
-  a{color:#2563eb}
-</style>
-<form method="post" action="/auth/password">
-  <h1>Change password</h1>
-  {% if error %}<p class="err">{{ error }}</p>{% endif %}
-  {% if done %}<p class="ok">Password changed.</p><p><a href="/">Back to the portal</a></p>{% else %}
-  <label>Current password <input name="current" type="password" required autocomplete="current-password"></label>
-  <label>New password (min. 8 characters)
-    <input name="new" type="password" minlength="8" required autocomplete="new-password"></label>
-  <button>Change password</button>
-  <p><a href="/">Back to the portal</a></p>
-  {% endif %}
-</form>
+_MARK_SVG = """
+<p class="mark"><svg viewBox="0 0 100 100" width="46" height="46" aria-hidden="true">
+  <polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="none"
+           stroke="#2563eb" stroke-width="6" stroke-linejoin="round"/>
+  <polygon points="50,28 69,39 69,61 50,72 31,61 31,39" fill="#2563eb"/></svg></p>
 """
+
+_FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
+            "viewBox='0 0 100 100'%3E%3Cpolygon points='50,4 90,27 90,73 50,96 "
+            "10,73 10,27' fill='%232563eb'/%3E%3C/svg%3E")
+
+_HEAD = ('<!doctype html><html lang="de"><meta charset="utf-8">'
+         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+         f'<link rel="icon" href="{_FAVICON}">')
+
+LOGIN_PAGE = _HEAD + "<title>Anmelden — OAAP</title>" + _CARD_STYLE + _MARK_SVG.join([
+    "<body><div class='card'>",
+    """<div class="wordmark">OAAP</div>
+<h1>Anmelden</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if not has_users %}
+  <p class="hint">Es gibt noch keine Benutzer — bitte zuerst die
+  Einrichtung abschließen (URL und Token stehen in der
+  Installationsausgabe).</p>
+{% endif %}
+<form method="post" action="/auth/login">
+  <label>Benutzername <input name="username" autofocus autocomplete="username"></label>
+  <label>Passwort <input name="password" type="password" autocomplete="current-password"></label>
+  <button>Anmelden</button>
+</form>
+</div></body></html>"""])
+
+PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE + _MARK_SVG.join([
+    "<body><div class='card'>",
+    """<h1>Passwort ändern</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if done %}
+  <p class="ok">Das Passwort wurde geändert.</p>
+  <p><a href="/">Zurück zum Portal</a></p>
+{% else %}
+<form method="post" action="/auth/password">
+  <label>Aktuelles Passwort <input name="current" type="password" required autocomplete="current-password"></label>
+  <label>Neues Passwort (mind. 8 Zeichen)
+    <input name="new" type="password" minlength="8" required autocomplete="new-password"></label>
+  <button>Passwort ändern</button>
+</form>
+<p><a href="/">Zurück zum Portal</a></p>
+{% endif %}
+</div></body></html>"""])
 
 
 @app.get("/verify")
@@ -173,7 +199,7 @@ def login():
         session["user"] = u["username"]
         return redirect("/", code=303)
     return render_template_string(
-        LOGIN_PAGE, error="Invalid username or password.", has_users=bool(users)
+        LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.", has_users=bool(users)
     ), 401
 
 
@@ -199,11 +225,11 @@ def password_change():
         return redirect("/auth/login", code=303)
     if not check_password_hash(u["password_hash"], request.form.get("current", "")):
         return render_template_string(
-            PASSWORD_PAGE, error="The current password is not correct.", done=False), 403
+            PASSWORD_PAGE, error="Das aktuelle Passwort stimmt nicht.", done=False), 403
     new = request.form.get("new", "")
     if len(new) < 8:
         return render_template_string(
-            PASSWORD_PAGE, error="The new password needs at least 8 characters.", done=False), 400
+            PASSWORD_PAGE, error="Das neue Passwort braucht mindestens 8 Zeichen.", done=False), 400
     u["password_hash"] = generate_password_hash(new)
     _save(USERS_FILE, users)
     return render_template_string(PASSWORD_PAGE, error=None, done=True)
@@ -224,19 +250,19 @@ def internal_setup():
     """Create the first admin. Called by the portal's first-run wizard."""
     state = _load(STATE_FILE, {})
     if state.get("setup_done"):
-        return {"error": "Setup is already completed; the token is no longer valid."}, 410
+        return {"error": "Die Einrichtung ist bereits abgeschlossen; das Token ist nicht mehr gültig."}, 410
     users = load_users()
     if users:
-        return {"error": "Users already exist."}, 409
+        return {"error": "Es existieren bereits Benutzer."}, 409
 
     body = request.get_json(force=True)
     if not secrets.compare_digest(body.get("token", ""), os.environ["SETUP_TOKEN"]):
-        return {"error": "Invalid setup token."}, 403
+        return {"error": "Das Setup-Token ist ungültig."}, 403
     username = body.get("username", "").strip()
     password = body.get("password", "")
     if not USERNAME_RE.fullmatch(username) or len(password) < 8:
-        return {"error": "Username: lowercase letters/digits/._- (2–40 chars); "
-                         "password must have at least 8 characters."}, 400
+        return {"error": "Benutzername: Kleinbuchstaben/Ziffern/._- (2–40 Zeichen); "
+                         "das Passwort braucht mindestens 8 Zeichen."}, 400
 
     _save(USERS_FILE, [{
         "username": username,
@@ -252,7 +278,7 @@ def internal_setup():
 def _validated_roles(raw):
     roles = [r for r in (raw or []) if r in ASSIGNABLE_ROLES]
     if not roles:
-        raise ValueError("At least one valid role is required.")
+        raise ValueError("Mindestens eine gültige Rolle ist erforderlich.")
     return sorted(set(roles))
 
 
@@ -267,11 +293,11 @@ def users_create():
     users = load_users()
     username = (body.get("username") or "").strip()
     if not USERNAME_RE.fullmatch(username):
-        return {"error": "Username: lowercase letters/digits/._- (2–40 chars)."}, 400
+        return {"error": "Benutzername: Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)."}, 400
     if find_user(users, username):
-        return {"error": f"User '{username}' already exists."}, 409
+        return {"error": f"Benutzer '{username}' existiert bereits."}, 409
     if len(body.get("password") or "") < 8:
-        return {"error": "Password must have at least 8 characters."}, 400
+        return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
     try:
         roles = _validated_roles(body.get("roles"))
     except ValueError as e:
@@ -293,7 +319,7 @@ def users_update(username):
     users = load_users()
     u = find_user(users, username)
     if not u:
-        return {"error": "User not found."}, 404
+        return {"error": "Benutzer nicht gefunden."}, 404
     try:
         roles = _validated_roles(body.get("roles"))
     except ValueError as e:
@@ -304,8 +330,8 @@ def users_update(username):
     loses_admin = "admin" in u["roles"] and u["active"] and \
                   ("admin" not in roles or not active)
     if loses_admin and not other_active_admin_exists(users, username):
-        return {"error": "This is the last active administrator — "
-                         "assign admin to someone else first."}, 409
+        return {"error": "Das ist der letzte aktive Administrator — "
+                         "bitte zuerst jemand anderem admin geben."}, 409
     u["roles"] = roles
     u["active"] = active
     u["display_name"] = (body.get("display_name") or "").strip()
@@ -319,9 +345,9 @@ def users_set_password(username):
     users = load_users()
     u = find_user(users, username)
     if not u:
-        return {"error": "User not found."}, 404
+        return {"error": "Benutzer nicht gefunden."}, 404
     if len(body.get("password") or "") < 8:
-        return {"error": "Password must have at least 8 characters."}, 400
+        return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
     u["password_hash"] = generate_password_hash(body["password"])
     _save(USERS_FILE, users)
     return {"ok": True}
