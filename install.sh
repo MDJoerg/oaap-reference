@@ -16,6 +16,8 @@
 #   OAAP_SERVER_MODE  1 = apply keep-awake without asking, 0 = skip
 #   OAAP_STATIC_IP    current = pin the current address, <address> = use
 #                     that address, skip = leave DHCP untouched
+#   OAAP_ADMIN_SUDO   1 = set up sudo for the invoking user without
+#                     asking (fresh netinstall via 'su'), 0 = skip
 
 set -euo pipefail
 
@@ -87,8 +89,39 @@ fi
 
 # ------------------------------------------- server readiness (spec 2.2 step 2)
 # A platform node must behave like a server: never sleep, keep its
-# address. Consumer hardware and default installs often do neither.
-# Every change needs explicit consent; 'prepare' runs only this part.
+# address, and have a working admin path. Consumer hardware and default
+# installs often have none of that (a Debian netinstall with a root
+# password ships without sudo). Every change needs explicit consent;
+# 'prepare' runs only this part.
+
+admin_access() {
+  # Running as root via 'su' on a fresh netinstall: offer to set up
+  # sudo for the regular user so that all later docs ('sudo oaap ...')
+  # just work. The target user is whoever owns the installer directory.
+  user="${SUDO_USER:-}"
+  [ -n "$user" ] || user="$(stat -c %U "$SCRIPT_DIR" 2>/dev/null || true)"
+  [ -n "$user" ] && [ "$user" != "root" ] || return 0
+  needs=""
+  command -v sudo >/dev/null 2>&1 || needs="install sudo"
+  if command -v sudo >/dev/null 2>&1 && ! id -nG "$user" 2>/dev/null | grep -qw sudo; then
+    needs="${needs:+$needs and }add '$user' to the sudo group"
+  fi
+  [ -n "$needs" ] || return 0
+  consent="${OAAP_ADMIN_SUDO:-}"
+  if [ -z "$consent" ] && [ -t 0 ]; then
+    say ""
+    say "This system has no working 'sudo' path for user '$user' yet."
+    read -r -p "Set it up now ($needs)? [Y/n] " answer
+    case "$answer" in n|N|no|NO) consent=0 ;; *) consent=1 ;; esac
+  fi
+  if [ "$consent" != "1" ]; then
+    say "Admin access: skipped (set OAAP_ADMIN_SUDO=1 to apply it non-interactively)."
+    return 0
+  fi
+  command -v sudo >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq sudo; }
+  usermod -aG sudo "$user"
+  say "Admin access: '$user' is in the sudo group (takes effect at the next login)."
+}
 
 keep_awake() {
   if [ "$(systemctl is-enabled sleep.target 2>/dev/null)" = "masked" ]; then
@@ -253,6 +286,7 @@ EOF
 }
 
 if [ "$(id -u)" -eq 0 ]; then
+  admin_access
   keep_awake
   static_ip
 elif [ "$MODE" = "prepare" ]; then
@@ -271,7 +305,14 @@ fi
 errors=()
 warnings=()
 
-[ "$(id -u)" -eq 0 ] || errors+=("Must run as root (sudo ./install.sh).")
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    errors+=("Must run as root (sudo ./install.sh).")
+  else
+    # Fresh Debian netinstall with a root password: no sudo on board.
+    errors+=("Must run as root, and 'sudo' is not installed yet (normal on a fresh Debian). Run:  su -c \"bash $(basename "$0")\"  — the installer then offers to set up sudo for your user.")
+  fi
+fi
 
 case "$OS_ID $OS_LIKE" in
   *debian*) : ;;  # Tier 1 (Debian) or Tier 2 (Ubuntu et al.), see ADR-0005

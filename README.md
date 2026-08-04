@@ -25,14 +25,37 @@ sudo ./install.sh
 ```
 
 The installer runs preflight checks (and changes nothing if they fail),
-starts the core services, and prints the setup URL plus a one-time
-token. Open the URL, enter the token, create the first admin — done.
-Check the node anytime with `oaap status`; remove the platform again
-with `sudo oaap uninstall` (add `--purge` to also delete all data —
-useful on test hardware).
+offers the server-readiness fixes (keep the machine awake, pin the
+current IP address — each only with your consent), starts the core
+services, and prints the setup URL plus a one-time token. Open the URL,
+enter the token, create the first admin — done. Check the node anytime
+with `oaap status`; remove the platform again with `sudo oaap
+uninstall` (add `--purge` to also delete all data — useful on test
+hardware). Server readiness alone (also later, also on installed
+machines): `sudo ./install.sh prepare`.
+
+### Fresh Debian (netinstall)
+
+A Debian netinstall where you set a root password ships **without
+`sudo` and without `git`**. Get from zero to installed like this
+(replace `<user>` with the user created during the Debian install):
+
+```sh
+su -                              # become root (root password)
+apt install git
+exit
+git clone <repo-url> && cd oaap-reference
+su -c "bash install.sh"           # installer offers to set up sudo for <user>
+```
+
+After the run, log out and in once — from then on `sudo` works and the
+printed `oaap` commands behave as documented.
 
 Configuration via environment: `OAAP_HTTP_PORT` (default 80),
-`OAAP_DATA_DIR` (default `/var/lib/oaap`), `OAAP_HOST` (setup-URL host).
+`OAAP_DATA_DIR` (default `/var/lib/oaap`), `OAAP_HOST` (setup-URL host);
+non-interactive consents: `OAAP_INSTALL_RUNTIME=1` (Docker),
+`OAAP_SERVER_MODE=1` (keep-awake), `OAAP_STATIC_IP=current|<ip>|skip`
+(pin address), `OAAP_ADMIN_SUDO=1` (sudo setup).
 
 ## Layout
 
