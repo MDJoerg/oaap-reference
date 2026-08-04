@@ -274,6 +274,15 @@ EOF
         sed -i "s|^[[:space:]]*iface $iface inet dhcp.*|iface $iface inet static\n    address $newip/$prefix\n    gateway $gateway\n    dns-nameservers $dns|" "$f"
         say "Stable address: $newip/$prefix written to $f (backup: $f.oaap-backup-$ts)."
       done
+      # Keep name resolution alive: once the interface is static, no
+      # DHCP client maintains /etc/resolv.conf anymore — and Debian's
+      # dhcpcd even empties it at boot. Pin the resolvers we detected
+      # (resolv.conf.head is dhcpcd's supported override hook).
+      if [ ! -L /etc/resolv.conf ]; then
+        { for d in $dns; do echo "nameserver $d"; done; } > /etc/resolv.conf.head
+        { echo "# Written by the OAAP installer (static address; see interfaces backup)."
+          for d in $dns; do echo "nameserver $d"; done; } > /etc/resolv.conf
+      fi
       if [ "$newip" = "$curip" ]; then
         say "The address stays the same; the static setting takes effect at the next boot."
       else
