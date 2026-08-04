@@ -273,14 +273,16 @@ def cmd_install(args):
         if not shutil.which("git"):
             die("installing from a Git URL needs git on this node (apt install git)")
         tmp_clone = tempfile.mkdtemp(prefix="oaap-pkg-")
-        print(f"Fetching {args.package} ...")
+        ref = getattr(args, "ref", "") or ""
+        print(f"Fetching {args.package}{' (' + ref + ')' if ref else ''} ...")
+        branch = ["--branch", ref] if ref else []
         try:
-            run(["git", "clone", "--depth", "1", args.package, tmp_clone])
+            run(["git", "clone", "--depth", "1", *branch, args.package, tmp_clone])
         except subprocess.CalledProcessError as e:
             shutil.rmtree(tmp_clone, ignore_errors=True)
             die(f"git clone failed: {e.stderr.strip()}")
         pkg = os.path.join(tmp_clone, args.path) if args.path else tmp_clone
-        source = {"kind": "git", "url": args.package, "path": args.path}
+        source = {"kind": "git", "url": args.package, "path": args.path, "ref": ref}
     else:
         pkg = os.path.abspath(os.path.join(args.package, args.path)
                               if args.path else args.package)
@@ -655,7 +657,8 @@ def _resolve_revision(source):
     if (source or {}).get("kind") != "git":
         return ""
     try:
-        out = run(["git", "ls-remote", source["url"], "HEAD"]).stdout.split()
+        ref = source.get("ref") or "HEAD"
+        out = run(["git", "ls-remote", source["url"], ref]).stdout.split()
         return out[0][:12] if out else ""
     except Exception:
         return ""
@@ -705,7 +708,7 @@ def cmd_process_deploys(_args):
             revision = _resolve_revision(src)
             ns = _argparse.Namespace(
                 package=src["url"], path=src.get("path", ""),
-                name=name, channel="test")
+                ref=src.get("ref", ""), name=name, channel="test")
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -820,7 +823,8 @@ def _deploy_from_registry(name, inst):
             if src.get("kind") == "git":
                 tmp = tempfile.mkdtemp(prefix="oaap-restore-")
                 print(f"Fetching {src['url']} ...")
-                run(["git", "clone", "--depth", "1", src["url"], tmp])
+                branch = ["--branch", src["ref"]] if src.get("ref") else []
+                run(["git", "clone", "--depth", "1", *branch, src["url"], tmp])
                 pkg = os.path.join(tmp, src.get("path") or "")
             elif src.get("kind") == "local":
                 pkg = os.path.join(src.get("url", ""), src.get("path") or "")
@@ -937,6 +941,7 @@ def main():
     pi = sub.add_parser("install")
     pi.add_argument("package", help="package directory or Git URL")
     pi.add_argument("--path", default="", help="package path inside the directory/repo")
+    pi.add_argument("--ref", default="", help="git branch/tag to install from (git sources)")
     pi.add_argument("--name")
     pi.add_argument("--channel", choices=["production", "test"], default="production")
     pi.set_defaults(fn=cmd_install)
