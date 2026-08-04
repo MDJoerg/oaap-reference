@@ -3,12 +3,19 @@
 # OAAP reference installer — implements oaap.core.host (bootstrap mode).
 # Spec: oaap-spec/spec/oaap.core.host.md
 #
-# Usage:  sudo ./install.sh [bootstrap]
+# Usage:  sudo ./install.sh [bootstrap|prepare]
+#
+#   bootstrap  install a new platform on this machine (default)
+#   prepare    server readiness only (keep-awake, static address);
+#              re-runnable, also on machines that are already installed
 #
 # Configuration via environment (all optional):
-#   OAAP_HTTP_PORT   HTTP port of the gateway         (default: 80)
-#   OAAP_DATA_DIR    platform state & app directory   (default: /var/lib/oaap)
-#   OAAP_HOST        hostname/IP used in the setup URL (default: first local IP)
+#   OAAP_HTTP_PORT    HTTP port of the gateway         (default: 80)
+#   OAAP_DATA_DIR     platform state & app directory   (default: /var/lib/oaap)
+#   OAAP_HOST         hostname/IP used in the setup URL (default: first local IP)
+#   OAAP_SERVER_MODE  1 = apply keep-awake without asking, 0 = skip
+#   OAAP_STATIC_IP    current = pin the current address, <address> = use
+#                     that address, skip = leave DHCP untouched
 
 set -euo pipefail
 
@@ -24,7 +31,7 @@ fail() { say "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- mode gate
 case "$MODE" in
-  bootstrap) ;;
+  bootstrap|prepare) ;;
   uninstall)
     fail "Uninstall is a node command: run 'sudo oaap uninstall' (add --purge to also delete data)." ;;
   join|remote-join)
@@ -65,7 +72,7 @@ install_runtime() {
   say "Docker Engine installed."
 }
 
-if [ "$(id -u)" -eq 0 ] && ! command -v docker >/dev/null 2>&1; then
+if [ "$MODE" = "bootstrap" ] && [ "$(id -u)" -eq 0 ] && ! command -v docker >/dev/null 2>&1; then
   consent="${OAAP_INSTALL_RUNTIME:-}"
   if [ -z "$consent" ] && [ -t 0 ]; then
     read -r -p "Docker Engine is not installed. Install it now from Docker's official repository? [y/N] " answer
@@ -78,9 +85,189 @@ if [ "$(id -u)" -eq 0 ] && ! command -v docker >/dev/null 2>&1; then
   fi
 fi
 
+# ------------------------------------------- server readiness (spec 2.2 step 2)
+# A platform node must behave like a server: never sleep, keep its
+# address. Consumer hardware and default installs often do neither.
+# Every change needs explicit consent; 'prepare' runs only this part.
+
+keep_awake() {
+  if [ "$(systemctl is-enabled sleep.target 2>/dev/null)" = "masked" ]; then
+    say "Keep-awake: already configured (sleep targets are masked)."
+    return 0
+  fi
+  consent="${OAAP_SERVER_MODE:-}"
+  if [ -z "$consent" ] && [ -t 0 ]; then
+    say ""
+    say "Mini-PCs and laptops often suspend after a while — a server must not."
+    read -r -p "Keep this machine permanently awake (recommended)? [Y/n] " answer
+    case "$answer" in n|N|no|NO) consent=0 ;; *) consent=1 ;; esac
+  fi
+  if [ "$consent" != "1" ]; then
+    say "Keep-awake: skipped (set OAAP_SERVER_MODE=1 to apply it non-interactively)."
+    return 0
+  fi
+  systemctl mask --now sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null 2>&1 || true
+  mkdir -p /etc/systemd/logind.conf.d
+  cat > /etc/systemd/logind.conf.d/oaap-server.conf <<'EOF'
+# OAAP server mode: never sleep on lid close or power/suspend keys.
+# Rollback: delete this file and run
+#   systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target
+[Login]
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+  systemctl kill -s HUP systemd-logind >/dev/null 2>&1 || true
+  say "Keep-awake: suspend/hibernate disabled, lid close and power key are ignored."
+}
+
+static_ip() {
+  # Detect the primary interface and its current IPv4 configuration.
+  defroute="$(ip -4 route show default 2>/dev/null | head -1)"
+  [ -n "$defroute" ] || { say "Stable address: no default route found — skipped."; return 0; }
+  iface="$(printf '%s\n' "$defroute" | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')"
+  gateway="$(printf '%s\n' "$defroute" | awk '{for(i=1;i<NF;i++) if($i=="via") print $(i+1)}')"
+  cidr="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
+  [ -n "$iface" ] && [ -n "$gateway" ] && [ -n "$cidr" ] || { say "Stable address: could not detect the network setup — skipped."; return 0; }
+  curip="${cidr%/*}"; prefix="${cidr#*/}"
+  dns="$(awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -v '^127\.' | tr '\n' ' ' | sed 's/ $//' || true)"
+  [ -n "$dns" ] || dns="$gateway"
+
+  # Which tool owns this interface, and is it on DHCP?
+  method=""
+  if systemctl is-active --quiet NetworkManager 2>/dev/null && command -v nmcli >/dev/null 2>&1; then
+    nm_con="$(nmcli -g GENERAL.CONNECTION device show "$iface" 2>/dev/null || true)"
+    if [ -n "$nm_con" ]; then
+      method=nm
+      if [ "$(nmcli -g ipv4.method connection show "$nm_con" 2>/dev/null)" = "manual" ]; then
+        say "Stable address: already configured ($curip is static via NetworkManager)."
+        return 0
+      fi
+    fi
+  elif [ -d /etc/netplan ] && ls /etc/netplan/*.y*ml >/dev/null 2>&1; then
+    method=netplan
+    if [ -f /etc/netplan/99-oaap-static.yaml ]; then
+      say "Stable address: already configured (/etc/netplan/99-oaap-static.yaml)."
+      return 0
+    fi
+  elif grep -qs "iface $iface inet static" /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null; then
+    say "Stable address: already configured ($curip is static in /etc/network/interfaces)."
+    return 0
+  elif grep -qs "iface $iface inet dhcp" /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null; then
+    method=ifupdown
+  fi
+  [ -n "$method" ] || { say "Stable address: could not determine how $iface is configured — please set a static address manually or reserve one in your router."; return 0; }
+
+  choice="${OAAP_STATIC_IP:-}"
+  if [ -z "$choice" ] && [ -t 0 ]; then
+    say ""
+    say "Network: $iface gets its address via DHCP — currently $curip/$prefix (gateway $gateway)."
+    say "A server should keep a fixed address; with DHCP it can change after a reboot."
+    read -r -p "Make the address permanent? [Enter = keep $curip / type another address / n = leave DHCP] " answer
+    case "$answer" in ""|y|Y|yes|YES) choice=current ;; n|N|no|NO) choice=skip ;; *) choice="$answer" ;; esac
+  fi
+  case "$choice" in
+    ""|skip|0)
+      say "Stable address: skipped (set OAAP_STATIC_IP=current or an address to apply it non-interactively)."
+      return 0 ;;
+    current) newip="$curip" ;;
+    *) newip="$choice" ;;
+  esac
+
+  if [ "$newip" != "$curip" ]; then
+    command -v python3 >/dev/null 2>&1 || { say "Stable address: python3 is needed to validate a custom address — keeping DHCP."; return 0; }
+    python3 -c "import ipaddress,sys; ipaddress.ip_address(sys.argv[1])" "$newip" 2>/dev/null \
+      || { say "Stable address: '$newip' is not a valid IPv4 address — keeping DHCP."; return 0; }
+    python3 -c "import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]) in ipaddress.ip_interface(sys.argv[2]).network else 1)" "$newip" "$cidr" \
+      || { say "Stable address: $newip is not inside this network ($cidr) — keeping DHCP."; return 0; }
+    # Reserved addresses can NOT be checked by ping alone (routers and
+    # hosts with firewalls often don't answer) — refuse them outright.
+    if [ "$newip" = "$gateway" ]; then
+      say "Stable address: $newip is the gateway's address — keeping DHCP."
+      return 0
+    fi
+    python3 -c "import ipaddress,sys; n=ipaddress.ip_interface(sys.argv[2]).network; a=ipaddress.ip_address(sys.argv[1]); sys.exit(1 if a in (n.network_address, n.broadcast_address) else 0)" "$newip" "$cidr" \
+      || { say "Stable address: $newip is the network/broadcast address — keeping DHCP."; return 0; }
+    # Best effort only: a silent machine may still own the address.
+    if ping -c1 -W1 "$newip" >/dev/null 2>&1; then
+      say "Stable address: $newip already answers on the network (in use) — keeping DHCP."
+      return 0
+    fi
+  fi
+
+  case "$method" in
+    nm)
+      nmcli connection modify "$nm_con" ipv4.method manual \
+        ipv4.addresses "$newip/$prefix" ipv4.gateway "$gateway" ipv4.dns "$dns"
+      if [ "$newip" = "$curip" ]; then
+        nmcli connection up "$nm_con" >/dev/null 2>&1 || true
+      else
+        say "The new address $newip becomes active at the next boot — please reboot, then reach the machine at $newip."
+      fi
+      say "Stable address: $newip/$prefix set via NetworkManager (rollback: nmcli connection modify \"$nm_con\" ipv4.method auto)."
+      ;;
+    netplan)
+      dns_list="$(printf '%s' "$dns" | sed 's/ /, /g')"
+      cat > /etc/netplan/99-oaap-static.yaml <<EOF
+# Written by the OAAP installer (server readiness).
+# Rollback: delete this file, then run 'netplan apply'.
+network:
+  version: 2
+  ethernets:
+    $iface:
+      dhcp4: false
+      addresses: [$newip/$prefix]
+      routes:
+        - to: default
+          via: $gateway
+      nameservers:
+        addresses: [$dns_list]
+EOF
+      chmod 600 /etc/netplan/99-oaap-static.yaml
+      if [ "$newip" = "$curip" ]; then
+        netplan apply >/dev/null 2>&1 || true
+      else
+        say "The new address $newip becomes active at the next boot — please reboot, then reach the machine at $newip."
+      fi
+      say "Stable address: $newip/$prefix set via netplan (/etc/netplan/99-oaap-static.yaml)."
+      ;;
+    ifupdown)
+      ts="$(date +%Y%m%d-%H%M%S)"
+      files="$(grep -ls "iface $iface inet dhcp" /etc/network/interfaces /etc/network/interfaces.d/* 2>/dev/null || true)"
+      for f in $files; do
+        cp -a "$f" "$f.oaap-backup-$ts"
+        sed -i "s|^[[:space:]]*iface $iface inet dhcp.*|iface $iface inet static\n    address $newip/$prefix\n    gateway $gateway\n    dns-nameservers $dns|" "$f"
+        say "Stable address: $newip/$prefix written to $f (backup: $f.oaap-backup-$ts)."
+      done
+      if [ "$newip" = "$curip" ]; then
+        say "The address stays the same; the static setting takes effect at the next boot."
+      else
+        # Never switch the address live: it would cut remote sessions
+        # and, if the address is silently taken, strand the machine.
+        say "The new address $newip becomes active at the next boot — please reboot, then reach the machine at $newip."
+      fi
+      ;;
+  esac
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+  keep_awake
+  static_ip
+elif [ "$MODE" = "prepare" ]; then
+  fail "Must run as root (sudo ./install.sh prepare)."
+fi
+
+if [ "$MODE" = "prepare" ]; then
+  say ""
+  say "Server preparation finished. (Re-run 'sudo ./install.sh prepare' anytime.)"
+  exit 0
+fi
+
 # ---------------------------------------------------------------- preflight
-# All checks run BEFORE anything is changed on the system (spec 2.2 step 2);
-# a runtime installed above was an explicitly requested change.
+# All checks run BEFORE anything is changed on the system (spec 2.2 step 3);
+# runtime/server-readiness changes above were explicitly consented.
 errors=()
 warnings=()
 
@@ -135,7 +322,7 @@ if command -v apt-get >/dev/null 2>&1 && ! python3 -c "import yaml" >/dev/null 2
   apt-get install -y -qq python3-yaml || say "WARNING: could not install python3-yaml — 'oaap app' will not work until it is present."
 fi
 
-# Secrets: generated locally, random, unique per installation (spec 2.2 step 3).
+# Secrets: generated locally, random, unique per installation (spec 2.2 step 5).
 gen_secret() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 SETUP_TOKEN="$(gen_secret)"
 SESSION_SECRET="$(gen_secret)"
