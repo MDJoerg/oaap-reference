@@ -19,8 +19,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 
 import yaml
 
@@ -29,6 +31,7 @@ APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
 APPS_DIR = os.path.join(DATA_DIR, "apps")          # app instances
 CADDY_APPS_DIR = os.path.join(APP_DIR, "apps-caddy")
 REGISTRY = os.path.join(APPS_DIR, "registry.json")
+STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
 PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
@@ -147,7 +150,31 @@ def reload_gateway():
 
 
 def cmd_install(args):
-    pkg = os.path.abspath(args.package)
+    # Store integration: the package may be a Git URL (+ --path inside
+    # the repo) instead of a local directory.
+    tmp_clone = None
+    if re.match(r"^(https?://|git@)", args.package):
+        if not shutil.which("git"):
+            die("installing from a Git URL needs git on this node (apt install git)")
+        tmp_clone = tempfile.mkdtemp(prefix="oaap-pkg-")
+        print(f"Fetching {args.package} ...")
+        try:
+            run(["git", "clone", "--depth", "1", args.package, tmp_clone])
+        except subprocess.CalledProcessError as e:
+            shutil.rmtree(tmp_clone, ignore_errors=True)
+            die(f"git clone failed: {e.stderr.strip()}")
+        pkg = os.path.join(tmp_clone, args.path) if args.path else tmp_clone
+    else:
+        pkg = os.path.abspath(os.path.join(args.package, args.path)
+                              if args.path else args.package)
+    try:
+        _install_from_dir(pkg, args)
+    finally:
+        if tmp_clone:
+            shutil.rmtree(tmp_clone, ignore_errors=True)
+
+
+def _install_from_dir(pkg, args):
     mf_path = os.path.join(pkg, "oaap-app.yaml")
     if not os.path.isfile(mf_path):
         die(f"no oaap-app.yaml in {pkg}")
@@ -407,11 +434,51 @@ def cmd_convert(args):
     print(f"Packages and REPORT.md written to {out_root} — review before installing.")
 
 
+def cmd_store(args):
+    """Manage store sources (list URLs the portal's Store page reads)."""
+    try:
+        with open(STORE_SOURCES, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {"sources": []}
+    sources = data.get("sources", [])
+
+    if args.action == "list":
+        if not sources:
+            print("No store sources configured. Add one with: sudo oaap store add-source <url>")
+        for i, s in enumerate(sources, 1):
+            name = s.get("name") or "(unbenannt)"
+            print(f"{i}. {name} — {s['url']}")
+        return
+    if not args.url:
+        die(f"'{args.action}' needs a URL (or index for remove-source)")
+    if args.action == "add-source":
+        if any(s["url"] == args.url for s in sources):
+            die("this source is already configured")
+        sources.append({"url": args.url, "name": args.name or ""})
+        print(f"Store source added ({args.url}).")
+    elif args.action == "remove-source":
+        before = len(sources)
+        if args.url.isdigit() and 1 <= int(args.url) <= len(sources):
+            sources.pop(int(args.url) - 1)
+        else:
+            sources = [s for s in sources if s["url"] != args.url]
+        if len(sources) == before:
+            die("no matching source")
+        print("Store source removed.")
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = STORE_SOURCES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"sources": sources}, f, indent=2)
+    os.replace(tmp, STORE_SOURCES)
+
+
 def main():
     p = argparse.ArgumentParser(prog="oaap app")
     sub = p.add_subparsers(dest="cmd", required=True)
     pi = sub.add_parser("install")
-    pi.add_argument("package")
+    pi.add_argument("package", help="package directory or Git URL")
+    pi.add_argument("--path", default="", help="package path inside the directory/repo")
     pi.add_argument("--name")
     pi.add_argument("--channel", choices=["production", "test"], default="production")
     pi.set_defaults(fn=cmd_install)
@@ -426,6 +493,11 @@ def main():
     pc.add_argument("--out", default="./oaap-converted")
     pc.add_argument("--profile")
     pc.set_defaults(fn=cmd_convert)
+    ps = sub.add_parser("store")
+    ps.add_argument("action", choices=["list", "add-source", "remove-source"])
+    ps.add_argument("url", nargs="?")
+    ps.add_argument("--name")
+    ps.set_defaults(fn=cmd_store)
     args = p.parse_args()
     if args.cmd != "convert" and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")

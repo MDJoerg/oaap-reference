@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import tempfile
+import time
 
 from flask import Flask, redirect, render_template_string, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -80,6 +81,47 @@ def public_user(u):
 def other_active_admin_exists(users, username):
     return any(u["active"] and "admin" in u["roles"] and u["username"] != username
                for u in users)
+
+
+# Login throttling (first hardening step for exposed setups): after 5
+# failures per client+username within 5 minutes, one attempt per
+# minute. State lives in /data so it is shared across gunicorn workers
+# (in-process memory would give every worker its own counter).
+THROTTLE_FILE = os.path.join(DATA_DIR, "login-throttle.json")
+_LOCK_THRESHOLD, _LOCK_WINDOW, _LOCK_SECONDS = 5, 300, 60
+
+
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() if fwd else (request.remote_addr or "?")
+
+
+def _throttle_state(key):
+    """Pruned failure timestamps for key plus the full (pruned) table."""
+    now = time.time()
+    table = _load(THROTTLE_FILE, {})
+    table = {k: hits for k, hits in
+             ((k, [t for t in v if now - t < _LOCK_WINDOW]) for k, v in table.items())
+             if hits}
+    return table.get(key, []), table
+
+
+def _login_blocked(key):
+    hits, _ = _throttle_state(key)
+    return len(hits) >= _LOCK_THRESHOLD and time.time() - hits[-1] < _LOCK_SECONDS
+
+
+def _login_failed(key):
+    hits, table = _throttle_state(key)
+    table[key] = hits + [time.time()]
+    _save(THROTTLE_FILE, table)
+
+
+def _login_succeeded(key):
+    hits, table = _throttle_state(key)
+    if key in table:
+        del table[key]
+        _save(THROTTLE_FILE, table)
 
 
 # Look & feel per oaap-design/docs/design-guidelines.md v0.1 (blue,
@@ -193,11 +235,18 @@ def login():
     users = load_users()
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
+    throttle_key = f"{_client_ip()}|{username}"
+    if _login_blocked(throttle_key):
+        return render_template_string(
+            LOGIN_PAGE, error="Zu viele Fehlversuche — bitte eine Minute warten.",
+            has_users=bool(users)), 429
     u = find_user(users, username)
     # Generic error either way — no username enumeration (spec 4.4).
     if u and u["active"] and check_password_hash(u["password_hash"], password):
+        _login_succeeded(throttle_key)
         session["user"] = u["username"]
         return redirect("/", code=303)
+    _login_failed(throttle_key)
     return render_template_string(
         LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.", has_users=bool(users)
     ), 401

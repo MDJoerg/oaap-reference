@@ -140,6 +140,7 @@ LAYOUT = STYLE + """
     <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
     {% if is_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
+    {% if is_admin %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
   </nav>
   <div class="userbox">
     <span class="who">{{ user }}<br><small>{{ roles }}</small></span>
@@ -319,6 +320,56 @@ HEALTH_BODY = """
 <p class="muted">Geprüft wird aus Sicht des Portals über das interne
 Netz. Knoten-Werte (Festplatte, Updates) folgen mit der
 Betriebs-Capability.</p>
+"""
+
+STORE_BODY = """
+<h1>Store</h1>
+{% if not sources %}
+<div class="card">
+  <p class="muted">Noch keine Store-Quelle eingetragen. Eine Quelle ist
+  eine URL auf eine <code>oaap-store.json</code>-Liste — hinzufügen mit:</p>
+  <p><code>sudo oaap store add-source &lt;url&gt;</code></p>
+</div>
+{% endif %}
+{% for src in sources %}
+<div class="card">
+  <h2>{{ src.title }}</h2>
+  <p class="muted">{{ src.url }}</p>
+  {% if src.error %}
+    <p class="err">Quelle nicht lesbar: {{ src.error }}</p>
+  {% elif not src.apps %}
+    <p class="muted">Diese Liste enthält keine Apps.</p>
+  {% else %}
+    {% for a in src.apps %}
+    <div style="border-top:1px solid var(--oaap-border);padding:.9rem 0">
+      <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+        <svg viewBox="0 0 100 100" width="20" height="20" aria-hidden="true">
+          <polygon points="50,6 71,18 71,42 50,54 29,42 29,18" fill="#2563eb"/>
+          <polygon points="28,44 49,56 49,80 28,92 7,80 7,56" fill="none" stroke="#2563eb" stroke-width="5"/>
+          <polygon points="72,44 93,56 93,80 72,92 51,80 51,56" fill="none" stroke="#2563eb" stroke-width="5"/></svg>
+        <strong>{{ a.name }}</strong>
+        <span class="badge">{{ a.type }}</span>
+        <span class="muted">v{{ a.version }}</span>
+        {% if a.installed %}<span class="badge test">installiert ({{ a.installed }})</span>{% endif %}
+        {% if a.homepage %}<a class="muted" href="{{ a.homepage }}" target="_blank" rel="noopener">Homepage ↗</a>{% endif %}
+        {% if a.license %}<span class="muted">Lizenz: {{ a.license }}</span>{% endif %}
+      </div>
+      <p class="muted" style="margin:.4rem 0">{{ a.description }}</p>
+      {% if a.command %}
+      <p class="muted" style="margin:.2rem 0 0">Installation (als Administrator auf dem Server):</p>
+      <code style="display:block;background:#f8fafc;border:1px solid var(--oaap-border);
+                   border-radius:.4rem;padding:.5rem .7rem;overflow-x:auto;white-space:pre">{{ a.command }}</code>
+      {% else %}
+      <p class="muted">Paketquelle wird von diesem Durchstich noch nicht unterstützt.</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>
+{% endfor %}
+<p class="muted">Durchstich: Der Store zeigt Listen an und liefert das
+Installationskommando — Ein-Klick-Installation folgt. Quellen verwaltet
+die Administration mit <code>sudo oaap store add-source|remove-source</code>.</p>
 """
 
 SETUP_PAGE = STYLE + """
@@ -607,6 +658,10 @@ def health():
         health_path = inst.get("health_path")
         if container and svc_port and health_path:
             state, label, detail = _probe(f"http://{container}:{svc_port}{health_path}")
+            # Wrapped apps often answer their root with a redirect —
+            # any response below 400 counts as alive.
+            if state == "warn" and detail.startswith("HTTP 3"):
+                state, label = "ok", "Gesund"
         elif container and svc_port:
             state, label, detail = _probe(f"http://{container}:{svc_port}/")
             if state == "warn":  # any HTTP answer counts as reachable here
@@ -625,6 +680,58 @@ def health():
         })
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
                 core=core, apps=apps)
+
+
+# ---------------------------------------------------------------------------
+# Store (admin only) — reads the configured source lists (early
+# walking-skeleton of the app store: display + install command; the
+# one-click install path comes later).
+
+STORE_SOURCES_FILE = "/apps-registry/store-sources.json"
+
+
+@app.get("/store")
+def store():
+    if "admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle admin.", 403
+    try:
+        with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
+            configured = json.load(f).get("sources", [])
+    except (OSError, ValueError):
+        configured = []
+    installed = {inst.get("app_id"): inst.get("version")
+                 for inst in load_instances().values()}
+    sources = []
+    for src in configured:
+        entry = {"url": src.get("url", ""), "title": src.get("name") or "Store-Quelle",
+                 "apps": [], "error": None}
+        try:
+            r = requests.get(entry["url"], timeout=4)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError) as e:
+            entry["error"] = type(e).__name__
+            sources.append(entry)
+            continue
+        entry["title"] = src.get("name") or data.get("name") or "Store-Quelle"
+        for a in data.get("apps", []):
+            pkg = a.get("package") or {}
+            command = None
+            if pkg.get("git"):
+                command = f"sudo oaap app install {pkg['git']}"
+                if pkg.get("path"):
+                    command += f" --path {pkg['path']}"
+                command += " --channel test"
+            entry["apps"].append({
+                "name": a.get("name", a.get("id", "?")),
+                "description": a.get("description", ""),
+                "type": a.get("type", "?"), "version": a.get("version", "?"),
+                "license": a.get("license", ""), "homepage": a.get("homepage", ""),
+                "installed": installed.get(a.get("id")),
+                "command": command,
+            })
+        sources.append(entry)
+    return page(STORE_BODY, "Store", "store", sources=sources)
 
 
 # ---------------------------------------------------------------------------
