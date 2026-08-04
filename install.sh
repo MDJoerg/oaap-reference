@@ -358,7 +358,8 @@ say "Preflight OK."
 
 # ---------------------------------------------------------------- install
 APP_DIR="$OAAP_DATA_DIR/app"
-mkdir -p "$APP_DIR" "$OAAP_DATA_DIR/data/identity" "$OAAP_DATA_DIR/apps"
+mkdir -p "$APP_DIR" "$OAAP_DATA_DIR/data/identity" "$OAAP_DATA_DIR/apps" \
+         "$OAAP_DATA_DIR/data/gateway/logs" "$OAAP_DATA_DIR/data/gateway/caddy-data"
 cp -r "$SCRIPT_DIR/platform/." "$APP_DIR/"
 cp "$SCRIPT_DIR/VERSION" "$APP_DIR/VERSION"
 

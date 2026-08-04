@@ -14,6 +14,7 @@ resources.
 
 import json
 import os
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
@@ -317,9 +318,24 @@ HEALTH_BODY = """
   </table>
   {% else %}<p class="muted">Keine Apps installiert.</p>{% endif %}
 </div>
+{% if ext %}
+<div class="card">
+  <h2>Externer Zugriff</h2>
+  <p><strong>{{ ext.host }}</strong> <span class="muted">— Portal:
+  https://{{ ext.host }}/ · Apps: https://&lt;instanz&gt;.{{ ext.host }}/</span></p>
+  {% if ext.last %}
+  <p><span class="dot ok"></span>Letzter Aufruf: <strong>{{ ext.last.when }}</strong>
+     <span class="muted">— {{ ext.last.host }} (HTTP {{ ext.last.status }})
+     von {{ ext.last.ip }}</span></p>
+  {% else %}
+  <p><span class="dot unknown"></span><span class="muted">Noch kein Aufruf
+  protokolliert — Zertifikate und Erreichbarkeit brauchen die
+  Portfreigaben 80 und 443 im Router auf diesen Knoten.</span></p>
+  {% endif %}
+</div>
+{% endif %}
 <p class="muted">Geprüft wird aus Sicht des Portals über das interne
-Netz. Knoten-Werte (Festplatte, Updates) folgen mit der
-Betriebs-Capability.</p>
+Netz. Landschafts-Gesundheit (Worker-Knoten) folgt mit RFC-0003.</p>
 """
 
 STORE_BODY = """
@@ -435,12 +451,29 @@ def load_instances():
         return {}
 
 
+EXTERNAL_FILE = "/apps-registry/external.json"
+ACCESS_LOG = "/gateway-logs/external-access.log"
+
+
+def external_host():
+    try:
+        with open(EXTERNAL_FILE, encoding="utf-8") as f:
+            return json.load(f).get("host", "")
+    except (OSError, ValueError):
+        return ""
+
+
 def launchpad_tiles(user_roles, host):
     """Role-filtered app tiles from the instance registry (spec 2.5).
 
     The filter is UX only — the gateway enforces the roles on every
     request regardless of what the portal shows.
     """
+    # Accessed via the registered external hostname? Then tiles must
+    # link to the TLS subdomains — the LAN ports are not reachable
+    # (and not forwarded) from outside.
+    ext = external_host()
+    via_external = bool(ext) and host == ext
     tiles = []
     for name, inst in sorted(load_instances().items()):
         allowed = set(inst.get("roles") or [])
@@ -454,7 +487,8 @@ def launchpad_tiles(user_roles, host):
             "channel": channel,
             "channel_label": CHANNEL_LABELS.get(channel, channel),
             "description": inst.get("description", ""),
-            "url": f"http://{host}:{inst['port']}/",
+            "url": (f"https://{name}.{ext}/" if via_external
+                    else f"http://{host}:{inst['port']}/"),
         })
     return tiles
 
@@ -628,6 +662,37 @@ def node_values():
     return rows
 
 
+def external_access():
+    """Registered external hostname + the most recent gateway hit."""
+    host = external_host()
+    if not host:
+        return None
+    info = {"host": host, "last": None}
+    try:
+        with open(ACCESS_LOG, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            lines = f.read().decode("utf-8", "replace").strip().splitlines()
+    except OSError:
+        return info
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+            when = datetime.fromtimestamp(float(e["ts"]), timezone.utc)
+        except (ValueError, TypeError, KeyError):
+            continue
+        req = e.get("request", {})
+        info["last"] = {
+            "when": when.strftime("%d.%m.%Y %H:%M:%S UTC"),
+            "host": req.get("host", "?"),
+            "ip": req.get("remote_ip", "?"),
+            "status": e.get("status", "?"),
+        }
+        break
+    return info
+
+
 def _probe(url, ok_status=200):
     try:
         r = requests.get(url, timeout=2, allow_redirects=False)
@@ -679,7 +744,7 @@ def health():
             "state": state, "label": label, "detail": detail,
         })
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
-                core=core, apps=apps)
+                core=core, apps=apps, ext=external_access())
 
 
 # ---------------------------------------------------------------------------

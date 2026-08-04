@@ -117,6 +117,7 @@ case "$cmd" in
   setup-token) setup_token ;;
   app)         exec python3 "$APP_DIR/appctl.py" "$@" ;;
   store)       exec python3 "$APP_DIR/appctl.py" store "$@" ;;
+  external)    exec python3 "$APP_DIR/appctl.py" external "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)
     fail "'oaap update' is reserved — the platform update capability is not implemented yet. For test setups use: sudo oaap uninstall && sudo ./install.sh" ;;
