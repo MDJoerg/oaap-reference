@@ -443,6 +443,9 @@ Description=OAAP deploy worker (processes queued app deployments)
 [Service]
 Type=oneshot
 Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+# git needs HOME for root's .gitconfig/.git-credentials (private
+# package sources); systemd services get none by default
+Environment=HOME=/root
 ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py process-deploys
 EOF
   cat > /etc/systemd/system/oaap-deployd.path <<EOF
