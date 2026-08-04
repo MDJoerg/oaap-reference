@@ -118,8 +118,9 @@ case "$cmd" in
   app)         exec python3 "$APP_DIR/appctl.py" "$@" ;;
   store)       exec python3 "$APP_DIR/appctl.py" store "$@" ;;
   external)    exec python3 "$APP_DIR/appctl.py" external "$@" ;;
+  backup)      exec python3 "$APP_DIR/appctl.py" backup "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)
     fail "'oaap update' is reserved — the platform update capability is not implemented yet. For test setups use: sudo oaap uninstall && sudo ./install.sh" ;;
-  *) echo "Usage: oaap [status|version|setup-token|app install|list|remove ...|store list|add-source|remove-source ...|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|app install|list|remove ...|store list|add-source|remove-source ...|backup create [--to PATH]|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac

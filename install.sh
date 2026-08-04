@@ -3,11 +3,13 @@
 # OAAP reference installer — implements oaap.core.host (bootstrap mode).
 # Spec: oaap-spec/spec/oaap.core.host.md
 #
-# Usage:  sudo ./install.sh [bootstrap|prepare]
+# Usage:  sudo ./install.sh [bootstrap|prepare|restore <backup.tar.gz>]
 #
 #   bootstrap  install a new platform on this machine (default)
 #   prepare    server readiness only (keep-awake, static address);
 #              re-runnable, also on machines that are already installed
+#   restore    recreate a platform from an 'oaap backup create' archive
+#              (oaap.data.backup) — no setup wizard, users come along
 #
 # Configuration via environment (all optional):
 #   OAAP_HTTP_PORT    HTTP port of the gateway         (default: 80)
@@ -22,6 +24,8 @@
 set -euo pipefail
 
 MODE="${1:-bootstrap}"
+RESTORE_FILE="${2:-}"
+OAAP_HTTP_PORT_EXPLICIT="${OAAP_HTTP_PORT:-}"
 OAAP_HTTP_PORT="${OAAP_HTTP_PORT:-80}"
 OAAP_DATA_DIR="${OAAP_DATA_DIR:-/var/lib/oaap}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,14 +37,21 @@ fail() { say "ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- mode gate
 case "$MODE" in
-  bootstrap|prepare) ;;
+  bootstrap|prepare|restore) ;;
   uninstall)
     fail "Uninstall is a node command: run 'sudo oaap uninstall' (add --purge to also delete data)." ;;
   join|remote-join)
     fail "Mode '$MODE' is reserved (RFC-0003) and not yet available in $VERSION. Only 'bootstrap' is supported." ;;
   *)
-    fail "Unknown mode '$MODE'. Supported: bootstrap (join/remote-join are reserved, see RFC-0003)." ;;
+    fail "Unknown mode '$MODE'. Supported: bootstrap, prepare, restore (join/remote-join are reserved, see RFC-0003)." ;;
 esac
+
+# Restore keeps the backed-up gateway port unless the caller overrides it —
+# read it early so the preflight checks the right port.
+if [ "$MODE" = "restore" ] && [ -z "$OAAP_HTTP_PORT_EXPLICIT" ] && [ -r "$RESTORE_FILE" ]; then
+  bp="$(tar -xzOf "$RESTORE_FILE" app/.env 2>/dev/null | grep '^OAAP_HTTP_PORT=' | cut -d= -f2- || true)"
+  [ -n "$bp" ] && OAAP_HTTP_PORT="$bp"
+fi
 
 # ---------------------------------------------------------------- os info
 # Parse os-release in subshells — sourcing it directly would clobber our
@@ -74,7 +85,7 @@ install_runtime() {
   say "Docker Engine installed."
 }
 
-if [ "$MODE" = "bootstrap" ] && [ "$(id -u)" -eq 0 ] && ! command -v docker >/dev/null 2>&1; then
+if [ "$MODE" != "prepare" ] && [ "$(id -u)" -eq 0 ] && ! command -v docker >/dev/null 2>&1; then
   consent="${OAAP_INSTALL_RUNTIME:-}"
   if [ -z "$consent" ] && [ -t 0 ]; then
     read -r -p "Docker Engine is not installed. Install it now from Docker's official repository? [y/N] " answer
@@ -344,7 +355,18 @@ if command -v ss >/dev/null 2>&1; then
   fi
 fi
 
-# Idempotence (spec test 5): never touch an existing installation.
+if [ "$MODE" = "restore" ]; then
+  if [ -z "$RESTORE_FILE" ]; then
+    errors+=("Mode 'restore' needs the backup file: sudo ./install.sh restore <backup.tar.gz>")
+  elif [ ! -r "$RESTORE_FILE" ]; then
+    errors+=("Cannot read backup file '$RESTORE_FILE'.")
+  elif ! tar -tzf "$RESTORE_FILE" backup-manifest.json >/dev/null 2>&1; then
+    errors+=("'$RESTORE_FILE' is not an OAAP backup (no backup-manifest.json inside).")
+  fi
+fi
+
+# Idempotence (spec test 5) and restore protection (backup spec test 4):
+# never touch an existing installation.
 [ -e "$MARKER" ] && fail "An OAAP platform is already installed at $OAAP_DATA_DIR. Nothing was changed. (Remove it deliberately before reinstalling.)"
 
 for w in "${warnings[@]:-}"; do [ -n "$w" ] && say "WARNING: $w"; done
@@ -378,6 +400,20 @@ gen_secret() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 SETUP_TOKEN="$(gen_secret)"
 SESSION_SECRET="$(gen_secret)"
 
+if [ "$MODE" = "restore" ]; then
+  say "Restoring platform state from $RESTORE_FILE ..."
+  tar --numeric-owner -xzpf "$RESTORE_FILE" -C "$OAAP_DATA_DIR" app/.env apps data/identity
+  tar -xzOf "$RESTORE_FILE" backup-manifest.json > "$OAAP_DATA_DIR/last-restore-manifest.json"
+  # No silent secret regeneration (oaap.data.backup §4): carry the old
+  # ones over — sessions and the identity store stay consistent.
+  SESSION_SECRET="$(grep '^SESSION_SECRET=' "$APP_DIR/.env" | cut -d= -f2- || true)"
+  SETUP_TOKEN="$(grep '^SETUP_TOKEN=' "$APP_DIR/.env" | cut -d= -f2- || true)"
+  [ -n "$SESSION_SECRET" ] && [ -n "$SETUP_TOKEN" ] || fail "The backup's app/.env is incomplete — cannot restore."
+  BACKUP_VERSION="$(grep -o '"platform_version": *"[^"]*"' "$OAAP_DATA_DIR/last-restore-manifest.json" | cut -d'"' -f4 || true)"
+  [ -z "$BACKUP_VERSION" ] || [ "$BACKUP_VERSION" = "$VERSION" ] \
+    || say "NOTE: the backup was taken on platform version $BACKUP_VERSION; this installer is $VERSION."
+fi
+
 umask 077
 cat > "$APP_DIR/.env" <<EOF
 OAAP_VERSION=$VERSION
@@ -396,6 +432,12 @@ install -m 0755 "$SCRIPT_DIR/bin/oaap" /usr/local/bin/oaap
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
 
+if [ "$MODE" = "restore" ]; then
+  say "Restoring app instances ..."
+  OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" restore-instances \
+    || say "WARNING: some app instances could not be restored automatically — see the messages above."
+fi
+
 # ---------------------------------------------------------------- handover
 if [ -z "${OAAP_HOST:-}" ]; then
   OAAP_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -406,14 +448,32 @@ PORT_SUFFIX=""
 
 say ""
 say "=============================================================="
-say " OAAP $VERSION is running."
-say ""
-say " Finish setup in your browser (creates the first admin user):"
-say ""
-say "   URL:          http://$OAAP_HOST$PORT_SUFFIX/setup"
-say "   Setup token:  $SETUP_TOKEN"
-say ""
-say " The token is valid once, until the first admin exists."
-say " Lost this output? Show it again with:  sudo oaap setup-token"
+if [ "$MODE" = "restore" ]; then
+  say " OAAP $VERSION restored from backup."
+  say ""
+  say " Sign in with your existing users (no setup wizard):"
+  say ""
+  say "   URL:  http://$OAAP_HOST$PORT_SUFFIX/"
+  EXT_HOST=""
+  [ -f "$OAAP_DATA_DIR/apps/external.json" ] \
+    && EXT_HOST="$(grep -o '"host": *"[^"]*"' "$OAAP_DATA_DIR/apps/external.json" | cut -d'"' -f4 || true)"
+  if [ -n "$EXT_HOST" ]; then
+    say ""
+    say " External hostname '$EXT_HOST' is still registered. When this"
+    say " machine shall take over: stop the old platform first, then point"
+    say " DNS and the router's port forwarding (80/443) here — certificates"
+    say " are re-issued automatically."
+  fi
+else
+  say " OAAP $VERSION is running."
+  say ""
+  say " Finish setup in your browser (creates the first admin user):"
+  say ""
+  say "   URL:          http://$OAAP_HOST$PORT_SUFFIX/setup"
+  say "   Setup token:  $SETUP_TOKEN"
+  say ""
+  say " The token is valid once, until the first admin exists."
+  say " Lost this output? Show it again with:  sudo oaap setup-token"
+fi
 say " Check this node anytime with:  oaap status"
 say "=============================================================="

@@ -51,6 +51,24 @@ su -c "bash install.sh"           # installer offers to set up sudo for <user>
 After the run, log out and in once — from then on `sudo` works and the
 printed `oaap` commands behave as documented.
 
+### Backup, restore & relocation (oaap.data.backup)
+
+```sh
+sudo oaap backup create [--to <path>]         # one archive with everything
+sudo ./install.sh restore <backup.tar.gz>     # on a fresh, prepared machine
+```
+
+The backup is offline-consistent (app containers stop briefly) and
+contains all platform state, users, app instances, and their data — it
+must live **outside** the data directory and is secret-grade. Restore
+brings the same platform up on another machine without a setup wizard:
+existing users just sign in; app images are rebuilt or pulled from each
+instance's recorded package source (a local package directory must be
+copied to the same path on the new machine first). Moving house: back
+up, restore on the new box, verify via LAN, then switch DNS and port
+forwarding — and stop the old platform before it competes for the
+hostname.
+
 Configuration via environment: `OAAP_HTTP_PORT` (default 80),
 `OAAP_DATA_DIR` (default `/var/lib/oaap`), `OAAP_HOST` (setup-URL host);
 non-interactive consents: `OAAP_INSTALL_RUNTIME=1` (Docker),
@@ -61,8 +79,8 @@ non-interactive consents: `OAAP_INSTALL_RUNTIME=1` (Docker),
 
 | Path | Implements |
 | ---- | ---------- |
-| `install.sh` | `oaap.core.host` — bootstrap mode |
-| `bin/oaap` | `oaap.core.host` — node CLI (`status`, `version`) |
+| `install.sh` | `oaap.core.host` — bootstrap/prepare/restore modes |
+| `bin/oaap` | `oaap.core.host` — node CLI; `oaap.data.backup` — `backup create` |
 | `platform/Caddyfile`, gateway service | `oaap.core.gateway` — default deny, forward auth |
 | `platform/services/identity` | `oaap.core.identity` — built-in minimal provider |
 | `platform/services/portal` | `oaap.core.portal` — first-run wizard + dashboard stub |

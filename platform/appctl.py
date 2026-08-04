@@ -270,17 +270,19 @@ def cmd_install(args):
             shutil.rmtree(tmp_clone, ignore_errors=True)
             die(f"git clone failed: {e.stderr.strip()}")
         pkg = os.path.join(tmp_clone, args.path) if args.path else tmp_clone
+        source = {"kind": "git", "url": args.package, "path": args.path}
     else:
         pkg = os.path.abspath(os.path.join(args.package, args.path)
                               if args.path else args.package)
+        source = {"kind": "local", "url": pkg, "path": ""}
     try:
-        _install_from_dir(pkg, args)
+        _install_from_dir(pkg, args, source)
     finally:
         if tmp_clone:
             shutil.rmtree(tmp_clone, ignore_errors=True)
 
 
-def _install_from_dir(pkg, args):
+def _install_from_dir(pkg, args, source):
     mf_path = os.path.join(pkg, "oaap-app.yaml")
     if not os.path.isfile(mf_path):
         die(f"no oaap-app.yaml in {pkg}")
@@ -361,6 +363,11 @@ def _install_from_dir(pkg, args):
         "health_path": (m.get("health") or {}).get("path", ""),
         # for regenerating gateway sites (external hostname, RFC-0005 L3)
         "routes": m["routes"],
+        # for restore (oaap.data.backup) and the deploy hook (runtime
+        # spec 2.5): where the package came from and how to rebuild it
+        "source": source,
+        "build": svc.get("build", "") if (app["type"] == "native" or svc.get("build")) else "",
+        "storage": m.get("storage") or [],
         "description": app.get("description", ""),
         # roles that may see/open the app — the portal filters tiles
         # with this; the gateway enforces it regardless (spec 2.5)
@@ -548,6 +555,167 @@ def cmd_convert(args):
     print(f"Packages and REPORT.md written to {out_root} — review before installing.")
 
 
+# --------------------------------------------- backup & restore (oaap.data.backup)
+
+def cmd_backup(args):
+    """Offline-consistent platform backup: one self-contained archive."""
+    import datetime
+    import socket
+    import time
+
+    target = args.to or "/var/backups/oaap"
+    if target.endswith(".tar.gz"):
+        out_dir = os.path.abspath(os.path.dirname(target) or ".")
+        out_file = os.path.basename(target)
+    else:
+        out_dir = os.path.abspath(target)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_file = f"oaap-backup-{socket.gethostname()}-{stamp}.tar.gz"
+    data_abs = os.path.abspath(DATA_DIR)
+    if os.path.commonpath([out_dir, data_abs]) == data_abs:
+        die(f"backup target {out_dir} lies inside the platform data directory "
+            f"{DATA_DIR} — a backup that dies with the machine is not a backup. "
+            "Choose an outside path with --to.")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, out_file)
+
+    env = {}
+    try:
+        with open(os.path.join(APP_DIR, ".env"), encoding="utf-8") as f:
+            env = dict(l.strip().split("=", 1) for l in f if "=" in l)
+    except OSError:
+        die(f"no platform installation found at {DATA_DIR}")
+    reg = load_registry()
+    manifest = {
+        "backup_format": "0.1",
+        "platform_version": env.get("OAAP_VERSION", "unknown"),
+        "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hostname": socket.gethostname(),
+        "http_port": env.get("OAAP_HTTP_PORT", "80"),
+        "external_host": load_external(),
+        "instances": {n: {"app_name": i["app_name"], "version": i["version"],
+                          "channel": i["channel"]}
+                      for n, i in sorted(reg["instances"].items())},
+    }
+
+    print("Offline-consistent backup: app containers are stopped for the copy")
+    print("and restarted right after (core services keep running).")
+    running = run(["docker", "ps", "-q", "--filter", "name=^oaap-app-"]).stdout.split()
+    stage = tempfile.mkdtemp(prefix="oaap-backup-")
+    t0 = time.monotonic()
+    try:
+        if running:
+            run(["docker", "stop", *running])
+        with open(os.path.join(stage, "backup-manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        tmp_out = out_path + ".tmp"
+        run(["tar", "--numeric-owner", "-czpf", tmp_out,
+             "--exclude=data/identity/login-throttle.json",
+             "-C", stage, "backup-manifest.json",
+             "-C", DATA_DIR, "app/.env", "apps", "data/identity"])
+        os.chmod(tmp_out, 0o600)
+        os.replace(tmp_out, out_path)
+    finally:
+        if running:
+            subprocess.run(["docker", "start", *running], capture_output=True, text=True)
+        shutil.rmtree(stage, ignore_errors=True)
+    downtime = time.monotonic() - t0
+    size = os.path.getsize(out_path)
+    size_h = f"{size / 1048576:.1f} MB" if size >= 1048576 else f"{size / 1024:.0f} KB"
+    print(f"Backup written: {out_path} ({size_h}, "
+          f"{len(manifest['instances'])} app instance(s), app downtime {downtime:.0f}s)")
+    print("SECURITY: this file contains ALL platform secrets, password hashes")
+    print("and app data — guard it like a master key (permissions are 0600).")
+    print("Restore on a prepared machine with: sudo ./install.sh restore <file>")
+
+
+def _deploy_from_registry(name, inst):
+    """Bring one restored instance back: image, container, gateway site.
+
+    Returns False (with an explanation) when the instance cannot come
+    back automatically; its data stays restored either way.
+    """
+    image = inst["image"]
+    if image.startswith("oaap-app/"):
+        src = inst.get("source") or {}
+        tmp = None
+        pkg = ""
+        try:
+            if src.get("kind") == "git":
+                tmp = tempfile.mkdtemp(prefix="oaap-restore-")
+                print(f"Fetching {src['url']} ...")
+                run(["git", "clone", "--depth", "1", src["url"], tmp])
+                pkg = os.path.join(tmp, src.get("path") or "")
+            elif src.get("kind") == "local":
+                pkg = os.path.join(src.get("url", ""), src.get("path") or "")
+            if not pkg or not os.path.isdir(pkg):
+                print(f"SKIPPED {name}: image {image} must be rebuilt, but its package "
+                      f"source is not available on this machine "
+                      f"({src.get('url') or 'no source recorded'}). Data is restored — "
+                      f"copy the package here or reinstall it under the same name.")
+                return False
+            print(f"Building {image} ...")
+            run(["docker", "build", "-q", "-t", image,
+                 os.path.join(pkg, inst.get("build") or ".")])
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+    else:
+        print(f"Pulling {image} ...")
+        run(["docker", "pull", "-q", image])
+
+    inst_dir = os.path.join(APPS_DIR, name)
+    env_path = os.path.join(inst_dir, "instance.env")
+    if not os.path.isfile(env_path):
+        print(f"SKIPPED {name}: no instance.env in the restored data.")
+        return False
+    uid = image_uid(image)
+    mounts = []
+    for s in inst.get("storage") or []:
+        host = os.path.join(inst_dir, "storage", s["name"])
+        os.makedirs(host, exist_ok=True)
+        if uid is not None:
+            os.chown(host, uid, uid)
+        mounts += ["-v", f"{host}:{s['mount']}"]
+
+    container = inst["container"]
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True, text=True)
+    run(["docker", "run", "-d", "--name", container,
+         "--restart", "unless-stopped", "--network", "oaap_default",
+         "--env-file", env_path, *mounts, image])
+    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
+        f.write(caddy_site(inst["port"], inst["routes"], container, inst["svc_port"]))
+    print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
+          f"channel {inst['channel']}, port {inst['port']})")
+    return True
+
+
+def cmd_restore_instances(_args):
+    """Used by 'install.sh restore': re-create every registered instance."""
+    reg = load_registry()
+    if not reg["instances"]:
+        print("No app instances in the restored registry.")
+        return
+    ok = skipped = 0
+    for name, inst in sorted(reg["instances"].items()):
+        if not inst.get("routes") or not inst.get("svc_port"):
+            print(f"SKIPPED {name}: registry entry predates route capture — "
+                  "reinstall it from its package.")
+            skipped += 1
+            continue
+        try:
+            if _deploy_from_registry(name, inst):
+                ok += 1
+            else:
+                skipped += 1
+        except subprocess.CalledProcessError as e:
+            print(f"SKIPPED {name}: {(e.stderr or str(e)).strip()}")
+            skipped += 1
+    write_external_caddy()
+    reload_gateway()
+    print(f"App instances: {ok} restored, {skipped} skipped.")
+
+
 def cmd_store(args):
     """Manage store sources (list URLs the portal's Store page reads)."""
     try:
@@ -607,6 +775,12 @@ def main():
     pc.add_argument("--out", default="./oaap-converted")
     pc.add_argument("--profile")
     pc.set_defaults(fn=cmd_convert)
+    pb = sub.add_parser("backup")
+    pb.add_argument("action", choices=["create"])
+    pb.add_argument("--to", default="", help="target directory or .tar.gz file (outside the data dir)")
+    pb.set_defaults(fn=cmd_backup)
+    pri = sub.add_parser("restore-instances")
+    pri.set_defaults(fn=cmd_restore_instances)
     ps = sub.add_parser("store")
     ps.add_argument("action", choices=["list", "add-source", "remove-source"])
     ps.add_argument("url", nargs="?")
