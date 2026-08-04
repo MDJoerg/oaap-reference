@@ -222,6 +222,10 @@ def cmd_install(args):
         "app_id": app["id"], "app_name": app["name"],
         "version": app["version"], "channel": channel,
         "port": port, "image": image, "container": container,
+        # for the portal's health page: where to reach the service on
+        # the internal network and which path confirms liveness
+        "svc_port": svc["port"],
+        "health_path": (m.get("health") or {}).get("path", ""),
         "description": app.get("description", ""),
         # roles that may see/open the app — the portal filters tiles
         # with this; the gateway enforces it regardless (spec 2.5)

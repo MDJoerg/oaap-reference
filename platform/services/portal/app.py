@@ -2,22 +2,26 @@
 
 Serves the first-run wizard (/setup, protected by the one-time setup
 token, validated by the identity service), the role-filtered launchpad,
-and the user management UI (admin only). Authentication is entirely
-the gateway's job: the portal trusts the X-OAAP-User / X-OAAP-Roles
-headers set after forward auth.
+user management (admin only, list report + object page floorplans),
+and the platform health page (admin/partner). Authentication is
+entirely the gateway's job: the portal trusts the X-OAAP-User /
+X-OAAP-Roles headers set after forward auth.
 
 Look & feel follows oaap-design/docs/design-guidelines.md v0.1 —
-blue palette, hexagon mark, German UI, no external resources.
+blue palette, hexagon mark, German UI, floorplans, no external
+resources.
 """
 
 import json
 import os
+from urllib.parse import quote
 
 import requests
 from flask import Flask, redirect, render_template_string, request
 from markupsafe import Markup
 
 IDENTITY = "http://identity:8000"
+GATEWAY = "http://gateway:80"
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
 REGISTRY = "/apps-registry/registry.json"
 
@@ -44,7 +48,7 @@ STYLE = """
     --oaap-blue-600:#2563eb; --oaap-blue-100:#dbeafe;
     --oaap-bg:#f4f6fa; --oaap-surface:#fff; --oaap-text:#1f2937;
     --oaap-muted:#6b7280; --oaap-border:#e5e7eb;
-    --ok:#15803d; --err:#b91c1c;
+    --ok:#15803d; --err:#b91c1c; --warn:#b45309;
   }
   *{box-sizing:border-box}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
@@ -70,9 +74,15 @@ STYLE = """
   .userbox button:hover{background:rgba(255,255,255,.25)}
   main{max-width:62rem;margin:1.6rem auto;padding:0 1.2rem}
   h1{font-size:1.35rem;margin:.2rem 0 1rem}
-  h2{font-size:1.05rem}
+  h2{font-size:1.02rem;margin:0 0 .8rem}
+  .pagehead{display:flex;align-items:center;justify-content:space-between;gap:1rem;
+       flex-wrap:wrap;margin-bottom:1rem}
+  .pagehead h1{margin:0}
+  .back{display:inline-block;margin-bottom:.8rem;color:var(--oaap-blue-600);text-decoration:none}
+  .back:hover{text-decoration:underline}
   .card{background:var(--oaap-surface);border:1px solid var(--oaap-border);
-       border-radius:.6rem;padding:1.4rem;box-shadow:0 1px 3px rgba(23,37,84,.06)}
+       border-radius:.6rem;padding:1.4rem;box-shadow:0 1px 3px rgba(23,37,84,.06);
+       margin-bottom:1.2rem}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:1rem;margin:1rem 0}
   .tile{display:block;background:var(--oaap-surface);border:1px solid var(--oaap-border);
        border-radius:.6rem;padding:1rem 1.1rem;text-decoration:none;color:inherit;
@@ -84,26 +94,30 @@ STYLE = """
   .tile .meta{color:var(--oaap-muted);font-size:.8rem}
   .hexdot{flex:none}
   .badge{font-size:.72rem;padding:.15rem .55rem;border-radius:1rem;
-       background:var(--oaap-blue-100);color:var(--oaap-blue-900)}
+       background:var(--oaap-blue-100);color:var(--oaap-blue-900);white-space:nowrap}
   .badge.test{background:#fef3c7;color:#92400e}
+  .badge.off{background:#f3f4f6;color:#6b7280}
+  .dot{display:inline-block;width:.65rem;height:.65rem;border-radius:50%;margin-right:.45rem}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
+  .dot.warn{background:var(--warn)} .dot.unknown{background:#9ca3af}
+  a.btn{display:inline-block;padding:.6rem 1.3rem;border-radius:.4rem;
+       background:var(--oaap-blue-600);color:#fff;text-decoration:none;min-height:44px}
+  a.btn:hover{background:var(--oaap-blue-700)}
   input,select{width:100%;padding:.55rem;margin:.25rem 0 1rem;
        border:1px solid var(--oaap-border);border-radius:.4rem;font-size:.95rem}
   button{padding:.6rem 1.3rem;border:0;border-radius:.4rem;background:var(--oaap-blue-600);
        color:#fff;font-size:.95rem;cursor:pointer;min-height:44px}
   button:hover{background:var(--oaap-blue-700)}
-  button.small{padding:.4rem .9rem;font-size:.85rem;min-height:36px}
   .err{color:var(--err)}.ok{color:var(--ok)}.muted{color:var(--oaap-muted);font-size:.9rem}
-  table{width:100%;border-collapse:collapse;margin:1rem 0}
-  th,td{text-align:left;padding:.55rem .5rem;border-bottom:1px solid var(--oaap-border);vertical-align:top}
+  table{width:100%;border-collapse:collapse}
+  th,td{text-align:left;padding:.6rem .5rem;border-bottom:1px solid var(--oaap-border);vertical-align:middle}
   th{font-size:.82rem;text-transform:uppercase;letter-spacing:.04em;color:var(--oaap-muted)}
-  td form{margin:0}
-  td input{margin:0;padding:.4rem}
-  .roles label{display:inline-block;margin-right:.6rem;font-size:.9rem;white-space:nowrap}
-  .roles input,.rowcheck input{width:auto;margin:0 .25rem 0 0}
-  .inactive td{color:#9ca3af}
-  fieldset{border:1px solid var(--oaap-border);border-radius:.6rem;margin:1.5rem 0;padding:1.2rem;
-       background:var(--oaap-surface)}
-  legend{font-weight:600;padding:0 .4rem}
+  tr.rowlink:hover td{background:#f8fafc}
+  td a.rowaction{color:var(--oaap-blue-600);text-decoration:none;white-space:nowrap}
+  td a.rowaction:hover{text-decoration:underline}
+  .roles label{display:inline-block;margin-right:.8rem;font-size:.95rem;white-space:nowrap}
+  .roles input,.checkline input{width:auto;margin:0 .3rem 0 0}
+  .checkline{display:block;margin:.3rem 0 1rem}
   footer.oaap{max-width:62rem;margin:2rem auto 1.2rem;padding:0 1.2rem;
        color:var(--oaap-muted);font-size:.8rem;display:flex;gap:.5rem;align-items:center}
   @media (max-width:640px){
@@ -125,6 +139,7 @@ LAYOUT = STYLE + """
   <nav class="main">
     <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
     {% if is_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
+    {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
   </nav>
   <div class="userbox">
     <span class="who">{{ user }}<br><small>{{ roles }}</small></span>
@@ -166,64 +181,133 @@ DASHBOARD_BODY = """
 {% endif %}
 """
 
-USERS_BODY = """
-<h1>Benutzer</h1>
+# Floorplan "Listenbericht" (design guidelines 6.1): read-only list,
+# one global action, one row action (navigate to the object page).
+USERS_LIST_BODY = """
+<div class="pagehead">
+  <h1>Benutzer</h1>
+  <a class="btn" href="/users/new">Benutzer anlegen</a>
+</div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
-<div class="card" style="overflow-x:auto">
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Benutzername</th><th>Anzeigename</th><th>Rollen</th><th>Aktiv</th><th></th><th>Neues Passwort</th></tr>
+  <tr><th>Benutzername</th><th>Anzeigename</th><th>Rollen</th><th>Status</th><th></th></tr>
   {% for u in users %}
-  {# Zeilenübergreifende Formulare sind ungültiges HTML — die Felder
-     referenzieren das Formular unter der Tabelle via form-Attribut #}
-  <tr class="{{ '' if u.active else 'inactive' }}">
-    <td>{{ u.username }}</td>
-    <td><input type="text" name="display_name" value="{{ u.display_name }}"
-               form="upd-{{ u.username }}"></td>
-    <td class="roles">
-      {% for r in all_roles %}
-      <label><input type="checkbox" name="roles" value="{{ r }}"
-             form="upd-{{ u.username }}" {{ 'checked' if r in u.roles }}>{{ r }}</label>
-      {% endfor %}
-    </td>
-    <td class="rowcheck"><label><input type="checkbox" name="active"
-        form="upd-{{ u.username }}" {{ 'checked' if u.active }}>aktiv</label></td>
-    <td><button class="small" form="upd-{{ u.username }}">Speichern</button></td>
-    <td>
-      <form method="post" action="/users/{{ u.username }}/password">
-        <input type="password" name="password" minlength="8" required
-               autocomplete="new-password" placeholder="mind. 8 Zeichen">
-        <button class="small">Setzen</button>
-      </form>
-    </td>
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/users/{{ u.username }}">{{ u.username }}</a></td>
+    <td>{{ u.display_name }}</td>
+    <td>{{ u.roles|join(", ") }}</td>
+    <td><span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span></td>
+    <td><a class="rowaction" href="/users/{{ u.username }}">Bearbeiten</a></td>
   </tr>
   {% endfor %}
 </table>
 </div>
-{% for u in users %}
-<form id="upd-{{ u.username }}" method="post" action="/users/{{ u.username }}/update"></form>
-{% endfor %}
-<fieldset>
-  <legend>Benutzer anlegen</legend>
-  <form method="post" action="/users/create">
-    <label>Benutzername <input type="text" name="username" required
-           pattern="[a-z0-9][a-z0-9._-]{1,39}"
-           title="Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)"></label>
-    <label>Anzeigename <input type="text" name="display_name"></label>
-    <label>Startpasswort <input type="password" name="password"
-           minlength="8" required autocomplete="new-password"></label>
+<p class="muted">Benutzer werden nicht gelöscht, sondern deaktiviert —
+Apps können sie in ihren Daten referenzieren.</p>
+"""
+
+# Floorplan "Objektseite" (design guidelines 6.2).
+USER_EDIT_BODY = """
+<a class="back" href="/users">← Zurück zur Liste</a>
+<div class="pagehead">
+  <h1>{{ u.username }}{% if u.display_name %} <span class="muted">({{ u.display_name }})</span>{% endif %}</h1>
+  <span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span>
+</div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+<form method="post" action="/users/{{ u.username }}/update">
+  <div class="card">
+    <h2>Stammdaten</h2>
+    <label>Anzeigename <input type="text" name="display_name" value="{{ u.display_name }}"></label>
+  </div>
+  <div class="card">
+    <h2>Rollen</h2>
     <p class="roles">
       {% for r in all_roles %}
       <label><input type="checkbox" name="roles" value="{{ r }}"
-             {{ 'checked' if r == 'user' }}>{{ r }}</label>
+             {{ 'checked' if r in u.roles }}>{{ r }}</label>
+      {% endfor %}
+    </p>
+    <p class="muted">Rollenänderungen wirken ab der nächsten Anfrage des Benutzers.</p>
+  </div>
+  <div class="card">
+    <h2>Status</h2>
+    <label class="checkline"><input type="checkbox" name="active"
+        {{ 'checked' if u.active }}>Benutzer ist aktiv (abwählen deaktiviert die Anmeldung sofort)</label>
+    <button>Speichern</button>
+  </div>
+</form>
+<div class="card">
+  <h2>Passwort setzen</h2>
+  <form method="post" action="/users/{{ u.username }}/password">
+    <label>Neues Passwort (mind. 8 Zeichen)
+      <input type="password" name="password" minlength="8" required
+             autocomplete="new-password"></label>
+    <button>Passwort setzen</button>
+  </form>
+</div>
+"""
+
+USER_NEW_BODY = """
+<a class="back" href="/users">← Zurück zur Liste</a>
+<h1>Benutzer anlegen</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<form method="post" action="/users/create">
+  <div class="card">
+    <h2>Stammdaten</h2>
+    <label>Benutzername <input type="text" name="username" required
+           value="{{ form.username }}" pattern="[a-z0-9][a-z0-9._-]{1,39}"
+           title="Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)"></label>
+    <label>Anzeigename <input type="text" name="display_name" value="{{ form.display_name }}"></label>
+    <label>Startpasswort (mind. 8 Zeichen) <input type="password" name="password"
+           minlength="8" required autocomplete="new-password"></label>
+  </div>
+  <div class="card">
+    <h2>Rollen</h2>
+    <p class="roles">
+      {% for r in all_roles %}
+      <label><input type="checkbox" name="roles" value="{{ r }}"
+             {{ 'checked' if r in form.roles }}>{{ r }}</label>
       {% endfor %}
     </p>
     <button>Anlegen</button>
-  </form>
-</fieldset>
-<p class="muted">Benutzer werden nicht gelöscht, sondern deaktiviert —
-Apps können sie in ihren Daten referenzieren. Rollenänderungen wirken ab
-der nächsten Anfrage des Benutzers.</p>
+  </div>
+</form>
+"""
+
+HEALTH_BODY = """
+<h1>Gesundheit</h1>
+<div class="card">
+  <h2>Kernservices</h2>
+  <table>
+    <tr><th>Service</th><th>Status</th><th>Details</th></tr>
+    {% for s in core %}
+    <tr><td>{{ s.name }}</td>
+        <td><span class="dot {{ s.state }}"></span>{{ s.label }}</td>
+        <td class="muted">{{ s.detail }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+<div class="card">
+  <h2>Apps</h2>
+  {% if apps %}
+  <table>
+    <tr><th>App</th><th>Instanz</th><th>Kanal</th><th>Status</th><th>Details</th></tr>
+    {% for a in apps %}
+    <tr><td>{{ a.name }} <span class="muted">v{{ a.version }}</span></td>
+        <td>{{ a.instance }}</td>
+        <td><span class="badge {{ a.channel }}">{{ a.channel_label }}</span></td>
+        <td><span class="dot {{ a.state }}"></span>{{ a.label }}</td>
+        <td class="muted">{{ a.detail }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Keine Apps installiert.</p>{% endif %}
+</div>
+<p class="muted">Geprüft wird aus Sicht des Portals über das interne
+Netz. Knoten-Werte (Festplatte, Updates) folgen mit der
+Betriebs-Capability.</p>
 """
 
 SETUP_PAGE = STYLE + """
@@ -271,12 +355,22 @@ def caller_roles():
 def page(body_template, title, active, status=200, **ctx):
     body = render_template_string(body_template, **ctx)
     roles = request.headers.get("X-OAAP-Roles", "")
+    caller = caller_roles()
     return render_template_string(
         LAYOUT,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
-        is_admin="admin" in caller_roles(), version=VERSION,
+        is_admin="admin" in caller, can_health=bool(caller & {"admin", "partner"}),
+        version=VERSION,
     ), status
+
+
+def load_instances():
+    try:
+        with open(REGISTRY, encoding="utf-8") as f:
+            return json.load(f).get("instances", {})
+    except (OSError, ValueError):
+        return {}
 
 
 def launchpad_tiles(user_roles, host):
@@ -285,13 +379,8 @@ def launchpad_tiles(user_roles, host):
     The filter is UX only — the gateway enforces the roles on every
     request regardless of what the portal shows.
     """
-    try:
-        with open(REGISTRY, encoding="utf-8") as f:
-            instances = json.load(f).get("instances", {})
-    except (OSError, ValueError):
-        return []
     tiles = []
-    for name, inst in sorted(instances.items()):
+    for name, inst in sorted(load_instances().items()):
         allowed = set(inst.get("roles") or [])
         if allowed and "admin" not in user_roles and not user_roles & allowed:
             continue
@@ -314,23 +403,17 @@ def setup_done() -> bool:
 
 @app.get("/")
 def dashboard():
-    roles = set(filter(None, request.headers.get("X-OAAP-Roles", "").split(",")))
     return page(
         DASHBOARD_BODY, "Apps", "apps",
-        tiles=launchpad_tiles(roles, request.host.split(":")[0]),
+        tiles=launchpad_tiles(caller_roles(), request.host.split(":")[0]),
     )
 
 
 # ---------------------------------------------------------------------------
-# User management (spec oaap.core.identity 2.4) — admin only. The
-# gateway has already authenticated the caller; the portal checks the
-# admin role and delegates the operations to identity's internal API.
-
-def users_page(error=None, msg=None, status=200):
-    users = requests.get(f"{IDENTITY}/internal/users", timeout=5).json()["users"]
-    return page(USERS_BODY, "Benutzer", "users", status=status,
-                users=users, all_roles=ALL_ROLES, error=error, msg=msg)
-
+# User management (spec oaap.core.identity 2.4) — admin only, floorplans
+# "Listenbericht" and "Objektseite". The gateway has already
+# authenticated the caller; the portal checks the admin role and
+# delegates the operations to identity's internal API.
 
 def require_admin():
     if "admin" not in caller_roles():
@@ -338,9 +421,27 @@ def require_admin():
     return None
 
 
+def identity_users():
+    return requests.get(f"{IDENTITY}/internal/users", timeout=5).json()["users"]
+
+
 @app.get("/users")
 def users_list():
-    return require_admin() or users_page()
+    denied = require_admin()
+    if denied:
+        return denied
+    return page(USERS_LIST_BODY, "Benutzer", "users", users=identity_users(),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.get("/users/new")
+def users_new():
+    denied = require_admin()
+    if denied:
+        return denied
+    return page(USER_NEW_BODY, "Benutzer anlegen", "users",
+                all_roles=ALL_ROLES, error=None,
+                form={"username": "", "display_name": "", "roles": ["user"]})
 
 
 @app.post("/users/create")
@@ -348,15 +449,34 @@ def users_create():
     denied = require_admin()
     if denied:
         return denied
-    resp = requests.post(f"{IDENTITY}/internal/users", json={
+    form = {
         "username": request.form.get("username", "").strip(),
         "display_name": request.form.get("display_name", ""),
-        "password": request.form.get("password", ""),
         "roles": request.form.getlist("roles"),
+    }
+    resp = requests.post(f"{IDENTITY}/internal/users", json={
+        **form, "password": request.form.get("password", ""),
     }, timeout=5)
     if resp.status_code == 201:
-        return users_page(msg=f"Benutzer '{request.form.get('username', '').strip()}' angelegt.")
-    return users_page(error=resp.json().get("error", "Anlegen fehlgeschlagen."), status=resp.status_code)
+        created = quote("Benutzer " + form["username"] + " wurde angelegt.")
+        return redirect(f"/users?msg={created}", code=303)
+    # Validation error: stay on the page, keep the inputs (guidelines 6.2)
+    return page(USER_NEW_BODY, "Benutzer anlegen", "users", status=resp.status_code,
+                all_roles=ALL_ROLES, form=form,
+                error=resp.json().get("error", "Anlegen fehlgeschlagen."))
+
+
+@app.get("/users/<username>")
+def users_detail(username):
+    denied = require_admin()
+    if denied:
+        return denied
+    u = next((x for x in identity_users() if x["username"] == username), None)
+    if not u:
+        return redirect(f"/users?err={quote('Benutzer nicht gefunden.')}", code=303)
+    return page(USER_EDIT_BODY, f"Benutzer {username}", "users", u=u,
+                all_roles=ALL_ROLES, msg=request.args.get("msg"),
+                error=request.args.get("err"))
 
 
 @app.post("/users/<username>/update")
@@ -370,8 +490,8 @@ def users_update(username):
         "active": request.form.get("active") == "on",
     }, timeout=5)
     if resp.status_code == 200:
-        return users_page(msg=f"Benutzer '{username}' aktualisiert.")
-    return users_page(error=resp.json().get("error", "Aktualisieren fehlgeschlagen."), status=resp.status_code)
+        return redirect(f"/users/{username}?msg={quote('Gespeichert.')}", code=303)
+    return redirect(f"/users/{username}?err={quote(resp.json().get('error', 'Speichern fehlgeschlagen.'))}", code=303)
 
 
 @app.post("/users/<username>/password")
@@ -383,8 +503,61 @@ def users_password(username):
         "password": request.form.get("password", ""),
     }, timeout=5)
     if resp.status_code == 200:
-        return users_page(msg=f"Passwort für '{username}' gesetzt.")
-    return users_page(error=resp.json().get("error", "Passwort setzen fehlgeschlagen."), status=resp.status_code)
+        return redirect(f"/users/{username}?msg={quote('Passwort wurde gesetzt.')}", code=303)
+    return redirect(f"/users/{username}?err={quote(resp.json().get('error', 'Passwort setzen fehlgeschlagen.'))}", code=303)
+
+
+# ---------------------------------------------------------------------------
+# Health (design guidelines: visible for admin and partner) — checked
+# live from the portal over the internal container network.
+
+def _probe(url, ok_status=200):
+    try:
+        r = requests.get(url, timeout=2, allow_redirects=False)
+    except requests.RequestException as e:
+        return "err", "Nicht erreichbar", type(e).__name__
+    if r.status_code == ok_status:
+        return "ok", "Gesund", f"HTTP {r.status_code}"
+    return "warn", "Antwortet unerwartet", f"HTTP {r.status_code}"
+
+
+@app.get("/health")
+def health():
+    if not caller_roles() & {"admin", "partner"}:
+        return "Zugriff verweigert: Gesundheit erfordert die Rolle admin oder partner.", 403
+
+    core = []
+    state, label, detail = _probe(f"{IDENTITY}/internal/status")
+    core.append({"name": "Identity", "state": state, "label": label, "detail": detail})
+    # Full chain: gateway proxies the login page to identity.
+    state, label, detail = _probe(f"{GATEWAY}/auth/login")
+    core.append({"name": "Gateway", "state": state, "label": label, "detail": detail})
+    core.append({"name": "Portal", "state": "ok", "label": "Gesund",
+                 "detail": "liefert diese Seite"})
+
+    apps = []
+    for name, inst in sorted(load_instances().items()):
+        container, svc_port = inst.get("container"), inst.get("svc_port")
+        health_path = inst.get("health_path")
+        if container and svc_port and health_path:
+            state, label, detail = _probe(f"http://{container}:{svc_port}{health_path}")
+        elif container and svc_port:
+            state, label, detail = _probe(f"http://{container}:{svc_port}/")
+            if state == "warn":  # any HTTP answer counts as reachable here
+                state, label = "ok", "Erreichbar"
+            if state == "ok":
+                detail += ", App ohne erfassten Healthcheck"
+        else:
+            state, label = "unknown", "Unbekannt"
+            detail = "vor der Gesundheits-Erfassung installiert — bei erneutem 'oaap app install' verfügbar"
+        channel = inst.get("channel", "production")
+        apps.append({
+            "name": inst.get("app_name", name), "instance": name,
+            "version": inst.get("version", "?"), "channel": channel,
+            "channel_label": CHANNEL_LABELS.get(channel, channel),
+            "state": state, "label": label, "detail": detail,
+        })
+    return page(HEALTH_BODY, "Gesundheit", "health", core=core, apps=apps)
 
 
 # ---------------------------------------------------------------------------
