@@ -115,14 +115,22 @@ def caddy_site(port, routes, container, svc_port):
     for r in ordered:
         matcher = "" if r["path"] == "/" else f" {r['path']}*"
         lines.append(f"\thandle{matcher} {{")
-        lines.append("\t\trequest_header -X-OAAP-User")
-        lines.append("\t\trequest_header -X-OAAP-Roles")
         roles = [x for x in r["roles"] if x != "public"]
         if roles or "public" not in r["roles"]:
+            # No explicit strip here: Caddy's directive order runs
+            # request_header AFTER forward_auth, which would wipe the
+            # verified headers again. forward_auth's copy_headers
+            # replaces any client-sent values (anti-spoofing), matching
+            # the main gateway Caddyfile.
             lines.append("\t\tforward_auth identity:8000 {")
             lines.append(f"\t\t\turi /verify?roles={','.join(sorted(set(roles)))}")
             lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
             lines.append("\t\t}")
+        else:
+            # Public route: nothing overwrites the headers, so strip
+            # client-sent identity headers explicitly (contract guarantee 1).
+            lines.append("\t\trequest_header -X-OAAP-User")
+            lines.append("\t\trequest_header -X-OAAP-Roles")
         lines.append(f"\t\treverse_proxy {container}:{svc_port}")
         lines.append("\t}")
     if not any(r["path"] == "/" for r in routes):
