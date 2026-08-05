@@ -664,6 +664,37 @@ def _resolve_revision(source):
         return ""
 
 
+def _store_lookup(app_id):
+    """Resolve an app id against the CONFIGURED store sources (spec 2.6).
+
+    The spool request names only the app id — the source of truth for
+    what gets installed is this host-side lookup, never the request.
+    Returns (source_dict, version) or (None, "") if no configured
+    source lists the app.
+    """
+    import urllib.request
+
+    try:
+        with open(STORE_SOURCES, encoding="utf-8") as f:
+            sources = json.load(f).get("sources", [])
+    except (OSError, ValueError):
+        return None, ""
+    for src in sources:
+        try:
+            with urllib.request.urlopen(src["url"], timeout=5) as r:
+                data = json.load(r)
+        except Exception:
+            continue
+        for a in data.get("apps", []):
+            pkg = a.get("package") or {}
+            if a.get("id") == app_id and pkg.get("git"):
+                return ({"kind": "git", "url": pkg["git"],
+                         "path": pkg.get("path", ""),
+                         "ref": pkg.get("ref", "")},
+                        a.get("version", ""))
+    return None, ""
+
+
 def cmd_process_deploys(_args):
     """Run queued deploy requests (invoked by the oaap-deployd path unit)."""
     import argparse as _argparse
@@ -692,12 +723,45 @@ def cmd_process_deploys(_args):
             continue
         name = req.get("instance", "")
         rid = req.get("id", "")
+        action = req.get("action", "redeploy")
         reg = load_registry()
         inst = reg["instances"].get(name)
         tokens = load_tokens()
         ok, msg, revision = False, "", ""
+
+        def run_install(src, channel):
+            ns = _argparse.Namespace(
+                package=src["url"], path=src.get("path", ""),
+                ref=src.get("ref", ""), name=name, channel=channel)
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                    cmd_install(ns)
+                return True, "deployed"
+            except SystemExit:
+                out = buf.getvalue().strip()
+                return False, (out.splitlines()[-1] if out else "install failed")
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or "").strip()
+                return False, (err.splitlines()[-1] if err else str(e))
+            except Exception as e:  # a broken deploy must never kill the worker
+                return False, str(e)
+
         # Re-validate on the host — the spool is data, not trust.
-        if not inst or name not in tokens:
+        if action == "install":
+            # One-click store install (spec 2.6): the request names only
+            # the app id; what gets installed is decided by resolving it
+            # against the CONFIGURED store sources, here on the host.
+            src, _listed_version = _store_lookup(name)
+            if not src:
+                msg = "app is not listed in any configured store source"
+            else:
+                revision = _resolve_revision(src)
+                channel = inst["channel"] if inst else "production"
+                ok, msg = run_install(src, channel)
+                if ok:
+                    msg = "installed from store"
+        elif not inst or name not in tokens:
             msg = "unknown instance or no deploy token"
         elif inst["channel"] != "test":
             msg = "not a test instance"
@@ -706,24 +770,11 @@ def cmd_process_deploys(_args):
         else:
             src = inst["source"]
             revision = _resolve_revision(src)
-            ns = _argparse.Namespace(
-                package=src["url"], path=src.get("path", ""),
-                ref=src.get("ref", ""), name=name, channel="test")
-            buf = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-                    cmd_install(ns)
-                ok = True
-                msg = "deployed"
-            except SystemExit:
-                msg = buf.getvalue().strip().splitlines()[-1] if buf.getvalue().strip() else "install failed"
-            except subprocess.CalledProcessError as e:
-                msg = (e.stderr or str(e)).strip().splitlines()[-1] if (e.stderr or "").strip() else str(e)
-            except Exception as e:  # a broken deploy must never kill the worker
-                msg = str(e)
+            ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
         audit_deploy({"instance": name, "ok": ok, "message": msg,
-                      "revision": revision, "version": version, "via": "deploy-hook"})
+                      "revision": revision, "version": version,
+                      "via": "store" if action == "install" else "deploy-hook"})
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:

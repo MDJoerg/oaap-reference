@@ -355,6 +355,9 @@ Netz. Landschafts-Gesundheit (Worker-Knoten) folgt mit RFC-0003.</p>
 
 STORE_BODY = """
 <h1>Store</h1>
+{% if msg %}
+<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
+{% endif %}
 {% if not sources %}
 <div class="card">
   <p class="muted">Noch keine Store-Quelle eingetragen. Eine Quelle ist
@@ -386,10 +389,21 @@ STORE_BODY = """
         {% if a.license %}<span class="muted">Lizenz: {{ a.license }}</span>{% endif %}
       </div>
       <p class="muted" style="margin:.4rem 0">{{ a.description }}</p>
-      {% if a.command %}
-      <p class="muted" style="margin:.2rem 0 0">Installation (als Administrator auf dem Server):</p>
+      {% if a.command and a.id %}
+        {% if a.installed == a.version %}
+        <p class="ok" style="margin:.2rem 0 0">Auf dem aktuellen Stand.</p>
+        {% else %}
+        <form method="post" action="/store/install" style="margin:.2rem 0 0"
+              onsubmit="this.querySelector('button').disabled=true;
+                        this.querySelector('button').textContent='Wird installiert …'">
+          <input type="hidden" name="app_id" value="{{ a.id }}">
+          <button>{{ ('Aktualisieren auf v' + a.version) if a.installed else 'Installieren' }}</button>
+        </form>
+        {% endif %}
+      <details style="margin:.4rem 0 0"><summary class="muted">Installation von Hand (CLI)</summary>
       <code style="display:block;background:#f8fafc;border:1px solid var(--oaap-border);
                    border-radius:.4rem;padding:.5rem .7rem;overflow-x:auto;white-space:pre">{{ a.command }}</code>
+      </details>
       {% else %}
       <p class="muted">Paketquelle wird von diesem Durchstich noch nicht unterstützt.</p>
       {% endif %}
@@ -398,9 +412,10 @@ STORE_BODY = """
   {% endif %}
 </div>
 {% endfor %}
-<p class="muted">Durchstich: Der Store zeigt Listen an und liefert das
-Installationskommando — Ein-Klick-Installation folgt. Quellen verwaltet
-die Administration mit <code>sudo oaap store add-source|remove-source</code>.</p>
+<p class="muted">Ein Klick auf „Installieren" installiert die App auf dem
+Produktions-Kanal; der Server prüft die App dabei selbst gegen die
+konfigurierten Quellen. Quellen verwaltet die Administration mit
+<code>sudo oaap store add-source|remove-source</code>.</p>
 """
 
 SETUP_PAGE = STYLE + """
@@ -928,17 +943,16 @@ def deploy_status(name):
 
 
 # ---------------------------------------------------------------------------
-# Store (admin only) — reads the configured source lists (early
-# walking-skeleton of the app store: display + install command; the
-# one-click install path comes later).
+# Store (admin only) — reads the configured source lists and offers
+# one-click installation (runtime spec 2.6): the portal queues only the
+# app id; the host-side worker resolves it against the configured
+# sources itself and installs from what that lookup returns.
 
 STORE_SOURCES_FILE = "/apps-registry/store-sources.json"
+INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 
 
-@app.get("/store")
-def store():
-    if "admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle admin.", 403
+def store_page(msg=None, msg_ok=True, status=200):
     try:
         with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
             configured = json.load(f).get("sources", [])
@@ -966,8 +980,8 @@ def store():
                 command = f"sudo oaap app install {pkg['git']}"
                 if pkg.get("path"):
                     command += f" --path {pkg['path']}"
-                command += " --channel test"
             entry["apps"].append({
+                "id": a.get("id", ""),
                 "name": a.get("name", a.get("id", "?")),
                 "description": a.get("description", ""),
                 "type": a.get("type", "?"), "version": a.get("version", "?"),
@@ -976,7 +990,56 @@ def store():
                 "command": command,
             })
         sources.append(entry)
-    return page(STORE_BODY, "Store", "store", sources=sources)
+    return page(STORE_BODY, "Store", "store", status=status,
+                sources=sources, msg=msg, msg_ok=msg_ok)
+
+
+@app.get("/store")
+def store():
+    if "admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle admin.", 403
+    return store_page()
+
+
+@app.post("/store/install")
+def store_install():
+    if "admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle admin.", 403
+    app_id = request.form.get("app_id", "").strip()
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", app_id):
+        return store_page("Ungültige App-Kennung.", msg_ok=False, status=400)
+    # Queue for the host worker. Deliberately NO source, no version:
+    # the worker resolves the app id against the configured store
+    # sources on the host (spec 2.6) — the spool is data, not trust.
+    rid = _uuid.uuid4().hex
+    os.makedirs(SPOOL_QUEUE, exist_ok=True)
+    tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "instance": app_id, "action": "install",
+                   "by": request.headers.get("X-OAAP-User", "?"),
+                   "requested": datetime.now(timezone.utc).isoformat()}, f)
+    os.replace(tmp, os.path.join(SPOOL_QUEUE, f"{rid}.json"))
+    res_path = os.path.join(SPOOL_RESULTS, f"{rid}.json")
+    deadline = _time.time() + INSTALL_WAIT_SECONDS
+    while _time.time() < deadline:
+        if os.path.exists(res_path):
+            try:
+                with open(res_path, encoding="utf-8") as f:
+                    res = json.load(f)
+            finally:
+                os.remove(res_path)
+            if res.get("ok"):
+                v = res.get("version", "")
+                return store_page(f"'{app_id}' wurde installiert"
+                                  + (f" (Version {v})" if v else "")
+                                  + " — die Kachel erscheint im Launchpad.")
+            return store_page(f"Installation von '{app_id}' fehlgeschlagen: "
+                              f"{res.get('message', 'unbekannter Fehler')}",
+                              msg_ok=False, status=502)
+        _time.sleep(2)
+    return store_page(f"Die Installation von '{app_id}' läuft noch — das "
+                      "Ergebnis erscheint im Deploy-Protokoll auf der "
+                      "Gesundheitsseite.", status=202)
 
 
 # ---------------------------------------------------------------------------
