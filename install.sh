@@ -439,6 +439,27 @@ SESSION_SECRET=$SESSION_SECRET
 SETUP_TOKEN=$SETUP_TOKEN
 EOF
 
+# Preconfigured store sources (install medium's oaap-setup.env or
+# OAAP_STORE_SOURCES environment) — comma-separated list URLs.
+if [ -n "${OAAP_STORE_SOURCES:-}" ] && [ ! -f "$OAAP_DATA_DIR/apps/store-sources.json" ]; then
+  OAAP_STORE_SOURCES="$OAAP_STORE_SOURCES" python3 - "$OAAP_DATA_DIR/apps/store-sources.json" <<'PYEOF'
+import json, os, sys
+urls = [u.strip() for u in os.environ["OAAP_STORE_SOURCES"].split(",") if u.strip()]
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump({"sources": [{"url": u, "name": ""} for u in urls]}, f, indent=2)
+PYEOF
+  say "Store sources preconfigured."
+fi
+
+# Containers must not start before the network has DNS (DHCP boot race
+# — suspected cause of 'store source unreadable' right after a reboot):
+# make network-online.target real for ifupdown; docker-ce already
+# Wants/After network-online.target.
+if [ -f /lib/systemd/system/ifupdown-wait-online.service ] \
+   || [ -f /usr/lib/systemd/system/ifupdown-wait-online.service ]; then
+  systemctl enable ifupdown-wait-online.service >/dev/null 2>&1 || true
+fi
+
 say "Building and starting core services (gateway, identity, portal) ..."
 docker compose --project-directory "$APP_DIR" --project-name oaap build --quiet
 docker compose --project-directory "$APP_DIR" --project-name oaap up -d
@@ -479,6 +500,38 @@ EOF
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."
 fi
+
+# Login greeting, console + SSH. The console banner uses agetty's \4
+# escape — the shown address is expanded at every login prompt, so it
+# survives DHCP address changes (alpha.4 boot test: stale IP in
+# /etc/issue). The SSH/motd variant runs per login and reflects
+# whether the setup wizard is still open.
+mkdir -p /etc/issue.d
+cat > /etc/issue.d/oaap.issue <<'EOF'
+
+===============================================
+ OAAP-Server
+ Portal:                  http://\4/
+ Einrichtung (falls offen): http://\4/setup
+ Setup-Token anzeigen:    sudo oaap setup-token
+===============================================
+
+EOF
+mkdir -p /etc/update-motd.d
+cat > /etc/update-motd.d/50-oaap <<EOF
+#!/bin/sh
+# OAAP login greeting (SSH + console via pam_motd) — state per login.
+ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+if [ -s "$OAAP_DATA_DIR/data/identity/users.json" ]; then
+  echo ""
+  echo "OAAP-Portal:  http://\${ip:-<adresse>}/   (Status: oaap status)"
+else
+  echo ""
+  echo "OAAP-Einrichtung noch offen:  http://\${ip:-<adresse>}/setup"
+  echo "Setup-Token anzeigen:         sudo oaap setup-token"
+fi
+EOF
+chmod 755 /etc/update-motd.d/50-oaap
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER"
 

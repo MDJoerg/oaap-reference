@@ -969,7 +969,9 @@ def store_page(msg=None, msg_ok=True, status=200):
             r.raise_for_status()
             data = r.json()
         except (requests.RequestException, ValueError) as e:
-            entry["error"] = type(e).__name__
+            # Show the cause, not just the class — "ConnectionError"
+            # alone hides whether it is DNS, routing, or TLS.
+            entry["error"] = f"{type(e).__name__}: {str(e)[:300]}"
             sources.append(entry)
             continue
         entry["title"] = src.get("name") or data.get("name") or "Store-Quelle"
