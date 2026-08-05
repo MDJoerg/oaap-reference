@@ -37,6 +37,17 @@ MARKER="$OAAP_DATA_DIR/.oaap-installed"
 say()  { printf '%s\n' "$*"; }
 fail() { say "ERROR: $*" >&2; exit 1; }
 
+# ---------------------------------------------------------------- transcript
+# Mirror the full run into /var/log/oaap-install.log (best effort) —
+# the feedback channel for installs that go wrong on foreign hardware.
+# Contains the setup token, hence root-only permissions.
+INSTALL_LOG="/var/log/oaap-install.log"
+if [ "$(id -u)" -eq 0 ] && touch "$INSTALL_LOG" 2>/dev/null; then
+  chmod 600 "$INSTALL_LOG"
+  exec > >(tee -a "$INSTALL_LOG") 2>&1
+  say "== install.sh $VERSION mode=$MODE $(date -u +%Y-%m-%dT%H:%M:%SZ) — transcript: $INSTALL_LOG"
+fi
+
 # ---------------------------------------------------------------- mode gate
 case "$MODE" in
   bootstrap|prepare|restore) ;;
@@ -513,6 +524,36 @@ else
   say ""
   say " The token is valid once, until the first admin exists."
   say " Lost this output? Show it again with:  sudo oaap setup-token"
+
+  # The same handover data as a file — like the install stick's
+  # oaap-setup.txt, but for manual installs: it lands in the invoking
+  # user's home so nothing must be copied off the screen. (On stick
+  # installs SUDO_USER is unset → /root/oaap-setup.txt, a fallback for
+  # sticks pulled before the log was written.)
+  SETUP_HOME="$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6 || true)"
+  { [ -n "$SETUP_HOME" ] && [ -d "$SETUP_HOME" ]; } || SETUP_HOME="/root"
+  SETUP_FILE="$SETUP_HOME/oaap-setup.txt"
+  if {
+    echo "OAAP-Installation — Zugangsdaten fuer die Einrichtung"
+    echo "====================================================="
+    echo ""
+    echo "Installiert am:          $(date '+%Y-%m-%d %H:%M')"
+    echo "Rechnername:             $(hostname)"
+    echo "Adresse:                 $OAAP_HOST"
+    echo ""
+    echo "Einrichtung im Browser:  http://$OAAP_HOST$PORT_SUFFIX/setup"
+    echo "Setup-Token:             $SETUP_TOKEN"
+    echo ""
+    echo "Hinweise:"
+    echo "- Das Token ist EINMAL gueltig, bis der erste Admin-Benutzer"
+    echo "  angelegt ist. Danach kann diese Datei geloescht werden."
+    echo "- Token verloren? 'sudo oaap setup-token' zeigt es erneut."
+  } > "$SETUP_FILE" 2>/dev/null; then
+    chmod 600 "$SETUP_FILE"
+    [ -z "${SUDO_USER:-}" ] || chown "$SUDO_USER": "$SETUP_FILE" 2>/dev/null || true
+    say ""
+    say " These details were also written to:  $SETUP_FILE"
+  fi
 fi
 say " Check this node anytime with:  oaap status"
 say "=============================================================="
