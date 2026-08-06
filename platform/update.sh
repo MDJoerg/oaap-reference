@@ -122,6 +122,9 @@ say "Copying platform files ..."
 # cp keeps inodes — safe for the Caddyfile file bind-mount.
 cp -r "$SRC/platform/." "$APP_DIR/"
 cp "$SRC/VERSION" "$APP_DIR/VERSION"
+# The portal shows OAAP_VERSION from the compose .env — keep it in
+# sync, or the UI keeps reporting the old version after an update.
+set_env OAAP_VERSION "$new_ver"
 install -m 0755 "$SRC/bin/oaap" /usr/local/bin/oaap
 
 say "Building core service images (the running services stay up) ..."

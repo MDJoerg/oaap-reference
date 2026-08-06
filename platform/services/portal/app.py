@@ -390,7 +390,10 @@ STORE_BODY = """
       </div>
       <p class="muted" style="margin:.4rem 0">{{ a.description }}</p>
       {% if a.command and a.id %}
-        {% if a.installed == a.version %}
+        {% if a.pending %}
+        <p class="muted" style="margin:.2rem 0 0">⏳ Installation läuft — das
+        Ergebnis erscheint hier und im Deploy-Protokoll (Gesundheitsseite).</p>
+        {% elif a.installed == a.version %}
         <p class="ok" style="margin:.2rem 0 0">Auf dem aktuellen Stand.</p>
         {% else %}
         <form method="post" action="/store/install" style="margin:.2rem 0 0"
@@ -952,12 +955,36 @@ STORE_SOURCES_FILE = "/apps-registry/store-sources.json"
 INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 
 
+def pending_installs():
+    """App ids with a queued/running store install (spool not yet done).
+
+    Without this the store page offers "Installieren" again while the
+    worker is still pulling images — a second click then fails
+    (Jörgs Befund 2026-08-06)."""
+    pending = set()
+    try:
+        for fn in os.listdir(SPOOL_QUEUE):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(SPOOL_QUEUE, fn), encoding="utf-8") as f:
+                    req = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if req.get("action") == "install":
+                pending.add(req.get("instance"))
+    except OSError:
+        pass
+    return pending
+
+
 def store_page(msg=None, msg_ok=True, status=200):
     try:
         with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
             configured = json.load(f).get("sources", [])
     except (OSError, ValueError):
         configured = []
+    pending = pending_installs()
     installed = {inst.get("app_id"): inst.get("version")
                  for inst in load_instances().values()}
     sources = []
@@ -989,6 +1016,7 @@ def store_page(msg=None, msg_ok=True, status=200):
                 "type": a.get("type", "?"), "version": a.get("version", "?"),
                 "license": a.get("license", ""), "homepage": a.get("homepage", ""),
                 "installed": installed.get(a.get("id")),
+                "pending": a.get("id") in pending,
                 "command": command,
             })
         sources.append(entry)
