@@ -504,7 +504,7 @@ def cmd_convert(args):
         for k, v in _service_env(svc).items():
             m = ENV_REF.match(v)
             key = m.group(1) if m else k
-            if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key):
                 warns.append(f"env '{k}' skipped (key not manifest-compatible)")
                 continue
             entry = {"key": k, "label": k.replace("_", " ").title()}
