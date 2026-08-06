@@ -450,13 +450,24 @@ if [ "$MODE" = "restore" ]; then
 fi
 
 umask 077
+# Recorded platform source (oaap.core.updates 2.2): `oaap update`
+# always pulls from here; a non-git source (install medium payload)
+# makes the update engine clone the repository on first use.
+PLATFORM_REPO="${OAAP_PLATFORM_REPO:-https://github.com/MDJoerg/oaap-reference}"
+PLATFORM_REF="${OAAP_PLATFORM_REF:-main}"
 cat > "$APP_DIR/.env" <<EOF
 OAAP_VERSION=$VERSION
 OAAP_HTTP_PORT=$OAAP_HTTP_PORT
 OAAP_DATA_DIR=$OAAP_DATA_DIR
+OAAP_PLATFORM_REPO=$PLATFORM_REPO
+OAAP_PLATFORM_REF=$PLATFORM_REF
+OAAP_PLATFORM_SOURCE=$SCRIPT_DIR
 SESSION_SECRET=$SESSION_SECRET
 SETUP_TOKEN=$SETUP_TOKEN
 EOF
+# Baseline for `oaap update`: which revision is installed right now.
+git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse --short HEAD > "$APP_DIR/REVISION" 2>/dev/null \
+  || rm -f "$APP_DIR/REVISION"
 
 # Preconfigured store sources (install medium's oaap-setup.env or
 # OAAP_STORE_SOURCES environment) — comma-separated list URLs.
