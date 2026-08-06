@@ -89,6 +89,16 @@ say "  Installed:  $cur_ver (${cur_rev:-unknown revision})"
 say "  Available:  $new_ver ($new_rev)"
 
 if [ -n "$cur_rev" ] && [ "$cur_rev" = "$new_rev" ]; then
+  # Self-heal: engines before 0.1.2 did not sync OAAP_VERSION into the
+  # compose env, so the portal kept showing the old version. Repair
+  # the display when it drifted (fault repair, not a normal no-op).
+  env_ver="$(get_env OAAP_VERSION)"
+  if [ "$CHECK" -eq 0 ] && [ -n "$cur_ver" ] && [ "$env_ver" != "$cur_ver" ]; then
+    say ""
+    say "Repairing the version display ($env_ver -> $cur_ver) ..."
+    set_env OAAP_VERSION "$cur_ver"
+    docker compose --project-directory "$APP_DIR" --project-name oaap up -d >/dev/null 2>&1 || true
+  fi
   say ""
   say "Already up to date — nothing changed."
   exit 0
