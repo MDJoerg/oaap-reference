@@ -24,6 +24,10 @@
 #                     default: generated here
 
 set -euo pipefail
+# apt must never try to ask questions here — under systemd (firstboot)
+# there is no stdin, and "dpkg-preconfigure: unable to re-open stdin"
+# was the first visible line on the console (alpha.6 boot test).
+export DEBIAN_FRONTEND=noninteractive
 
 MODE="${1:-bootstrap}"
 RESTORE_FILE="${2:-}"
@@ -507,10 +511,10 @@ fi
 # /etc/issue). The SSH/motd variant runs per login and reflects
 # whether the setup wizard is still open.
 mkdir -p /etc/issue.d
-cat > /etc/issue.d/oaap.issue <<'EOF'
+cat > /etc/issue.d/oaap.issue <<EOF
 
 ===============================================
- OAAP-Server
+ OAAP-Server ($VERSION)
  Portal:                  http://\4/
  Einrichtung (falls offen): http://\4/setup
  Setup-Token anzeigen:    sudo oaap setup-token
@@ -522,13 +526,14 @@ cat > /etc/update-motd.d/50-oaap <<EOF
 #!/bin/sh
 # OAAP login greeting (SSH + console via pam_motd) — state per login.
 ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+v="\$(cat "$OAAP_DATA_DIR/app/VERSION" 2>/dev/null)"
 if [ -s "$OAAP_DATA_DIR/data/identity/users.json" ]; then
   echo ""
-  echo "OAAP-Portal:  http://\${ip:-<adresse>}/   (Status: oaap status)"
+  echo "OAAP \${v:-?}  —  Portal:  http://\${ip:-<adresse>}/   (Status: oaap status)"
 else
   echo ""
-  echo "OAAP-Einrichtung noch offen:  http://\${ip:-<adresse>}/setup"
-  echo "Setup-Token anzeigen:         sudo oaap setup-token"
+  echo "OAAP \${v:-?}  —  Einrichtung noch offen:  http://\${ip:-<adresse>}/setup"
+  echo "Setup-Token anzeigen:  sudo oaap setup-token"
 fi
 EOF
 chmod 755 /etc/update-motd.d/50-oaap
