@@ -45,7 +45,8 @@ say "== oaap update $(date -u +%Y-%m-%dT%H:%M:%SZ) $([ "$CHECK" -eq 1 ] && echo 
 
 # ------------------------------------------------ recorded source (2.2)
 ENVF="$APP_DIR/.env"
-get_env() { grep "^$1=" "$ENVF" 2>/dev/null | head -1 | cut -d= -f2-; }
+# tolerate missing keys (existing installations predate these entries)
+get_env() { grep "^$1=" "$ENVF" 2>/dev/null | head -1 | cut -d= -f2- || true; }
 set_env() {
   if grep -q "^$1=" "$ENVF" 2>/dev/null; then
     sed -i "s|^$1=.*|$1=$2|" "$ENVF"
