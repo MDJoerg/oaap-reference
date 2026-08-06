@@ -189,6 +189,17 @@ static_ip() {
   defroute="$(ip -4 route show default 2>/dev/null | head -1)"
   [ -n "$defroute" ] || { say "Stable address: no default route found — skipped."; return 0; }
   iface="$(printf '%s\n' "$defroute" | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')"
+  # Wireless interfaces (Raspberry Pi over WLAN, laptops): our simple
+  # static rewrite breaks wpa_supplicant/NetworkManager setups — leave
+  # the network configuration untouched (2026-08-06, aborted installs
+  # on two WLAN machines).
+  if [ -d "/sys/class/net/$iface/wireless" ]; then
+    say "Stable address: $iface is a WLAN interface — leaving the network"
+    say "configuration untouched. For a fixed address, reserve one in your"
+    say "router instead (Fritzbox: 'Diesem Netzwerkgerät immer die gleiche"
+    say "IPv4-Adresse zuweisen')."
+    return 0
+  fi
   gateway="$(printf '%s\n' "$defroute" | awk '{for(i=1;i<NF;i++) if($i=="via") print $(i+1)}')"
   cidr="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}')"
   [ -n "$iface" ] && [ -n "$gateway" ] && [ -n "$cidr" ] || { say "Stable address: could not detect the network setup — skipped."; return 0; }
@@ -323,9 +334,13 @@ EOF
 }
 
 if [ "$(id -u)" -eq 0 ]; then
-  admin_access
-  keep_awake
-  static_ip
+  # Server readiness is best effort: a failure here (odd network tool,
+  # exotic hardware) must never abort the whole installation — under
+  # `set -e` an unguarded call would (2026-08-06: nmcli on a WLAN
+  # machine killed the bootstrap mid-run).
+  admin_access || say "WARNING: admin access step failed — set up sudo manually if needed."
+  keep_awake   || say "WARNING: keep-awake step failed — check power settings manually."
+  static_ip    || say "WARNING: stable-address step failed — keeping the current network configuration (DHCP)."
 elif [ "$MODE" = "prepare" ]; then
   fail "Must run as root (sudo ./install.sh prepare)."
 fi
