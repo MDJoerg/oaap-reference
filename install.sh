@@ -460,6 +460,12 @@ EOF
 
 # Preconfigured store sources (install medium's oaap-setup.env or
 # OAAP_STORE_SOURCES environment) — comma-separated list URLs.
+# Default: the curated community list, so a plain git install comes
+# with a working store out of the box (Jörgs decision 2026-08-06).
+# Opt out with OAAP_STORE_SOURCES=none; remove later with
+# 'sudo oaap store remove-source'.
+OAAP_STORE_SOURCES="${OAAP_STORE_SOURCES:-https://raw.githubusercontent.com/MDJoerg/oaap-store/main/oaap-store.json}"
+[ "$OAAP_STORE_SOURCES" = "none" ] && OAAP_STORE_SOURCES=""
 if [ -n "${OAAP_STORE_SOURCES:-}" ] && [ ! -f "$OAAP_DATA_DIR/apps/store-sources.json" ]; then
   OAAP_STORE_SOURCES="$OAAP_STORE_SOURCES" python3 - "$OAAP_DATA_DIR/apps/store-sources.json" <<'PYEOF'
 import json, os, sys
