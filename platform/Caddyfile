@@ -1,4 +1,14 @@
 # OAAP gateway — single entry point, default deny (RFC-0002).
+
+# On-demand TLS approval (gateway spec, edge section): certificates for
+# edge-routed foreign names are obtained per requested hostname at
+# handshake time; the portal approves only names under a configured
+# edge route. Harmless when no edge routes exist (never consulted).
+{
+	on_demand_tls {
+		ask http://portal:8000/edge/tls-ask
+	}
+}
 #
 # Public routes (the only ones, per spec):
 #   /auth/*  — login/logout, served by identity

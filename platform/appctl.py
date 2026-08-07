@@ -359,6 +359,12 @@ def write_edge_caddy():
     for r in routes:
         target = f"{r['target']}:{r.get('port', 80)}"
         lines.append(f"https://{r['host']}, https://*.{r['host']} {{")
+        # Wildcard certificates need a DNS challenge we cannot do —
+        # so certificates come on demand per requested name, approved
+        # by the portal (only names under a configured edge route).
+        lines.append("\ttls {")
+        lines.append("\t\ton_demand")
+        lines.append("\t}")
         lines += _LOG_BLOCK
         lines.append(f"\treverse_proxy {target}")
         lines.append("}")

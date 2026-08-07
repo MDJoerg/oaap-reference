@@ -485,6 +485,7 @@ def load_instances():
 
 
 EXTERNAL_FILE = "/apps-registry/external.json"
+EDGE_FILE = "/apps-registry/edge.json"
 ACCESS_LOG = "/gateway-logs/external-access.log"
 
 
@@ -494,6 +495,32 @@ def external_host():
             return json.load(f).get("host", "")
     except (OSError, ValueError):
         return ""
+
+
+@app.get("/edge/tls-ask")
+def edge_tls_ask():
+    """Approve on-demand TLS for edge-routed names (gateway spec, edge).
+
+    The edge terminates TLS for foreign platforms' hostnames, but their
+    app subdomains are unknown here and wildcard certificates are not
+    obtainable via HTTP challenge — so the gateway asks per requested
+    name at handshake time. Approved: a routed hostname or any name
+    below it. Only the gateway can reach this endpoint (internal
+    network; /edge/* is no declared client route).
+    """
+    domain = (request.args.get("domain") or "").lower().strip(".")
+    if not domain:
+        return "missing domain", 400
+    try:
+        with open(EDGE_FILE, encoding="utf-8") as f:
+            routes = json.load(f).get("routes", [])
+    except (OSError, ValueError):
+        routes = []
+    for r in routes:
+        h = r.get("host", "")
+        if h and (domain == h or domain.endswith("." + h)):
+            return "ok", 200
+    return "not an edge-routed name", 404
 
 
 def launchpad_tiles(user_roles, host):
