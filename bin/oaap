@@ -122,8 +122,9 @@ case "$cmd" in
   app)         exec python3 "$APP_DIR/appctl.py" "$@" ;;
   store)       exec python3 "$APP_DIR/appctl.py" store "$@" ;;
   external)    exec python3 "$APP_DIR/appctl.py" external "$@" ;;
+  edge)        exec python3 "$APP_DIR/appctl.py" edge "$@" ;;
   backup)      exec python3 "$APP_DIR/appctl.py" backup "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)      exec bash "$APP_DIR/update.sh" "$@" ;;
-  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|remove ...|store list|add-source|remove-source ...|backup create [--to PATH]|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|remove ...|store list|add-source|remove-source ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac
