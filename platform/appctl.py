@@ -16,6 +16,7 @@ tiles yet; role `public` supported but discouraged.
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -41,6 +42,7 @@ SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
 PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
+IDENTITY_CONTAINER = "oaap-identity-1"
 
 
 def die(msg):
@@ -668,6 +670,69 @@ def cmd_visibility(args):
         print(f"'{args.name}' visibility set to 'all' (role check only, as before).")
 
 
+# --------------------------------------------------- user rescue (root only)
+# `oaap user list|password` — a CLI-only path to see accounts and reset a
+# password when the portal itself is unreachable or the caller is locked
+# out. Root already implies full control of the platform (the user store
+# is just a file on disk); this only saves the detour through docker
+# exec + a hand-written script. Runs identity's OWN code (hashing,
+# load/save) inside its container rather than reimplementing it on the
+# host, so results are byte-for-byte what the app itself would produce.
+
+def _identity_exec(script, env=None):
+    cmd = ["docker", "exec"]
+    for k, v in (env or {}).items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd += [IDENTITY_CONTAINER, "python3", "-c", script]
+    try:
+        return run(cmd).stdout
+    except subprocess.CalledProcessError as e:
+        die(f"cannot reach the identity container ({IDENTITY_CONTAINER}): "
+            f"{(e.stderr or str(e)).strip()}")
+
+
+def cmd_user(args):
+    if args.action == "list":
+        out = _identity_exec(
+            "import json, app as m\n"
+            "print(json.dumps([m.public_user(u) for u in m.load_users()]))\n")
+        users = json.loads(out)
+        if not users:
+            print("No users exist.")
+            return
+        for u in users:
+            roles = ",".join(u["roles"]) or "-"
+            groups = ",".join(u.get("groups") or []) or "-"
+            status = "active" if u["active"] else "INACTIVE"
+            print(f"{u['username']:<20} roles={roles:<32} groups={groups:<20} {status}")
+        return
+
+    # password
+    if not args.username:
+        die("'user password' needs a username, e.g. 'oaap user password joerg'")
+    password = args.password or getpass.getpass("New password (min 8 chars, hidden): ")
+    if len(password) < 8:
+        die("password must be at least 8 characters")
+    out = _identity_exec(
+        "import os, sys, app as m\n"
+        "from werkzeug.security import generate_password_hash\n"
+        "users = m.load_users()\n"
+        "u = m.find_user(users, os.environ['OAAP_CLI_USERNAME'])\n"
+        "if not u:\n"
+        "    print('no such user: ' + os.environ['OAAP_CLI_USERNAME'], file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "u['password_hash'] = generate_password_hash(os.environ['OAAP_CLI_PASSWORD'])\n"
+        # invalidates every existing session for this user (same
+        # mechanism as a self-service password change, spec 2.3) — a
+        # rescue reset should not leave an old, possibly-compromised
+        # session valid.
+        "u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
+        "m._save(m.USERS_FILE, users)\n"
+        "print('password reset for ' + u['username'] + ' -- existing sessions were signed out')\n",
+        {"OAAP_CLI_USERNAME": args.username, "OAAP_CLI_PASSWORD": password})
+    print(out.strip())
+
+
 # ---------------------------------------------------------------- convert
 # Compose converter (RFC-0004): import a docker-compose stack, emit one
 # wrapped-app package per HTTP service plus a conversion report for
@@ -1266,6 +1331,12 @@ def main():
     pv.add_argument("groups", nargs="?", default="",
                     help="comma-separated group tags, e.g. buero,finanzen (with 'groups')")
     pv.set_defaults(fn=cmd_visibility)
+    pu = sub.add_parser("user")
+    pu.add_argument("action", choices=["list", "password"])
+    pu.add_argument("username", nargs="?")
+    pu.add_argument("password", nargs="?",
+                    help="omit to be prompted (hidden input) -- 'password' action only")
+    pu.set_defaults(fn=cmd_user)
     pc = sub.add_parser("convert")
     pc.add_argument("compose")
     pc.add_argument("--out", default="./oaap-converted")
