@@ -90,6 +90,11 @@ def load_users():
     for u in users:
         u.setdefault("display_name", "")
         u.setdefault("active", True)
+        # Sessions are stateless (signed cookie, no server-side store) —
+        # logout alone cannot invalidate a copy of the cookie held
+        # elsewhere (another tab/window, browser history). This counter,
+        # bumped on logout, is what actually revokes it (see verify()).
+        u.setdefault("session_epoch", 0)
     return users
 
 
@@ -245,7 +250,8 @@ def verify():
     """
     username = session_username()
     user = find_user(load_users(), username) if username else None
-    if not user or not user["active"]:
+    if (not user or not user["active"]
+            or session.get("epoch") != user.get("session_epoch", 0)):
         session.clear()
         return redirect("/auth/login", code=303)
     required = request.args.get("roles", "")
@@ -277,15 +283,34 @@ def login():
     if u and u["active"] and check_password_hash(u["password_hash"], password):
         _login_succeeded(throttle_key)
         session["user"] = u["username"]
+        session["epoch"] = u.get("session_epoch", 0)
+        print(f"login ok: {u['username']} from {_client_ip()}", flush=True)
         return redirect("/", code=303)
     _login_failed(throttle_key)
+    print(f"login failed: '{username}' from {_client_ip()}", flush=True)
     return render_template_string(
         LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.", has_users=bool(users)
     ), 401
 
 
+def _revoke_sessions(username):
+    """Bump a user's session epoch, invalidating every copy of their
+    cookie immediately (see load_users()/verify()) — used by logout and
+    password change, since a signed cookie cannot otherwise be revoked.
+    """
+    users = load_users()
+    u = find_user(users, username)
+    if u:
+        u["session_epoch"] = u.get("session_epoch", 0) + 1
+        _save(USERS_FILE, users)
+
+
 @app.post("/auth/logout")
 def logout():
+    username = session_username()
+    if username:
+        _revoke_sessions(username)
+        print(f"logout: {username}", flush=True)
     session.clear()
     return redirect("/auth/login", code=303)
 
@@ -312,7 +337,14 @@ def password_change():
         return render_template_string(
             PASSWORD_PAGE, error="Das neue Passwort braucht mindestens 8 Zeichen.", done=False), 400
     u["password_hash"] = generate_password_hash(new)
+    # Standard practice: a password change signs out every OTHER copy of
+    # this user's cookie. Keep this browser signed in by advancing its
+    # own session to match (else the request right after this one would
+    # find itself logged out too).
+    u["session_epoch"] = u.get("session_epoch", 0) + 1
+    session["epoch"] = u["session_epoch"]
     _save(USERS_FILE, users)
+    print(f"password changed: {u['username']} (other sessions revoked)", flush=True)
     return render_template_string(PASSWORD_PAGE, error=None, done=True)
 
 
