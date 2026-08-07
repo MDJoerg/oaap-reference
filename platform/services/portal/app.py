@@ -1,11 +1,12 @@
 """OAAP web portal (oaap.core.portal, skeleton).
 
 Serves the first-run wizard (/setup, protected by the one-time setup
-token, validated by the identity service), the role-filtered launchpad,
-user management (admin only, list report + object page floorplans),
-and the platform health page (admin/partner). Authentication is
-entirely the gateway's job: the portal trusts the X-OAAP-User /
-X-OAAP-Roles headers set after forward auth.
+token, validated by the identity service), the role-and-group-filtered
+launchpad, user management (server_admin only, list report + object
+page floorplans), app-instance visibility (RFC-0007, server_admin
+only) and the platform health page (server_admin/partner).
+Authentication is entirely the gateway's job: the portal trusts the
+X-OAAP-User / X-OAAP-Roles headers set after forward auth.
 
 Look & feel follows oaap-design/docs/design-guidelines.md v0.1 —
 blue palette, hexagon mark, German UI, floorplans, no external
@@ -26,7 +27,7 @@ GATEWAY = "http://gateway:80"
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
 REGISTRY = "/apps-registry/registry.json"
 
-ALL_ROLES = ("admin", "keyuser", "user", "guest", "partner")
+ALL_ROLES = ("server_admin", "admin", "keyuser", "user", "guest", "partner")
 CHANNEL_LABELS = {"test": "Test", "production": "Produktiv"}
 
 # Hexagon mark per design guidelines (assets/logo.svg, white for the
@@ -139,9 +140,10 @@ LAYOUT = STYLE + """
   </a>
   <nav class="main">
     <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
-    {% if is_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
+    {% if is_server_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
-    {% if is_admin %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
+    {% if is_server_admin %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
+    {% if is_server_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
   </nav>
   <div class="userbox">
     <span class="who">{{ user }}<br><small>{{ roles }}</small></span>
@@ -194,12 +196,13 @@ USERS_LIST_BODY = """
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Benutzername</th><th>Anzeigename</th><th>Rollen</th><th>Status</th><th></th></tr>
+  <tr><th>Benutzername</th><th>Anzeigename</th><th>Rollen</th><th>Gruppen</th><th>Status</th><th></th></tr>
   {% for u in users %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/users/{{ u.username }}">{{ u.username }}</a></td>
     <td>{{ u.display_name }}</td>
     <td>{{ u.roles|join(", ") }}</td>
+    <td class="muted">{{ u.groups|join(", ") if u.groups else "–" }}</td>
     <td><span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span></td>
     <td><a class="rowaction" href="/users/{{ u.username }}">Bearbeiten</a></td>
   </tr>
@@ -233,6 +236,15 @@ USER_EDIT_BODY = """
       {% endfor %}
     </p>
     <p class="muted">Rollenänderungen wirken ab der nächsten Anfrage des Benutzers.</p>
+  </div>
+  <div class="card">
+    <h2>Gruppen</h2>
+    <label>Sichtbarkeits-Gruppen (kommagetrennt)
+      <input type="text" name="groups" value="{{ u.groups|join(', ') }}"
+             placeholder="z. B. buero, finanzen"></label>
+    <p class="muted">Freie Stichworte — steuern zusätzlich zur Rolle, welche
+      App-Instanzen mit eingeschränkter Sichtbarkeit dieser Benutzer sieht
+      (Instanzen-Seite). server_admin sieht immer alles.</p>
   </div>
   <div class="card">
     <h2>Status</h2>
@@ -274,6 +286,12 @@ USER_NEW_BODY = """
              {{ 'checked' if r in form.roles }}>{{ r }}</label>
       {% endfor %}
     </p>
+  </div>
+  <div class="card">
+    <h2>Gruppen</h2>
+    <label>Sichtbarkeits-Gruppen (kommagetrennt)
+      <input type="text" name="groups" value="{{ form.groups|join(', ') if form.groups else '' }}"
+             placeholder="z. B. buero, finanzen"></label>
     <button>Anlegen</button>
   </div>
 </form>
@@ -421,6 +439,56 @@ konfigurierten Quellen. Quellen verwaltet die Administration mit
 <code>sudo oaap store add-source|remove-source</code>.</p>
 """
 
+# Floorplan "Listenbericht" — installed app instances and their
+# visibility setting (RFC-0007). server_admin only.
+INSTANCES_LIST_BODY = """
+<h1>Instanzen</h1>
+{% if instances %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+  <tr><th>Instanz</th><th>App</th><th>Kanal</th><th>Sichtbarkeit</th><th></th></tr>
+  {% for i in instances %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/instances/{{ i.name }}">{{ i.name }}</a></td>
+    <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
+    <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span></td>
+    <td>{{ i.visibility_label }}</td>
+    <td><a class="rowaction" href="/instances/{{ i.name }}">Bearbeiten</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}
+<div class="card"><p class="muted">Noch keine Apps installiert.</p></div>
+{% endif %}
+<p class="muted">Sichtbarkeit schränkt zusätzlich zur Rolle ein, wer eine
+installierte Instanz sehen und öffnen darf (RFC-0007) — <code>server_admin</code>
+sieht immer alle Instanzen, unabhängig davon.</p>
+"""
+
+# Floorplan "Objektseite" (design guidelines 6.2).
+INSTANCE_EDIT_BODY = """
+<a class="back" href="/instances">← Zurück zur Liste</a>
+<h1>{{ i.name }} <span class="muted">({{ i.app_name }} v{{ i.version }})</span></h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+<form method="post" action="/instances/{{ i.name }}/visibility">
+  <div class="card">
+    <h2>Sichtbarkeit</h2>
+    <label class="checkline"><input type="radio" name="mode" value="all"
+           {{ 'checked' if not i.groups }}>Für alle mit passender Rolle sichtbar (Standard)</label>
+    <label class="checkline"><input type="radio" name="mode" value="groups"
+           {{ 'checked' if i.groups }}>Nur für bestimmte Gruppen</label>
+    <label>Gruppen (kommagetrennt) <input type="text" name="groups"
+           value="{{ i.groups|join(', ') }}" placeholder="z. B. buero, finanzen"></label>
+    <p class="muted"><code>server_admin</code> sieht diese Instanz immer,
+       unabhängig von dieser Einstellung. Rollen legt weiterhin das
+       App-Manifest fest ({{ i.roles|join(", ") if i.roles else "keine Einschränkung" }}).</p>
+    <button>Speichern</button>
+  </div>
+</form>
+"""
+
 SETUP_PAGE = STYLE + """
 <!doctype html><html lang="de"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -463,6 +531,20 @@ def caller_roles():
     return set(filter(None, request.headers.get("X-OAAP-Roles", "").split(",")))
 
 
+def caller_groups():
+    """The caller's own visibility groups (RFC-0007).
+
+    Deliberately NOT a header — the App Deployment Contract stays
+    unchanged (no X-OAAP-Groups). Looked up from identity by the
+    verified username instead, same trust boundary as roles.
+    """
+    username = request.headers.get("X-OAAP-User", "")
+    if not username:
+        return set()
+    u = next((x for x in identity_users() if x["username"] == username), None)
+    return set(u.get("groups") or []) if u else set()
+
+
 def page(body_template, title, active, status=200, **ctx):
     body = render_template_string(body_template, **ctx)
     roles = request.headers.get("X-OAAP-Roles", "")
@@ -471,7 +553,8 @@ def page(body_template, title, active, status=200, **ctx):
         LAYOUT,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
-        is_admin="admin" in caller, can_health=bool(caller & {"admin", "partner"}),
+        is_server_admin="server_admin" in caller,
+        can_health=bool(caller & {"server_admin", "partner"}),
         version=VERSION,
     ), status
 
@@ -523,21 +606,27 @@ def edge_tls_ask():
     return "not an edge-routed name", 404
 
 
-def launchpad_tiles(user_roles, host):
-    """Role-filtered app tiles from the instance registry (spec 2.5).
-
-    The filter is UX only — the gateway enforces the roles on every
-    request regardless of what the portal shows.
+def launchpad_tiles(user_roles, user_groups, host):
+    """Role- and group-filtered app tiles from the instance registry
+    (spec 2.5, RFC-0007). The filter is UX only — the gateway enforces
+    both on every request regardless of what the portal shows (mirrored
+    exactly: no bypass here that the gateway's /verify does not also
+    grant, and vice versa — server_admin bypasses the group check only,
+    same as /verify).
     """
     # Accessed via the registered external hostname? Then tiles must
     # link to the TLS subdomains — the LAN ports are not reachable
     # (and not forwarded) from outside.
     ext = external_host()
     via_external = bool(ext) and host == ext
+    is_server_admin = "server_admin" in user_roles
     tiles = []
     for name, inst in sorted(load_instances().items()):
         allowed = set(inst.get("roles") or [])
-        if allowed and "admin" not in user_roles and not user_roles & allowed:
+        if allowed and not user_roles & allowed:
+            continue
+        vis_groups = set((inst.get("visibility") or {}).get("groups") or [])
+        if vis_groups and not is_server_admin and not user_groups & vis_groups:
             continue
         channel = inst.get("channel", "production")
         tiles.append({
@@ -561,19 +650,20 @@ def setup_done() -> bool:
 def dashboard():
     return page(
         DASHBOARD_BODY, "Apps", "apps",
-        tiles=launchpad_tiles(caller_roles(), request.host.split(":")[0]),
+        tiles=launchpad_tiles(caller_roles(), caller_groups(), request.host.split(":")[0]),
     )
 
 
 # ---------------------------------------------------------------------------
-# User management (spec oaap.core.identity 2.4) — admin only, floorplans
-# "Listenbericht" and "Objektseite". The gateway has already
-# authenticated the caller; the portal checks the admin role and
-# delegates the operations to identity's internal API.
+# User management (spec oaap.core.identity 2.4) — server_admin only
+# (RFC-0008: this operates on the server itself, not on one app's own
+# data), floorplans "Listenbericht" and "Objektseite". The gateway has
+# already authenticated the caller; the portal checks the server_admin
+# role and delegates the operations to identity's internal API.
 
-def require_admin():
-    if "admin" not in caller_roles():
-        return "Zugriff verweigert: Benutzerverwaltung erfordert die Rolle admin.", 403
+def require_server_admin():
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: erfordert die Rolle server_admin.", 403
     return None
 
 
@@ -581,9 +671,14 @@ def identity_users():
     return requests.get(f"{IDENTITY}/internal/users", timeout=5).json()["users"]
 
 
+def _parse_groups(raw):
+    """Free-form group tags (RFC-0007) from a comma-separated form field."""
+    return sorted({g.strip().lower() for g in raw.split(",") if g.strip()})
+
+
 @app.get("/users")
 def users_list():
-    denied = require_admin()
+    denied = require_server_admin()
     if denied:
         return denied
     return page(USERS_LIST_BODY, "Benutzer", "users", users=identity_users(),
@@ -592,23 +687,24 @@ def users_list():
 
 @app.get("/users/new")
 def users_new():
-    denied = require_admin()
+    denied = require_server_admin()
     if denied:
         return denied
     return page(USER_NEW_BODY, "Benutzer anlegen", "users",
                 all_roles=ALL_ROLES, error=None,
-                form={"username": "", "display_name": "", "roles": ["user"]})
+                form={"username": "", "display_name": "", "roles": ["user"], "groups": []})
 
 
 @app.post("/users/create")
 def users_create():
-    denied = require_admin()
+    denied = require_server_admin()
     if denied:
         return denied
     form = {
         "username": request.form.get("username", "").strip(),
         "display_name": request.form.get("display_name", ""),
         "roles": request.form.getlist("roles"),
+        "groups": _parse_groups(request.form.get("groups", "")),
     }
     resp = requests.post(f"{IDENTITY}/internal/users", json={
         **form, "password": request.form.get("password", ""),
@@ -624,7 +720,7 @@ def users_create():
 
 @app.get("/users/<username>")
 def users_detail(username):
-    denied = require_admin()
+    denied = require_server_admin()
     if denied:
         return denied
     u = next((x for x in identity_users() if x["username"] == username), None)
@@ -637,12 +733,13 @@ def users_detail(username):
 
 @app.post("/users/<username>/update")
 def users_update(username):
-    denied = require_admin()
+    denied = require_server_admin()
     if denied:
         return denied
     resp = requests.put(f"{IDENTITY}/internal/users/{username}", json={
         "display_name": request.form.get("display_name", ""),
         "roles": request.form.getlist("roles"),
+        "groups": _parse_groups(request.form.get("groups", "")),
         "active": request.form.get("active") == "on",
     }, timeout=5)
     if resp.status_code == 200:
@@ -652,7 +749,7 @@ def users_update(username):
 
 @app.post("/users/<username>/password")
 def users_password(username):
-    denied = require_admin()
+    denied = require_server_admin()
     if denied:
         return denied
     resp = requests.post(f"{IDENTITY}/internal/users/{username}/password", json={
@@ -765,8 +862,8 @@ def _probe(url, ok_status=200):
 
 @app.get("/health")
 def health():
-    if not caller_roles() & {"admin", "partner"}:
-        return "Zugriff verweigert: Gesundheit erfordert die Rolle admin oder partner.", 403
+    if not caller_roles() & {"server_admin", "partner"}:
+        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder partner.", 403
 
     core = []
     state, label, detail = _probe(f"{IDENTITY}/internal/status")
@@ -1053,15 +1150,15 @@ def store_page(msg=None, msg_ok=True, status=200):
 
 @app.get("/store")
 def store():
-    if "admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle admin.", 403
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
     return store_page()
 
 
 @app.post("/store/install")
 def store_install():
-    if "admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle admin.", 403
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
     app_id = request.form.get("app_id", "").strip()
     if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", app_id):
         return store_page("Ungültige App-Kennung.", msg_ok=False, status=400)
@@ -1097,6 +1194,94 @@ def store_install():
     return store_page(f"Die Installation von '{app_id}' läuft noch — das "
                       "Ergebnis erscheint im Deploy-Protokoll auf der "
                       "Gesundheitsseite.", status=202)
+
+
+# ---------------------------------------------------------------------------
+# App-instance visibility (RFC-0007) — server_admin only. /apps-registry
+# is mounted read-only in this container (like the store install above),
+# so a change is queued to the host-side worker (appctl.py
+# process-deploys), which updates the registry, regenerates that
+# instance's Caddy site(s) and reloads the gateway.
+
+VISIBILITY_WAIT_SECONDS = 20  # registry+Caddy+reload only, no docker work
+
+
+def _instance_groups(inst):
+    return (inst.get("visibility") or {}).get("groups") or []
+
+
+@app.get("/instances")
+def instances_list():
+    denied = require_server_admin()
+    if denied:
+        return denied
+    rows = []
+    for name, inst in sorted(load_instances().items()):
+        groups = _instance_groups(inst)
+        channel = inst.get("channel", "production")
+        rows.append({
+            "name": name, "app_name": inst.get("app_name", name),
+            "version": inst.get("version", "?"),
+            "channel": channel, "channel_label": CHANNEL_LABELS.get(channel, channel),
+            "visibility_label": "Alle" if not groups else "Gruppen: " + ", ".join(groups),
+        })
+    return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows)
+
+
+@app.get("/instances/<name>")
+def instance_detail(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    i = {"name": name, "app_name": inst.get("app_name", name),
+         "version": inst.get("version", "?"),
+         "groups": _instance_groups(inst), "roles": inst.get("roles") or []}
+    return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.post("/instances/<name>/visibility")
+def instance_visibility(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    mode = request.form.get("mode", "all")
+    groups = _parse_groups(request.form.get("groups", "")) if mode == "groups" else []
+    if mode == "groups" and not groups:
+        return redirect(
+            f"/instances/{name}?err={quote('Bitte mindestens eine Gruppe angeben oder Alle wählen.')}",
+            code=303)
+    rid = _uuid.uuid4().hex
+    os.makedirs(SPOOL_QUEUE, exist_ok=True)
+    tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "instance": name, "action": "visibility",
+                   "groups": groups, "by": request.headers.get("X-OAAP-User", "?"),
+                   "requested": datetime.now(timezone.utc).isoformat()}, f)
+    os.replace(tmp, os.path.join(SPOOL_QUEUE, f"{rid}.json"))
+    res_path = os.path.join(SPOOL_RESULTS, f"{rid}.json")
+    deadline = _time.time() + VISIBILITY_WAIT_SECONDS
+    while _time.time() < deadline:
+        if os.path.exists(res_path):
+            try:
+                with open(res_path, encoding="utf-8") as f:
+                    res = json.load(f)
+            finally:
+                os.remove(res_path)
+            if res.get("ok"):
+                return redirect(f"/instances/{name}?msg={quote('Gespeichert.')}", code=303)
+            return redirect(
+                f"/instances/{name}?err={quote(res.get('message', 'Speichern fehlgeschlagen.'))}",
+                code=303)
+        _time.sleep(1)
+    return redirect(
+        f"/instances/{name}?err={quote('Die Änderung läuft noch — bitte gleich erneut prüfen.')}",
+        code=303)
 
 
 # ---------------------------------------------------------------------------

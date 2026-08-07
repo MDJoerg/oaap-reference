@@ -25,10 +25,17 @@ DATA_DIR = "/data"
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
-# Standard roles a user account may hold (RFC-0002; `public` is a route
-# marker, not a role).
-ASSIGNABLE_ROLES = ("admin", "keyuser", "user", "guest", "partner")
+# Standard roles a user account may hold (RFC-0002 + RFC-0008; `public`
+# is a route marker, not a role). server_admin is platform authority
+# (users, groups, edge/external routing, backup, visibility bypass) and
+# is never forwarded to apps as something app-specific — see RFC-0008.
+# admin is unchanged: an app-facing role only, carrying no platform
+# authority by itself.
+ASSIGNABLE_ROLES = ("server_admin", "admin", "keyuser", "user", "guest", "partner")
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
+# Free-form visibility tags (RFC-0007) — no registry, a group exists
+# the moment any user carries it. Kept short and simple like usernames.
+GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 
 app = Flask(__name__)
 app.secret_key = os.environ["SESSION_SECRET"]
@@ -95,7 +102,37 @@ def load_users():
         # elsewhere (another tab/window, browser history). This counter,
         # bumped on logout, is what actually revokes it (see verify()).
         u.setdefault("session_epoch", 0)
+        # RFC-0007: free-form visibility group tags.
+        u.setdefault("groups", [])
     return users
+
+
+def _migrate_server_admin_once():
+    """RFC-0008, one-time upgrade step: every existing `admin` holder
+    also becomes `server_admin`, so nobody presently trusted with the
+    server loses access when the two roles split apart. Runs once per
+    installation (STATE_FILE flag), not on every load — after this,
+    the two roles are granted independently.
+    """
+    state = _load(STATE_FILE, {})
+    if state.get("server_admin_migrated"):
+        return
+    users = load_users()
+    changed = False
+    for u in users:
+        if "admin" in u["roles"] and "server_admin" not in u["roles"]:
+            u["roles"] = sorted(set(u["roles"]) | {"server_admin"})
+            changed = True
+    if changed:
+        _save(USERS_FILE, users)
+        print(f"RFC-0008 migration: granted server_admin to "
+              f"{sum(1 for u in users if 'server_admin' in u['roles'])} existing admin(s)",
+              flush=True)
+    state["server_admin_migrated"] = True
+    _save(STATE_FILE, state)
+
+
+_migrate_server_admin_once()
 
 
 def find_user(users, username):
@@ -112,11 +149,16 @@ def session_username():
 def public_user(u):
     """User record for list/UI use — never the password hash (spec 5.7)."""
     return {"username": u["username"], "display_name": u["display_name"],
-            "roles": u["roles"], "active": u["active"]}
+            "roles": u["roles"], "groups": u["groups"], "active": u["active"]}
 
 
-def other_active_admin_exists(users, username):
-    return any(u["active"] and "admin" in u["roles"] and u["username"] != username
+def other_active_server_admin_exists(users, username):
+    """RFC-0008: the platform must keep at least one active server_admin
+    (losing the last one would lock everyone out of user/edge/store
+    management — the same protection RFC-0002 gave `admin` originally,
+    now attached to the role that actually carries platform authority).
+    """
+    return any(u["active"] and "server_admin" in u["roles"] and u["username"] != username
                for u in users)
 
 
@@ -245,8 +287,13 @@ def verify():
 
     Optional ?roles=a,b restricts the route to users holding at least
     one of the given roles (route-level authorization from the app
-    manifest, spec oaap.apps.runtime 2.4). Roles always come from the
-    current user store, never from the session (spec 2.3).
+    manifest, spec oaap.apps.runtime 2.4). Optional ?groups=a,b is an
+    ADDITIONAL restriction from the instance's visibility setting
+    (RFC-0007): the caller needs at least one of the listed groups,
+    unless they hold server_admin (RFC-0008's platform-wide bypass —
+    the true administrator sees every instance regardless of
+    visibility). Roles and groups always come from the current user
+    store, never from the session (spec 2.3).
     """
     username = session_username()
     user = find_user(load_users(), username) if username else None
@@ -257,6 +304,10 @@ def verify():
     required = request.args.get("roles", "")
     if required and not set(required.split(",")) & set(user["roles"]):
         return "Forbidden: missing role", 403
+    required_groups = request.args.get("groups", "")
+    if (required_groups and "server_admin" not in user["roles"]
+            and not set(required_groups.split(",")) & set(user["groups"])):
+        return "Forbidden: not in a visibility group for this app", 403
     return "", 204, {
         "X-OAAP-User": user["username"],
         "X-OAAP-Roles": ",".join(user["roles"]),
@@ -381,10 +432,15 @@ def internal_setup():
         "username": username,
         "display_name": "",
         "password_hash": generate_password_hash(password),
-        "roles": ["admin", "keyuser"],
+        # RFC-0008: the initial user gets both server_admin (platform
+        # authority — can designate further server admins) and admin
+        # (app-facing, unchanged) — no behavior change for the common
+        # single-operator install.
+        "roles": ["server_admin", "admin", "keyuser"],
+        "groups": [],
         "active": True,
     }])
-    _save(STATE_FILE, {"setup_done": True})
+    _save(STATE_FILE, {"setup_done": True, "server_admin_migrated": True})
     return {"ok": True}, 201
 
 
@@ -393,6 +449,17 @@ def _validated_roles(raw):
     if not roles:
         raise ValueError("Mindestens eine gültige Rolle ist erforderlich.")
     return sorted(set(roles))
+
+
+def _validated_groups(raw):
+    """Free-form visibility tags (RFC-0007) — no registry, just a
+    filtered, deduplicated list of short lowercase tokens."""
+    groups = [g.strip().lower() for g in (raw or []) if g and g.strip()]
+    bad = [g for g in groups if not GROUP_RE.fullmatch(g)]
+    if bad:
+        raise ValueError(f"Ungültige Gruppen-Stichworte: {', '.join(bad)} "
+                          "(Kleinbuchstaben/Ziffern/._-, max. 40 Zeichen).")
+    return sorted(set(groups))
 
 
 @app.get("/internal/users")
@@ -413,6 +480,7 @@ def users_create():
         return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
     try:
         roles = _validated_roles(body.get("roles"))
+        groups = _validated_groups(body.get("groups"))
     except ValueError as e:
         return {"error": str(e)}, 400
     users.append({
@@ -420,6 +488,7 @@ def users_create():
         "display_name": (body.get("display_name") or "").strip(),
         "password_hash": generate_password_hash(body["password"]),
         "roles": roles,
+        "groups": groups,
         "active": True,
     })
     _save(USERS_FILE, users)
@@ -435,17 +504,20 @@ def users_update(username):
         return {"error": "Benutzer nicht gefunden."}, 404
     try:
         roles = _validated_roles(body.get("roles"))
+        groups = _validated_groups(body.get("groups"))
     except ValueError as e:
         return {"error": str(e)}, 400
     active = bool(body.get("active", True))
-    # Last-admin protection (spec 2.4): the platform must keep at least
-    # one active admin.
-    loses_admin = "admin" in u["roles"] and u["active"] and \
-                  ("admin" not in roles or not active)
-    if loses_admin and not other_active_admin_exists(users, username):
-        return {"error": "Das ist der letzte aktive Administrator — "
-                         "bitte zuerst jemand anderem admin geben."}, 409
+    # Last-server_admin protection (RFC-0008): the platform must keep
+    # at least one active server_admin, or nobody could manage users,
+    # edge routes, external hostnames or the store any more.
+    loses_server_admin = "server_admin" in u["roles"] and u["active"] and \
+                         ("server_admin" not in roles or not active)
+    if loses_server_admin and not other_active_server_admin_exists(users, username):
+        return {"error": "Das ist der letzte aktive server_admin — "
+                         "bitte zuerst jemand anderem server_admin geben."}, 409
     u["roles"] = roles
+    u["groups"] = groups
     u["active"] = active
     u["display_name"] = (body.get("display_name") or "").strip()
     _save(USERS_FILE, users)

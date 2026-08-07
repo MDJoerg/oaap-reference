@@ -6,6 +6,7 @@ Host-side app manager invoked via `oaap app ...`:
     oaap app install <package-dir> [--name NAME] [--channel production|test]
     oaap app list
     oaap app remove <name> [--purge]
+    oaap app visibility <name> all | groups <g1,g2,...>   (RFC-0007)
 
 Implements: manifest validation (subset of the published JSON Schema),
 build on device, named instances with channels, per-instance storage/
@@ -115,7 +116,7 @@ def image_uid(image):
         return None
 
 
-def site_body(routes, container, svc_port):
+def site_body(routes, container, svc_port, groups=None):
     """Shared handler block for one app instance (LAN and external sites).
 
     /auth/* is reserved on every entry point, not only the portal apex
@@ -130,6 +131,10 @@ def site_body(routes, container, svc_port):
     whole registered external hostname (DomainAwareSessionInterface), so
     logging in here authenticates the user platform-wide, and login
     redirects to "/" — back to this same instance.
+
+    groups: optional visibility restriction (RFC-0007) from the
+    instance's registry entry — an ADDITIONAL check alongside roles,
+    added to every non-public route's forward_auth call.
     """
     lines = []
     lines.append("\thandle /auth/* {")
@@ -149,8 +154,11 @@ def site_body(routes, container, svc_port):
             # verified headers again. forward_auth's copy_headers
             # replaces any client-sent values (anti-spoofing), matching
             # the main gateway Caddyfile.
+            uri = f"/verify?roles={','.join(sorted(set(roles)))}"
+            if groups:
+                uri += f"&groups={','.join(sorted(set(groups)))}"
             lines.append("\t\tforward_auth identity:8000 {")
-            lines.append(f"\t\t\turi /verify?roles={','.join(sorted(set(roles)))}")
+            lines.append(f"\t\t\turi {uri}")
             lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
             lines.append("\t\t}")
         else:
@@ -167,9 +175,9 @@ def site_body(routes, container, svc_port):
     return lines
 
 
-def caddy_site(port, routes, container, svc_port):
+def caddy_site(port, routes, container, svc_port, groups=None):
     """Generate a LAN gateway listener for one app instance."""
-    lines = [f":{port} {{"] + site_body(routes, container, svc_port) + ["}"]
+    lines = [f":{port} {{"] + site_body(routes, container, svc_port, groups) + ["}"]
     return "\n".join(lines) + "\n"
 
 
@@ -279,7 +287,8 @@ def write_external_caddy():
         if edge:
             lines += _edge_guard(edge)
         lines += _LOG_BLOCK
-        lines += site_body(routes, inst["container"], inst["svc_port"])
+        groups = (inst.get("visibility") or {}).get("groups")
+        lines += site_body(routes, inst["container"], inst["svc_port"], groups)
         lines.append("}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -543,8 +552,12 @@ def _install_from_dir(pkg, args, source):
          "--restart", "unless-stopped", "--network", "oaap_default",
          "--env-file", env_path, *mounts, image])
 
+    # visibility (RFC-0007) survives reinstall, same as the port above —
+    # a redeploy must not silently reopen a group-restricted instance
+    visibility = (inst.get("visibility") or {}) if inst else {}
+
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(port, m["routes"], container, svc["port"]))
+        f.write(caddy_site(port, m["routes"], container, svc["port"], visibility.get("groups")))
     reload_gateway()
 
     reg["instances"][name] = {
@@ -566,6 +579,9 @@ def _install_from_dir(pkg, args, source):
         # roles that may see/open the app — the portal filters tiles
         # with this; the gateway enforces it regardless (spec 2.5)
         "roles": sorted({r for rt in m["routes"] for r in rt["roles"] if r != "public"}),
+        # additional visibility restriction on top of roles (RFC-0007);
+        # {} means "all" (no restriction) — set with 'oaap app visibility'
+        "visibility": visibility,
     }
     save_registry(reg)
     if channel == "production":
@@ -609,6 +625,47 @@ def cmd_remove(args):
         print(f"Removed '{args.name}' including data.")
     else:
         print(f"Removed '{args.name}'. Data kept at {os.path.join(APPS_DIR, args.name)}.")
+
+
+# ------------------------------------------------- app visibility (RFC-0007)
+# Restricts, in ADDITION to the manifest's roles, who may see and reach an
+# installed instance — a free-form group tag on users, an operator
+# decision made per instance (never in the manifest). server_admin
+# (RFC-0008) always bypasses it. The portal offers the same control
+# through /instances, queued through the spool worker because its
+# registry mount is read-only; this CLI writes directly (it already
+# needs root).
+
+GROUP_RE = r"[a-z0-9][a-z0-9._-]{0,39}"
+
+
+def cmd_visibility(args):
+    reg = load_registry()
+    inst = reg["instances"].get(args.name)
+    if not inst:
+        die(f"no instance named '{args.name}'")
+    if args.mode == "all":
+        groups = []
+    else:
+        groups = sorted({g.strip().lower() for g in (args.groups or "").split(",") if g.strip()})
+        if not groups:
+            die("'visibility groups' needs at least one group, "
+                "e.g. 'oaap app visibility <name> groups buero,finanzen'")
+        for g in groups:
+            if not re.fullmatch(GROUP_RE, g):
+                die(f"invalid group tag '{g}' (lowercase [a-z0-9._-], max 40 chars)")
+    inst["visibility"] = {"groups": groups} if groups else {}
+    save_registry(reg)
+    with open(os.path.join(CADDY_APPS_DIR, f"{args.name}.caddy"), "w", encoding="utf-8") as f:
+        f.write(caddy_site(inst["port"], inst["routes"], inst["container"], inst["svc_port"], groups))
+    if load_external():
+        write_external_caddy()
+    reload_gateway()
+    if groups:
+        print(f"'{args.name}' visibility set to groups: {', '.join(groups)}")
+        print("Users need at least one of these groups (or the server_admin role) to see/reach it.")
+    else:
+        print(f"'{args.name}' visibility set to 'all' (role check only, as before).")
 
 
 # ---------------------------------------------------------------- convert
@@ -943,6 +1000,24 @@ def cmd_process_deploys(_args):
                 ok, msg = run_install(src, channel)
                 if ok:
                     msg = "installed from store"
+        elif action == "visibility":
+            # App-instance visibility groups (RFC-0007): the portal's
+            # /apps-registry mount is read-only, so this — like the
+            # store install above — is applied here on the host.
+            if not inst:
+                msg = "unknown instance"
+            else:
+                groups = req.get("groups") or []
+                inst["visibility"] = {"groups": groups} if groups else {}
+                save_registry(reg)
+                with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
+                    f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
+                                       inst["svc_port"], groups))
+                if load_external():
+                    write_external_caddy()
+                reload_gateway()
+                ok = True
+                msg = ("visibility set to groups: " + ", ".join(groups)) if groups else "visibility set to all"
         elif not inst or name not in tokens:
             msg = "unknown instance or no deploy token"
         elif inst["channel"] != "test":
@@ -954,9 +1029,9 @@ def cmd_process_deploys(_args):
             revision = _resolve_revision(src)
             ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
+        via = {"install": "store", "visibility": "portal"}.get(action, "deploy-hook")
         audit_deploy({"instance": name, "ok": ok, "message": msg,
-                      "revision": revision, "version": version,
-                      "via": "store" if action == "install" else "deploy-hook"})
+                      "revision": revision, "version": version, "via": via})
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:
@@ -1097,7 +1172,8 @@ def _deploy_from_registry(name, inst):
          "--restart", "unless-stopped", "--network", "oaap_default",
          "--env-file", env_path, *mounts, image])
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(inst["port"], inst["routes"], container, inst["svc_port"]))
+        f.write(caddy_site(inst["port"], inst["routes"], container, inst["svc_port"],
+                           (inst.get("visibility") or {}).get("groups")))
     print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
           f"channel {inst['channel']}, port {inst['port']})")
     return True
@@ -1184,6 +1260,12 @@ def main():
     pr.add_argument("name")
     pr.add_argument("--purge", action="store_true")
     pr.set_defaults(fn=cmd_remove)
+    pv = sub.add_parser("visibility")
+    pv.add_argument("name")
+    pv.add_argument("mode", choices=["all", "groups"])
+    pv.add_argument("groups", nargs="?", default="",
+                    help="comma-separated group tags, e.g. buero,finanzen (with 'groups')")
+    pv.set_defaults(fn=cmd_visibility)
     pc = sub.add_parser("convert")
     pc.add_argument("compose")
     pc.add_argument("--out", default="./oaap-converted")
