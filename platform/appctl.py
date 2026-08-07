@@ -116,8 +116,27 @@ def image_uid(image):
 
 
 def site_body(routes, container, svc_port):
-    """Shared handler block for one app instance (LAN and external sites)."""
+    """Shared handler block for one app instance (LAN and external sites).
+
+    /auth/* is reserved on every entry point, not only the portal apex
+    (mirrors the main gateway Caddyfile and _portal_site_body()). Without
+    it, a session started directly on an app's own port/subdomain — no
+    prior visit to the portal — hits an infinite redirect loop: identity's
+    /verify sends an unauthenticated visitor to the relative "/auth/login",
+    which on a bare instance site has no dedicated handler and falls
+    through to the app's own catch-all route, re-triggering forward_auth.
+    Placing it first also protects it from any app route of the same
+    name. Safe to expose everywhere: the session cookie is scoped to the
+    whole registered external hostname (DomainAwareSessionInterface), so
+    logging in here authenticates the user platform-wide, and login
+    redirects to "/" — back to this same instance.
+    """
     lines = []
+    lines.append("\thandle /auth/* {")
+    lines.append("\t\trequest_header -X-OAAP-User")
+    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines.append("\t\treverse_proxy identity:8000")
+    lines.append("\t}")
     # longest prefix first; catch-all "/" last
     ordered = sorted(routes, key=lambda r: len(r["path"]), reverse=True)
     for r in ordered:
