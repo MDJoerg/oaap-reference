@@ -488,6 +488,75 @@ INSTANCE_EDIT_BODY = """
     <button>Speichern</button>
   </div>
 </form>
+<form method="post" action="/instances/{{ i.name }}/address">
+  <div class="card">
+    <h2>Eigene Adresse</h2>
+    <p class="muted">Automatisch erreichbar unter
+       <code>{{ i.auto_address or "— (dieser Knoten hat keinen externen Namen)" }}</code>.
+       Zusätzlich kann diese Instanz einen eigenen öffentlichen Namen tragen —
+       sinnvoll, wenn die Adresse in ausgelieferte Software eingebaut wird und
+       einen späteren Umzug überleben soll.</p>
+    <label>Eigener Name <input type="text" name="hostname" value="{{ i.address }}"
+           placeholder="z. B. hub.meine-domain.de"></label>
+    <p class="muted">Der Name muss selbst auf diesen Knoten zeigen (DNS-Eintrag
+       und Portfreigabe bleiben Deine Sache). Das Zertifikat holt die Plattform
+       beim ersten Zugriff. Die automatische Adresse bleibt gültig.</p>
+    <button>Speichern</button>
+    {% if i.address %}<button name="op" value="remove" class="secondary">Namen entfernen</button>{% endif %}
+  </div>
+</form>
+{% if i.has_public_route %}
+<form method="post" action="/instances/{{ i.name }}/throttle">
+  <div class="card">
+    <h2>Drosselung öffentlicher Routen</h2>
+    <p class="muted">Diese App hat mindestens eine Route, die <strong>ohne
+       Anmeldung</strong> erreichbar ist. Dort begrenzt die Plattform die
+       Anfragen je Client-Adresse — ein gemeinsames Budget über alle Zugänge
+       dieser Instanz.</p>
+    <label class="checkline"><input type="radio" name="mode" value="default"
+           {{ 'checked' if i.throttle_mode == 'default' }}>Standard ({{ i.throttle_default }})</label>
+    <label class="checkline"><input type="radio" name="mode" value="custom"
+           {{ 'checked' if i.throttle_mode == 'custom' }}>Eigener Wert</label>
+    <label>Anfragen pro Sekunden <input type="text" name="rate" value="{{ i.throttle_rate }}"
+           placeholder="z. B. 600/60 für 600 Anfragen pro Minute"></label>
+    <label class="checkline"><input type="radio" name="mode" value="off"
+           {{ 'checked' if i.throttle_mode == 'off' }}>Aus — keine Bremse</label>
+    <p class="muted">Das ist eine Mengenbremse, keine Zugangskontrolle: Sie
+       begrenzt pro Adresse und hält niemanden auf, der viele Adressen hat.
+       Die App muss ihre eigenen Zugangsschlüssel weiterhin selbst schützen.
+       Alle Geräte hinter einem Internetanschluss zählen als ein Client.</p>
+    <button>Speichern</button>
+  </div>
+</form>
+{% endif %}
+{% if i.is_test %}
+<div class="card">
+  <h2>Deploy-Token</h2>
+  {% if i.token_created %}
+  <p>Ein Token für diese Instanz besteht seit <strong>{{ i.token_created }}</strong>.
+     Der Wert selbst ist nirgends gespeichert — nur seine Prüfsumme. Wenn er
+     verloren ging, erzeuge einen neuen; der alte gilt dann nicht mehr.</p>
+  {% else %}
+  <p class="muted">Für diese Instanz besteht kein Token.</p>
+  {% endif %}
+  <p class="muted">Adresse für den Hook (an die KI weitergeben, sie ist nicht
+     geheim):<br><code>{{ i.hook_url }}</code></p>
+  <form method="post" action="/instances/{{ i.name }}/token" style="display:inline">
+    <input type="hidden" name="op" value="create">
+    <button>{{ "Neues Token erzeugen" if i.token_created else "Token erzeugen" }}</button>
+  </form>
+  {% if i.token_created %}
+  <form method="post" action="/instances/{{ i.name }}/token" style="display:inline">
+    <input type="hidden" name="op" value="revoke">
+    <button class="secondary">Widerrufen</button>
+  </form>
+  {% endif %}
+  <p class="muted">Ein Deploy-Token erlaubt genau eines: diese Test-Instanz aus
+     ihrer hinterlegten Quelle neu zu deployen. Keine Anmeldung, kein Zugriff
+     auf Daten, keine Änderung an Routen oder Rollen. Produktiv-Instanzen
+     bekommen grundsätzlich kein Token.</p>
+</div>
+{% endif %}
 {% if i.config %}
 <form method="post" action="/instances/{{ i.name }}/config">
   <div class="card">
@@ -512,6 +581,30 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 {% endif %}
+"""
+
+# Floorplan "Dialogseite": the one and only time the token is readable.
+# Deliberately NOT a redirect — a Post/Redirect/Get would have to carry
+# the token in the URL, and the gateway logs full URIs including their
+# query string.
+TOKEN_SHOW_BODY = """
+<a class="back" href="/instances/{{ name }}">← Zurück zur Instanz</a>
+<h1>Deploy-Token für {{ name }}</h1>
+<div class="card">
+  <p class="ok">Token erzeugt. <strong>Es wird nur dieses eine Mal
+     angezeigt.</strong> Die Plattform speichert davon nur eine Prüfsumme —
+     wir können es Dir später nicht noch einmal zeigen.</p>
+  <p><code style="display:block;padding:.7rem;word-break:break-all;font-size:1.05rem">{{ token }}</code></p>
+  <p>Weitergabe an die KI: über den vereinbarten Postkasten oder einen
+     anderen Kanal, den nur ihr beide lest — <strong>nicht ins
+     Repository, nicht in einen Brief, nicht in ein Ticket.</strong></p>
+  <h2>So wird es benutzt</h2>
+  <p class="muted">Nach jedem Push auf die hinterlegte Quelle:</p>
+  <p><code style="display:block;padding:.7rem;word-break:break-all">curl -X POST {{ hook_url }} -H "Authorization: Bearer &lt;token&gt;"</code></p>
+  <p class="muted">Antwort 202 heißt „läuft noch"; den Ausgang danach unter
+     <code>{{ hook_url }}/status</code> abfragen.</p>
+  <p><a href="/instances/{{ name }}">Fertig — zurück zur Instanz</a></p>
+</div>
 """
 
 SETUP_PAGE = STYLE + """
@@ -974,6 +1067,7 @@ def health():
 
 import hashlib
 import hmac
+import secrets
 import re as _re
 import time as _time
 import uuid as _uuid
@@ -1337,7 +1431,15 @@ def instance_detail(name):
     i = {"name": name, "app_name": inst.get("app_name", name),
          "version": inst.get("version", "?"),
          "groups": _instance_groups(inst), "roles": inst.get("roles") or [],
-         "config": _instance_config(name, inst)}
+         "config": _instance_config(name, inst),
+         "is_test": inst.get("channel") == "test",
+         "token_created": _token_created(name),
+         "hook_url": _hook_url(name),
+         "address": inst.get("address", ""),
+         "auto_address": f"{name}.{external_host()}" if external_host() else "",
+         "has_public_route": any("public" in (r.get("roles") or [])
+                                 for r in inst.get("routes") or []),
+         **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
@@ -1361,6 +1463,114 @@ def instance_visibility(name):
 
 # Recreating the container takes noticeably longer than a registry edit.
 CONFIG_WAIT_SECONDS = 90
+TOKEN_WAIT_SECONDS = 20    # writes one small file, no container work
+ADDRESS_WAIT_SECONDS = 30  # registry + Caddy regeneration + reload
+
+
+def _token_created(name):
+    """When the instance's deploy token was issued ('' = none)."""
+    try:
+        with open(DEPLOY_TOKENS, encoding="utf-8") as f:
+            stamp = (json.load(f).get(name) or {}).get("created", "")
+    except (OSError, ValueError):
+        return ""
+    return stamp.replace("T", " ").rstrip("Z")
+
+
+DEFAULT_THROTTLE = {"limit": 300, "window": 60}  # mirrors appctl.DEFAULT_THROTTLE
+
+
+def _throttle_view(inst):
+    """Radio state and rate field for the throttle card (RFC-0010)."""
+    t = inst.get("throttle")
+    default = (f"{DEFAULT_THROTTLE['limit']} Anfragen pro "
+               f"{DEFAULT_THROTTLE['window']} Sekunden")
+    if t is None:                      # kein Override -> Plattform-Standard
+        mode, rate = "default", ""
+    elif not t:                        # ausdrücklich abgeschaltet
+        mode, rate = "off", ""
+    else:
+        mode, rate = "custom", f"{t['limit']}/{t['window']}"
+    return {"throttle_mode": mode, "throttle_rate": rate,
+            "throttle_default": default}
+
+
+@app.post("/instances/<name>/address")
+def instance_address(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    hostname = (request.form.get("hostname") or "").strip()
+    if request.form.get("op") == "remove" or not hostname:
+        return _queue_and_redirect(name, {"action": "address", "op": "remove"},
+                                   ADDRESS_WAIT_SECONDS)
+    return _queue_and_redirect(name, {"action": "address", "hostname": hostname},
+                               ADDRESS_WAIT_SECONDS)
+
+
+@app.post("/instances/<name>/throttle")
+def instance_throttle(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    return _queue_and_redirect(name, {
+        "action": "throttle",
+        "mode": request.form.get("mode", "default"),
+        "rate": request.form.get("rate", ""),
+    }, ADDRESS_WAIT_SECONDS)
+
+
+def _hook_url(name):
+    """Where the deploy hook answers for this instance.
+
+    The hook lives on the platform apex, not on an instance's own
+    address — so this is always the node's external hostname, or the
+    host the caller is using when the node has none.
+    """
+    ext = external_host()
+    return f"https://{ext}/deploy/{name}" if ext else f"http://{request.host}/deploy/{name}"
+
+
+@app.post("/instances/<name>/token")
+def instance_token(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    if inst.get("channel") != "test":
+        return redirect(
+            f"/instances/{name}?err={quote('Deploy-Token gibt es nur für Test-Instanzen.')}",
+            code=303)
+    if request.form.get("op") == "revoke":
+        return _queue_and_redirect(name, {"action": "token", "op": "revoke"},
+                                   TOKEN_WAIT_SECONDS)
+    # The portal mints the token and hands the host only its digest, so
+    # the readable value never touches the filesystem — not the spool,
+    # not the token store. Creating one is no more privilege than this
+    # page already has: a token authorizes exactly the redeploy the
+    # portal can trigger anyway (runtime spec 2.5).
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    res = _queue_and_wait(name, {"action": "token", "op": "create", "digest": digest},
+                          TOKEN_WAIT_SECONDS)
+    if res is None:
+        return redirect(
+            f"/instances/{name}?err={quote('Die Ausstellung läuft noch — bitte gleich erneut prüfen.')}",
+            code=303)
+    if not res.get("ok"):
+        return redirect(
+            f"/instances/{name}?err={quote(res.get('message', 'Token konnte nicht erzeugt werden.'))}",
+            code=303)
+    # Rendered directly, NOT via Post/Redirect/Get: a redirect would put
+    # the token into a URL, and the gateway logs full URIs.
+    return page(TOKEN_SHOW_BODY, f"Deploy-Token {name}", "instances",
+                name=name, token=token, hook_url=_hook_url(name))
 
 
 @app.post("/instances/<name>/config")
@@ -1388,10 +1598,26 @@ def instance_config(name):
 
 
 def _queue_and_redirect(name, payload, wait_seconds):
+    """Queue a change and turn the worker's verdict into a redirect."""
+    res = _queue_and_wait(name, payload, wait_seconds)
+    if res is None:
+        return redirect(
+            f"/instances/{name}?err={quote('Die Änderung läuft noch — bitte gleich erneut prüfen.')}",
+            code=303)
+    if res.get("ok"):
+        return redirect(f"/instances/{name}?msg={quote('Gespeichert.')}", code=303)
+    return redirect(
+        f"/instances/{name}?err={quote(res.get('message', 'Speichern fehlgeschlagen.'))}",
+        code=303)
+
+
+def _queue_and_wait(name, payload, wait_seconds):
     """Hand a change to the host-side worker and wait for its verdict.
 
-    The request file may carry configuration values, so it is written
-    0600 -- it lives in the spool only until the worker consumes it.
+    Returns the worker's result dict, or None if it did not answer in
+    time. The request file may carry configuration values, so it is
+    written 0600 -- it lives in the spool only until the worker
+    consumes it.
     """
     rid = _uuid.uuid4().hex
     os.makedirs(SPOOL_QUEUE, exist_ok=True)
@@ -1409,18 +1635,11 @@ def _queue_and_redirect(name, payload, wait_seconds):
         if os.path.exists(res_path):
             try:
                 with open(res_path, encoding="utf-8") as f:
-                    res = json.load(f)
+                    return json.load(f)
             finally:
                 os.remove(res_path)
-            if res.get("ok"):
-                return redirect(f"/instances/{name}?msg={quote('Gespeichert.')}", code=303)
-            return redirect(
-                f"/instances/{name}?err={quote(res.get('message', 'Speichern fehlgeschlagen.'))}",
-                code=303)
         _time.sleep(1)
-    return redirect(
-        f"/instances/{name}?err={quote('Die Änderung läuft noch — bitte gleich erneut prüfen.')}",
-        code=303)
+    return None
 
 
 # ---------------------------------------------------------------------------

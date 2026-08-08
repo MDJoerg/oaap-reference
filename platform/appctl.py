@@ -793,6 +793,38 @@ def cmd_throttle(args):
     reload_gateway()
 
 
+def check_instance_address(reg, name, inst, hostname):
+    """Validate a candidate public hostname; returns it normalised.
+
+    Shared by the CLI and the portal's host-side worker, so both refuse
+    exactly the same collisions (RFC-0009). Raises ValueError.
+    """
+    ext_host = load_external()
+    host = (hostname or "").lower().strip().rstrip(".")
+    if not re.fullmatch(HOSTNAME_RE, host):
+        raise ValueError("needs a valid hostname, e.g. hub.example.org")
+    if host == ext_host:
+        raise ValueError(f"{host} is this node's own external hostname (the "
+                         "portal answers there) — choose a different name")
+    if ext_host and host.endswith(f".{ext_host}"):
+        raise ValueError(f"names under {ext_host} are already generated "
+                         f"automatically — '{name}' is reachable at "
+                         f"{name}.{ext_host} without this")
+    for r in load_edge():
+        if host == r["host"] or host.endswith(f".{r['host']}"):
+            raise ValueError(f"{host} is covered by the edge route for "
+                             f"{r['host']} (forwarded to {r['target']}) — "
+                             "remove that route first")
+    taken = next((n for n, i in reg["instances"].items()
+                  if n != name and i.get("address") == host), "")
+    if taken:
+        raise ValueError(f"{host} is already registered for instance '{taken}'")
+    if not inst.get("routes") or not inst.get("svc_port"):
+        raise ValueError(f"'{name}' predates route capture — reinstall it "
+                         "once, then set its address")
+    return host
+
+
 def cmd_address(args):
     """Give one instance a public hostname of its own (RFC-0009)."""
     reg = load_registry()
@@ -821,26 +853,10 @@ def cmd_address(args):
             print(f"Still reachable at https://{name}.{ext_host}/")
         return
 
-    host = (args.hostname or "").lower().strip().rstrip(".")
-    if not re.fullmatch(HOSTNAME_RE, host):
-        die("'app address set' needs a valid hostname, e.g. hub.example.org")
-    if host == ext_host:
-        die(f"{host} is this node's own external hostname (the portal answers "
-            "there) — choose a different name")
-    if ext_host and host.endswith(f".{ext_host}"):
-        die(f"names under {ext_host} are already generated automatically — "
-            f"'{name}' is reachable at {name}.{ext_host} without this")
-    for r in load_edge():
-        if host == r["host"] or host.endswith(f".{r['host']}"):
-            die(f"{host} is covered by the edge route for {r['host']} "
-                f"(forwarded to {r['target']}) — remove that route first")
-    taken = next((n for n, i in reg["instances"].items()
-                  if n != name and i.get("address") == host), "")
-    if taken:
-        die(f"{host} is already registered for instance '{taken}'")
-    if not inst.get("routes") or not inst.get("svc_port"):
-        die(f"'{name}' predates route capture — reinstall it once, then set "
-            "its address")
+    try:
+        host = check_instance_address(reg, name, inst, args.hostname)
+    except ValueError as e:
+        die(str(e))
 
     inst["address"] = host
     save_registry(reg)
@@ -1487,6 +1503,97 @@ def cmd_process_deploys(_args):
                 reload_gateway()
                 ok = True
                 msg = ("visibility set to groups: " + ", ".join(groups)) if groups else "visibility set to all"
+        elif action == "token":
+            # Deploy token from the portal (runtime spec 2.5/2.6). The
+            # portal generates the token and sends only its digest, so
+            # the readable value never reaches the filesystem; the host
+            # re-checks here what the CLI checks, because the spool is
+            # data, not trust: test channel only, recorded source
+            # required.
+            op = req.get("op", "")
+            if not inst:
+                msg = "unknown instance"
+            elif op == "revoke":
+                if name in tokens:
+                    del tokens[name]
+                    save_tokens(tokens)
+                ok, msg = True, "deploy token revoked"
+            elif inst["channel"] != "test":
+                msg = ("production instances never carry a deploy token "
+                       "(spec 2.5)")
+            elif not inst.get("source"):
+                msg = ("no package source recorded — reinstall the instance "
+                       "once, then issue a token")
+            elif not re.fullmatch(r"[0-9a-f]{64}", req.get("digest", "")):
+                msg = "malformed token digest"
+            else:
+                import datetime
+                tokens[name] = {
+                    "digest": req["digest"],
+                    "created": datetime.datetime.now(datetime.timezone.utc)
+                                       .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                save_tokens(tokens)
+                ok, msg = True, "deploy token issued"
+        elif action == "address":
+            # Own public hostname (RFC-0009). Validation runs here, with
+            # the same function the CLI uses — the portal's copy of the
+            # rules would only drift.
+            if not inst:
+                msg = "unknown instance"
+            elif req.get("op") == "remove":
+                old = inst.pop("address", "")
+                save_registry(reg)
+                write_instance_address_caddy()
+                reload_gateway()
+                ok = True
+                msg = f"address {old} removed" if old else "no address was set"
+            else:
+                try:
+                    host = check_instance_address(reg, name, inst,
+                                                  req.get("hostname", ""))
+                    inst["address"] = host
+                    save_registry(reg)
+                    write_instance_address_caddy()
+                    reload_gateway()
+                    ok, msg = True, f"address set to {host}"
+                except ValueError as e:
+                    msg = str(e)
+        elif action == "throttle":
+            # Public-route rate brake (RFC-0010).
+            if not inst:
+                msg = "unknown instance"
+            else:
+                mode = req.get("mode", "default")
+                # value None means "no override" -> platform default
+                apply_it, value = True, None
+                if mode == "off":
+                    value = {}
+                elif mode == "custom":
+                    m = re.fullmatch(r"(\d+)/(\d+)", (req.get("rate") or "").strip())
+                    if not m or int(m.group(1)) < 1 or int(m.group(2)) < 1:
+                        apply_it = False
+                        msg = "rate must look like 300/60, both parts at least 1"
+                    else:
+                        value = {"limit": int(m.group(1)), "window": int(m.group(2))}
+                if apply_it:
+                    if value is None:
+                        inst.pop("throttle", None)
+                    else:
+                        inst["throttle"] = value
+                    save_registry(reg)
+                    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w",
+                              encoding="utf-8") as f:
+                        f.write(caddy_site(inst["port"], inst["routes"],
+                                           inst["container"], inst["svc_port"],
+                                           (inst.get("visibility") or {}).get("groups"),
+                                           name, throttle_of(inst)))
+                    refresh_generated_sites()
+                    reload_gateway()
+                    t = throttle_of(inst)
+                    ok = True
+                    msg = (f"throttle set to {t['limit']}/{t['window']}" if t
+                           else "throttle switched off")
         elif action == "config":
             # Instance configuration (spec 2.3/2.4.3). Same reason as
             # above: the portal cannot write the registry or talk to the
@@ -1515,7 +1622,7 @@ def cmd_process_deploys(_args):
             ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
         via = {"install": "store", "visibility": "portal",
-               "config": "portal"}.get(action, "deploy-hook")
+               "config": "portal", "token": "portal"}.get(action, "deploy-hook")
         audit_deploy({"instance": name, "ok": ok, "message": msg,
                       "revision": revision, "version": version, "via": via})
         if rid:
