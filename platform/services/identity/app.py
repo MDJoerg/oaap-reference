@@ -400,6 +400,63 @@ def password_change():
 
 
 # ---------------------------------------------------------------------------
+# Request throttling for public routes (RFC-0010).
+#
+# Public routes carry no authentication at all — the platform hands the
+# request straight to the app. This is the one gateway-side brake it can
+# still apply: requests per client address per instance. It is a volume
+# brake, not an authentication substitute (see the RFC).
+#
+# Counters live in process memory on purpose: this runs in the hot path
+# of every public request, and the login throttle's file-per-request
+# approach would be far too expensive. Consequence, documented rather
+# than hidden: each gunicorn worker counts on its own, so the effective
+# ceiling is the configured limit times the worker count, and a restart
+# forgets the counters. Both are acceptable for a coarse abuse brake.
+
+_RATE = {}
+_RATE_MAX_KEYS = 20000
+
+
+def _throttle_client():
+    """The client address the gateway vouches for.
+
+    Never derived from X-Forwarded-For here: on a directly exposed
+    route a client can send that header itself. The gateway sets
+    X-OAAP-Client per site, because only it knows whether the peer is
+    the real client (direct) or the edge (behind-edge mode), and the
+    edge overwrites X-Forwarded-For with the true peer.
+    """
+    return (request.headers.get("X-OAAP-Client", "").split(",")[0].strip()
+            or request.remote_addr or "?")
+
+
+@app.get("/throttle")
+def throttle():
+    scope = request.args.get("scope", "")
+    try:
+        limit = max(1, int(request.args.get("limit", "300")))
+        window = max(1, int(request.args.get("window", "60")))
+    except ValueError:
+        limit, window = 300, 60
+    key = f"{scope}|{_throttle_client()}"
+    now = time.time()
+    hits = [t for t in _RATE.get(key, ()) if now - t < window]
+    if len(hits) >= limit:
+        _RATE[key] = hits
+        retry = max(1, int(window - (now - hits[0])))
+        return ("Too many requests", 429,
+                {"Retry-After": str(retry), "Cache-Control": "no-store"})
+    hits.append(now)
+    if key not in _RATE and len(_RATE) >= _RATE_MAX_KEYS:
+        # keep memory bounded under a spray of distinct addresses; the
+        # oldest bucket is the least interesting one to lose
+        _RATE.pop(min(_RATE, key=lambda k: _RATE[k][-1]), None)
+    _RATE[key] = hits
+    return "", 204
+
+
+# ---------------------------------------------------------------------------
 # Internal API — only reachable on the container network (spec 4.3).
 # The portal is responsible for admin authorization of its callers.
 

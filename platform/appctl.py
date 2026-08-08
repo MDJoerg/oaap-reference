@@ -9,6 +9,7 @@ Host-side app manager invoked via `oaap app ...`:
     oaap app visibility <name> all | groups <g1,g2,...>   (RFC-0007)
     oaap app config list|set|unset <name> [key] [value]   (spec 2.3/2.4)
     oaap app address show|set|remove <name> [hostname]    (RFC-0009)
+    oaap app throttle show|set|off <name> [reqs/seconds]  (RFC-0010)
 
 Implements: manifest validation (subset of the published JSON Schema),
 build on device, named instances with channels, per-instance storage/
@@ -120,7 +121,55 @@ def image_uid(image):
         return None
 
 
-def site_body(routes, container, svc_port, groups=None):
+DEFAULT_THROTTLE = {"limit": 300, "window": 60}
+# identity runs several gunicorn workers and each counts on its own
+# (RFC-0010) — kept here so the CLI can state the real ceiling
+IDENTITY_WORKERS = 2
+
+
+def throttle_of(inst):
+    """Effective throttle for an instance ({} = explicitly switched off)."""
+    t = inst.get("throttle")
+    return DEFAULT_THROTTLE if t is None else t
+
+
+def _throttle_block(scope, throttle, edge):
+    """Gateway-side request brake for a public route (RFC-0010).
+
+    Public routes get no forward_auth for identity, so this is the only
+    place the platform can still say "enough". The client address is
+    handed to identity explicitly: in direct mode the TCP peer is the
+    client, behind an edge the peer is the edge and the real client
+    stands in X-Forwarded-For (which the edge overwrites, so it cannot
+    be spoofed). Deriving it inside identity would get this wrong.
+    """
+    if not throttle:
+        return []
+    client = ("{http.request.header.X-Forwarded-For}" if edge
+              else "{http.request.remote.host}")
+    return [
+        "\t\tforward_auth identity:8000 {",
+        f"\t\t\turi /throttle?scope={scope}&limit={throttle['limit']}"
+        f"&window={throttle['window']}",
+        f"\t\t\theader_up X-OAAP-Client {client}",
+        *_AUTH_NO_UPGRADE,
+        "\t\t}",
+    ]
+
+
+# forward_auth hands the ORIGINAL request headers to the auth endpoint.
+# For a WebSocket handshake that includes Connection: Upgrade and
+# Upgrade: websocket, which makes the WSGI server reject the auth
+# subrequest with 400 — and forward_auth passes that straight back to
+# the client, so the handshake dies before the app ever sees it. The
+# auth call is a plain GET; these hop-by-hop headers have no business
+# in it. Without this, App Deployment Contract guarantee 7 (WebSocket
+# and SSE pass through) does not hold on ANY authenticated route.
+_AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
+
+
+def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
+              edge=""):
     """Shared handler block for one app instance (LAN and external sites).
 
     /auth/* is reserved on every entry point, not only the portal apex
@@ -164,10 +213,12 @@ def site_body(routes, container, svc_port, groups=None):
             lines.append("\t\tforward_auth identity:8000 {")
             lines.append(f"\t\t\turi {uri}")
             lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
+            lines += _AUTH_NO_UPGRADE
             lines.append("\t\t}")
         else:
             # Public route: nothing overwrites the headers, so strip
             # client-sent identity headers explicitly (contract guarantee 1).
+            lines += _throttle_block(scope, throttle, edge)
             lines.append("\t\trequest_header -X-OAAP-User")
             lines.append("\t\trequest_header -X-OAAP-Roles")
         lines.append(f"\t\treverse_proxy {container}:{svc_port}")
@@ -179,9 +230,17 @@ def site_body(routes, container, svc_port, groups=None):
     return lines
 
 
-def caddy_site(port, routes, container, svc_port, groups=None):
-    """Generate a LAN gateway listener for one app instance."""
-    lines = [f":{port} {{"] + site_body(routes, container, svc_port, groups) + ["}"]
+def caddy_site(port, routes, container, svc_port, groups=None, scope="",
+               throttle=None):
+    """Generate a LAN gateway listener for one app instance.
+
+    The throttle scope is the instance name on every entry point, so a
+    caller cannot multiply its budget by rotating between the LAN port,
+    the node subdomain and the instance's own hostname.
+    """
+    lines = ([f":{port} {{"]
+             + site_body(routes, container, svc_port, groups, scope, throttle)
+             + ["}"])
     return "\n".join(lines) + "\n"
 
 
@@ -228,6 +287,7 @@ def _portal_site_body():
     lines.append("\t\tforward_auth identity:8000 {")
     lines.append("\t\t\turi /verify")
     lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
+    lines += _AUTH_NO_UPGRADE
     lines.append("\t\t}")
     lines.append("\t\treverse_proxy portal:8000")
     lines.append("\t}")
@@ -292,7 +352,8 @@ def write_external_caddy():
             lines += _edge_guard(edge)
         lines += _LOG_BLOCK
         groups = (inst.get("visibility") or {}).get("groups")
-        lines += site_body(routes, inst["container"], inst["svc_port"], groups)
+        lines += site_body(routes, inst["container"], inst["svc_port"], groups,
+                           name, throttle_of(inst), edge)
         lines.append("}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -331,7 +392,8 @@ def write_instance_address_caddy():
             lines += _edge_guard(edge)
         lines += _LOG_BLOCK
         lines += site_body(inst["routes"], inst["container"], inst["svc_port"],
-                           (inst.get("visibility") or {}).get("groups"))
+                           (inst.get("visibility") or {}).get("groups"),
+                           name, throttle_of(inst), edge)
         lines.append("}")
         if not edge:
             lines.append(f"http://{host} {{")
@@ -448,7 +510,14 @@ def write_edge_caddy():
         lines.append("\t\ton_demand")
         lines.append("\t}")
         lines += _LOG_BLOCK
-        lines.append(f"\treverse_proxy {target}")
+        lines.append(f"\treverse_proxy {target} {{")
+        # Overwrite instead of append: the edge is the outermost hop, so
+        # the only trustworthy entry is the peer it sees itself. Caddy's
+        # default would keep a client-supplied prefix, and everything
+        # downstream that reads the first entry — access log, the public
+        # route throttle (RFC-0010) — would believe the client.
+        lines.append("\t\theader_up X-Forwarded-For {http.request.remote.host}")
+        lines.append("\t}")
         lines.append("}")
         lines.append(f"http://{r['host']}, http://*.{r['host']} {{")
         lines.append("\tredir https://{host}{uri} permanent")
@@ -674,6 +743,56 @@ def cmd_config(args):
     print("brief downtime, storage and address are unchanged.")
 
 
+def cmd_throttle(args):
+    """Rate brake for an instance's public routes (RFC-0010)."""
+    reg = load_registry()
+    name = args.name
+    inst = reg["instances"].get(name)
+    if not inst:
+        die(f"no instance named '{name}'")
+    has_public = any("public" in r["roles"] for r in inst.get("routes") or [])
+
+    if args.action == "show":
+        t = throttle_of(inst)
+        state = (f"{t['limit']} requests per {t['window']} s and client address"
+                 if t else "off")
+        origin = "default" if inst.get("throttle") is None else "set for this instance"
+        print(f"{name}: {state} ({origin})")
+        if not has_public:
+            print("No public route — the throttle never applies here; every "
+                  "route of this instance is authenticated.")
+        return
+
+    if args.action == "off":
+        inst["throttle"] = {}
+        print(f"Throttle switched OFF for '{name}'.")
+        if has_public:
+            print("WARNING: this instance has a public route and now has no "
+                  "platform-side rate brake at all.")
+    else:
+        m = re.fullmatch(r"(\d+)/(\d+)", args.rate or "")
+        if not m:
+            die("'app throttle set' needs <requests>/<seconds>, e.g. 300/60")
+        limit, window = int(m.group(1)), int(m.group(2))
+        if limit < 1 or window < 1:
+            die("requests and seconds must both be at least 1")
+        inst["throttle"] = {"limit": limit, "window": window}
+        print(f"'{name}': at most {limit} requests per {window} s and client "
+              "address on public routes.")
+        print(f"Counted per identity worker, so the real ceiling is about "
+              f"{limit * IDENTITY_WORKERS} — this is a volume brake against "
+              "floods, not a substitute for the app's own key lockout "
+              "(RFC-0010).")
+    save_registry(reg)
+    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
+        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
+                           inst["svc_port"],
+                           (inst.get("visibility") or {}).get("groups"), name,
+                           throttle_of(inst)))
+    refresh_generated_sites()
+    reload_gateway()
+
+
 def cmd_address(args):
     """Give one instance a public hostname of its own (RFC-0009)."""
     reg = load_registry()
@@ -824,7 +943,9 @@ def _install_from_dir(pkg, args, source):
     visibility = (inst.get("visibility") or {}) if inst else {}
 
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(port, m["routes"], container, svc["port"], visibility.get("groups")))
+        f.write(caddy_site(port, m["routes"], container, svc["port"],
+                           visibility.get("groups"), name,
+                           throttle_of(inst or {})))
     reload_gateway()
 
     reg["instances"][name] = {
@@ -861,6 +982,10 @@ def _install_from_dir(pkg, args, source):
     # visibility — clients must not lose their address to a deployment
     if inst and inst.get("address"):
         reg["instances"][name]["address"] = inst["address"]
+    # same for a throttle override (RFC-0010): a deployment must not
+    # silently reset an operator's rate decision to the default
+    if inst and inst.get("throttle") is not None:
+        reg["instances"][name]["throttle"] = inst["throttle"]
     save_registry(reg)
     if channel == "production":
         # moving to production invalidates any deploy token (spec 2.5)
@@ -937,7 +1062,9 @@ def cmd_visibility(args):
     inst["visibility"] = {"groups": groups} if groups else {}
     save_registry(reg)
     with open(os.path.join(CADDY_APPS_DIR, f"{args.name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(inst["port"], inst["routes"], inst["container"], inst["svc_port"], groups))
+        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
+                           inst["svc_port"], groups, args.name,
+                           throttle_of(inst)))
     refresh_generated_sites()
     reload_gateway()
     if groups:
@@ -1354,7 +1481,8 @@ def cmd_process_deploys(_args):
                 save_registry(reg)
                 with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
                     f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
-                                       inst["svc_port"], groups))
+                                       inst["svc_port"], groups, name,
+                                       throttle_of(inst)))
                 refresh_generated_sites()
                 reload_gateway()
                 ok = True
@@ -1517,7 +1645,8 @@ def _deploy_from_registry(name, inst):
     start_instance_container(name, container, image, inst.get("storage"))
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(inst["port"], inst["routes"], container, inst["svc_port"],
-                           (inst.get("visibility") or {}).get("groups")))
+                           (inst.get("visibility") or {}).get("groups"), name,
+                           throttle_of(inst)))
     print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
           f"channel {inst['channel']}, port {inst['port']})")
     return True
@@ -1623,6 +1752,12 @@ def main():
     pa.add_argument("hostname", nargs="?",
                     help="public hostname of its own, e.g. hub.example.org")
     pa.set_defaults(fn=cmd_address)
+    pth = sub.add_parser("throttle")
+    pth.add_argument("action", choices=["show", "set", "off"])
+    pth.add_argument("name")
+    pth.add_argument("rate", nargs="?",
+                     help="<requests>/<seconds> per client address, e.g. 300/60")
+    pth.set_defaults(fn=cmd_throttle)
     pu = sub.add_parser("user")
     pu.add_argument("action", choices=["list", "password"])
     pu.add_argument("username", nargs="?")

@@ -77,6 +77,24 @@ DNS and port forwarding remain the operator's job: the name must
 resolve to the node's public address (or, behind an edge, to the edge,
 with `oaap edge add <name> <node>` there).
 
+## Public-route throttling (RFC-0010)
+
+Public routes get no authentication, so the gateway applies the one
+control left: requests per client address per instance, on by default
+(300 per 60 s), one budget across all of the instance's entry points.
+
+```sh
+sudo oaap app throttle show bdt-hub
+sudo oaap app throttle set bdt-hub 600/60
+sudo oaap app throttle off bdt-hub     # warns if a public route exists
+```
+
+Over the limit the client gets `429` with `Retry-After` and the app is
+not reached. Counting happens in identity's memory, per gunicorn
+worker, so the real ceiling is roughly `limit × workers` — this is a
+flood brake, not a credential control. See RFC-0010 for what it
+deliberately does not promise.
+
 ## Portal launchpad (increment 2)
 
 The portal dashboard shows installed instances as tiles (name,

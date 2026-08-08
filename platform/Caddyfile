@@ -48,6 +48,13 @@
 		forward_auth identity:8000 {
 			uri /verify
 			copy_headers X-OAAP-User X-OAAP-Roles
+			# The auth call is a plain GET — never hand it the
+			# handshake's hop-by-hop headers. The WSGI server answers
+			# those with 400, and forward_auth returns that to the
+			# client, killing every WebSocket upgrade before the app
+			# is reached (contract guarantee 7).
+			header_up -Connection
+			header_up -Upgrade
 		}
 		reverse_proxy portal:8000
 	}
