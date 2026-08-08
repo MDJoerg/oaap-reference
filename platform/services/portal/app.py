@@ -337,6 +337,56 @@ HEALTH_BODY = """
   </table>
   {% else %}<p class="muted">Keine Apps installiert.</p>{% endif %}
 </div>
+{% if dns and dns.rows %}
+<div class="card">
+  <h2>Veröffentlichte Namen</h2>
+  <table>
+    <tr><th>Name</th><th>Gehört zu</th><th>Löst auf nach</th><th>Status</th></tr>
+    {% for d in dns.rows %}
+    <tr><td>{{ d.name }}</td>
+        <td class="muted">{{ d.what }}</td>
+        <td class="muted">{{ d.resolved }}</td>
+        <td><span class="dot {{ d.state }}"></span>{{ d.label }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if dns.note %}<p class="muted">{{ dns.note }}</p>{% endif %}
+  {% if dns.public_ip %}
+  <p class="muted">Öffentliche Adresse dieses Knotens: <strong>{{ dns.public_ip }}</strong>
+     — ermittelt über {{ dns.source }}. Diese eine Anfrage nach außen ist
+     nötig, um „zeigt der Name noch hierher?" beantworten zu können; sie
+     entfällt, sobald der Knoten keinen Namen mehr veröffentlicht.</p>
+  {% elif not dns.note %}
+  <p class="muted">Die eigene öffentliche Adresse war nicht zu ermitteln —
+     ohne sie lässt sich nur sagen, ob die Namen überhaupt auflösen.</p>
+  {% endif %}
+  <p class="muted">Zuletzt geprüft: {{ dns.when[:19].replace("T", " ") }} UTC
+     (höchstens halbstündlich). „Zeigt woanders hin" heißt fast immer:
+     Die öffentliche Adresse hat sich geändert und der DynDNS-Eintrag
+     hinkt hinterher.</p>
+</div>
+{% endif %}
+{% if braked %}
+<div class="card">
+  <h2>Gebremste Anfragen ({{ braked.hours }} Stunden)</h2>
+  {% if braked.error %}
+  <p class="muted">Der Zähler war nicht abrufbar.</p>
+  {% else %}
+  <table>
+    <tr><th>Instanz</th><th>Abgewiesen</th><th>Zuletzt</th></tr>
+    {% for b in braked.rows %}
+    <tr><td>{{ b.instance }}</td>
+        <td>{% if b.count %}<span class="dot warn"></span>{{ b.count }}{% else %}<span class="dot ok"></span>0{% endif %}</td>
+        <td class="muted">{{ b.last }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <p class="muted">Gezählt wird, wie oft die Mengenbremse eine Anfrage an
+     eine öffentliche Route abgewiesen hat (HTTP 429). Das ist eine
+     Mengenbremse und <strong>keine Zugangskontrolle</strong> — dauerhaft
+     hohe Zahlen heißen: nachsehen, wer da klopft, und die App selbst
+     absichern. Einstellbar je Instanz auf deren Objektseite.</p>
+</div>
+{% endif %}
 {% if deploys %}
 <div class="card">
   <h2>KI-Deployments (Deploy-Hook)</h2>
@@ -1117,6 +1167,141 @@ def external_access():
     return info
 
 
+# --------------------------------------------------------------------------
+# Do the published names still point here? (RFC-0009 decision 2)
+#
+# The DuckDNS incident is what this is for: a node was off the internet
+# for days and nothing said so — its DynDNS entry quietly kept an old
+# address. With an instance address baked into shipped clients
+# (RFC-0009) the consequence is worse.
+#
+# The price is stated rather than hidden: to compare, the node must ask
+# an OUTSIDE service for its own public address. So this runs only when
+# the node actually publishes a name — a LAN-only platform never
+# reaches out, and the installer's promise of an offline-capable
+# platform stands. Which service was asked is shown on the page.
+
+DNS_CACHE = "/deploy-spool/.dns-check.json"  # SPOOL_DIR, defined further down
+DNS_CHECK_TTL = 1800  # seconds; one outside request per half hour at most
+PUBLIC_IP_SERVICES = ("https://api.ipify.org", "https://checkip.amazonaws.com")
+
+
+def published_names():
+    """Names this node hands out to the world, with their origin."""
+    names = []
+    host = external_host()
+    if host:
+        names.append({"name": host, "what": "Knoten"})
+    for inst_name, inst in sorted(load_instances().items()):
+        if inst.get("address"):
+            names.append({"name": inst["address"], "what": f"Instanz {inst_name}"})
+    return names
+
+
+def _behind_edge():
+    try:
+        with open(EXTERNAL_FILE, encoding="utf-8") as f:
+            return json.load(f).get("edge", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def _public_ip():
+    for url in PUBLIC_IP_SERVICES:
+        try:
+            r = requests.get(url, timeout=4)
+            r.raise_for_status()
+            ip = r.text.strip()
+            if _re.fullmatch(r"[0-9.]{7,15}", ip):
+                return ip, url
+        except (requests.RequestException, ValueError):
+            continue
+    return "", ""
+
+
+def _resolve(name):
+    import socket
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(name, None, socket.AF_INET)})
+    except OSError:
+        return []
+
+
+def _dns_check_run():
+    names = published_names()
+    now = datetime.now(timezone.utc)
+    result = {"when": now.isoformat(), "rows": [], "public_ip": "",
+              "source": "", "note": ""}
+    if not names:
+        return result
+    if _behind_edge():
+        # The names resolve to the EDGE's public address, which this
+        # node cannot know. Saying "unknown" is honest; guessing is not.
+        result["note"] = ("Dieser Knoten steht hinter einem Edge-Knoten — die "
+                          "veröffentlichten Namen zeigen auf dessen öffentliche "
+                          "Adresse, die von hier aus nicht feststellbar ist. "
+                          "Geprüft wird nur, ob sie überhaupt auflösen.")
+    else:
+        result["public_ip"], result["source"] = _public_ip()
+    for entry in names:
+        ips = _resolve(entry["name"])
+        row = dict(entry, resolved=", ".join(ips) or "–")
+        if not ips:
+            row["state"], row["label"] = "err", "Löst nicht auf"
+        elif result["note"]:
+            row["state"], row["label"] = "unknown", "Löst auf"
+        elif not result["public_ip"]:
+            row["state"], row["label"] = "unknown", "Nicht vergleichbar"
+        elif result["public_ip"] in ips:
+            row["state"], row["label"] = "ok", "Zeigt hierher"
+        else:
+            row["state"], row["label"] = "warn", "Zeigt woanders hin"
+        result["rows"].append(row)
+    return result
+
+
+def dns_check():
+    """Cached verdict; refreshed at most every DNS_CHECK_TTL seconds."""
+    try:
+        age = _time.time() - os.path.getmtime(DNS_CACHE)
+        if age < DNS_CHECK_TTL:
+            with open(DNS_CACHE, encoding="utf-8") as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    result = _dns_check_run()
+    try:
+        os.makedirs(SPOOL_DIR, exist_ok=True)
+        tmp = DNS_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+        os.replace(tmp, DNS_CACHE)
+    except OSError:
+        pass
+    return result
+
+
+def braked_requests():
+    """Per-instance count of throttled requests (RFC-0010 decision 2)."""
+    instances = load_instances()
+    public = {n for n, i in instances.items()
+              if any("public" in (r.get("roles") or []) for r in (i.get("routes") or []))}
+    if not public:
+        return None
+    try:
+        data = requests.get(f"{IDENTITY}/internal/throttle-braked", timeout=3).json()
+    except (requests.RequestException, ValueError):
+        return {"hours": 24, "rows": [], "error": True}
+    counts = data.get("instances", {})
+    rows = []
+    for name in sorted(public):
+        c = counts.get(name, {})
+        rows.append({"instance": name, "count": c.get("count", 0),
+                     "last": datetime.fromtimestamp(c["last_hour"] * 3600, timezone.utc)
+                                     .strftime("%d.%m.%Y %H:00 UTC") if c else "–"})
+    return {"hours": data.get("hours", 24), "rows": rows, "error": False}
+
+
 def _probe(url, ok_status=200):
     try:
         r = requests.get(url, timeout=2, allow_redirects=False)
@@ -1169,6 +1354,7 @@ def health():
         })
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
                 core=core, apps=apps, ext=external_access(),
+                dns=dns_check(), braked=braked_requests(),
                 deploys=recent_deploys())
 
 

@@ -20,6 +20,8 @@
 #                     that address, skip = leave DHCP untouched
 #   OAAP_ADMIN_SUDO   1 = set up sudo for the invoking user without
 #                     asking (fresh netinstall via 'su'), 0 = skip
+#   OAAP_WLAN_WATCHDOG 1 = on a wireless node, install the reconnect
+#                     watchdog without asking, 0 = skip
 #   OAAP_SETUP_TOKEN  pre-generated setup token (install medium);
 #                     default: generated here
 
@@ -184,6 +186,118 @@ EOF
   say "Keep-awake: suspend/hibernate disabled, lid close and power key are ignored."
 }
 
+wlan_resilience() {
+  # A wireless node must not lose the network permanently over one
+  # failed handshake. Real incident (Raspberry Pi 400, 2026-08-07/08):
+  # roaming inside a mesh network, the 4-way handshake fails
+  # occasionally (IEEE reason 17); NetworkManager reads that as a wrong
+  # password, asks for credentials, gets no answer on a machine without
+  # a screen, and gives up for good after two minutes
+  # ("failed (reason 'no-secrets')"). It then never retries on its own.
+  # The node was offline twice in two days, once for 38 hours, while
+  # the machine itself ran the whole time.
+  #
+  # Two changes, neither of which touches the radio link itself:
+  #   1. unlimited autoconnect retries — remove the dead end
+  #   2. a two-minute watchdog that pings the default gateway and
+  #      brings the connection back when it does not answer
+  # This does not fix the cause (access points and NetworkManager
+  # disagreeing); it stops one bad handshake from locking a headless
+  # node out of its own network.
+  defroute="$(ip -4 route show default 2>/dev/null | head -1)"
+  [ -n "$defroute" ] || return 0
+  iface="$(printf '%s\n' "$defroute" | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')"
+  [ -n "$iface" ] && [ -d "/sys/class/net/$iface/wireless" ] || return 0
+  systemctl is-active --quiet NetworkManager 2>/dev/null && command -v nmcli >/dev/null 2>&1 \
+    || { say "WLAN resilience: $iface is wireless but not managed by NetworkManager — skipped."; return 0; }
+  if [ "$(systemctl is-enabled oaap-wlan-watchdog.timer 2>/dev/null)" = "enabled" ]; then
+    say "WLAN resilience: already configured (oaap-wlan-watchdog.timer is enabled)."
+    return 0
+  fi
+  conn="$(nmcli -g GENERAL.CONNECTION device show "$iface" 2>/dev/null || true)"
+  gateway="$(printf '%s\n' "$defroute" | awk '{for(i=1;i<NF;i++) if($i=="via") print $(i+1)}')"
+  # The watchdog decides by "does the gateway answer a ping". A router
+  # that drops ICMP would make it reconnect every two minutes forever —
+  # so prove the assumption here instead of shipping a reconnect loop.
+  if [ -z "$gateway" ] || ! ping -c 2 -W 3 "$gateway" >/dev/null 2>&1; then
+    say "WLAN resilience: the default gateway (${gateway:-none}) does not answer a"
+    say "ping, so a ping-based watchdog would reconnect endlessly — skipped."
+    return 0
+  fi
+
+  consent="${OAAP_WLAN_WATCHDOG:-}"
+  if [ -z "$consent" ] && [ -t 0 ]; then
+    say ""
+    say "This node is on WLAN ($iface). A single failed handshake can make"
+    say "NetworkManager give up permanently — on a machine without a screen"
+    say "that means offline until someone walks over to it."
+    read -r -p "Install the WLAN watchdog (recommended)? [Y/n] " answer
+    case "$answer" in n|N|no|NO) consent=0 ;; *) consent=1 ;; esac
+  fi
+  if [ "$consent" != "1" ]; then
+    say "WLAN resilience: skipped (set OAAP_WLAN_WATCHDOG=1 to apply it non-interactively)."
+    return 0
+  fi
+
+  [ -n "$conn" ] && nmcli connection modify "$conn" connection.autoconnect-retries 0 >/dev/null 2>&1 || true
+  printf 'OAAP_WLAN_IFACE=%s\nOAAP_WLAN_CONN=%s\n' "$iface" "$conn" > /etc/default/oaap-wlan-watchdog
+  cat > /usr/local/sbin/oaap-wlan-watchdog.sh <<'EOF'
+#!/bin/sh
+# OAAP WLAN watchdog — see 'Stable network' in oaap.core.host 2.2.
+# Checks whether the default gateway still answers and brings the
+# wireless connection back when it does not. Does nothing while the
+# network is fine. Rollback:
+#   systemctl disable --now oaap-wlan-watchdog.timer
+#   rm /usr/local/sbin/oaap-wlan-watchdog.sh /etc/default/oaap-wlan-watchdog \
+#      /etc/systemd/system/oaap-wlan-watchdog.{service,timer}
+set -u
+[ -r /etc/default/oaap-wlan-watchdog ] && . /etc/default/oaap-wlan-watchdog
+IFACE="${OAAP_WLAN_IFACE:-}"
+CONN="${OAAP_WLAN_CONN:-}"
+
+gw="$(ip -4 route show default | awk '{print $3; exit}')"
+# Two pings, so a single lost packet does not trigger a reconnect.
+if [ -n "$gw" ] && ping -c 2 -W 3 "$gw" >/dev/null 2>&1; then
+    exit 0
+fi
+
+logger -t oaap-wlan-watchdog "network unreachable (gateway '${gw:-none}') - bringing the WLAN connection back"
+if [ -n "$CONN" ] && nmcli connection up "$CONN" >/dev/null 2>&1; then
+    logger -t oaap-wlan-watchdog "connection '$CONN' restored"
+elif [ -n "$IFACE" ] && nmcli device connect "$IFACE" >/dev/null 2>&1; then
+    logger -t oaap-wlan-watchdog "device '$IFACE' reconnected"
+else
+    logger -t oaap-wlan-watchdog "recovery failed - retrying on the next run"
+fi
+EOF
+  chmod 755 /usr/local/sbin/oaap-wlan-watchdog.sh
+  cat > /etc/systemd/system/oaap-wlan-watchdog.service <<'EOF'
+[Unit]
+Description=OAAP WLAN watchdog (bring the wireless connection back)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/oaap-wlan-watchdog.sh
+EOF
+  cat > /etc/systemd/system/oaap-wlan-watchdog.timer <<'EOF'
+[Unit]
+Description=Check every two minutes that this node still has network
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-wlan-watchdog.timer >/dev/null 2>&1 || true
+  say "WLAN resilience: unlimited reconnect attempts${conn:+ for '$conn'} and a"
+  say "two-minute watchdog installed (journalctl -t oaap-wlan-watchdog)."
+}
+
 static_ip() {
   # Detect the primary interface and its current IPv4 configuration.
   defroute="$(ip -4 route show default 2>/dev/null | head -1)"
@@ -341,6 +455,7 @@ if [ "$(id -u)" -eq 0 ]; then
   admin_access || say "WARNING: admin access step failed — set up sudo manually if needed."
   keep_awake   || say "WARNING: keep-awake step failed — check power settings manually."
   static_ip    || say "WARNING: stable-address step failed — keeping the current network configuration (DHCP)."
+  wlan_resilience || say "WARNING: WLAN resilience step failed — a wireless node may stay offline after a failed handshake."
 elif [ "$MODE" = "prepare" ]; then
   fail "Must run as root (sudo ./install.sh prepare)."
 fi

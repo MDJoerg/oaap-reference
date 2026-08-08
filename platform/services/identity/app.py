@@ -431,6 +431,70 @@ def _throttle_client():
             or request.remote_addr or "?")
 
 
+# How often the brake actually engaged (RFC-0010 decision 2). Without
+# this a 429 leaves nothing but a line in an access log nobody reads,
+# and abuse stays invisible until somebody goes looking.
+#
+# Two properties this has to have, and neither is free:
+#   - it must be COMPLETE across gunicorn workers, or the number is a
+#     lie in the same way the effective limit is (each worker counts on
+#     its own). So the file is the shared state, and any worker can
+#     answer for all of them.
+#   - it must not become an amplifier: one line per braked request is
+#     exactly what an attacker would like to trigger. So counts go into
+#     HOURLY BUCKETS, pruned to 24 hours — bounded by instances times
+#     24, no matter how hard anyone knocks — and are flushed at most
+#     every few seconds.
+
+BRAKED_FILE = os.path.join(DATA_DIR, "throttle-braked.json")
+BRAKED_HOURS = 24
+
+
+def _braked_note(scope):
+    """Record one braked request, straight through to the shared file.
+
+    Batching in process memory was tried first and produces a wrong
+    number, not merely a late one: a reader can force a flush only in
+    the gunicorn worker that happens to answer it, so whatever the
+    OTHER workers still hold is missing — and after a short burst
+    nothing follows to settle it. Measured on a real node: 14 braked
+    requests showed up as 2.
+
+    Writing per braked request is affordable because the file does not
+    grow with traffic — one integer per instance per hour, pruned to 24
+    hours. The extra cost is a small locked read-modify-write on a page
+    already in cache, next to the full HTTP request the brake performs
+    anyway. So a flood cannot inflate this into a disk problem; it can
+    only make the number it produces larger.
+    """
+    import fcntl
+    hour = int(time.time() // 3600)
+    oldest = hour - BRAKED_HOURS + 1
+    try:
+        fd = os.open(BRAKED_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "r+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                data = json.load(f)
+            except ValueError:
+                data = {}
+            buckets = {k: v for k, v in (data.get(scope) or {}).items()
+                       if str(k).isdigit() and int(k) >= oldest}
+            buckets[str(hour)] = buckets.get(str(hour), 0) + 1
+            data[scope] = buckets
+            # drop instances whose last brake fell out of the window
+            data = {s: b for s, b in data.items()
+                    if any(str(k).isdigit() and int(k) >= oldest for k in b)}
+            f.seek(0)
+            json.dump(data, f)
+            f.truncate()
+    except OSError:
+        return
+
+
 @app.get("/throttle")
 def throttle():
     scope = request.args.get("scope", "")
@@ -444,6 +508,7 @@ def throttle():
     hits = [t for t in _RATE.get(key, ()) if now - t < window]
     if len(hits) >= limit:
         _RATE[key] = hits
+        _braked_note(scope)
         retry = max(1, int(window - (now - hits[0])))
         return ("Too many requests", 429,
                 {"Retry-After": str(retry), "Cache-Control": "no-store"})
@@ -464,6 +529,30 @@ def throttle():
 def internal_status():
     state = _load(STATE_FILE, {})
     return {"setup_done": bool(state.get("setup_done"))}
+
+
+@app.get("/internal/throttle-braked")
+def internal_throttle_braked():
+    """Per-instance count of braked requests in the last 24 hours.
+
+    Answers for ALL workers, not just this one: the file is the state,
+    written through on every braked request, so no worker holds a count
+    that this answer would miss.
+    """
+    try:
+        with open(BRAKED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    oldest = int(time.time() // 3600) - BRAKED_HOURS + 1
+    out = {}
+    for scope, buckets in data.items():
+        fresh = {int(h): c for h, c in buckets.items()
+                 if str(h).isdigit() and int(h) >= oldest}
+        if fresh:
+            out[scope] = {"count": sum(fresh.values()),
+                          "last_hour": max(fresh)}
+    return {"hours": BRAKED_HOURS, "instances": out}
 
 
 @app.post("/internal/setup")
