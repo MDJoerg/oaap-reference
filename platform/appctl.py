@@ -7,6 +7,7 @@ Host-side app manager invoked via `oaap app ...`:
     oaap app list
     oaap app remove <name> [--purge]
     oaap app visibility <name> all | groups <g1,g2,...>   (RFC-0007)
+    oaap app config list|set|unset <name> [key] [value]   (spec 2.3/2.4)
 
 Implements: manifest validation (subset of the published JSON Schema),
 build on device, named instances with channels, per-instance storage/
@@ -458,6 +459,164 @@ def reload_gateway():
          "--config", "/etc/caddy/Caddyfile"])
 
 
+# ------------------------------------------- instance container & config
+# Env values are baked into a container at 'docker run' time, so every
+# config change needs a FRESH container -- 'docker restart' would keep
+# the old values. install, restore and 'app config set' all go through
+# start_instance_container so the container shape stays identical.
+
+RESERVED_ENV = {"OAAP_APP_SECRET"}  # platform-owned, never operator-editable
+
+
+def instance_dir(name):
+    return os.path.join(APPS_DIR, name)
+
+
+def env_path(name):
+    return os.path.join(instance_dir(name), "instance.env")
+
+
+def load_env(name):
+    try:
+        with open(env_path(name), encoding="utf-8") as f:
+            return dict(l.strip().split("=", 1) for l in f if "=" in l)
+    except OSError:
+        return {}
+
+
+def save_env(name, env):
+    path = env_path(name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(f"{k}={v}\n" for k, v in env.items())
+    os.replace(tmp, path)
+
+
+def start_instance_container(name, container, image, storage):
+    """(Re)create an instance container from its recorded shape."""
+    uid = image_uid(image)
+    mounts = []
+    for s in storage or []:
+        host = os.path.join(instance_dir(name), "storage", s["name"])
+        os.makedirs(host, exist_ok=True)
+        if uid is not None:
+            os.chown(host, uid, uid)
+        mounts += ["-v", f"{host}:{s['mount']}"]
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True, text=True)
+    run(["docker", "run", "-d", "--name", container,
+         "--restart", "unless-stopped", "--network", "oaap_default",
+         "--env-file", env_path(name), *mounts, image])
+
+
+def config_entries(name, inst):
+    """Declared config keys of an instance, with current values.
+
+    Instances installed before the manifest's config block was recorded
+    have no declaration to go by; their keys are then read back from
+    instance.env and treated as SECRET -- a key we cannot classify might
+    well be one, and masking a harmless value is the cheaper mistake.
+    """
+    env = load_env(name)
+    declared = inst.get("config")
+    if declared is None:
+        declared = [{"key": k, "label": k, "secret": True}
+                    for k in env if k not in RESERVED_ENV]
+    entries = []
+    for c in declared:
+        key = c["key"]
+        if key in RESERVED_ENV:
+            continue
+        entries.append({
+            "key": key,
+            "label": c.get("label") or key,
+            "secret": bool(c.get("secret")),
+            "default": c.get("default", ""),
+            "value": env.get(key, ""),
+        })
+    return entries
+
+
+def apply_config(name, inst, values):
+    """Write config values and recreate the container. Returns a message.
+
+    Only keys the instance actually declares are accepted -- a caller
+    (CLI or the portal's spool request) can never introduce new
+    environment variables into a container this way.
+    """
+    entries = {e["key"]: e for e in config_entries(name, inst)}
+    unknown = [k for k in values if k not in entries]
+    if unknown:
+        raise ValueError(f"'{name}' does not declare config key(s): "
+                         f"{', '.join(sorted(unknown))}")
+    env = load_env(name)
+    changed = []
+    for key, value in values.items():
+        if env.get(key, "") == value:
+            continue
+        env[key] = value
+        changed.append(key)
+    if not changed:
+        return "no change"
+    save_env(name, env)
+    start_instance_container(name, inst["container"], inst["image"],
+                             inst.get("storage"))
+    return "changed: " + ", ".join(sorted(changed))
+
+
+def cmd_config(args):
+    reg = load_registry()
+    name = args.name
+    inst = reg["instances"].get(name)
+    if not inst:
+        die(f"no instance named '{name}'")
+    entries = config_entries(name, inst)
+    if args.action == "list":
+        if not entries:
+            print(f"'{name}' declares no configuration values.")
+            return
+        width = max(len(e["key"]) for e in entries)
+        for e in entries:
+            if e["secret"]:
+                # never print a secret back -- 'set' is the way to change it
+                shown = "******** (set)" if e["value"] else "(empty)"
+            else:
+                shown = e["value"] if e["value"] else "(empty)"
+            print(f"{e['key']:<{width}}  {shown}")
+            if e["label"] != e["key"]:
+                print(f"{'':<{width}}  {e['label']}")
+        if inst.get("config") is None:
+            print("")
+            print("NOTE: this instance predates config recording — keys were read")
+            print("from instance.env and are all masked. A redeploy records the")
+            print("manifest's real labels and secret flags.")
+        return
+    key = args.key or die(f"'app config {args.action}' needs a key name")
+    if args.action == "unset":
+        entry = next((e for e in entries if e["key"] == key), None)
+        if not entry:
+            die(f"'{name}' does not declare config key '{key}'")
+        value = entry["default"]
+    else:
+        value = args.value
+        if value is None:
+            # keeps secrets out of the shell history (same as 'oaap user password')
+            value = getpass.getpass(f"Value for {key} (hidden): ")
+    try:
+        msg = apply_config(name, inst, {key: value})
+    except ValueError as e:
+        die(str(e))
+    if msg == "no change":
+        print(f"{key} already had this value — nothing changed.")
+        return
+    audit_deploy({"instance": name, "ok": True, "message": f"config {msg}",
+                  "revision": "", "version": inst.get("version", ""), "via": "cli"})
+    print(f"Config updated for '{name}' ({msg}).")
+    print("The container was recreated so the new value takes effect —")
+    print("brief downtime, storage and address are unchanged.")
+
+
 def cmd_install(args):
     # Store integration: the package may be a Git URL (+ --path inside
     # the repo) instead of a local directory.
@@ -520,39 +679,20 @@ def _install_from_dir(pkg, args, source):
     used = {i["port"] for i in reg["instances"].values()}
     port = inst["port"] if inst else next(p for p in PORT_RANGE if p not in used)
 
-    inst_dir = os.path.join(APPS_DIR, name)
-    env_path = os.path.join(inst_dir, "instance.env")
-    os.makedirs(inst_dir, exist_ok=True)
+    os.makedirs(instance_dir(name), exist_ok=True)
 
-    # stable per-instance secret, never inside storage mounts
-    env = {}
-    if os.path.isfile(env_path):
-        with open(env_path, encoding="utf-8") as f:
-            env = dict(l.strip().split("=", 1) for l in f if "=" in l)
+    # stable per-instance secret, never inside storage mounts. Existing
+    # values win over manifest defaults: a redeploy must not undo what
+    # the operator configured ('oaap app config').
+    env = load_env(name)
     env.setdefault("OAAP_APP_SECRET", secrets.token_hex(32))
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
-
-    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(f"{k}={v}\n" for k, v in env.items())
+    save_env(name, env)
 
     # per-instance storage, writable for the container user (guarantee 4)
-    uid = image_uid(image)
-    mounts = []
-    for s in m.get("storage") or []:
-        host = os.path.join(inst_dir, "storage", s["name"])
-        os.makedirs(host, exist_ok=True)
-        if uid is not None:
-            os.chown(host, uid, uid)
-        mounts += ["-v", f"{host}:{s['mount']}"]
-
     container = f"oaap-app-{name}"
-    subprocess.run(["docker", "rm", "-f", container],
-                   capture_output=True, text=True)
-    run(["docker", "run", "-d", "--name", container,
-         "--restart", "unless-stopped", "--network", "oaap_default",
-         "--env-file", env_path, *mounts, image])
+    start_instance_container(name, container, image, m.get("storage") or [])
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance
@@ -577,6 +717,13 @@ def _install_from_dir(pkg, args, source):
         "source": source,
         "build": svc.get("build", "") if (app["type"] == "native" or svc.get("build")) else "",
         "storage": m.get("storage") or [],
+        # declared config keys (labels + secret flags) so the CLI and the
+        # portal can offer them for editing without the manifest at hand
+        "config": [{"key": c["key"], "label": c.get("label", ""),
+                    "secret": bool(c.get("secret")),
+                    "default": c.get("default", "")}
+                   for c in (m.get("config") or [])
+                   if c["key"] not in RESERVED_ENV],
         "description": app.get("description", ""),
         # roles that may see/open the app — the portal filters tiles
         # with this; the gateway enforces it regardless (spec 2.5)
@@ -1083,6 +1230,22 @@ def cmd_process_deploys(_args):
                 reload_gateway()
                 ok = True
                 msg = ("visibility set to groups: " + ", ".join(groups)) if groups else "visibility set to all"
+        elif action == "config":
+            # Instance configuration (spec 2.3/2.4.3). Same reason as
+            # above: the portal cannot write the registry or talk to the
+            # container runtime, so the host side applies it. Values are
+            # re-checked against the DECLARED keys here -- the spool is
+            # data, not trust -- and never end up in the audit log.
+            if not inst:
+                msg = "unknown instance"
+            else:
+                try:
+                    msg = "config " + apply_config(name, inst, req.get("values") or {})
+                    ok = True
+                except ValueError as e:
+                    msg = str(e)
+                except subprocess.CalledProcessError as e:
+                    msg = (e.stderr or str(e)).strip().splitlines()[-1]
         elif not inst or name not in tokens:
             msg = "unknown instance or no deploy token"
         elif inst["channel"] != "test":
@@ -1094,7 +1257,8 @@ def cmd_process_deploys(_args):
             revision = _resolve_revision(src)
             ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
-        via = {"install": "store", "visibility": "portal"}.get(action, "deploy-hook")
+        via = {"install": "store", "visibility": "portal",
+               "config": "portal"}.get(action, "deploy-hook")
         audit_deploy({"instance": name, "ok": ok, "message": msg,
                       "revision": revision, "version": version, "via": via})
         if rid:
@@ -1217,25 +1381,11 @@ def _deploy_from_registry(name, inst):
         print(f"Pulling {image} ...")
         run(["docker", "pull", "-q", image])
 
-    inst_dir = os.path.join(APPS_DIR, name)
-    env_path = os.path.join(inst_dir, "instance.env")
-    if not os.path.isfile(env_path):
+    if not os.path.isfile(env_path(name)):
         print(f"SKIPPED {name}: no instance.env in the restored data.")
         return False
-    uid = image_uid(image)
-    mounts = []
-    for s in inst.get("storage") or []:
-        host = os.path.join(inst_dir, "storage", s["name"])
-        os.makedirs(host, exist_ok=True)
-        if uid is not None:
-            os.chown(host, uid, uid)
-        mounts += ["-v", f"{host}:{s['mount']}"]
-
     container = inst["container"]
-    subprocess.run(["docker", "rm", "-f", container], capture_output=True, text=True)
-    run(["docker", "run", "-d", "--name", container,
-         "--restart", "unless-stopped", "--network", "oaap_default",
-         "--env-file", env_path, *mounts, image])
+    start_instance_container(name, container, image, inst.get("storage"))
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(inst["port"], inst["routes"], container, inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups")))
@@ -1331,6 +1481,13 @@ def main():
     pv.add_argument("groups", nargs="?", default="",
                     help="comma-separated group tags, e.g. buero,finanzen (with 'groups')")
     pv.set_defaults(fn=cmd_visibility)
+    pcf = sub.add_parser("config")
+    pcf.add_argument("action", choices=["list", "set", "unset"])
+    pcf.add_argument("name")
+    pcf.add_argument("key", nargs="?")
+    pcf.add_argument("value", nargs="?",
+                     help="omit with 'set' to be prompted (hidden input)")
+    pcf.set_defaults(fn=cmd_config)
     pu = sub.add_parser("user")
     pu.add_argument("action", choices=["list", "password"])
     pu.add_argument("username", nargs="?")

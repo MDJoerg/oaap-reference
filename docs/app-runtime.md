@@ -9,6 +9,7 @@ install an app package on the node and run it behind the gateway.
 sudo oaap app install <package-dir> [--name NAME] [--channel production|test]
 sudo oaap app list
 sudo oaap app remove <name> [--purge]
+sudo oaap app config list|set|unset <name> [key] [value]
 ```
 
 A package is a directory with `oaap-app.yaml` (validated against
@@ -26,6 +27,30 @@ reload the gateway.
 
 Redeploy: `production` requires a version bump; `test` may redeploy the
 same version.
+
+## Instance configuration (spec 2.8)
+
+`oaap app config` edits the values an app declares in its manifest's
+`config` block, for the life of the instance — on both channels and
+without a version bump, because configuring is not deploying:
+
+```sh
+sudo oaap app config list bdt-hub                 # secrets shown only as set/empty
+sudo oaap app config set bdt-hub BDT_HUB_ROOT_API_KEY   # prompts, hidden input
+sudo oaap app config unset bdt-hub BDT_HUB_ROOT_API_KEY # back to the manifest default
+```
+
+Only declared keys are accepted; `OAAP_APP_SECRET` is platform-owned
+and refused. Saving rewrites `instance.env` (0600) and **recreates the
+container** — `docker restart` would keep the old values, since env
+vars are fixed at `docker run` time. Storage, port, version and
+visibility are untouched. Operator values win over manifest defaults on
+every later redeploy. The portal offers the same on an instance's
+object page (`server_admin` only), queued through the host-side worker.
+
+Instances installed before 0.1.11 have no recorded config declaration;
+their keys are read back from `instance.env` and all treated as secret
+until the next redeploy records the manifest's real labels and flags.
 
 ## Portal launchpad (increment 2)
 

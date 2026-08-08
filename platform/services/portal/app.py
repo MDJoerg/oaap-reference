@@ -3,8 +3,9 @@
 Serves the first-run wizard (/setup, protected by the one-time setup
 token, validated by the identity service), the role-and-group-filtered
 launchpad, user management (server_admin only, list report + object
-page floorplans), app-instance visibility (RFC-0007, server_admin
-only) and the platform health page (server_admin/partner).
+page floorplans), app-instance visibility (RFC-0007) and configuration
+(both server_admin only) and the platform health page
+(server_admin/partner).
 Authentication is entirely the gateway's job: the portal trusts the
 X-OAAP-User / X-OAAP-Roles headers set after forward auth.
 
@@ -487,6 +488,30 @@ INSTANCE_EDIT_BODY = """
     <button>Speichern</button>
   </div>
 </form>
+{% if i.config %}
+<form method="post" action="/instances/{{ i.name }}/config">
+  <div class="card">
+    <h2>Konfiguration</h2>
+    {% for c in i.config %}
+    <label>{{ c.label }}
+      {% if c.secret %}
+      <input type="password" name="cfg-{{ c.key }}" value="" autocomplete="new-password"
+             placeholder="{{ 'gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt' }}">
+      {% else %}
+      <input type="text" name="cfg-{{ c.key }}" value="{{ c.value }}">
+      {% endif %}
+    </label>
+    <p class="muted"><code>{{ c.key }}</code>{% if c.secret %} — vertraulich,
+       wird nie angezeigt{% endif %}</p>
+    {% endfor %}
+    <p class="muted">Diese Werte deklariert die App in ihrem Manifest; andere
+       lassen sich hier nicht setzen. Beim Speichern wird der Container mit
+       den neuen Werten neu erzeugt — die App ist dabei kurz nicht
+       erreichbar. Daten, Adresse und Version bleiben unverändert.</p>
+    <button>Speichern</button>
+  </div>
+</form>
+{% endif %}
 """
 
 SETUP_PAGE = STYLE + """
@@ -1197,7 +1222,8 @@ def store_install():
 
 
 # ---------------------------------------------------------------------------
-# App-instance visibility (RFC-0007) — server_admin only. /apps-registry
+# App-instance visibility (RFC-0007) and configuration (spec 2.3/2.4.3)
+# — server_admin only. /apps-registry
 # is mounted read-only in this container (like the store install above),
 # so a change is queued to the host-side worker (appctl.py
 # process-deploys), which updates the registry, regenerates that
@@ -1208,6 +1234,45 @@ VISIBILITY_WAIT_SECONDS = 20  # registry+Caddy+reload only, no docker work
 
 def _instance_groups(inst):
     return (inst.get("visibility") or {}).get("groups") or []
+
+
+RESERVED_ENV = {"OAAP_APP_SECRET"}  # platform-owned, never operator-editable
+
+
+def _instance_env(name):
+    """Current config values of an instance (read-only mount)."""
+    try:
+        with open(f"/apps-registry/{name}/instance.env", encoding="utf-8") as f:
+            return dict(l.strip().split("=", 1) for l in f if "=" in l)
+    except OSError:
+        return {}
+
+
+def _instance_config(name, inst):
+    """Declared config keys with their current values (spec 2.4.3).
+
+    Mirrors appctl.config_entries: instances installed before config
+    recording fall back to the keys in instance.env and are treated as
+    secret, so an unclassified value is never rendered into a page.
+    """
+    env = _instance_env(name)
+    declared = inst.get("config")
+    if declared is None:
+        declared = [{"key": k, "label": k, "secret": True}
+                    for k in env if k not in RESERVED_ENV]
+    rows = []
+    for c in declared:
+        key = c["key"]
+        if key in RESERVED_ENV:
+            continue
+        secret = bool(c.get("secret"))
+        rows.append({
+            "key": key, "label": c.get("label") or key, "secret": secret,
+            "is_set": bool(env.get(key)),
+            # a secret value never leaves the server, not even prefilled
+            "value": "" if secret else env.get(key, ""),
+        })
+    return rows
 
 
 @app.get("/instances")
@@ -1238,7 +1303,8 @@ def instance_detail(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     i = {"name": name, "app_name": inst.get("app_name", name),
          "version": inst.get("version", "?"),
-         "groups": _instance_groups(inst), "roles": inst.get("roles") or []}
+         "groups": _instance_groups(inst), "roles": inst.get("roles") or [],
+         "config": _instance_config(name, inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
@@ -1256,16 +1322,56 @@ def instance_visibility(name):
         return redirect(
             f"/instances/{name}?err={quote('Bitte mindestens eine Gruppe angeben oder Alle wählen.')}",
             code=303)
+    return _queue_and_redirect(name, {"action": "visibility", "groups": groups},
+                               VISIBILITY_WAIT_SECONDS)
+
+
+# Recreating the container takes noticeably longer than a registry edit.
+CONFIG_WAIT_SECONDS = 90
+
+
+@app.post("/instances/<name>/config")
+def instance_config(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    values = {}
+    for c in _instance_config(name, inst):
+        submitted = request.form.get(f"cfg-{c['key']}")
+        if submitted is None:
+            continue
+        # an empty secret field means "keep the stored value" -- there is
+        # nothing to prefill it with, so blank cannot mean "clear it"
+        if c["secret"] and submitted == "":
+            continue
+        values[c["key"]] = submitted
+    if not values:
+        return redirect(f"/instances/{name}?msg={quote('Keine Änderung.')}", code=303)
+    return _queue_and_redirect(name, {"action": "config", "values": values},
+                               CONFIG_WAIT_SECONDS)
+
+
+def _queue_and_redirect(name, payload, wait_seconds):
+    """Hand a change to the host-side worker and wait for its verdict.
+
+    The request file may carry configuration values, so it is written
+    0600 -- it lives in the spool only until the worker consumes it.
+    """
     rid = _uuid.uuid4().hex
     os.makedirs(SPOOL_QUEUE, exist_ok=True)
     tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"id": rid, "instance": name, "action": "visibility",
-                   "groups": groups, "by": request.headers.get("X-OAAP-User", "?"),
-                   "requested": datetime.now(timezone.utc).isoformat()}, f)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "instance": name,
+                   "by": request.headers.get("X-OAAP-User", "?"),
+                   "requested": datetime.now(timezone.utc).isoformat(),
+                   **payload}, f)
     os.replace(tmp, os.path.join(SPOOL_QUEUE, f"{rid}.json"))
     res_path = os.path.join(SPOOL_RESULTS, f"{rid}.json")
-    deadline = _time.time() + VISIBILITY_WAIT_SECONDS
+    deadline = _time.time() + wait_seconds
     while _time.time() < deadline:
         if os.path.exists(res_path):
             try:
