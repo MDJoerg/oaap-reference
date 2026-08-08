@@ -52,6 +52,31 @@ Instances installed before 0.1.11 have no recorded config declaration;
 their keys are read back from `instance.env` and all treated as secret
 until the next redeploy records the manifest's real labels and flags.
 
+## Instance public address (RFC-0009)
+
+An instance's automatic external name is a subdomain of the *node*
+(`<instance>.<node hostname>`). For an app whose address ends up inside
+distributed clients, that ties the published address to the machine it
+first ran on. `oaap app address` adds a hostname of the instance's own,
+served **in addition** to the automatic one:
+
+```sh
+sudo oaap app address set bdt-hub hub.example.org
+sudo oaap app address show bdt-hub
+sudo oaap app address remove bdt-hub
+```
+
+The generated site (`apps-caddy/instance-addresses.caddy`) reuses the
+instance's own route/role/group block, so nothing about enforcement
+changes. Direct nodes get a TLS site plus an HTTP→HTTPS redirect;
+behind-edge nodes get plain HTTP with the edge guard and no ACME. The
+name survives redeploy and is refused if it collides with the node's
+external hostname, an edge route, or another instance.
+
+DNS and port forwarding remain the operator's job: the name must
+resolve to the node's public address (or, behind an edge, to the edge,
+with `oaap edge add <name> <node>` there).
+
 ## Portal launchpad (increment 2)
 
 The portal dashboard shows installed instances as tiles (name,
