@@ -1024,14 +1024,17 @@ def cmd_list(_args):
         print(f"{name}: {i['app_name']} {i['version']} [{i['channel']}] port {i['port']} ({i['container']})")
 
 
-def cmd_remove(args):
-    reg = load_registry()
-    inst = reg["instances"].pop(args.name, None)
-    if not inst:
-        die(f"no instance named '{args.name}'")
+def remove_instance(reg, name, purge):
+    """Tear down one instance; returns a human-readable outcome.
+
+    Shared by the CLI and the portal's host-side worker. Storage is only
+    touched when purge is asked for — keeping it is the safe default,
+    and the operator can still delete the directory later.
+    """
+    inst = reg["instances"].pop(name)
     subprocess.run(["docker", "rm", "-f", inst["container"]],
                    capture_output=True, text=True)
-    site = os.path.join(CADDY_APPS_DIR, f"{args.name}.caddy")
+    site = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
     if os.path.isfile(site):
         os.remove(site)
     save_registry(reg)
@@ -1039,13 +1042,18 @@ def cmd_remove(args):
     # or the node keeps proxying its external name to a dead container
     refresh_generated_sites()
     reload_gateway()
-    drop_token(args.name, "instance removed")
-    if args.purge:
-        import shutil
-        shutil.rmtree(os.path.join(APPS_DIR, args.name), ignore_errors=True)
-        print(f"Removed '{args.name}' including data.")
-    else:
-        print(f"Removed '{args.name}'. Data kept at {os.path.join(APPS_DIR, args.name)}.")
+    drop_token(name, "instance removed")
+    if purge:
+        shutil.rmtree(os.path.join(APPS_DIR, name), ignore_errors=True)
+        return f"removed '{name}' including data"
+    return f"removed '{name}'; data kept at {os.path.join(APPS_DIR, name)}"
+
+
+def cmd_remove(args):
+    reg = load_registry()
+    if args.name not in reg["instances"]:
+        die(f"no instance named '{args.name}'")
+    print(remove_instance(reg, args.name, args.purge).capitalize() + ".")
 
 
 # ------------------------------------------------- app visibility (RFC-0007)
@@ -1535,6 +1543,19 @@ def cmd_process_deploys(_args):
                 }
                 save_tokens(tokens)
                 ok, msg = True, "deploy token issued"
+        elif action == "remove":
+            # The only destructive operation the portal can request, so
+            # the host re-checks the confirmation too: the request must
+            # name the instance it claims to remove. A misdirected or
+            # replayed request therefore cannot take down a different
+            # app than the one the operator was looking at.
+            if not inst:
+                msg = "unknown instance"
+            elif req.get("confirm", "") != name:
+                msg = "confirmation did not match the instance name"
+            else:
+                msg = remove_instance(reg, name, bool(req.get("purge")))
+                ok = True
         elif action == "address":
             # Own public hostname (RFC-0009). Validation runs here, with
             # the same function the CLI uses — the portal's copy of the
@@ -1622,7 +1643,9 @@ def cmd_process_deploys(_args):
             ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
         via = {"install": "store", "visibility": "portal",
-               "config": "portal", "token": "portal"}.get(action, "deploy-hook")
+               "config": "portal", "token": "portal",
+               "address": "portal", "throttle": "portal",
+               "remove": "portal"}.get(action, "deploy-hook")
         audit_deploy({"instance": name, "ok": ok, "message": msg,
                       "revision": revision, "version": version, "via": via})
         if rid:

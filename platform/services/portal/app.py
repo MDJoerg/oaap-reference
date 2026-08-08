@@ -444,6 +444,8 @@ konfigurierten Quellen. Quellen verwaltet die Administration mit
 # visibility setting (RFC-0007). server_admin only.
 INSTANCES_LIST_BODY = """
 <h1>Instanzen</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
@@ -581,6 +583,22 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 {% endif %}
+<form method="post" action="/instances/{{ i.name }}/remove">
+  <div class="card">
+    <h2>Instanz entfernen</h2>
+    <p>Entfernt Container, Adresse und Kachel dieser Instanz. Der Vorgang
+       lässt sich nicht rückgängig machen — eine erneute Installation legt
+       eine frische Instanz an.</p>
+    <label class="checkline"><input type="radio" name="purge" value=""
+           checked>Daten behalten (liegen weiter auf dem Server und werden
+           bei einer Neuinstallation gleichen Namens wiederverwendet)</label>
+    <label class="checkline"><input type="radio" name="purge" value="1">Daten
+           ebenfalls <strong>unwiderruflich löschen</strong></label>
+    <label>Zum Bestätigen den Instanznamen eintippen: <code>{{ i.name }}</code>
+      <input type="text" name="confirm" autocomplete="off" placeholder="{{ i.name }}"></label>
+    <button class="secondary">Entfernen</button>
+  </div>
+</form>
 """
 
 # Floorplan "Dialogseite": the one and only time the token is readable.
@@ -1417,7 +1435,8 @@ def instances_list():
             "channel": channel, "channel_label": CHANNEL_LABELS.get(channel, channel),
             "visibility_label": "Alle" if not groups else "Gruppen: " + ", ".join(groups),
         })
-    return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows)
+    return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
+                msg=request.args.get("msg"), error=request.args.get("err"))
 
 
 @app.get("/instances/<name>")
@@ -1522,6 +1541,38 @@ def instance_throttle(name):
         "mode": request.form.get("mode", "default"),
         "rate": request.form.get("rate", ""),
     }, ADDRESS_WAIT_SECONDS)
+
+
+REMOVE_WAIT_SECONDS = 60  # stops a container and rewrites gateway config
+
+
+@app.post("/instances/<name>/remove")
+def instance_remove(name):
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    # Typing the name is the guard against a misclick on the one
+    # destructive control in this UI; the host checks it a second time.
+    if (request.form.get("confirm") or "").strip() != name:
+        return redirect(
+            f"/instances/{name}?err={quote('Zum Entfernen bitte den Instanznamen eintippen.')}",
+            code=303)
+    res = _queue_and_wait(name, {"action": "remove",
+                                 "confirm": name,
+                                 "purge": bool(request.form.get("purge"))},
+                          REMOVE_WAIT_SECONDS)
+    if res is None:
+        return redirect(
+            f"/instances?err={quote('Das Entfernen läuft noch — bitte die Liste gleich erneut prüfen.')}",
+            code=303)
+    if not res.get("ok"):
+        return redirect(
+            f"/instances/{name}?err={quote(res.get('message', 'Entfernen fehlgeschlagen.'))}",
+            code=303)
+    # back to the list: the object page this came from no longer exists
+    return redirect(f"/instances?msg={quote(res.get('message', 'Entfernt.'))}", code=303)
 
 
 def _hook_url(name):
