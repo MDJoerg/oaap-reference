@@ -639,11 +639,15 @@ def launchpad_tiles(user_roles, user_groups, host):
     grant, and vice versa — server_admin bypasses the group check only,
     same as /verify).
     """
-    # Accessed via the registered external hostname? Then tiles must
-    # link to the TLS subdomains — the LAN ports are not reachable
-    # (and not forwarded) from outside.
+    # Where is the caller? The LAN listener ports only work from inside;
+    # from outside only 80/443 are forwarded. Deciding this by "is the
+    # host exactly our external name" was too narrow: a platform can be
+    # entered under any public name that resolves here — an instance's
+    # own hostname (RFC-0009), an operator's CNAME — and every one of
+    # those got LAN-port links that are dead from outside. Ask the
+    # opposite question instead: does this look like a LAN address?
     ext = external_host()
-    via_external = bool(ext) and host == ext
+    on_lan = not ext or _looks_like_lan(host)
     is_server_admin = "server_admin" in user_roles
     tiles = []
     for name, inst in sorted(load_instances().items()):
@@ -661,10 +665,39 @@ def launchpad_tiles(user_roles, user_groups, host):
             "channel": channel,
             "channel_label": CHANNEL_LABELS.get(channel, channel),
             "description": inst.get("description", ""),
-            "url": (f"https://{name}.{ext}/" if via_external
-                    else f"http://{host}:{inst['port']}/"),
+            "url": _tile_url(name, inst, host, ext, on_lan),
         })
     return tiles
+
+
+_LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".oaap.internal")
+
+
+def _looks_like_lan(host):
+    """Rough check: is this host a LAN-only way to reach the node?
+
+    A bare IP address or a single-label name (`oaap-demo`) can only come
+    from inside; anything with a public-looking domain is treated as
+    "from outside", where LAN listener ports are not forwarded. Erring
+    towards "outside" is the safe direction: an external link shown on
+    the LAN still works, the reverse does not.
+    """
+    host = host.lower()
+    if host.startswith("[") or ":" in host:          # IPv6 literal
+        return True
+    if host.replace(".", "").isdigit():              # IPv4 literal
+        return True
+    return "." not in host or host.endswith(_LAN_SUFFIXES)
+
+
+def _tile_url(name, inst, host, ext, on_lan):
+    if on_lan:
+        return f"http://{host}:{inst['port']}/"
+    # entered from outside: prefer the instance's own public hostname
+    # (RFC-0009), otherwise its subdomain of this node
+    if inst.get("address"):
+        return f"https://{inst['address']}/"
+    return f"https://{name}.{ext}/"
 
 
 def setup_done() -> bool:
