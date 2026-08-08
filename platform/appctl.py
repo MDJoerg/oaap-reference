@@ -11,6 +11,10 @@ Host-side app manager invoked via `oaap app ...`:
     oaap app address show|set|remove <name> [hostname]    (RFC-0009)
     oaap app throttle show|set|off <name> [reqs/seconds]  (RFC-0010)
 
+Node-level, not per app:
+
+    oaap node show | add-profile <p> | remove-profile <p>  (RFC-0011)
+
 Implements: manifest validation (subset of the published JSON Schema),
 build on device, named instances with channels, per-instance storage/
 secret/port, gateway wiring (generated Caddy site + reload).
@@ -39,6 +43,7 @@ REGISTRY = os.path.join(APPS_DIR, "registry.json")
 STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
 EXTERNAL_FILE = os.path.join(APPS_DIR, "external.json")
 EDGE_FILE = os.path.join(APPS_DIR, "edge.json")
+NODE_FILE = os.path.join(APPS_DIR, "node.json")   # node profiles (RFC-0011)
 DEPLOY_TOKENS = os.path.join(APPS_DIR, "deploy-tokens.json")
 DEPLOY_LOG = os.path.join(APPS_DIR, "deploy-log.jsonl")
 SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
@@ -71,6 +76,86 @@ def save_registry(reg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=2)
     os.replace(tmp, REGISTRY)
+
+
+# ------------------------------------------------ node profiles (RFC-0011)
+# What this node is FOR. Zero or more, maintained by the operator on the
+# machine itself, empty by default -- a node that says nothing behaves
+# exactly as before. Only profiles that have an effect today exist
+# (RFC-0011 decision 2): a settable profile that does nothing would
+# invite typos and false expectations.
+
+PROFILES = {
+    "dev": "development node — the portal may create test instances and "
+           "install from a source no store list carries yet (RFC-0011)",
+}
+
+
+def load_profiles():
+    """Profiles of this node, unknown entries ignored.
+
+    Ignoring rather than trusting matters: a hand-edited or restored
+    node.json must never grant a behaviour this version does not
+    understand.
+    """
+    try:
+        with open(NODE_FILE, encoding="utf-8") as f:
+            stored = json.load(f).get("profiles") or []
+    except (OSError, ValueError):
+        return []
+    return sorted({p for p in stored if p in PROFILES})
+
+
+def save_profiles(profiles):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = NODE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"profiles": sorted(set(profiles))}, f, indent=2)
+    os.replace(tmp, NODE_FILE)
+
+
+def has_profile(name):
+    return name in load_profiles()
+
+
+def cmd_node(args):
+    """Show or change what this node is for (RFC-0011).
+
+    Deliberately CLI-only: the portal displays profiles but cannot
+    change them (except in the first-run wizard, which is authorised by
+    the setup token). Otherwise a compromised portal could simply grant
+    itself the `dev` profile and with it the very powers the profile is
+    meant to be a deliberate, per-node decision about.
+    """
+    profiles = load_profiles()
+    if args.action == "show":
+        print("Node profiles: " + (", ".join(profiles) if profiles else "(none)"))
+        for p in profiles:
+            print(f"  {p}: {PROFILES[p]}")
+        if not profiles:
+            print("  This node behaves like a plain production node.")
+        print("\nAvailable: " + ", ".join(sorted(PROFILES)))
+        return
+    profile = (args.profile or "").strip().lower()
+    if profile not in PROFILES:
+        die(f"unknown profile '{profile or '(missing)'}' — available: "
+            + ", ".join(sorted(PROFILES)))
+    if args.action == "add-profile":
+        if profile in profiles:
+            print(f"Node already has profile '{profile}'.")
+            return
+        save_profiles(profiles + [profile])
+        print(f"Node profile '{profile}' added: {PROFILES[profile]}")
+        if profile == "dev":
+            print("Note: on this node the portal may now install from any Git\n"
+                  "source it is given — not only from the configured store\n"
+                  "sources. That is the point of the profile, and it is a bad\n"
+                  "trade on a machine holding customer data.")
+    else:
+        if profile not in profiles:
+            die(f"node does not have profile '{profile}'")
+        save_profiles([p for p in profiles if p != profile])
+        print(f"Node profile '{profile}' removed.")
 
 
 def validate_manifest(m):
@@ -1493,6 +1578,76 @@ def cmd_process_deploys(_args):
                 ok, msg = run_install(src, channel)
                 if ok:
                     msg = "installed from store"
+        elif action == "create":
+            # New instance from the portal (RFC-0011). Only on a node
+            # that says it is a workbench, and only on the test channel:
+            # production installs keep going through the store's
+            # one-click path (2.6), where the host resolves the app id
+            # itself and no request can name a source.
+            src = None
+            if not has_profile("dev"):
+                msg = ("this node has no profile 'dev' — creating instances "
+                       "from the portal is a development act (RFC-0011)")
+            elif inst:
+                msg = f"an instance named '{name}' already exists"
+            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+                msg = "instance name: lowercase letters, digits and hyphens"
+            elif req.get("from") == "store":
+                # Same resolution as the one-click install: the request
+                # names an app id, the host decides where it comes from.
+                src, _listed = _store_lookup(req.get("app_id", ""))
+                if not src:
+                    msg = "app is not listed in any configured store source"
+            else:
+                url = (req.get("url") or "").strip()
+                # No local paths, no plain http: a local path would let
+                # the portal build an image from anything on this
+                # machine, which is a different power than "install from
+                # a repository the operator named".
+                if not re.match(r"^(https://|git@)", url):
+                    msg = "package source must be an https:// or git@ Git URL"
+                else:
+                    src = {"kind": "git", "url": url,
+                           "path": (req.get("path") or "").strip(),
+                           "ref": (req.get("ref") or "").strip()}
+            if src:
+                revision = _resolve_revision(src)
+                ok, msg = run_install(src, "test")
+                if ok:
+                    msg = "test instance created"
+        elif action == "node":
+            # Node profiles (RFC-0011) are a CLI matter — with exactly
+            # one exception: the first-run wizard, which asks what the
+            # node is for. That request is authorised by the setup
+            # token and only while no admin exists yet, so it cannot
+            # become a way for a portal to promote its own node later.
+            import hmac as _hmac
+            env_token = ""
+            try:
+                with open(os.path.join(APP_DIR, ".env"), encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("SETUP_TOKEN="):
+                            env_token = line.strip().split("=", 1)[1]
+            except OSError:
+                pass
+            state_file = os.path.join(DATA_DIR, "data", "identity", "state.json")
+            try:
+                with open(state_file, encoding="utf-8") as f:
+                    done = bool(json.load(f).get("setup_done"))
+            except (OSError, ValueError):
+                done = False
+            wanted = [p for p in (req.get("profiles") or []) if p in PROFILES]
+            if done:
+                msg = ("setup is already complete — node profiles are changed "
+                       "on the machine with 'sudo oaap node add-profile'")
+            elif not env_token or not _hmac.compare_digest(
+                    req.get("setup_token", ""), env_token):
+                msg = "invalid setup token"
+            else:
+                save_profiles(wanted)
+                ok = True
+                msg = ("node profiles set: " + ", ".join(wanted)) if wanted \
+                    else "node profiles cleared"
         elif action == "visibility":
             # App-instance visibility groups (RFC-0007): the portal's
             # /apps-registry mount is read-only, so this — like the
@@ -1645,9 +1800,11 @@ def cmd_process_deploys(_args):
         via = {"install": "store", "visibility": "portal",
                "config": "portal", "token": "portal",
                "address": "portal", "throttle": "portal",
-               "remove": "portal"}.get(action, "deploy-hook")
-        audit_deploy({"instance": name, "ok": ok, "message": msg,
-                      "revision": revision, "version": version, "via": via})
+               "remove": "portal", "create": "portal",
+               "node": "setup wizard"}.get(action, "deploy-hook")
+        audit_deploy({"instance": name or "(dieser Knoten)", "ok": ok,
+                      "message": msg, "revision": revision,
+                      "version": version, "via": via})
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:
@@ -1696,6 +1853,9 @@ def cmd_backup(args):
         "hostname": socket.gethostname(),
         "http_port": env.get("OAAP_HTTP_PORT", "80"),
         "external_host": load_external(),
+        # Recorded for the operator, NOT restored (RFC-0011 decision 4):
+        # a profile describes the machine, not the service.
+        "node_profiles": load_profiles(),
         "instances": {n: {"app_name": i["app_name"], "version": i["version"],
                           "channel": i["channel"]}
                       for n, i in sorted(reg["instances"].items())},
@@ -1714,6 +1874,11 @@ def cmd_backup(args):
         tmp_out = out_path + ".tmp"
         run(["tar", "--numeric-owner", "-czpf", tmp_out,
              "--exclude=data/identity/login-throttle.json",
+             # node profiles stay with the machine (RFC-0011 decision 4):
+             # a 'dev' backup restored onto a production box must not
+             # bring developer powers along. The manifest still records
+             # them so the operator can set them again deliberately.
+             "--exclude=apps/node.json",
              "-C", stage, "backup-manifest.json",
              "-C", DATA_DIR, "app/.env", "apps", "data/identity"])
         os.chmod(tmp_out, 0o600)
@@ -1779,11 +1944,39 @@ def _deploy_from_registry(name, inst):
                            throttle_of(inst)))
     print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
           f"channel {inst['channel']}, port {inst['port']})")
+    # The instance's own public address travels with it (RFC-0009): it
+    # belongs to the app, not to the machine. Say so out loud — on a new
+    # machine that name still points at the OLD one until DNS is moved.
+    if inst.get("address"):
+        print(f"         own address {inst['address']} came along — it must be "
+              f"pointed at THIS machine before it works again.")
     return True
+
+
+def _report_dropped_profiles():
+    """Name what the restore deliberately did NOT bring along (RFC-0011).
+
+    Silence would be the wrong kind of safe: an operator restoring a
+    workbench would wonder why the portal suddenly refuses to create
+    instances.
+    """
+    try:
+        with open(os.path.join(DATA_DIR, "last-restore-manifest.json"),
+                  encoding="utf-8") as f:
+            profiles = json.load(f).get("node_profiles") or []
+    except (OSError, ValueError):
+        return
+    if not profiles:
+        return
+    print(f"Note: the backup came from a node with profile(s) "
+          f"{', '.join(profiles)}. Profiles describe the machine, not the "
+          f"service, so they are NOT restored. Set them again deliberately "
+          f"with: sudo oaap node add-profile {profiles[0]}")
 
 
 def cmd_restore_instances(_args):
     """Used by 'install.sh restore': re-create every registered instance."""
+    _report_dropped_profiles()
     reg = load_registry()
     if not reg["instances"]:
         print("No app instances in the restored registry.")
@@ -1916,6 +2109,11 @@ def main():
     ps.add_argument("url", nargs="?")
     ps.add_argument("--name")
     ps.set_defaults(fn=cmd_store)
+    pn = sub.add_parser("node")
+    pn.add_argument("action", choices=["show", "add-profile", "remove-profile"])
+    pn.add_argument("profile", nargs="?",
+                    help="node profile, e.g. dev (RFC-0011)")
+    pn.set_defaults(fn=cmd_node)
     pe = sub.add_parser("external")
     pe.add_argument("action", choices=["show", "set", "remove"])
     pe.add_argument("hostname", nargs="?")
@@ -1930,7 +2128,10 @@ def main():
                     help="target platform's HTTP port (default 80)")
     pg.set_defaults(fn=cmd_edge)
     args = p.parse_args()
-    if args.cmd != "convert" and (not hasattr(os, "geteuid") or os.geteuid() != 0):
+    # 'convert' works on files the caller owns; 'node show' only prints
+    # what 'oaap status' prints anyway — everything else changes the node.
+    read_only = args.cmd == "convert" or (args.cmd == "node" and args.action == "show")
+    if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:
         args.fn(args)

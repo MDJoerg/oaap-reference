@@ -15,6 +15,19 @@ compose() { docker compose --project-directory "$APP_DIR" --project-name oaap "$
 
 version() { cat "$APP_DIR/VERSION" 2>/dev/null || echo "unknown (is OAAP installed?)"; }
 
+# What this node is for (RFC-0011). Read straight from the node's own
+# state so 'status' works even when the platform is down.
+profiles() {
+  python3 -c '
+import json, sys
+try:
+    p = json.load(open(sys.argv[1])).get("profiles") or []
+except Exception:
+    p = []
+print(", ".join(p) if p else "(none)")' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null \
+    || echo "(none)"
+}
+
 status() {
   if [ ! -e "$MARKER" ]; then
     echo "OAAP is not installed on this node ($OAAP_DATA_DIR)."
@@ -22,6 +35,7 @@ status() {
   fi
   echo "OAAP node status"
   echo "  Version:   $(version)"
+  echo "  Profiles:  $(profiles)"
   echo "  Data dir:  $OAAP_DATA_DIR"
   echo ""
   echo "Core services:"
@@ -121,11 +135,12 @@ case "$cmd" in
   setup-token) setup_token ;;
   app)         exec python3 "$APP_DIR/appctl.py" "$@" ;;
   store)       exec python3 "$APP_DIR/appctl.py" store "$@" ;;
+  node)        exec python3 "$APP_DIR/appctl.py" node "$@" ;;
   external)    exec python3 "$APP_DIR/appctl.py" external "$@" ;;
   edge)        exec python3 "$APP_DIR/appctl.py" edge "$@" ;;
   backup)      exec python3 "$APP_DIR/appctl.py" backup "$@" ;;
   user)        exec python3 "$APP_DIR/appctl.py" user "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)      exec bash "$APP_DIR/update.sh" "$@" ;;
-  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|remove|visibility|config|address|throttle ...|store list|add-source|remove-source ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|remove|visibility|config|address|throttle ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac

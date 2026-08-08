@@ -446,6 +446,12 @@ INSTANCES_LIST_BODY = """
 <h1>Instanzen</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if can_create %}
+<p style="display:flex;align-items:center;gap:.8rem;flex-wrap:wrap">
+   <a class="btn" href="/instances/new">Test-Instanz anlegen</a>
+   <span class="muted">möglich, weil dieser Knoten das Profil
+   <code>dev</code> trägt (RFC-0011)</span></p>
+{% endif %}
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
@@ -467,6 +473,60 @@ INSTANCES_LIST_BODY = """
 <p class="muted">Sichtbarkeit schränkt zusätzlich zur Rolle ein, wer eine
 installierte Instanz sehen und öffnen darf (RFC-0007) — <code>server_admin</code>
 sieht immer alle Instanzen, unabhängig davon.</p>
+"""
+
+# Floorplan "Dialogseite" — create a test instance. Only reachable on a
+# node with profile `dev` (RFC-0011); the store's one-click install
+# remains the way to production instances on every node.
+INSTANCE_NEW_BODY = """
+<a class="back" href="/instances">← Zurück zur Liste</a>
+<h1>Test-Instanz anlegen</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<div class="card">
+  <p><span class="badge test">Profil dev</span> Dieser Knoten ist als
+  <strong>Entwicklungsknoten</strong> gekennzeichnet. Deshalb darf hier
+  aus dem Portal heraus angelegt werden — auf einem Produktivknoten
+  bleibt das der Kommandozeile vorbehalten (RFC-0011).</p>
+</div>
+<form method="post" action="/instances/new">
+  <div class="card">
+    <h2>Was soll installiert werden?</h2>
+    <label class="checkline"><input type="radio" name="from" value="store" checked>
+      Eine App aus dem Store</label>
+    <label>App
+      <select name="app_id">
+        {% for a in store_apps %}
+        <option value="{{ a.id }}">{{ a.name }} (v{{ a.version }}) — {{ a.source }}</option>
+        {% else %}
+        <option value="">— keine Store-Quelle lesbar —</option>
+        {% endfor %}
+      </select></label>
+    <label class="checkline"><input type="radio" name="from" value="git">
+      Aus einem Git-Repository, das noch in keiner Liste steht</label>
+    <label>Git-URL <input type="text" name="url"
+           placeholder="https://github.com/… oder git@github.com:…"></label>
+    <label>Pfad im Repository (optional) <input type="text" name="path"
+           placeholder="z. B. apps/hub"></label>
+    <label>Branch oder Tag (optional) <input type="text" name="ref"
+           placeholder="z. B. v0.3.0 — leer = Standardbranch"></label>
+    <p class="muted">Der freie Git-Weg ist der Grund für das Profil: Eine
+    brandneue App steht in keiner Store-Liste. Auf einem Knoten ohne
+    <code>dev</code> gilt weiterhin, dass nur installiert wird, was eine
+    konfigurierte Quelle listet.</p>
+  </div>
+  <div class="card">
+    <h2>Name der Instanz</h2>
+    <label>Instanzname (optional) <input type="text" name="name"
+           placeholder="leer = Kennung der App"></label>
+    <p class="muted">Der Name ist die Adresse der Instanz und lässt sich
+    später nicht ändern. Kleinbuchstaben, Ziffern und Bindestriche.</p>
+    <p class="muted"><strong>Kanal: Test.</strong> Aus dem Portal
+    angelegte Instanzen landen immer auf dem Test-Kanal — sie dürfen ein
+    Deploy-Token bekommen, und ein erneutes Deployment derselben Version
+    ist erlaubt. Produktiv installiert weiterhin der Store.</p>
+    <button>Anlegen</button>
+  </div>
+</form>
 """
 
 # Floorplan "Objektseite" (design guidelines 6.2).
@@ -652,6 +712,14 @@ SETUP_PAGE = STYLE + """
       <label>Admin-Benutzername <input name="username" required autocomplete="username"></label>
       <label>Passwort (mind. 8 Zeichen)
         <input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
+      <p class="muted" style="margin:1.2rem 0 .2rem">Wofür ist dieser Knoten da?</p>
+      <label class="checkline"><input type="checkbox" name="profile_dev" value="1">
+        Entwicklungsknoten (Profil <code>dev</code>)</label>
+      <p class="muted" style="margin:.2rem 0 0">Auf einem Entwicklungsknoten
+      darf das Portal Test-Instanzen anlegen — auch aus einem Repository,
+      das in keiner Store-Liste steht. Für eine Maschine mit echten
+      Daten: nicht ankreuzen. Später änderbar mit
+      <code>sudo oaap node add-profile dev</code>.</p>
       <button style="width:100%">Administrator anlegen</button>
     </form>
   {% endif %}
@@ -705,7 +773,26 @@ def load_instances():
 
 EXTERNAL_FILE = "/apps-registry/external.json"
 EDGE_FILE = "/apps-registry/edge.json"
+NODE_FILE = "/apps-registry/node.json"
 ACCESS_LOG = "/gateway-logs/external-access.log"
+
+# What this node is for (RFC-0011). The portal READS profiles and never
+# writes them — the one exception is the first-run wizard, which is
+# authorised by the setup token. Anything else would defeat the point:
+# a profile that the portal can grant itself is not a per-node decision.
+PROFILE_LABELS = {
+    "dev": "Entwicklungsknoten — das Portal darf Test-Instanzen anlegen "
+           "und aus einer noch nicht gelisteten Quelle installieren",
+}
+
+
+def node_profiles():
+    try:
+        with open(NODE_FILE, encoding="utf-8") as f:
+            stored = json.load(f).get("profiles") or []
+    except (OSError, ValueError):
+        return []
+    return sorted(p for p in stored if p in PROFILE_LABELS)
 
 
 def external_host():
@@ -947,6 +1034,17 @@ def node_values():
     rows = []
     rows.append({"name": "Plattformversion", "state": "ok", "label": VERSION,
                  "detail": ""})
+    # RFC-0011: nobody should have to guess why this node behaves
+    # differently from its neighbour.
+    profiles = node_profiles()
+    rows.append({
+        "name": "Knoten-Profil", "state": "ok",
+        "label": ", ".join(profiles) if profiles else "(keins)",
+        "detail": "; ".join(PROFILE_LABELS[p] for p in profiles) if profiles
+                  else "verhält sich wie ein normaler Produktivknoten; "
+                       "gesetzt wird das auf der Maschine mit "
+                       "'sudo oaap node add-profile'",
+    })
     try:
         up = float(open("/proc/uptime").read().split()[0])
         d, rest = divmod(int(up), 86400)
@@ -1436,7 +1534,108 @@ def instances_list():
             "visibility_label": "Alle" if not groups else "Gruppen: " + ", ".join(groups),
         })
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
+                can_create="dev" in node_profiles(),
                 msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+# --- creating a test instance from the portal (RFC-0011, profile `dev`) ---
+# The store's one-click install (2.6) stays untouched and available on
+# every node. What the profile adds here is the development case: a test
+# instance, optionally from a repository no store list carries yet.
+
+CREATE_WAIT_SECONDS = 120  # clone + build + start, like a store install
+
+
+def _store_apps():
+    """Every app the configured store sources list, for the create form."""
+    try:
+        with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
+            sources = json.load(f).get("sources", [])
+    except (OSError, ValueError):
+        return []
+    apps = []
+    for src in sources:
+        try:
+            r = requests.get(src.get("url", ""), timeout=4)
+            r.raise_for_status()
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            continue
+        title = src.get("name") or data.get("name") or "Store-Quelle"
+        for a in data.get("apps", []):
+            if a.get("id") and (a.get("package") or {}).get("git"):
+                apps.append({"id": a["id"], "name": a.get("name", a["id"]),
+                             "version": a.get("version", "?"), "source": title})
+    return sorted(apps, key=lambda a: (a["name"].lower(), a["source"]))
+
+
+def _require_dev_node():
+    """Guard for the create path — the profile is checked twice.
+
+    Here for a readable answer, and again on the host, where the
+    decision actually is: the spool is data, not trust.
+    """
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if "dev" not in node_profiles():
+        return ("Dieser Knoten hat kein Profil 'dev'. Instanzen aus dem "
+                "Portal anzulegen ist eine Entwicklungshandlung und deshalb "
+                "an das Profil gebunden (RFC-0011) — setzen mit "
+                "'sudo oaap node add-profile dev' auf der Maschine.", 403)
+    return None
+
+
+@app.get("/instances/new")
+def instance_new_form():
+    denied = _require_dev_node()
+    if denied:
+        return denied
+    return page(INSTANCE_NEW_BODY, "Instanz anlegen", "instances",
+                store_apps=_store_apps(), error=request.args.get("err"))
+
+
+@app.post("/instances/new")
+def instance_new():
+    denied = _require_dev_node()
+    if denied:
+        return denied
+    from_ = request.form.get("from", "store")
+    app_id = request.form.get("app_id", "").strip()
+    url = request.form.get("url", "").strip()
+    name = request.form.get("name", "").strip().lower()
+    if from_ == "store" and not app_id:
+        return _new_error("Bitte eine App aus dem Store wählen.")
+    if from_ == "git" and not url:
+        return _new_error("Bitte die Git-URL des Repositories angeben.")
+    # An instance name derived from a Git URL would be a guess; the app
+    # id from the manifest is the honest default, so the host decides it
+    # when the field is left empty.
+    if name and not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        return _new_error("Instanzname: Kleinbuchstaben, Ziffern, Bindestriche.")
+    if name and name in load_instances():
+        return _new_error(f"Eine Instanz namens '{name}' gibt es bereits.")
+    if not name and from_ == "store":
+        name = app_id
+    if not name:
+        return _new_error("Für den Git-Weg bitte einen Instanznamen angeben.")
+    res = _queue_and_wait(name, {
+        "action": "create", "from": from_, "app_id": app_id,
+        "url": url, "path": request.form.get("path", "").strip(),
+        "ref": request.form.get("ref", "").strip(),
+    }, CREATE_WAIT_SECONDS)
+    if res is None:
+        return redirect(f"/instances?msg={quote(f'Die Installation von {name} läuft noch — das Ergebnis steht im Deploy-Protokoll auf der Gesundheitsseite.')}", code=303)
+    if res.get("ok"):
+        return redirect(f"/instances/{name}?msg={quote('Test-Instanz angelegt.')}",
+                        code=303)
+    return _new_error(f"Anlegen fehlgeschlagen: "
+                      f"{res.get('message', 'unbekannter Fehler')}")
+
+
+def _new_error(text):
+    return page(INSTANCE_NEW_BODY, "Instanz anlegen", "instances", status=400,
+                store_apps=_store_apps(), error=text)
 
 
 @app.get("/instances/<name>")
@@ -1701,12 +1900,36 @@ def setup_form():
     return render_template_string(SETUP_PAGE, done=setup_done(), error=None)
 
 
+SETUP_PROFILE_WAIT_SECONDS = 15  # writes one small file, no docker work
+
+
 @app.post("/setup")
 def setup_submit():
     if setup_done():
         return render_template_string(SETUP_PAGE, done=True, error=None)
+    token = request.form.get("token", "").strip()
+    # The node profile is written BEFORE the admin is created, because
+    # the host worker accepts it only while setup is still open (and
+    # only against the real setup token, which it checks itself). Doing
+    # it afterwards would race with the very flag that guards it.
+    if request.form.get("profile_dev"):
+        res = _queue_and_wait("", {"action": "node", "profiles": ["dev"],
+                                   "setup_token": token},
+                              SETUP_PROFILE_WAIT_SECONDS)
+        if res is None or not res.get("ok"):
+            # Stop before creating the admin: a half-applied first run is
+            # worse than a repeated one, and the form can simply be sent
+            # again (the setup token is still valid).
+            why = res.get("message", "") if res else \
+                "der Dienst auf dem Server hat nicht rechtzeitig geantwortet"
+            return render_template_string(
+                SETUP_PAGE, done=False,
+                error=f"Das Knoten-Profil konnte nicht gesetzt werden ({why}). "
+                      "Bitte erneut absenden — oder ohne Haken fortfahren und "
+                      "das Profil später mit 'sudo oaap node add-profile dev' "
+                      "setzen."), 503
     resp = requests.post(f"{IDENTITY}/internal/setup", json={
-        "token": request.form.get("token", "").strip(),
+        "token": token,
         "username": request.form.get("username", ""),
         "password": request.form.get("password", ""),
     }, timeout=5)
