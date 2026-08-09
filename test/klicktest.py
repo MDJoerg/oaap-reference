@@ -207,8 +207,11 @@ ok("mindestens eine Instanz zum Pruefen gefunden", bool(target), str(names[:5]))
 st, body7, url = get(f"/instances/{target}")
 ok("die Instanzseite kommt", st == 200, f"{st} {url}")
 ok("sie hat die Karte fuer die Kachel", "Kachel im Launchpad" in body7)
-ok("sie sagt, was die App ueber sich selbst behauptet",
-   "bezeichnet sich selbst" in body7)
+# Beides ist richtig, je nachdem, ob die App eine Klasse erklaert. Was
+# NICHT vorkommen darf, ist eine App zu zitieren, die nichts gesagt hat.
+ok("sie sagt, woher die Entscheidung kommt",
+   "bezeichnet sich selbst" in body7 or "keine Angabe" in body7,
+   body7[body7.find("Kachel im Launchpad"):][:300])
 ok("sie warnt, dass Verstecken niemanden aussperrt",
    "Zugriffskontrolle" in body7)
 
