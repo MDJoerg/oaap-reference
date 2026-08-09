@@ -632,6 +632,17 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
   cat > /etc/systemd/system/oaap-deployd.service <<EOF
 [Unit]
 Description=OAAP deploy worker (processes queued app deployments)
+# systemd's default rate limit (5 starts in 10 s) is meant for services
+# that crash-loop. This one is a queue drainer: every request in the
+# portal starts it once, so a handful of clicks in a row looks exactly
+# like a crash loop from the outside. When the limit hits, systemd puts
+# the SERVICE and the watching PATH unit into 'failed' and stops looking
+# at the queue at all -- the node then silently accepts requests and
+# processes none of them until someone runs 'systemctl reset-failed' by
+# hand. Found on oaap-test, 2026-08-09, with six portal actions in six
+# seconds. The worker itself drains the whole queue per run and is
+# harmless to start often, so the limit buys nothing here.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

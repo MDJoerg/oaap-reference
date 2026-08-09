@@ -9,14 +9,21 @@ Zwei Arten von Prüfung liegen hier:
   Wegwerf-Datenverzeichnis; Store-Listen liefert ein lokaler
   HTTP-Server im Test selbst, damit nichts gegen eine Fixture-Datei
   auseinanderläuft.
+- **`klicktest.py`** — die Oberfläche an einem **laufenden Knoten**:
+  anmelden, Store-Katalog, Filter, Objektseite, Quellenverwaltung und
+  der Schreibweg über den Spool-Worker. Braucht Zugangsdaten in `.env`
+  (nicht im Git) und einen Portal-Benutzer mit Rolle `server_admin`.
 
 ```bash
 python3 test/test_manifest_version.py
 python3 test/test_store_sources.py
 python3 test/test_store_view.py
+
+python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
 
-Jede gibt `ALL PASS` aus und endet mit Rückgabewert 0, sonst 1.
+Jede gibt `ALL PASS` bzw. `ALLE PRUEFUNGEN BESTANDEN` aus und endet mit
+Rückgabewert 0, sonst 1.
 
 Was sie festhalten, ist jeweils eine **Regel aus einem RFC**, nicht das
 heutige Verhalten des Codes: Manifest-Versionstoleranz und

@@ -1625,6 +1625,7 @@ def health():
     core.append({"name": "Gateway", "state": state, "label": label, "detail": detail})
     core.append({"name": "Portal", "state": "ok", "label": "Gesund",
                  "detail": "liefert diese Seite"})
+    core.append(deploy_worker_state())
 
     apps = []
     for name, inst in sorted(load_instances().items()):
@@ -1870,6 +1871,57 @@ def all_sources():
 def configured_sources():
     """The enabled ones — what the store actually reads from."""
     return [s for s in all_sources() if s["enabled"]]
+
+
+# A queued request is normally gone in a second or two; an install may
+# take minutes while images are pulled. Anything still lying there after
+# this long means nothing is draining the queue.
+WORKER_STUCK_SECONDS = 600
+
+
+def deploy_worker_state():
+    """Is anything actually processing the spool? (oaap.core.host §2.4)
+
+    The worker runs on the machine as a systemd path unit, so this
+    container cannot ask systemd about it. It can see the symptom, and
+    the symptom is the better test anyway: it catches a failed unit, a
+    host without systemd, and a worker that dies on every request alike.
+
+    Found on oaap-test, 2026-08-09: a burst of portal actions tripped
+    systemd's start rate limit, the path unit went to 'failed', and the
+    node kept accepting requests while processing none of them. Nothing
+    anywhere said so — every page looked healthy, actions just quietly
+    had no effect.
+    """
+    name = "Deploy-Worker"
+    try:
+        waiting = [os.path.join(SPOOL_QUEUE, fn)
+                   for fn in os.listdir(SPOOL_QUEUE) if fn.endswith(".json")]
+    except OSError:
+        return {"name": name, "state": "unknown", "label": "Unbekannt",
+                "detail": "Warteschlange nicht lesbar"}
+    if not waiting:
+        return {"name": name, "state": "ok", "label": "Gesund",
+                "detail": "Warteschlange leer"}
+    now = _time.time()
+    ages = []
+    for p in waiting:
+        try:
+            ages.append(now - os.path.getmtime(p))
+        except OSError:
+            pass
+    oldest = max(ages) if ages else 0
+    if oldest > WORKER_STUCK_SECONDS:
+        return {
+            "name": name, "state": "error", "label": "Steht",
+            "detail": (f"{len(waiting)} Anfrage(n) warten, die älteste seit "
+                       f"{int(oldest // 60)} Minuten — auf der Maschine prüfen "
+                       "mit 'systemctl status oaap-deployd.path'; wieder in "
+                       "Gang bringen mit 'systemctl reset-failed "
+                       "oaap-deployd.service oaap-deployd.path && systemctl "
+                       "start oaap-deployd.path'")}
+    return {"name": name, "state": "ok", "label": "Arbeitet",
+            "detail": f"{len(waiting)} Anfrage(n) in Arbeit"}
 
 
 def pending_installs():

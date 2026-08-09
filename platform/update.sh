@@ -158,6 +158,27 @@ echo "$new_rev" > "$APP_DIR/REVISION"
 # moves, every node in the field strands, visibly only as an empty
 # store. Reconcile carries a moved list along where the operator has not
 # edited the URL, leaves it alone where they have, and says which.
+# The deploy worker's unit is written by the installer and was never
+# touched again, so a node installed before this version keeps systemd's
+# default start rate limit — and with it the failure found on oaap-test:
+# a handful of portal actions in a row look like a crash loop, systemd
+# fails the watching path unit, and the node quietly stops processing
+# ANY queued request until someone resets it by hand. Repair it here,
+# and clear the failed state if this node already fell into it.
+UNIT=/etc/systemd/system/oaap-deployd.service
+if [ -f "$UNIT" ] && ! grep -q '^StartLimitIntervalSec=' "$UNIT"; then
+  say ""
+  say "Repairing the deploy worker's start rate limit ..."
+  if sed -i '/^Description=OAAP deploy worker/a StartLimitIntervalSec=0' "$UNIT"; then
+    systemctl daemon-reload
+    systemctl reset-failed oaap-deployd.service oaap-deployd.path >/dev/null 2>&1 || true
+    systemctl start oaap-deployd.path >/dev/null 2>&1 || true
+    say "  Done — queued requests are processed again after a burst of clicks."
+  else
+    say "  WARNING: could not update $UNIT."
+  fi
+fi
+
 say ""
 say "Checking store sources ..."
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store reconcile \
