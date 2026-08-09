@@ -197,7 +197,10 @@ ok("und sagt, dass das keine Zugriffskontrolle ist",
 
 # Nicht auf einen Instanznamen festnageln — der Test soll auf jedem
 # Knoten laufen. Die Regel gilt fuer jede Instanz gleich.
-names = re.findall(r'href="/instances/([a-z0-9][a-z0-9-]*)"', body)
+# 'new' ist der Anlegen-Knopf, keine Instanz — der Filter fehlte im
+# ersten Anlauf und der Test prüfte die Dialogseite statt einer Instanz.
+names = [n for n in re.findall(r'href="/instances/([a-z0-9][a-z0-9-]*)"', body)
+         if n != "new"]
 target = names[0] if names else ""
 ok("mindestens eine Instanz zum Pruefen gefunden", bool(target), str(names[:5]))
 

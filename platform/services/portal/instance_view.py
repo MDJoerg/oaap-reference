@@ -50,6 +50,21 @@ def tile_mode(inst):
     return mode if mode in TILE_MODES else "auto"
 
 
+def class_phrase(inst):
+    """How to talk about the class without overclaiming.
+
+    Every app installed before manifest 0.2 declares nothing at all, and
+    that is most of the fleet today. "Die App bezeichnet sich selbst
+    als …" would be a small untruth about all of them, and small
+    untruths on an admin page cost somebody an hour later.
+    """
+    declared = str(inst.get("app_class") or "").strip()
+    if declared in CLASS_LABEL:
+        return f"Die App bezeichnet sich selbst als {CLASS_LABEL[declared]}."
+    return ("Die App macht dazu keine Angabe und gilt deshalb als "
+            f"{CLASS_LABEL[DEFAULT_APP_CLASS]}.")
+
+
 def tile_visible(inst):
     """Does this instance get a launchpad tile?"""
     mode = tile_mode(inst)
@@ -65,18 +80,19 @@ def tile_reason(inst):
     state — otherwise the only way to find out is to read the source.
     """
     mode, shown = tile_mode(inst), tile_visible(inst)
-    if mode == "auto":
-        if shown:
-            return ("Diese App bringt eine Oberfläche mit und erscheint "
-                    "deshalb im Launchpad.")
-        return ("Diese App ist ein Hintergrunddienst — sie wird von anderer "
-                "Software benutzt, nicht von einem Menschen — und bekommt "
-                "deshalb keine Kachel.")
-    if shown:
-        return ("Die Kachel ist ausdrücklich eingeschaltet, unabhängig "
-                "davon, was die App über sich sagt.")
-    return ("Die Kachel ist ausdrücklich abgeschaltet, unabhängig davon, "
-            "was die App über sich sagt.")
+    if mode != "auto":
+        state = "eingeschaltet" if shown else "abgeschaltet"
+        return (f"Die Kachel ist ausdrücklich {state}, unabhängig davon, was "
+                f"die App über sich sagt. {class_phrase(inst)}")
+    if not shown:
+        return ("Die App bezeichnet sich selbst als Hintergrunddienst — sie "
+                "wird von anderer Software benutzt, nicht von einem Menschen "
+                "— und bekommt deshalb keine Kachel.")
+    if str(inst.get("app_class") or "").strip() in CLASS_LABEL:
+        return ("Die App bezeichnet sich selbst als Anwendung mit Oberfläche "
+                "und erscheint deshalb im Launchpad.")
+    return ("Die App macht keine Angabe über ihre Art und gilt deshalb als "
+            "Anwendung mit Oberfläche — sie erscheint im Launchpad.")
 
 
 def hidden_instances(instances):

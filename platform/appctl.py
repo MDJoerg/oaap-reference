@@ -1311,6 +1311,20 @@ def tile_mode_of(inst):
     return mode if mode in TILE_MODES else "auto"
 
 
+def class_phrase(inst):
+    """How to talk about an instance's class without overclaiming.
+
+    Every app installed before manifest 0.2 declares nothing at all, and
+    that is most of the fleet. Saying "declares itself 'frontend'" about
+    those is a small untruth that sends anybody debugging in the wrong
+    direction, so say what actually happened instead.
+    """
+    declared = str(inst.get("app_class") or "").strip()
+    if declared in APP_CLASSES:
+        return f"the app declares itself '{declared}'"
+    return f"the app declares no class, so it counts as '{DEFAULT_APP_CLASS}'"
+
+
 def tile_visible(inst):
     """Does this instance belong on the launchpad? (runtime spec 2.10)
 
@@ -1334,9 +1348,8 @@ def cmd_tile(args):
         die(f"tile: '{args.mode}' is not one of {' | '.join(TILE_MODES)}")
     if not args.mode:
         mode = tile_mode_of(inst)
-        cls = inst.get("app_class") or DEFAULT_APP_CLASS
         print(f"'{args.name}' tile: {mode} ({TILE_EXPLAIN[mode]}) — "
-              f"the app declares itself '{cls}'")
+              f"{class_phrase(inst)}")
         print("Currently " + ("shown" if tile_visible(inst)
                               else "not shown") + " on the launchpad.")
         return
@@ -1348,10 +1361,9 @@ def cmd_tile(args):
     # No gateway work: unlike visibility, this changes nothing about
     # who may reach the instance, so no site is regenerated.
     if args.mode == "auto":
-        cls = inst.get("app_class") or DEFAULT_APP_CLASS
-        print(f"'{args.name}' tile follows the app again (it declares "
-              f"itself '{cls}') — " + ("shown." if tile_visible(inst)
-                                       else "not shown."))
+        print(f"'{args.name}' tile follows the app again "
+              f"({class_phrase(inst)}) — "
+              + ("shown." if tile_visible(inst) else "not shown."))
     else:
         print(f"'{args.name}' tile: {args.mode} ({TILE_EXPLAIN[args.mode]}).")
     print("This is display only — the app keeps its address, its routes "

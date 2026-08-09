@@ -84,6 +84,24 @@ for case in (inst(app_class="service"), inst(app_class="frontend"),
 ok("an explicit setting says so, so nobody blames the app",
    "ausdrücklich" in iv.tile_reason(inst(app_class="service", tile="on")))
 
+# Found on oaap-test, 2026-08-09: every instance on the whole fleet
+# predates manifest 0.2, and both the CLI and the page told each of them
+# "the app declares itself frontend" — about apps that declare nothing.
+# A small untruth on an admin page costs somebody an hour later.
+ok("an app that declared nothing is not credited with having declared",
+   "keine Angabe" in iv.tile_reason(inst())
+   and "declares no class" in appctl.class_phrase(inst()),
+   f"{iv.tile_reason(inst())} / {appctl.class_phrase(inst())}")
+ok("...and one that did declare is quoted as declaring",
+   "bezeichnet sich selbst" in iv.tile_reason(inst(app_class="frontend"))
+   and "declares itself 'service'" in appctl.class_phrase(inst(app_class="service")))
+ok("an unknown value is not quoted back either",
+   "keine Angabe" in iv.tile_reason(inst(app_class="kuehlschrank"))
+   and "declares no class" in appctl.class_phrase(inst(app_class="kuehlschrank")))
+ok("and the override text names the class without repeating itself",
+   iv.tile_reason(inst(tile="off")).count("Kachel") == 1,
+   iv.tile_reason(inst(tile="off")))
+
 print("\n=== the launchpad can report what it is hiding ===")
 # A node running only background services would otherwise have a
 # launchpad indistinguishable from a broken one (portal spec 2.2).

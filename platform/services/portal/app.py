@@ -919,8 +919,7 @@ INSTANCE_EDIT_BODY = """
 <form method="post" action="/instances/{{ i.name }}/tile">
   <div class="card">
     <h2>Kachel im Launchpad</h2>
-    <p class="muted">{{ i.tile_reason }} Die App bezeichnet sich selbst als
-       <strong>{{ i.app_class_label }}</strong>.</p>
+    <p class="muted">{{ i.tile_reason }}</p>
     <label class="checkline"><input type="radio" name="mode" value="auto"
            {{ 'checked' if i.tile_mode == 'auto' }}>Der App folgen (Standard)</label>
     <label class="checkline"><input type="radio" name="mode" value="on"
@@ -2404,7 +2403,6 @@ def instance_detail(name):
                                  for r in inst.get("routes") or []),
          "tile_mode": iv.tile_mode(inst),
          "tile_reason": iv.tile_reason(inst),
-         "app_class_label": iv.CLASS_LABEL[iv.app_class(inst)],
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 msg=request.args.get("msg"), error=request.args.get("err"))
