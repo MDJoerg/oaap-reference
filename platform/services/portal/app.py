@@ -1213,6 +1213,15 @@ def edge_tls_ask():
     return "not an edge-routed name", 404
 
 
+# Whether an installed instance belongs on the launchpad is an RFC
+# decision (RFC-0012 §1.2 with its §1.3 addendum, oaap.apps.runtime
+# 2.10), so it lives outside this file for the same reason the catalogue
+# rules do — readable and testable without Flask. Imported as a module:
+# it carries a CLASS_LABEL of its own, about instances rather than store
+# entries.
+import instance_view as iv  # noqa: E402
+
+
 def launchpad_tiles(user_roles, user_groups, host):
     """Role- and group-filtered app tiles from the instance registry
     (spec 2.5, RFC-0007). The filter is UX only — the gateway enforces

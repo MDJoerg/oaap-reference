@@ -229,5 +229,43 @@ ok("the change is in the deploy log like every other portal action",
    json.loads(open(appctl.DEPLOY_LOG, encoding="utf-8")
               .read().strip().splitlines()[0]).get("via") == "portal")
 
+print("\n=== benutzt das Portal nur, was es auch importiert? ===")
+# Gefunden auf oaap-test, 2026-08-09: app.py rief `iv.tile_visible(...)`
+# auf, ohne `instance_view` zu importieren. `py_compile` sieht das nicht
+# (es ist ein NameError zur Laufzeit, kein Syntaxfehler), Flask ist hier
+# nicht installiert, also laesst sich app.py auch nicht einfach
+# importieren — und so ging es bis auf den Knoten durch, wo das
+# Launchpad mit 500 antwortete. Diese Pruefung ist bewusst grob: Sie
+# sammelt JEDEN Namen, der irgendwo im Modul gebunden wird, und meldet
+# nur die, die nirgends herkommen.
+import ast  # noqa: E402
+import builtins  # noqa: E402
+
+PORTAL = os.path.join(HERE, "..", "platform", "services", "portal")
+for fn in sorted(f for f in os.listdir(PORTAL) if f.endswith(".py")):
+    tree = ast.parse(open(os.path.join(PORTAL, fn), encoding="utf-8").read())
+    bound = set(dir(builtins)) | {"__name__", "__file__", "__doc__"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            bound.add(node.name)
+            args = getattr(node, "args", None)
+            if args:
+                for a in (args.posonlyargs + args.args + args.kwonlyargs
+                          + [args.vararg, args.kwarg]):
+                    if a:
+                        bound.add(a.arg)
+        elif isinstance(node, ast.alias):
+            bound.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+    used = {n.value.id for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+    missing = sorted(used - bound)
+    ok(f"{fn}: jeder benutzte Modulname ist auch importiert",
+       not missing, f"nirgends gebunden: {missing}")
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)
