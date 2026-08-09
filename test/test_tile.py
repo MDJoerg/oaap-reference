@@ -95,9 +95,27 @@ ok("an app that declared nothing is not credited with having declared",
 ok("...and one that did declare is quoted as declaring",
    "bezeichnet sich selbst" in iv.tile_reason(inst(app_class="frontend"))
    and "declares itself 'service'" in appctl.class_phrase(inst(app_class="service")))
-ok("an unknown value is not quoted back either",
-   "keine Angabe" in iv.tile_reason(inst(app_class="kuehlschrank"))
-   and "declares no class" in appctl.class_phrase(inst(app_class="kuehlschrank")))
+# Drei Fälle, nicht zwei — gefunden auf dem Raspi, 2026-08-09: Die
+# Installation schrieb den NORMALISIERTEN Wert in die Registry, also
+# stand dort 'frontend' für eine App, die nichts erklärt hatte. Damit
+# war der Unterschied für jeden Leser für immer weg.
+ok("ein unbekannter Wert wird als unbekannt gemeldet, nicht als Erklärung",
+   "kennt diese Plattform nicht" in iv.tile_reason(inst(app_class="kuehlschrank"))
+   and "does not know" in appctl.class_phrase(inst(app_class="kuehlschrank")),
+   f"{iv.tile_reason(inst(app_class='kuehlschrank'))}")
+ok("...aber die Kachel bleibt, weil unbekannt als frontend zählt",
+   iv.tile_visible(inst(app_class="kuehlschrank"))
+   and appctl.tile_visible(inst(app_class="kuehlschrank")))
+ok("die Installation schreibt VERBATIM, was das Manifest sagte",
+   appctl.declared_class({"class": "service"}) == "service"
+   and appctl.declared_class({}) == ""
+   and appctl.declared_class({"class": "kuehlschrank"}) == "kuehlschrank",
+   "sonst ist 'erklärt frontend' von 'erklärt nichts' nicht mehr zu "
+   "unterscheiden")
+ok("...während das Verhalten weiterhin normalisiert entscheidet",
+   appctl.app_class_of({"class": "kuehlschrank"}) == "frontend"
+   and appctl.instance_class({"app_class": ""}) == "frontend"
+   and appctl.instance_class({"app_class": "service"}) == "service")
 ok("and the override text names the class without repeating itself",
    iv.tile_reason(inst(tile="off")).count("Kachel") == 1,
    iv.tile_reason(inst(tile="off")))

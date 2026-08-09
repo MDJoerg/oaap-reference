@@ -79,9 +79,28 @@ APP_CLASSES = ("frontend", "service")
 DEFAULT_APP_CLASS = "frontend"
 
 
+def declared_class(app):
+    """What the manifest ACTUALLY said, verbatim — '' when it said nothing.
+
+    This is what goes into the registry. Storing the normalised value
+    instead would throw away the difference between "declares frontend"
+    and "declares nothing", and then no reader could ever tell them
+    apart again. Found on the Raspi, 2026-08-09: a freshly installed
+    0.1 app was recorded as 'frontend' and the CLI duly credited it
+    with a declaration it never made.
+    """
+    return str(app.get("class") or "").strip()
+
+
 def app_class_of(app):
     """The declared application class, normalised (runtime spec 2.10)."""
-    value = str(app.get("class") or "").strip()
+    value = declared_class(app)
+    return value if value in APP_CLASSES else DEFAULT_APP_CLASS
+
+
+def instance_class(inst):
+    """The effective class of an INSTALLED instance, normalised."""
+    value = str(inst.get("app_class") or "").strip()
     return value if value in APP_CLASSES else DEFAULT_APP_CLASS
 
 # Features a manifest may declare under 'must_understand' -- the exception
@@ -1150,7 +1169,9 @@ def _install_from_dir(pkg, args, source):
         # installed straight from Git, and without a foreign list being
         # able to rearrange somebody else's launchpad. Re-read on every
         # install, because it describes the app and the app may change.
-        "app_class": app_class_of(app),
+        # Stored VERBATIM ('' when the manifest is silent) — see
+        # declared_class() for why the normalised value would be wrong.
+        "app_class": declared_class(app),
         "port": port, "image": image, "container": container,
         # for the portal's health page: where to reach the service on
         # the internal network and which path confirms liveness
@@ -1314,14 +1335,17 @@ def tile_mode_of(inst):
 def class_phrase(inst):
     """How to talk about an instance's class without overclaiming.
 
-    Every app installed before manifest 0.2 declares nothing at all, and
-    that is most of the fleet. Saying "declares itself 'frontend'" about
+    Most of the fleet declares nothing at all — every app packaged
+    before manifest 0.2. Saying "declares itself 'frontend'" about
     those is a small untruth that sends anybody debugging in the wrong
-    direction, so say what actually happened instead.
+    direction, so distinguish the three cases that actually exist.
     """
     declared = str(inst.get("app_class") or "").strip()
     if declared in APP_CLASSES:
         return f"the app declares itself '{declared}'"
+    if declared:
+        return (f"the app declares '{declared}', which this platform does "
+                f"not know, so it counts as '{DEFAULT_APP_CLASS}'")
     return f"the app declares no class, so it counts as '{DEFAULT_APP_CLASS}'"
 
 
@@ -1336,7 +1360,7 @@ def tile_visible(inst):
     mode = tile_mode_of(inst)
     if mode != "auto":
         return mode == "on"
-    return (inst.get("app_class") or DEFAULT_APP_CLASS) != "service"
+    return instance_class(inst) != "service"
 
 
 def cmd_tile(args):

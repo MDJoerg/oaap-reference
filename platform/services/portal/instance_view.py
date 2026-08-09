@@ -61,6 +61,10 @@ def class_phrase(inst):
     declared = str(inst.get("app_class") or "").strip()
     if declared in CLASS_LABEL:
         return f"Die App bezeichnet sich selbst als {CLASS_LABEL[declared]}."
+    if declared:
+        return (f"Die App bezeichnet sich als „{declared}“ — das kennt diese "
+                f"Plattform nicht, sie gilt deshalb als "
+                f"{CLASS_LABEL[DEFAULT_APP_CLASS]}.")
     return ("Die App macht dazu keine Angabe und gilt deshalb als "
             f"{CLASS_LABEL[DEFAULT_APP_CLASS]}.")
 
@@ -91,8 +95,7 @@ def tile_reason(inst):
     if str(inst.get("app_class") or "").strip() in CLASS_LABEL:
         return ("Die App bezeichnet sich selbst als Anwendung mit Oberfläche "
                 "und erscheint deshalb im Launchpad.")
-    return ("Die App macht keine Angabe über ihre Art und gilt deshalb als "
-            "Anwendung mit Oberfläche — sie erscheint im Launchpad.")
+    return class_phrase(inst) + " Sie erscheint im Launchpad."
 
 
 def hidden_instances(instances):
