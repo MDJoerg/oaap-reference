@@ -142,6 +142,32 @@ ok("reconcile reports the change of resolution rule",
 ok("migration reached disk", all(x.get("id") for x in after))
 ok("reconcile is idempotent", appctl.reconcile_shipped_sources() == [])
 
+print("\n=== a foreign list from a repository we also ship from ===")
+# Found on oaap-test, 2026-08-09: the URL prefix was consulted for every
+# entry on every read, so a source the operator added from the same
+# repository (here: the community list pinned to a commit) was silently
+# marked as one the installation shipped.
+pinned = ("https://raw.githubusercontent.com/MDJoerg/oaap-store/"
+          "26681d051d61eba96da4d4d616559e4d877b07b0/oaap-store.json")
+okr, out = run(appctl.cmd_store, Args(action="add-source", target=pinned,
+                                      name="Angeheftet"))
+ok("a pinned URL from the same repository can be added", okr, out)
+sources, removed, migrated = appctl.load_sources()
+mine = next(s for s in sources if s["url"] == pinned)
+ok("it is NOT marked as shipped", not mine.get("shipped"), str(mine))
+ok("it keeps the unverified class", mine["trust"] == "unverified", mine["trust"])
+ok("it keeps its own derived id", mine["id"] != "oaap.community", mine["id"])
+ok("and reading it back reports no migration", not migrated)
+okr, out = run(appctl.cmd_store, Args(action="remove-source", target=mine["id"]))
+ok("removing it is not remembered as a shipped removal",
+   okr and "remembered" not in out, out)
+ok("so removed_shipped stays empty",
+   not read_sources().get("removed_shipped"),
+   str(read_sources().get("removed_shipped")))
+ok("and the shipped sources are untouched by all this",
+   {"oaap.community", "oaap.platform"}
+   <= {x["id"] for x in read_sources()["sources"]})
+
 print("\n=== a shipped list moves (B4) ===")
 moved = "https://lists.oaap.org/community/oaap-store.json"
 real = appctl.SHIPPED_SOURCES[1]["url"]
@@ -295,6 +321,8 @@ ok("install from an unverified source without confirmation is refused",
 ok("and nothing was installed", not installed)
 ok("the refusal names the source in the log",
    last_log().get("source") == "foreign", str(last_log()))
+ok("but names nobody as having confirmed it",
+   "confirmed_by" not in last_log(), str(last_log()))
 
 res = queue({"id": "r2", "instance": "studio", "action": "install",
              "source_id": "foreign", "confirm_source": "foreign",
@@ -309,6 +337,25 @@ ok("the log records who confirmed which source, for which app",
    rec.get("source") == "foreign" and rec.get("source_trust") == "unverified"
    and rec.get("confirmed_by") == "joerg" and rec.get("instance") == "studio",
    str(rec))
+
+# An audit trail records the decision, not its outcome: a confirmed
+# install that fails afterwards is exactly what one wants to find later.
+_stub_install = appctl.cmd_install
+
+
+def _fails(ns):
+    print("ERROR: build failed")
+    raise SystemExit(1)
+
+
+appctl.cmd_install = _fails
+res = queue({"id": "r2b", "instance": "studio", "action": "install",
+             "source_id": "foreign", "confirm_source": "foreign",
+             "by": "lars"})
+rec = last_log()
+ok("a confirmed install that fails is still recorded as confirmed",
+   not res["ok"] and rec.get("confirmed_by") == "lars", f"{res} / {rec}")
+appctl.cmd_install = _stub_install
 
 res = queue({"id": "r3", "instance": "studio", "action": "install",
              "source_id": "not-configured", "confirm_source": "not-configured",

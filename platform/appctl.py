@@ -1622,8 +1622,18 @@ def migrate_source(entry):
     """
     out = dict(entry)
     url = str(out.get("url") or "").strip()
+    # The URL prefix may only speak for an entry that actually predates
+    # RFC-0012 — one without an id or without a trust class. An entry
+    # that already carries both was written by this format and is taken
+    # at its word. Without this guard, every source an operator adds
+    # from the same repository (a pinned commit, a second list) would be
+    # mistaken for one the installation shipped: displayed as
+    # "mitgeliefert", and its removal remembered forever in
+    # removed_shipped.
+    legacy = (not str(out.get("id") or "").strip()
+              or out.get("trust") not in TRUST_CLASSES)
     known = next((k for k in SHIPPED_SOURCES
-                  if url.startswith(k["url_prefix"])), None)
+                  if url.startswith(k["url_prefix"])), None) if legacy else None
     before = dict(out)
     if not str(out.get("id") or "").strip():
         out["id"] = known["id"] if known else derived_source_id(url)
@@ -2165,7 +2175,13 @@ def cmd_process_deploys(_args):
             # trace (RFC-0012 §3).
             record["source"] = store_src["id"]
             record["source_trust"] = store_src.get("trust", "")
-            if store_src.get("trust") == "unverified" and ok:
+            if (store_src.get("trust") == "unverified"
+                    and req.get("confirm_source") == store_src["id"]):
+                # Tied to the confirmation, NOT to the outcome: a run
+                # that was accepted and then failed for some other
+                # reason is exactly what one wants to find later, and
+                # the refusal path must not name anybody as having
+                # confirmed something they did not.
                 record["confirmed_by"] = req.get("by", "?")
         audit_deploy(record)
         if rid:
