@@ -14,6 +14,11 @@ Host-side app manager invoked via `oaap app ...`:
 Node-level, not per app:
 
     oaap node show | add-profile <p> | remove-profile <p>  (RFC-0011)
+    oaap store list                                        (RFC-0012)
+    oaap store add-source <url> [--name N] [--trust verified|unverified]
+    oaap store remove-source <id|url|n> | enable <id> | disable <id>
+    oaap store trust <id> verified|unverified
+    oaap store reconcile          (run by `oaap update`, RFC-0012 §4)
 
 Implements: manifest validation (subset of the published JSON Schema),
 build on device, named instances with channels, per-instance storage/
@@ -51,6 +56,26 @@ PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
 IDENTITY_CONTAINER = "oaap-identity-1"
+
+# ------------------------------------------- manifest version (RFC-0012 §8.2)
+# The manifest version is MAJOR.MINOR. A new MINOR only ever ADDS things,
+# so a node may read a manifest newer than itself and ignore what it does
+# not know. A new MAJOR changed something that cannot be ignored, and that
+# is the only case where a node refuses.
+#
+# This is deliberately NOT the semver 0.x convention, where the minor
+# carries breaking changes: manifest 0.2 has to stay readable on every
+# node already in the field, or every extension to the format becomes a
+# flag day for the whole fleet.
+MANIFEST_MAJOR = 0
+MANIFEST_MINOR = 1
+
+# Features a manifest may declare under 'must_understand' -- the exception
+# that makes "ignore what you do not know" safe (RFC-0012 §8.2 rule 2). A
+# manifest naming anything not listed here is refused with a clear message
+# rather than installed half-understood. Empty on purpose: the names
+# reserved in RFC-0012 §8.3 land here as they are actually implemented.
+MANIFEST_FEATURES = set()
 
 
 def die(msg):
@@ -158,11 +183,49 @@ def cmd_node(args):
         print(f"Node profile '{profile}' removed.")
 
 
+def read_manifest_version(value):
+    """Read 'oaap_manifest' tolerantly. Returns (minor, error).
+
+    See MANIFEST_MAJOR above for why a higher minor is read rather than
+    refused. Only a foreign major, or a version that is not a version at
+    all, produces an error.
+    """
+    mv = re.fullmatch(r"(\d+)\.(\d+)", str(value or ""))
+    if not mv:
+        return -1, ('oaap_manifest: "MAJOR.MINOR" required, e.g. "0.1" '
+                    f'(found: {value!r})')
+    if int(mv.group(1)) != MANIFEST_MAJOR:
+        return -1, (f'oaap_manifest "{value}": this platform reads '
+                    f"{MANIFEST_MAJOR}.x manifests — update OAAP to install "
+                    "this app")
+    return int(mv.group(2)), ""
+
+
 def validate_manifest(m):
-    """Minimal validation mirroring oaap-spec/schema/oaap-app.schema.json."""
+    """Minimal validation mirroring oaap-spec/schema/oaap-app.schema.json.
+
+    Deliberately more tolerant than that schema (RFC-0012 §8.2): the
+    schema is an authoring tool, where a typo should be caught; a node in
+    the field must still be able to read a manifest that is newer than
+    itself. Strict schema, tolerant runtime.
+    """
     errs = []
-    if m.get("oaap_manifest") != "0.1":
-        errs.append("oaap_manifest must be \"0.1\"")
+    minor, verr = read_manifest_version(m.get("oaap_manifest"))
+    if verr:
+        errs.append(verr)
+    else:
+        must = m.get("must_understand") or []
+        if not isinstance(must, list) or any(not isinstance(f, str) for f in must):
+            errs.append("must_understand: list of feature names expected")
+        elif sorted(set(must) - MANIFEST_FEATURES):
+            errs.append(
+                "this app requires manifest features the platform does not "
+                "understand: " + ", ".join(sorted(set(must) - MANIFEST_FEATURES))
+                + " — update OAAP to install it")
+        elif minor > MANIFEST_MINOR:
+            print(f"Note: manifest {m['oaap_manifest']} is newer than this "
+                  f"platform ({MANIFEST_MAJOR}.{MANIFEST_MINOR}). Installing "
+                  "it anyway; anything it adds beyond that is ignored.")
     app = m.get("app") or {}
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,38}[a-z0-9]", str(app.get("id", ""))):
         errs.append("app.id: lowercase [a-z0-9-], 3-40 chars")
@@ -980,6 +1043,13 @@ def cmd_install(args):
             die(f"git clone failed: {e.stderr.strip()}")
         pkg = os.path.join(tmp_clone, args.path) if args.path else tmp_clone
         source = {"kind": "git", "url": args.package, "path": args.path, "ref": ref}
+        if getattr(args, "store_source", ""):
+            # Which list this instance came from (RFC-0012 §3). A later
+            # resolution prefers it, so an app installed from the
+            # platform list cannot be silently re-pointed at a different
+            # list after somebody adds a source. Changing the source
+            # stays possible — it just becomes a deliberate act.
+            source["store_source"] = args.store_source
     else:
         pkg = os.path.abspath(os.path.join(args.package, args.path)
                               if args.path else args.package)
@@ -1481,35 +1551,256 @@ def _resolve_revision(source):
         return ""
 
 
-def _store_lookup(app_id):
-    """Resolve an app id against the CONFIGURED store sources (spec 2.6).
+# --------------------------------------------------- store sources (RFC-0012)
+# A source is an OBJECT, not a URL with a label: stable id, display name,
+# URL, trust class, on/off, origin in plain text. The id is what
+# everything else refers to — the resolution rule, the confirmation
+# record, the reconcile step below. The URL is an ATTRIBUTE of a source,
+# never its identity, and that distinction is the whole of finding B4: a
+# list that moves must not strand every node that has it configured.
 
-    The spool request names only the app id — the source of truth for
-    what gets installed is this host-side lookup, never the request.
-    Returns (source_dict, version) or (None, "") if no configured
-    source lists the app.
+TRUST_CLASSES = ("platform", "verified", "unverified")
+TRUST_RANK = {"platform": 3, "verified": 2, "unverified": 1}
+TRUST_LABEL = {
+    "platform": "von uns",
+    "verified": "geprüft",
+    "unverified": "muss bestätigt werden",
+}
+
+# What this version of the platform ships. Adding an entry here adds the
+# source on every node at the next 'oaap update' — unless the operator
+# removed it, which is remembered by id (RFC-0012 §4).
+SHIPPED_SOURCES = [
+    {
+        "id": "oaap.platform",
+        "name": "OAAP Plattform-Apps",
+        "url": "https://raw.githubusercontent.com/MDJoerg/oaap-apps/main/oaap-store.json",
+        "url_prefix": "https://raw.githubusercontent.com/MDJoerg/oaap-apps/",
+        "trust": "platform",
+        "origin": "MDJoerg / oaap-apps",
+    },
+    {
+        "id": "oaap.community",
+        "name": "OAAP Community-Liste",
+        "url": "https://raw.githubusercontent.com/MDJoerg/oaap-store/main/oaap-store.json",
+        "url_prefix": "https://raw.githubusercontent.com/MDJoerg/oaap-store/",
+        # Curated by us, but the software in it is not ours. Keeping it
+        # one class below 'platform' is what gives the resolution rule
+        # teeth: when both lists carry the same app id, ours wins — no
+        # matter which order the two happen to sit in on this node.
+        "trust": "verified",
+        "origin": "MDJoerg / oaap-store",
+    },
+]
+
+
+def derived_source_id(url):
+    """A stable, readable id for a source that predates RFC-0012.
+
+    Host plus a short digest of the URL: readable enough to recognise in
+    a log line, and stable across reads — which matters, because the
+    migration runs in memory on every read until something writes the
+    file back.
     """
+    import hashlib
+    import urllib.parse
+
+    host = (urllib.parse.urlsplit(url).hostname or "unknown").lower()
+    host = re.sub(r"^www\.", "", host)
+    return f"{host}-{hashlib.sha256(url.encode()).hexdigest()[:6]}"
+
+
+def migrate_source(entry):
+    """Fill in what RFC-0012 §2 requires, for an entry that predates it.
+
+    The URL prefix is used exactly as far as it is trustworthy: as a
+    suggestion at THIS moment, written into the entry once, and never as
+    a value recomputed on every lookup. Rename a repository later and
+    the stored class stays what the operator last saw.
+
+    Returns (source, migrated).
+    """
+    out = dict(entry)
+    url = str(out.get("url") or "").strip()
+    known = next((k for k in SHIPPED_SOURCES
+                  if url.startswith(k["url_prefix"])), None)
+    before = dict(out)
+    if not str(out.get("id") or "").strip():
+        out["id"] = known["id"] if known else derived_source_id(url)
+    if out.get("trust") not in TRUST_CLASSES:
+        out["trust"] = known["trust"] if known else "unverified"
+        if not known:
+            # Everything we cannot recognise starts as unverified and is
+            # marked for a look — never silently trusted.
+            out["review"] = True
+    if not isinstance(out.get("enabled"), bool):
+        out["enabled"] = True
+    if not str(out.get("name") or "").strip():
+        out["name"] = (known or {}).get("name") or out["id"]
+    if known and not str(out.get("origin") or "").strip():
+        out["origin"] = known["origin"]
+    if known and "shipped" not in out:
+        out["shipped"] = True
+        # There was no way to edit a source URL before this version —
+        # add-source and remove-source were the only tools — so the
+        # stored URL is what we shipped. Recording it as such lets the
+        # reconcile step below carry it along when the list moves.
+        out["shipped_url"] = url
+    return out, out != before
+
+
+def load_sources():
+    """Store sources in the object form of RFC-0012 §2.
+
+    Old `{url, name}` entries are migrated **in memory on every read**,
+    so a node resolves correctly the moment this version lands — before
+    anyone runs an update. The migration reaches disk the next time
+    something writes the file.
+
+    Returns (sources, removed_shipped, migrated).
+    """
+    try:
+        with open(STORE_SOURCES, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    sources, migrated, seen = [], False, set()
+    for entry in (data.get("sources") or []):
+        if not isinstance(entry, dict) or not str(entry.get("url") or "").strip():
+            migrated = True          # unusable line, dropped on next write
+            continue
+        src, changed = migrate_source(entry)
+        if src["id"] in seen:        # two entries, one id — keep the first
+            migrated = True
+            continue
+        seen.add(src["id"])
+        sources.append(src)
+        migrated = migrated or changed
+    removed = sorted({str(x) for x in (data.get("removed_shipped") or [])})
+    return sources, removed, migrated
+
+
+def save_sources(sources, removed):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = STORE_SOURCES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"sources": sources, "removed_shipped": sorted(set(removed))},
+                  f, indent=2, ensure_ascii=False)
+    os.replace(tmp, STORE_SOURCES)
+
+
+def reconcile_shipped_sources():
+    """Bring shipped sources in line with what this version ships (§4).
+
+    Called by 'oaap update'. Returns human-readable lines for the update
+    transcript — an operator should be TOLD that resolution changed on
+    this node, not discover it later.
+    """
+    sources, removed, changed = load_sources()
+    lines = []
+    if changed:
+        lines.append(
+            "Store sources migrated to the object form (RFC-0012): they now "
+            "carry a stable id and a trust class, and an app listed by "
+            "several sources is resolved by trust instead of by the order "
+            "the sources happen to sit in.")
+    by_id = {s["id"]: s for s in sources}
+    for shipped in SHIPPED_SOURCES:
+        sid = shipped["id"]
+        cur = by_id.get(sid)
+        if cur is None:
+            if sid in removed:
+                continue        # a removal is remembered, never undone
+            sources.append({
+                "id": sid, "name": shipped["name"], "url": shipped["url"],
+                "trust": shipped["trust"], "enabled": True,
+                "origin": shipped["origin"], "shipped": True,
+                "shipped_url": shipped["url"],
+            })
+            changed = True
+            lines.append(f"Store source added: {shipped['name']} "
+                         f"({sid}, {TRUST_LABEL[shipped['trust']]}).")
+            continue
+        cur["shipped"] = True
+        url, was = str(cur.get("url") or ""), str(cur.get("shipped_url") or "")
+        if url == shipped["url"]:
+            if was != shipped["url"]:
+                cur["shipped_url"] = shipped["url"]
+                changed = True
+        elif was and url == was:
+            cur["url"], cur["shipped_url"] = shipped["url"], shipped["url"]
+            changed = True
+            lines.append(f"Store source '{sid}' moved to {shipped['url']} "
+                         f"(was {url}).")
+        else:
+            # Differs from what we shipped: the operator edited it.
+            # Leave it alone and say so — silently overwriting an
+            # operator's URL is exactly the surprise B4 argues against.
+            lines.append(f"Store source '{sid}' points at {url}, we now ship "
+                         f"{shipped['url']}. Left unchanged because it was "
+                         "edited on this node — adjust it yourself if you "
+                         "want ours.")
+    if changed:
+        save_sources(sources, removed)
+    return lines
+
+
+def fetch_store_list(url, timeout=5):
+    """Read one store list. Returns the parsed document or None."""
     import urllib.request
 
     try:
-        with open(STORE_SOURCES, encoding="utf-8") as f:
-            sources = json.load(f).get("sources", [])
-    except (OSError, ValueError):
-        return None, ""
-    for src in sources:
-        try:
-            with urllib.request.urlopen(src["url"], timeout=5) as r:
-                data = json.load(r)
-        except Exception:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def _store_lookup(app_id, source_id="", prefer=""):
+    """Resolve an app id against the CONFIGURED store sources (spec 2.6).
+
+    The spool request names an app id and at most a source id — what
+    gets installed is decided here, on the host, and only from sources
+    the server_admin configured. A request can pick among them; it can
+    never introduce one.
+
+    Resolution follows RFC-0012 §3: the highest trust class wins, and
+    only within one class does configured order decide. The old rule
+    (first configured source wins) turned a foreign list into a takeover
+    path — claim a known id, sit above the real list, collect the
+    one-click install.
+
+    `prefer` is the source an existing instance was installed from: it
+    wins over the trust rule as long as that source still lists the app,
+    so a redeploy cannot be silently re-pointed at a different list.
+
+    Returns (package_dict, version, source) — source is the full source
+    object, or (None, "", None) when nothing matches.
+    """
+    sources = [s for s in load_sources()[0] if s.get("enabled", True)]
+    if source_id:
+        sources = [s for s in sources if s["id"] == source_id]
+    hits = []
+    for pos, src in enumerate(sources):
+        data = fetch_store_list(src["url"])
+        if not data:
             continue
         for a in data.get("apps", []):
             pkg = a.get("package") or {}
             if a.get("id") == app_id and pkg.get("git"):
-                return ({"kind": "git", "url": pkg["git"],
-                         "path": pkg.get("path", ""),
-                         "ref": pkg.get("ref", "")},
-                        a.get("version", ""))
-    return None, ""
+                hits.append((src, a, pos))
+                break
+    if not hits:
+        return None, "", None
+    hits.sort(key=lambda h: (h[0]["id"] != prefer,
+                             -TRUST_RANK.get(h[0].get("trust"), 0),
+                             h[2]))
+    src, entry, _ = hits[0]
+    pkg = entry["package"]
+    return ({"kind": "git", "url": pkg["git"],
+             "path": pkg.get("path", ""),
+             "ref": pkg.get("ref", "")},
+            entry.get("version", ""), src)
 
 
 def cmd_process_deploys(_args):
@@ -1549,7 +1840,8 @@ def cmd_process_deploys(_args):
         def run_install(src, channel):
             ns = _argparse.Namespace(
                 package=src["url"], path=src.get("path", ""),
-                ref=src.get("ref", ""), name=name, channel=channel)
+                ref=src.get("ref", ""), name=name, channel=channel,
+                store_source=src.get("store_source", ""))
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -1565,19 +1857,33 @@ def cmd_process_deploys(_args):
                 return False, str(e)
 
         # Re-validate on the host — the spool is data, not trust.
+        store_src = None
         if action == "install":
-            # One-click store install (spec 2.6): the request names only
-            # the app id; what gets installed is decided by resolving it
-            # against the CONFIGURED store sources, here on the host.
-            src, _listed_version = _store_lookup(name)
+            # One-click store install (spec 2.6): the request names an
+            # app id and at most a source id; what gets installed is
+            # decided by resolving it against the CONFIGURED store
+            # sources, here on the host. A request may pick among the
+            # sources the server_admin chose; it can never add one.
+            src, _listed_version, store_src = _store_lookup(
+                name, req.get("source_id", ""),
+                prefer=((inst or {}).get("source") or {}).get("store_source", ""))
             if not src:
                 msg = "app is not listed in any configured store source"
+            elif (store_src["trust"] == "unverified"
+                  and req.get("confirm_source") != store_src["id"]):
+                # A brake against inattention, not a security boundary —
+                # what protects against a compromised portal is still
+                # 2.6's rule that only configured sources resolve at all.
+                msg = (f"'{store_src['name']}' is an unverified source — "
+                       "installing from it has to be confirmed explicitly "
+                       "(RFC-0012 §3)")
             else:
                 revision = _resolve_revision(src)
                 channel = inst["channel"] if inst else "production"
+                src["store_source"] = store_src["id"]
                 ok, msg = run_install(src, channel)
                 if ok:
-                    msg = "installed from store"
+                    msg = f"installed from store source '{store_src['id']}'"
         elif action == "create":
             # New instance from the portal (RFC-0011). Only on a node
             # that says it is a workbench, and only on the test channel:
@@ -1595,9 +1901,18 @@ def cmd_process_deploys(_args):
             elif req.get("from") == "store":
                 # Same resolution as the one-click install: the request
                 # names an app id, the host decides where it comes from.
-                src, _listed = _store_lookup(req.get("app_id", ""))
+                src, _listed, store_src = _store_lookup(
+                    req.get("app_id", ""), req.get("source_id", ""))
                 if not src:
                     msg = "app is not listed in any configured store source"
+                elif (store_src["trust"] == "unverified"
+                      and req.get("confirm_source") != store_src["id"]):
+                    src = None
+                    msg = (f"'{store_src['name']}' is an unverified source — "
+                           "installing from it has to be confirmed explicitly "
+                           "(RFC-0012 §3)")
+                else:
+                    src["store_source"] = store_src["id"]
             else:
                 url = (req.get("url") or "").strip()
                 # No local paths, no plain http: a local path would let
@@ -1802,9 +2117,19 @@ def cmd_process_deploys(_args):
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
                "node": "setup wizard"}.get(action, "deploy-hook")
-        audit_deploy({"instance": name or "(dieser Knoten)", "ok": ok,
-                      "message": msg, "revision": revision,
-                      "version": version, "via": via})
+        record = {"instance": name or "(dieser Knoten)", "ok": ok,
+                  "message": msg, "revision": revision,
+                  "version": version, "via": via}
+        if store_src:
+            # Which list an app came from, and — for an unverified
+            # source — who accepted it, when, for which app. Without
+            # this the confirmation would be a dialogue that leaves no
+            # trace (RFC-0012 §3).
+            record["source"] = store_src["id"]
+            record["source_trust"] = store_src.get("trust", "")
+            if store_src.get("trust") == "unverified" and ok:
+                record["confirmed_by"] = req.get("by", "?")
+        audit_deploy(record)
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:
@@ -2001,43 +2326,125 @@ def cmd_restore_instances(_args):
     print(f"App instances: {ok} restored, {skipped} skipped.")
 
 
+def find_source(sources, target):
+    """One source by id, URL, or 1-based position from 'store list'."""
+    for s in sources:
+        if s["id"] == target or s["url"] == target:
+            return s
+    if target.isdigit() and 1 <= int(target) <= len(sources):
+        return sources[int(target) - 1]
+    return None
+
+
 def cmd_store(args):
-    """Manage store sources (list URLs the portal's Store page reads)."""
-    try:
-        with open(STORE_SOURCES, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        data = {"sources": []}
-    sources = data.get("sources", [])
+    """Manage store sources (RFC-0012 §2/§3/§4)."""
+    sources, removed, migrated = load_sources()
+    target = args.target or ""
 
     if args.action == "list":
         if not sources:
             print("No store sources configured. Add one with: sudo oaap store add-source <url>")
         for i, s in enumerate(sources, 1):
-            name = s.get("name") or "(unbenannt)"
-            print(f"{i}. {name} — {s['url']}")
+            flags = [TRUST_LABEL[s["trust"]]]
+            if not s.get("enabled", True):
+                flags.append("deaktiviert")
+            if s.get("shipped"):
+                flags.append("mitgeliefert")
+            if s.get("review"):
+                flags.append("bitte prüfen")
+            print(f"{i}. {s['name']} [{s['id']}] — {', '.join(flags)}")
+            print(f"   {s['url']}")
+            if s.get("origin"):
+                print(f"   Herkunft: {s['origin']}")
+        if sources:
+            print("\nResolution: highest trust class wins; within a class the "
+                  "order above decides (RFC-0012 §3).")
+        if migrated:
+            save_sources(sources, removed)
         return
-    if not args.url:
-        die(f"'{args.action}' needs a URL (or index for remove-source)")
+
+    if args.action == "reconcile":
+        lines = reconcile_shipped_sources()
+        for line in lines:
+            print(line)
+        if not lines:
+            print("Store sources already match what this version ships.")
+        return
+
+    if not target:
+        die(f"'{args.action}' needs an argument")
+
     if args.action == "add-source":
-        if any(s["url"] == args.url for s in sources):
+        if not re.match(r"^https://", target):
+            die("a store source must be an https:// URL")
+        if any(s["url"] == target for s in sources):
             die("this source is already configured")
-        sources.append({"url": args.url, "name": args.name or ""})
-        print(f"Store source added ({args.url}).")
+        trust = args.trust or "unverified"
+        if trust == "platform":
+            # RFC-0012 decision 4: 'von uns' must mean the same thing on
+            # every node, so it stays reserved for what the installation
+            # shipped. An operator who vouches for a list uses 'verified'.
+            die("trust class 'platform' is reserved for sources the "
+                "installation ships — use 'verified' if you vouch for this "
+                "list yourself")
+        sid = args.id or derived_source_id(target)
+        if any(s["id"] == sid for s in sources):
+            die(f"a source with id '{sid}' already exists")
+        sources.append({"id": sid, "name": args.name or sid, "url": target,
+                        "trust": trust, "enabled": True,
+                        "origin": args.origin or ""})
+        removed = [r for r in removed if r != sid]
+        print(f"Store source added: {sid} ({TRUST_LABEL[trust]}).")
+        if trust == "unverified":
+            print("Installing from it will ask for a confirmation each time.")
+
     elif args.action == "remove-source":
-        before = len(sources)
-        if args.url.isdigit() and 1 <= int(args.url) <= len(sources):
-            sources.pop(int(args.url) - 1)
-        else:
-            sources = [s for s in sources if s["url"] != args.url]
-        if len(sources) == before:
+        src = find_source(sources, target)
+        if not src:
             die("no matching source")
-        print("Store source removed.")
-    os.makedirs(APPS_DIR, exist_ok=True)
-    tmp = STORE_SOURCES + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"sources": sources}, f, indent=2)
-    os.replace(tmp, STORE_SOURCES)
+        sources = [s for s in sources if s["id"] != src["id"]]
+        if src.get("shipped"):
+            # Remembered by id: 'oaap update' must not quietly re-add
+            # what the operator threw out (RFC-0012 §4).
+            removed = sorted(set(removed) | {src["id"]})
+            print(f"Store source '{src['id']}' removed. It ships with the "
+                  "platform, so the removal is remembered — updates will not "
+                  "bring it back.")
+        else:
+            print(f"Store source '{src['id']}' removed.")
+
+    elif args.action in ("enable", "disable"):
+        src = find_source(sources, target)
+        if not src:
+            die("no matching source")
+        src["enabled"] = args.action == "enable"
+        print(f"Store source '{src['id']}' "
+              + ("enabled." if src["enabled"] else "disabled."))
+
+    elif args.action == "trust":
+        src = find_source(sources, target)
+        if not src:
+            die("no matching source")
+        want = (args.value or "").strip().lower()
+        if want == "platform":
+            die("trust class 'platform' is reserved for sources the "
+                "installation ships (RFC-0012 decision 4) — use 'verified'")
+        if want not in ("verified", "unverified"):
+            die("trust class must be 'verified' or 'unverified'")
+        if src.get("trust") == "platform":
+            die(f"'{src['id']}' ships with the platform; its trust class is "
+                "not settable. Disable or remove it instead.")
+        was = src.get("trust")
+        src["trust"], src["review"] = want, False
+        print(f"Store source '{src['id']}': {TRUST_LABEL[was]} → "
+              f"{TRUST_LABEL[want]}.")
+        if want == "verified":
+            print("Note: apps from it now install without a confirmation, and "
+                  "it outranks unverified sources when several list the same "
+                  "app. Set it back with: oaap store trust "
+                  f"{src['id']} unverified")
+
+    save_sources(sources, removed)
 
 
 def main():
@@ -2105,9 +2512,19 @@ def main():
     pri = sub.add_parser("restore-instances")
     pri.set_defaults(fn=cmd_restore_instances)
     ps = sub.add_parser("store")
-    ps.add_argument("action", choices=["list", "add-source", "remove-source"])
-    ps.add_argument("url", nargs="?")
+    ps.add_argument("action", choices=["list", "add-source", "remove-source",
+                                       "enable", "disable", "trust",
+                                       "reconcile"])
+    ps.add_argument("target", nargs="?",
+                    help="source URL, id, or position from 'store list'")
+    ps.add_argument("value", nargs="?",
+                    help="trust class with 'trust': verified | unverified")
     ps.add_argument("--name")
+    ps.add_argument("--id", help="stable id (default: derived from the URL)")
+    ps.add_argument("--origin", default="",
+                    help="who publishes it, shown to the user verbatim")
+    ps.add_argument("--trust", choices=["verified", "unverified"],
+                    help="trust class for a new source (default: unverified)")
     ps.set_defaults(fn=cmd_store)
     pn = sub.add_parser("node")
     pn.add_argument("action", choices=["show", "add-profile", "remove-profile"])

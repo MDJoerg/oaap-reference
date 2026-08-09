@@ -436,8 +436,12 @@ STORE_BODY = """
 {% endif %}
 {% for src in sources %}
 <div class="card">
-  <h2>{{ src.title }}</h2>
-  <p class="muted">{{ src.url }}</p>
+  <h2>{{ src.title }} <span class="badge {{ 'test' if src.trust != 'platform' }}">{{ src.trust_label }}</span></h2>
+  <p class="muted">{{ src.url }}{% if src.origin %} — Herkunft: {{ src.origin }}{% endif %}</p>
+  {% if src.confirm %}
+  <p class="muted">Diese Liste ist nicht geprüft. Eine Installation daraus
+  muss einzeln bestätigt werden und wird mit Deinem Namen protokolliert.</p>
+  {% endif %}
   {% if src.error %}
     <p class="err">Quelle nicht lesbar: {{ src.error }}</p>
   {% elif not src.apps %}
@@ -469,6 +473,12 @@ STORE_BODY = """
               onsubmit="this.querySelector('button').disabled=true;
                         this.querySelector('button').textContent='Wird installiert …'">
           <input type="hidden" name="app_id" value="{{ a.id }}">
+          <input type="hidden" name="source_id" value="{{ src.id }}">
+          {% if src.confirm %}
+          <label class="checkline"><input type="checkbox" name="confirm_source"
+                 value="{{ src.id }}" required>
+            Ich installiere bewusst aus der ungeprüften Quelle „{{ src.title }}".</label>
+          {% endif %}
           <button>{{ ('Aktualisieren auf v' + a.version) if a.installed else 'Installieren' }}</button>
         </form>
         {% endif %}
@@ -485,9 +495,11 @@ STORE_BODY = """
 </div>
 {% endfor %}
 <p class="muted">Ein Klick auf „Installieren" installiert die App auf dem
-Produktions-Kanal; der Server prüft die App dabei selbst gegen die
-konfigurierten Quellen. Quellen verwaltet die Administration mit
-<code>sudo oaap store add-source|remove-source</code>.</p>
+Produktions-Kanal; der Server löst die App dabei selbst gegen die
+konfigurierten Quellen auf. Nennen mehrere Quellen dieselbe App, gewinnt
+die höchste Vertrauensklasse — nicht die zuerst eingetragene Quelle
+(RFC-0012 §3). Quellen verwaltet die Administration mit
+<code>sudo oaap store list|add-source|remove-source|enable|disable|trust</code>.</p>
 """
 
 # Floorplan "Listenbericht" — installed app instances and their
@@ -546,11 +558,16 @@ INSTANCE_NEW_BODY = """
     <label>App
       <select name="app_id">
         {% for a in store_apps %}
-        <option value="{{ a.id }}">{{ a.name }} (v{{ a.version }}) — {{ a.source }}</option>
+        <option value="{{ a.id }}">{{ a.name }} (v{{ a.version }}) — {{ a.source }} [{{ a.trust_label }}]</option>
         {% else %}
         <option value="">— keine Store-Quelle lesbar —</option>
         {% endfor %}
       </select></label>
+    {% if store_apps | selectattr('trust', 'equalto', 'unverified') | list %}
+    <label class="checkline"><input type="checkbox" name="confirm_source" value="yes">
+      Ich installiere bewusst aus einer ungeprüften Quelle (nur nötig, wenn
+      die gewählte App aus einer solchen stammt).</label>
+    {% endif %}
     <label class="checkline"><input type="radio" name="from" value="git">
       Aus einem Git-Repository, das noch in keiner Liste steht</label>
     <label>Git-URL <input type="text" name="url"
@@ -1532,6 +1549,31 @@ def deploy_status(name):
 STORE_SOURCES_FILE = "/apps-registry/store-sources.json"
 INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 
+# Trust classes (RFC-0012 §3). appctl.py is the authority — it migrates
+# old {url, name} entries into this form and writes them back. The
+# portal only reads, and reads tolerantly: an entry it cannot classify
+# counts as unverified, which is the cautious direction to fall in.
+TRUST_LABEL = {"platform": "von uns", "verified": "geprüft",
+               "unverified": "muss bestätigt werden"}
+
+
+def configured_sources():
+    """Enabled store sources, in the object form of RFC-0012 §2."""
+    try:
+        with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
+            raw = json.load(f).get("sources", [])
+    except (OSError, ValueError):
+        return []
+    out = []
+    for i, s in enumerate(raw, 1):
+        if not isinstance(s, dict) or not s.get("url") or not s.get("enabled", True):
+            continue
+        trust = s.get("trust") if s.get("trust") in TRUST_LABEL else "unverified"
+        out.append({"id": s.get("id") or f"quelle-{i}", "url": s["url"],
+                    "name": s.get("name") or "", "trust": trust,
+                    "origin": s.get("origin") or ""})
+    return out
+
 
 def pending_installs():
     """App ids with a queued/running store install (spool not yet done).
@@ -1557,17 +1599,17 @@ def pending_installs():
 
 
 def store_page(msg=None, msg_ok=True, status=200):
-    try:
-        with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
-            configured = json.load(f).get("sources", [])
-    except (OSError, ValueError):
-        configured = []
+    configured = configured_sources()
     pending = pending_installs()
     installed = {inst.get("app_id"): inst.get("version")
                  for inst in load_instances().values()}
     sources = []
     for src in configured:
-        entry = {"url": src.get("url", ""), "title": src.get("name") or "Store-Quelle",
+        entry = {"url": src["url"], "title": src["name"] or "Store-Quelle",
+                 "id": src["id"], "trust": src["trust"],
+                 "trust_label": TRUST_LABEL[src["trust"]],
+                 "origin": src["origin"],
+                 "confirm": src["trust"] == "unverified",
                  "apps": [], "error": None}
         try:
             r = requests.get(entry["url"], timeout=4)
@@ -1616,14 +1658,29 @@ def store_install():
     app_id = request.form.get("app_id", "").strip()
     if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", app_id):
         return store_page("Ungültige App-Kennung.", msg_ok=False, status=400)
-    # Queue for the host worker. Deliberately NO source, no version:
-    # the worker resolves the app id against the configured store
-    # sources on the host (spec 2.6) — the spool is data, not trust.
+    # Queue for the host worker. The request names the app id and the
+    # source the user was looking at — never a package URL or a version:
+    # the worker resolves both against the CONFIGURED sources on the
+    # host (spec 2.6, RFC-0012 §3). Picking among the sources the
+    # server_admin already chose is all a request can do; the spool is
+    # data, not trust.
+    source_id = request.form.get("source_id", "").strip()
+    confirm = request.form.get("confirm_source", "").strip()
+    src = next((s for s in configured_sources() if s["id"] == source_id), None)
+    if source_id and not src:
+        return store_page("Diese Store-Quelle ist auf diesem Knoten nicht "
+                          "(mehr) eingetragen.", msg_ok=False, status=400)
+    if src and src["trust"] == "unverified" and confirm != source_id:
+        label = src["name"] or source_id
+        return store_page("Nicht bestätigt: " + label + " ist eine ungeprüfte "
+                          "Quelle. Bitte das Häkchen setzen.",
+                          msg_ok=False, status=400)
     rid = _uuid.uuid4().hex
     os.makedirs(SPOOL_QUEUE, exist_ok=True)
     tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"id": rid, "instance": app_id, "action": "install",
+                   "source_id": source_id, "confirm_source": confirm,
                    "by": request.headers.get("X-OAAP-User", "?"),
                    "requested": datetime.now(timezone.utc).isoformat()}, f)
     os.replace(tmp, os.path.join(SPOOL_QUEUE, f"{rid}.json"))
@@ -1732,27 +1789,38 @@ def instances_list():
 CREATE_WAIT_SECONDS = 120  # clone + build + start, like a store install
 
 
+TRUST_RANK = {"platform": 3, "verified": 2, "unverified": 1}
+
+
 def _store_apps():
-    """Every app the configured store sources list, for the create form."""
-    try:
-        with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
-            sources = json.load(f).get("sources", [])
-    except (OSError, ValueError):
-        return []
-    apps = []
-    for src in sources:
+    """Every app the configured store sources list, for the create form.
+
+    One entry per app id, resolved the same way the host resolves it
+    (RFC-0012 §3): highest trust class first, configured order within a
+    class. Showing two entries for one id would only invite a choice the
+    host would then overrule.
+    """
+    apps = {}
+    for pos, src in enumerate(configured_sources()):
         try:
-            r = requests.get(src.get("url", ""), timeout=4)
+            r = requests.get(src["url"], timeout=4)
             r.raise_for_status()
             data = r.json()
         except (requests.RequestException, ValueError):
             continue
-        title = src.get("name") or data.get("name") or "Store-Quelle"
+        title = src["name"] or data.get("name") or "Store-Quelle"
         for a in data.get("apps", []):
-            if a.get("id") and (a.get("package") or {}).get("git"):
-                apps.append({"id": a["id"], "name": a.get("name", a["id"]),
-                             "version": a.get("version", "?"), "source": title})
-    return sorted(apps, key=lambda a: (a["name"].lower(), a["source"]))
+            if not a.get("id") or not (a.get("package") or {}).get("git"):
+                continue
+            cand = {"id": a["id"], "name": a.get("name", a["id"]),
+                    "version": a.get("version", "?"), "source": title,
+                    "source_id": src["id"], "trust": src["trust"],
+                    "trust_label": TRUST_LABEL[src["trust"]], "pos": pos}
+            best = apps.get(a["id"])
+            if best is None or (TRUST_RANK[cand["trust"]], -cand["pos"]) \
+                    > (TRUST_RANK[best["trust"]], -best["pos"]):
+                apps[a["id"]] = cand
+    return sorted(apps.values(), key=lambda a: (a["name"].lower(), a["source"]))
 
 
 def _require_dev_node():
@@ -1805,8 +1873,24 @@ def instance_new():
         name = app_id
     if not name:
         return _new_error("Für den Git-Weg bitte einen Instanznamen angeben.")
+    # Which list the chosen app comes from, resolved the same way the
+    # host will resolve it (RFC-0012 §3). An unverified source costs a
+    # confirmation here too — the dev profile relaxes where a package
+    # may come from, not whether the operator is told.
+    source_id, confirm = "", ""
+    if from_ == "store":
+        chosen = next((a for a in _store_apps() if a["id"] == app_id), None)
+        if chosen:
+            source_id = chosen["source_id"]
+            if chosen["trust"] == "unverified":
+                if request.form.get("confirm_source") != "yes":
+                    return _new_error(
+                        f"'{chosen['name']}' stammt aus der ungeprüften Quelle "
+                        f"{chosen['source']} — bitte die Bestätigung setzen.")
+                confirm = source_id
     res = _queue_and_wait(name, {
         "action": "create", "from": from_, "app_id": app_id,
+        "source_id": source_id, "confirm_source": confirm,
         "url": url, "path": request.form.get("path", "").strip(),
         "ref": request.form.get("ref", "").strip(),
     }, CREATE_WAIT_SECONDS)

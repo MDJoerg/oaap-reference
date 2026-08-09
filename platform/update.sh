@@ -153,6 +153,16 @@ fi
 
 echo "$new_rev" > "$APP_DIR/REVISION"
 
+# Shipped store sources (RFC-0012 §4). Sources used to be written once,
+# at installation, and never touched again — so the day one of our lists
+# moves, every node in the field strands, visibly only as an empty
+# store. Reconcile carries a moved list along where the operator has not
+# edited the URL, leaves it alone where they have, and says which.
+say ""
+say "Checking store sources ..."
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store reconcile \
+  2>&1 | sed 's/^/  /' || say "  WARNING: store sources could not be checked."
+
 # ------------------------------------------------------------- verify
 sleep 3
 total="$(docker compose --project-directory "$APP_DIR" --project-name oaap ps --services | wc -l)"

@@ -584,21 +584,26 @@ EOF
 git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse --short HEAD > "$APP_DIR/REVISION" 2>/dev/null \
   || rm -f "$APP_DIR/REVISION"
 
-# Preconfigured store sources (install medium's oaap-setup.env or
-# OAAP_STORE_SOURCES environment) — comma-separated list URLs.
-# Default: the curated community list, so a plain git install comes
-# with a working store out of the box (Jörgs decision 2026-08-06).
-# Opt out with OAAP_STORE_SOURCES=none; remove later with
-# 'sudo oaap store remove-source'.
-OAAP_STORE_SOURCES="${OAAP_STORE_SOURCES:-https://raw.githubusercontent.com/MDJoerg/oaap-store/main/oaap-store.json}"
-[ "$OAAP_STORE_SOURCES" = "none" ] && OAAP_STORE_SOURCES=""
-if [ -n "${OAAP_STORE_SOURCES:-}" ] && [ ! -f "$OAAP_DATA_DIR/apps/store-sources.json" ]; then
-  OAAP_STORE_SOURCES="$OAAP_STORE_SOURCES" python3 - "$OAAP_DATA_DIR/apps/store-sources.json" <<'PYEOF'
-import json, os, sys
-urls = [u.strip() for u in os.environ["OAAP_STORE_SOURCES"].split(",") if u.strip()]
-with open(sys.argv[1], "w", encoding="utf-8") as f:
-    json.dump({"sources": [{"url": u, "name": ""} for u in urls]}, f, indent=2)
-PYEOF
+# Store sources (RFC-0012 §2/§4). The sources this version ships are
+# defined once, in appctl.py — 'store reconcile' writes them here and
+# keeps them in step later, including when one of our lists moves.
+# Both our lists ship enabled, the platform list first (RFC-0012
+# decision 1); Jörgs decision of 2026-08-06 — a plain git install comes
+# with a working store — still holds and now covers both.
+#
+# OAAP_STORE_SOURCES (install medium's oaap-setup.env or the
+# environment) adds further lists as comma-separated URLs; they are
+# 'unverified' and take a confirmation at every install. Opt out of the
+# shipped ones with OAAP_STORE_SOURCES=none.
+if [ "${OAAP_STORE_SOURCES:-}" = "none" ]; then
+  say "Store sources: none preconfigured (OAAP_STORE_SOURCES=none)."
+else
+  OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store reconcile \
+    | sed 's/^/  /' || say "WARNING: could not preconfigure store sources."
+  for u in $(printf '%s' "${OAAP_STORE_SOURCES:-}" | tr ',' ' '); do
+    OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store add-source "$u" \
+      >/dev/null 2>&1 || say "WARNING: store source '$u' was not added."
+  done
   say "Store sources preconfigured."
 fi
 
