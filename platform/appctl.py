@@ -1330,6 +1330,8 @@ def cmd_tile(args):
     inst = reg["instances"].get(args.name)
     if not inst:
         die(f"no instance named '{args.name}'")
+    if args.mode and args.mode not in TILE_MODES:
+        die(f"tile: '{args.mode}' is not one of {' | '.join(TILE_MODES)}")
     if not args.mode:
         mode = tile_mode_of(inst)
         cls = inst.get("app_class") or DEFAULT_APP_CLASS
@@ -2690,7 +2692,12 @@ def main():
     pv.set_defaults(fn=cmd_visibility)
     pt = sub.add_parser("tile")
     pt.add_argument("name")
-    pt.add_argument("mode", nargs="?", choices=list(TILE_MODES), default="",
+    # Deliberately no argparse `choices` here: whether it validates the
+    # DEFAULT of an omitted optional positional differs between Python
+    # versions (3.13 rejects "", 3.14 does not), and `oaap app tile
+    # <name>` with no mode has to work on every node in the fleet.
+    # Checked in cmd_tile instead, where the message is ours.
+    pt.add_argument("mode", nargs="?", default="",
                     help="auto = follow the app's own class (default), "
                          "on = always show, off = never show; omit to ask")
     pt.set_defaults(fn=cmd_tile)

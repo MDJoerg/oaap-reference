@@ -182,6 +182,15 @@ ok("every answer repeats that this is not a way to keep people out",
    "visibility" in out, out)
 okr, out = run(appctl.cmd_tile, Args(name="gibtsnicht", mode="on"))
 ok("an unknown instance is refused", not okr, out)
+# Found on oaap-test, 2026-08-09: argparse `choices` validated the
+# DEFAULT of the omitted mode on Python 3.13 and refused `oaap app tile
+# <name>` outright, while 3.14 accepted it. The check belongs in here,
+# where it behaves the same on every node in the fleet.
+okr, out = run(appctl.cmd_tile, Args(name="kuma", mode="unsichtbar"))
+ok("a mode nobody defined is refused by the command, not by argparse",
+   not okr and "auto | on | off" in out, out)
+okr, out = run(appctl.cmd_tile, Args(name="kuma"))
+ok("...and asking without a mode still works", okr, out)
 
 print("\n=== the queued path the portal uses ===")
 # The portal cannot write the registry — its mount is read-only — so it
