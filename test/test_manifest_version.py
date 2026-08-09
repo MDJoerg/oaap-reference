@@ -49,18 +49,28 @@ def check(doc):
         return False, buf.getvalue()
 
 
-def case(label, doc, want_ok, want_text=""):
+def case(label, doc, want_ok, want_text="", unwanted_text=None):
     global fails
     got_ok, out = check(doc)
-    good = got_ok == want_ok and want_text in out
+    good = (got_ok == want_ok and want_text in out
+            and (unwanted_text is None or unwanted_text not in out))
     fails += not good
     print(f"{'PASS' if good else 'FAIL'}  {label}")
     if not good:
         print(f"      accepted={got_ok} (wanted {want_ok}) output={out.strip()!r}")
 
 
+def with_class(value, version="0.2"):
+    doc = manifest(oaap_manifest=version)
+    doc["app"]["class"] = value
+    return doc
+
+
 case("today's 0.1 manifest installs", manifest(), True)
-case("a newer MINOR is read, with a note", manifest(oaap_manifest="0.2"),
+case("0.2 is this platform's own version, so no note",
+     manifest(oaap_manifest="0.2"), True,
+     unwanted_text="newer than this platform")
+case("a newer MINOR is read, with a note", manifest(oaap_manifest="0.3"),
      True, "newer than this platform")
 case("a much newer MINOR is still read", manifest(oaap_manifest="0.9"),
      True, "newer than this platform")
@@ -82,6 +92,39 @@ case("a malformed must_understand is refused",
      manifest(must_understand="dependencies"), False, "list of feature names")
 case("real breakage is still caught", {**manifest(), "routes": []},
      False, "at least one route")
+
+# --- app.class, the first field manifest 0.2 adds (runtime spec 2.10) ---
+# Deliberately NOT a must_understand feature: a node that ignores it
+# shows one tile too many, which is untidy, not broken. So every case
+# here installs — the only question is what the class ends up being.
+print()
+case("a manifest declaring itself a service installs",
+     with_class("service"), True)
+case("...and so does one declaring frontend", with_class("frontend"), True)
+case("a class this platform never heard of installs anyway",
+     with_class("kuehlschrank"), True, "Treating it as 'frontend'")
+case("a 0.1 manifest using the 0.2 field is still read (tolerant runtime)",
+     with_class("service", version="0.1"), True)
+
+
+def class_case(label, value, want):
+    global fails
+    got = appctl.app_class_of({"class": value} if value is not None else {})
+    fails += got != want
+    print(f"{'PASS' if got == want else 'FAIL'}  {label}")
+    if got != want:
+        print(f"      got {got!r}, wanted {want!r}")
+
+
+class_case("'service' is read as declared", "service", "service")
+class_case("'frontend' is read as declared", "frontend", "frontend")
+class_case("no class at all means frontend", None, "frontend")
+class_case("an empty class means frontend", "", "frontend")
+# The safe direction, and worth pinning down: a tile too many is untidy,
+# a missing tile hides a working app from whoever installed it.
+class_case("an unknown class means frontend, never service",
+           "kuehlschrank", "frontend")
+class_case("and neither does a wrong type sneak through", 42, "frontend")
 
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)

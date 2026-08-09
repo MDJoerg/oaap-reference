@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Klicktest der Store-Seiten an einem laufenden Knoten (RFC-0012 §6/§7).
+"""Klicktest an einem laufenden Knoten (RFC-0012 §6/§7, Spec 2.10).
 
 Anders als die `test_*.py` braucht dieser Test eine **echte Maschine**:
 Er meldet sich am Portal an und prueft, was ein Mensch im Browser saehe
@@ -11,6 +11,11 @@ und wieder ein, versucht sie unzulaessig hochzustufen und entfernt sie
 wieder. Die verwendete URL zeigt bewusst ins Leere und liegt ausserhalb
 unserer Repositories: So wird zugleich die Fehleranzeige einer
 unlesbaren Quelle geprueft, und es bleibt kein Rueckstand.
+
+Dazu die Kachel im Launchpad (Spec 2.10): aus, an, eine unzulaessige
+Einstellung, zurueck auf automatisch — jeweils mit Blick darauf, ob das
+Launchpad mitzaehlt, was es verbirgt. Auch dieser Teil raeumt hinter
+sich auf.
 
 Zugangsdaten kommen aus `test/.env` (nicht im Git) und werden nirgends
 ausgegeben:
@@ -177,6 +182,63 @@ ok("entfernen wirkt", f'value="{sid}"' not in body,
    urllib.parse.unquote(url))
 ok("und die mitgelieferten Quellen sind unversehrt",
    "oaap.community" in body and "oaap.platform" in body)
+
+print("\n=== Kachel im Launchpad (Bauschritt 7, Spec 2.10) ===")
+# Ollama ist der lebende Fall: der Katalog kennzeichnet es seit jeher
+# als Hintergrunddienst, das Launchpad zeigte trotzdem eine Kachel auf
+# eine reine Schnittstelle. Der Knoten entscheidet am MANIFEST, also
+# wirkt das erst nach einem Deployment der Fassung, die sich selbst so
+# nennt — bis dahin behaelt die Instanz ihre Kachel, und genau das
+# gehoert geprueft: ein Update darf kein Launchpad leerraeumen.
+st, body, url = get("/instances")
+ok("die Instanzliste hat eine Spalte fuer die Kachel", "Kachel" in body, url)
+ok("und sagt, dass das keine Zugriffskontrolle ist",
+   "reine Anzeige" in body)
+
+# Nicht auf einen Instanznamen festnageln — der Test soll auf jedem
+# Knoten laufen. Die Regel gilt fuer jede Instanz gleich.
+names = re.findall(r'href="/instances/([a-z0-9][a-z0-9-]*)"', body)
+target = names[0] if names else ""
+ok("mindestens eine Instanz zum Pruefen gefunden", bool(target), str(names[:5]))
+
+st, body7, url = get(f"/instances/{target}")
+ok("die Instanzseite kommt", st == 200, f"{st} {url}")
+ok("sie hat die Karte fuer die Kachel", "Kachel im Launchpad" in body7)
+ok("sie sagt, was die App ueber sich selbst behauptet",
+   "bezeichnet sich selbst" in body7)
+ok("sie warnt, dass Verstecken niemanden aussperrt",
+   "Zugriffskontrolle" in body7)
+
+# Kacheln zaehlen statt Namen suchen: eindeutig, auch wenn zwei
+# Instanzen dieselbe App fahren.
+def tiles_now():
+    return get("/")[1].count('class="tile"')
+
+
+before = tiles_now()
+post(f"/instances/{target}/tile", {"mode": "off"})
+after_off = tiles_now()
+ok("abgeschaltet verschwindet genau eine Kachel", after_off == before - 1,
+   f"vorher={before} nachher={after_off}")
+ok("und das Launchpad sagt einem server_admin, dass es etwas verbirgt",
+   "ohne Kachel" in get("/")[1])
+
+post(f"/instances/{target}/tile", {"mode": "on"})
+ok("eingeschaltet ist sie wieder da", tiles_now() == before,
+   f"{tiles_now()} vs {before}")
+
+st, body, url = post(f"/instances/{target}/tile", {"mode": "kaputt"})
+ok("eine unbekannte Einstellung wird abgewiesen",
+   "nbekannte" in body, body[-300:])
+ok("und hat nichts veraendert", tiles_now() == before)
+
+post(f"/instances/{target}/tile", {"mode": "auto"})
+st, body7, url = get(f"/instances/{target}")
+ok("zurueck auf automatisch wirkt", 'value="auto"' in body7, body[-300:])
+# Egal wie die Kachel steht: die Instanz behaelt Adresse, Routen und
+# Rollen. Das ist die Zusicherung, die am leichtesten kaputtgeht.
+ok("die Instanz hat Sichtbarkeit und Adresse unveraendert behalten",
+   "Sichtbarkeit" in body7 and "Eigene Adresse" in body7)
 
 print("\n=== unbekannte Kennungen werden abgewiesen ===")
 try:

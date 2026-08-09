@@ -7,6 +7,7 @@ Host-side app manager invoked via `oaap app ...`:
     oaap app list
     oaap app remove <name> [--purge]
     oaap app visibility <name> all | groups <g1,g2,...>   (RFC-0007)
+    oaap app tile <name> [auto|on|off]                    (spec 2.10)
     oaap app config list|set|unset <name> [key] [value]   (spec 2.3/2.4)
     oaap app address show|set|remove <name> [hostname]    (RFC-0009)
     oaap app throttle show|set|off <name> [reqs/seconds]  (RFC-0010)
@@ -68,7 +69,20 @@ IDENTITY_CONTAINER = "oaap-identity-1"
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 1
+MANIFEST_MINOR = 2      # 0.2 adds app.class (runtime spec 2.10)
+
+# What an app IS, as opposed to app.type, which says how it is packaged.
+# 'service' means "used by other software" and costs the instance its
+# launchpad tile. An unknown or missing value counts as 'frontend': a
+# tile too many is untidy, a missing tile hides a working app.
+APP_CLASSES = ("frontend", "service")
+DEFAULT_APP_CLASS = "frontend"
+
+
+def app_class_of(app):
+    """The declared application class, normalised (runtime spec 2.10)."""
+    value = str(app.get("class") or "").strip()
+    return value if value in APP_CLASSES else DEFAULT_APP_CLASS
 
 # Features a manifest may declare under 'must_understand' -- the exception
 # that makes "ignore what you do not know" safe (RFC-0012 §8.2 rule 2). A
@@ -235,6 +249,14 @@ def validate_manifest(m):
         errs.append("app.type: native | image | wrapped")
     if not app.get("name"):
         errs.append("app.name: required")
+    # Not an error: an unrecognised class is ignored like any other
+    # unknown value (RFC-0012 §8.1) and the app installs. But a typo
+    # here silently costs or grants a launchpad tile, so say it out
+    # loud rather than let it pass in silence.
+    if app.get("class") and app["class"] not in APP_CLASSES:
+        print(f"Note: app.class '{app['class']}' is not a class this "
+              f"platform knows ({' | '.join(APP_CLASSES)}). Treating it as "
+              f"'{DEFAULT_APP_CLASS}'.")
     services = m.get("services") or {}
     if len(services) != 1:
         errs.append("exactly one service is supported in runtime increment 1")
@@ -1122,6 +1144,13 @@ def _install_from_dir(pkg, args, source):
     reg["instances"][name] = {
         "app_id": app["id"], "app_name": app["name"],
         "version": app["version"], "channel": channel,
+        # what the app IS (runtime spec 2.10) — decides the launchpad
+        # tile. Read from the MANIFEST at install time, never from a
+        # store list: the node must answer this offline, for an app
+        # installed straight from Git, and without a foreign list being
+        # able to rearrange somebody else's launchpad. Re-read on every
+        # install, because it describes the app and the app may change.
+        "app_class": app_class_of(app),
         "port": port, "image": image, "container": container,
         # for the portal's health page: where to reach the service on
         # the internal network and which path confirms liveness
@@ -1157,6 +1186,12 @@ def _install_from_dir(pkg, args, source):
     # silently reset an operator's rate decision to the default
     if inst and inst.get("throttle") is not None:
         reg["instances"][name]["throttle"] = inst["throttle"]
+    # and for the launchpad tile override (runtime spec 2.10). Note the
+    # asymmetry with app_class right above: the CLASS is re-read from
+    # every manifest because it describes the app, the OVERRIDE is kept
+    # because it is the operator's decision about this instance.
+    if inst and inst.get("tile"):
+        reg["instances"][name]["tile"] = inst["tile"]
     save_registry(reg)
     if channel == "production":
         # moving to production invalidates any deploy token (spec 2.5)
@@ -1251,6 +1286,74 @@ def cmd_visibility(args):
         print("Users need at least one of these groups (or the server_admin role) to see/reach it.")
     else:
         print(f"'{args.name}' visibility set to 'all' (role check only, as before).")
+
+
+# ------------------------------------------- launchpad tile (runtime 2.10)
+# Whether an instance appears on the launchpad. The app's own class
+# decides by default — a background 'service' gets no tile — and this is
+# the operator's override on top of it, per instance, kept in the
+# registry alongside (never inside) the manifest-derived class. It is
+# display only: routes, roles and URL are untouched and the gateway
+# keeps enforcing them. To hide an app from a person, use visibility
+# groups above.
+
+TILE_MODES = ("auto", "on", "off")
+TILE_EXPLAIN = {
+    "auto": "follows the app itself",
+    "on": "always shown",
+    "off": "never shown",
+}
+
+
+def tile_mode_of(inst):
+    """The instance's tile override; absent means 'auto'."""
+    mode = str(inst.get("tile") or "").strip()
+    return mode if mode in TILE_MODES else "auto"
+
+
+def tile_visible(inst):
+    """Does this instance belong on the launchpad? (runtime spec 2.10)
+
+    Kept next to the registry it reads so the CLI and the portal cannot
+    drift apart on the answer; the portal has its own copy of exactly
+    this rule in services/portal/instance_view.py, because it runs in a
+    container that cannot import this file.
+    """
+    mode = tile_mode_of(inst)
+    if mode != "auto":
+        return mode == "on"
+    return (inst.get("app_class") or DEFAULT_APP_CLASS) != "service"
+
+
+def cmd_tile(args):
+    reg = load_registry()
+    inst = reg["instances"].get(args.name)
+    if not inst:
+        die(f"no instance named '{args.name}'")
+    if not args.mode:
+        mode = tile_mode_of(inst)
+        cls = inst.get("app_class") or DEFAULT_APP_CLASS
+        print(f"'{args.name}' tile: {mode} ({TILE_EXPLAIN[mode]}) — "
+              f"the app declares itself '{cls}'")
+        print("Currently " + ("shown" if tile_visible(inst)
+                              else "not shown") + " on the launchpad.")
+        return
+    if args.mode == "auto":
+        inst.pop("tile", None)
+    else:
+        inst["tile"] = args.mode
+    save_registry(reg)
+    # No gateway work: unlike visibility, this changes nothing about
+    # who may reach the instance, so no site is regenerated.
+    if args.mode == "auto":
+        cls = inst.get("app_class") or DEFAULT_APP_CLASS
+        print(f"'{args.name}' tile follows the app again (it declares "
+              f"itself '{cls}') — " + ("shown." if tile_visible(inst)
+                                       else "not shown."))
+    else:
+        print(f"'{args.name}' tile: {args.mode} ({TILE_EXPLAIN[args.mode]}).")
+    print("This is display only — the app keeps its address, its routes "
+          "and its roles. To keep people out, use 'oaap app visibility'.")
 
 
 # --------------------------------------------------- user rescue (root only)
@@ -2029,6 +2132,26 @@ def cmd_process_deploys(_args):
                 reload_gateway()
                 ok = True
                 msg = ("visibility set to groups: " + ", ".join(groups)) if groups else "visibility set to all"
+        elif action == "tile":
+            # Launchpad tile override (runtime spec 2.10). Registry only
+            # — no gateway work, because this changes nothing about who
+            # may reach the instance. The mode is re-checked here rather
+            # than trusted: the spool is data, not trust.
+            mode = req.get("mode", "")
+            if not inst:
+                msg = "unknown instance"
+            elif mode not in TILE_MODES:
+                msg = f"unknown tile mode '{mode}'"
+            else:
+                if mode == "auto":
+                    inst.pop("tile", None)
+                else:
+                    inst["tile"] = mode
+                save_registry(reg)
+                ok = True
+                msg = (f"tile set to {mode} ({TILE_EXPLAIN[mode]})"
+                       + (" — now shown" if tile_visible(inst)
+                          else " — now not shown"))
         elif action == "token":
             # Deploy token from the portal (runtime spec 2.5/2.6). The
             # portal generates the token and sends only its digest, so
@@ -2161,6 +2284,7 @@ def cmd_process_deploys(_args):
             ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
         via = {"install": "store", "visibility": "portal",
+               "tile": "portal",
                "config": "portal", "token": "portal",
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
@@ -2564,6 +2688,12 @@ def main():
     pv.add_argument("groups", nargs="?", default="",
                     help="comma-separated group tags, e.g. buero,finanzen (with 'groups')")
     pv.set_defaults(fn=cmd_visibility)
+    pt = sub.add_parser("tile")
+    pt.add_argument("name")
+    pt.add_argument("mode", nargs="?", choices=list(TILE_MODES), default="",
+                    help="auto = follow the app's own class (default), "
+                         "on = always show, off = never show; omit to ask")
+    pt.set_defaults(fn=cmd_tile)
     pcf = sub.add_parser("config")
     pcf.add_argument("action", choices=["list", "set", "unset"])
     pcf.add_argument("name")

@@ -2,7 +2,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py store_view.py ./
+COPY app.py store_view.py instance_view.py ./
 EXPOSE 8000
 # --timeout above the deploy hook's synchronous wait (120s), so a
 # worker waiting for a build result is not killed mid-request

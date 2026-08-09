@@ -10,14 +10,16 @@ Zwei Arten von Prüfung liegen hier:
   HTTP-Server im Test selbst, damit nichts gegen eine Fixture-Datei
   auseinanderläuft.
 - **`klicktest.py`** — die Oberfläche an einem **laufenden Knoten**:
-  anmelden, Store-Katalog, Filter, Objektseite, Quellenverwaltung und
-  der Schreibweg über den Spool-Worker. Braucht Zugangsdaten in `.env`
-  (nicht im Git) und einen Portal-Benutzer mit Rolle `server_admin`.
+  anmelden, Store-Katalog, Filter, Objektseite, Quellenverwaltung, die
+  Kachel im Launchpad und der Schreibweg über den Spool-Worker. Braucht
+  Zugangsdaten in `.env` (nicht im Git) und einen Portal-Benutzer mit
+  Rolle `server_admin`.
 
 ```bash
 python3 test/test_manifest_version.py
 python3 test/test_store_sources.py
 python3 test/test_store_view.py
+python3 test/test_tile.py
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -33,9 +35,22 @@ ungeprüften Quellen, und der Umzug mitgelieferter Quellen (RFC-0012
 §2/§3/§4, Befunde B2/B3/B4), sowie die Regeln der Store-Seite: welcher
 Eintrag gewinnt, wenn zwei Listen dieselbe App führen, was mit einem
 unbekannten Vokabular-Wert geschieht, welche Bilder überhaupt geladen
-werden und was standardmäßig ausgefiltert ist (§1.2/§3/§6). Wer eine
-dieser Regeln ändern will, ändert zuerst den RFC.
+werden und was standardmäßig ausgefiltert ist (§1.2/§3/§6), sowie wer
+eine Kachel im Launchpad bekommt — die App entscheidet über ihr
+Manifest, der Betreiber übersteuert je Instanz, und Verstecken ist
+ausdrücklich keine Zugriffskontrolle (§1.2 mit Nachtrag zu §1.3,
+Runtime-Spec 2.10). Wer eine dieser Regeln ändern will, ändert zuerst
+den RFC.
 
-`test_store_view.py` läuft gegen `store_view.py` — die Katalogregeln
-liegen bewusst außerhalb von `app.py`, damit man sie ohne Flask, ohne
-Anfrage und ohne Knoten lesen und prüfen kann.
+`test_store_view.py` läuft gegen `store_view.py`, `test_tile.py` gegen
+`instance_view.py` — beide Regelwerke liegen bewusst außerhalb von
+`app.py`, damit man sie ohne Flask, ohne Anfrage und ohne Knoten lesen
+und prüfen kann. `test_tile.py` vergleicht zusätzlich die Antworten von
+`appctl.py` und `instance_view.py`: die Regel steht zwangsläufig
+zweimal da — auf dem Wirt und im Portal-Container, der `appctl` nicht
+importieren kann —, und zwei Kopien driften auseinander.
+
+Was `test_tile.py` **nicht** prüfen kann, weil es Docker bräuchte: dass
+die Übersteuerung ein erneutes Deployment übersteht, während die Klasse
+selbst aus dem neuen Manifest neu gelesen wird. Das gehört auf eine
+echte Maschine.

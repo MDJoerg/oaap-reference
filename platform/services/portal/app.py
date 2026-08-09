@@ -184,6 +184,13 @@ DASHBOARD_BODY = """
   Ihre Rollen ist keine sichtbar. Apps installiert die Administration mit
   <code>oaap app install</code>.</p></div>
 {% endif %}
+{% if hidden_count %}
+<p class="muted">{{ hidden_count }}
+   {{ "weitere Instanz läuft" if hidden_count == 1 else "weitere Instanzen laufen" }}
+   ohne Kachel — Hintergrunddienste, die von anderer Software benutzt
+   werden. Zu sehen und umzustellen unter
+   <a href="/instances">Instanzen</a>.</p>
+{% endif %}
 """
 
 # Floorplan "Listenbericht" (design guidelines 6.1): read-only list,
@@ -750,7 +757,10 @@ STORE_APP_BODY = """
     <dt>Kennung</dt><dd><code>{{ a.id }}</code></dd>
     <dt>Version</dt><dd>{{ a.version }}{% if a.released %} vom {{ a.released }}{% endif %}</dd>
     {% if a.type %}<dt>Verpackung</dt><dd>{{ a.type }}</dd>{% endif %}
-    {% if a.class_label %}<dt>Art</dt><dd>{{ a.class_label }}</dd>{% endif %}
+    {% if a.class_label %}<dt>Art</dt><dd>{{ a.class_label }}{% if a.app_class == 'service' %}
+      <br><span class="muted">Wird von anderer Software benutzt und bekommt
+      deshalb keine Kachel im Launchpad. Umstellen lässt sich das nach der
+      Installation auf der Instanzseite.</span>{% endif %}</dd>{% endif %}
     {% if a.audience_labels %}<dt>Zielgruppe</dt><dd>{{ a.audience_labels|join(', ') }}</dd>{% endif %}
     {% if a.roles %}<dt>Rollen</dt><dd>{{ a.roles|join(', ') }}</dd>{% endif %}
     {% if a.license %}<dt>Lizenz</dt><dd>{{ a.license }}</dd>{% endif %}
@@ -800,13 +810,15 @@ INSTANCES_LIST_BODY = """
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Instanz</th><th>App</th><th>Kanal</th><th>Sichtbarkeit</th><th></th></tr>
+  <tr><th>Instanz</th><th>App</th><th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/instances/{{ i.name }}">{{ i.name }}</a></td>
     <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
     <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span></td>
     <td>{{ i.visibility_label }}</td>
+    <td>{{ "ja" if i.tile_visible else "nein" }}{% if i.tile_mode != "auto" %}
+        <span class="muted">(fest)</span>{% endif %}</td>
     <td><a class="rowaction" href="/instances/{{ i.name }}">Bearbeiten</a></td>
   </tr>
   {% endfor %}
@@ -818,6 +830,10 @@ INSTANCES_LIST_BODY = """
 <p class="muted">Sichtbarkeit schränkt zusätzlich zur Rolle ein, wer eine
 installierte Instanz sehen und öffnen darf (RFC-0007) — <code>server_admin</code>
 sieht immer alle Instanzen, unabhängig davon.</p>
+<p class="muted"><strong>Kachel</strong> sagt nur, ob die Instanz im Launchpad
+erscheint. Hintergrunddienste bekommen von sich aus keine; „fest" heißt, dass
+jemand das ausdrücklich umgestellt hat. Das ist reine Anzeige — Adresse,
+Routen und Rollen der Instanz bleiben davon unberührt.</p>
 """
 
 # Floorplan "Dialogseite" — create a test instance. Only reachable on a
@@ -897,6 +913,24 @@ INSTANCE_EDIT_BODY = """
     <p class="muted"><code>server_admin</code> sieht diese Instanz immer,
        unabhängig von dieser Einstellung. Rollen legt weiterhin das
        App-Manifest fest ({{ i.roles|join(", ") if i.roles else "keine Einschränkung" }}).</p>
+    <button>Speichern</button>
+  </div>
+</form>
+<form method="post" action="/instances/{{ i.name }}/tile">
+  <div class="card">
+    <h2>Kachel im Launchpad</h2>
+    <p class="muted">{{ i.tile_reason }} Die App bezeichnet sich selbst als
+       <strong>{{ i.app_class_label }}</strong>.</p>
+    <label class="checkline"><input type="radio" name="mode" value="auto"
+           {{ 'checked' if i.tile_mode == 'auto' }}>Der App folgen (Standard)</label>
+    <label class="checkline"><input type="radio" name="mode" value="on"
+           {{ 'checked' if i.tile_mode == 'on' }}>Immer zeigen</label>
+    <label class="checkline"><input type="radio" name="mode" value="off"
+           {{ 'checked' if i.tile_mode == 'off' }}>Nie zeigen</label>
+    <p class="muted">Das ist reine Anzeige und <strong>keine
+       Zugriffskontrolle</strong>: Die Instanz behält ihre Adresse, ihre Routen
+       und ihre Rollen, und das Gateway prüft weiter wie bisher. Wer eine App
+       vor bestimmten Leuten verbergen will, nimmt die Sichtbarkeit oben.</p>
     <button>Speichern</button>
   </div>
 </form>
@@ -1186,6 +1220,12 @@ def launchpad_tiles(user_roles, user_groups, host):
     exactly: no bypass here that the gateway's /verify does not also
     grant, and vice versa — server_admin bypasses the group check only,
     same as /verify).
+
+    Returns (tiles, hidden): `hidden` counts the instances this caller
+    passed both filters for but which carry no tile (runtime spec 2.10).
+    The launchpad reports that number to a server_admin, because a page
+    that is empty for a good reason looks exactly like one that is empty
+    for a bad one.
     """
     # Where is the caller? The LAN listener ports only work from inside;
     # from outside only 80/443 are forwarded. Deciding this by "is the
@@ -1197,13 +1237,19 @@ def launchpad_tiles(user_roles, user_groups, host):
     ext = external_host()
     on_lan = not ext or _looks_like_lan(host)
     is_server_admin = "server_admin" in user_roles
-    tiles = []
+    tiles, hidden = [], 0
     for name, inst in sorted(load_instances().items()):
         allowed = set(inst.get("roles") or [])
         if allowed and not user_roles & allowed:
             continue
         vis_groups = set((inst.get("visibility") or {}).get("groups") or [])
         if vis_groups and not is_server_admin and not user_groups & vis_groups:
+            continue
+        # Counted AFTER the two filters above, never before: the number
+        # must not tell a caller that instances exist which they may not
+        # see anyway. Display only — nothing here grants or denies access.
+        if not iv.tile_visible(inst):
+            hidden += 1
             continue
         channel = inst.get("channel", "production")
         tiles.append({
@@ -1215,7 +1261,7 @@ def launchpad_tiles(user_roles, user_groups, host):
             "description": inst.get("description", ""),
             "url": _tile_url(name, inst, host, ext, on_lan),
         })
-    return tiles
+    return tiles, hidden
 
 
 _LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".oaap.internal")
@@ -1254,10 +1300,14 @@ def setup_done() -> bool:
 
 @app.get("/")
 def dashboard():
-    return page(
-        DASHBOARD_BODY, "Apps", "apps",
-        tiles=launchpad_tiles(caller_roles(), caller_groups(), request.host.split(":")[0]),
-    )
+    roles = caller_roles()
+    tiles, hidden = launchpad_tiles(roles, caller_groups(),
+                                    request.host.split(":")[0])
+    # Only a server_admin is told about tileless instances: they are the
+    # only ones who can do anything about it, and everybody else would
+    # be told to miss something they were never meant to operate.
+    return page(DASHBOARD_BODY, "Apps", "apps", tiles=tiles,
+                hidden_count=hidden if "server_admin" in roles else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2209,6 +2259,8 @@ def instances_list():
             "version": inst.get("version", "?"),
             "channel": channel, "channel_label": CHANNEL_LABELS.get(channel, channel),
             "visibility_label": "Alle" if not groups else "Gruppen: " + ", ".join(groups),
+            "tile_visible": iv.tile_visible(inst),
+            "tile_mode": iv.tile_mode(inst),
         })
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
                 can_create="dev" in node_profiles(),
@@ -2341,6 +2393,9 @@ def instance_detail(name):
          "auto_address": f"{name}.{external_host()}" if external_host() else "",
          "has_public_route": any("public" in (r.get("roles") or [])
                                  for r in inst.get("routes") or []),
+         "tile_mode": iv.tile_mode(inst),
+         "tile_reason": iv.tile_reason(inst),
+         "app_class_label": iv.CLASS_LABEL[iv.app_class(inst)],
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 msg=request.args.get("msg"), error=request.args.get("err"))
@@ -2361,6 +2416,31 @@ def instance_visibility(name):
             code=303)
     return _queue_and_redirect(name, {"action": "visibility", "groups": groups},
                                VISIBILITY_WAIT_SECONDS)
+
+
+@app.post("/instances/<name>/tile")
+def instance_tile(name):
+    """Launchpad tile override (runtime spec 2.10).
+
+    Queued like every other write from here — the registry mount is
+    read-only — even though this one touches nothing but one registry
+    field. The host re-checks the mode: the spool is data, not trust.
+    """
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    mode = request.form.get("mode", "auto")
+    if mode not in iv.TILE_MODES:
+        return redirect(
+            f"/instances/{name}?err={quote('Unbekannte Einstellung für die Kachel.')}",
+            code=303)
+    return _queue_and_redirect(name, {"action": "tile", "mode": mode},
+                               TILE_WAIT_SECONDS)
+
+
+TILE_WAIT_SECONDS = 20  # one registry field, no container and no gateway work
 
 
 # Recreating the container takes noticeably longer than a registry edit.
