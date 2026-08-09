@@ -2360,7 +2360,13 @@ def cmd_store(args):
             print("\nResolution: highest trust class wins; within a class the "
                   "order above decides (RFC-0012 §3).")
         if migrated:
-            save_sources(sources, removed)
+            # Shown, not written: 'list' is the one store command that
+            # changes nothing, so it stays usable without root. The
+            # migration reaches disk at the next 'store reconcile',
+            # which every 'oaap update' runs.
+            print("\nThese entries predate RFC-0012; id and trust class are "
+                  "derived above and written down by 'sudo oaap store "
+                  "reconcile' (which 'sudo oaap update' runs for you).")
         return
 
     if args.action == "reconcile":
@@ -2547,7 +2553,9 @@ def main():
     args = p.parse_args()
     # 'convert' works on files the caller owns; 'node show' only prints
     # what 'oaap status' prints anyway — everything else changes the node.
-    read_only = args.cmd == "convert" or (args.cmd == "node" and args.action == "show")
+    read_only = (args.cmd == "convert"
+                 or (args.cmd == "node" and args.action == "show")
+                 or (args.cmd == "store" and args.action == "list"))
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:
