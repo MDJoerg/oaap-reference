@@ -25,6 +25,21 @@ UPDATE_LOG="/var/log/oaap-update.log"
 say()  { printf '%s\n' "$*"; }
 fail() { say "ERROR: $*" >&2; exit 1; }
 
+# Steps that make an installed node consistent with the code on it —
+# unit repairs, format migrations. They live in their own file because
+# THIS script is always the old one: `oaap update` runs the update.sh
+# that was on disk when the operator typed the command, so a step added
+# here would be skipped by exactly the update that introduces it. The
+# call below reads $APP_DIR, which holds the new file. It also runs when
+# there is nothing to update — that is what heals a node which already
+# missed a step. See platform/migrate.sh.
+run_migrations() {
+  if [ -x "$APP_DIR/migrate.sh" ] || [ -f "$APP_DIR/migrate.sh" ]; then
+    OAAP_DATA_DIR="$OAAP_DATA_DIR" bash "$APP_DIR/migrate.sh" \
+      || say "WARNING: not every consistency step completed — see above."
+  fi
+}
+
 [ "$(id -u)" -eq 0 ] || fail "Requires root (sudo oaap update)."
 [ -e "$OAAP_DATA_DIR/.oaap-installed" ] || fail "OAAP is not installed on this node ($OAAP_DATA_DIR)."
 command -v git >/dev/null 2>&1 || fail "git is required (apt install git)."
@@ -99,8 +114,15 @@ if [ -n "$cur_rev" ] && [ "$cur_rev" = "$new_rev" ]; then
     set_env OAAP_VERSION "$cur_ver"
     docker compose --project-directory "$APP_DIR" --project-name oaap up -d >/dev/null 2>&1 || true
   fi
+  # Even here: the code is current, but the NODE may not be. A step
+  # that a previous update skipped (because that update ran the old
+  # script) gets its chance now, and every step is quiet when there is
+  # nothing to do.
+  if [ "$CHECK" -eq 0 ]; then
+    run_migrations
+  fi
   say ""
-  say "Already up to date — nothing changed."
+  say "Already up to date."
   exit 0
 fi
 
@@ -153,36 +175,11 @@ fi
 
 echo "$new_rev" > "$APP_DIR/REVISION"
 
-# Shipped store sources (RFC-0012 §4). Sources used to be written once,
-# at installation, and never touched again — so the day one of our lists
-# moves, every node in the field strands, visibly only as an empty
-# store. Reconcile carries a moved list along where the operator has not
-# edited the URL, leaves it alone where they have, and says which.
-# The deploy worker's unit is written by the installer and was never
-# touched again, so a node installed before this version keeps systemd's
-# default start rate limit — and with it the failure found on oaap-test:
-# a handful of portal actions in a row look like a crash loop, systemd
-# fails the watching path unit, and the node quietly stops processing
-# ANY queued request until someone resets it by hand. Repair it here,
-# and clear the failed state if this node already fell into it.
-UNIT=/etc/systemd/system/oaap-deployd.service
-if [ -f "$UNIT" ] && ! grep -q '^StartLimitIntervalSec=' "$UNIT"; then
-  say ""
-  say "Repairing the deploy worker's start rate limit ..."
-  if sed -i '/^Description=OAAP deploy worker/a StartLimitIntervalSec=0' "$UNIT"; then
-    systemctl daemon-reload
-    systemctl reset-failed oaap-deployd.service oaap-deployd.path >/dev/null 2>&1 || true
-    systemctl start oaap-deployd.path >/dev/null 2>&1 || true
-    say "  Done — queued requests are processed again after a burst of clicks."
-  else
-    say "  WARNING: could not update $UNIT."
-  fi
-fi
-
-say ""
-say "Checking store sources ..."
-OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store reconcile \
-  2>&1 | sed 's/^/  /' || say "  WARNING: store sources could not be checked."
+# Bring the node in line with the code we just installed. Deliberately
+# a call into $APP_DIR — that path holds the NEW file, while everything
+# above this line is still running from the OLD update.sh (see the
+# header of migrate.sh for what that cost us on oaap-demo).
+run_migrations
 
 # ------------------------------------------------------------- verify
 sleep 3
