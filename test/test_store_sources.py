@@ -316,6 +316,64 @@ res = queue({"id": "r3", "instance": "studio", "action": "install",
 ok("a request cannot introduce a source of its own",
    not res["ok"] and "not listed in any configured" in res["message"], str(res))
 
+print("\n=== sources from the portal go through the same rules (§7) ===")
+# The portal's /apps-registry mount is read-only, so a change is queued
+# for the host worker — which re-checks everything the CLI checks,
+# because the spool is data, not trust.
+appctl.save_sources([
+    {"id": "oaap.platform", "name": "Plattform", "url": BASE + "/platform.json",
+     "trust": "platform", "enabled": True, "shipped": True,
+     "shipped_url": BASE + "/platform.json"},
+], [])
+
+
+def portal(op, **fields):
+    rid = f"s{len(os.listdir(QUEUE)) if os.path.isdir(QUEUE) else 0}{op}{len(fields)}"
+    return queue({"id": rid, "instance": "", "action": "source", "op": op,
+                  "by": "joerg", **fields})
+
+
+res = portal("add", url="http://unsicher.invalid/list.json")
+ok("the portal cannot add a plain-http source",
+   not res["ok"] and "https://" in res["message"], str(res))
+res = portal("add", url="https://neu.invalid/list.json", name="Neue Liste",
+             trust="platform")
+ok("the portal cannot claim the 'platform' class",
+   not res["ok"] and "reserved" in res["message"], str(res))
+res = portal("add", url="https://neu.invalid/list.json", name="Neue Liste",
+             trust="unverified", origin="Firma X")
+ok("a foreign list can be added as unverified", res["ok"], str(res))
+added = [s for s in appctl.load_sources()[0] if s["name"] == "Neue Liste"]
+ok("and it lands in the file, enabled, with its origin",
+   len(added) == 1 and added[0]["enabled"] and added[0]["origin"] == "Firma X",
+   str(added))
+new_id = added[0]["id"]
+res = portal("trust", source_id="oaap.platform", trust="verified")
+ok("a shipped platform source cannot be re-classified from the portal",
+   not res["ok"] and "not settable" in res["message"], str(res))
+res = portal("trust", source_id=new_id, trust="verified")
+ok("but a foreign one can be raised to 'verified'", res["ok"], str(res))
+ok("and the message says what that costs",
+   "without a confirmation" in res["message"], str(res))
+res = portal("disable", source_id=new_id)
+ok("a source can be switched off from the portal", res["ok"], str(res))
+ok("and the store stops reading from it",
+   not any(s["id"] == new_id
+           for s in appctl.load_sources()[0] if s.get("enabled")))
+res = portal("rename", source_id=new_id, name="")
+ok("an empty name is refused", not res["ok"], str(res))
+res = portal("remove", source_id="gibt-es-nicht")
+ok("an unknown source is refused", not res["ok"]
+   and "unknown store source" in res["message"], str(res))
+res = portal("remove", source_id="oaap.platform")
+ok("removing a shipped source works and is remembered",
+   res["ok"] and "remembered" in res["message"], str(res))
+appctl.reconcile_shipped_sources()
+ok("an update does not bring it back",
+   "oaap.platform" not in [s["id"] for s in appctl.load_sources()[0]])
+res = portal("frisieren", source_id=new_id)
+ok("an unknown operation is refused", not res["ok"], str(res))
+
 srv.shutdown()
 shutil.rmtree(DATA, ignore_errors=True)
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")

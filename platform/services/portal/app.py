@@ -16,7 +16,7 @@ resources.
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from urllib.parse import quote
 
 import requests
@@ -422,84 +422,367 @@ HEALTH_BODY = """
 Netz. Landschafts-Gesundheit (Worker-Knoten) folgt mit RFC-0003.</p>
 """
 
+# Floorplan "Listenbericht" — one catalogue across all enabled sources,
+# with the source and its trust class on every entry (RFC-0012 §6).
 STORE_BODY = """
-<h1>Store</h1>
+<style>
+  .filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));
+       gap:.2rem .8rem;align-items:end}
+  .filters label{font-size:.82rem;color:var(--oaap-muted);display:block}
+  .filters select,.filters input{margin:.2rem 0 .6rem}
+  .storecard{display:flex;flex-direction:column}
+  .storecard .badges{display:flex;gap:.3rem;flex-wrap:wrap;margin:.5rem 0 0}
+  .storecard .src{margin-top:auto;padding-top:.6rem;font-size:.78rem;
+       color:var(--oaap-muted)}
+  .icon{width:2rem;height:2rem;border-radius:.35rem;object-fit:contain;flex:none}
+</style>
+<div class="pagehead"><h1>Store</h1>
+  <span><span class="muted" style="margin-right:.8rem">{{ apps|length }} von
+    {{ total }} Apps</span><a class="btn" href="/store/sources">Quellen</a></span></div>
 {% if msg %}
 <div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
 {% endif %}
-{% if not sources %}
+{% for e in errors %}
+<div class="card"><p class="err" style="margin:0"><strong>{{ e.name }}</strong>
+  nicht lesbar: {{ e.error }}</p>
+  <p class="muted" style="margin:.3rem 0 0">{{ e.url }}</p></div>
+{% endfor %}
+
+<form class="card" method="get" action="/store">
+  <div class="filters">
+    <div style="grid-column:1/-1"><label for="q">Suche</label>
+      <input id="q" name="q" value="{{ f.q }}"
+             placeholder="Name, Kurztext, Beschreibung oder Hashtag"></div>
+    <div><label for="categories">Kategorie</label>
+      <select id="categories" name="categories"><option value="">alle</option>
+      {% for o in opt_categories %}<option value="{{ o.value }}"
+        {{ 'selected' if f.categories == o.value }}>{{ o.label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="app_class">Art</label>
+      <select id="app_class" name="app_class"><option value="">alle</option>
+      {% for o in opt_class %}<option value="{{ o.value }}"
+        {{ 'selected' if f.app_class == o.value }}>{{ o.label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="audience">Zielgruppe</label>
+      <select id="audience" name="audience"><option value="">alle</option>
+      {% for o in opt_audience %}<option value="{{ o.value }}"
+        {{ 'selected' if f.audience == o.value }}>{{ o.label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="maturity">Reifegrad</label>
+      <select id="maturity" name="maturity"><option value="">alle</option>
+      {% for o in opt_maturity %}<option value="{{ o.value }}"
+        {{ 'selected' if f.maturity == o.value }}>{{ o.label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="trust">Vertrauen</label>
+      <select id="trust" name="trust"><option value="">alle</option>
+      {% for o in trusts %}<option value="{{ o.value }}"
+        {{ 'selected' if f.trust == o.value }}>{{ o.label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="source">Quelle</label>
+      <select id="source" name="source"><option value="">alle</option>
+      {% for o in sources %}<option value="{{ o.value }}"
+        {{ 'selected' if f.source == o.value }}>{{ o.label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="license">Lizenz</label>
+      <select id="license" name="license"><option value="">alle</option>
+      {% for l in licenses %}<option value="{{ l }}"
+        {{ 'selected' if f.license == l }}>{{ l }}</option>{% endfor %}
+      </select></div>
+    <div><label for="installed">Installiert</label>
+      <select id="installed" name="installed"><option value="">egal</option>
+        <option value="yes" {{ 'selected' if f.installed == 'yes' }}>ja</option>
+        <option value="no" {{ 'selected' if f.installed == 'no' }}>nein</option>
+      </select></div>
+  </div>
+  <label class="checkline"><input type="checkbox" name="all_profiles" value="1"
+    {{ 'checked' if f.all_profiles }}> Auch Apps zeigen, die ein Profil
+    erwarten, das dieser Knoten nicht hat{% if hidden_profile %}
+    ({{ hidden_profile }}){% endif %}</label>
+  <label class="checkline"><input type="checkbox" name="all_status" value="1"
+    {{ 'checked' if f.all_status }}> Auch archivierte Apps zeigen{% if hidden_archived %}
+    ({{ hidden_archived }}){% endif %}</label>
+  <button>Filtern</button>
+  {% if f.q or filtered %}<a class="rowaction" href="/store"
+     style="margin-left:.8rem">Zurücksetzen</a>{% endif %}
+</form>
+
+{% if not apps %}
+<div class="card"><p class="muted" style="margin:0">
+  {% if total %}Kein Treffer — mit „Zurücksetzen" siehst Du wieder alles.
+  {% else %}Keine App gefunden. Store-Quellen verwaltet die Administration
+  auf der Maschine: <code>sudo oaap store list</code>.{% endif %}</p></div>
+{% endif %}
+<div class="tiles">
+  {% for a in apps %}
+  <a class="tile storecard" href="/store/{{ a.source.id }}/{{ a.id }}">
+    <div class="top">
+      {% if a.icon %}<img class="icon" src="{{ a.icon }}" alt="">
+      {% else %}
+      <svg class="hexdot" viewBox="0 0 100 100" width="24" height="24" aria-hidden="true">
+        <polygon points="50,6 71,18 71,42 50,54 29,42 29,18" fill="#2563eb"/>
+        <polygon points="28,44 49,56 49,80 28,92 7,80 7,56" fill="none" stroke="#2563eb" stroke-width="5"/>
+        <polygon points="72,44 93,56 93,80 72,92 51,80 51,56" fill="none" stroke="#2563eb" stroke-width="5"/></svg>
+      {% endif %}
+      <h3>{{ a.name }}</h3>
+    </div>
+    <p>{{ a.summary }}</p>
+    <div class="badges">
+      <span class="badge">v{{ a.version }}</span>
+      {% if a.is_new %}<span class="badge">neu</span>{% endif %}
+      {% if a.installed %}<span class="badge test">installiert ({{ a.installed }})</span>{% endif %}
+      {% if a.maturity and a.maturity != 'stable' %}<span class="badge test">{{ a.maturity_label }}</span>{% endif %}
+      {% if a.status == 'deprecated' %}<span class="badge test">veraltet</span>{% endif %}
+      {% if a.status == 'archived' %}<span class="badge off">archiviert</span>{% endif %}
+      {% if a.expert %}<span class="badge test">nur für Experten</span>{% endif %}
+      {% if a.app_class == 'service' %}<span class="badge off">{{ a.class_label }}</span>{% endif %}
+      {% if not a.profile_fit %}<span class="badge off">Profil {{ a.profiles|join(', ') }}</span>{% endif %}
+      {% for c in a.category_labels %}<span class="badge off">{{ c }}</span>{% endfor %}
+    </div>
+    <div class="src">{{ a.source.name }} · {{ a.source.trust_label }}</div>
+  </a>
+  {% endfor %}
+</div>
+<p class="muted">Nennen mehrere Quellen dieselbe App, gewinnt die höchste
+Vertrauensklasse — nicht die zuerst eingetragene Quelle (RFC-0012 §3).
+Quellen verwaltet die Administration auf der Maschine mit
+<code>sudo oaap store list|add-source|remove-source|enable|disable|trust</code>.</p>
+"""
+
+# Floorplan "Listenbericht" — store sources (RFC-0012 §7). server_admin
+# only; every change goes through the host-side worker, like every other
+# portal-side registry write.
+STORE_SOURCES_BODY = """
+<a class="back" href="/store">← Zurück zum Store</a>
+<h1>Store-Quellen</h1>
+{% if msg %}
+<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
+{% endif %}
 <div class="card">
-  <p class="muted">Noch keine Store-Quelle eingetragen. Eine Quelle ist
-  eine URL auf eine <code>oaap-store.json</code>-Liste — hinzufügen mit:</p>
-  <p><code>sudo oaap store add-source &lt;url&gt;</code></p>
+  <table>
+    <tr><th>Quelle</th><th>Vertrauen</th><th>Status</th><th></th></tr>
+    {% for s in sources %}
+    <tr>
+      <td><strong>{{ s.name }}</strong>
+        {% if s.shipped %}<span class="badge off">mitgeliefert</span>{% endif %}
+        {% if s.review %}<span class="badge test">bitte prüfen</span>{% endif %}
+        <br><span class="muted">{{ s.url }}</span>
+        {% if s.origin %}<br><span class="muted">Herkunft: {{ s.origin }}</span>{% endif %}
+        <br><span class="muted"><code>{{ s.id }}</code></span></td>
+      <td><span class="badge {{ 'test' if s.trust != 'platform' }}">{{ s.trust_label }}</span></td>
+      <td><span class="badge {{ '' if s.enabled else 'off' }}">{{ 'an' if s.enabled else 'aus' }}</span></td>
+      <td>
+        <form method="post" action="/store/sources" style="display:inline">
+          <input type="hidden" name="op" value="{{ 'disable' if s.enabled else 'enable' }}">
+          <input type="hidden" name="source_id" value="{{ s.id }}">
+          <button style="padding:.35rem .8rem;min-height:0;font-size:.85rem">
+            {{ 'Ausschalten' if s.enabled else 'Einschalten' }}</button>
+        </form>
+        <details style="margin-top:.4rem"><summary class="muted">Ändern</summary>
+          <form method="post" action="/store/sources" style="margin:.5rem 0 0">
+            <input type="hidden" name="op" value="rename">
+            <input type="hidden" name="source_id" value="{{ s.id }}">
+            <label>Anzeigename <input type="text" name="name" value="{{ s.name }}"></label>
+            <button style="padding:.35rem .8rem;min-height:0;font-size:.85rem">Umbenennen</button>
+          </form>
+          {% if s.trust != 'platform' %}
+          <form method="post" action="/store/sources" style="margin:.8rem 0 0">
+            <input type="hidden" name="op" value="trust">
+            <input type="hidden" name="source_id" value="{{ s.id }}">
+            <label>Vertrauensklasse
+              <select name="trust">
+                <option value="verified" {{ 'selected' if s.trust == 'verified' }}>geprüft</option>
+                <option value="unverified" {{ 'selected' if s.trust == 'unverified' }}>muss bestätigt werden</option>
+              </select></label>
+            <p class="muted" style="margin:0 0 .5rem">Auf „geprüft" zu heben
+              heißt: Apps von hier installieren <strong>ohne Bestätigung</strong>,
+              und diese Quelle sticht ungeprüfte, wenn mehrere dieselbe App
+              führen. „Von uns" bleibt dem vorbehalten, was die Installation
+              mitbringt.</p>
+            <button style="padding:.35rem .8rem;min-height:0;font-size:.85rem">Klasse setzen</button>
+          </form>
+          {% else %}
+          <p class="muted" style="margin:.5rem 0 0">„Von uns" ist nicht
+            umstellbar — die Klasse gehört zur Auslieferung. Ausschalten oder
+            entfernen geht.</p>
+          {% endif %}
+          <form method="post" action="/store/sources" style="margin:.8rem 0 0"
+                onsubmit="return confirm('Quelle {{ s.id }} entfernen?')">
+            <input type="hidden" name="op" value="remove">
+            <input type="hidden" name="source_id" value="{{ s.id }}">
+            <input type="hidden" name="confirm" value="{{ s.id }}">
+            <button style="padding:.35rem .8rem;min-height:0;font-size:.85rem">Entfernen</button>
+            {% if s.shipped %}<p class="muted" style="margin:.3rem 0 0">Diese
+              Quelle wird mitgeliefert; die Entfernung wird gemerkt und von
+              Updates nicht rückgängig gemacht.</p>{% endif %}
+          </form>
+        </details>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="muted">Noch keine Quelle eingetragen.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<form method="post" action="/store/sources">
+  <div class="card">
+    <h2>Quelle hinzufügen</h2>
+    <input type="hidden" name="op" value="add">
+    <label>URL der Liste <input type="text" name="url" required
+           placeholder="https://…/oaap-store.json"></label>
+    <label>Anzeigename <input type="text" name="name"
+           placeholder="z. B. Liste von Firma X"></label>
+    <label>Herkunft <input type="text" name="origin"
+           placeholder="wer sie veröffentlicht — wird unverändert angezeigt"></label>
+    <label>Vertrauensklasse
+      <select name="trust">
+        <option value="unverified">muss bestätigt werden (Standard)</option>
+        <option value="verified">geprüft — ich stehe für diese Liste ein</option>
+      </select></label>
+    <button>Hinzufügen</button>
+  </div>
+</form>
+<p class="muted">Führen mehrere Quellen dieselbe App, gewinnt die höchste
+Vertrauensklasse — innerhalb einer Klasse die Reihenfolge oben (RFC-0012 §3).
+Dieselben Regeln prüft der Server noch einmal selbst; dieselbe Verwaltung
+gibt es auf der Maschine mit <code>sudo oaap store …</code>.</p>
+"""
+
+# Floorplan "Objektseite" — one app in full. This page is the reason the
+# list format carries presentation fields at all; without it they would
+# be decoration (RFC-0012 §6).
+STORE_APP_BODY = """
+<style>
+  .shots{display:grid;grid-template-columns:repeat(auto-fit,minmax(16rem,1fr));gap:.8rem}
+  .shots figure{margin:0}
+  .shots img{width:100%;border:1px solid var(--oaap-border);border-radius:.4rem}
+  .shots figcaption{font-size:.8rem;color:var(--oaap-muted);margin-top:.3rem}
+  .facts{display:grid;grid-template-columns:auto 1fr;gap:.45rem 1rem;font-size:.92rem}
+  .facts dt{color:var(--oaap-muted)}
+  .facts dd{margin:0}
+  .icon-lg{width:3rem;height:3rem;object-fit:contain;flex:none}
+</style>
+<a class="back" href="/store">← Zurück zum Store</a>
+{% if msg %}
+<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
+{% endif %}
+<div class="card">
+  <div style="display:flex;gap:.9rem;align-items:flex-start">
+    {% if a.icon %}<img class="icon-lg" src="{{ a.icon }}" alt="">{% endif %}
+    <div style="flex:1">
+      <h1 style="margin:0">{{ a.name }}</h1>
+      <p class="muted" style="margin:.3rem 0 0">{{ a.summary }}</p>
+      <div style="display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.7rem">
+        <span class="badge">v{{ a.version }}</span>
+        {% if a.is_new %}<span class="badge">neu</span>{% endif %}
+        {% if a.installed %}<span class="badge test">installiert ({{ a.installed }})</span>{% endif %}
+        {% if a.maturity %}<span class="badge {{ 'test' if a.maturity != 'stable' }}">{{ a.maturity_label }}</span>{% endif %}
+        {% if a.status != 'active' %}<span class="badge test">{{ a.status_label }}</span>{% endif %}
+        {% if a.expert %}<span class="badge test">nur für Experten</span>{% endif %}
+        {% for c in a.category_labels %}<span class="badge off">{{ c }}</span>{% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if not a.profile_fit %}
+<div class="card"><p style="margin:0"><span class="badge test">Hinweis</span>
+  Diese App erwartet ein Knoten-Profil ({{ a.profiles|join(', ') }}), das dieser
+  Knoten nicht hat{% if profiles %} (hier: {{ profiles|join(', ') }}){% else %}
+  (hier: keines){% endif %}. Der Store <strong>warnt nur</strong> — installieren
+  kannst Du sie trotzdem (RFC-0011).</p></div>
+{% endif %}
+{% if a.status == 'deprecated' %}
+<div class="card"><p style="margin:0"><span class="badge test">Veraltet</span>
+  Diese App wird nicht mehr empfohlen. Installierbar bleibt sie.</p></div>
+{% endif %}
+
+<div class="card">
+  <h2>Installieren</h2>
+  {% if a.pending %}
+  <p class="muted" style="margin:0">⏳ Installation läuft — das Ergebnis
+  erscheint hier und im Deploy-Protokoll auf der Gesundheitsseite.</p>
+  {% elif a.installed == a.version %}
+  <p class="ok" style="margin:0">Auf dem aktuellen Stand (v{{ a.version }}).</p>
+  {% else %}
+  <form method="post" action="/store/install"
+        onsubmit="this.querySelector('button').disabled=true;
+                  this.querySelector('button').textContent='Wird installiert …'">
+    <input type="hidden" name="app_id" value="{{ a.id }}">
+    <input type="hidden" name="source_id" value="{{ a.source.id }}">
+    {% if a.source.trust == 'unverified' %}
+    <p class="muted">„{{ a.source.name }}" ist eine <strong>ungeprüfte
+    Quelle</strong>. Die Bestätigung wird mit Deinem Namen protokolliert.</p>
+    <label class="checkline"><input type="checkbox" name="confirm_source"
+           value="{{ a.source.id }}" required>
+      Ich installiere bewusst aus dieser Quelle.</label>
+    {% endif %}
+    {% if a.expert %}
+    <p class="muted">Diese App ist als <strong>nur für Experten</strong>
+    gekennzeichnet — sie verlangt Wissen, das über die Bedienung hinausgeht.</p>
+    {% endif %}
+    <button>{{ ('Aktualisieren auf v' + a.version) if a.installed else 'Installieren' }}</button>
+  </form>
+  <p class="muted" style="margin:.6rem 0 0">Installiert wird auf dem
+  Produktions-Kanal. Welches Paket geholt wird, entscheidet der Server
+  selbst anhand der eingetragenen Quellen — nicht diese Seite.</p>
+  {% endif %}
+</div>
+
+{% if a.description and a.description != a.summary %}
+<div class="card"><h2>Beschreibung</h2>
+  <p style="margin:0;white-space:pre-line">{{ a.description }}</p></div>
+{% endif %}
+
+{% if a.screenshots %}
+<div class="card"><h2>Bilder</h2>
+  <div class="shots">
+    {% for s in a.screenshots %}
+    <figure><img src="{{ s.src }}" alt="{{ s.caption }}">
+      {% if s.caption %}<figcaption>{{ s.caption }}</figcaption>{% endif %}</figure>
+    {% endfor %}
+  </div></div>
+{% endif %}
+
+<div class="card">
+  <h2>Fakten</h2>
+  <dl class="facts">
+    <dt>Kennung</dt><dd><code>{{ a.id }}</code></dd>
+    <dt>Version</dt><dd>{{ a.version }}{% if a.released %} vom {{ a.released }}{% endif %}</dd>
+    {% if a.type %}<dt>Verpackung</dt><dd>{{ a.type }}</dd>{% endif %}
+    {% if a.class_label %}<dt>Art</dt><dd>{{ a.class_label }}</dd>{% endif %}
+    {% if a.audience_labels %}<dt>Zielgruppe</dt><dd>{{ a.audience_labels|join(', ') }}</dd>{% endif %}
+    {% if a.roles %}<dt>Rollen</dt><dd>{{ a.roles|join(', ') }}</dd>{% endif %}
+    {% if a.license %}<dt>Lizenz</dt><dd>{{ a.license }}</dd>{% endif %}
+    <dt>Quelle</dt><dd>{{ a.source.name }} — {{ a.source.trust_label }}{% if a.source.origin %}
+      <br><span class="muted">Herkunft: {{ a.source.origin }}</span>{% endif %}</dd>
+    {% if a.also_in %}<dt>Auch gelistet in</dt>
+      <dd>{{ a.also_in|join(', ') }} <span class="muted">— installiert wird
+      aus der Quelle mit der höchsten Vertrauensklasse</span></dd>{% endif %}
+    <dt>Paket</dt><dd>
+      {% if a.pinned %}festgelegt auf <code>{{ a.ref }}</code>
+      {% else %}<span class="badge test">nicht festgelegt</span>
+      <span class="muted">— installiert wird, was der Standard-Zweig gerade
+      enthält</span>{% endif %}</dd>
+    {% if a.tags %}<dt>Hashtags</dt><dd class="muted">{{ a.tags|join(' · ') }}</dd>{% endif %}
+  </dl>
+</div>
+
+{% if a.links %}
+<div class="card"><h2>Links</h2>
+  <ul style="margin:0;padding-left:1.1rem">
+    {% for l in a.links %}
+    <li><a href="{{ l.url }}" target="_blank" rel="noopener">{{ l.label }} ↗</a></li>
+    {% endfor %}
+  </ul></div>
+{% endif %}
+
+{% if a.command %}
+<div class="card"><h2>Installation von Hand</h2>
+  <code style="display:block;background:#f8fafc;border:1px solid var(--oaap-border);
+               border-radius:.4rem;padding:.5rem .7rem;overflow-x:auto;white-space:pre">{{ a.command }}</code>
 </div>
 {% endif %}
-{% for src in sources %}
-<div class="card">
-  <h2>{{ src.title }} <span class="badge {{ 'test' if src.trust != 'platform' }}">{{ src.trust_label }}</span></h2>
-  <p class="muted">{{ src.url }}{% if src.origin %} — Herkunft: {{ src.origin }}{% endif %}</p>
-  {% if src.confirm %}
-  <p class="muted">Diese Liste ist nicht geprüft. Eine Installation daraus
-  muss einzeln bestätigt werden und wird mit Deinem Namen protokolliert.</p>
-  {% endif %}
-  {% if src.error %}
-    <p class="err">Quelle nicht lesbar: {{ src.error }}</p>
-  {% elif not src.apps %}
-    <p class="muted">Diese Liste enthält keine Apps.</p>
-  {% else %}
-    {% for a in src.apps %}
-    <div style="border-top:1px solid var(--oaap-border);padding:.9rem 0">
-      <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
-        <svg viewBox="0 0 100 100" width="20" height="20" aria-hidden="true">
-          <polygon points="50,6 71,18 71,42 50,54 29,42 29,18" fill="#2563eb"/>
-          <polygon points="28,44 49,56 49,80 28,92 7,80 7,56" fill="none" stroke="#2563eb" stroke-width="5"/>
-          <polygon points="72,44 93,56 93,80 72,92 51,80 51,56" fill="none" stroke="#2563eb" stroke-width="5"/></svg>
-        <strong>{{ a.name }}</strong>
-        <span class="badge">{{ a.type }}</span>
-        <span class="muted">v{{ a.version }}</span>
-        {% if a.installed %}<span class="badge test">installiert ({{ a.installed }})</span>{% endif %}
-        {% if a.homepage %}<a class="muted" href="{{ a.homepage }}" target="_blank" rel="noopener">Homepage ↗</a>{% endif %}
-        {% if a.license %}<span class="muted">Lizenz: {{ a.license }}</span>{% endif %}
-      </div>
-      <p class="muted" style="margin:.4rem 0">{{ a.description }}</p>
-      {% if a.command and a.id %}
-        {% if a.pending %}
-        <p class="muted" style="margin:.2rem 0 0">⏳ Installation läuft — das
-        Ergebnis erscheint hier und im Deploy-Protokoll (Gesundheitsseite).</p>
-        {% elif a.installed == a.version %}
-        <p class="ok" style="margin:.2rem 0 0">Auf dem aktuellen Stand.</p>
-        {% else %}
-        <form method="post" action="/store/install" style="margin:.2rem 0 0"
-              onsubmit="this.querySelector('button').disabled=true;
-                        this.querySelector('button').textContent='Wird installiert …'">
-          <input type="hidden" name="app_id" value="{{ a.id }}">
-          <input type="hidden" name="source_id" value="{{ src.id }}">
-          {% if src.confirm %}
-          <label class="checkline"><input type="checkbox" name="confirm_source"
-                 value="{{ src.id }}" required>
-            Ich installiere bewusst aus der ungeprüften Quelle „{{ src.title }}".</label>
-          {% endif %}
-          <button>{{ ('Aktualisieren auf v' + a.version) if a.installed else 'Installieren' }}</button>
-        </form>
-        {% endif %}
-      <details style="margin:.4rem 0 0"><summary class="muted">Installation von Hand (CLI)</summary>
-      <code style="display:block;background:#f8fafc;border:1px solid var(--oaap-border);
-                   border-radius:.4rem;padding:.5rem .7rem;overflow-x:auto;white-space:pre">{{ a.command }}</code>
-      </details>
-      {% else %}
-      <p class="muted">Paketquelle wird von diesem Durchstich noch nicht unterstützt.</p>
-      {% endif %}
-    </div>
-    {% endfor %}
-  {% endif %}
-</div>
-{% endfor %}
-<p class="muted">Ein Klick auf „Installieren" installiert die App auf dem
-Produktions-Kanal; der Server löst die App dabei selbst gegen die
-konfigurierten Quellen auf. Nennen mehrere Quellen dieselbe App, gewinnt
-die höchste Vertrauensklasse — nicht die zuerst eingetragene Quelle
-(RFC-0012 §3). Quellen verwaltet die Administration mit
-<code>sudo oaap store list|add-source|remove-source|enable|disable|trust</code>.</p>
 """
 
 # Floorplan "Listenbericht" — installed app instances and their
@@ -1549,16 +1832,21 @@ def deploy_status(name):
 STORE_SOURCES_FILE = "/apps-registry/store-sources.json"
 INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 
-# Trust classes (RFC-0012 §3). appctl.py is the authority — it migrates
-# old {url, name} entries into this form and writes them back. The
-# portal only reads, and reads tolerantly: an entry it cannot classify
-# counts as unverified, which is the cautious direction to fall in.
-TRUST_LABEL = {"platform": "von uns", "verified": "geprüft",
-               "unverified": "muss bestätigt werden"}
+# Store list rules live in store_view.py — merging, vocabulary, image
+# paths and the filter defaults are decisions RFC-0012 makes, and they
+# are readable and testable there without Flask around them.
+from store_view import (AUDIENCE_LABEL, CATEGORY_LABEL, CLASS_LABEL,
+                        MATURITY_LABEL, TRUST_LABEL,
+                        matches, merge_catalogue, options)
 
+def all_sources():
+    """Every configured store source, in the object form of RFC-0012 §2.
 
-def configured_sources():
-    """Enabled store sources, in the object form of RFC-0012 §2."""
+    appctl.py is the authority — it migrates old {url, name} entries into
+    this form and writes them back. The portal only reads, and reads
+    tolerantly: an entry it cannot classify counts as unverified, which
+    is the cautious direction to fall in.
+    """
     try:
         with open(STORE_SOURCES_FILE, encoding="utf-8") as f:
             raw = json.load(f).get("sources", [])
@@ -1566,13 +1854,22 @@ def configured_sources():
         return []
     out = []
     for i, s in enumerate(raw, 1):
-        if not isinstance(s, dict) or not s.get("url") or not s.get("enabled", True):
+        if not isinstance(s, dict) or not s.get("url"):
             continue
         trust = s.get("trust") if s.get("trust") in TRUST_LABEL else "unverified"
         out.append({"id": s.get("id") or f"quelle-{i}", "url": s["url"],
                     "name": s.get("name") or "", "trust": trust,
-                    "origin": s.get("origin") or ""})
+                    "trust_label": TRUST_LABEL[trust],
+                    "origin": s.get("origin") or "",
+                    "enabled": bool(s.get("enabled", True)),
+                    "shipped": bool(s.get("shipped")),
+                    "review": bool(s.get("review"))})
     return out
+
+
+def configured_sources():
+    """The enabled ones — what the store actually reads from."""
+    return [s for s in all_sources() if s["enabled"]]
 
 
 def pending_installs():
@@ -1598,50 +1895,67 @@ def pending_installs():
     return pending
 
 
-def store_page(msg=None, msg_ok=True, status=200):
-    configured = configured_sources()
-    pending = pending_installs()
-    installed = {inst.get("app_id"): inst.get("version")
-                 for inst in load_instances().values()}
-    sources = []
-    for src in configured:
-        entry = {"url": src["url"], "title": src["name"] or "Store-Quelle",
-                 "id": src["id"], "trust": src["trust"],
-                 "trust_label": TRUST_LABEL[src["trust"]],
-                 "origin": src["origin"],
-                 "confirm": src["trust"] == "unverified",
-                 "apps": [], "error": None}
+
+
+def store_catalogue():
+    """Fetch every enabled source and merge it into one catalogue."""
+    fetched, errors = [], []
+    for src in configured_sources():
         try:
-            r = requests.get(entry["url"], timeout=4)
+            r = requests.get(src["url"], timeout=4)
             r.raise_for_status()
             data = r.json()
         except (requests.RequestException, ValueError) as e:
             # Show the cause, not just the class — "ConnectionError"
             # alone hides whether it is DNS, routing, or TLS.
-            entry["error"] = f"{type(e).__name__}: {str(e)[:300]}"
-            sources.append(entry)
+            errors.append({"name": src["name"] or src["id"], "url": src["url"],
+                           "error": f"{type(e).__name__}: {str(e)[:300]}"})
             continue
-        entry["title"] = src.get("name") or data.get("name") or "Store-Quelle"
-        for a in data.get("apps", []):
-            pkg = a.get("package") or {}
-            command = None
-            if pkg.get("git"):
-                command = f"sudo oaap app install {pkg['git']}"
-                if pkg.get("path"):
-                    command += f" --path {pkg['path']}"
-            entry["apps"].append({
-                "id": a.get("id", ""),
-                "name": a.get("name", a.get("id", "?")),
-                "description": a.get("description", ""),
-                "type": a.get("type", "?"), "version": a.get("version", "?"),
-                "license": a.get("license", ""), "homepage": a.get("homepage", ""),
-                "installed": installed.get(a.get("id")),
-                "pending": a.get("id") in pending,
-                "command": command,
-            })
-        sources.append(entry)
+        fetched.append((dict(src, name=src["name"] or data.get("name") or src["id"]),
+                        data))
+    installed = {inst.get("app_id"): inst.get("version")
+                 for inst in load_instances().values()}
+    return merge_catalogue(fetched, installed, pending_installs(),
+                           node_profiles()), errors
+
+
+def store_page(msg=None, msg_ok=True, status=200):
+    entries, errors = store_catalogue()
+    f = {
+        "q": request.args.get("q", "").strip().lower(),
+        "categories": request.args.get("categories", ""),
+        "app_class": request.args.get("app_class", ""),
+        "audience": request.args.get("audience", ""),
+        "maturity": request.args.get("maturity", ""),
+        "trust": request.args.get("trust", ""),
+        "source": request.args.get("source", ""),
+        "license": request.args.get("license", ""),
+        "installed": request.args.get("installed", ""),
+        "all_status": request.args.get("all_status") == "1",
+        "all_profiles": request.args.get("all_profiles") == "1",
+    }
+    shown = [e for e in entries if matches(e, f)]
+    hidden_profile = sum(1 for e in entries if not e["profile_fit"])
+    hidden_archived = sum(1 for e in entries if e["status"] == "archived")
     return page(STORE_BODY, "Store", "store", status=status,
-                sources=sources, msg=msg, msg_ok=msg_ok)
+                apps=shown, total=len(entries), errors=errors, f=f,
+                filtered=any(v for k, v in f.items()
+                             if k not in ("all_status", "all_profiles")),
+                hidden_profile=hidden_profile, hidden_archived=hidden_archived,
+                opt_categories=options(entries, "categories", CATEGORY_LABEL),
+                opt_class=options(entries, "app_class", CLASS_LABEL),
+                opt_audience=options(entries, "audience", AUDIENCE_LABEL),
+                opt_maturity=options(entries, "maturity", MATURITY_LABEL),
+                trusts=[{"value": t, "label": TRUST_LABEL[t]}
+                        for t in ("platform", "verified", "unverified")
+                        if any(e["source"]["trust"] == t for e in entries)],
+                sources=[{"value": s["id"], "label": s["name"]}
+                         for s in {e["source"]["id"]: e["source"]
+                                   for e in entries}.values()],
+                licenses=sorted({e["license"] for e in entries if e["license"]}),
+                profiles=node_profiles(),
+                msg=msg or request.args.get("msg"),
+                msg_ok=msg_ok and request.args.get("err") is None)
 
 
 @app.get("/store")
@@ -1651,11 +1965,83 @@ def store():
     return store_page()
 
 
+SOURCE_WAIT_SECONDS = 20   # a small JSON file, no docker work
+
+
+@app.get("/store/sources")
+def store_sources():
+    """Store sources in the portal (RFC-0012 §7) — closes step 4 of
+    `portal-statt-cli.md`. The CLI keeps working unchanged."""
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    return page(STORE_SOURCES_BODY, "Store-Quellen", "store",
+                sources=all_sources(), msg=request.args.get("msg"),
+                msg_ok=request.args.get("err") is None)
+
+
+@app.post("/store/sources")
+def store_sources_change():
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    op = request.form.get("op", "")
+    if op not in ("add", "remove", "enable", "disable", "rename", "trust"):
+        return redirect("/store/sources?err=1&msg="
+                        + quote("Unbekannte Aktion."), code=303)
+    source_id = request.form.get("source_id", "").strip()
+    # Removal names the source it claims to remove — a misdirected or
+    # replayed request must not throw out a different list than the one
+    # the operator was looking at (same rule as removing an instance).
+    if op == "remove" and request.form.get("confirm", "") != source_id:
+        return redirect("/store/sources?err=1&msg="
+                        + quote("Entfernen nicht bestätigt."), code=303)
+    res = _queue_and_wait("", {
+        "action": "source", "op": op, "source_id": source_id,
+        "url": request.form.get("url", "").strip(),
+        "name": request.form.get("name", "").strip(),
+        "origin": request.form.get("origin", "").strip(),
+        "trust": request.form.get("trust", "").strip(),
+    }, SOURCE_WAIT_SECONDS)
+    if res is None:
+        return redirect("/store/sources?err=1&msg="
+                        + quote("Der Server hat nicht rechtzeitig geantwortet — "
+                                "die Liste oben zeigt den tatsächlichen Stand."),
+                        code=303)
+    text = res.get("message", "unbekanntes Ergebnis")
+    return redirect(f"/store/sources?msg={quote(text[0].upper() + text[1:])}"
+                    + ("" if res.get("ok") else "&err=1"), code=303)
+
+
+@app.get("/store/<source_id>/<app_id>")
+def store_app(source_id, app_id):
+    """Object page for one app (§6) — the reason the format carries
+    presentation fields at all; without it they would be decoration."""
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    entries, _errors = store_catalogue()
+    a = next((e for e in entries
+              if e["id"] == app_id and e["source"]["id"] == source_id), None)
+    if not a:
+        return redirect("/store?err=1&msg="
+                        + quote("Diese App steht in keiner eingetragenen "
+                                "Quelle (mehr)."), code=303)
+    return page(STORE_APP_BODY, a["name"], "store", a=a,
+                profiles=node_profiles(),
+                msg=request.args.get("msg"),
+                msg_ok=request.args.get("err") is None)
+
+
 @app.post("/store/install")
 def store_install():
     if "server_admin" not in caller_roles():
         return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
     app_id = request.form.get("app_id", "").strip()
+    source_id = request.form.get("source_id", "").strip()
+
+    def back(text, ok=True):
+        where = f"/store/{source_id}/{app_id}" if source_id and app_id else "/store"
+        return redirect(f"{where}?msg={quote(text)}"
+                        + ("" if ok else "&err=1"), code=303)
+
     if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", app_id):
         return store_page("Ungültige App-Kennung.", msg_ok=False, status=400)
     # Queue for the host worker. The request names the app id and the
@@ -1664,17 +2050,15 @@ def store_install():
     # host (spec 2.6, RFC-0012 §3). Picking among the sources the
     # server_admin already chose is all a request can do; the spool is
     # data, not trust.
-    source_id = request.form.get("source_id", "").strip()
     confirm = request.form.get("confirm_source", "").strip()
     src = next((s for s in configured_sources() if s["id"] == source_id), None)
     if source_id and not src:
         return store_page("Diese Store-Quelle ist auf diesem Knoten nicht "
                           "(mehr) eingetragen.", msg_ok=False, status=400)
     if src and src["trust"] == "unverified" and confirm != source_id:
-        label = src["name"] or source_id
-        return store_page("Nicht bestätigt: " + label + " ist eine ungeprüfte "
-                          "Quelle. Bitte das Häkchen setzen.",
-                          msg_ok=False, status=400)
+        return back("Nicht bestätigt: " + (src["name"] or source_id)
+                    + " ist eine ungeprüfte Quelle. Bitte das Häkchen setzen.",
+                    ok=False)
     rid = _uuid.uuid4().hex
     os.makedirs(SPOOL_QUEUE, exist_ok=True)
     tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
@@ -1695,16 +2079,14 @@ def store_install():
                 os.remove(res_path)
             if res.get("ok"):
                 v = res.get("version", "")
-                return store_page(f"'{app_id}' wurde installiert"
-                                  + (f" (Version {v})" if v else "")
-                                  + " — die Kachel erscheint im Launchpad.")
-            return store_page(f"Installation von '{app_id}' fehlgeschlagen: "
-                              f"{res.get('message', 'unbekannter Fehler')}",
-                              msg_ok=False, status=502)
+                return back(f"'{app_id}' wurde installiert"
+                            + (f" (Version {v})" if v else "")
+                            + " — die Kachel erscheint im Launchpad.")
+            return back(f"Installation von '{app_id}' fehlgeschlagen: "
+                        f"{res.get('message', 'unbekannter Fehler')}", ok=False)
         _time.sleep(2)
-    return store_page(f"Die Installation von '{app_id}' läuft noch — das "
-                      "Ergebnis erscheint im Deploy-Protokoll auf der "
-                      "Gesundheitsseite.", status=202)
+    return back(f"Die Installation von '{app_id}' läuft noch — das Ergebnis "
+                "erscheint im Deploy-Protokoll auf der Gesundheitsseite.")
 
 
 # ---------------------------------------------------------------------------
@@ -1789,38 +2171,18 @@ def instances_list():
 CREATE_WAIT_SECONDS = 120  # clone + build + start, like a store install
 
 
-TRUST_RANK = {"platform": 3, "verified": 2, "unverified": 1}
-
-
 def _store_apps():
     """Every app the configured store sources list, for the create form.
 
-    One entry per app id, resolved the same way the host resolves it
-    (RFC-0012 §3): highest trust class first, configured order within a
-    class. Showing two entries for one id would only invite a choice the
-    host would then overrule.
+    Same catalogue as the store page, so both agree with the host on
+    which source wins for an app id (RFC-0012 §3). Showing two entries
+    for one id would only invite a choice the host would then overrule.
     """
-    apps = {}
-    for pos, src in enumerate(configured_sources()):
-        try:
-            r = requests.get(src["url"], timeout=4)
-            r.raise_for_status()
-            data = r.json()
-        except (requests.RequestException, ValueError):
-            continue
-        title = src["name"] or data.get("name") or "Store-Quelle"
-        for a in data.get("apps", []):
-            if not a.get("id") or not (a.get("package") or {}).get("git"):
-                continue
-            cand = {"id": a["id"], "name": a.get("name", a["id"]),
-                    "version": a.get("version", "?"), "source": title,
-                    "source_id": src["id"], "trust": src["trust"],
-                    "trust_label": TRUST_LABEL[src["trust"]], "pos": pos}
-            best = apps.get(a["id"])
-            if best is None or (TRUST_RANK[cand["trust"]], -cand["pos"]) \
-                    > (TRUST_RANK[best["trust"]], -best["pos"]):
-                apps[a["id"]] = cand
-    return sorted(apps.values(), key=lambda a: (a["name"].lower(), a["source"]))
+    return [{"id": e["id"], "name": e["name"], "version": e["version"],
+             "source": e["source"]["name"], "source_id": e["source"]["id"],
+             "trust": e["source"]["trust"],
+             "trust_label": e["source"]["trust_label"]}
+            for e in store_catalogue()[0]]
 
 
 def _require_dev_node():

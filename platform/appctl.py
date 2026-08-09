@@ -1963,6 +1963,44 @@ def cmd_process_deploys(_args):
                 ok = True
                 msg = ("node profiles set: " + ", ".join(wanted)) if wanted \
                     else "node profiles cleared"
+        elif action == "source":
+            # Store sources from the portal (RFC-0012 §7). Same reason as
+            # visibility below: the portal's /apps-registry mount is
+            # read-only, so the host applies it. And the same rules run
+            # here as in the CLI — the spool is data, not trust, so the
+            # checks cannot live only where the button is.
+            #
+            # Nothing here lets the portal grant ITSELF more reach than
+            # the server_admin already granted: adding a source is
+            # visible, reversible, and by itself installs nothing. That
+            # is why this may move into the portal while setting a node
+            # profile (RFC-0011) stayed on the machine.
+            sources, removed, _mig = load_sources()
+            op = req.get("op", "")
+            src = find_source(sources, str(req.get("source_id") or ""))
+            try:
+                if op == "add":
+                    msg = source_add(sources, removed,
+                                     str(req.get("url") or "").strip(),
+                                     name=str(req.get("name") or "").strip(),
+                                     trust=str(req.get("trust") or "unverified"),
+                                     origin=str(req.get("origin") or "").strip())
+                elif not src:
+                    raise ValueError("unknown store source")
+                elif op == "remove":
+                    msg = source_remove(sources, removed, src)
+                elif op in ("enable", "disable"):
+                    msg = source_enable(src, op == "enable")
+                elif op == "rename":
+                    msg = source_rename(src, req.get("name"))
+                elif op == "trust":
+                    msg = source_trust(src, req.get("trust"))
+                else:
+                    raise ValueError(f"unknown source operation '{op}'")
+                save_sources(sources, removed)
+                ok = True
+            except ValueError as e:
+                msg = str(e)
         elif action == "visibility":
             # App-instance visibility groups (RFC-0007): the portal's
             # /apps-registry mount is read-only, so this — like the
@@ -2116,7 +2154,7 @@ def cmd_process_deploys(_args):
                "config": "portal", "token": "portal",
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
-               "node": "setup wizard"}.get(action, "deploy-hook")
+               "source": "portal", "node": "setup wizard"}.get(action, "deploy-hook")
         record = {"instance": name or "(dieser Knoten)", "ok": ok,
                   "message": msg, "revision": revision,
                   "version": version, "via": via}
@@ -2336,6 +2374,90 @@ def find_source(sources, target):
     return None
 
 
+# --- source operations, shared by the CLI and the portal --------------------
+# Both paths run exactly these checks. The portal writes through the
+# spool worker (its /apps-registry mount is read-only), and the spool is
+# data, not trust — so the rules cannot live only where the button is.
+# Each function mutates in place and returns a message; it raises
+# ValueError when it refuses.
+
+
+def source_add(sources, removed, url, name="", sid="", trust="unverified",
+               origin=""):
+    if not re.match(r"^https://", url or ""):
+        raise ValueError("a store source must be an https:// URL")
+    if any(s["url"] == url for s in sources):
+        raise ValueError("this source is already configured")
+    if trust == "platform":
+        # RFC-0012 decision 4: "von uns" must mean the same thing on
+        # every node, so it stays reserved for what the installation
+        # shipped. An operator who vouches for a list uses 'verified'.
+        raise ValueError("trust class 'platform' is reserved for sources the "
+                         "installation ships — use 'verified' if you vouch "
+                         "for this list yourself")
+    if trust not in ("verified", "unverified"):
+        raise ValueError("trust class must be 'verified' or 'unverified'")
+    sid = sid or derived_source_id(url)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,62}[a-z0-9]", sid):
+        raise ValueError("source id: lowercase letters, digits, dot and hyphen")
+    if any(s["id"] == sid for s in sources):
+        raise ValueError(f"a source with id '{sid}' already exists")
+    sources.append({"id": sid, "name": name or sid, "url": url,
+                    "trust": trust, "enabled": True, "origin": origin or ""})
+    removed[:] = [r for r in removed if r != sid]
+    msg = f"store source added: {sid} ({TRUST_LABEL[trust]})"
+    if trust == "unverified":
+        msg += " — installing from it asks for a confirmation each time"
+    return msg
+
+
+def source_remove(sources, removed, src):
+    sources[:] = [s for s in sources if s["id"] != src["id"]]
+    if src.get("shipped"):
+        # Remembered by id: 'oaap update' must not quietly re-add what
+        # the operator threw out (RFC-0012 §4).
+        removed[:] = sorted(set(removed) | {src["id"]})
+        return (f"store source '{src['id']}' removed — it ships with the "
+                "platform, so the removal is remembered and updates will not "
+                "bring it back")
+    return f"store source '{src['id']}' removed"
+
+
+def source_enable(src, on):
+    src["enabled"] = bool(on)
+    return f"store source '{src['id']}' " + ("enabled" if on else "disabled")
+
+
+def source_rename(src, name):
+    name = (name or "").strip()
+    if not name or len(name) > 120:
+        raise ValueError("name: 1 to 120 characters")
+    src["name"] = name
+    return f"store source '{src['id']}' renamed to '{name}'"
+
+
+def source_trust(src, want):
+    want = (want or "").strip().lower()
+    if want == "platform":
+        raise ValueError("trust class 'platform' is reserved for sources the "
+                         "installation ships (RFC-0012 decision 4) — use "
+                         "'verified'")
+    if want not in ("verified", "unverified"):
+        raise ValueError("trust class must be 'verified' or 'unverified'")
+    if src.get("trust") == "platform":
+        raise ValueError(f"'{src['id']}' ships with the platform; its trust "
+                         "class is not settable. Disable or remove it instead.")
+    was = src.get("trust")
+    src["trust"], src["review"] = want, False
+    msg = f"store source '{src['id']}': {TRUST_LABEL[was]} -> {TRUST_LABEL[want]}"
+    if want == "verified":
+        # Raising a class is exactly the step that skips the
+        # confirmation of §3, so it says what it costs.
+        msg += (" — apps from it now install without a confirmation, and it "
+                "outranks unverified sources when several list the same app")
+    return msg
+
+
 def cmd_store(args):
     """Manage store sources (RFC-0012 §2/§3/§4)."""
     sources, removed, migrated = load_sources()
@@ -2380,76 +2502,27 @@ def cmd_store(args):
     if not target:
         die(f"'{args.action}' needs an argument")
 
-    if args.action == "add-source":
-        if not re.match(r"^https://", target):
-            die("a store source must be an https:// URL")
-        if any(s["url"] == target for s in sources):
-            die("this source is already configured")
-        trust = args.trust or "unverified"
-        if trust == "platform":
-            # RFC-0012 decision 4: 'von uns' must mean the same thing on
-            # every node, so it stays reserved for what the installation
-            # shipped. An operator who vouches for a list uses 'verified'.
-            die("trust class 'platform' is reserved for sources the "
-                "installation ships — use 'verified' if you vouch for this "
-                "list yourself")
-        sid = args.id or derived_source_id(target)
-        if any(s["id"] == sid for s in sources):
-            die(f"a source with id '{sid}' already exists")
-        sources.append({"id": sid, "name": args.name or sid, "url": target,
-                        "trust": trust, "enabled": True,
-                        "origin": args.origin or ""})
-        removed = [r for r in removed if r != sid]
-        print(f"Store source added: {sid} ({TRUST_LABEL[trust]}).")
-        if trust == "unverified":
-            print("Installing from it will ask for a confirmation each time.")
-
-    elif args.action == "remove-source":
+    src = None
+    if args.action != "add-source":
         src = find_source(sources, target)
         if not src:
             die("no matching source")
-        sources = [s for s in sources if s["id"] != src["id"]]
-        if src.get("shipped"):
-            # Remembered by id: 'oaap update' must not quietly re-add
-            # what the operator threw out (RFC-0012 §4).
-            removed = sorted(set(removed) | {src["id"]})
-            print(f"Store source '{src['id']}' removed. It ships with the "
-                  "platform, so the removal is remembered — updates will not "
-                  "bring it back.")
+    try:
+        if args.action == "add-source":
+            msg = source_add(sources, removed, target, name=args.name or "",
+                             sid=args.id or "", trust=args.trust or "unverified",
+                             origin=args.origin or "")
+        elif args.action == "remove-source":
+            msg = source_remove(sources, removed, src)
+        elif args.action in ("enable", "disable"):
+            msg = source_enable(src, args.action == "enable")
+        elif args.action == "rename":
+            msg = source_rename(src, args.value or args.name or "")
         else:
-            print(f"Store source '{src['id']}' removed.")
-
-    elif args.action in ("enable", "disable"):
-        src = find_source(sources, target)
-        if not src:
-            die("no matching source")
-        src["enabled"] = args.action == "enable"
-        print(f"Store source '{src['id']}' "
-              + ("enabled." if src["enabled"] else "disabled."))
-
-    elif args.action == "trust":
-        src = find_source(sources, target)
-        if not src:
-            die("no matching source")
-        want = (args.value or "").strip().lower()
-        if want == "platform":
-            die("trust class 'platform' is reserved for sources the "
-                "installation ships (RFC-0012 decision 4) — use 'verified'")
-        if want not in ("verified", "unverified"):
-            die("trust class must be 'verified' or 'unverified'")
-        if src.get("trust") == "platform":
-            die(f"'{src['id']}' ships with the platform; its trust class is "
-                "not settable. Disable or remove it instead.")
-        was = src.get("trust")
-        src["trust"], src["review"] = want, False
-        print(f"Store source '{src['id']}': {TRUST_LABEL[was]} → "
-              f"{TRUST_LABEL[want]}.")
-        if want == "verified":
-            print("Note: apps from it now install without a confirmation, and "
-                  "it outranks unverified sources when several list the same "
-                  "app. Set it back with: oaap store trust "
-                  f"{src['id']} unverified")
-
+            msg = source_trust(src, args.value)
+    except ValueError as e:
+        die(str(e))
+    print(msg[0].upper() + msg[1:] + ".")
     save_sources(sources, removed)
 
 
@@ -2519,7 +2592,7 @@ def main():
     pri.set_defaults(fn=cmd_restore_instances)
     ps = sub.add_parser("store")
     ps.add_argument("action", choices=["list", "add-source", "remove-source",
-                                       "enable", "disable", "trust",
+                                       "enable", "disable", "trust", "rename",
                                        "reconcile"])
     ps.add_argument("target", nargs="?",
                     help="source URL, id, or position from 'store list'")
