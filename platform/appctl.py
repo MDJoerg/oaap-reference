@@ -1105,10 +1105,16 @@ def recreate_instance_containers(name, services, storage):
             if uid is not None:
                 os.chown(host, uid, uid)
             mounts += ["-v", f"{host}:{st['mount']}"]
+        # A multi-service container also answers to its bare service name
+        # on the instance network (--network-alias), because a wrapped
+        # compose stack's containers refer to each other by service name
+        # (e.g. a UI talking to "db"), not by our oaap-app-<inst>-<svc>
+        # container name. Single-service apps need no alias.
+        alias = ["--network-alias", s["service"]] if s["service"] else []
         subprocess.run(["docker", "rm", "-f", s["container"]],
                        capture_output=True, text=True)
         run(["docker", "run", "-d", "--name", s["container"],
-             "--restart", "unless-stopped", "--network", net,
+             "--restart", "unless-stopped", "--network", net, *alias,
              "--env-file", env_path(name), *mounts, s["image"]])
 
 
