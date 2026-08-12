@@ -79,6 +79,18 @@ if [ -f "$ENVF" ] && ! grep -q '^INTERNAL_API_KEY=' "$ENVF"; then
   fi
 fi
 
+# --- per-app networks + gateway links (RFC-0016) ---
+# Two jobs, both idempotent: isolate any app still on the flat platform
+# network onto its own (one-time for apps installed before 0.1.30), and
+# reconnect the gateway to EVERY app network. The second is not a
+# one-time migration -- it must run on every update, because the compose
+# `up -d` a few steps earlier RECREATED the gateway, which drops its
+# manual network links. Without this, all apps would 502 after an update.
+say ""
+say "Checking app network isolation (RFC-0016) ..."
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-networks \
+  2>&1 | sed 's/^/  /' || say "  WARNING: app network migration could not complete — check 'oaap status'."
+
 # --- shipped store sources (RFC-0012 §4) ---
 # Sources used to be written once, at installation, and never touched
 # again — so the day one of our lists moves, every node in the field

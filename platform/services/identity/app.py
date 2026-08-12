@@ -525,12 +525,16 @@ def throttle():
 # Internal API — the portal is responsible for admin authorization of its
 # callers; this layer only establishes that the caller IS the portal.
 #
-# WHY THIS GUARD EXISTS (RFC-0015 addendum A4, found 2026-08-11). Until
-# now the only protection was "reachable on the container network" — and
-# EVERY app instance runs on that same network (`--network oaap_default`).
-# So any code inside any app container could POST /internal/users with
+# WHY THIS GUARD EXISTS (RFC-0015 addendum A4, found 2026-08-11). The
+# only protection used to be "reachable on the container network" — and
+# every app instance ran on that same flat network. So any code inside
+# any app container could POST /internal/users with
 # `roles: ["server_admin"]` and hand itself the platform. The gateway
 # enforces RFC-0002 perfectly on the way IN; there was nothing sideways.
+# RFC-0016 (0.1.30) closed that structurally by giving each app its own
+# network, so an app can no longer reach identity at all. This key stays
+# as defence in depth: if a future mistake reconnects something, the
+# internal API still refuses a caller that is not the portal.
 #
 # Checked in one place, by path prefix, rather than per route: the
 # failure we are fixing is precisely the kind where someone adds an

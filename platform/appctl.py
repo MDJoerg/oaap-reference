@@ -57,6 +57,175 @@ PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
 IDENTITY_CONTAINER = "oaap-identity-1"
+# The compose default network, home of the three platform services
+# (gateway, identity, portal). Before RFC-0016 every app instance also
+# ran here — the flat network that let any app reach identity's internal
+# API. Apps now each get their own network (below) and this one carries
+# platform services only.
+PLATFORM_NETWORK = "oaap_default"
+
+
+# ---------------------------------------------- app networks (RFC-0016)
+# One Docker network per app instance. The instance's container(s) live
+# on it and resolve each other by name; the GATEWAY joins it so it can
+# proxy in; identity and portal never do. An app therefore reaches the
+# gateway and its own siblings, and nothing else — the escalation path
+# closed by the 0.1.29 key (RFC-0015 A4) is now closed structurally too.
+#
+# The gateway's membership is manual (`docker network connect`), and a
+# compose recreate of the gateway drops it — so `ensure_app_network` +
+# `connect_gateway` are called on every path that (re)creates an app
+# (install, config recreate, migration), and the migration step
+# reconnects the gateway to EVERY app network on every `oaap update`,
+# because that update recreated the gateway. See migrate.sh.
+def app_network(name):
+    return f"oaap-inst-{name}"
+
+
+def _network_exists(net):
+    return subprocess.run(["docker", "network", "inspect", net],
+                          capture_output=True, text=True).returncode == 0
+
+
+def ensure_app_network(name):
+    net = app_network(name)
+    if not _network_exists(net):
+        run(["docker", "network", "create", net])
+    return net
+
+
+def connect_gateway(net):
+    """Attach the gateway to an app network. Idempotent — Docker returns
+    non-zero if it is already connected, which is not an error here."""
+    subprocess.run(["docker", "network", "connect", net, GATEWAY_CONTAINER],
+                   capture_output=True, text=True)
+
+
+def remove_app_network(name):
+    net = app_network(name)
+    if not _network_exists(net):
+        return
+    # the gateway is the one lingering member once the app is gone
+    subprocess.run(["docker", "network", "disconnect", "-f", net, GATEWAY_CONTAINER],
+                   capture_output=True, text=True)
+    subprocess.run(["docker", "network", "rm", net],
+                   capture_output=True, text=True)
+
+
+def container_networks(container):
+    r = subprocess.run(
+        ["docker", "inspect", "-f",
+         "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", container],
+        capture_output=True, text=True)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def network_members(net):
+    r = subprocess.run(
+        ["docker", "network", "inspect", "-f",
+         "{{range .Containers}}{{.Name}} {{end}}", net],
+        capture_output=True, text=True)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+# ------------------------------------------- app-to-app links (RFC-0016)
+# Default is isolation: no app can reach another. A link is a deliberate,
+# operator-declared, revocable grant recorded in the registry (survives
+# redeploy, like visibility and address). Mechanism (Jörg's decision):
+# a DEDICATED network `oaap-link-<a>-<b>` that both instances' primary
+# containers join — NOT connecting a into b's own network, which would
+# expose all of b's internal containers. Revocation is a clean teardown.
+#
+# The link is directed in intent (a may reach b) but a shared L3 network
+# is reachable both ways; the value is that it is a separate wire, scoped
+# to the two named apps, and nothing reaches b's private siblings.
+def link_network(a, b):
+    # order-independent: one shared network per pair, so a link declared
+    # either or both ways is the same wire (the direction lives in the
+    # registry as intent, not in a second redundant network).
+    x, y = sorted([a, b])
+    return f"oaap-link-{x}-{y}"
+
+
+def app_link_partners(reg, name):
+    """Every instance linked with `name`, either direction."""
+    inst = reg["instances"].get(name, {})
+    partners = set(inst.get("links") or [])
+    partners |= {other for other, i in reg["instances"].items()
+                 if name in (i.get("links") or [])}
+    partners.discard(name)
+    return partners
+
+
+def setup_link_network(reg, a, b):
+    net = link_network(a, b)
+    if not _network_exists(net):
+        run(["docker", "network", "create", net])
+    for who in (a, b):
+        c = reg["instances"][who]["container"]
+        subprocess.run(["docker", "network", "connect", net, c],
+                       capture_output=True, text=True)
+
+
+def teardown_link_network(a, b):
+    """Remove the pair's link network, disconnecting any container still
+    attached first (`docker network rm` refuses a network with endpoints)."""
+    net = link_network(a, b)
+    if not _network_exists(net):
+        return
+    for c in network_members(net):
+        subprocess.run(["docker", "network", "disconnect", "-f", net, c],
+                       capture_output=True, text=True)
+    subprocess.run(["docker", "network", "rm", net],
+                   capture_output=True, text=True)
+
+
+def reconcile_links(reg):
+    """Bring the live link networks in line with the registry — used by
+    the migration step so links survive a gateway/app recreate. Creates
+    the network for every declared link and connects both primaries;
+    quiet, idempotent."""
+    for a, inst in reg["instances"].items():
+        for b in inst.get("links") or []:
+            if b in reg["instances"]:
+                setup_link_network(reg, a, b)
+
+
+# ------------------------------------------------ network migration (RFC-0016)
+# Runs from migrate.sh on every `oaap update`. Two jobs, both idempotent
+# and quiet when there is nothing to do:
+#   1) move any instance still sharing the platform network onto its own
+#      network (the one-time isolation of apps installed before 0.1.30);
+#   2) reconnect the gateway to EVERY app network — a compose recreate of
+#      the gateway (which every update performs) drops the manual link,
+#      so without this step all apps would 502 after an update.
+def cmd_migrate_networks(_args):
+    reg = load_registry()
+    isolated, reconnected = 0, 0
+    for name, inst in sorted(reg["instances"].items()):
+        net = app_network(name)
+        nets = container_networks(inst["container"])
+        if PLATFORM_NETWORK in nets or net not in nets:
+            # still on the flat network (or missing its own) — isolate it.
+            # start_instance_container creates the network, connects the
+            # gateway, and recreates the container on it.
+            start_instance_container(name, inst["container"], inst["image"],
+                                     inst.get("storage") or [])
+            isolated += 1
+            print(f"  isolated '{name}' onto {net}")
+        else:
+            # already isolated; the gateway may have lost its link when a
+            # platform update recreated it — restore it.
+            ensure_app_network(name)
+            if GATEWAY_CONTAINER not in network_members(net):
+                connect_gateway(net)
+                reconnected += 1
+    reconcile_links(reg)
+    if isolated or reconnected:
+        print(f"  network migration: {isolated} isolated, "
+              f"{reconnected} gateway link(s) restored.")
+    else:
+        print("  networks already isolated; gateway links intact.")
 
 # ------------------------------------------- manifest version (RFC-0012 §8.2)
 # The manifest version is MAJOR.MINOR. A new MINOR only ever ADDS things,
@@ -819,9 +988,16 @@ def start_instance_container(name, container, image, storage):
         if uid is not None:
             os.chown(host, uid, uid)
         mounts += ["-v", f"{host}:{s['mount']}"]
+    # RFC-0016: the instance's own network, with the gateway bridged in.
+    # Set up before the container so it lands on the right network at
+    # `docker run` time (network membership cannot be changed afterwards
+    # without a reconnect, and a compose recreate would drop the manual
+    # gateway link — the migration step restores it on every update).
+    net = ensure_app_network(name)
+    connect_gateway(net)
     subprocess.run(["docker", "rm", "-f", container], capture_output=True, text=True)
     run(["docker", "run", "-d", "--name", container,
-         "--restart", "unless-stopped", "--network", "oaap_default",
+         "--restart", "unless-stopped", "--network", net,
          "--env-file", env_path(name), *mounts, image])
 
 
@@ -1242,9 +1418,21 @@ def remove_instance(reg, name, purge):
     touched when purge is asked for — keeping it is the safe default,
     and the operator can still delete the directory later.
     """
+    # RFC-0016: capture link partners before the instance leaves the
+    # registry, so both the outgoing links it declared and the incoming
+    # links others declared to it get torn down.
+    partners = app_link_partners(reg, name)
     inst = reg["instances"].pop(name)
+    # drop any link this instance held from the OTHER side's registry entry
+    for other in reg["instances"].values():
+        if name in (other.get("links") or []):
+            other["links"] = [x for x in other["links"] if x != name]
     subprocess.run(["docker", "rm", "-f", inst["container"]],
                    capture_output=True, text=True)
+    for other in partners:
+        teardown_link_network(name, other)
+    # drop the instance's own network (disconnects the gateway first)
+    remove_app_network(name)
     site = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
     if os.path.isfile(site):
         os.remove(site)
@@ -1277,6 +1465,57 @@ def cmd_remove(args):
 # needs root).
 
 GROUP_RE = r"[a-z0-9][a-z0-9._-]{0,39}"
+
+
+def cmd_link(args):
+    """Declare, drop or list app-to-app links (RFC-0016). server_admin
+    territory (root here) — a deliberate hole in the default isolation,
+    recorded in the registry and revocable."""
+    reg = load_registry()
+    if args.action in ("add", "remove") and not (args.source and args.target):
+        die(f"'oaap app link {args.action}' needs a source and a target, "
+            f"e.g. 'oaap app link {args.action} app-a app-b'")
+    if args.action == "list":
+        rows = [(a, b) for a in sorted(reg["instances"])
+                for b in (reg["instances"][a].get("links") or [])]
+        if not rows:
+            print("No app-to-app links. Every app is isolated (RFC-0016).")
+            return
+        print("Declared links (source may reach target):")
+        for a, b in rows:
+            gone = "" if b in reg["instances"] else "  (target no longer installed)"
+            print(f"  {a} -> {b}{gone}")
+        return
+
+    a, b = args.source, args.target
+    for who in (a, b):
+        if who not in reg["instances"]:
+            die(f"no instance named '{who}'")
+    if a == b:
+        die("an instance cannot link to itself")
+    inst = reg["instances"][a]
+    links = set(inst.get("links") or [])
+
+    if args.action == "add":
+        if b in links:
+            print(f"'{a}' already links to '{b}'.")
+            return
+        inst["links"] = sorted(links | {b})
+        save_registry(reg)
+        setup_link_network(reg, a, b)
+        print(f"Link added: '{a}' may reach '{b}' on a dedicated network "
+              f"(RFC-0016).")
+        print(f"  '{a}' resolves it by the container name "
+              f"'{reg['instances'][b]['container']}'.")
+    else:  # remove
+        if b not in links:
+            die(f"'{a}' has no link to '{b}'")
+        inst["links"] = sorted(links - {b})
+        save_registry(reg)
+        # keep the shared network only if the reverse link still stands
+        if a not in (reg["instances"][b].get("links") or []):
+            teardown_link_network(a, b)
+        print(f"Link removed: '{a}' can no longer reach '{b}'.")
 
 
 def cmd_visibility(args):
@@ -2726,6 +2965,14 @@ def main():
     pv.add_argument("groups", nargs="?", default="",
                     help="comma-separated group tags, e.g. buero,finanzen (with 'groups')")
     pv.set_defaults(fn=cmd_visibility)
+    pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
+    pk.add_argument("action", choices=["add", "remove", "list"])
+    pk.add_argument("source", nargs="?", help="the instance that may reach the target")
+    pk.add_argument("target", nargs="?", help="the instance it may reach")
+    pk.set_defaults(fn=cmd_link)
+    pmn = sub.add_parser("migrate-networks",
+                         help="internal: isolate app networks + reconnect the gateway (RFC-0016)")
+    pmn.set_defaults(fn=cmd_migrate_networks)
     pt = sub.add_parser("tile")
     pt.add_argument("name")
     # Deliberately no argparse `choices` here: whether it validates the
