@@ -1029,8 +1029,8 @@ INSTANCE_EDIT_BODY = """
      die App.</p>
   {% for e in i.endpoints %}
   <div class="subcard">
-    <p><strong>{{ e.name }}</strong> — {{ e.protocol }}, App-Port {{ e.container_port }}</p>
-    <p class="muted">Begründung der App: {{ e.reason or '—' }}</p>
+    <p><strong>{{ e.name }}</strong> — {{ e.protocol }}, App-Port {{ e.container_port }}{% if e.fixed %} <span class="muted">(fester Port {{ e.container_port }})</span>{% endif %}</p>
+    <p class="muted">Begründung der App: {{ e.reason or '—' }}{% if e.fixed %} Dieser Port ist <strong>fest</strong>: Die App bewirbt ihn selbst bei ihren Clients, deshalb wird er unverändert veröffentlicht — ist er belegt, scheitert die Freigabe (statt einen anderen zu nehmen).{% endif %}</p>
     {% if e.granted %}
     <p>Freigegeben auf <strong>Host-Port {{ e.host_port }}</strong>. Leite diesen
        Port auf Deinem Router auf diesen Knoten weiter ({{ e.protocol }}
@@ -2689,6 +2689,7 @@ def _endpoint_view(inst):
         rows.append({
             "name": d["name"], "protocol": d["protocol"],
             "container_port": d["container_port"], "wish": d.get("wish"),
+            "fixed": bool(d.get("fixed")),
             "reason": (d.get("reason") or "").strip(),
             "granted": bool(g), "host_port": g["host_port"] if g else None,
         })

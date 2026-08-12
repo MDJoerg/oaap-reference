@@ -522,6 +522,22 @@ def validate_manifest(m):
             errs.append(f"endpoint {e.get('name')}: container_port (integer) required")
         if e.get("wish") is not None and not isinstance(e.get("wish"), int):
             errs.append(f"endpoint {e.get('name')}: wish must be an integer port")
+        # RFC-0015 §fixed (RFC-0017 §5.1): a server that advertises its own
+        # port to clients (a media server: ICE candidates carry the exact
+        # port) cannot accept a silently-reassigned one. `fixed: true` makes
+        # the port a requirement — published unchanged on the host, grant
+        # fails loudly if taken. Because host_port then equals container_port,
+        # the number must live in the endpoint range so it cannot collide
+        # with a platform port (80/443, gateway 8100-8199, internals).
+        if e.get("fixed") is not None and not isinstance(e.get("fixed"), bool):
+            errs.append(f"endpoint {e.get('name')}: fixed must be true or false")
+        if e.get("fixed") and isinstance(e.get("container_port"), int) \
+                and e["container_port"] not in ENDPOINT_PORT_RANGE:
+            errs.append(f"endpoint {e.get('name')}: a fixed endpoint's "
+                        f"container_port must be in {ENDPOINT_PORT_RANGE.start}–"
+                        f"{ENDPOINT_PORT_RANGE.stop - 1} (it is published "
+                        "unchanged on the host, so it must not clash with a "
+                        "platform port)")
         if not str(e.get("reason") or "").strip():
             errs.append(f"endpoint {e.get('name')}: a 'reason' is required — it is "
                         "shown to the operator verbatim at grant time")
@@ -1166,14 +1182,31 @@ def recreate_instance_containers(name, services, storage, endpoints=None):
 ENDPOINT_PORT_RANGE = range(8200, 8300)
 
 
-def assign_endpoint_port(reg, wish, exclude=None):
-    """Pick a host port for a granted endpoint (RFC-0015): the wished-for
-    one if free, else the next free port in the reserved range. Ports are
-    node-unique; a fixed/wished port that collides falls back rather than
-    fail (Jörg's decision: a wish, not a demand)."""
+class EndpointPortTaken(Exception):
+    """A fixed endpoint's required port is already in use (RFC-0017 §5.1).
+    Raised rather than die()d so both callers can react in their own way:
+    the CLI turns it into a die(), the spool worker into a queued-result
+    message that does not kill the whole run."""
+
+
+def assign_endpoint_port(reg, wish, exclude=None, fixed=False):
+    """Pick a host port for a granted endpoint (RFC-0015). Default: the
+    wished-for one if free, else the next free port in the reserved range —
+    a wish, not a demand (Jörg's decision). With `fixed` (RFC-0017 §5.1),
+    `wish` is a requirement: it is the port the app advertises to clients,
+    so a collision must FAIL LOUDLY rather than silently reassign — media
+    would break at a port the server never announced."""
     used = {e["host_port"] for i in reg["instances"].values()
             for e in (i.get("endpoints") or [])}
     used.discard(exclude)
+    if fixed:
+        if wish in used:
+            raise EndpointPortTaken(
+                f"endpoint requires fixed port {wish}, but it is already in "
+                f"use on this node. A fixed port is a requirement, not a wish "
+                f"(RFC-0017 §5.1): free it or change the app's port — the "
+                f"platform will not silently reassign it.")
+        return wish
     if wish and wish not in used:
         return wish
     for p in ENDPOINT_PORT_RANGE:
@@ -1784,6 +1817,9 @@ def _print_endpoint_grant(name, ep):
         print(f"    {proto.upper()}  {ep['host_port']}  ->  this node  ({proto} {ep['host_port']})")
     print("")
     print(f"  The app is told its public port via OAAP_ENDPOINT_PORT={ep['host_port']}.")
+    if ep.get("fixed"):
+        print(f"  This is a FIXED port: the app advertises {ep['host_port']} to its")
+        print("  clients, so it was published unchanged (not reassignable).")
     print("  This address is node-local: the edge cannot forward it, and a")
     print("  restore on another machine will not bring it along.")
 
@@ -1811,9 +1847,14 @@ def cmd_endpoint(args):
                 print(f"  {d['name']}: GRANTED — host port {g['host_port']} "
                       f"({protos} -> container {g['container_port']})")
             else:
-                wish = f", wants {d['wish']}" if d.get("wish") else ""
+                if d.get("fixed"):
+                    want = f", fixed port {d['container_port']}"
+                elif d.get("wish"):
+                    want = f", wants {d['wish']}"
+                else:
+                    want = ""
                 print(f"  {d['name']}: not granted ({d['protocol']}, "
-                      f"container {d['container_port']}{wish})")
+                      f"container {d['container_port']}{want})")
             print(f"      reason: {d.get('reason', '').strip()}")
         return
 
@@ -1834,11 +1875,18 @@ def cmd_endpoint(args):
             print(f"'{ep_name}' is already granted "
                   f"(host port {granted[ep_name]['host_port']}).")
             return
-        host_port = assign_endpoint_port(reg, decl.get("wish"))
+        fixed = bool(decl.get("fixed"))
+        # A fixed endpoint is published unchanged (host_port == container_port),
+        # so the app advertises the very port the world reaches (RFC-0017 §5.1).
+        target = decl["container_port"] if fixed else decl.get("wish")
+        try:
+            host_port = assign_endpoint_port(reg, target, fixed=fixed)
+        except EndpointPortTaken as e:
+            die(str(e))
         entry = {"name": ep_name, "protocol": decl["protocol"],
                  "container_port": decl["container_port"],
                  "host_port": host_port, "service": decl.get("service", ""),
-                 "reason": decl.get("reason", "")}
+                 "fixed": fixed, "reason": decl.get("reason", "")}
         inst["endpoints"] = [e for e in (inst.get("endpoints") or [])
                              if e["name"] != ep_name] + [entry]
         save_registry(reg)
@@ -2769,20 +2817,30 @@ def cmd_process_deploys(_args):
                 current = [e for e in (inst.get("endpoints") or [])
                            if e["name"] != ep_name]
                 if op == "allow":
-                    hp = assign_endpoint_port(reg, decl.get("wish"))
-                    current.append({"name": ep_name, "protocol": decl["protocol"],
-                                    "container_port": decl["container_port"],
-                                    "host_port": hp, "service": decl.get("service", ""),
-                                    "reason": decl.get("reason", "")})
-                    inst["endpoints"] = current
-                    save_registry(reg)
-                    recreate_instance_containers(name, instance_services(inst),
-                                                 inst.get("storage") or [],
-                                                 inst["endpoints"])
-                    ok = True
-                    msg = (f"endpoint '{ep_name}' granted on host port {hp} "
-                           f"({'+'.join(_endpoint_protos(decl['protocol']))}) — "
-                           f"raw port, no gateway; forward it on your router")
+                    fixed = bool(decl.get("fixed"))
+                    target = decl["container_port"] if fixed else decl.get("wish")
+                    try:
+                        # A fixed-port clash raises rather than exits, so it
+                        # becomes this item's failure message instead of
+                        # killing the whole spool run (RFC-0017 §5.1).
+                        hp = assign_endpoint_port(reg, target, fixed=fixed)
+                    except EndpointPortTaken as e:
+                        hp = None
+                        msg = str(e)
+                    if hp is not None:
+                        current.append({"name": ep_name, "protocol": decl["protocol"],
+                                        "container_port": decl["container_port"],
+                                        "host_port": hp, "service": decl.get("service", ""),
+                                        "fixed": fixed, "reason": decl.get("reason", "")})
+                        inst["endpoints"] = current
+                        save_registry(reg)
+                        recreate_instance_containers(name, instance_services(inst),
+                                                     inst.get("storage") or [],
+                                                     inst["endpoints"])
+                        ok = True
+                        msg = (f"endpoint '{ep_name}' granted on host port {hp} "
+                               f"({'+'.join(_endpoint_protos(decl['protocol']))}) — "
+                               f"raw port, no gateway; forward it on your router")
                 elif op == "deny":
                     inst["endpoints"] = current
                     save_registry(reg)
