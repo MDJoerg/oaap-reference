@@ -977,23 +977,51 @@ INSTANCE_EDIT_BODY = """
     <button>Speichern</button>
   </div>
 </form>
-<form method="post" action="/instances/{{ i.name }}/address">
-  <div class="card">
-    <h2>Eigene Adresse</h2>
-    <p class="muted">Automatisch erreichbar unter
-       <code>{{ i.auto_address or "— (dieser Knoten hat keinen externen Namen)" }}</code>.
-       Zusätzlich kann diese Instanz einen eigenen öffentlichen Namen tragen —
-       sinnvoll, wenn die Adresse in ausgelieferte Software eingebaut wird und
-       einen späteren Umzug überleben soll.</p>
-    <label>Eigener Name <input type="text" name="hostname" value="{{ i.address }}"
+<div class="card">
+  <h2>Eigene Adresse</h2>
+  <p class="muted">Automatisch erreichbar unter
+     <code>{{ i.auto_address or "— (dieser Knoten hat keinen externen Namen)" }}</code>.
+     Zusätzlich kann diese Instanz eigene öffentliche Namen tragen —
+     einen <strong>Hauptnamen</strong> (den man in ausgelieferte Software
+     einbaut und der einen Umzug überlebt) und beliebig viele
+     <strong>Aliasse</strong>, die gleichwertig erreichbar sind. Alle Namen
+     stehen unter demselben Schutz — ein Alias ist kein Schlupfloch.</p>
+  <form method="post" action="/instances/{{ i.name }}/address">
+    <label>Hauptname <input type="text" name="hostname" value="{{ i.address }}"
            placeholder="z. B. hub.meine-domain.de"></label>
     <p class="muted">Der Name muss selbst auf diesen Knoten zeigen (DNS-Eintrag
        und Portfreigabe bleiben Deine Sache). Das Zertifikat holt die Plattform
        beim ersten Zugriff. Die automatische Adresse bleibt gültig.</p>
-    <button>Speichern</button>
-    {% if i.address %}<button name="op" value="remove" class="secondary">Namen entfernen</button>{% endif %}
-  </div>
-</form>
+    <button>Hauptnamen speichern</button>
+    {% if i.address and not i.aliases %}<button name="op" value="remove" class="secondary">Hauptnamen entfernen</button>{% endif %}
+  </form>
+  {% if i.address %}
+  <h3>Aliasse</h3>
+  {% if i.aliases %}
+  <ul class="muted">
+    {% for a in i.aliases %}
+    <li><code>{{ a }}</code>
+      <form method="post" action="/instances/{{ i.name }}/address" style="display:inline">
+        <input type="hidden" name="op" value="alias-remove">
+        <input type="hidden" name="hostname" value="{{ a }}">
+        <button class="secondary">entfernen</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">Noch keine Aliasse.</p>
+  {% endif %}
+  <form method="post" action="/instances/{{ i.name }}/address">
+    <input type="hidden" name="op" value="alias-add">
+    <label>Alias hinzufügen <input type="text" name="hostname"
+           placeholder="z. B. bdt-hub-test.joomp.de"></label>
+    <button>Alias hinzufügen</button>
+  </form>
+  {% else %}
+  <p class="muted">Aliasse sind erst möglich, wenn ein Hauptname gesetzt ist.</p>
+  {% endif %}
+</div>
 {% if i.has_public_route %}
 <form method="post" action="/instances/{{ i.name }}/throttle">
   <div class="card">
@@ -1665,14 +1693,22 @@ PUBLIC_IP_SERVICES = ("https://api.ipify.org", "https://checkip.amazonaws.com")
 
 
 def published_names():
-    """Names this node hands out to the world, with their origin."""
+    """Names this node hands out to the world, with their origin. An
+    instance's canonical name and every alias (RFC-0018) are all published
+    and all watched."""
     names = []
     host = external_host()
     if host:
         names.append({"name": host, "what": "Knoten"})
     for inst_name, inst in sorted(load_instances().items()):
-        if inst.get("address"):
-            names.append({"name": inst["address"], "what": f"Instanz {inst_name}"})
+        canon = inst.get("address")
+        if not canon:
+            continue
+        names.append({"name": canon, "what": f"Instanz {inst_name}"})
+        for alias in inst.get("aliases") or []:
+            if alias and alias != canon:
+                names.append({"name": alias,
+                              "what": f"Instanz {inst_name} (Alias)"})
     return names
 
 
@@ -2670,6 +2706,7 @@ def instance_detail(name):
          "token_created": _token_created(name),
          "hook_url": _hook_url(name),
          "address": inst.get("address", ""),
+         "aliases": inst.get("aliases") or [],
          "auto_address": f"{name}.{external_host()}" if external_host() else "",
          "has_public_route": any("public" in (r.get("roles") or [])
                                  for r in inst.get("routes") or []),
@@ -2827,9 +2864,18 @@ def instance_address(name):
         return denied
     if not load_instances().get(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    op = (request.form.get("op") or "").strip()
     hostname = (request.form.get("hostname") or "").strip()
-    if request.form.get("op") == "remove" or not hostname:
+    # Canonical name: an explicit remove, or an empty field, clears it.
+    if op == "remove" or (not op and not hostname):
         return _queue_and_redirect(name, {"action": "address", "op": "remove"},
+                                   ADDRESS_WAIT_SECONDS)
+    if op in ("alias-add", "alias-remove"):
+        if not hostname:
+            return redirect(f"/instances/{name}?err="
+                            f"{quote('Kein Aliasname angegeben.')}", code=303)
+        return _queue_and_redirect(name, {"action": "address", "op": op,
+                                          "hostname": hostname},
                                    ADDRESS_WAIT_SECONDS)
     return _queue_and_redirect(name, {"action": "address", "hostname": hostname},
                                ADDRESS_WAIT_SECONDS)
