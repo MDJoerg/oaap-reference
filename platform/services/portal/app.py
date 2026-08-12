@@ -387,6 +387,35 @@ HEALTH_BODY = """
      hinkt hinterher.</p>
 </div>
 {% endif %}
+{% if reach and reach.rows %}
+<div class="card">
+  <h2>Direkte Ports (Erreichbarkeit)</h2>
+  <table>
+    <tr><th>Endpunkt</th><th>Instanz</th><th>Port</th><th>Prüfung</th><th>Status</th></tr>
+    {% for r in reach.rows %}
+    <tr><td>{{ r.name or "–" }}</td>
+        <td class="muted">{{ r.instance }}</td>
+        <td class="muted">{{ r.host_port }}/{{ r.protocol }}</td>
+        <td class="muted">{% if r.how %}{{ r.how }}{% else %}–{% endif %}</td>
+        <td><span class="dot {{ r.state }}"></span>{{ r.label }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if reach.note %}<p class="muted">{{ reach.note }}</p>{% endif %}
+  <p class="muted">Geprüft wird per <strong>Selbstverbindung</strong> zur eigenen
+     öffentlichen Adresse{% if reach.public_ip %} ({{ reach.public_ip }}, ermittelt
+     über {{ reach.source }}){% endif %} — TCP direkt, UDP per STUN-Anfrage
+     (die jeder WebRTC-Medienserver beantwortet). <strong>„Erreichbar"</strong>
+     heißt: Der Port antwortet an der öffentlichen Adresse. <strong>„Von hier
+     nicht bestätigt"</strong> ist bewusst <em>kein</em> Fehler — ein Router,
+     der Verbindungen zur eigenen öffentlichen Adresse nicht zurückschleift
+     (kein Hairpin), lässt eine funktionierende Freigabe von hier aus stumm
+     erscheinen. Die endgültige Bestätigung von außen liefert erst der
+     Reflektor (RFC-0015, Stufe 2); bis dahin gilt: mit einem echten Client
+     gegentesten.</p>
+  <p class="muted">Zuletzt geprüft: {{ reach.when[:19].replace("T", " ") }} UTC
+     (höchstens halbstündlich).</p>
+</div>
+{% endif %}
 {% if braked %}
 <div class="card">
   <h2>Gebremste Anfragen ({{ braked.hours }} Stunden)</h2>
@@ -1730,6 +1759,138 @@ def dns_check():
     return result
 
 
+# --------------------------------------------------------------------------
+# Do the granted direct ports still reach here? (RFC-0015 decision Q4)
+#
+# The sibling of the DNS watchdog above, and it shares that mechanism as
+# RFC-0015 asked: RFC-0009 asks "does the published NAME still point here",
+# this asks "does the published PORT still reach here". The forgotten
+# router forward is the failure it exists for — silent, and until now
+# indistinguishable from a broken app.
+#
+# Two honest limits, both stated rather than hidden:
+#   * A home router that does not hairpin (loop a connection to its own
+#     public address back inside) makes a working forward look unreachable
+#     FROM HERE. So a failed probe is never a red "broken" — it is a grey
+#     "could not confirm from here". Only a SUCCESS is asserted.
+#   * This is stage 1 (RFC-0015): the probe runs from the node itself, so a
+#     router that answers the public address locally can show "reachable"
+#     even with no forward. The stage-2 reflector (an outside vantage) is
+#     the one that removes both caveats. The page says which one produced
+#     the verdict.
+#
+# UDP cannot be confirmed by a bare datagram — answered and dropped look
+# the same. For UDP we send a STUN binding request (RFC 5389): every WebRTC
+# media server (LiveKit, mediasoup, coturn) answers it by standard, which
+# is exactly what a declared UDP endpoint carries. A STUN reply is real
+# proof; its absence is the same grey "not confirmed".
+
+REACH_CACHE = "/deploy-spool/.reach-check.json"
+REACH_CHECK_TTL = 1800  # seconds; matches the DNS watchdog's outside cadence
+REACH_TIMEOUT = 3  # seconds per probe
+
+
+def granted_endpoints():
+    """Direct ports handed to the world, with instance and protocol."""
+    eps = []
+    for inst_name, inst in sorted(load_instances().items()):
+        for ep in inst.get("endpoints") or []:
+            if ep.get("host_port"):
+                eps.append({"instance": inst_name, "name": ep.get("name", ""),
+                            "protocol": ep.get("protocol", "tcp"),
+                            "host_port": ep["host_port"]})
+    return eps
+
+
+def _probe_tcp(ip, port):
+    """True only if a connection completes — a fact that cannot be faked."""
+    import socket
+    try:
+        with socket.create_connection((ip, port), timeout=REACH_TIMEOUT):
+            return True
+    except OSError:
+        return False
+
+
+def _probe_stun(ip, port):
+    """Send a STUN binding request; a reply on the transaction proves the
+    UDP port reaches a WebRTC media server. RFC 5389: 20-byte header, type
+    0x0001, magic cookie 0x2112A442, 12-byte transaction id echoed back."""
+    import socket
+    import struct
+    txid = os.urandom(12)
+    req = struct.pack(">HHI", 0x0001, 0, 0x2112A442) + txid
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(REACH_TIMEOUT)
+    try:
+        s.sendto(req, (ip, port))
+        data, _ = s.recvfrom(1024)
+    except OSError:
+        return False
+    finally:
+        s.close()
+    if len(data) < 20:
+        return False
+    _mtype, _mlen, cookie = struct.unpack(">HHI", data[:8])
+    # Any answer carrying our magic cookie and transaction id is a STUN
+    # speaker on that port — success or error class alike proves reach.
+    return cookie == 0x2112A442 and data[8:20] == txid
+
+
+def _reach_check_run():
+    eps = granted_endpoints()
+    now = datetime.now(timezone.utc)
+    result = {"when": now.isoformat(), "rows": [], "public_ip": "",
+              "source": "", "vantage": "self", "note": ""}
+    if not eps:
+        return result
+    if _behind_edge():
+        result["note"] = ("Dieser Knoten steht hinter einem Edge-Knoten — die "
+                          "direkten Ports werden dort weitergeleitet und sind "
+                          "von hier aus nicht prüfbar.")
+        for ep in eps:
+            result["rows"].append(dict(ep, state="unknown", label="Nicht prüfbar"))
+        return result
+    result["public_ip"], result["source"] = _public_ip()
+    if not result["public_ip"]:
+        for ep in eps:
+            result["rows"].append(dict(ep, state="unknown", label="Nicht vergleichbar"))
+        return result
+    ip = result["public_ip"]
+    for ep in eps:
+        proto, port = ep["protocol"], ep["host_port"]
+        ok_tcp = _probe_tcp(ip, port) if proto in ("tcp", "both") else False
+        ok_udp = _probe_stun(ip, port) if proto in ("udp", "both") else False
+        if ok_tcp or ok_udp:
+            how = "STUN" if ok_udp and not ok_tcp else "TCP"
+            result["rows"].append(dict(ep, state="ok", label="Erreichbar", how=how))
+        else:
+            result["rows"].append(dict(ep, state="unknown",
+                                       label="Von hier nicht bestätigt", how=""))
+    return result
+
+
+def reach_check():
+    """Cached verdict; refreshed at most every REACH_CHECK_TTL seconds."""
+    try:
+        age = _time.time() - os.path.getmtime(REACH_CACHE)
+        if age < REACH_CHECK_TTL:
+            with open(REACH_CACHE, encoding="utf-8") as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    result = _reach_check_run()
+    try:
+        os.makedirs(SPOOL_DIR, exist_ok=True)
+        tmp = REACH_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(result, f)
+        os.replace(tmp, REACH_CACHE)
+    except OSError:
+        pass
+    return result
+
+
 def braked_requests():
     """Per-instance count of throttled requests (RFC-0010 decision 2)."""
     instances = load_instances()
@@ -1811,7 +1972,7 @@ def health():
         })
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
                 core=core, apps=apps, ext=external_access(),
-                dns=dns_check(), braked=braked_requests(),
+                dns=dns_check(), reach=reach_check(), braked=braked_requests(),
                 deploys=recent_deploys())
 
 
