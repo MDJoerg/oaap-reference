@@ -207,10 +207,10 @@ def cmd_migrate_networks(_args):
         nets = container_networks(inst["container"])
         if PLATFORM_NETWORK in nets or net not in nets:
             # still on the flat network (or missing its own) — isolate it.
-            # start_instance_container creates the network, connects the
-            # gateway, and recreates the container on it.
-            start_instance_container(name, inst["container"], inst["image"],
-                                     inst.get("storage") or [])
+            # recreate_instance_containers creates the network, connects
+            # the gateway, and recreates all service containers on it.
+            recreate_instance_containers(name, instance_services(inst),
+                                         inst.get("storage") or [])
             isolated += 1
             print(f"  isolated '{name}' onto {net}")
         else:
@@ -221,11 +221,31 @@ def cmd_migrate_networks(_args):
                 connect_gateway(net)
                 reconnected += 1
     reconcile_links(reg)
-    if isolated or reconnected:
+    # the internal health endpoint (RFC-0016) lives in a generated site;
+    # (re)write it and reload so the portal can probe apps through the
+    # gateway after this update — it cannot reach them directly anymore.
+    health_before = _read_file(os.path.join(CADDY_APPS_DIR, "_internal-health.caddy"))
+    write_internal_health_caddy()
+    health_changed = _read_file(os.path.join(CADDY_APPS_DIR, "_internal-health.caddy")) != health_before
+    if isolated or reconnected or health_changed:
+        if health_changed:
+            try:
+                reload_gateway()
+            except Exception:
+                pass
         print(f"  network migration: {isolated} isolated, "
-              f"{reconnected} gateway link(s) restored.")
+              f"{reconnected} gateway link(s) restored"
+              f"{'; health endpoint updated' if health_changed else ''}.")
     else:
         print("  networks already isolated; gateway links intact.")
+
+
+def _read_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
 
 # ------------------------------------------- manifest version (RFC-0012 §8.2)
 # The manifest version is MAJOR.MINOR. A new MINOR only ever ADDS things,
@@ -445,14 +465,20 @@ def validate_manifest(m):
         print(f"Note: app.class '{app['class']}' is not a class this "
               f"platform knows ({' | '.join(APP_CLASSES)}). Treating it as "
               f"'{DEFAULT_APP_CLASS}'.")
+    # RFC-0016: more than one service is allowed. Each runs as its own
+    # container on the instance's network; routes and storage may name a
+    # target service, defaulting to the single one when there is only one.
     services = m.get("services") or {}
-    if len(services) != 1:
-        errs.append("exactly one service is supported in runtime increment 1")
+    if not services:
+        errs.append("services: at least one service")
     for sname, svc in services.items():
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(sname)):
+            errs.append(f"service name invalid: '{sname}' (lowercase [a-z0-9-])")
         if not isinstance(svc.get("port"), int):
             errs.append(f"services.{sname}.port: integer required")
         if bool(svc.get("build")) == bool(svc.get("image")):
             errs.append(f"services.{sname}: exactly one of build/image")
+    multi = len(services) > 1
     routes = m.get("routes") or []
     if not routes:
         errs.append("routes: at least one route")
@@ -462,9 +488,23 @@ def validate_manifest(m):
         roles = set(r.get("roles") or [])
         if not roles or not roles <= ROLES:
             errs.append(f"routes {r.get('path')}: roles must be non-empty subset of {sorted(ROLES)}")
+        # a route's target service must exist; it may be omitted only when
+        # there is exactly one service to mean (RFC-0016)
+        rsvc = r.get("service")
+        if rsvc is not None and rsvc not in services:
+            errs.append(f"routes {r.get('path')}: unknown service '{rsvc}'")
+        elif rsvc is None and multi:
+            errs.append(f"routes {r.get('path')}: 'service' is required when the "
+                        "app has more than one service")
     for s in m.get("storage") or []:
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(s.get("name", ""))) or not str(s.get("mount", "")).startswith("/"):
             errs.append(f"storage entry invalid: {s}")
+        ssvc = s.get("service")
+        if ssvc is not None and ssvc not in services:
+            errs.append(f"storage {s.get('name')}: unknown service '{ssvc}'")
+        elif ssvc is None and multi:
+            errs.append(f"storage {s.get('name')}: 'service' is required when the "
+                        "app has more than one service")
     if not str((m.get("health") or {}).get("path", "")).startswith("/"):
         errs.append("health.path: required, must start with /")
     if errs:
@@ -527,7 +567,7 @@ _AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
 
 
 def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
-              edge=""):
+              edge="", services=None):
     """Shared handler block for one app instance (LAN and external sites).
 
     /auth/* is reserved on every entry point, not only the portal apex
@@ -546,6 +586,11 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     groups: optional visibility restriction (RFC-0007) from the
     instance's registry entry — an ADDITIONAL check alongside roles,
     added to every non-public route's forward_auth call.
+
+    services: for a multi-container app (RFC-0016), a map service name ->
+    (container, port); each route is proxied to the container of its
+    declared `service`. None (single service) proxies every route to the
+    given container:svc_port, exactly as before.
     """
     lines = []
     lines.append("\thandle /auth/* {")
@@ -579,7 +624,10 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
             lines += _throttle_block(scope, throttle, edge)
             lines.append("\t\trequest_header -X-OAAP-User")
             lines.append("\t\trequest_header -X-OAAP-Roles")
-        lines.append(f"\t\treverse_proxy {container}:{svc_port}")
+        target_c, target_p = container, svc_port
+        if services and r.get("service") in services:
+            target_c, target_p = services[r["service"]]
+        lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
         lines.append("\t}")
     if not any(r["path"] == "/" for r in routes):
         lines.append("\thandle {")
@@ -589,7 +637,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
 
 
 def caddy_site(port, routes, container, svc_port, groups=None, scope="",
-               throttle=None):
+               throttle=None, services=None):
     """Generate a LAN gateway listener for one app instance.
 
     The throttle scope is the instance name on every entry point, so a
@@ -597,7 +645,8 @@ def caddy_site(port, routes, container, svc_port, groups=None, scope="",
     the node subdomain and the instance's own hostname.
     """
     lines = ([f":{port} {{"]
-             + site_body(routes, container, svc_port, groups, scope, throttle)
+             + site_body(routes, container, svc_port, groups, scope, throttle,
+                         services=services)
              + ["}"])
     return "\n".join(lines) + "\n"
 
@@ -711,7 +760,8 @@ def write_external_caddy():
         lines += _LOG_BLOCK
         groups = (inst.get("visibility") or {}).get("groups")
         lines += site_body(routes, inst["container"], inst["svc_port"], groups,
-                           name, throttle_of(inst), edge)
+                           name, throttle_of(inst), edge,
+                           services=route_targets(inst))
         lines.append("}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -751,7 +801,8 @@ def write_instance_address_caddy():
         lines += _LOG_BLOCK
         lines += site_body(inst["routes"], inst["container"], inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups"),
-                           name, throttle_of(inst), edge)
+                           name, throttle_of(inst), edge,
+                           services=route_targets(inst))
         lines.append("}")
         if not edge:
             lines.append(f"http://{host} {{")
@@ -762,10 +813,48 @@ def write_instance_address_caddy():
         f.write("\n".join(lines) + "\n")
 
 
+# The gateway is the only core service on the app networks (RFC-0016),
+# so it is the only one that can reach an app to check its health. The
+# portal used to probe apps by container name directly; after isolation
+# it cannot. This internal site lets the portal ask the gateway to probe
+# for it: a listener on :8099 — reachable only container-to-container on
+# the platform network (never published, and apps are not on that
+# network) — with one no-auth route per instance that proxies to the
+# app's health endpoint. Health checks are the only thing it exposes.
+HEALTH_PROBE_PORT = 8099
+
+
+def write_internal_health_caddy():
+    reg = load_registry()
+    path = os.path.join(CADDY_APPS_DIR, "_internal-health.caddy")
+    insts = [(n, i) for n, i in sorted(reg["instances"].items())
+             if i.get("container") and i.get("svc_port")]
+    if not insts:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    lines = [f"# generated by appctl — internal health probe endpoint "
+             f"(RFC-0016); reachable only from the platform network",
+             f":{HEALTH_PROBE_PORT} {{"]
+    for name, inst in insts:
+        hp = inst.get("health_path") or "/"
+        lines.append(f"\thandle /h/{name} {{")
+        lines.append(f"\t\trewrite * {hp}")
+        lines.append(f"\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+        lines.append("\t}")
+    lines.append("\thandle {")
+    lines.append("\t\trespond 404")
+    lines.append("\t}")
+    lines.append("}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 def refresh_generated_sites():
     """Regenerate every site file derived from the registry."""
     write_external_caddy()
     write_instance_address_caddy()
+    write_internal_health_caddy()
 
 
 HOSTNAME_RE = r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+"
@@ -978,27 +1067,58 @@ def save_env(name, env):
     os.replace(tmp, path)
 
 
-def start_instance_container(name, container, image, storage):
-    """(Re)create an instance container from its recorded shape."""
-    uid = image_uid(image)
-    mounts = []
-    for s in storage or []:
-        host = os.path.join(instance_dir(name), "storage", s["name"])
-        os.makedirs(host, exist_ok=True)
-        if uid is not None:
-            os.chown(host, uid, uid)
-        mounts += ["-v", f"{host}:{s['mount']}"]
-    # RFC-0016: the instance's own network, with the gateway bridged in.
-    # Set up before the container so it lands on the right network at
-    # `docker run` time (network membership cannot be changed afterwards
-    # without a reconnect, and a compose recreate would drop the manual
-    # gateway link — the migration step restores it on every update).
+def instance_services(inst):
+    """Normalised list of an instance's services, newest-shape first.
+
+    RFC-0016 lets an instance have several services; each is recorded as
+    {service, container, image, build, port}, primary first. Instances
+    installed before 0.1.31 have no `services` list — synthesise a
+    single one from the flat container/image/svc_port fields so every
+    caller (recreate, migrate, config) treats old and new the same."""
+    if inst.get("services"):
+        return inst["services"]
+    return [{"service": "", "container": inst["container"],
+             "image": inst["image"], "build": inst.get("build", ""),
+             "port": inst.get("svc_port")}]
+
+
+def recreate_instance_containers(name, services, storage):
+    """(Re)create ALL of an instance's service containers on its own
+    network (RFC-0016), from their recorded shape. Storage entries go to
+    the service named in `service`, defaulting to the primary (services
+    are ordered primary-first)."""
+    primary = services[0]["service"]
+    # RFC-0016: the instance's own network, gateway bridged in. Set up
+    # before the containers so they land on the right network at
+    # `docker run` time; the migration step restores the gateway link
+    # after a platform update recreates the gateway.
     net = ensure_app_network(name)
     connect_gateway(net)
-    subprocess.run(["docker", "rm", "-f", container], capture_output=True, text=True)
-    run(["docker", "run", "-d", "--name", container,
-         "--restart", "unless-stopped", "--network", net,
-         "--env-file", env_path(name), *mounts, image])
+    for s in services:
+        uid = image_uid(s["image"])
+        mounts = []
+        for st in storage or []:
+            if (st.get("service") or primary) != s["service"]:
+                continue
+            host = os.path.join(instance_dir(name), "storage", st["name"])
+            os.makedirs(host, exist_ok=True)
+            if uid is not None:
+                os.chown(host, uid, uid)
+            mounts += ["-v", f"{host}:{st['mount']}"]
+        subprocess.run(["docker", "rm", "-f", s["container"]],
+                       capture_output=True, text=True)
+        run(["docker", "run", "-d", "--name", s["container"],
+             "--restart", "unless-stopped", "--network", net,
+             "--env-file", env_path(name), *mounts, s["image"]])
+
+
+def route_targets(inst):
+    """Map service name -> (container, port) for site generation, or None
+    for a single-service instance (site_body then uses the primary)."""
+    svcs = inst.get("services")
+    if not svcs or len(svcs) == 1:
+        return None
+    return {s["service"]: (s["container"], s["port"]) for s in svcs}
 
 
 def config_entries(name, inst):
@@ -1051,8 +1171,8 @@ def apply_config(name, inst, values):
     if not changed:
         return "no change"
     save_env(name, env)
-    start_instance_container(name, inst["container"], inst["image"],
-                             inst.get("storage"))
+    recreate_instance_containers(name, instance_services(inst),
+                                 inst.get("storage") or [])
     return "changed: " + ", ".join(sorted(changed))
 
 
@@ -1153,7 +1273,7 @@ def cmd_throttle(args):
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst)))
+                           throttle_of(inst), services=route_targets(inst)))
     refresh_generated_sites()
     reload_gateway()
 
@@ -1296,16 +1416,43 @@ def _install_from_dir(pkg, args, source):
     if inst and inst["channel"] == "production" and inst["version"] == app["version"]:
         die(f"production instance '{name}' already runs version {app['version']} — bump the version (spec: redeploy semantics)")
 
-    (sname, svc), = m["services"].items()
-    image = f"oaap-app/{app['id']}:{app['version']}"
-    if app["type"] == "native" or svc.get("build"):
-        print(f"Building {image} on this node ...")
-        run(["docker", "build", "-q", "-t", image,
-             os.path.join(pkg, svc.get("build", "."))])
-    else:
-        image = svc["image"]
-        print(f"Pulling {image} ...")
-        run(["docker", "pull", "-q", image])
+    # RFC-0016: an app may have several services, each its own container.
+    # The PRIMARY service is the one serving "/" (or the first route, or
+    # the first service) — it carries the health check and the flat
+    # container/image/svc_port fields the rest of the code and old
+    # backups still read.
+    svc_items = list(m["services"].items())
+    multi = len(svc_items) > 1
+    service_names = [s for s, _ in svc_items]
+
+    def route_service_name(r):
+        return r.get("service") or service_names[0]
+    root = [r for r in m["routes"] if r["path"] == "/"]
+    primary_name = (route_service_name(root[0]) if root
+                    else route_service_name(m["routes"][0]) if m["routes"]
+                    else service_names[0])
+    ordered = sorted(svc_items, key=lambda kv: kv[0] != primary_name)
+
+    services = []
+    for sname, svc in ordered:
+        cname = f"oaap-app-{name}" if not multi else f"oaap-app-{name}-{sname}"
+        if app["type"] == "native" or svc.get("build"):
+            img = (f"oaap-app/{app['id']}:{app['version']}" if not multi
+                   else f"oaap-app/{app['id']}-{sname}:{app['version']}")
+            print(f"Building {img} on this node ...")
+            run(["docker", "build", "-q", "-t", img,
+                 os.path.join(pkg, svc.get("build", "."))])
+            build = svc.get("build", "")
+        else:
+            img = svc["image"]
+            print(f"Pulling {img} ...")
+            run(["docker", "pull", "-q", img])
+            build = ""
+        services.append({"service": sname if multi else "", "container": cname,
+                         "image": img, "build": build, "port": svc["port"]})
+
+    primary = services[0]
+    container, image = primary["container"], primary["image"]
 
     # port: keep existing assignment (RFC-0005), else allocate
     used = {i["port"] for i in reg["instances"].values()}
@@ -1322,18 +1469,20 @@ def _install_from_dir(pkg, args, source):
         env.setdefault(c["key"], c.get("default", ""))
     save_env(name, env)
 
-    # per-instance storage, writable for the container user (guarantee 4)
-    container = f"oaap-app-{name}"
-    start_instance_container(name, container, image, m.get("storage") or [])
+    # per-instance storage, writable for the container user (guarantee 4);
+    # every service container lands on the instance's own network (RFC-0016)
+    recreate_instance_containers(name, services, m.get("storage") or [])
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance
     visibility = (inst.get("visibility") or {}) if inst else {}
 
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(port, m["routes"], container, svc["port"],
+        f.write(caddy_site(port, m["routes"], container, primary["port"],
                            visibility.get("groups"), name,
-                           throttle_of(inst or {})))
+                           throttle_of(inst or {}),
+                           services=(route_targets({"services": services})
+                                     if multi else None)))
     reload_gateway()
 
     reg["instances"][name] = {
@@ -1348,17 +1497,24 @@ def _install_from_dir(pkg, args, source):
         # Stored VERBATIM ('' when the manifest is silent) — see
         # declared_class() for why the normalised value would be wrong.
         "app_class": declared_class(app),
+        # flat fields describe the PRIMARY service — kept for the health
+        # page, for legacy readers, and for backups written before 0.1.31
         "port": port, "image": image, "container": container,
         # for the portal's health page: where to reach the service on
         # the internal network and which path confirms liveness
-        "svc_port": svc["port"],
+        "svc_port": primary["port"],
+        # all services (RFC-0016), primary first: {service, container,
+        # image, build, port}. A single-service app has one entry with
+        # service "" — route_targets() then returns None and every route
+        # proxies to the primary, exactly as before.
+        "services": services,
         "health_path": (m.get("health") or {}).get("path", ""),
         # for regenerating gateway sites (external hostname, RFC-0005 L3)
         "routes": m["routes"],
         # for restore (oaap.data.backup) and the deploy hook (runtime
         # spec 2.5): where the package came from and how to rebuild it
         "source": source,
-        "build": svc.get("build", "") if (app["type"] == "native" or svc.get("build")) else "",
+        "build": primary["build"],
         "storage": m.get("storage") or [],
         # declared config keys (labels + secret flags) so the CLI and the
         # portal can offer them for editing without the manifest at hand
@@ -1427,8 +1583,10 @@ def remove_instance(reg, name, purge):
     for other in reg["instances"].values():
         if name in (other.get("links") or []):
             other["links"] = [x for x in other["links"] if x != name]
-    subprocess.run(["docker", "rm", "-f", inst["container"]],
-                   capture_output=True, text=True)
+    # remove every service container of the instance (RFC-0016)
+    for s in instance_services(inst):
+        subprocess.run(["docker", "rm", "-f", s["container"]],
+                       capture_output=True, text=True)
     for other in partners:
         teardown_link_network(name, other)
     # drop the instance's own network (disconnects the gateway first)
@@ -1538,7 +1696,7 @@ def cmd_visibility(args):
     with open(os.path.join(CADDY_APPS_DIR, f"{args.name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"], groups, args.name,
-                           throttle_of(inst)))
+                           throttle_of(inst), services=route_targets(inst)))
     refresh_generated_sites()
     reload_gateway()
     if groups:
@@ -2404,11 +2562,42 @@ def cmd_process_deploys(_args):
                 with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
                     f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                                        inst["svc_port"], groups, name,
-                                       throttle_of(inst)))
+                                       throttle_of(inst), services=route_targets(inst)))
                 refresh_generated_sites()
                 reload_gateway()
                 ok = True
                 msg = ("visibility set to groups: " + ", ".join(groups)) if groups else "visibility set to all"
+        elif action == "link":
+            # App-to-app link (RFC-0016). Like visibility, the portal's
+            # registry mount is read-only, so the host applies it — and
+            # the same checks run here as in the CLI, because the spool
+            # is data, not trust. server_admin territory (the portal
+            # route already gates it).
+            op = req.get("op", "")
+            target = str(req.get("target") or "")
+            if not inst:
+                msg = "unknown instance"
+            elif target not in reg["instances"]:
+                msg = f"unknown target instance '{target}'"
+            elif target == name:
+                msg = "an instance cannot link to itself"
+            else:
+                links = set(inst.get("links") or [])
+                if op == "add":
+                    inst["links"] = sorted(links | {target})
+                    save_registry(reg)
+                    setup_link_network(reg, name, target)
+                    ok = True
+                    msg = f"linked: {name} may reach {target}"
+                elif op == "remove":
+                    inst["links"] = sorted(links - {target})
+                    save_registry(reg)
+                    if name not in (reg["instances"][target].get("links") or []):
+                        teardown_link_network(name, target)
+                    ok = True
+                    msg = f"link {name} -> {target} removed"
+                else:
+                    msg = f"unknown link op '{op}'"
         elif action == "tile":
             # Launchpad tile override (runtime spec 2.10). Registry only
             # — no gateway work, because this changes nothing about who
@@ -2526,7 +2715,8 @@ def cmd_process_deploys(_args):
                         f.write(caddy_site(inst["port"], inst["routes"],
                                            inst["container"], inst["svc_port"],
                                            (inst.get("visibility") or {}).get("groups"),
-                                           name, throttle_of(inst)))
+                                           name, throttle_of(inst),
+                                           services=route_targets(inst)))
                     refresh_generated_sites()
                     reload_gateway()
                     t = throttle_of(inst)
@@ -2683,12 +2873,16 @@ def _deploy_from_registry(name, inst):
     Returns False (with an explanation) when the instance cannot come
     back automatically; its data stays restored either way.
     """
-    image = inst["image"]
-    if image.startswith("oaap-app/"):
-        src = inst.get("source") or {}
-        tmp = None
-        pkg = ""
-        try:
+    # RFC-0016: an instance may have several service containers; build or
+    # pull each. The package source is fetched once if ANY service needs
+    # a local build.
+    services = instance_services(inst)
+    needs_build = any(s["image"].startswith("oaap-app/") for s in services)
+    tmp = None
+    pkg = ""
+    try:
+        if needs_build:
+            src = inst.get("source") or {}
             if src.get("kind") == "git":
                 tmp = tempfile.mkdtemp(prefix="oaap-restore-")
                 print(f"Fetching {src['url']} ...")
@@ -2698,30 +2892,32 @@ def _deploy_from_registry(name, inst):
             elif src.get("kind") == "local":
                 pkg = os.path.join(src.get("url", ""), src.get("path") or "")
             if not pkg or not os.path.isdir(pkg):
-                print(f"SKIPPED {name}: image {image} must be rebuilt, but its package "
+                print(f"SKIPPED {name}: images must be rebuilt, but the package "
                       f"source is not available on this machine "
                       f"({src.get('url') or 'no source recorded'}). Data is restored — "
                       f"copy the package here or reinstall it under the same name.")
                 return False
-            print(f"Building {image} ...")
-            run(["docker", "build", "-q", "-t", image,
-                 os.path.join(pkg, inst.get("build") or ".")])
-        finally:
-            if tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        print(f"Pulling {image} ...")
-        run(["docker", "pull", "-q", image])
+        for s in services:
+            if s["image"].startswith("oaap-app/"):
+                print(f"Building {s['image']} ...")
+                run(["docker", "build", "-q", "-t", s["image"],
+                     os.path.join(pkg, s.get("build") or ".")])
+            else:
+                print(f"Pulling {s['image']} ...")
+                run(["docker", "pull", "-q", s["image"]])
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     if not os.path.isfile(env_path(name)):
         print(f"SKIPPED {name}: no instance.env in the restored data.")
         return False
-    container = inst["container"]
-    start_instance_container(name, container, image, inst.get("storage"))
+    recreate_instance_containers(name, services, inst.get("storage") or [])
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(inst["port"], inst["routes"], container, inst["svc_port"],
+        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
+                           inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst)))
+                           throttle_of(inst), services=route_targets(inst)))
     print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
           f"channel {inst['channel']}, port {inst['port']})")
     # The instance's own public address travels with it (RFC-0009): it

@@ -25,6 +25,11 @@ from markupsafe import Markup
 
 IDENTITY = "http://identity:8000"
 GATEWAY = "http://gateway:80"
+# Internal health-probe listener on the gateway (RFC-0016): the portal
+# cannot reach isolated app containers directly, so it asks the gateway
+# — the only core service on every app network — to probe them. Only
+# reachable container-to-container on the platform network.
+GATEWAY_HEALTH = "http://gateway:8099"
 
 # Every call to identity's /internal/* API carries this key (RFC-0015
 # addendum A4). Reaching identity over the container network is no longer
@@ -984,6 +989,43 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 {% endif %}
+<div class="card">
+  <h2>Verbindungen zu anderen Apps</h2>
+  <p class="muted">Standardmäßig ist jede App für sich — sie erreicht keine
+     andere. Hier kannst Du dieser Instanz ausdrücklich erlauben, eine andere
+     zu erreichen (über ein eigenes, getrenntes Netz). Das ist die einzige Art,
+     wie zwei Apps miteinander sprechen, und sie ist jederzeit widerrufbar.</p>
+  {% if i.links %}
+  <table class="mini">
+    <tr><th>Diese App darf erreichen</th><th></th></tr>
+    {% for t in i.links %}
+    <tr>
+      <td><code>{{ t }}</code></td>
+      <td><form method="post" action="/instances/{{ i.name }}/link">
+        <input type="hidden" name="op" value="remove">
+        <input type="hidden" name="target" value="{{ t }}">
+        <button class="secondary">Trennen</button>
+      </form></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Keine Verbindung — diese App ist vollständig isoliert.</p>
+  {% endif %}
+  {% if i.link_candidates %}
+  <form method="post" action="/instances/{{ i.name }}/link">
+    <input type="hidden" name="op" value="add">
+    <label>Verbindung erlauben zu
+      <select name="target">
+        {% for c in i.link_candidates %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+      </select>
+    </label>
+    <button>Verbinden</button>
+    <p class="muted">Die Ziel-App sieht dadurch nur den vereinbarten Draht, nicht
+       das Innenleben dieser App. Die Verbindung übersteht ein Neu-Ausrollen.</p>
+  </form>
+  {% endif %}
+</div>
 {% if i.is_test %}
 <div class="card">
   <h2>Deploy-Token</h2>
@@ -1701,14 +1743,19 @@ def health():
     for name, inst in sorted(load_instances().items()):
         container, svc_port = inst.get("container"), inst.get("svc_port")
         health_path = inst.get("health_path")
+        # RFC-0016: apps are isolated on their own networks and the portal
+        # can no longer reach them by container name. The gateway is the
+        # one core service on every app network, so we probe THROUGH it,
+        # via its internal health endpoint (appctl write_internal_health_
+        # caddy, gateway:8099/h/<name> -> the app's health path, no auth).
         if container and svc_port and health_path:
-            state, label, detail = _probe(f"http://{container}:{svc_port}{health_path}")
+            state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
             # Wrapped apps often answer their root with a redirect —
             # any response below 400 counts as alive.
             if state == "warn" and detail.startswith("HTTP 3"):
                 state, label = "ok", "Gesund"
         elif container and svc_port:
-            state, label, detail = _probe(f"http://{container}:{svc_port}/")
+            state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
             if state == "warn":  # any HTTP answer counts as reachable here
                 state, label = "ok", "Erreichbar"
             if state == "ok":
@@ -2220,6 +2267,7 @@ def store_install():
 # instance's Caddy site(s) and reloads the gateway.
 
 VISIBILITY_WAIT_SECONDS = 20  # registry+Caddy+reload only, no docker work
+LINK_WAIT_SECONDS = 30  # creates/removes a network and connects containers
 
 
 def _instance_groups(inst):
@@ -2415,9 +2463,33 @@ def instance_detail(name):
                                  for r in inst.get("routes") or []),
          "tile_mode": iv.tile_mode(inst),
          "tile_reason": iv.tile_reason(inst),
+         # app-to-app links (RFC-0016): the instances this one may reach,
+         # and the other instances still available to link to
+         "links": inst.get("links") or [],
+         "link_candidates": sorted(n for n in load_instances()
+                                   if n != name
+                                   and n not in (inst.get("links") or [])),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.post("/instances/<name>/link")
+def instance_link(name):
+    """Declare or drop an app-to-app link (RFC-0016). server_admin only;
+    queued through the spool worker like every other instance write."""
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    op = request.form.get("op", "add")
+    target = (request.form.get("target") or "").strip()
+    if not target:
+        return redirect(f"/instances/{name}?err={quote('Bitte eine Ziel-Instanz wählen.')}",
+                        code=303)
+    return _queue_and_redirect(name, {"action": "link", "op": op, "target": target},
+                               LINK_WAIT_SECONDS)
 
 
 @app.post("/instances/<name>/visibility")
