@@ -335,6 +335,9 @@ def save_registry(reg):
 PROFILES = {
     "dev": "development node — the portal may create test instances and "
            "install from a source no store list carries yet (RFC-0011)",
+    "exposed": "exposed node — an operator may grant an app a non-HTTP "
+               "port that bypasses the gateway (RFC-0015). Only meaningful "
+               "where the node has (or will get) the router port forward.",
 }
 
 
@@ -504,6 +507,29 @@ def validate_manifest(m):
             errs.append(f"storage {s.get('name')}: unknown service '{ssvc}'")
         elif ssvc is None and multi:
             errs.append(f"storage {s.get('name')}: 'service' is required when the "
+                        "app has more than one service")
+    # RFC-0015: at most one non-HTTP endpoint, declared but not published
+    # until an operator grants it on an 'exposed' node.
+    endpoints = m.get("endpoints") or []
+    if len(endpoints) > 1:
+        errs.append("endpoints: at most one endpoint per app (RFC-0015)")
+    for e in endpoints:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(e.get("name", ""))):
+            errs.append(f"endpoint name invalid: '{e.get('name')}'")
+        if e.get("protocol") not in ("udp", "tcp", "both"):
+            errs.append(f"endpoint {e.get('name')}: protocol must be udp | tcp | both")
+        if not isinstance(e.get("container_port"), int):
+            errs.append(f"endpoint {e.get('name')}: container_port (integer) required")
+        if e.get("wish") is not None and not isinstance(e.get("wish"), int):
+            errs.append(f"endpoint {e.get('name')}: wish must be an integer port")
+        if not str(e.get("reason") or "").strip():
+            errs.append(f"endpoint {e.get('name')}: a 'reason' is required — it is "
+                        "shown to the operator verbatim at grant time")
+        esvc = e.get("service")
+        if esvc is not None and esvc not in services:
+            errs.append(f"endpoint {e.get('name')}: unknown service '{esvc}'")
+        elif esvc is None and multi:
+            errs.append(f"endpoint {e.get('name')}: 'service' is required when the "
                         "app has more than one service")
     if not str((m.get("health") or {}).get("path", "")).startswith("/"):
         errs.append("health.path: required, must start with /")
@@ -1082,11 +1108,29 @@ def instance_services(inst):
              "port": inst.get("svc_port")}]
 
 
-def recreate_instance_containers(name, services, storage):
+def _endpoint_publish(endpoints, svc_name, primary):
+    """docker -p / -e args for the granted endpoint (RFC-0015) attached to
+    this service. At most one endpoint exists; it publishes a raw host
+    port straight to the container (bypassing the gateway) and tells the
+    app its assigned public port via OAAP_ENDPOINT_PORT."""
+    args = []
+    for e in endpoints or []:
+        if (e.get("service") or primary) != svc_name:
+            continue
+        protos = ["udp", "tcp"] if e["protocol"] == "both" else [e["protocol"]]
+        for proto in protos:
+            args += ["-p", f"{e['host_port']}:{e['container_port']}/{proto}"]
+        args += ["-e", f"OAAP_ENDPOINT_PORT={e['host_port']}",
+                 "-e", f"OAAP_ENDPOINT_NAME={e['name']}"]
+    return args
+
+
+def recreate_instance_containers(name, services, storage, endpoints=None):
     """(Re)create ALL of an instance's service containers on its own
     network (RFC-0016), from their recorded shape. Storage entries go to
     the service named in `service`, defaulting to the primary (services
-    are ordered primary-first)."""
+    are ordered primary-first). A granted non-HTTP endpoint (RFC-0015)
+    publishes a raw host port on its service's container."""
     primary = services[0]["service"]
     # RFC-0016: the instance's own network, gateway bridged in. Set up
     # before the containers so they land on the right network at
@@ -1111,11 +1155,31 @@ def recreate_instance_containers(name, services, storage):
         # (e.g. a UI talking to "db"), not by our oaap-app-<inst>-<svc>
         # container name. Single-service apps need no alias.
         alias = ["--network-alias", s["service"]] if s["service"] else []
+        publish = _endpoint_publish(endpoints, s["service"], primary)
         subprocess.run(["docker", "rm", "-f", s["container"]],
                        capture_output=True, text=True)
         run(["docker", "run", "-d", "--name", s["container"],
              "--restart", "unless-stopped", "--network", net, *alias,
-             "--env-file", env_path(name), *mounts, s["image"]])
+             "--env-file", env_path(name), *mounts, *publish, s["image"]])
+
+
+ENDPOINT_PORT_RANGE = range(8200, 8300)
+
+
+def assign_endpoint_port(reg, wish, exclude=None):
+    """Pick a host port for a granted endpoint (RFC-0015): the wished-for
+    one if free, else the next free port in the reserved range. Ports are
+    node-unique; a fixed/wished port that collides falls back rather than
+    fail (Jörg's decision: a wish, not a demand)."""
+    used = {e["host_port"] for i in reg["instances"].values()
+            for e in (i.get("endpoints") or [])}
+    used.discard(exclude)
+    if wish and wish not in used:
+        return wish
+    for p in ENDPOINT_PORT_RANGE:
+        if p not in used:
+            return p
+    die("no free endpoint port available on this node")
 
 
 def route_targets(inst):
@@ -1475,9 +1539,15 @@ def _install_from_dir(pkg, args, source):
         env.setdefault(c["key"], c.get("default", ""))
     save_env(name, env)
 
+    # a granted non-HTTP endpoint (RFC-0015) survives redeploy like the
+    # address and visibility do — the operator's decision to open a port
+    # must not be undone by a deployment. The declared endpoint(s) from
+    # the manifest are re-read so 'endpoint list/allow' works offline.
+    granted = (inst.get("endpoints") or []) if inst else []
+
     # per-instance storage, writable for the container user (guarantee 4);
     # every service container lands on the instance's own network (RFC-0016)
-    recreate_instance_containers(name, services, m.get("storage") or [])
+    recreate_instance_containers(name, services, m.get("storage") or [], granted)
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance
@@ -1522,6 +1592,10 @@ def _install_from_dir(pkg, args, source):
         "source": source,
         "build": primary["build"],
         "storage": m.get("storage") or [],
+        # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the
+        # manifest on every install; publication needs a separate operator
+        # grant (stored in "endpoints" below), which survives redeploy.
+        "declared_endpoints": m.get("endpoints") or [],
         # declared config keys (labels + secret flags) so the CLI and the
         # portal can offer them for editing without the manifest at hand
         "config": [{"key": c["key"], "label": c.get("label", ""),
@@ -1551,6 +1625,13 @@ def _install_from_dir(pkg, args, source):
     # because it is the operator's decision about this instance.
     if inst and inst.get("tile"):
         reg["instances"][name]["tile"] = inst["tile"]
+    # a granted non-HTTP endpoint (RFC-0015) is the operator's decision to
+    # open a port — it survives redeploy like the address. The container
+    # was already recreated with its publish mapping (via `granted`).
+    if inst and inst.get("endpoints"):
+        reg["instances"][name]["endpoints"] = inst["endpoints"]
+    if inst and inst.get("links"):
+        reg["instances"][name]["links"] = inst["links"]
     save_registry(reg)
     if channel == "production":
         # moving to production invalidates any deploy token (spec 2.5)
@@ -1680,6 +1761,99 @@ def cmd_link(args):
         if a not in (reg["instances"][b].get("links") or []):
             teardown_link_network(a, b)
         print(f"Link removed: '{a}' can no longer reach '{b}'.")
+
+
+def _endpoint_protos(proto):
+    return ["udp", "tcp"] if proto == "both" else [proto]
+
+
+def _print_endpoint_grant(name, ep):
+    """The loud, mandatory warning + the router forwards to create
+    (RFC-0015). Said in the operator's terms, not dressed up."""
+    print(f"Endpoint '{ep['name']}' granted for instance '{name}'.")
+    print("")
+    print("  WHAT YOU JUST OPENED — read this:")
+    print("  This is a RAW port straight to the app. It does NOT pass through")
+    print("  the gateway, so it has NO login, NO role check, NO rate limit and")
+    print("  NO access log. The app alone is responsible for who it lets in.")
+    print(f"  The app author's stated reason: {ep.get('reason', '(none given)')}")
+    print("")
+    print("  Router port forward(s) to create on your internet router,")
+    print("  pointed at THIS node:")
+    for proto in _endpoint_protos(ep["protocol"]):
+        print(f"    {proto.upper()}  {ep['host_port']}  ->  this node  ({proto} {ep['host_port']})")
+    print("")
+    print(f"  The app is told its public port via OAAP_ENDPOINT_PORT={ep['host_port']}.")
+    print("  This address is node-local: the edge cannot forward it, and a")
+    print("  restore on another machine will not bring it along.")
+
+
+def cmd_endpoint(args):
+    """Declare-time endpoints are in the manifest; this grants/denies them
+    per instance (RFC-0015). Grant is gated on the 'exposed' node profile,
+    because opening a gateway-bypassing port is exactly the power that
+    profile marks a node as willing to give."""
+    reg = load_registry()
+    inst = reg["instances"].get(args.name)
+    if not inst:
+        die(f"no instance named '{args.name}'")
+    declared = inst.get("declared_endpoints") or []
+    granted = {e["name"]: e for e in (inst.get("endpoints") or [])}
+
+    if args.action == "list":
+        if not declared:
+            print(f"'{args.name}' declares no non-HTTP endpoints.")
+            return
+        for d in declared:
+            g = granted.get(d["name"])
+            if g:
+                protos = "+".join(_endpoint_protos(g["protocol"]))
+                print(f"  {d['name']}: GRANTED — host port {g['host_port']} "
+                      f"({protos} -> container {g['container_port']})")
+            else:
+                wish = f", wants {d['wish']}" if d.get("wish") else ""
+                print(f"  {d['name']}: not granted ({d['protocol']}, "
+                      f"container {d['container_port']}{wish})")
+            print(f"      reason: {d.get('reason', '').strip()}")
+        return
+
+    ep_name = args.endpoint
+    if not ep_name:
+        die(f"'oaap app endpoint {args.action}' needs an endpoint name "
+            f"(see 'oaap app endpoint list {args.name}')")
+    decl = next((d for d in declared if d["name"] == ep_name), None)
+    if not decl:
+        die(f"'{args.name}' declares no endpoint named '{ep_name}'")
+
+    if args.action == "allow":
+        if not has_profile("exposed"):
+            die("this node has no profile 'exposed' — granting a "
+                "gateway-bypassing port is refused. Set it deliberately on "
+                "the machine with 'sudo oaap node add-profile exposed'.")
+        if ep_name in granted:
+            print(f"'{ep_name}' is already granted "
+                  f"(host port {granted[ep_name]['host_port']}).")
+            return
+        host_port = assign_endpoint_port(reg, decl.get("wish"))
+        entry = {"name": ep_name, "protocol": decl["protocol"],
+                 "container_port": decl["container_port"],
+                 "host_port": host_port, "service": decl.get("service", ""),
+                 "reason": decl.get("reason", "")}
+        inst["endpoints"] = [e for e in (inst.get("endpoints") or [])
+                             if e["name"] != ep_name] + [entry]
+        save_registry(reg)
+        recreate_instance_containers(args.name, instance_services(inst),
+                                     inst.get("storage") or [], inst["endpoints"])
+        _print_endpoint_grant(args.name, entry)
+    else:  # deny
+        if ep_name not in granted:
+            die(f"'{ep_name}' is not currently granted")
+        inst["endpoints"] = [e for e in inst["endpoints"] if e["name"] != ep_name]
+        save_registry(reg)
+        recreate_instance_containers(args.name, instance_services(inst),
+                                     inst.get("storage") or [], inst["endpoints"])
+        print(f"Endpoint '{ep_name}' denied for '{args.name}'. The raw port is "
+              f"closed; you may remove its router forward.")
 
 
 def cmd_visibility(args):
@@ -2573,6 +2747,52 @@ def cmd_process_deploys(_args):
                 reload_gateway()
                 ok = True
                 msg = ("visibility set to groups: " + ", ".join(groups)) if groups else "visibility set to all"
+        elif action == "endpoint":
+            # Non-HTTP endpoint grant/deny (RFC-0015). Applied on the host
+            # like visibility (read-only registry mount in the portal),
+            # and the same checks run here — the spool is data, not trust.
+            # The 'exposed' profile gate is re-checked here, not only at
+            # the button: a queued request must not open a raw port on a
+            # node the operator never marked as exposed.
+            op = req.get("op", "")
+            ep_name = str(req.get("endpoint") or "")
+            declared = (inst.get("declared_endpoints") if inst else None) or []
+            decl = next((d for d in declared if d["name"] == ep_name), None)
+            if not inst:
+                msg = "unknown instance"
+            elif not decl:
+                msg = f"no declared endpoint '{ep_name}'"
+            elif op == "allow" and not has_profile("exposed"):
+                msg = ("this node has no profile 'exposed' — a gateway-"
+                       "bypassing port is refused (set it on the machine)")
+            else:
+                current = [e for e in (inst.get("endpoints") or [])
+                           if e["name"] != ep_name]
+                if op == "allow":
+                    hp = assign_endpoint_port(reg, decl.get("wish"))
+                    current.append({"name": ep_name, "protocol": decl["protocol"],
+                                    "container_port": decl["container_port"],
+                                    "host_port": hp, "service": decl.get("service", ""),
+                                    "reason": decl.get("reason", "")})
+                    inst["endpoints"] = current
+                    save_registry(reg)
+                    recreate_instance_containers(name, instance_services(inst),
+                                                 inst.get("storage") or [],
+                                                 inst["endpoints"])
+                    ok = True
+                    msg = (f"endpoint '{ep_name}' granted on host port {hp} "
+                           f"({'+'.join(_endpoint_protos(decl['protocol']))}) — "
+                           f"raw port, no gateway; forward it on your router")
+                elif op == "deny":
+                    inst["endpoints"] = current
+                    save_registry(reg)
+                    recreate_instance_containers(name, instance_services(inst),
+                                                 inst.get("storage") or [],
+                                                 inst["endpoints"])
+                    ok = True
+                    msg = f"endpoint '{ep_name}' denied; raw port closed"
+                else:
+                    msg = f"unknown endpoint op '{op}'"
         elif action == "link":
             # App-to-app link (RFC-0016). Like visibility, the portal's
             # registry mount is read-only, so the host applies it — and
@@ -2761,6 +2981,7 @@ def cmd_process_deploys(_args):
                "config": "portal", "token": "portal",
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
+               "endpoint": "portal", "link": "portal",
                "source": "portal", "node": "setup wizard"}.get(action, "deploy-hook")
         record = {"instance": name or "(dieser Knoten)", "ok": ok,
                   "message": msg, "revision": revision,
@@ -2918,7 +3139,17 @@ def _deploy_from_registry(name, inst):
     if not os.path.isfile(env_path(name)):
         print(f"SKIPPED {name}: no instance.env in the restored data.")
         return False
+    # RFC-0015: a granted endpoint's PORT and router forward belong to the
+    # old machine. Do not re-publish it here (the port may be taken and no
+    # forward exists) — bring the instance back with the port CLOSED, drop
+    # the stale grant, and report so the operator re-grants deliberately.
+    had_endpoints = inst.get("endpoints") or []
     recreate_instance_containers(name, services, inst.get("storage") or [])
+    if had_endpoints:
+        r = load_registry()
+        if name in r["instances"]:
+            r["instances"][name].pop("endpoints", None)
+            save_registry(r)
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"],
@@ -3175,6 +3406,11 @@ def main():
     pmn = sub.add_parser("migrate-networks",
                          help="internal: isolate app networks + reconnect the gateway (RFC-0016)")
     pmn.set_defaults(fn=cmd_migrate_networks)
+    pep = sub.add_parser("endpoint", help="non-HTTP endpoints (RFC-0015)")
+    pep.add_argument("action", choices=["list", "allow", "deny"])
+    pep.add_argument("name", help="instance name")
+    pep.add_argument("endpoint", nargs="?", help="endpoint name (for allow/deny)")
+    pep.set_defaults(fn=cmd_endpoint)
     pt = sub.add_parser("tile")
     pt.add_argument("name")
     # Deliberately no argparse `choices` here: whether it validates the

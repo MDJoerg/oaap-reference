@@ -989,6 +989,45 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 {% endif %}
+{% if i.endpoints %}
+<div class="card">
+  <h2>Direkter Port (ohne Gateway)</h2>
+  <p class="muted">Diese App möchte einen <strong>Nicht-HTTP-Port</strong> —
+     etwa für Echtzeit-Medien. Ein solcher Port läuft <strong>am Gateway
+     vorbei</strong>: <strong>keine Anmeldung, keine Rollenprüfung, keine
+     Drosselung, kein Zugriffsprotokoll</strong>. Wer hereinkommt, entscheidet
+     allein die App. Das ist die bewusste Ausnahme — Du gibst sie frei, nicht
+     die App.</p>
+  {% for e in i.endpoints %}
+  <div class="subcard">
+    <p><strong>{{ e.name }}</strong> — {{ e.protocol }}, App-Port {{ e.container_port }}</p>
+    <p class="muted">Begründung der App: {{ e.reason or '—' }}</p>
+    {% if e.granted %}
+    <p>Freigegeben auf <strong>Host-Port {{ e.host_port }}</strong>. Leite diesen
+       Port auf Deinem Router auf diesen Knoten weiter ({{ e.protocol }}
+       {{ e.host_port }}). Die Adresse ist knotenlokal — der Edge trägt sie nicht,
+       und eine Wiederherstellung auf einer anderen Maschine bringt sie nicht mit.</p>
+    <form method="post" action="/instances/{{ i.name }}/endpoint">
+      <input type="hidden" name="op" value="deny">
+      <input type="hidden" name="endpoint" value="{{ e.name }}">
+      <button class="secondary">Port schließen</button>
+    </form>
+    {% elif i.node_exposed %}
+    <form method="post" action="/instances/{{ i.name }}/endpoint"
+          onsubmit="return confirm('Dieser Port läuft am Gateway vorbei — keine Anmeldung, keine Drosselung, kein Protokoll. Wirklich freigeben?');">
+      <input type="hidden" name="op" value="allow">
+      <input type="hidden" name="endpoint" value="{{ e.name }}">
+      <button>Port freigeben</button>
+    </form>
+    {% else %}
+    <p class="muted">Dieser Knoten hat das Profil <code>exposed</code> nicht —
+       einen solchen Port kann er nicht freigeben. Setze es bewusst auf der
+       Maschine: <code>sudo oaap node add-profile exposed</code>.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
 <div class="card">
   <h2>Verbindungen zu anderen Apps</h2>
   <p class="muted">Standardmäßig ist jede App für sich — sie erreicht keine
@@ -2268,6 +2307,7 @@ def store_install():
 
 VISIBILITY_WAIT_SECONDS = 20  # registry+Caddy+reload only, no docker work
 LINK_WAIT_SECONDS = 30  # creates/removes a network and connects containers
+ENDPOINT_WAIT_SECONDS = 90  # recreates the instance's containers with a port map
 
 
 def _instance_groups(inst):
@@ -2469,9 +2509,48 @@ def instance_detail(name):
          "link_candidates": sorted(n for n in load_instances()
                                    if n != name
                                    and n not in (inst.get("links") or [])),
+         # non-HTTP endpoints (RFC-0015): what the app declares, which are
+         # granted, and whether this node is even allowed to grant them
+         "endpoints": _endpoint_view(inst),
+         "node_exposed": "exposed" in node_profiles(),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+def _endpoint_view(inst):
+    """Declared endpoints merged with their grant status, for the portal
+    card (RFC-0015)."""
+    granted = {e["name"]: e for e in (inst.get("endpoints") or [])}
+    rows = []
+    for d in inst.get("declared_endpoints") or []:
+        g = granted.get(d["name"])
+        rows.append({
+            "name": d["name"], "protocol": d["protocol"],
+            "container_port": d["container_port"], "wish": d.get("wish"),
+            "reason": (d.get("reason") or "").strip(),
+            "granted": bool(g), "host_port": g["host_port"] if g else None,
+        })
+    return rows
+
+
+@app.post("/instances/<name>/endpoint")
+def instance_endpoint(name):
+    """Grant or revoke a non-HTTP endpoint (RFC-0015). server_admin only;
+    queued through the spool worker, which re-checks the 'exposed' node
+    profile — the button is not the boundary."""
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    op = request.form.get("op", "allow")
+    ep = (request.form.get("endpoint") or "").strip()
+    if not ep:
+        return redirect(f"/instances/{name}?err={quote('Kein Endpunkt angegeben.')}",
+                        code=303)
+    return _queue_and_redirect(name, {"action": "endpoint", "op": op, "endpoint": ep},
+                               ENDPOINT_WAIT_SECONDS)
 
 
 @app.post("/instances/<name>/link")
