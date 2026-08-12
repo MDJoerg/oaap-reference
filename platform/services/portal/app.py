@@ -1698,9 +1698,14 @@ def _public_ip():
 
 
 def _resolve(name):
+    """All addresses, IPv4 AND IPv6 (AF_UNSPEC). A name that resolves only
+    over IPv6 — e.g. a Fritzbox rebind-protected CNAME seen from inside the
+    LAN, which strips the IPv4 answer — must not read as 'does not resolve'.
+    That IPv4-only false negative is exactly what this dual-stack lookup
+    fixes (RFC-0009 follow-up)."""
     import socket
     try:
-        return sorted({a[4][0] for a in socket.getaddrinfo(name, None, socket.AF_INET)})
+        return sorted({a[4][0] for a in socket.getaddrinfo(name, None, socket.AF_UNSPEC)})
     except OSError:
         return []
 
@@ -1723,6 +1728,7 @@ def _dns_check_run():
         result["public_ip"], result["source"] = _public_ip()
     for entry in names:
         ips = _resolve(entry["name"])
+        v4 = [a for a in ips if ":" not in a]
         row = dict(entry, resolved=", ".join(ips) or "–")
         if not ips:
             row["state"], row["label"] = "err", "Löst nicht auf"
@@ -1732,6 +1738,11 @@ def _dns_check_run():
             row["state"], row["label"] = "unknown", "Nicht vergleichbar"
         elif result["public_ip"] in ips:
             row["state"], row["label"] = "ok", "Zeigt hierher"
+        elif not v4:
+            # Resolves only over IPv6. Our public address is IPv4 (ipify),
+            # so there is nothing to compare against — say so honestly
+            # instead of raising a false "points elsewhere" alarm.
+            row["state"], row["label"] = "unknown", "Nur IPv6 (nicht vergleichbar)"
         else:
             row["state"], row["label"] = "warn", "Zeigt woanders hin"
         result["rows"].append(row)
