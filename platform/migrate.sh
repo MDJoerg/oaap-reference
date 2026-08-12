@@ -51,6 +51,34 @@ if [ -f "$UNIT" ] && ! grep -q '^StartLimitIntervalSec=' "$UNIT"; then
   fi
 fi
 
+# --- key for identity's internal API (RFC-0015 addendum A4) ---
+# Existing installations have no INTERNAL_API_KEY in their .env, and
+# identity fails closed without one — so this step must run, and it must
+# recreate the two services itself. `oaap update` calls migrate.sh AFTER
+# `docker compose up -d`, so by the time we get here identity is already
+# running with the new code and an empty key. Writing the value alone
+# would change nothing until the next restart.
+#
+# The window this leaves is a few seconds of a portal that cannot manage
+# users, on the node of an operator who is watching an update run. Login
+# and app traffic are unaffected — they never touch /internal/*.
+ENVF="$APP_DIR/.env"
+if [ -f "$ENVF" ] && ! grep -q '^INTERNAL_API_KEY=' "$ENVF"; then
+  say ""
+  say "Securing identity's internal API (RFC-0015 A4) ..."
+  umask 077
+  printf 'INTERNAL_API_KEY=%s\n' \
+    "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$ENVF"
+  if docker compose --project-directory "$APP_DIR" --project-name oaap \
+       up -d identity portal >/dev/null 2>&1; then
+    say "  Done — /internal/* now requires the platform key."
+  else
+    say "  WARNING: the key was written but identity/portal could not be"
+    say "  recreated. Run: docker compose --project-directory $APP_DIR \\"
+    say "    --project-name oaap up -d identity portal"
+  fi
+fi
+
 # --- shipped store sources (RFC-0012 §4) ---
 # Sources used to be written once, at installation, and never touched
 # again — so the day one of our lists moves, every node in the field

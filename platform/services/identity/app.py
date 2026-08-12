@@ -522,8 +522,42 @@ def throttle():
 
 
 # ---------------------------------------------------------------------------
-# Internal API — only reachable on the container network (spec 4.3).
-# The portal is responsible for admin authorization of its callers.
+# Internal API — the portal is responsible for admin authorization of its
+# callers; this layer only establishes that the caller IS the portal.
+#
+# WHY THIS GUARD EXISTS (RFC-0015 addendum A4, found 2026-08-11). Until
+# now the only protection was "reachable on the container network" — and
+# EVERY app instance runs on that same network (`--network oaap_default`).
+# So any code inside any app container could POST /internal/users with
+# `roles: ["server_admin"]` and hand itself the platform. The gateway
+# enforces RFC-0002 perfectly on the way IN; there was nothing sideways.
+#
+# Checked in one place, by path prefix, rather than per route: the
+# failure we are fixing is precisely the kind where someone adds an
+# endpoint and forgets the decorator. A new /internal/* route is covered
+# the moment it exists.
+#
+# Deliberately FAIL CLOSED when the key is missing. A node whose key was
+# never generated then loses portal user administration and says why —
+# loudly, in a way somebody fixes. Failing open would restore exactly the
+# hole this closes, invisibly and forever. Login, /verify and app traffic
+# do not pass through here and keep working either way.
+INTERNAL_KEY = os.environ.get("INTERNAL_API_KEY", "")
+INTERNAL_HEADER = "X-OAAP-Internal-Key"
+
+
+@app.before_request
+def _guard_internal_api():
+    if not request.path.startswith("/internal/"):
+        return None
+    if not INTERNAL_KEY:
+        return {"error": "internal API key is not configured on this node — "
+                         "run 'sudo oaap update' to generate it"}, 503
+    if not secrets.compare_digest(
+            request.headers.get(INTERNAL_HEADER, ""), INTERNAL_KEY):
+        return {"error": "internal API requires the platform key"}, 401
+    return None
+
 
 @app.get("/internal/status")
 def internal_status():

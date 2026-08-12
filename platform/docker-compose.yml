@@ -30,6 +30,10 @@ services:
     environment:
       SESSION_SECRET: "${SESSION_SECRET}"
       SETUP_TOKEN: "${SETUP_TOKEN}"
+      # Proves that a caller of /internal/* is the portal. Being on this
+      # network no longer proves anything — every app instance is on it
+      # too (RFC-0015 addendum A4). Held by these two services only.
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
     volumes:
       - "${OAAP_DATA_DIR}/data/identity:/data"
       # read-only: external.json — the session cookie must span the
@@ -41,6 +45,7 @@ services:
     restart: unless-stopped
     environment:
       OAAP_VERSION: "${OAAP_VERSION}"
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
     volumes:
       # read-only view of the app-instance registry for launchpad tiles
       - "${OAAP_DATA_DIR}/apps:/apps-registry:ro"

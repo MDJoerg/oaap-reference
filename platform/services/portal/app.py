@@ -25,6 +25,16 @@ from markupsafe import Markup
 
 IDENTITY = "http://identity:8000"
 GATEWAY = "http://gateway:80"
+
+# Every call to identity's /internal/* API carries this key (RFC-0015
+# addendum A4). Reaching identity over the container network is no longer
+# proof of anything — every app instance sits on that same network — so
+# the portal now proves it is the portal. The key is only in the env of
+# these two containers; app instances get their own env file and never
+# see it. Identity refuses /internal/* without it.
+INTERNAL = requests.Session()
+INTERNAL.headers[
+    "X-OAAP-Internal-Key"] = os.environ.get("INTERNAL_API_KEY", "")
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
 REGISTRY = "/apps-registry/registry.json"
 
@@ -1303,7 +1313,7 @@ def _tile_url(name, inst, host, ext, on_lan):
 
 
 def setup_done() -> bool:
-    return requests.get(f"{IDENTITY}/internal/status", timeout=5).json()["setup_done"]
+    return INTERNAL.get(f"{IDENTITY}/internal/status", timeout=5).json()["setup_done"]
 
 
 @app.get("/")
@@ -1332,7 +1342,7 @@ def require_server_admin():
 
 
 def identity_users():
-    return requests.get(f"{IDENTITY}/internal/users", timeout=5).json()["users"]
+    return INTERNAL.get(f"{IDENTITY}/internal/users", timeout=5).json()["users"]
 
 
 def _parse_groups(raw):
@@ -1370,7 +1380,7 @@ def users_create():
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
     }
-    resp = requests.post(f"{IDENTITY}/internal/users", json={
+    resp = INTERNAL.post(f"{IDENTITY}/internal/users", json={
         **form, "password": request.form.get("password", ""),
     }, timeout=5)
     if resp.status_code == 201:
@@ -1400,7 +1410,7 @@ def users_update(username):
     denied = require_server_admin()
     if denied:
         return denied
-    resp = requests.put(f"{IDENTITY}/internal/users/{username}", json={
+    resp = INTERNAL.put(f"{IDENTITY}/internal/users/{username}", json={
         "display_name": request.form.get("display_name", ""),
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
@@ -1416,7 +1426,7 @@ def users_password(username):
     denied = require_server_admin()
     if denied:
         return denied
-    resp = requests.post(f"{IDENTITY}/internal/users/{username}/password", json={
+    resp = INTERNAL.post(f"{IDENTITY}/internal/users/{username}/password", json={
         "password": request.form.get("password", ""),
     }, timeout=5)
     if resp.status_code == 200:
@@ -1647,7 +1657,7 @@ def braked_requests():
     if not public:
         return None
     try:
-        data = requests.get(f"{IDENTITY}/internal/throttle-braked", timeout=3).json()
+        data = INTERNAL.get(f"{IDENTITY}/internal/throttle-braked", timeout=3).json()
     except (requests.RequestException, ValueError):
         return {"hours": 24, "rows": [], "error": True}
     counts = data.get("instances", {})
@@ -1660,9 +1670,11 @@ def braked_requests():
     return {"hours": data.get("hours", 24), "rows": rows, "error": False}
 
 
-def _probe(url, ok_status=200):
+def _probe(url, ok_status=200, via=requests):
+    """Health probe. `via` is the keyed session for /internal/* targets —
+    without it identity answers 401 and a healthy node reads as broken."""
     try:
-        r = requests.get(url, timeout=2, allow_redirects=False)
+        r = via.get(url, timeout=2, allow_redirects=False)
     except requests.RequestException as e:
         return "err", "Nicht erreichbar", type(e).__name__
     if r.status_code == ok_status:
@@ -1676,7 +1688,7 @@ def health():
         return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder partner.", 403
 
     core = []
-    state, label, detail = _probe(f"{IDENTITY}/internal/status")
+    state, label, detail = _probe(f"{IDENTITY}/internal/status", via=INTERNAL)
     core.append({"name": "Identity", "state": state, "label": label, "detail": detail})
     # Full chain: gateway proxies the login page to identity.
     state, label, detail = _probe(f"{GATEWAY}/auth/login")
@@ -2699,7 +2711,7 @@ def setup_submit():
                       "Bitte erneut absenden — oder ohne Haken fortfahren und "
                       "das Profil später mit 'sudo oaap node add-profile dev' "
                       "setzen."), 503
-    resp = requests.post(f"{IDENTITY}/internal/setup", json={
+    resp = INTERNAL.post(f"{IDENTITY}/internal/setup", json={
         "token": token,
         "username": request.form.get("username", ""),
         "password": request.form.get("password", ""),

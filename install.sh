@@ -549,6 +549,10 @@ fi
 gen_secret() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 SETUP_TOKEN="${OAAP_SETUP_TOKEN:-$(gen_secret)}"
 SESSION_SECRET="$(gen_secret)"
+# Proves to identity that a caller of its /internal/* API is the portal
+# (RFC-0015 addendum A4). Unlike the two above it carries no state, so a
+# fresh one is always fine — including on restore.
+INTERNAL_API_KEY="$(gen_secret)"
 
 if [ "$MODE" = "restore" ]; then
   say "Restoring platform state from $RESTORE_FILE ..."
@@ -579,6 +583,7 @@ OAAP_PLATFORM_REF=$PLATFORM_REF
 OAAP_PLATFORM_SOURCE=$SCRIPT_DIR
 SESSION_SECRET=$SESSION_SECRET
 SETUP_TOKEN=$SETUP_TOKEN
+INTERNAL_API_KEY=$INTERNAL_API_KEY
 EOF
 # Baseline for `oaap update`: which revision is installed right now.
 git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse --short HEAD > "$APP_DIR/REVISION" 2>/dev/null \
