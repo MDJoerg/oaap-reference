@@ -35,9 +35,11 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 import yaml
 
@@ -52,6 +54,9 @@ EDGE_FILE = os.path.join(APPS_DIR, "edge.json")
 NODE_FILE = os.path.join(APPS_DIR, "node.json")   # node profiles (RFC-0011)
 DEPLOY_TOKENS = os.path.join(APPS_DIR, "deploy-tokens.json")
 DEPLOY_LOG = os.path.join(APPS_DIR, "deploy-log.jsonl")
+# short-lived, single-use permissions for artifact deployment (RFC-0019):
+# upload grants and envelope confirmations. Nothing long-lived lives here.
+ARTIFACT_GRANTS = os.path.join(APPS_DIR, "artifact-grants.json")
 SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
 PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
@@ -1564,6 +1569,52 @@ def cmd_install(args):
             # list after somebody adds a source. Changing the source
             # stays possible — it just becomes a deliberate act.
             source["store_source"] = args.store_source
+    elif args.package.lower().endswith(".zip") and os.path.isfile(args.package):
+        # an uploaded package (RFC-0019). The same path serves the CLI:
+        # 'oaap app install ./bdt-app.zip --name bdt-app-test --channel test'
+        # needs no repository and no credential for one.
+        reg = load_registry()
+        name = args.name
+        if not name:
+            probe = tempfile.mkdtemp(prefix="oaap-probe-")
+            try:
+                extract_artifact(args.package, probe)
+                with open(os.path.join(package_root(probe, args.path),
+                                       "oaap-app.yaml"), encoding="utf-8") as f:
+                    name = (yaml.safe_load(f) or {})["app"]["id"]
+            except (ArtifactRejected, KeyError, TypeError) as e:
+                shutil.rmtree(probe, ignore_errors=True)
+                die(str(e) if isinstance(e, ArtifactRejected)
+                    else "the archive has no usable oaap-app.yaml")
+            finally:
+                shutil.rmtree(probe, ignore_errors=True)
+        inst = reg["instances"].get(name)
+        if inst and args.channel == "test" and inst.get("channel") == "test":
+            # the envelope rule applies to the CLI too — the difference is
+            # that here a person is standing at the machine, so a widening
+            # is reported and then proceeds
+            probe = tempfile.mkdtemp(prefix="oaap-probe-")
+            try:
+                extract_artifact(args.package, probe)
+                with open(os.path.join(package_root(probe, args.path),
+                                       "oaap-app.yaml"), encoding="utf-8") as f:
+                    notes = sum(envelope_review(inst, yaml.safe_load(f)), [])
+            except ArtifactRejected as e:
+                shutil.rmtree(probe, ignore_errors=True)
+                die(str(e))
+            finally:
+                shutil.rmtree(probe, ignore_errors=True)
+            # reported, not refused: the envelope rule protects the
+            # UNATTENDED path. Here a person is at the machine, and that
+            # person is the confirmation the rule asks for.
+            for line in notes:
+                print(f"NOTE: {line}")
+        try:
+            install_artifact(name, args.package, None, channel=args.channel,
+                             path=args.path)
+        except ArtifactRejected as e:
+            die(str(e))
+        return
     else:
         pkg = os.path.abspath(os.path.join(args.package, args.path)
                               if args.path else args.package)
@@ -1742,7 +1793,9 @@ def _install_from_dir(pkg, args, source):
     save_registry(reg)
     if channel == "production":
         # moving to production invalidates any deploy token (spec 2.5)
+        # and with it every open artifact grant (RFC-0019)
         drop_token(name, "instance is on the production channel")
+        grants_drop_for(name, "instance is on the production channel")
     refresh_generated_sites()
     reload_gateway()
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
@@ -1794,6 +1847,7 @@ def remove_instance(reg, name, purge):
     refresh_generated_sites()
     reload_gateway()
     drop_token(name, "instance removed")
+    grants_drop_for(name, "instance removed")
     if purge:
         shutil.rmtree(os.path.join(APPS_DIR, name), ignore_errors=True)
         return f"removed '{name}' including data"
@@ -2306,6 +2360,7 @@ def cmd_convert(args):
 # runs 'appctl.py process-deploys' on this host.
 
 import hashlib
+import hmac
 
 
 def load_tokens():
@@ -2378,6 +2433,455 @@ def cmd_token(args):
     print("Usage (after pushing to the recorded source):")
     print(f"  curl -X POST {hook} -H \"Authorization: Bearer <token>\"")
     print("The token redeploys only this test instance from its recorded source.")
+
+
+# -------------------------------------- artifact deployment (RFC-0019)
+# A deployment may bring its own package instead of naming a source the
+# node fetches. The reason is not convenience: fetching from a private
+# repository forces this node to hold a FOREIGN credential in cleartext
+# in the registry, and thus in every backup. An artifact is a package,
+# not an access right — nothing foreign is kept.
+#
+# Three phases (RFC-0019 §2): announce (version, manifest, checksum,
+# size) → the node validates and issues a single-use upload grant → the
+# artifact is admitted only against that grant and checked again before
+# anything is unpacked. The announcement is the contract: the manifest
+# INSIDE the artifact must be byte-identical to the announced one, or
+# phase 1 would be theatre.
+
+ARTIFACT_KEEP = 4                 # current + three predecessors (decision 6)
+ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+ARTIFACT_MAX_UNPACKED = 1024 * 1024 * 1024
+ARTIFACT_MAX_ENTRIES = 20000
+GRANT_TTL = 900                   # 15 minutes
+GRANT_MAX_ATTEMPTS = 3
+
+
+class ArtifactRejected(Exception):
+    """A refusal with a sentence its recipient can act on.
+
+    The recipient is usually an AI without a person next to it, so the
+    message has to say what to change, not merely that something is
+    wrong.
+    """
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def extract_artifact(zip_path, dest):
+    """Unpack an untrusted archive (RFC-0019 §5).
+
+    Everything here guards against an archive that was built to escape
+    its own extraction: absolute paths and '..' walk out of the target,
+    symlinks point out of it after the fact, and a small file can expand
+    to fill the disk. The expansion bound is therefore checked WHILE
+    unpacking — the declared size in the header is the attacker's number.
+    """
+    dest = os.path.abspath(dest)
+    total = 0
+    try:
+        archive = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile:
+        raise ArtifactRejected("the upload is not a readable ZIP archive")
+    with archive as z:
+        infos = z.infolist()
+        if len(infos) > ARTIFACT_MAX_ENTRIES:
+            raise ArtifactRejected(
+                f"archive has {len(infos)} entries, limit is {ARTIFACT_MAX_ENTRIES}")
+        for zi in infos:
+            entry = zi.filename
+            if entry.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", entry):
+                raise ArtifactRejected(f"absolute path in archive: {entry}")
+            target = os.path.abspath(os.path.join(dest, entry))
+            if target != dest and not target.startswith(dest + os.sep):
+                raise ArtifactRejected(f"path escapes the package root: {entry}")
+            if zi.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            mode = (zi.external_attr >> 16) & 0o170000
+            # mode 0 = written by a tool that records no unix modes
+            if mode not in (0, stat.S_IFREG):
+                raise ArtifactRejected(
+                    f"archive contains a link or special file: {entry}")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(zi) as src, open(target, "wb") as out:
+                while True:
+                    chunk = src.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > ARTIFACT_MAX_UNPACKED:
+                        raise ArtifactRejected(
+                            "archive expands past the unpacked size limit "
+                            f"({ARTIFACT_MAX_UNPACKED // (1024 * 1024)} MB)")
+                    out.write(chunk)
+    return total
+
+
+def package_root(unpacked, path=""):
+    """Where oaap-app.yaml lives inside an unpacked artifact.
+
+    An explicit --path wins. Otherwise the root, and failing that a
+    single top-level directory that holds it — 'zip up the project
+    folder' is what people actually do, and refusing it would teach
+    nothing.
+    """
+    if path:
+        return os.path.join(unpacked, path)
+    if os.path.isfile(os.path.join(unpacked, "oaap-app.yaml")):
+        return unpacked
+    entries = [e for e in os.listdir(unpacked)
+               if os.path.isdir(os.path.join(unpacked, e))]
+    if len(entries) == 1:
+        nested = os.path.join(unpacked, entries[0])
+        if os.path.isfile(os.path.join(nested, "oaap-app.yaml")):
+            return nested
+    raise ArtifactRejected(
+        "no oaap-app.yaml found in the archive — it must sit at the root "
+        "of the ZIP (or in a single top-level folder)")
+
+
+def artifact_dir(name):
+    return os.path.join(instance_dir(name), "artifacts")
+
+
+def artifact_list(name):
+    """Retained artifacts, newest first."""
+    d = artifact_dir(name)
+    try:
+        files = [f for f in os.listdir(d) if f.endswith(".zip")]
+    except OSError:
+        return []
+    return sorted(files, key=lambda f: os.path.getmtime(os.path.join(d, f)),
+                  reverse=True)
+
+
+def artifact_store(name, src_path, version, sha):
+    """Keep the artifact so it stays a real source (RFC-0019 §4)."""
+    d = artifact_dir(name)
+    os.makedirs(d, exist_ok=True)
+    fn = f"{version}-{sha[:12]}.zip"
+    dst = os.path.join(d, fn)
+    # a redeploy and a rollback install FROM the retained artifact, so
+    # source and destination are the same file — copying it onto itself
+    # would truncate it
+    if os.path.abspath(src_path) != os.path.abspath(dst):
+        shutil.copyfile(src_path, dst)
+    else:
+        os.utime(dst, None)     # keep retention ordering honest
+    return fn
+
+
+def artifact_prune(name, keep=ARTIFACT_KEEP):
+    d = artifact_dir(name)
+    for old in artifact_list(name)[keep:]:
+        try:
+            os.remove(os.path.join(d, old))
+        except OSError:
+            pass
+
+
+def source_package_arg(name, src):
+    """The 'package' argument that reinstalls from a recorded source."""
+    if (src or {}).get("kind") == "artifact":
+        stored = src.get("stored") or ""
+        return os.path.join(artifact_dir(name), stored) if stored else ""
+    return (src or {}).get("url", "")
+
+
+def _public_paths(routes):
+    return {r["path"] for r in (routes or []) if "public" in (r.get("roles") or [])}
+
+
+def _endpoint_keys(endpoints):
+    return {(e.get("name", ""), e.get("protocol", ""), e.get("container_port"),
+             bool(e.get("fixed"))) for e in (endpoints or [])}
+
+
+def _storage_keys(storage):
+    return {(s.get("name", ""), s.get("mount", "")) for s in (storage or [])}
+
+
+def envelope_review(inst, m):
+    """What a deployment may do on its own, and what needs a person.
+
+    RFC-0019 §3: a deploy token redeploys within the envelope already
+    granted to the instance; anything that WIDENS the envelope requires
+    a human. Returns (hard, confirm) — two lists of sentences.
+    """
+    hard, confirm = [], []
+    app = m["app"]
+    if inst.get("app_id") and app["id"] != inst["app_id"]:
+        hard.append(
+            f"the artifact is app '{app['id']}', but this instance runs "
+            f"'{inst['app_id']}' — an instance belongs to one app")
+    if inst.get("version") and app["version"] == inst["version"]:
+        hard.append(
+            f"version {app['version']} is already installed — an artifact "
+            "deployment must carry a different version, it is the only "
+            "record of what is running")
+    new_public = _public_paths(m.get("routes")) - _public_paths(inst.get("routes"))
+    if new_public:
+        confirm.append("routes become reachable without login: "
+                       + ", ".join(sorted(new_public)))
+    new_ep = _endpoint_keys(m.get("endpoints")) - _endpoint_keys(inst.get("declared_endpoints"))
+    if new_ep:
+        confirm.append("new declared endpoints (ports past the gateway): "
+                       + ", ".join(sorted(e[0] for e in new_ep)))
+    new_st = _storage_keys(m.get("storage")) - _storage_keys(inst.get("storage"))
+    if new_st:
+        confirm.append("new storage mounts: "
+                       + ", ".join(sorted(s[0] for s in new_st)))
+    return hard, confirm
+
+
+# --- single-use grants -------------------------------------------------
+# Nothing here is long-lived, and nothing here is held by whoever uses
+# it: a grant is spent, not kept (RFC-0019, Studio section).
+
+def load_grants():
+    try:
+        with open(ARTIFACT_GRANTS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_grants(grants):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = ARTIFACT_GRANTS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(grants, f, indent=2)
+    os.replace(tmp, ARTIFACT_GRANTS)
+
+
+def _now():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+
+def _grants_prune(grants):
+    now = _now()
+    return {k: v for k, v in grants.items() if v.get("expires", 0) > now}
+
+
+def grant_create(kind, instance, digest, payload, ttl=GRANT_TTL):
+    grants = _grants_prune(load_grants())
+    # one live grant per instance and kind — announcing again replaces
+    # the previous announcement instead of accumulating open doors
+    grants = {k: v for k, v in grants.items()
+              if not (v.get("kind") == kind and v.get("instance") == instance)}
+    grants[digest] = {"kind": kind, "instance": instance, "attempts": 0,
+                      "expires": _now() + ttl, "payload": payload}
+    save_grants(grants)
+
+
+def grant_spend(kind, instance, digest):
+    """Consume a grant. Returns its payload, or None if it does not hold."""
+    grants = _grants_prune(load_grants())
+    entry = grants.get(digest)
+    if (not entry or entry.get("kind") != kind
+            or entry.get("instance") != instance):
+        save_grants(grants)
+        return None
+    entry["attempts"] = entry.get("attempts", 0) + 1
+    if entry["attempts"] > GRANT_MAX_ATTEMPTS:
+        del grants[digest]
+        save_grants(grants)
+        return None
+    payload = entry["payload"]
+    del grants[digest]          # single use
+    save_grants(grants)
+    return payload
+
+
+def grants_drop_for(instance, reason=""):
+    grants = {k: v for k, v in _grants_prune(load_grants()).items()
+              if v.get("instance") != instance}
+    save_grants(grants)
+    if reason:
+        print(f"Artifact grants for '{instance}' dropped ({reason}).")
+
+
+def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
+                      digest, confirmed=False):
+    """Phase 1+2: validate the announcement, issue the upload grant.
+
+    Raises ArtifactRejected with a sentence the caller can act on.
+    """
+    reg = load_registry()
+    inst = reg["instances"].get(name)
+    if not inst:
+        raise ArtifactRejected(f"no instance named '{name}'")
+    if inst.get("channel") != "test":
+        raise ArtifactRejected(
+            f"'{name}' is a production instance — artifact deployment exists "
+            "only for the test channel; promotion stays a human action")
+    if artifact_bytes > ARTIFACT_MAX_BYTES:
+        raise ArtifactRejected(
+            f"artifact is {artifact_bytes} bytes, limit is "
+            f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB")
+    if not re.fullmatch(r"[0-9a-f]{64}", (artifact_sha or "").lower()):
+        raise ArtifactRejected("artifact_sha256 must be a hex SHA-256 digest")
+    try:
+        m = yaml.safe_load(manifest_text)
+    except yaml.YAMLError as e:
+        raise ArtifactRejected(f"the announced manifest is not valid YAML: {e}")
+    if not isinstance(m, dict):
+        raise ArtifactRejected("the announced manifest is empty or not a mapping")
+    import contextlib
+    import io as _io
+    buf = _io.StringIO()
+    try:
+        # the validator reports to the console and exits; here the report
+        # IS the answer — the recipient is usually an AI with nobody
+        # next to it to read a log
+        with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+            validate_manifest(m)
+    except SystemExit:
+        detail = buf.getvalue().strip().replace("ERROR: ", "")
+        raise ArtifactRejected(
+            "the announced manifest is invalid — "
+            + (detail or "validate it against the published schema"))
+    hard, confirm = envelope_review(inst, m)
+    if hard:
+        raise ArtifactRejected("; ".join(hard))
+    manifest_sha = hashlib.sha256(manifest_text.encode()).hexdigest()
+    if confirm and not confirmed:
+        # remembered so an administrator can confirm exactly THIS
+        # manifest in the portal — not "the next deployment, whatever
+        # it turns out to be"
+        pending = _grants_prune(load_grants())
+        pending[f"pending:{name}"] = {
+            "kind": "pending", "instance": name, "attempts": 0,
+            "expires": _now() + 7 * 24 * 3600,
+            "payload": {"manifest_sha": manifest_sha, "reasons": confirm,
+                        "version": m["app"]["version"]}}
+        save_grants(pending)
+        raise ArtifactRejected(
+            "this deployment would widen what the instance may reach or who "
+            "may reach it (" + "; ".join(confirm) + ") — it needs an "
+            "administrator's confirmation in the portal")
+    grant_create("upload", name, digest,
+                 {"manifest_sha": manifest_sha, "artifact_sha256": artifact_sha.lower(),
+                  "bytes": int(artifact_bytes), "version": m["app"]["version"]})
+    return m["app"]["version"]
+
+
+def install_artifact(name, zip_path, grant, channel="test", path=""):
+    """Phase 3: verify the upload against its grant, then install.
+
+    `grant` is positional and mandatory on purpose. It was optional
+    once, and the worker forgot to pass it — every check below was
+    silently skipped, and a package that contradicted its own
+    announcement installed cleanly (found on oaap-demo, 2026-08-15).
+    A caller with nothing to verify against — the CLI, a rollback, an
+    administrator creating an instance — has to say so by passing None.
+    """
+    size = os.path.getsize(zip_path)
+    if grant is not None:
+        if size != grant.get("bytes"):
+            raise ArtifactRejected(
+                f"upload is {size} bytes, {grant.get('bytes')} were announced")
+        got = _sha256_file(zip_path)
+        if not hmac.compare_digest(got, grant.get("artifact_sha256", "")):
+            raise ArtifactRejected(
+                "the upload does not match the announced checksum")
+    elif size > ARTIFACT_MAX_BYTES:
+        raise ArtifactRejected(
+            f"artifact is {size} bytes, limit is "
+            f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB")
+    sha = _sha256_file(zip_path)
+    unpacked = tempfile.mkdtemp(prefix="oaap-artifact-")
+    try:
+        extract_artifact(zip_path, unpacked)
+        pkg = package_root(unpacked, path)
+        mf = os.path.join(pkg, "oaap-app.yaml")
+        if not os.path.isfile(mf):
+            raise ArtifactRejected(f"no oaap-app.yaml in {path or 'the archive'}")
+        with open(mf, "rb") as f:
+            manifest_bytes = f.read()
+        if grant is not None:
+            inner = hashlib.sha256(manifest_bytes).hexdigest()
+            if not hmac.compare_digest(inner, grant.get("manifest_sha", "")):
+                # without this the announcement would be decoration: one
+                # could announce a harmless manifest and ship another
+                raise ArtifactRejected(
+                    "the manifest inside the archive differs from the "
+                    "announced one — announce the manifest you are shipping")
+        m = yaml.safe_load(manifest_bytes.decode("utf-8"))
+        version = m["app"]["version"]
+        stored = artifact_store(name, zip_path, version, sha)
+        source = {"kind": "artifact", "version": version, "sha256": sha,
+                  "stored": stored, "path": path,
+                  "received": _stamp()}
+        ns = argparse.Namespace(package=pkg, path="", ref="", name=name,
+                                channel=channel, store_source="")
+        try:
+            _install_from_dir(pkg, ns, source)
+        except BaseException:
+            try:
+                os.remove(os.path.join(artifact_dir(name), stored))
+            except OSError:
+                pass
+            raise
+        artifact_prune(name)
+        return version, sha
+    finally:
+        shutil.rmtree(unpacked, ignore_errors=True)
+
+
+def _stamp():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def cmd_artifact(args):
+    name = args.name
+    reg = load_registry()
+    if name not in reg["instances"]:
+        die(f"no instance named '{name}'")
+    files = artifact_list(name)
+    if args.action == "list":
+        if not files:
+            print(f"No artifacts retained for '{name}' "
+                  "(it was not installed from an uploaded package).")
+            return
+        current = ((reg["instances"][name].get("source") or {}).get("stored") or "")
+        for f in files:
+            mark = " <- running" if f == current else ""
+            print(f"{f}{mark}")
+        return
+    # action == "rollback"
+    if not files:
+        die(f"no retained artifacts for '{name}'")
+    target = args.artifact or ""
+    if target:
+        match = [f for f in files if f == target or f.startswith(target)]
+        if not match:
+            die(f"no retained artifact matching '{target}' — "
+                f"'oaap app artifact list {name}' shows what is kept")
+        target = match[0]
+    else:
+        current = ((reg["instances"][name].get("source") or {}).get("stored") or "")
+        rest = [f for f in files if f != current]
+        if not rest:
+            die("only the running artifact is retained — nothing to roll back to")
+        target = rest[0]
+    print(f"Rolling '{name}' back to {target} ...")
+    try:
+        install_artifact(name, os.path.join(artifact_dir(name), target), None,
+                         channel=reg["instances"][name]["channel"])
+    except ArtifactRejected as e:
+        die(str(e))
+    audit_deploy({"instance": name, "ok": True, "via": "cli",
+                  "message": f"rolled back to {target}"})
 
 
 def _resolve_revision(source):
@@ -2689,7 +3193,7 @@ def cmd_process_deploys(_args):
 
         def run_install(src, channel):
             ns = _argparse.Namespace(
-                package=src["url"], path=src.get("path", ""),
+                package=source_package_arg(name, src), path=src.get("path", ""),
                 ref=src.get("ref", ""), name=name, channel=channel,
                 store_source=src.get("store_source", ""))
             buf = io.StringIO()
@@ -2763,6 +3267,34 @@ def cmd_process_deploys(_args):
                            "(RFC-0012 §3)")
                 else:
                     src["store_source"] = store_src["id"]
+            elif req.get("from") == "artifact":
+                # RFC-0019: the first instance from an uploaded package.
+                # No source is fetched and no credential is needed —
+                # which is the whole point for a private repository.
+                up = os.path.join(SPOOL_DIR, "uploads", f"{rid}.zip")
+                try:
+                    if not os.path.isfile(up):
+                        msg = "the upload did not arrive"
+                    else:
+                        version, sha = install_artifact(
+                            name, up, None, channel="test",
+                            path=(req.get("path") or "").strip())
+                        revision = sha[:12]
+                        ok, msg = True, f"test instance created from artifact ({version})"
+                except ArtifactRejected as e:
+                    msg = str(e)
+                except SystemExit as e:
+                    msg = f"install refused: {e}"
+                except subprocess.CalledProcessError as e:
+                    err = (e.stderr or "").strip()
+                    msg = err.splitlines()[-1] if err else str(e)
+                except Exception as e:
+                    msg = str(e)
+                finally:
+                    try:
+                        os.remove(up)
+                    except OSError:
+                        pass
             else:
                 url = (req.get("url") or "").strip()
                 # No local paths, no plain http: a local path would let
@@ -2780,6 +3312,111 @@ def cmd_process_deploys(_args):
                 ok, msg = run_install(src, "test")
                 if ok:
                     msg = "test instance created"
+        elif action == "announce":
+            # Phase 1+2 of RFC-0019. The portal has already checked the
+            # deploy token; it mints the upload token and sends only its
+            # digest, exactly as it does for deploy tokens — the secret
+            # never reaches this file, and the spool stays data, not trust.
+            try:
+                confirmed = False
+                pend = (load_grants().get(f"pending:{name}") or {}).get("payload") or {}
+                announced_sha = hashlib.sha256(
+                    (req.get("manifest") or "").encode()).hexdigest()
+                if (req.get("confirmed_sha")
+                        and hmac.compare_digest(req["confirmed_sha"], announced_sha)):
+                    confirmed = True
+                elif pend.get("confirmed") and hmac.compare_digest(
+                        pend.get("manifest_sha", ""), announced_sha):
+                    confirmed = True
+                version = announce_artifact(
+                    name, req.get("manifest") or "",
+                    req.get("artifact_sha256") or "",
+                    int(req.get("artifact_bytes") or 0),
+                    req.get("digest") or "", confirmed=confirmed)
+                ok, msg = True, f"announced {version}"
+            except ArtifactRejected as e:
+                msg = str(e)
+            except (TypeError, ValueError) as e:
+                msg = f"malformed announcement: {e}"
+        elif action == "artifact":
+            # Phase 3. The upload itself is a file the portal wrote next
+            # to the request; it is verified against the grant BEFORE a
+            # single entry is unpacked.
+            up = os.path.join(SPOOL_DIR, "uploads", f"{rid}.zip")
+            grant = grant_spend("upload", name, req.get("digest") or "")
+            try:
+                if not inst:
+                    msg = "unknown instance"
+                elif inst.get("channel") != "test":
+                    msg = "not a test instance"
+                elif grant is None:
+                    msg = ("no valid upload grant — announce the version "
+                           "first, and upload within 15 minutes")
+                elif not os.path.isfile(up):
+                    msg = "the upload did not arrive"
+                else:
+                    version, sha = install_artifact(
+                        name, up, grant, channel="test",
+                        path=req.get("path") or "")
+                    revision = sha[:12]
+                    ok, msg = True, f"deployed {version} from uploaded artifact"
+            except ArtifactRejected as e:
+                msg = str(e)
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or "").strip()
+                msg = err.splitlines()[-1] if err else str(e)
+            except SystemExit as e:
+                msg = f"install refused: {e}"
+            except Exception as e:
+                msg = str(e)
+            finally:
+                try:
+                    os.remove(up)
+                except OSError:
+                    pass
+        elif action == "rollback":
+            # Reinstalling a retained package. Nothing new is admitted
+            # here — only something this node already accepted once.
+            want = str(req.get("artifact") or "")
+            path = os.path.join(artifact_dir(name), want)
+            if not inst:
+                msg = "unknown instance"
+            elif want not in artifact_list(name):
+                msg = "no such retained artifact"
+            else:
+                try:
+                    version, sha = install_artifact(
+                        name, path, None, channel=inst.get("channel", "test"),
+                        path=(inst.get("source") or {}).get("path", ""))
+                    revision = sha[:12]
+                    ok, msg = True, f"rolled back to {want} ({version})"
+                except ArtifactRejected as e:
+                    msg = str(e)
+                except SystemExit as e:
+                    msg = f"install refused: {e}"
+                except Exception as e:
+                    msg = str(e)
+        elif action == "envelope":
+            # An administrator confirms one specific pending announcement
+            # in the portal (RFC-0019 decision 5). Bound to the manifest
+            # that was announced — never "the next deployment, whatever
+            # that turns out to be".
+            grants = load_grants()
+            entry = grants.get(f"pending:{name}")
+            if not entry:
+                msg = "nothing is waiting for confirmation for this instance"
+            elif req.get("op") == "reject":
+                del grants[f"pending:{name}"]
+                save_grants(grants)
+                ok, msg = True, "pending deployment rejected"
+            elif not hmac.compare_digest(
+                    str(req.get("manifest_sha") or ""),
+                    entry["payload"].get("manifest_sha", "")):
+                msg = "the confirmation does not match the pending announcement"
+            else:
+                entry["payload"]["confirmed"] = True
+                save_grants(grants)
+                ok, msg = True, "deployment confirmed — the client may announce again"
         elif action == "node":
             # Node profiles (RFC-0011) are a CLI matter — with exactly
             # one exception: the first-run wizard, which asks what the
@@ -3143,8 +3780,15 @@ def cmd_process_deploys(_args):
             msg = "unknown instance or no deploy token"
         elif inst["channel"] != "test":
             msg = "not a test instance"
-        elif not inst.get("source") or inst["source"].get("kind") not in ("git", "local"):
+        elif not inst.get("source") or inst["source"].get("kind") not in (
+                "git", "local", "artifact"):
             msg = "no usable package source recorded"
+        elif (inst["source"].get("kind") == "artifact"
+              and not os.path.isfile(source_package_arg(name, inst["source"]))):
+            # the retained artifact IS the source; without it there is
+            # nothing to fetch and the hook must say so plainly
+            msg = ("the retained artifact for this instance is gone — upload "
+                   "a new one (announce, then PUT the package)")
         else:
             src = inst["source"]
             revision = _resolve_revision(src)
@@ -3156,7 +3800,8 @@ def cmd_process_deploys(_args):
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
-               "source": "portal", "node": "setup wizard"}.get(action, "deploy-hook")
+               "source": "portal", "node": "setup wizard",
+               "envelope": "portal", "rollback": "portal"}.get(action, "deploy-hook")
         record = {"instance": name or "(dieser Knoten)", "ok": ok,
                   "message": msg, "revision": revision,
                   "version": version, "via": via}
@@ -3292,6 +3937,19 @@ def _deploy_from_registry(name, inst):
                 pkg = os.path.join(tmp, src.get("path") or "")
             elif src.get("kind") == "local":
                 pkg = os.path.join(src.get("url", ""), src.get("path") or "")
+            elif src.get("kind") == "artifact":
+                # the retained artifact travelled in the backup with the
+                # instance directory — an artifact-deployed instance is
+                # the first kind whose backup is genuinely self-contained
+                zip_path = source_package_arg(name, src)
+                if os.path.isfile(zip_path):
+                    tmp = tempfile.mkdtemp(prefix="oaap-restore-")
+                    try:
+                        extract_artifact(zip_path, tmp)
+                        pkg = package_root(tmp, src.get("path") or "")
+                    except ArtifactRejected as e:
+                        print(f"SKIPPED {name}: retained artifact unusable ({e}).")
+                        return False
             if not pkg or not os.path.isdir(pkg):
                 print(f"SKIPPED {name}: images must be rebuilt, but the package "
                       f"source is not available on this machine "
@@ -3632,6 +4290,13 @@ def main():
     pt = sub.add_parser("token")
     pt.add_argument("action", choices=["create", "revoke", "list"])
     pt.add_argument("name", nargs="?")
+
+    par = sub.add_parser("artifact", help="uploaded packages (RFC-0019)")
+    par.add_argument("action", choices=["list", "rollback"])
+    par.add_argument("name", help="instance name")
+    par.add_argument("artifact", nargs="?",
+                     help="retained artifact (default: the one before the running version)")
+    par.set_defaults(fn=cmd_artifact)
     pt.set_defaults(fn=cmd_token)
     pd = sub.add_parser("process-deploys")
     pd.set_defaults(fn=cmd_process_deploys)

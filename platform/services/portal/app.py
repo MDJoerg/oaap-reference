@@ -101,6 +101,8 @@ STYLE = """
   .card{background:var(--oaap-surface);border:1px solid var(--oaap-border);
        border-radius:.6rem;padding:1.4rem;box-shadow:0 1px 3px rgba(23,37,84,.06);
        margin-bottom:1.2rem}
+  /* a card that is asking for a decision, not merely reporting */
+  .card.warn{border-color:var(--warn);border-left-width:4px}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:1rem;margin:1rem 0}
   .tile{display:block;background:var(--oaap-surface);border:1px solid var(--oaap-border);
        border-radius:.6rem;padding:1rem 1.1rem;text-decoration:none;color:inherit;
@@ -893,7 +895,7 @@ INSTANCE_NEW_BODY = """
   aus dem Portal heraus angelegt werden — auf einem Produktivknoten
   bleibt das der Kommandozeile vorbehalten (RFC-0011).</p>
 </div>
-<form method="post" action="/instances/new">
+<form method="post" action="/instances/new" enctype="multipart/form-data">
   <div class="card">
     <h2>Was soll installiert werden?</h2>
     <label class="checkline"><input type="radio" name="from" value="store" checked>
@@ -923,6 +925,17 @@ INSTANCE_NEW_BODY = """
     brandneue App steht in keiner Store-Liste. Auf einem Knoten ohne
     <code>dev</code> gilt weiterhin, dass nur installiert wird, was eine
     konfigurierte Quelle listet.</p>
+    <label class="checkline"><input type="radio" name="from" value="artifact">
+      Aus einem hochgeladenen Paket (ZIP)</label>
+    <label>Paket <input type="file" name="artifact" accept=".zip"></label>
+    <label>Pfad im Paket (optional) <input type="text" name="artifact_path"
+           placeholder="leer = Wurzel oder einziger Oberordner"></label>
+    <p class="muted">Für Quellen, auf die dieser Knoten keinen Zugriff hat
+    oder haben soll: ein privates Repository, ein Rechner ohne Internet,
+    eine Datei vom Stick. Der Knoten bekommt damit ein <strong>Paket statt
+    eines Zugangsrechts</strong> — er muss keine fremden Zugangsdaten
+    speichern (RFC-0019). Das Paket bleibt hier liegen, damit spätere
+    Deployments und ein Rückschritt eine echte Quelle haben.</p>
   </div>
   <div class="card">
     <h2>Name der Instanz</h2>
@@ -1148,6 +1161,55 @@ INSTANCE_EDIT_BODY = """
      ihrer hinterlegten Quelle neu zu deployen. Keine Anmeldung, kein Zugriff
      auf Daten, keine Änderung an Routen oder Rollen. Produktiv-Instanzen
      bekommen grundsätzlich kein Token.</p>
+  <p class="muted">Bringt das Deployment sein Paket selbst mit (RFC-0019), sind
+     es zwei Schritte mit demselben Token:<br>
+     <code>POST {{ i.hook_url }}/announce</code> mit Manifest, Prüfsumme und
+     Größe — die Antwort enthält ein Einmal-Token —, dann
+     <code>PUT {{ i.hook_url }}/artifact</code> mit dem Paket.</p>
+</div>
+{% endif %}
+{% if i.pending %}
+<div class="card warn">
+  <h2>Deployment wartet auf Bestätigung</h2>
+  <p>Eine Anmeldung für <strong>Version {{ i.pending.version }}</strong> würde
+     erweitern, was diese Instanz erreichen darf oder wer sie erreichen darf.
+     Deshalb ist sie abgelehnt worden, bis Du zustimmst:</p>
+  <ul>{% for r in i.pending.reasons %}<li>{{ r }}</li>{% endfor %}</ul>
+  <p class="muted">Die Bestätigung gilt für <em>genau dieses</em> Manifest, nicht
+     für das nächste Deployment. Nach dem Zustimmen meldet die KI dieselbe
+     Version erneut an und lädt hoch.</p>
+  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
+    <input type="hidden" name="op" value="confirm">
+    <input type="hidden" name="manifest_sha" value="{{ i.pending.manifest_sha }}">
+    <button>Erweiterung bestätigen</button>
+  </form>
+  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
+    <input type="hidden" name="op" value="reject">
+    <button class="secondary">Verwerfen</button>
+  </form>
+</div>
+{% endif %}
+{% if i.artifacts %}
+<div class="card">
+  <h2>Hochgeladene Pakete</h2>
+  <p class="muted">Diese Instanz läuft aus einem hochgeladenen Paket. Es bleibt
+     hier liegen — deshalb kann sie neu ausgerollt und zurückgesetzt werden,
+     und deshalb ist ihr Backup vollständig.</p>
+  <table>
+    <tr><th>Paket</th><th>Empfangen</th><th></th></tr>
+    {% for a in i.artifacts %}
+    <tr>
+      <td><code>{{ a.file }}</code>{% if a.running %} <span class="badge">läuft</span>{% endif %}</td>
+      <td>{{ a.received }}</td>
+      <td>{% if not a.running %}
+        <form method="post" action="/instances/{{ i.name }}/rollback">
+          <input type="hidden" name="artifact" value="{{ a.file }}">
+          <button class="secondary">Hierauf zurück</button>
+        </form>
+      {% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
 </div>
 {% endif %}
 {% if i.config %}
@@ -2176,6 +2238,142 @@ def deploy_hook(name):
                        f"/deploy/{name}/status"}, 202
 
 
+# --------------------------------------- artifact deployment (RFC-0019)
+# The deploy hook above fetches a recorded source. This pair lets a
+# deployment bring its own package instead — for a private repository,
+# that is the difference between the platform holding a foreign
+# credential in cleartext and holding nothing at all.
+#
+# Three phases: announce (manifest + checksum + size) → the HOST decides
+# and an upload grant is issued → the package is admitted only against
+# that grant. The portal mints the upload token and sends only its
+# digest to the host, exactly as it does for deploy tokens: the secret
+# never reaches the spool.
+
+ARTIFACT_GRANTS = "/apps-registry/artifact-grants.json"
+ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+SPOOL_UPLOADS = os.path.join(SPOOL_DIR, "uploads")
+
+
+def _hook_base():
+    ext = external_host()
+    return f"https://{ext}" if ext else request.host_url.rstrip("/")
+
+
+def _valid_upload_grant(name):
+    """Is the presented bearer a live upload grant for this instance?
+
+    Checked here only to refuse a stranger before 256 MB are streamed to
+    disk. The authoritative check runs on the host, where the grant is
+    also SPENT — the spool is data, not trust.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return ""
+    digest = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+    try:
+        with open(ARTIFACT_GRANTS, encoding="utf-8") as f:
+            entry = json.load(f).get(digest) or {}
+    except (OSError, ValueError):
+        return ""
+    if entry.get("kind") != "upload" or entry.get("instance") != name:
+        return ""
+    if entry.get("expires", 0) < _time.time():
+        return ""
+    return digest
+
+
+@app.post("/deploy/<name>/announce")
+def deploy_announce(name):
+    inst, err = _deploy_auth(name)
+    if err:
+        return inst, err
+    data = request.get_json(silent=True) or {}
+    manifest = data.get("manifest") or ""
+    if not manifest.strip():
+        return {"refused": "no_manifest",
+                "message": "announce the complete oaap-app.yaml as 'manifest' "
+                           "— the announcement is the contract the upload is "
+                           "checked against"}, 422
+    try:
+        size = int(data.get("artifact_bytes") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0 or size > ARTIFACT_MAX_BYTES:
+        return {"refused": "bad_size",
+                "message": f"'artifact_bytes' must be the real ZIP size, at "
+                           f"most {ARTIFACT_MAX_BYTES // (1024 * 1024)} MB"}, 422
+    token = secrets.token_urlsafe(32)
+    res = _queue_and_wait(name, {
+        "action": "announce", "manifest": manifest,
+        "artifact_sha256": (data.get("artifact_sha256") or "").strip().lower(),
+        "artifact_bytes": size,
+        "digest": hashlib.sha256(token.encode()).hexdigest(),
+    }, DEPLOY_WAIT_SECONDS)
+    if res is None:
+        return {"refused": "timeout",
+                "message": "the node did not answer in time — try again"}, 504
+    if not res.get("ok"):
+        return {"refused": "rejected", "message": res.get("message", "")}, 422
+    return {"ok": True,
+            "upload_token": token,
+            "upload_url": f"{_hook_base()}/deploy/{name}/artifact",
+            "expires_in": 900,
+            "message": res.get("message", "")}, 200
+
+
+@app.put("/deploy/<name>/artifact")
+def deploy_artifact(name):
+    """Phase 3 — the package itself, admitted only by an upload grant."""
+    key = _client_ip()
+    if _deploy_blocked(key):
+        return {"error": "too many attempts — wait a minute"}, 429
+    digest = (_valid_upload_grant(name)
+              if _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or "") else "")
+    if not digest:
+        _deploy_failed(key)
+        return DENIED, 403
+    _deploy_succeeded(key)
+    declared = request.content_length or 0
+    if declared > ARTIFACT_MAX_BYTES:
+        return {"ok": False,
+                "message": f"artifact exceeds "
+                           f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB"}, 413
+    rid = _uuid.uuid4().hex
+    os.makedirs(SPOOL_UPLOADS, exist_ok=True)
+    up = os.path.join(SPOOL_UPLOADS, f"{rid}.zip")
+    written = 0
+    fd = os.open(up, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = request.stream.read(1 << 16)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > ARTIFACT_MAX_BYTES:
+                    raise ValueError("too large")
+                out.write(chunk)
+    except (ValueError, OSError):
+        os.remove(up)
+        return {"ok": False,
+                "message": f"artifact exceeds "
+                           f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB"}, 413
+    res = _queue_with_id(rid, name, {"action": "artifact", "digest": digest,
+                                     "path": (request.args.get("path") or "").strip()},
+                         DEPLOY_WAIT_SECONDS)
+    if res is None:
+        return {"ok": None, "instance": name,
+                "message": "deployment is still running — poll GET "
+                           f"/deploy/{name}/status"}, 202
+    body = {"ok": res.get("ok", False), "instance": name,
+            "version": res.get("version", ""),
+            "revision": res.get("revision", ""),
+            "message": res.get("message", ""),
+            "url": _entry_url(name, load_instances().get(name) or {})}
+    return body, (200 if res.get("ok") else 422)
+
+
 @app.get("/deploy/<name>/status")
 def deploy_status(name):
     inst, err = _deploy_auth(name)
@@ -2644,6 +2842,15 @@ def instance_new():
         return _new_error("Bitte eine App aus dem Store wählen.")
     if from_ == "git" and not url:
         return _new_error("Bitte die Git-URL des Repositories angeben.")
+    upload = request.files.get("artifact") if from_ == "artifact" else None
+    if from_ == "artifact":
+        if not upload or not upload.filename:
+            return _new_error("Bitte ein ZIP-Paket auswählen.")
+        if not name:
+            # the manifest inside would answer this, but reading it here
+            # would mean unpacking an untrusted archive in the portal —
+            # that job belongs to the host, which is why it asks instead
+            return _new_error("Für den Paket-Weg bitte einen Instanznamen angeben.")
     # An instance name derived from a Git URL would be a guess; the app
     # id from the manifest is the honest default, so the host decides it
     # when the field is left empty.
@@ -2670,10 +2877,33 @@ def instance_new():
                         f"'{chosen['name']}' stammt aus der ungeprüften Quelle "
                         f"{chosen['source']} — bitte die Bestätigung setzen.")
                 confirm = source_id
-    res = _queue_and_wait(name, {
+    rid = _uuid.uuid4().hex
+    if upload is not None:
+        os.makedirs(SPOOL_UPLOADS, exist_ok=True)
+        dest = os.path.join(SPOOL_UPLOADS, f"{rid}.zip")
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        written = 0
+        try:
+            with os.fdopen(fd, "wb") as out:
+                while True:
+                    chunk = upload.stream.read(1 << 16)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > ARTIFACT_MAX_BYTES:
+                        raise ValueError("too large")
+                    out.write(chunk)
+        except (ValueError, OSError):
+            os.remove(dest)
+            return _new_error(
+                f"Das Paket ist größer als "
+                f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB.")
+    res = _queue_with_id(rid, name, {
         "action": "create", "from": from_, "app_id": app_id,
         "source_id": source_id, "confirm_source": confirm,
-        "url": url, "path": request.form.get("path", "").strip(),
+        "url": url, "path": (request.form.get("artifact_path", "").strip()
+                             if from_ == "artifact"
+                             else request.form.get("path", "").strip()),
         "ref": request.form.get("ref", "").strip(),
     }, CREATE_WAIT_SECONDS)
     if res is None:
@@ -2704,6 +2934,8 @@ def instance_detail(name):
          "config": _instance_config(name, inst),
          "is_test": inst.get("channel") == "test",
          "token_created": _token_created(name),
+         "artifacts": _artifacts(name, inst),
+         "pending": _pending_envelope(name),
          "hook_url": _hook_url(name),
          "address": inst.get("address", ""),
          "aliases": inst.get("aliases") or [],
@@ -2839,6 +3071,40 @@ def _token_created(name):
     return stamp.replace("T", " ").rstrip("Z")
 
 
+def _artifacts(name, inst):
+    """Retained packages of an artifact-deployed instance, newest first."""
+    src = inst.get("source") or {}
+    if src.get("kind") != "artifact":
+        return []
+    d = os.path.join("/apps-registry", name, "artifacts")
+    running = src.get("stored", "")
+    try:
+        files = [f for f in os.listdir(d) if f.endswith(".zip")]
+    except OSError:
+        return []
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True)
+    out = []
+    for f in files:
+        stamp = datetime.fromtimestamp(os.path.getmtime(os.path.join(d, f)),
+                                       timezone.utc)
+        out.append({"file": f, "running": f == running,
+                    "received": stamp.strftime("%Y-%m-%d %H:%M")})
+    return out
+
+
+def _pending_envelope(name):
+    """An announcement held back because it would widen the envelope."""
+    try:
+        with open(ARTIFACT_GRANTS, encoding="utf-8") as f:
+            entry = json.load(f).get(f"pending:{name}") or {}
+    except (OSError, ValueError):
+        return None
+    payload = entry.get("payload") or {}
+    if not payload.get("reasons") or payload.get("confirmed"):
+        return None
+    return payload
+
+
 DEFAULT_THROTTLE = {"limit": 300, "window": 60}  # mirrors appctl.DEFAULT_THROTTLE
 
 
@@ -2938,6 +3204,42 @@ def _hook_url(name):
     return f"https://{ext}/deploy/{name}" if ext else f"http://{request.host}/deploy/{name}"
 
 
+@app.post("/instances/<name>/envelope")
+def instance_envelope(name):
+    """Confirm or discard a held-back deployment (RFC-0019 decision 5).
+
+    Confirmation is deliberately bound to the announced manifest, not to
+    the instance: it says yes to THIS change, never to whatever the next
+    upload turns out to contain.
+    """
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    op = "reject" if request.form.get("op") == "reject" else "confirm"
+    return _queue_and_redirect(
+        name, {"action": "envelope", "op": op,
+               "manifest_sha": request.form.get("manifest_sha", "").strip()},
+        TOKEN_WAIT_SECONDS)
+
+
+@app.post("/instances/<name>/rollback")
+def instance_rollback(name):
+    """Reinstall a retained package (RFC-0019 §4)."""
+    denied = require_server_admin()
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    artifact = request.form.get("artifact", "").strip()
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
+        return redirect(f"/instances/{name}?err={quote('Unbekanntes Paket.')}",
+                        code=303)
+    return _queue_and_redirect(name, {"action": "rollback", "artifact": artifact},
+                               CREATE_WAIT_SECONDS)
+
+
 @app.post("/instances/<name>/token")
 def instance_token(name):
     denied = require_server_admin()
@@ -3022,7 +3324,15 @@ def _queue_and_wait(name, payload, wait_seconds):
     written 0600 -- it lives in the spool only until the worker
     consumes it.
     """
-    rid = _uuid.uuid4().hex
+    return _queue_with_id(_uuid.uuid4().hex, name, payload, wait_seconds)
+
+
+def _queue_with_id(rid, name, payload, wait_seconds):
+    """Same, with the request id decided by the caller.
+
+    An artifact upload has to write its package next to the request
+    under that id (RFC-0019), so it cannot let the queue invent one.
+    """
     os.makedirs(SPOOL_QUEUE, exist_ok=True)
     tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
