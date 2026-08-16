@@ -2454,6 +2454,11 @@ ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
 ARTIFACT_MAX_UNPACKED = 1024 * 1024 * 1024
 ARTIFACT_MAX_ENTRIES = 20000
 GRANT_TTL = 900                   # 15 minutes
+# An instance creation grant (RFC-0019, Studio section) is handed from
+# the portal to a person, who then walks to another app, picks a file
+# and uploads it. Fifteen minutes is enough for a machine and not for a
+# human, so this one is longer — still short-lived, still single-use.
+CREATE_GRANT_TTL = 1800           # 30 minutes
 GRANT_MAX_ATTEMPTS = 3
 
 
@@ -2701,6 +2706,31 @@ def grant_spend(kind, instance, digest):
     return payload
 
 
+def grant_check(kind, instance, digest):
+    """Is this grant live, without spending it?
+
+    Deliberately separate from grant_spend: an instance creation grant
+    is checked when the package is ANNOUNCED but only spent when the
+    package is actually installed. Spending it earlier would burn the
+    operator's permission on a failed upload and force them back to the
+    portal for a network hiccup.
+    """
+    entry = _grants_prune(load_grants()).get(digest) or {}
+    if entry.get("kind") != kind or entry.get("instance") != instance:
+        return None
+    return entry.get("payload") or {}
+
+
+def grants_of_kind(kind):
+    """Live grants of one kind, for a page that shows what is open."""
+    out = []
+    for entry in _grants_prune(load_grants()).values():
+        if entry.get("kind") == kind:
+            out.append({"instance": entry.get("instance", ""),
+                        "expires": entry.get("expires", 0)})
+    return sorted(out, key=lambda e: e["instance"])
+
+
 def grants_drop_for(instance, reason=""):
     grants = {k: v for k, v in _grants_prune(load_grants()).items()
               if v.get("instance") != instance}
@@ -2710,16 +2740,42 @@ def grants_drop_for(instance, reason=""):
 
 
 def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
-                      digest, confirmed=False):
+                      digest, confirmed=False, create_digest=""):
     """Phase 1+2: validate the announcement, issue the upload grant.
+
+    With `create_digest` this announces the FIRST package for an
+    instance that does not exist yet, against an instance creation
+    grant an administrator issued in the portal (RFC-0019, Studio
+    section). Everything else is identical — which is the point: the
+    creation is the same handshake one level up, not a second path.
 
     Raises ArtifactRejected with a sentence the caller can act on.
     """
     reg = load_registry()
     inst = reg["instances"].get(name)
-    if not inst:
+    creating = bool(create_digest)
+    if creating:
+        # The grant is only CHECKED here; it is spent when the package
+        # is actually installed (phase 3), so a failed upload does not
+        # cost the operator their permission.
+        if inst:
+            raise ArtifactRejected(f"an instance named '{name}' already exists "
+                                   "— use its deploy token, not a creation grant")
+        if not has_profile("dev"):
+            raise ArtifactRejected(
+                "this node has no profile 'dev' — creating instances is a "
+                "development act (RFC-0011)")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or ""):
+            raise ArtifactRejected(
+                "instance name: lowercase letters, digits and hyphens")
+        if grant_check("create", name, create_digest) is None:
+            raise ArtifactRejected(
+                "no valid creation grant for this instance — have an "
+                "administrator issue one in the portal (it is single-use "
+                f"and lasts {CREATE_GRANT_TTL // 60} minutes)")
+    elif not inst:
         raise ArtifactRejected(f"no instance named '{name}'")
-    if inst.get("channel") != "test":
+    elif inst.get("channel") != "test":
         raise ArtifactRejected(
             f"'{name}' is a production instance — artifact deployment exists "
             "only for the test channel; promotion stays a human action")
@@ -2749,7 +2805,11 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
         raise ArtifactRejected(
             "the announced manifest is invalid — "
             + (detail or "validate it against the published schema"))
-    hard, confirm = envelope_review(inst, m)
+    # A new instance has no envelope to widen: what the manifest asks
+    # for IS the envelope the administrator agreed to when they issued
+    # the grant. Reviewing it against nothing would refuse every first
+    # package that declares a public route.
+    hard, confirm = ([], []) if creating else envelope_review(inst, m)
     if hard:
         raise ArtifactRejected("; ".join(hard))
     manifest_sha = hashlib.sha256(manifest_text.encode()).hexdigest()
@@ -2770,7 +2830,10 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
             "administrator's confirmation in the portal")
     grant_create("upload", name, digest,
                  {"manifest_sha": manifest_sha, "artifact_sha256": artifact_sha.lower(),
-                  "bytes": int(artifact_bytes), "version": m["app"]["version"]})
+                  "bytes": int(artifact_bytes), "version": m["app"]["version"],
+                  # carried so phase 3 knows this upload creates the
+                  # instance, and which permission to spend for it
+                  "create": creating, "create_digest": create_digest})
     return m["app"]["version"]
 
 
@@ -2840,6 +2903,35 @@ def install_artifact(name, zip_path, grant, channel="test", path=""):
 def _stamp():
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def cmd_grant(args):
+    """Show or revoke open instance creation grants (RFC-0019).
+
+    The portal issues them and can revoke them, but an operator sitting
+    at the machine has to be able to see what doors are open without a
+    browser — and to shut one.
+    """
+    open_grants = grants_of_kind("create")
+    if args.action == "list":
+        if not open_grants:
+            print("No open instance creation grants.")
+            return
+        now = _now()
+        for g in open_grants:
+            mins = max(0, int((g["expires"] - now) // 60))
+            print(f"{g['instance']}  (single use, {mins} min left)")
+        return
+    # action == "revoke"
+    if not args.name:
+        die("name the instance whose grant should be revoked")
+    if not any(g["instance"] == args.name for g in open_grants):
+        die(f"no open creation grant for '{args.name}'")
+    grants = {k: v for k, v in _grants_prune(load_grants()).items()
+              if not (v.get("kind") == "create"
+                      and v.get("instance") == args.name)}
+    save_grants(grants)
+    print(f"Creation grant for '{args.name}' revoked.")
 
 
 def cmd_artifact(args):
@@ -3332,7 +3424,8 @@ def cmd_process_deploys(_args):
                     name, req.get("manifest") or "",
                     req.get("artifact_sha256") or "",
                     int(req.get("artifact_bytes") or 0),
-                    req.get("digest") or "", confirmed=confirmed)
+                    req.get("digest") or "", confirmed=confirmed,
+                    create_digest=str(req.get("create_digest") or ""))
                 ok, msg = True, f"announced {version}"
             except ArtifactRejected as e:
                 msg = str(e)
@@ -3344,14 +3437,28 @@ def cmd_process_deploys(_args):
             # single entry is unpacked.
             up = os.path.join(SPOOL_DIR, "uploads", f"{rid}.zip")
             grant = grant_spend("upload", name, req.get("digest") or "")
+            # An upload that CREATES the instance carries the operator's
+            # single-use creation grant with it (RFC-0019, Studio
+            # section). It is spent here, not at the announcement: only
+            # now does an instance actually come into being.
+            creating = bool(grant and grant.get("create"))
             try:
-                if not inst:
-                    msg = "unknown instance"
-                elif inst.get("channel") != "test":
-                    msg = "not a test instance"
-                elif grant is None:
+                if grant is None:
                     msg = ("no valid upload grant — announce the version "
                            "first, and upload within 15 minutes")
+                elif creating and inst:
+                    msg = f"an instance named '{name}' already exists"
+                elif creating and not has_profile("dev"):
+                    msg = ("this node has no profile 'dev' — creating "
+                           "instances is a development act (RFC-0011)")
+                elif creating and grant_spend(
+                        "create", name, grant.get("create_digest") or "") is None:
+                    msg = ("the creation grant is spent or expired — have an "
+                           "administrator issue a new one in the portal")
+                elif not creating and not inst:
+                    msg = "unknown instance"
+                elif not creating and inst.get("channel") != "test":
+                    msg = "not a test instance"
                 elif not os.path.isfile(up):
                     msg = "the upload did not arrive"
                 else:
@@ -3359,7 +3466,10 @@ def cmd_process_deploys(_args):
                         name, up, grant, channel="test",
                         path=req.get("path") or "")
                     revision = sha[:12]
-                    ok, msg = True, f"deployed {version} from uploaded artifact"
+                    ok = True
+                    msg = (f"test instance created from uploaded artifact ({version})"
+                           if creating else
+                           f"deployed {version} from uploaded artifact")
             except ArtifactRejected as e:
                 msg = str(e)
             except subprocess.CalledProcessError as e:
@@ -3396,6 +3506,43 @@ def cmd_process_deploys(_args):
                     msg = f"install refused: {e}"
                 except Exception as e:
                     msg = str(e)
+        elif action == "grant":
+            # Instance creation grant (RFC-0019, Studio section): the
+            # one privileged thing Studio can do that no deploy token
+            # covers, because before the instance exists there is no
+            # token. server_admin issues it in the portal for ONE name;
+            # Studio spends it for ONE creation and holds nothing
+            # afterwards.
+            #
+            # The portal mints the secret and sends only its digest,
+            # exactly as for deploy tokens — and every gate is re-checked
+            # here, because the spool is data, not trust.
+            op = req.get("op", "create")
+            if op == "revoke":
+                before = len(load_grants())
+                grants = {k: v for k, v in _grants_prune(load_grants()).items()
+                          if not (v.get("kind") == "create"
+                                  and v.get("instance") == name)}
+                save_grants(grants)
+                ok = True
+                msg = ("creation grant revoked" if len(grants) < before
+                       else "no creation grant was open for this instance")
+            elif not has_profile("dev"):
+                msg = ("this node has no profile 'dev' — creating instances "
+                       "is a development act (RFC-0011)")
+            elif inst:
+                msg = f"an instance named '{name}' already exists"
+            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or ""):
+                msg = "instance name: lowercase letters, digits and hyphens"
+            elif not re.fullmatch(r"[0-9a-f]{64}", req.get("digest", "")):
+                msg = "malformed grant digest"
+            else:
+                grant_create("create", name, req["digest"],
+                             {"channel": "test", "by": req.get("by", "?")},
+                             ttl=CREATE_GRANT_TTL)
+                ok = True
+                msg = (f"creation grant issued for '{name}', single use, "
+                       f"{CREATE_GRANT_TTL // 60} minutes")
         elif action == "envelope":
             # An administrator confirms one specific pending announcement
             # in the portal (RFC-0019 decision 5). Bound to the manifest
@@ -3801,7 +3948,8 @@ def cmd_process_deploys(_args):
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
                "source": "portal", "node": "setup wizard",
-               "envelope": "portal", "rollback": "portal"}.get(action, "deploy-hook")
+               "envelope": "portal", "rollback": "portal",
+               "grant": "portal"}.get(action, "deploy-hook")
         record = {"instance": name or "(dieser Knoten)", "ok": ok,
                   "message": msg, "revision": revision,
                   "version": version, "via": via}
@@ -4297,6 +4445,11 @@ def main():
     par.add_argument("artifact", nargs="?",
                      help="retained artifact (default: the one before the running version)")
     par.set_defaults(fn=cmd_artifact)
+    pg = sub.add_parser("grant",
+                        help="open instance creation grants (RFC-0019)")
+    pg.add_argument("action", choices=["list", "revoke"])
+    pg.add_argument("name", nargs="?", help="instance name -- 'revoke' only")
+    pg.set_defaults(fn=cmd_grant)
     pt.set_defaults(fn=cmd_token)
     pd = sub.add_parser("process-deploys")
     pd.set_defaults(fn=cmd_process_deploys)

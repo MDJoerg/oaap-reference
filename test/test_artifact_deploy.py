@@ -266,6 +266,70 @@ try:
 except m.ArtifactRejected as e:
     check("checksum mismatch refused", "checksum" in str(e), e)
 
+print("\n-- instance creation grant (RFC-0019, Studio section)")
+# The one privileged step no deploy token can cover: before the
+# instance exists there is nothing to hold a token for. The permission
+# is therefore SPENT for one creation, never held.
+cdig = hashlib.sha256(b"anlege-erlaubnis").hexdigest()
+new_mf = yaml.safe_load(MANIFEST)
+new_mf["app"]["id"] = "frisch"
+new_mf["app"]["version"] = "0.1.0"
+new_text = yaml.safe_dump(new_mf)
+udig = hashlib.sha256(b"upload-fuer-frisch").hexdigest()
+
+m.save_profiles([])
+m.grant_create("create", "frisch-test", cdig, {"channel": "test"})
+try:
+    m.announce_artifact("frisch-test", new_text, sha, 10, udig,
+                        create_digest=cdig)
+    check("creation needs the dev profile", False, "was accepted")
+except m.ArtifactRejected as e:
+    check("creation needs the dev profile", "dev" in str(e), e)
+
+m.save_profiles(["dev"])
+try:
+    m.announce_artifact("frisch-test", new_text, sha, 10, udig,
+                        create_digest=hashlib.sha256(b"erfunden").hexdigest())
+    check("an invented grant is refused", False, "was accepted")
+except m.ArtifactRejected as e:
+    check("an invented grant is refused", "creation grant" in str(e), e)
+
+try:
+    m.announce_artifact("demo-test", yaml.safe_dump(bumped), sha, 10, udig,
+                        create_digest=cdig)
+    check("a creation grant does not touch an existing instance",
+          False, "was accepted")
+except m.ArtifactRejected as e:
+    check("a creation grant does not touch an existing instance",
+          "already exists" in str(e), e)
+
+# A first package has no envelope to widen — the manifest IS what the
+# administrator agreed to. The same manifest against an existing
+# instance was refused above.
+wide_mf = yaml.safe_load(new_text)
+wide_mf["routes"] = [{"path": "/", "roles": ["public"]}]
+v = m.announce_artifact("frisch-test", yaml.safe_dump(wide_mf), sha, 10, udig,
+                        create_digest=cdig)
+check("the first package needs no envelope confirmation", v == "0.1.0", v)
+check("announcing does not spend the permission yet",
+      m.grant_check("create", "frisch-test", cdig) is not None)
+up = m.grant_spend("upload", "frisch-test", udig)
+check("the upload grant knows it creates the instance",
+      bool(up) and up["create"] and up["create_digest"] == cdig, up)
+check("the permission is spent exactly once",
+      m.grant_spend("create", "frisch-test", cdig) is not None
+      and m.grant_spend("create", "frisch-test", cdig) is None)
+m.grant_create("create", "spaeter-test", cdig, {"channel": "test"})
+check("an open permission is visible to the operator",
+      [g["instance"] for g in m.grants_of_kind("create")] == ["spaeter-test"],
+      m.grants_of_kind("create"))
+check("...and the listing carries no secret",
+      all(set(g) == {"instance", "expires"} for g in m.grants_of_kind("create")))
+
+m.grant_create("create", "spaeter-test", cdig, {"channel": "test"}, ttl=-1)
+check("an expired permission is gone",
+      m.grant_check("create", "spaeter-test", cdig) is None)
+
 print("\n-- retention keeps the current plus three")
 d = m.artifact_dir("demo-test")
 os.makedirs(d, exist_ok=True)

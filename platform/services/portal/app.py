@@ -20,7 +20,7 @@ from datetime import date, datetime, timezone
 from urllib.parse import quote
 
 import requests
-from flask import Flask, redirect, render_template_string, request
+from flask import Flask, g, redirect, render_template_string, request
 from markupsafe import Markup
 
 IDENTITY = "http://identity:8000"
@@ -910,6 +910,68 @@ sieht immer alle Instanzen, unabhängig davon.</p>
 erscheint. Hintergrunddienste bekommen von sich aus keine; „fest" heißt, dass
 jemand das ausdrücklich umgestellt hat. Das ist reine Anzeige — Adresse,
 Routen und Rollen der Instanz bleiben davon unberührt.</p>
+{% if can_create %}
+<div class="card">
+  <h2>Anlege-Erlaubnis fürs Studio</h2>
+  <p class="muted">Eine Test-Instanz legst Du oben selbst an. Soll sie
+     stattdessen <strong>aus dem Studio heraus</strong> entstehen — dort liegt
+     das Paket schon —, dann stellst Du hier eine <strong>einmalige
+     Erlaubnis</strong> für <em>einen</em> Instanznamen aus. Sie gilt
+     {{ grant_minutes }} Minuten, wird beim Anlegen verbraucht und lässt sich
+     bis dahin widerrufen. Das Studio bewahrt sie nicht auf — wie beim
+     Deploy-Token gibt der Mensch sie im Augenblick der Handlung ein
+     (RFC-0019).</p>
+  {% if grants %}
+  <table class="mini">
+    <tr><th>Offen für</th><th>Läuft ab in</th><th></th></tr>
+    {% for gr in grants %}
+    <tr>
+      <td><code>{{ gr.instance }}</code></td>
+      <td>{{ gr.minutes }} Minuten</td>
+      <td><form method="post" action="/instances/grant">
+        <input type="hidden" name="op" value="revoke">
+        <input type="hidden" name="name" value="{{ gr.instance }}">
+        <button class="secondary">Widerrufen</button>
+      </form></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <form method="post" action="/instances/grant">
+    <label>Name der künftigen Instanz <input type="text" name="name"
+           placeholder="z. B. bdt-app-test" autocomplete="off"></label>
+    <button>Erlaubnis ausstellen</button>
+  </form>
+  <p class="muted">Die Erlaubnis gilt <strong>nur für diesen Namen</strong> und
+     <strong>nur für den Test-Kanal</strong>. Sie erlaubt genau ein Anlegen —
+     kein Ausrollen einer bestehenden Instanz, keinen Zugriff auf Daten. Für
+     spätere Aktualisierungen erzeugst Du danach ein normales Deploy-Token auf
+     der Instanzseite.</p>
+</div>
+{% endif %}
+"""
+
+# Floorplan "Dialogseite": like the deploy token, the grant is readable
+# exactly once, and deliberately NOT after a redirect — a redirect would
+# put it in a URL, and the gateway logs full URIs including their query.
+GRANT_SHOW_BODY = """
+<a class="back" href="/instances">← Zurück zur Liste</a>
+<h1>Anlege-Erlaubnis für {{ name }}</h1>
+<div class="card">
+  <p class="ok">Erlaubnis ausgestellt. <strong>Sie wird nur dieses eine Mal
+     angezeigt.</strong> Gespeichert ist davon nur eine Prüfsumme.</p>
+  <p><code style="display:block;padding:.7rem;word-break:break-all;font-size:1.05rem">{{ grant }}</code></p>
+  <p>Gültig {{ minutes }} Minuten, <strong>einmal verwendbar</strong>, gebunden
+     an den Namen <code>{{ name }}</code> und den Test-Kanal.</p>
+  <h2>So wird sie benutzt</h2>
+  <p class="muted">Im Studio beim Vorhaben: Instanzname <code>{{ name }}</code>,
+     Hook-Adresse <code>{{ hook_url }}</code>, Paket wählen, und diese Erlaubnis
+     in das Token-Feld eintragen. Das Studio meldet das Paket an und lädt es
+     hoch — dieselben drei Schritte wie bei jedem Deployment.</p>
+  <p class="muted">Danach ist die Erlaubnis verbraucht. Für spätere
+     Aktualisierungen erzeugst Du auf der Instanzseite ein Deploy-Token.</p>
+  <p><a href="/instances">Fertig — zurück zur Liste</a></p>
+</div>
 """
 
 # Floorplan "Dialogseite" — create a test instance. Only reachable on a
@@ -2340,25 +2402,65 @@ def _valid_deploy_token(name):
     return hmac.compare_digest(entry.get("digest", ""), digest)
 
 
-def _deploy_auth(name):
-    """One indistinguishable answer for every failure (spec test 13)."""
+def _valid_creation_grant(name):
+    """Is the presented bearer a live creation grant for this name?
+
+    Only a pre-check, exactly like _valid_upload_grant: the host
+    re-checks it and is the only place that SPENDS it. Returns the
+    digest so the announcement can name the permission it is using.
+    """
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return ""
+    digest = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+    try:
+        with open(ARTIFACT_GRANTS, encoding="utf-8") as f:
+            entry = json.load(f).get(digest) or {}
+    except (OSError, ValueError):
+        return ""
+    if entry.get("kind") != "create" or entry.get("instance") != name:
+        return ""
+    if entry.get("expires", 0) < _time.time():
+        return ""
+    return digest
+
+
+def _deploy_auth(name, allow_creation=False):
+    """One indistinguishable answer for every failure (spec test 13).
+
+    With `allow_creation` a live instance creation grant is accepted in
+    place of a deploy token — the case where the instance does not exist
+    yet and therefore cannot have a token (RFC-0019, Studio section).
+    Returns (instance-or-{}, None) on success; the caller learns which
+    of the two carried it from `g.creation_digest`.
+    """
     key = _client_ip()
     if _deploy_blocked(key):
         return {"error": "too many attempts — wait a minute"}, 429
-    inst = (load_instances().get(name)
-            if _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or "") else None)
-    if not inst or inst.get("channel") != "test" or not _valid_deploy_token(name):
-        _deploy_failed(key)
-        return DENIED, 403
-    _deploy_succeeded(key)
-    return inst, None
+    named = bool(_re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or ""))
+    inst = load_instances().get(name) if named else None
+    g.creation_digest = ""
+    if inst and inst.get("channel") == "test" and _valid_deploy_token(name):
+        _deploy_succeeded(key)
+        return inst, None
+    if allow_creation and named and not inst:
+        digest = _valid_creation_grant(name)
+        if digest:
+            _deploy_succeeded(key)
+            g.creation_digest = digest
+            return {}, None
+    _deploy_failed(key)
+    return DENIED, 403
 
 
 def _entry_url(name, inst):
     ext = external_host()
     if ext:
         return f"https://{name}.{ext}/"
-    return f"http://{request.host.split(':')[0]}:{inst['port']}/"
+    # `inst` can be empty when a creation failed — then there is no port
+    # and no address to name, and saying so beats a 500
+    port = (inst or {}).get("port")
+    return (f"http://{request.host.split(':')[0]}:{port}/" if port else "")
 
 
 def recent_deploys(limit=5):
@@ -2456,7 +2558,12 @@ def _valid_upload_grant(name):
 
 @app.post("/deploy/<name>/announce")
 def deploy_announce(name):
-    inst, err = _deploy_auth(name)
+    # The one place that also accepts an instance creation grant: before
+    # the instance exists there is no deploy token, so the operator's
+    # single-use permission stands in for one (RFC-0019, Studio
+    # section). Everything after this line is identical for both — the
+    # creation is the same handshake, one level up.
+    inst, err = _deploy_auth(name, allow_creation=True)
     if err:
         return inst, err
     data = request.get_json(silent=True) or {}
@@ -2480,6 +2587,7 @@ def deploy_announce(name):
         "artifact_sha256": (data.get("artifact_sha256") or "").strip().lower(),
         "artifact_bytes": size,
         "digest": hashlib.sha256(token.encode()).hexdigest(),
+        "create_digest": g.get("creation_digest", ""),
     }, DEPLOY_WAIT_SECONDS)
     if res is None:
         return {"refused": "timeout",
@@ -2949,7 +3057,85 @@ def instances_list():
         })
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
                 can_create="dev" in node_profiles(),
+                grants=_open_creation_grants(),
+                grant_minutes=CREATE_GRANT_MINUTES,
                 msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+# --- instance creation grant (RFC-0019, Studio section) --------------------
+# Before an instance exists there is no deploy token, so the one step
+# Studio cannot do with a pasted token is the first one. Instead of
+# giving Studio a standing permission, `server_admin` hands it a
+# single-use one for exactly one name — spendable, not held.
+
+CREATE_GRANT_MINUTES = 30  # mirrors appctl.CREATE_GRANT_TTL
+
+
+def _open_creation_grants():
+    """Which creation grants are open, for the list page.
+
+    Names and remaining time only — never the digest. What is shown here
+    is what an administrator has to be able to revoke, not a credential.
+    """
+    try:
+        with open(ARTIFACT_GRANTS, encoding="utf-8") as f:
+            grants = json.load(f)
+    except (OSError, ValueError):
+        return []
+    now = _time.time()
+    out = []
+    for entry in grants.values():
+        if entry.get("kind") != "create" or entry.get("expires", 0) <= now:
+            continue
+        out.append({"instance": entry.get("instance", ""),
+                    "minutes": max(1, int((entry["expires"] - now) // 60))})
+    return sorted(out, key=lambda e: e["instance"])
+
+
+@app.post("/instances/grant")
+def instance_grant():
+    denied = require_server_admin()
+    if denied:
+        return denied
+    name = (request.form.get("name") or "").strip().lower()
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        return redirect("/instances?err="
+                        + quote("Instanzname: Kleinbuchstaben, Ziffern, Bindestriche."),
+                        code=303)
+    if request.form.get("op") == "revoke":
+        res = _queue_and_wait(name, {"action": "grant", "op": "revoke"},
+                              TOKEN_WAIT_SECONDS)
+        if res is None:
+            return redirect("/instances?err="
+                            + quote("Der Widerruf läuft noch — bitte gleich erneut prüfen."),
+                            code=303)
+        return redirect(f"/instances?{'msg' if res.get('ok') else 'err'}="
+                        + quote(res.get("message", "")), code=303)
+    if name in load_instances():
+        return redirect("/instances?err="
+                        + quote(f"Eine Instanz namens „{name}“ gibt es schon — "
+                                "sie braucht ein Deploy-Token, keine Anlege-Erlaubnis."),
+                        code=303)
+    # Same shape as the deploy token: the portal mints the secret and
+    # hands the host only its digest, so the readable value never
+    # touches the spool or the filesystem.
+    grant = secrets.token_urlsafe(32)
+    res = _queue_and_wait(name, {
+        "action": "grant", "op": "create",
+        "digest": hashlib.sha256(grant.encode()).hexdigest(),
+    }, TOKEN_WAIT_SECONDS)
+    if res is None:
+        return redirect("/instances?err="
+                        + quote("Die Ausstellung läuft noch — bitte gleich erneut prüfen."),
+                        code=303)
+    if not res.get("ok"):
+        return redirect("/instances?err="
+                        + quote(res.get("message", "Erlaubnis konnte nicht ausgestellt werden.")),
+                        code=303)
+    # Rendered directly, NOT via Post/Redirect/Get — see TOKEN_SHOW_BODY.
+    return page(GRANT_SHOW_BODY, f"Anlege-Erlaubnis {name}", "instances",
+                name=name, grant=grant, minutes=CREATE_GRANT_MINUTES,
+                hook_url=_hook_url(name))
 
 
 # --- creating a test instance from the portal (RFC-0011, profile `dev`) ---
