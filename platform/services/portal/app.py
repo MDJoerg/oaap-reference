@@ -103,6 +103,35 @@ STYLE = """
        margin-bottom:1.2rem}
   /* a card that is asking for a decision, not merely reporting */
   .card.warn{border-color:var(--warn);border-left-width:4px}
+  /* Objektkopf + Reiter (design guidelines 6.2.1/6.2.2): a page with a
+     dozen cards is a scroll hunt. The head answers "what is this?", the
+     tabs group the rest. Tabs are LINKS and the server picks the active
+     one — no JavaScript, and every section stays in the document so a
+     missing stylesheet makes the page long, not broken. */
+  .objhead{background:var(--oaap-surface);border:1px solid var(--oaap-border);
+       border-radius:.6rem;padding:1.1rem 1.4rem;margin-bottom:1rem;
+       box-shadow:0 1px 3px rgba(23,37,84,.06)}
+  .objhead .titleline{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+  .objhead h1{margin:0}
+  .objhead .sub{color:var(--oaap-muted);font-size:.9rem;margin:.35rem 0 0}
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));
+       gap:.7rem 1.4rem;margin-top:1rem;border-top:1px solid var(--oaap-border);
+       padding-top:.9rem}
+  .facts .k{display:block;font-size:.72rem;text-transform:uppercase;
+       letter-spacing:.04em;color:var(--oaap-muted)}
+  .facts .v{display:block;font-size:.95rem;word-break:break-word}
+  .tabs{display:flex;gap:.2rem;flex-wrap:wrap;margin-bottom:1.2rem;
+       border-bottom:1px solid var(--oaap-border);position:sticky;top:0;
+       background:var(--oaap-bg);z-index:5}
+  .tabs a{display:flex;align-items:center;padding:.7rem 1rem;min-height:44px;
+       text-decoration:none;color:var(--oaap-muted);
+       border-bottom:3px solid transparent}
+  .tabs a:hover{color:var(--oaap-text);background:rgba(37,99,235,.06)}
+  .tabs a.active{color:var(--oaap-blue-700);font-weight:600;
+       border-bottom-color:var(--oaap-blue-600)}
+  .tabs a.danger.active{color:var(--err);border-bottom-color:var(--err)}
+  .panel{display:none}
+  .panel.active{display:block}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:1rem;margin:1rem 0}
   .tile{display:block;background:var(--oaap-surface);border:1px solid var(--oaap-border);
        border-radius:.6rem;padding:1rem 1.1rem;text-decoration:none;color:inherit;
@@ -117,6 +146,7 @@ STYLE = """
        background:var(--oaap-blue-100);color:var(--oaap-blue-900);white-space:nowrap}
   .badge.test{background:#fef3c7;color:#92400e}
   .badge.off{background:#f3f4f6;color:#6b7280}
+  .badge.todo{background:#fee2e2;color:#991b1b}
   .dot{display:inline-block;width:.65rem;height:.65rem;border-radius:50%;margin-right:.45rem}
   .dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
   .dot.warn{background:var(--warn)} .dot.unknown{background:#9ca3af}
@@ -952,13 +982,126 @@ INSTANCE_NEW_BODY = """
 </form>
 """
 
-# Floorplan "Objektseite" (design guidelines 6.2).
+# Floorplan "Objektseite" mit Objektkopf und Reitern (design guidelines
+# 6.2.1/6.2.2). Diese Seite trägt ein Dutzend Karten — ohne Gruppierung
+# ist sie eine Scroll-Jagd. Reihenfolge der Reiter: erst lesen
+# (Überblick), dann das Tägliche, zuletzt das Gefährliche.
+#
+# Alle Abschnitte stehen IMMER im Dokument, nur der gewählte ist
+# sichtbar. Das kostet ein paar Kilobyte und spart JavaScript, einen
+# zweiten Zustand und die Frage, was ohne Stylesheet passiert.
 INSTANCE_EDIT_BODY = """
 <a class="back" href="/instances">← Zurück zur Liste</a>
-<h1>{{ i.name }} <span class="muted">({{ i.app_name }} v{{ i.version }})</span></h1>
+<div class="objhead">
+  <div class="titleline">
+    <h1>{{ i.name }}</h1>
+    <span class="badge {{ 'test' if i.is_test else 'off' }}">{{ i.channel_label }}</span>
+    {% if i.pending %}<span class="badge todo">Bestätigung offen</span>{% endif %}
+  </div>
+  <p class="sub">{{ i.app_name }} {{ i.version }} · Kennung <code>{{ i.app_id }}</code></p>
+  <div class="facts">
+    <div><span class="k">Adresse</span><span class="v">
+      {% if i.address_url %}<a href="{{ i.address_url }}">{{ i.address_host }}</a>
+      {% else %}— <span class="muted">(kein externer Name)</span>{% endif %}</span></div>
+    <div><span class="k">Sichtbar für</span><span class="v">{{ i.visibility_label }}</span></div>
+    <div><span class="k">Kachel</span><span class="v">{{ "im Launchpad" if i.tile_visible else "ausgeblendet" }}</span></div>
+    <div><span class="k">Herkunft</span><span class="v">{{ i.source_label }}</span></div>
+    <div><span class="k">Deploy-Token</span><span class="v">
+      {% if not i.is_test %}<span class="muted">nur für Test-Instanzen</span>
+      {% elif i.token_created %}seit {{ i.token_created }}
+      {% else %}<span class="muted">keins</span>{% endif %}</span></div>
+    <div><span class="k">Verbindungen</span><span class="v">
+      {% if i.links %}{{ i.links|length }} zu {{ i.links|join(", ") }}
+      {% else %}<span class="muted">keine — isoliert</span>{% endif %}</span></div>
+  </div>
+</div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if i.pending %}
+{# Über den Reitern, nicht in einem: eine anstehende Entscheidung darf
+   die Gruppierung nicht verstecken (design guidelines 6.2.2). #}
+<div class="card warn">
+  <h2>Deployment wartet auf Bestätigung</h2>
+  <p>Eine Anmeldung für <strong>Version {{ i.pending.version }}</strong> würde
+     erweitern, was diese Instanz erreichen darf oder wer sie erreichen darf.
+     Deshalb ist sie abgelehnt worden, bis Du zustimmst:</p>
+  <ul>{% for r in i.pending.reasons %}<li>{{ r }}</li>{% endfor %}</ul>
+  <p class="muted">Die Bestätigung gilt für <em>genau dieses</em> Manifest, nicht
+     für das nächste Deployment. Nach dem Zustimmen meldet die KI dieselbe
+     Version erneut an und lädt hoch.</p>
+  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
+    <input type="hidden" name="tab" value="{{ tab }}">
+    <input type="hidden" name="op" value="confirm">
+    <input type="hidden" name="manifest_sha" value="{{ i.pending.manifest_sha }}">
+    <button>Erweiterung bestätigen</button>
+  </form>
+  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
+    <input type="hidden" name="tab" value="{{ tab }}">
+    <input type="hidden" name="op" value="reject">
+    <button class="secondary">Verwerfen</button>
+  </form>
+</div>
+{% endif %}
+<nav class="tabs">
+  {% for key, label in tabs %}
+  <a href="/instances/{{ i.name }}?tab={{ key }}"
+     class="{{ 'active' if key == tab }}{{ ' danger' if key == 'verwaltung' }}">{{ label }}</a>
+  {% endfor %}
+</nav>
+
+<section class="panel {{ 'active' if tab == 'ueberblick' }}">
+<div class="card">
+  <h2>Was die App mitbringt</h2>
+  {% if i.description %}<p>{{ i.description }}</p>{% endif %}
+  <p class="muted">Das hier ist die Selbstauskunft der App aus ihrem Manifest —
+     sie kann sich mit dem nächsten Deployment ändern. Was <em>Du</em>
+     entscheidest, steht in den anderen Reitern.</p>
+  <h3>Routen</h3>
+  <table class="mini">
+    <tr><th>Pfad</th><th>Wer darf hinein</th></tr>
+    {% for r in i.route_rows %}
+    <tr><td><code>{{ r.path }}</code></td><td>{{ r.who }}</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Die Rollen erzwingt das Gateway bei jeder Anfrage — nicht
+     diese Seite und nicht die App.</p>
+  {% if i.services|length > 1 %}
+  <h3>Dienste</h3>
+  <ul class="muted">
+    {% for s in i.services %}
+    <li><code>{{ s.service or "(einziger)" }}</code> — Port {{ s.port }}{{ " (Hauptdienst)" if loop.first }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <h3>Datenablage</h3>
+  {% if i.storage %}
+  <ul class="muted">
+    {% for s in i.storage %}<li><code>{{ s.name }}</code> im Container unter <code>{{ s.mount }}</code></li>{% endfor %}
+  </ul>
+  <p class="muted">Nur hier darf die App schreiben, und nur das ist im Backup.</p>
+  {% else %}
+  <p class="muted">Diese App erklärt keine Ablage — sie hält nichts fest, was
+     einen Neustart überlebt.</p>
+  {% endif %}
+</div>
+<div class="card">
+  <h2>Herkunft</h2>
+  <p>{{ i.source_label }}</p>
+  {% if i.source_lines %}
+  <ul class="muted">{% for l in i.source_lines %}<li>{{ l }}</li>{% endfor %}</ul>
+  {% endif %}
+  <p class="muted">Aus dieser Quelle wird die Instanz neu ausgerollt und
+     wiederhergestellt. Kanal <strong>{{ i.channel_label }}</strong>:
+     {% if i.is_test %}Test-Instanzen dürfen ein Deploy-Token bekommen, und
+     dieselbe Version darf erneut ausgerollt werden.
+     {% else %}Produktiv-Instanzen bekommen kein Deploy-Token; sie werden über
+     den Store aktualisiert.{% endif %}</p>
+</div>
+</section>
+
+<section class="panel {{ 'active' if tab == 'zugang' }}">
 <form method="post" action="/instances/{{ i.name }}/visibility">
+  <input type="hidden" name="tab" value="zugang">
   <div class="card">
     <h2>Sichtbarkeit</h2>
     <label class="checkline"><input type="radio" name="mode" value="all"
@@ -974,6 +1117,7 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 <form method="post" action="/instances/{{ i.name }}/tile">
+  <input type="hidden" name="tab" value="zugang">
   <div class="card">
     <h2>Kachel im Launchpad</h2>
     <p class="muted">{{ i.tile_reason }}</p>
@@ -990,53 +1134,9 @@ INSTANCE_EDIT_BODY = """
     <button>Speichern</button>
   </div>
 </form>
-<div class="card">
-  <h2>Eigene Adresse</h2>
-  <p class="muted">Automatisch erreichbar unter
-     <code>{{ i.auto_address or "— (dieser Knoten hat keinen externen Namen)" }}</code>.
-     Zusätzlich kann diese Instanz eigene öffentliche Namen tragen —
-     einen <strong>Hauptnamen</strong> (den man in ausgelieferte Software
-     einbaut und der einen Umzug überlebt) und beliebig viele
-     <strong>Aliasse</strong>, die gleichwertig erreichbar sind. Alle Namen
-     stehen unter demselben Schutz — ein Alias ist kein Schlupfloch.</p>
-  <form method="post" action="/instances/{{ i.name }}/address">
-    <label>Hauptname <input type="text" name="hostname" value="{{ i.address }}"
-           placeholder="z. B. hub.meine-domain.de"></label>
-    <p class="muted">Der Name muss selbst auf diesen Knoten zeigen (DNS-Eintrag
-       und Portfreigabe bleiben Deine Sache). Das Zertifikat holt die Plattform
-       beim ersten Zugriff. Die automatische Adresse bleibt gültig.</p>
-    <button>Hauptnamen speichern</button>
-    {% if i.address and not i.aliases %}<button name="op" value="remove" class="secondary">Hauptnamen entfernen</button>{% endif %}
-  </form>
-  {% if i.address %}
-  <h3>Aliasse</h3>
-  {% if i.aliases %}
-  <ul class="muted">
-    {% for a in i.aliases %}
-    <li><code>{{ a }}</code>
-      <form method="post" action="/instances/{{ i.name }}/address" style="display:inline">
-        <input type="hidden" name="op" value="alias-remove">
-        <input type="hidden" name="hostname" value="{{ a }}">
-        <button class="secondary">entfernen</button>
-      </form>
-    </li>
-    {% endfor %}
-  </ul>
-  {% else %}
-  <p class="muted">Noch keine Aliasse.</p>
-  {% endif %}
-  <form method="post" action="/instances/{{ i.name }}/address">
-    <input type="hidden" name="op" value="alias-add">
-    <label>Alias hinzufügen <input type="text" name="hostname"
-           placeholder="z. B. bdt-hub-test.joomp.de"></label>
-    <button>Alias hinzufügen</button>
-  </form>
-  {% else %}
-  <p class="muted">Aliasse sind erst möglich, wenn ein Hauptname gesetzt ist.</p>
-  {% endif %}
-</div>
 {% if i.has_public_route %}
 <form method="post" action="/instances/{{ i.name }}/throttle">
+  <input type="hidden" name="tab" value="zugang">
   <div class="card">
     <h2>Drosselung öffentlicher Routen</h2>
     <p class="muted">Diese App hat mindestens eine Route, die <strong>ohne
@@ -1059,6 +1159,57 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 {% endif %}
+</section>
+
+<section class="panel {{ 'active' if tab == 'netz' }}">
+<div class="card">
+  <h2>Eigene Adresse</h2>
+  <p class="muted">Automatisch erreichbar unter
+     <code>{{ i.auto_address or "— (dieser Knoten hat keinen externen Namen)" }}</code>.
+     Zusätzlich kann diese Instanz eigene öffentliche Namen tragen —
+     einen <strong>Hauptnamen</strong> (den man in ausgelieferte Software
+     einbaut und der einen Umzug überlebt) und beliebig viele
+     <strong>Aliasse</strong>, die gleichwertig erreichbar sind. Alle Namen
+     stehen unter demselben Schutz — ein Alias ist kein Schlupfloch.</p>
+  <form method="post" action="/instances/{{ i.name }}/address">
+    <input type="hidden" name="tab" value="netz">
+    <label>Hauptname <input type="text" name="hostname" value="{{ i.address }}"
+           placeholder="z. B. hub.meine-domain.de"></label>
+    <p class="muted">Der Name muss selbst auf diesen Knoten zeigen (DNS-Eintrag
+       und Portfreigabe bleiben Deine Sache). Das Zertifikat holt die Plattform
+       beim ersten Zugriff. Die automatische Adresse bleibt gültig.</p>
+    <button>Hauptnamen speichern</button>
+    {% if i.address and not i.aliases %}<button name="op" value="remove" class="secondary">Hauptnamen entfernen</button>{% endif %}
+  </form>
+  {% if i.address %}
+  <h3>Aliasse</h3>
+  {% if i.aliases %}
+  <ul class="muted">
+    {% for a in i.aliases %}
+    <li><code>{{ a }}</code>
+      <form method="post" action="/instances/{{ i.name }}/address" style="display:inline">
+        <input type="hidden" name="tab" value="netz">
+        <input type="hidden" name="op" value="alias-remove">
+        <input type="hidden" name="hostname" value="{{ a }}">
+        <button class="secondary">entfernen</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">Noch keine Aliasse.</p>
+  {% endif %}
+  <form method="post" action="/instances/{{ i.name }}/address">
+    <input type="hidden" name="tab" value="netz">
+    <input type="hidden" name="op" value="alias-add">
+    <label>Alias hinzufügen <input type="text" name="hostname"
+           placeholder="z. B. bdt-hub-test.joomp.de"></label>
+    <button>Alias hinzufügen</button>
+  </form>
+  {% else %}
+  <p class="muted">Aliasse sind erst möglich, wenn ein Hauptname gesetzt ist.</p>
+  {% endif %}
+</div>
 {% if i.endpoints %}
 <div class="card">
   <h2>Direkter Port (ohne Gateway)</h2>
@@ -1078,6 +1229,7 @@ INSTANCE_EDIT_BODY = """
        {{ e.host_port }}). Die Adresse ist knotenlokal — der Edge trägt sie nicht,
        und eine Wiederherstellung auf einer anderen Maschine bringt sie nicht mit.</p>
     <form method="post" action="/instances/{{ i.name }}/endpoint">
+      <input type="hidden" name="tab" value="netz">
       <input type="hidden" name="op" value="deny">
       <input type="hidden" name="endpoint" value="{{ e.name }}">
       <button class="secondary">Port schließen</button>
@@ -1085,6 +1237,7 @@ INSTANCE_EDIT_BODY = """
     {% elif i.node_exposed %}
     <form method="post" action="/instances/{{ i.name }}/endpoint"
           onsubmit="return confirm('Dieser Port läuft am Gateway vorbei — keine Anmeldung, keine Drosselung, kein Protokoll. Wirklich freigeben?');">
+      <input type="hidden" name="tab" value="netz">
       <input type="hidden" name="op" value="allow">
       <input type="hidden" name="endpoint" value="{{ e.name }}">
       <button>Port freigeben</button>
@@ -1096,6 +1249,13 @@ INSTANCE_EDIT_BODY = """
     {% endif %}
   </div>
   {% endfor %}
+</div>
+{% else %}
+<div class="card">
+  <h2>Direkter Port (ohne Gateway)</h2>
+  <p class="muted">Diese App will keinen Port am Gateway vorbei. Alles, was sie
+     anbietet, läuft über die Adresse oben — mit Anmeldung, Rollenprüfung,
+     Drosselung und Protokoll.</p>
 </div>
 {% endif %}
 <div class="card">
@@ -1111,6 +1271,7 @@ INSTANCE_EDIT_BODY = """
     <tr>
       <td><code>{{ t }}</code></td>
       <td><form method="post" action="/instances/{{ i.name }}/link">
+        <input type="hidden" name="tab" value="netz">
         <input type="hidden" name="op" value="remove">
         <input type="hidden" name="target" value="{{ t }}">
         <button class="secondary">Trennen</button>
@@ -1123,6 +1284,7 @@ INSTANCE_EDIT_BODY = """
   {% endif %}
   {% if i.link_candidates %}
   <form method="post" action="/instances/{{ i.name }}/link">
+    <input type="hidden" name="tab" value="netz">
     <input type="hidden" name="op" value="add">
     <label>Verbindung erlauben zu
       <select name="target">
@@ -1135,6 +1297,9 @@ INSTANCE_EDIT_BODY = """
   </form>
   {% endif %}
 </div>
+</section>
+
+<section class="panel {{ 'active' if tab == 'deployment' }}">
 {% if i.is_test %}
 <div class="card">
   <h2>Deploy-Token</h2>
@@ -1148,11 +1313,13 @@ INSTANCE_EDIT_BODY = """
   <p class="muted">Adresse für den Hook (an die KI weitergeben, sie ist nicht
      geheim):<br><code>{{ i.hook_url }}</code></p>
   <form method="post" action="/instances/{{ i.name }}/token" style="display:inline">
+    <input type="hidden" name="tab" value="deployment">
     <input type="hidden" name="op" value="create">
     <button>{{ "Neues Token erzeugen" if i.token_created else "Token erzeugen" }}</button>
   </form>
   {% if i.token_created %}
   <form method="post" action="/instances/{{ i.name }}/token" style="display:inline">
+    <input type="hidden" name="tab" value="deployment">
     <input type="hidden" name="op" value="revoke">
     <button class="secondary">Widerrufen</button>
   </form>
@@ -1167,26 +1334,13 @@ INSTANCE_EDIT_BODY = """
      Größe — die Antwort enthält ein Einmal-Token —, dann
      <code>PUT {{ i.hook_url }}/artifact</code> mit dem Paket.</p>
 </div>
-{% endif %}
-{% if i.pending %}
-<div class="card warn">
-  <h2>Deployment wartet auf Bestätigung</h2>
-  <p>Eine Anmeldung für <strong>Version {{ i.pending.version }}</strong> würde
-     erweitern, was diese Instanz erreichen darf oder wer sie erreichen darf.
-     Deshalb ist sie abgelehnt worden, bis Du zustimmst:</p>
-  <ul>{% for r in i.pending.reasons %}<li>{{ r }}</li>{% endfor %}</ul>
-  <p class="muted">Die Bestätigung gilt für <em>genau dieses</em> Manifest, nicht
-     für das nächste Deployment. Nach dem Zustimmen meldet die KI dieselbe
-     Version erneut an und lädt hoch.</p>
-  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
-    <input type="hidden" name="op" value="confirm">
-    <input type="hidden" name="manifest_sha" value="{{ i.pending.manifest_sha }}">
-    <button>Erweiterung bestätigen</button>
-  </form>
-  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
-    <input type="hidden" name="op" value="reject">
-    <button class="secondary">Verwerfen</button>
-  </form>
+{% else %}
+<div class="card">
+  <h2>Deploy-Token</h2>
+  <p class="muted">Diese Instanz läuft auf dem Kanal <strong>Produktiv</strong>
+     und bekommt deshalb grundsätzlich kein Deploy-Token: Was hier läuft,
+     wechselt über den Store, nicht auf Zuruf einer Maschine. Zum Erproben
+     einer neuen Fassung gehört eine Test-Instanz.</p>
 </div>
 {% endif %}
 {% if i.artifacts %}
@@ -1203,6 +1357,7 @@ INSTANCE_EDIT_BODY = """
       <td>{{ a.received }}</td>
       <td>{% if not a.running %}
         <form method="post" action="/instances/{{ i.name }}/rollback">
+          <input type="hidden" name="tab" value="deployment">
           <input type="hidden" name="artifact" value="{{ a.file }}">
           <button class="secondary">Hierauf zurück</button>
         </form>
@@ -1212,8 +1367,12 @@ INSTANCE_EDIT_BODY = """
   </table>
 </div>
 {% endif %}
+</section>
+
+<section class="panel {{ 'active' if tab == 'konfiguration' }}">
 {% if i.config %}
 <form method="post" action="/instances/{{ i.name }}/config">
+  <input type="hidden" name="tab" value="konfiguration">
   <div class="card">
     <h2>Konfiguration</h2>
     {% for c in i.config %}
@@ -1235,8 +1394,19 @@ INSTANCE_EDIT_BODY = """
     <button>Speichern</button>
   </div>
 </form>
+{% else %}
+<div class="card">
+  <h2>Konfiguration</h2>
+  <p class="muted">Diese App erklärt in ihrem Manifest keine Konfigurationswerte
+     — es gibt hier nichts einzustellen. Andere Werte lassen sich nicht
+     nachreichen: Was eine App braucht, sagt sie selbst.</p>
+</div>
 {% endif %}
+</section>
+
+<section class="panel {{ 'active' if tab == 'verwaltung' }}">
 <form method="post" action="/instances/{{ i.name }}/remove">
+  <input type="hidden" name="tab" value="verwaltung">
   <div class="card">
     <h2>Instanz entfernen</h2>
     <p>Entfernt Container, Adresse und Kachel dieser Instanz. Der Vorgang
@@ -1252,6 +1422,7 @@ INSTANCE_EDIT_BODY = """
     <button class="secondary">Entfernen</button>
   </div>
 </form>
+</section>
 """
 
 # Floorplan "Dialogseite": the one and only time the token is readable.
@@ -2920,6 +3091,27 @@ def _new_error(text):
                 store_apps=_store_apps(), error=text)
 
 
+def _tab(default=""):
+    """Which section the caller is in — from the link (?tab=) or from the
+    hidden field a form carried along, so a save comes back where it was
+    triggered instead of dropping the user at the top of the page."""
+    return iv.valid_tab(request.values.get("tab"), default)
+
+
+def _inst_back(name, msg="", err=""):
+    """Post/Redirect/Get back to the instance page, same section."""
+    q = []
+    if msg:
+        q.append("msg=" + quote(msg))
+    if err:
+        q.append("err=" + quote(err))
+    tab = _tab()
+    if tab:
+        q.append("tab=" + tab)
+    return redirect(f"/instances/{name}" + ("?" + "&".join(q) if q else ""),
+                    code=303)
+
+
 @app.get("/instances/<name>")
 def instance_detail(name):
     denied = require_server_admin()
@@ -2928,18 +3120,36 @@ def instance_detail(name):
     inst = load_instances().get(name)
     if not inst:
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    groups = _instance_groups(inst)
+    address = inst.get("address", "")
+    auto = f"{name}.{external_host()}" if external_host() else ""
+    source_label, source_lines = iv.source_view(inst)
     i = {"name": name, "app_name": inst.get("app_name", name),
          "version": inst.get("version", "?"),
-         "groups": _instance_groups(inst), "roles": inst.get("roles") or [],
+         # Objektkopf (design guidelines 6.2.1): the answers one would
+         # otherwise have to hunt for across six sections
+         "app_id": inst.get("app_id", ""),
+         "description": inst.get("description", ""),
+         "channel_label": CHANNEL_LABELS.get(inst.get("channel", ""),
+                                             inst.get("channel", "?")),
+         "address_host": address or auto,
+         "address_url": f"https://{address or auto}" if (address or auto) else "",
+         "visibility_label": iv.visibility_label(inst),
+         "tile_visible": iv.tile_visible(inst),
+         "source_label": source_label, "source_lines": source_lines,
+         "route_rows": iv.route_rows(inst),
+         "storage": inst.get("storage") or [],
+         "services": inst.get("services") or [],
+         "groups": groups, "roles": inst.get("roles") or [],
          "config": _instance_config(name, inst),
          "is_test": inst.get("channel") == "test",
          "token_created": _token_created(name),
          "artifacts": _artifacts(name, inst),
          "pending": _pending_envelope(name),
          "hook_url": _hook_url(name),
-         "address": inst.get("address", ""),
+         "address": address,
          "aliases": inst.get("aliases") or [],
-         "auto_address": f"{name}.{external_host()}" if external_host() else "",
+         "auto_address": auto,
          "has_public_route": any("public" in (r.get("roles") or [])
                                  for r in inst.get("routes") or []),
          "tile_mode": iv.tile_mode(inst),
@@ -2956,6 +3166,7 @@ def instance_detail(name):
          "node_exposed": "exposed" in node_profiles(),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
+                tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
 
@@ -2989,8 +3200,7 @@ def instance_endpoint(name):
     op = request.form.get("op", "allow")
     ep = (request.form.get("endpoint") or "").strip()
     if not ep:
-        return redirect(f"/instances/{name}?err={quote('Kein Endpunkt angegeben.')}",
-                        code=303)
+        return _inst_back(name, err="Kein Endpunkt angegeben.")
     return _queue_and_redirect(name, {"action": "endpoint", "op": op, "endpoint": ep},
                                ENDPOINT_WAIT_SECONDS)
 
@@ -3007,8 +3217,7 @@ def instance_link(name):
     op = request.form.get("op", "add")
     target = (request.form.get("target") or "").strip()
     if not target:
-        return redirect(f"/instances/{name}?err={quote('Bitte eine Ziel-Instanz wählen.')}",
-                        code=303)
+        return _inst_back(name, err="Bitte eine Ziel-Instanz wählen.")
     return _queue_and_redirect(name, {"action": "link", "op": op, "target": target},
                                LINK_WAIT_SECONDS)
 
@@ -3023,9 +3232,8 @@ def instance_visibility(name):
     mode = request.form.get("mode", "all")
     groups = _parse_groups(request.form.get("groups", "")) if mode == "groups" else []
     if mode == "groups" and not groups:
-        return redirect(
-            f"/instances/{name}?err={quote('Bitte mindestens eine Gruppe angeben oder Alle wählen.')}",
-            code=303)
+        return _inst_back(
+            name, err="Bitte mindestens eine Gruppe angeben oder Alle wählen.")
     return _queue_and_redirect(name, {"action": "visibility", "groups": groups},
                                VISIBILITY_WAIT_SECONDS)
 
@@ -3045,9 +3253,7 @@ def instance_tile(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     mode = request.form.get("mode", "auto")
     if mode not in iv.TILE_MODES:
-        return redirect(
-            f"/instances/{name}?err={quote('Unbekannte Einstellung für die Kachel.')}",
-            code=303)
+        return _inst_back(name, err="Unbekannte Einstellung für die Kachel.")
     return _queue_and_redirect(name, {"action": "tile", "mode": mode},
                                TILE_WAIT_SECONDS)
 
@@ -3138,8 +3344,7 @@ def instance_address(name):
                                    ADDRESS_WAIT_SECONDS)
     if op in ("alias-add", "alias-remove"):
         if not hostname:
-            return redirect(f"/instances/{name}?err="
-                            f"{quote('Kein Aliasname angegeben.')}", code=303)
+            return _inst_back(name, err="Kein Aliasname angegeben.")
         return _queue_and_redirect(name, {"action": "address", "op": op,
                                           "hostname": hostname},
                                    ADDRESS_WAIT_SECONDS)
@@ -3174,9 +3379,8 @@ def instance_remove(name):
     # Typing the name is the guard against a misclick on the one
     # destructive control in this UI; the host checks it a second time.
     if (request.form.get("confirm") or "").strip() != name:
-        return redirect(
-            f"/instances/{name}?err={quote('Zum Entfernen bitte den Instanznamen eintippen.')}",
-            code=303)
+        return _inst_back(name,
+                          err="Zum Entfernen bitte den Instanznamen eintippen.")
     res = _queue_and_wait(name, {"action": "remove",
                                  "confirm": name,
                                  "purge": bool(request.form.get("purge"))},
@@ -3186,9 +3390,7 @@ def instance_remove(name):
             f"/instances?err={quote('Das Entfernen läuft noch — bitte die Liste gleich erneut prüfen.')}",
             code=303)
     if not res.get("ok"):
-        return redirect(
-            f"/instances/{name}?err={quote(res.get('message', 'Entfernen fehlgeschlagen.'))}",
-            code=303)
+        return _inst_back(name, err=res.get("message", "Entfernen fehlgeschlagen."))
     # back to the list: the object page this came from no longer exists
     return redirect(f"/instances?msg={quote(res.get('message', 'Entfernt.'))}", code=303)
 
@@ -3234,8 +3436,7 @@ def instance_rollback(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     artifact = request.form.get("artifact", "").strip()
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
-        return redirect(f"/instances/{name}?err={quote('Unbekanntes Paket.')}",
-                        code=303)
+        return _inst_back(name, err="Unbekanntes Paket.")
     return _queue_and_redirect(name, {"action": "rollback", "artifact": artifact},
                                CREATE_WAIT_SECONDS)
 
@@ -3249,9 +3450,7 @@ def instance_token(name):
     if not inst:
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     if inst.get("channel") != "test":
-        return redirect(
-            f"/instances/{name}?err={quote('Deploy-Token gibt es nur für Test-Instanzen.')}",
-            code=303)
+        return _inst_back(name, err="Deploy-Token gibt es nur für Test-Instanzen.")
     if request.form.get("op") == "revoke":
         return _queue_and_redirect(name, {"action": "token", "op": "revoke"},
                                    TOKEN_WAIT_SECONDS)
@@ -3265,13 +3464,11 @@ def instance_token(name):
     res = _queue_and_wait(name, {"action": "token", "op": "create", "digest": digest},
                           TOKEN_WAIT_SECONDS)
     if res is None:
-        return redirect(
-            f"/instances/{name}?err={quote('Die Ausstellung läuft noch — bitte gleich erneut prüfen.')}",
-            code=303)
+        return _inst_back(
+            name, err="Die Ausstellung läuft noch — bitte gleich erneut prüfen.")
     if not res.get("ok"):
-        return redirect(
-            f"/instances/{name}?err={quote(res.get('message', 'Token konnte nicht erzeugt werden.'))}",
-            code=303)
+        return _inst_back(name,
+                          err=res.get("message", "Token konnte nicht erzeugt werden."))
     # Rendered directly, NOT via Post/Redirect/Get: a redirect would put
     # the token into a URL, and the gateway logs full URIs.
     return page(TOKEN_SHOW_BODY, f"Deploy-Token {name}", "instances",
@@ -3297,7 +3494,7 @@ def instance_config(name):
             continue
         values[c["key"]] = submitted
     if not values:
-        return redirect(f"/instances/{name}?msg={quote('Keine Änderung.')}", code=303)
+        return _inst_back(name, msg="Keine Änderung.")
     return _queue_and_redirect(name, {"action": "config", "values": values},
                                CONFIG_WAIT_SECONDS)
 
@@ -3306,14 +3503,11 @@ def _queue_and_redirect(name, payload, wait_seconds):
     """Queue a change and turn the worker's verdict into a redirect."""
     res = _queue_and_wait(name, payload, wait_seconds)
     if res is None:
-        return redirect(
-            f"/instances/{name}?err={quote('Die Änderung läuft noch — bitte gleich erneut prüfen.')}",
-            code=303)
+        return _inst_back(
+            name, err="Die Änderung läuft noch — bitte gleich erneut prüfen.")
     if res.get("ok"):
-        return redirect(f"/instances/{name}?msg={quote('Gespeichert.')}", code=303)
-    return redirect(
-        f"/instances/{name}?err={quote(res.get('message', 'Speichern fehlgeschlagen.'))}",
-        code=303)
+        return _inst_back(name, msg="Gespeichert.")
+    return _inst_back(name, err=res.get("message", "Speichern fehlgeschlagen."))
 
 
 def _queue_and_wait(name, payload, wait_seconds):

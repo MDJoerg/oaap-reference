@@ -1,11 +1,19 @@
-"""Which installed instances belong on the launchpad (runtime spec 2.10).
+"""What the portal shows about one installed instance.
 
-Like `store_view.py`, this carries no Flask: the rule is an RFC decision
-(RFC-0012 §1.2 and its §1.3 addendum) and should be readable and
-testable without a request, a container or a node.
+Two things live here: which instances belong on the launchpad (runtime
+spec 2.10), and how the instance object page is cut into sections
+(design guidelines 6.2.1/6.2.2).
 
-The rule in one sentence: **the app's own manifest decides, the operator
-overrides.** An app that declares itself a background `service` gets no
+Launchpad rule below; the sections rule in one sentence: **an object
+page with more than three cards gets a reading head and tabs**, and the
+server — not JavaScript — decides which tab is open.
+
+Like `store_view.py`, this carries no Flask: these are RFC and design
+decisions (RFC-0012 §1.2 and its §1.3 addendum) and should be readable
+and testable without a request, a container or a node.
+
+The launchpad rule in one sentence: **the app's own manifest decides,
+the operator overrides.** An app that declares itself a background `service` gets no
 tile, because a tile leading to a machine interface serves nobody. The
 class comes from the manifest the node installed — never from a store
 list, which may be disabled, unreachable, or written by a stranger.
@@ -96,6 +104,104 @@ def tile_reason(inst):
         return ("Die App bezeichnet sich selbst als Anwendung mit Oberfläche "
                 "und erscheint deshalb im Launchpad.")
     return class_phrase(inst) + " Sie erscheint im Launchpad."
+
+
+# --------------------------------------------------------------------
+# Sections of the instance object page (design guidelines 6.2.2)
+
+# Order is deliberate: read first ("Überblick" carries no form, so
+# nobody lands in one), then the daily business, and the single
+# irreversible action last and alone.
+TABS = (
+    ("ueberblick", "Überblick"),
+    ("zugang", "Zugang"),
+    ("netz", "Netz & Adressen"),
+    ("deployment", "Deployment"),
+    ("konfiguration", "Konfiguration"),
+    ("verwaltung", "Verwaltung"),
+)
+DEFAULT_TAB = TABS[0][0]
+TAB_KEYS = tuple(k for k, _ in TABS)
+
+
+def valid_tab(raw, default=""):
+    """The requested section, or the fallback.
+
+    An unknown value is not an error worth a message — the tab comes
+    from a link or a hidden field, so a wrong one means a stale
+    bookmark, not a wrong decision. Falling back to the reading tab is
+    the honest answer. The empty default means "no tab in the URL",
+    which is what a redirect after a save uses.
+    """
+    tab = str(raw or "").strip()
+    return tab if tab in TAB_KEYS else default
+
+
+SOURCE_LABELS = {
+    "git": "Git-Repository",
+    "artifact": "Hochgeladenes Paket (ZIP)",
+    "local": "Lokaler Pfad auf dem Knoten",
+    "store": "Store-Eintrag",
+}
+
+
+def source_view(inst):
+    """Where this instance's code came from: a label for the head and a
+    few lines for the overview.
+
+    An unknown kind is named as unknown rather than guessed, and an
+    instance installed before the platform recorded its origin says so —
+    „unbekannt" is a fact, an invented Git URL would be a lie.
+    """
+    src = inst.get("source") or {}
+    kind = str(src.get("kind") or "")
+    label = SOURCE_LABELS.get(kind, "Unbekannte Herkunft")
+    lines = []
+    if kind == "git":
+        lines.append(f"Repository {src.get('url', '?')}")
+        if src.get("path"):
+            lines.append(f"Pfad im Repository: {src['path']}")
+        lines.append(f"Branch oder Tag: {src.get('ref') or 'Standardbranch'}")
+    elif kind == "artifact":
+        lines.append(f"Version {src.get('version', '?')} "
+                     f"aus {src.get('stored', '?')}")
+        if src.get("received"):
+            lines.append("Empfangen "
+                         + src["received"].replace("T", " ").rstrip("Z"))
+        if src.get("sha256"):
+            lines.append(f"Prüfsumme {src['sha256'][:16]}…")
+    elif kind == "local":
+        lines.append(f"Verzeichnis {src.get('url', '?')}")
+    elif not kind:
+        lines.append("Diese Instanz wurde installiert, bevor die Plattform "
+                     "die Herkunft festgehalten hat.")
+    return label, lines
+
+
+def route_rows(inst):
+    """The app's routes with their roles, in words instead of JSON.
+
+    `public` wins over everything else on a route: if one role is
+    "no login at all", naming the others next to it would read as a
+    restriction that does not exist.
+    """
+    rows = []
+    for r in inst.get("routes") or []:
+        roles = r.get("roles") or []
+        if "public" in roles:
+            who = "ohne Anmeldung (öffentlich)"
+        elif roles:
+            who = ", ".join(roles)
+        else:
+            who = "jede angemeldete Person"
+        rows.append({"path": r.get("path", "/"), "who": who})
+    return rows
+
+
+def visibility_label(inst):
+    """Who may see this instance, for the head (RFC-0007)."""
+    groups = (inst.get("visibility") or {}).get("groups") or []
+    return ("Gruppen " + ", ".join(groups)) if groups else "alle mit passender Rolle"
 
 
 def hidden_instances(instances):

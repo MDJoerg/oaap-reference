@@ -17,6 +17,10 @@ Einstellung, zurueck auf automatisch — jeweils mit Blick darauf, ob das
 Launchpad mitzaehlt, was es verbirgt. Auch dieser Teil raeumt hinter
 sich auf.
 
+An derselben Stelle das eine, was `test_instance_page.py` nicht pruefen
+kann: dass das Speichern in den Reiter zurueckfuehrt, aus dem es kam
+(Design-Guidelines 6.2.2) — dazwischen liegt der Spool-Worker.
+
 Zugangsdaten kommen aus `test/.env` (nicht im Git) und werden nirgends
 ausgegeben:
 
@@ -238,9 +242,19 @@ ok("eine unbekannte Einstellung wird abgewiesen",
    "nbekannte" in body, body[-300:])
 ok("und hat nichts veraendert", tiles_now() == before)
 
-post(f"/instances/{target}/tile", {"mode": "auto"})
+st, body, url = post(f"/instances/{target}/tile", {"mode": "auto", "tab": "zugang"})
+# Reiter (Design-Guidelines 6.2.2): Das Speichern muss dorthin
+# zurueckfuehren, wo es ausgeloest wurde. Nur hier — mit echtem
+# Spool-Worker dazwischen — laesst sich das pruefen.
+ok("das Speichern fuehrt in denselben Reiter zurueck", "tab=zugang" in url, url)
 st, body7, url = get(f"/instances/{target}")
 ok("zurueck auf automatisch wirkt", 'value="auto"' in body7, body[-300:])
+ok("die Objektseite hat einen Kopfbereich und Reiter",
+   'class="objhead"' in body7 and 'class="tabs"' in body7)
+ok("und ohne Angabe steht der lesende Reiter offen",
+   body7.count('class="panel active"') == 1
+   and body7.find('class="panel active"') < body7.find('class="panel "'),
+   str(body7.count('class="panel active"')))
 # Egal wie die Kachel steht: die Instanz behaelt Adresse, Routen und
 # Rollen. Das ist die Zusicherung, die am leichtesten kaputtgeht.
 ok("die Instanz hat Sichtbarkeit und Adresse unveraendert behalten",

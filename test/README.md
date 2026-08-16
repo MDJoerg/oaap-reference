@@ -20,6 +20,7 @@ python3 test/test_manifest_version.py
 python3 test/test_store_sources.py
 python3 test/test_store_view.py
 python3 test/test_tile.py
+python3 test/test_instance_page.py   # braucht jinja2
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -41,6 +42,17 @@ Manifest, der Betreiber übersteuert je Instanz, und Verstecken ist
 ausdrücklich keine Zugriffskontrolle (§1.2 mit Nachtrag zu §1.3,
 Runtime-Spec 2.10). Wer eine dieser Regeln ändern will, ändert zuerst
 den RFC.
+
+`test_instance_page.py` prüft die **Objektseite einer Instanz** gegen
+die Design-Guidelines 6.2.1/6.2.2: Kopfbereich ohne Formular, Reiter als
+Links statt JavaScript, genau ein sichtbarer Abschnitt bei allen im
+Dokument (fällt das Stylesheet aus, ist die Seite lang statt kaputt),
+jedes Formular trägt seinen Reiter mit, die anstehende Bestätigung steht
+über den Reitern, und leere Abschnitte begründen ihre Leere. Der Test
+liest die Vorlage per `ast` aus `app.py` und rendert sie mit Jinja2 —
+ohne Flask, ohne Container. Was er **nicht** prüfen kann, ist der
+Rückweg nach dem Speichern (dazwischen liegt der Spool-Worker); das
+macht `klicktest.py` an einer echten Maschine.
 
 `test_store_view.py` läuft gegen `store_view.py`, `test_tile.py` gegen
 `instance_view.py` — beide Regelwerke liegen bewusst außerhalb von
