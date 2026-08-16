@@ -1405,6 +1405,50 @@ INSTANCE_EDIT_BODY = """
      einer neuen Fassung gehört eine Test-Instanz.</p>
 </div>
 {% endif %}
+{% if i.promote %}
+<div class="card">
+  <h2>Nach Produktiv übernehmen</h2>
+  <p class="muted">Diese Test-Instanz läuft aus einem hochgeladenen Paket
+     (Version <strong>{{ i.version }}</strong>). „Übernehmen" installiert
+     <strong>genau dieses Paket</strong> in einer Produktiv-Instanz:
+     <strong>dieselben Bytes</strong>, keine erneute Übertragung, keine
+     Zugangsdaten. Was produktiv geht, ist damit nachweislich das, was Du
+     getestet hast (RFC-0020).</p>
+  <form method="post" action="/instances/{{ i.name }}/promote">
+    <input type="hidden" name="tab" value="deployment">
+    {% if i.promote.targets %}
+    <label>Bestehende Produktiv-Instanz
+      <select name="target">
+        <option value="">— neue Instanz anlegen —</option>
+        {% for t in i.promote.targets %}
+        <option value="{{ t.name }}">{{ t.name }} (läuft {{ t.version }})</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
+    <label>Oder neuer Name für die Produktiv-Instanz
+      <input type="text" name="new_target" placeholder="{{ i.promote.suggestion }}"
+             autocomplete="off"></label>
+    <label class="checkline"><input type="checkbox" name="confirm" value="1">
+      Rahmenerweiterung bestätigen — nur ankreuzen, wenn der erste Versuch
+      eine gemeldet hat</label>
+    <button>Übernehmen</button>
+  </form>
+  <p class="muted">Erweitert das Paket den Rahmen der Produktiv-Instanz, bricht
+     der erste Versuch ab und <strong>nennt jeden Grund</strong>. Erst dann
+     kreuzt Du an und übernimmst. So steht die Erweiterung vor der Zustimmung,
+     nicht dahinter.</p>
+  <p class="muted">Die Produktiv-Instanz behält dabei
+     <strong>ihre eigenen Daten</strong>, ihre Konfigurationswerte, ihre
+     Adresse, Gruppen und Freigaben — übernommen wird das Paket, sonst nichts.
+     Aus dem Test wandert nichts mit. Die vorige Fassung bleibt aufgehoben:
+     der Weg zurück ist der Rückschritt auf der Produktiv-Instanz.</p>
+  <p class="muted">Produktiv nimmt nur eine <strong>höhere Version</strong> an,
+     und eine Erweiterung des Rahmens (neue öffentliche Route, neuer Speicher,
+     neuer Port) wird oben angezeigt und muss ausdrücklich bestätigt werden.
+     Ein Deploy-Token bekommt die Produktiv-Instanz dadurch nicht.</p>
+</div>
+{% endif %}
 {% if i.artifacts %}
 <div class="card">
   <h2>Hochgeladene Pakete</h2>
@@ -3331,6 +3375,7 @@ def instance_detail(name):
          "is_test": inst.get("channel") == "test",
          "token_created": _token_created(name),
          "artifacts": _artifacts(name, inst),
+         "promote": _promote_view(name, inst),
          "pending": _pending_envelope(name),
          "hook_url": _hook_url(name),
          "address": address,
@@ -3610,6 +3655,73 @@ def instance_envelope(name):
         name, {"action": "envelope", "op": op,
                "manifest_sha": request.form.get("manifest_sha", "").strip()},
         TOKEN_WAIT_SECONDS)
+
+
+def _promote_view(name, inst):
+    """The promotion offer for a test instance (RFC-0020), or None.
+
+    Only for an instance that runs from a retained artifact — that is
+    the only case where "the same bytes" is provable, which is the whole
+    promise. The candidate list is deliberately narrow: production
+    instances of the SAME app, because promoting into a different app is
+    the mistake this page must not make easy.
+    """
+    if inst.get("channel") != "test":
+        return None
+    if (inst.get("source") or {}).get("kind") != "artifact":
+        return None
+    app_id = inst.get("app_id", "")
+    targets = [{"name": n, "version": i.get("version", "?")}
+               for n, i in sorted(load_instances().items())
+               if i.get("channel") == "production" and i.get("app_id") == app_id]
+    suggestion = name[:-5] if name.endswith("-test") else f"{app_id}-prod"
+    return {"targets": targets, "suggestion": suggestion}
+
+
+PROMOTE_WAIT_SECONDS = 180  # builds an image, like any other installation
+
+
+@app.post("/instances/<name>/promote")
+def instance_promote(name):
+    """Ship this test instance's tested artifact to production (RFC-0020).
+
+    `server_admin` only, and deliberately no spendable permission: this
+    is the one decision the grants of RFC-0019 are careful not to
+    include. The portal only forwards it — the host re-checks channel,
+    app id, version and envelope before it installs.
+    """
+    denied = require_server_admin()
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    target = (request.form.get("target") or "").strip()
+    new_target = (request.form.get("new_target") or "").strip().lower()
+    if target and new_target and target != new_target:
+        return _inst_back(name, err="Bitte entweder eine bestehende "
+                                    "Produktiv-Instanz wählen oder einen neuen "
+                                    "Namen eintragen — nicht beides.")
+    target = target or new_target
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", target):
+        return _inst_back(name, err="Ziel fehlt oder ist kein gültiger "
+                                    "Instanzname (Kleinbuchstaben, Ziffern, "
+                                    "Bindestriche).")
+    if target == name:
+        return _inst_back(name, err="Eine Instanz kann nicht in sich selbst "
+                                    "übernommen werden.")
+    # queued on the TARGET: that is the instance that changes, and the
+    # log, the result and the registry are all keyed on it
+    res = _queue_and_wait(target, {"action": "promote", "from": name,
+                                   "confirmed": bool(request.form.get("confirm"))},
+                          PROMOTE_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Die Übernahme läuft noch — sieh gleich in "
+                                    "der Instanzliste nach, ob sie durch ist.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message", "Übernahme fehlgeschlagen."))
+    return redirect(f"/instances/{target}?msg="
+                    + quote(res.get("message", "Übernommen.")), code=303)
 
 
 @app.post("/instances/<name>/rollback")

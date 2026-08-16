@@ -163,6 +163,10 @@ def source_view(inst):
             lines.append(f"Pfad im Repository: {src['path']}")
         lines.append(f"Branch oder Tag: {src.get('ref') or 'Standardbranch'}")
     elif kind == "artifact":
+        if src.get("promoted_from"):
+            # RFC-0020: „was läuft hier?" wird mit einem Teststand und
+            # einer Prüfsumme beantwortet, nicht mit einer Versionshoffnung
+            label = f"Aus dem Teststand „{src['promoted_from']}“ übernommen"
         lines.append(f"Version {src.get('version', '?')} "
                      f"aus {src.get('stored', '?')}")
         if src.get("received"):

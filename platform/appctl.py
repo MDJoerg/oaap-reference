@@ -2837,7 +2837,7 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
     return m["app"]["version"]
 
 
-def install_artifact(name, zip_path, grant, channel="test", path=""):
+def install_artifact(name, zip_path, grant, channel="test", path="", origin=""):
     """Phase 3: verify the upload against its grant, then install.
 
     `grant` is positional and mandatory on purpose. It was optional
@@ -2884,6 +2884,10 @@ def install_artifact(name, zip_path, grant, channel="test", path=""):
         source = {"kind": "artifact", "version": version, "sha256": sha,
                   "stored": stored, "path": path,
                   "received": _stamp()}
+        if origin:
+            # where production got it from (RFC-0020) — so "what runs
+            # here?" is answerable with a test instance and a checksum
+            source["promoted_from"] = origin
         ns = argparse.Namespace(package=pkg, path="", ref="", name=name,
                                 channel=channel, store_source="")
         try:
@@ -2903,6 +2907,163 @@ def install_artifact(name, zip_path, grant, channel="test", path=""):
 def _stamp():
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# --- promotion to production (RFC-0020) --------------------------------
+# Moving BYTES, not permissions: the artifact already lies on this node,
+# was accepted once, and is installed again — unchanged — into the
+# production instance. What goes live is exactly what was tested, and
+# "exactly" means the same checksum, not the same version string.
+
+
+class PromotionRefused(Exception):
+    """A refusal a person can act on — same contract as ArtifactRejected."""
+
+
+def promotion_review(reg, source, target_name):
+    """Everything that must hold before a promotion may run.
+
+    Returns (artifact_path, manifest, notes). `notes` are envelope
+    widenings against the TARGET — not refusals: a server_admin is
+    present, and that is the human the envelope rule asks for. They MUST
+    be shown and confirmed, which is the caller's job.
+
+    Deliberately a pure check that reads no request and writes nothing:
+    the portal calls it to show the notes, the host calls it again
+    before it acts, and both get the same answer.
+    """
+    src = reg["instances"].get(source)
+    if not src:
+        raise PromotionRefused(f"no instance named '{source}'")
+    if src.get("channel") != "test":
+        raise PromotionRefused(
+            f"'{source}' is not a test instance — promotion goes from test "
+            "to production, never the other way")
+    stored = (src.get("source") or {})
+    if stored.get("kind") != "artifact":
+        raise PromotionRefused(
+            f"'{source}' does not run from an uploaded package — promotion "
+            "guarantees the same BYTES, which only a retained artifact can "
+            "prove. Install the production instance from its own source "
+            "instead (store or 'oaap app install')")
+    path = source_package_arg(source, stored)
+    if not path or not os.path.isfile(path):
+        raise PromotionRefused(
+            f"the retained package of '{source}' is gone — deploy it once "
+            "more, then promote")
+
+    unpacked = tempfile.mkdtemp(prefix="oaap-promote-")
+    try:
+        extract_artifact(path, unpacked)
+        pkg = package_root(unpacked, stored.get("path", ""))
+        mf = os.path.join(pkg, "oaap-app.yaml")
+        if not os.path.isfile(mf):
+            raise PromotionRefused("the retained package has no oaap-app.yaml")
+        with open(mf, encoding="utf-8") as f:
+            m = yaml.safe_load(f)
+    finally:
+        shutil.rmtree(unpacked, ignore_errors=True)
+
+    target = reg["instances"].get(target_name)
+    notes = []
+    if target:
+        if target.get("channel") != "production":
+            raise PromotionRefused(
+                f"'{target_name}' is not a production instance — promote into "
+                "production, or pick another target")
+        if target.get("app_id") != m["app"]["id"]:
+            raise PromotionRefused(
+                f"'{target_name}' runs app '{target.get('app_id')}', the "
+                f"package is '{m['app']['id']}' — a promotion never turns one "
+                "app into another")
+        running, new = target.get("version", ""), m["app"]["version"]
+        if not _version_gt(new, running):
+            raise PromotionRefused(
+                f"production runs {running}, the tested package is {new} — "
+                "production takes a higher version only. Going back is a "
+                f"rollback ('oaap app artifact rollback {target_name}'), "
+                "which is a different and deliberate act")
+        hard, confirm = envelope_review(target, m)
+        # Hard refusals of RFC-0019 §3 do not apply here the way they do
+        # to a token: an app id change is caught above, and the version
+        # rule is production's own. What remains is the widening, and a
+        # human decides it.
+        notes = confirm + [h for h in hard if "version" not in h]
+    elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", target_name or ""):
+        raise PromotionRefused(
+            "instance name: lowercase letters, digits and hyphens")
+    return path, m, notes
+
+
+def promote_artifact(source, target_name, confirmed=False):
+    """Install the tested artifact of `source` into the production
+    instance `target_name` (RFC-0020).
+
+    Nothing is fetched and nothing is uploaded: the file that installs
+    is the one this node already accepted. `confirmed` is the human's
+    answer to the envelope notes — without it a widening refuses, with
+    it the promotion runs and the reasons are logged.
+    """
+    reg = load_registry()
+    path, m, notes = promotion_review(reg, source, target_name)
+    if notes and not confirmed:
+        raise PromotionRefused(
+            "this promotion would widen what the production instance may "
+            "reach or who may reach it (" + "; ".join(notes)
+            + ") — read it and confirm it explicitly")
+    src_path = (reg["instances"][source].get("source") or {}).get("path", "")
+    version, sha = install_artifact(target_name, path, None,
+                                    channel="production", path=src_path,
+                                    origin=source)
+    return version, sha, notes
+
+
+def cmd_promote(args):
+    """`oaap app promote <test-instance> [--to <name>] [--confirm]`."""
+    target = args.to or (args.name[:-5] if args.name.endswith("-test")
+                         else "")
+    if not target:
+        die("name the production instance with --to "
+            f"(a name ending in '-test' is shortened automatically, "
+            f"'{args.name}' is not)")
+    reg = load_registry()
+    try:
+        _path, m, notes = promotion_review(reg, args.name, target)
+    except PromotionRefused as e:
+        die(str(e))
+    exists = target in reg["instances"]
+    print(f"Promoting {args.name} -> {target} "
+          f"({'update' if exists else 'new production instance'}), "
+          f"app {m['app']['id']} {m['app']['version']}")
+    for n in notes:
+        print(f"NOTE: {n}")
+    if notes and not args.confirm:
+        die("this promotion widens the envelope (see NOTE above) — "
+            "repeat with --confirm if that is intended")
+    try:
+        version, sha, _ = promote_artifact(args.name, target,
+                                           confirmed=bool(args.confirm))
+    except (PromotionRefused, ArtifactRejected) as e:
+        die(str(e))
+    print(f"Promoted {version} to '{target}' (sha {sha[:12]}).")
+    print("The previous package is retained — 'oaap app artifact rollback "
+          f"{target}' is the way back.")
+
+
+def _version_gt(new, old):
+    """Is `new` later than `old`? Numeric where possible, else textual.
+
+    Deliberately lenient: an app whose versions are not numbers still
+    gets the "must change" guarantee, just not an ordering one.
+    """
+    def parts(v):
+        return [int(p) if p.isdigit() else p
+                for p in re.split(r"[.\-+]", str(v or "")) if p != ""]
+    a, b = parts(new), parts(old)
+    try:
+        return a > b
+    except TypeError:                      # mixed number/text — compare as text
+        return str(new) > str(old)
 
 
 def cmd_grant(args):
@@ -3506,6 +3667,34 @@ def cmd_process_deploys(_args):
                     msg = f"install refused: {e}"
                 except Exception as e:
                     msg = str(e)
+        elif action == "promote":
+            # Ship the tested artifact to production (RFC-0020). The
+            # request names the SOURCE instance; `name` is the target,
+            # because everything downstream (log, result, registry)
+            # is keyed on the instance that changes.
+            #
+            # Every rule is re-checked here even though the portal
+            # already showed them: the spool is data, not trust — and
+            # between showing and clicking, a deployment may have
+            # changed what the test instance runs.
+            try:
+                version, sha, notes = promote_artifact(
+                    str(req.get("from") or ""), name,
+                    confirmed=bool(req.get("confirmed")))
+                revision = sha[:12]
+                ok = True
+                msg = (f"promoted {version} from '{req.get('from')}'"
+                       + (" (envelope widened: " + "; ".join(notes) + ")"
+                          if notes else ""))
+            except (PromotionRefused, ArtifactRejected) as e:
+                msg = str(e)
+            except SystemExit as e:
+                msg = f"install refused: {e}"
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or "").strip()
+                msg = err.splitlines()[-1] if err else str(e)
+            except Exception as e:
+                msg = str(e)
         elif action == "grant":
             # Instance creation grant (RFC-0019, Studio section): the
             # one privileged thing Studio can do that no deploy token
@@ -3949,7 +4138,7 @@ def cmd_process_deploys(_args):
                "endpoint": "portal", "link": "portal",
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
-               "grant": "portal"}.get(action, "deploy-hook")
+               "grant": "portal", "promote": "portal"}.get(action, "deploy-hook")
         record = {"instance": name or "(dieser Knoten)", "ok": ok,
                   "message": msg, "revision": revision,
                   "version": version, "via": via}
@@ -4450,6 +4639,14 @@ def main():
     pg.add_argument("action", choices=["list", "revoke"])
     pg.add_argument("name", nargs="?", help="instance name -- 'revoke' only")
     pg.set_defaults(fn=cmd_grant)
+    pp = sub.add_parser("promote",
+                        help="ship the tested artifact to production (RFC-0020)")
+    pp.add_argument("name", help="test instance to promote FROM")
+    pp.add_argument("--to", default="",
+                    help="production instance (default: the name without '-test')")
+    pp.add_argument("--confirm", action="store_true",
+                    help="accept an envelope widening reported as NOTE")
+    pp.set_defaults(fn=cmd_promote)
     pt.set_defaults(fn=cmd_token)
     pd = sub.add_parser("process-deploys")
     pd.set_defaults(fn=cmd_process_deploys)

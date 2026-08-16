@@ -114,7 +114,7 @@ def render(tab, inst=None, **over):
         "has_public_route": any("public" in (r.get("roles") or [])
                                 for r in inst.get("routes") or []),
         "links": ["ollama"], "link_candidates": ["studio"],
-        "endpoints": [], "node_exposed": False,
+        "endpoints": [], "node_exposed": False, "promote": None,
         "throttle_mode": "default", "throttle_rate": "",
         "throttle_default": "300 Anfragen pro 60 Sekunden",
     }
@@ -215,6 +215,21 @@ ok("ohne Konfigurationsschluessel steht da eine Begruendung",
 ok("und kein Eingabefeld", 'name="cfg-' not in h)
 ok("ohne Direktport steht da eine Begruendung",
    "keinen Port am Gateway vorbei" in h)
+
+print("\n=== Übernehmen nach Produktiv (RFC-0020) ===")
+h = render("deployment", promote={"targets": [{"name": "bdt-hub", "version": "0.4.0"}],
+                                  "suggestion": "bdt-hub"})
+ok("die Karte steht im Reiter Deployment", "Nach Produktiv übernehmen" in h)
+ok("sie verspricht dieselben Bytes, nicht dieselbe Version",
+   "genau dieses Paket" in h and "dieselben Bytes" in h)
+ok("sie nennt das bestehende Ziel mit seiner laufenden Fassung",
+   "bdt-hub" in h and "läuft 0.4.0" in h)
+ok("und sagt, was die Produktiv-Instanz behält",
+   "ihre eigenen Daten" in h and "Konfigurationswerte" in h)
+ok("die Bestätigung kommt NACH der Meldung, nicht davor",
+   "nur ankreuzen, wenn der erste Versuch" in h)
+ok("ohne Paketquelle gibt es die Karte nicht",
+   "Nach Produktiv übernehmen" not in render("deployment", promote=None))
 
 print("\n=== Produktiv bekommt kein Token, sagt aber warum ===")
 prod = dict(TESTINSTANZ, channel="production")

@@ -330,6 +330,106 @@ m.grant_create("create", "spaeter-test", cdig, {"channel": "test"}, ttl=-1)
 check("an expired permission is gone",
       m.grant_check("create", "spaeter-test", cdig) is None)
 
+print("\n-- promotion to production (RFC-0020)")
+# Die Zusage lautet: was produktiv geht, ist GENAU das, was getestet
+# wurde. Deshalb pruefen wir hier, was eine Uebernahme verweigert —
+# jede dieser Weigerungen ist ein Weg, auf dem etwas anderes als das
+# Getestete produktiv gehen koennte.
+prom_mf = yaml.safe_load(MANIFEST)
+prom_mf["app"]["id"] = "shop"
+prom_mf["app"]["version"] = "1.2.0"
+prom_zip = zip_with({"oaap-app.yaml": yaml.safe_dump(prom_mf)},
+                    os.path.join(DATA, "shop.zip"))
+shop_dir = m.artifact_dir("shop-test")
+os.makedirs(shop_dir, exist_ok=True)
+import shutil as _sh
+_sh.copy(prom_zip, os.path.join(shop_dir, "1.2.0-abc.zip"))
+
+reg = m.load_registry()
+reg["instances"]["shop-test"] = {
+    "app_id": "shop", "app_name": "Shop", "version": "1.2.0", "channel": "test",
+    "routes": [{"path": "/", "roles": ["user"]}], "storage": [],
+    "source": {"kind": "artifact", "stored": "1.2.0-abc.zip", "path": ""}}
+reg["instances"]["shop"] = {
+    "app_id": "shop", "app_name": "Shop", "version": "1.1.0",
+    "channel": "production", "routes": [{"path": "/", "roles": ["user"]}],
+    "storage": [], "source": {"kind": "artifact", "stored": "1.1.0-old.zip"}}
+reg["instances"]["fremd"] = {
+    "app_id": "anderes", "app_name": "Anderes", "version": "0.1.0",
+    "channel": "production", "routes": [], "storage": [], "source": {}}
+reg["instances"]["git-test"] = {
+    "app_id": "shop", "app_name": "Shop", "version": "1.3.0", "channel": "test",
+    "routes": [], "storage": [], "source": {"kind": "git", "url": "https://x/y"}}
+m.save_registry(reg)
+
+
+def refuses(label, source, target, needle):
+    try:
+        m.promotion_review(m.load_registry(), source, target)
+        check(label, False, "was accepted")
+    except m.PromotionRefused as e:
+        check(label, needle in str(e), e)
+
+
+refuses("production cannot be promoted from", "shop", "shop", "not a test instance")
+refuses("a git-installed test instance cannot be promoted",
+        "git-test", "shop", "same BYTES")
+refuses("promoting into another app is refused", "shop-test", "fremd",
+        "never turns one app into another")
+refuses("promoting into a test instance is refused", "shop-test", "git-test",
+        "not a production instance")
+refuses("an unknown source is refused", "gibtsnicht", "shop", "no instance named")
+
+# Gleiche und kleinere Version: der Weg zurueck ist der Rueckschritt,
+# nicht eine Uebernahme, die sich als Fortschritt ausgibt.
+reg = m.load_registry()
+reg["instances"]["shop"]["version"] = "1.2.0"
+m.save_registry(reg)
+refuses("the same version is not a promotion", "shop-test", "shop", "rollback")
+reg["instances"]["shop"]["version"] = "1.3.0"
+m.save_registry(reg)
+refuses("a lower version is not a promotion", "shop-test", "shop", "higher version")
+reg["instances"]["shop"]["version"] = "1.1.0"
+m.save_registry(reg)
+
+path, mf, notes = m.promotion_review(m.load_registry(), "shop-test", "shop")
+check("a clean promotion is allowed", path.endswith("1.2.0-abc.zip") and not notes,
+      (path, notes))
+check("and it names the tested package, not a fresh build",
+      os.path.isfile(path) and mf["app"]["version"] == "1.2.0")
+
+# Der Rahmen wird gegen die PRODUKTIV-Instanz geprueft, nicht gegen den
+# Teststand: ein Paket kann neben seinem Teststand unauffaellig sein und
+# trotzdem erweitern, was produktiv erlaubt ist.
+wide = yaml.safe_load(yaml.safe_dump(prom_mf))
+wide["routes"] = [{"path": "/", "roles": ["public"]}]
+wide_zip = zip_with({"oaap-app.yaml": yaml.safe_dump(wide)},
+                    os.path.join(DATA, "shop-wide.zip"))
+_sh.copy(wide_zip, os.path.join(shop_dir, "1.4.0-wide.zip"))
+reg = m.load_registry()
+reg["instances"]["shop-test"]["source"]["stored"] = "1.4.0-wide.zip"
+reg["instances"]["shop-test"]["routes"] = [{"path": "/", "roles": ["public"]}]
+m.save_registry(reg)
+_p, _mf, notes = m.promotion_review(m.load_registry(), "shop-test", "shop")
+check("a widening against production is reported", bool(notes), notes)
+try:
+    m.promote_artifact("shop-test", "shop", confirmed=False)
+    check("and refuses without an explicit confirmation", False, "ran anyway")
+except m.PromotionRefused as e:
+    check("and refuses without an explicit confirmation",
+          "confirm it explicitly" in str(e), e)
+
+check("a new production instance needs a usable name",
+      m.promotion_review(m.load_registry(), "shop-test", "shop-neu")[2] == [],
+      "a free name has nothing to widen")
+refuses("a malformed new name is refused", "shop-test", "Shop Neu",
+        "lowercase letters")
+
+check("version ordering: 1.10.0 is newer than 1.9.0",
+      m._version_gt("1.10.0", "1.9.0") and not m._version_gt("1.9.0", "1.10.0"))
+check("version ordering: unchanged is not newer",
+      not m._version_gt("1.2.0", "1.2.0"))
+
 print("\n-- retention keeps the current plus three")
 d = m.artifact_dir("demo-test")
 os.makedirs(d, exist_ok=True)
