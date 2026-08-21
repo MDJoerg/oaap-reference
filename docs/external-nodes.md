@@ -99,3 +99,11 @@ would not be updatable.
   wildcards (`*.oaap.joomp.de` for automatic instance names,
   `*.bdt.joomp.de` for product names) — until then Caddy's ACME attempts
   for `bdt-hub*.oaap.joomp.de` fail and back off (harmless).
+- **2026-08-21 (later)** DNS wildcards `*.bdt.joomp.de` and `*.oaap.joomp.de`
+  set by Jörg at united-domains (the form does accept `*.bdt` — an earlier
+  refusal was an expired session with a misleading error). `oaap app
+  address set bdt-hub hub.bdt.joomp.de`; certificates for
+  `hub.bdt.joomp.de`, `bdt-hub.oaap.joomp.de`, `bdt-hub-test.oaap.joomp.de`
+  obtained within ~20 s of the reload; all three answer `/healthz` 200 over
+  valid TLS from outside, HTTP→HTTPS 301. **bdt-hub is live at
+  https://hub.bdt.joomp.de/.**
