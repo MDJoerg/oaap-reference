@@ -86,3 +86,16 @@ would not be updatable.
   via local `/setup` POST, `oaap external set oaap.joomp.de` → certificate
   obtained within seconds, HTTP→HTTPS 301, portal login end-to-end over
   HTTPS verified. No apps yet.
+- **2026-08-21** bdt-hub productive on oaapx01 (see
+  `oaap-root/program/studio/runbooks/bdt-hub-produktivsetzung.md`):
+  package built from the bdt-hub repo at commit `ce0035f` with
+  `git archive --format=zip` (no repository credential reaches the node —
+  RFC-0019 path), uploaded by scp, `oaap app install <zip> --name
+  bdt-hub-test --channel test`, then `oaap app promote bdt-hub-test --to
+  bdt-hub` (RFC-0020, same bytes, sha 796652fb0491). Root API keys set per
+  instance via `oaap app config set` (value piped on stdin, never an
+  argument), both `/healthz` 200, key check 200/401. Throttle left at the
+  default 300/60. No deploy token yet. Public names: waiting for DNS
+  wildcards (`*.oaap.joomp.de` for automatic instance names,
+  `*.bdt.joomp.de` for product names) — until then Caddy's ACME attempts
+  for `bdt-hub*.oaap.joomp.de` fail and back off (harmless).
