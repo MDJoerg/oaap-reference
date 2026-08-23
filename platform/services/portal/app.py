@@ -215,7 +215,11 @@ DASHBOARD_BODY = """
 {% if tiles %}
   <div class="tiles">
     {% for t in tiles %}
-    <a class="tile" href="{{ t.url }}">
+    {# Apps öffnen im neuen Tab (Jörg, 2026-08-23): das Portal bleibt
+       als Ausgangspunkt offen — der "Rückweg" ist der Tab-Wechsel,
+       ohne Eingriff in fremde App-Seiten. Direkteinstieg per URL
+       bleibt unberührt. #}
+    <a class="tile" href="{{ t.url }}" target="_blank" rel="noopener">
       <div class="top">
         <svg class="hexdot" viewBox="0 0 100 100" width="20" height="20" aria-hidden="true">
           <polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="none"
