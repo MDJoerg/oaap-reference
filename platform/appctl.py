@@ -103,10 +103,49 @@ def ensure_app_network(name):
     return net
 
 
+_GW_PRIORITY_OK = None
+
+
+def _gw_priority_supported():
+    """Docker >= 28 knows --gw-priority; probe once per process."""
+    global _GW_PRIORITY_OK
+    if _GW_PRIORITY_OK is None:
+        r = subprocess.run(["docker", "network", "connect", "--help"],
+                           capture_output=True, text=True)
+        _GW_PRIORITY_OK = "--gw-priority" in (r.stdout or "")
+    return _GW_PRIORITY_OK
+
+
+def _gateway_endpoint_priority(net):
+    """GwPriority of the gateway's endpoint in `net`, None if unknown."""
+    r = subprocess.run(
+        ["docker", "inspect", "-f",
+         '{{(index .NetworkSettings.Networks "' + net + '").GwPriority}}',
+         GATEWAY_CONTAINER], capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except (ValueError, TypeError):
+        return None
+
+
 def connect_gateway(net):
     """Attach the gateway to an app network. Idempotent — Docker returns
-    non-zero if it is already connected, which is not an error here."""
-    subprocess.run(["docker", "network", "connect", net, GATEWAY_CONTAINER],
+    non-zero if it is already connected, which is not an error here.
+
+    The link is made with a LOWER gateway priority than the platform
+    network's, so the NAT target of the published ports (80/443/app
+    ports) stays on oaap_default. Without this Docker homes that target
+    on the alphabetically first network the gateway is in: removing one
+    instance then silently moved it into the next instance's subnet,
+    and that app could no longer reach its own node's published ports
+    (asymmetric return path — found live 2026-08-23 when FleetView on
+    oaap-demo lost its own node after an unrelated instance was
+    removed). Older Docker has no --gw-priority; there the historic
+    behaviour remains."""
+    cmd = ["docker", "network", "connect"]
+    if _gw_priority_supported():
+        cmd.append("--gw-priority=-1")
+    subprocess.run(cmd + [net, GATEWAY_CONTAINER],
                    capture_output=True, text=True)
 
 
@@ -227,6 +266,16 @@ def cmd_migrate_networks(_args):
             # platform update recreated it — restore it.
             ensure_app_network(name)
             if GATEWAY_CONTAINER not in network_members(net):
+                connect_gateway(net)
+                reconnected += 1
+            elif (_gw_priority_supported()
+                  and (_gateway_endpoint_priority(net) or 0) >= 0):
+                # pre-0.1.45 link: re-attach once with low gw-priority so
+                # the published-port NAT target can never land in an
+                # instance subnet again (see connect_gateway).
+                subprocess.run(["docker", "network", "disconnect", net,
+                                GATEWAY_CONTAINER],
+                               capture_output=True, text=True)
                 connect_gateway(net)
                 reconnected += 1
     reconcile_links(reg)
