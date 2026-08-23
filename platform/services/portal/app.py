@@ -2425,6 +2425,7 @@ def fleet_status():
         instances.append(fleet_view.instance_row(name, inst, state))
         if _pending_envelope(name):
             pending.append(name)
+    dns = dns_check() or {}
     return fleet_view.build_document(
         node=external_host() or request.host.split(":")[0],
         version=VERSION,
@@ -2432,8 +2433,9 @@ def fleet_status():
         now_iso=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         core=_core_states(),
         instances=instances,
-        dns_rows=(dns_check() or {}).get("rows"),
+        dns_rows=dns.get("rows"),
         pending_names=pending,
+        public_ip=dns.get("public_ip", ""),
     )
 
 

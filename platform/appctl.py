@@ -1345,6 +1345,16 @@ def cmd_config(args):
         if value is None:
             # keeps secrets out of the shell history (same as 'oaap user password')
             value = getpass.getpass(f"Value for {key} (hidden): ")
+        if getattr(args, "append", False):
+            # List-valued keys (';'-separated, e.g. FleetView's node and
+            # key lists) grow one entry at a time — without the operator
+            # having to re-enter every existing value, which for secrets
+            # they cannot even read back.
+            entry = next((e for e in entries if e["key"] == key), None)
+            if not entry:
+                die(f"'{name}' does not declare config key '{key}'")
+            if entry["value"]:
+                value = entry["value"].rstrip(";") + ";" + value.lstrip(";")
     try:
         msg = apply_config(name, inst, {key: value})
     except ValueError as e:
@@ -4689,6 +4699,9 @@ def main():
     pcf.add_argument("key", nargs="?")
     pcf.add_argument("value", nargs="?",
                      help="omit with 'set' to be prompted (hidden input)")
+    pcf.add_argument("--append", action="store_true",
+                     help="with 'set': append to the current value with ';' "
+                          "instead of replacing it (list-valued keys)")
     pcf.set_defaults(fn=cmd_config)
     pa = sub.add_parser("address")
     pa.add_argument("action", choices=["show", "set", "remove",

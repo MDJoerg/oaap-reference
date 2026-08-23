@@ -126,12 +126,36 @@ check("a quiet node yields an empty list",
       fv.attention_items([{"name": "Identity", "state": "ok"}],
                          [{"instance": "a", "state": "ok"}], [], []) == [])
 
+print("\n-- published names are a whitelist too (schema 0.2)")
+row = fv.name_row({"name": "hub.beispiel.de", "what": "Instanz bdt-hub",
+                   "state": "ok", "resolved": "203.0.113.7",
+                   "label": "Zeigt hierher"})
+check("instance name is parsed out",
+      row == {"name": "hub.beispiel.de", "kind": "instance",
+              "instance": "bdt-hub", "state": "ok",
+              "resolved": "203.0.113.7"})
+check("alias and node kinds",
+      fv.name_row({"name": "x", "what": "Instanz app1 (Alias)",
+                   "state": "warn"})["kind"] == "alias"
+      and fv.name_row({"name": "x", "what": "Knoten",
+                       "state": "err"}) == {"name": "x", "kind": "node",
+                                            "state": "error"})
+check("empty resolved is omitted",
+      "resolved" not in fv.name_row({"name": "x", "what": "Knoten",
+                                     "state": "ok", "resolved": "–"}))
+
 print("\n-- the assembled document")
 doc = fv.build_document(node="oaap.joomp.de", version="0.1.41",
                         profiles=["dev"], now_iso="2026-08-23T10:15:00Z",
                         core=core, instances=instances, dns_rows=dns,
-                        pending_names=["b-test"])
-check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.1")
+                        pending_names=["b-test"], public_ip="203.0.113.7")
+check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.2")
+check("names and public_ip carried",
+      len(doc["names"]) == 3 and doc["public_ip"] == "203.0.113.7")
+check("no public_ip -> field absent",
+      "public_ip" not in fv.build_document(
+          node="n", version="v", profiles=[], now_iso="t", core=[],
+          instances=[], dns_rows=None, pending_names=[]))
 check("node, version, profiles, time carried",
       doc["node"] == "oaap.joomp.de" and doc["platform_version"] == "0.1.41"
       and doc["profiles"] == ["dev"] and doc["time"] == "2026-08-23T10:15:00Z")

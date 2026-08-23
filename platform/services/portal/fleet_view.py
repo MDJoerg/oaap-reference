@@ -13,7 +13,7 @@ values, no source URLs (a source URL has already leaked a PAT once).
 import hashlib
 import hmac
 
-SCHEMA = "oaap.fleet.status/0.1"
+SCHEMA = "oaap.fleet.status/0.2"
 
 # The document's state vocabulary. The health page grew two spellings
 # ("err" from probes, "error" from the worker); consumers get one.
@@ -71,6 +71,33 @@ def instance_row(name, inst, state):
     return row
 
 
+def name_row(row):
+    """One published name as facts (schema 0.2) — again a whitelist.
+
+    The health page's dns_check rows carry a German `what` label; the
+    document gets a normalized kind plus the owning instance, so a
+    consumer never has to parse prose.
+    """
+    what = row.get("what", "")
+    if what == "Knoten":
+        kind, instance = "node", ""
+    elif what.endswith("(Alias)"):
+        kind = "alias"
+        instance = what[len("Instanz "):-len(" (Alias)")].strip()
+    elif what.startswith("Instanz "):
+        kind, instance = "instance", what[len("Instanz "):].strip()
+    else:
+        kind, instance = "unknown", ""
+    out = {"name": row.get("name", ""), "kind": kind,
+           "state": normalize_state(row.get("state", ""))}
+    if instance:
+        out["instance"] = instance
+    resolved = row.get("resolved", "")
+    if resolved and resolved != "–":
+        out["resolved"] = resolved
+    return out
+
+
 def attention_items(core, instances, dns_rows, pending_names):
     """What needs a human — the machine-readable "Bestätigung offen".
 
@@ -99,9 +126,14 @@ def attention_items(core, instances, dns_rows, pending_names):
 
 
 def build_document(node, version, profiles, now_iso, core, instances,
-                   dns_rows, pending_names):
-    """Assemble the versioned status document (RFC-0021 §1)."""
-    return {
+                   dns_rows, pending_names, public_ip=""):
+    """Assemble the versioned status document (RFC-0021 §1).
+
+    Schema 0.2 adds `names` (published names with the node's own DNS
+    verdicts) and `public_ip` — both additive, consumers of 0.1 keep
+    working (spec rule: additive changes bump the minor).
+    """
+    doc = {
         "schema": SCHEMA,
         "node": node,
         "platform_version": version,
@@ -111,6 +143,10 @@ def build_document(node, version, profiles, now_iso, core, instances,
                   "state": normalize_state(c.get("state", ""))}
                  for c in core],
         "instances": instances,
+        "names": [name_row(r) for r in dns_rows or []],
         "attention": attention_items(core, instances, dns_rows,
                                      pending_names),
     }
+    if public_ip:
+        doc["public_ip"] = public_ip
+    return doc
