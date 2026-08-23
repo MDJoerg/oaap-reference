@@ -23,6 +23,8 @@ import requests
 from flask import Flask, g, redirect, render_template_string, request
 from markupsafe import Markup
 
+import fleet_view
+
 IDENTITY = "http://identity:8000"
 GATEWAY = "http://gateway:80"
 # Internal health-probe listener on the gateway (RFC-0016): the portal
@@ -2310,11 +2312,8 @@ def _probe(url, ok_status=200, via=requests):
     return "warn", "Antwortet unerwartet", f"HTTP {r.status_code}"
 
 
-@app.get("/health")
-def health():
-    if not caller_roles() & {"server_admin", "partner"}:
-        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder partner.", 403
-
+def _core_states():
+    """Core-service probes — shared by the health page and /fleet/status."""
     core = []
     state, label, detail = _probe(f"{IDENTITY}/internal/status", via=INTERNAL)
     core.append({"name": "Identity", "state": state, "label": label, "detail": detail})
@@ -2324,31 +2323,49 @@ def health():
     core.append({"name": "Portal", "state": "ok", "label": "Gesund",
                  "detail": "liefert diese Seite"})
     core.append(deploy_worker_state())
+    return core
+
+
+def _instance_probe(name, inst):
+    """State/label/detail of one instance — shared by the health page
+    and /fleet/status.
+
+    RFC-0016: apps are isolated on their own networks and the portal
+    can no longer reach them by container name. The gateway is the
+    one core service on every app network, so we probe THROUGH it,
+    via its internal health endpoint (appctl write_internal_health_
+    caddy, gateway:8099/h/<name> -> the app's health path, no auth).
+    """
+    container, svc_port = inst.get("container"), inst.get("svc_port")
+    health_path = inst.get("health_path")
+    if container and svc_port and health_path:
+        state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
+        # Wrapped apps often answer their root with a redirect —
+        # any response below 400 counts as alive.
+        if state == "warn" and detail.startswith("HTTP 3"):
+            state, label = "ok", "Gesund"
+    elif container and svc_port:
+        state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
+        if state == "warn":  # any HTTP answer counts as reachable here
+            state, label = "ok", "Erreichbar"
+        if state == "ok":
+            detail += ", App ohne erfassten Healthcheck"
+    else:
+        state, label = "unknown", "Unbekannt"
+        detail = "vor der Gesundheits-Erfassung installiert — bei erneutem 'oaap app install' verfügbar"
+    return state, label, detail
+
+
+@app.get("/health")
+def health():
+    if not caller_roles() & {"server_admin", "partner"}:
+        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder partner.", 403
+
+    core = _core_states()
 
     apps = []
     for name, inst in sorted(load_instances().items()):
-        container, svc_port = inst.get("container"), inst.get("svc_port")
-        health_path = inst.get("health_path")
-        # RFC-0016: apps are isolated on their own networks and the portal
-        # can no longer reach them by container name. The gateway is the
-        # one core service on every app network, so we probe THROUGH it,
-        # via its internal health endpoint (appctl write_internal_health_
-        # caddy, gateway:8099/h/<name> -> the app's health path, no auth).
-        if container and svc_port and health_path:
-            state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
-            # Wrapped apps often answer their root with a redirect —
-            # any response below 400 counts as alive.
-            if state == "warn" and detail.startswith("HTTP 3"):
-                state, label = "ok", "Gesund"
-        elif container and svc_port:
-            state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
-            if state == "warn":  # any HTTP answer counts as reachable here
-                state, label = "ok", "Erreichbar"
-            if state == "ok":
-                detail += ", App ohne erfassten Healthcheck"
-        else:
-            state, label = "unknown", "Unbekannt"
-            detail = "vor der Gesundheits-Erfassung installiert — bei erneutem 'oaap app install' verfügbar"
+        state, label, detail = _instance_probe(name, inst)
         channel = inst.get("channel", "production")
         apps.append({
             "name": inst.get("app_name", name), "instance": name,
@@ -2360,6 +2377,60 @@ def health():
                 core=core, apps=apps, ext=external_access(),
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
                 deploys=recent_deploys())
+
+
+# --------------------------------------------- fleet status (RFC-0021)
+# One read-only, machine-readable status document per node, guarded by
+# a revocable fleet key instead of a session — the fleet overview app
+# on the operator's inner node polls this. The key grants EXACTLY this
+# one GET; the gateway strips identity headers on /fleet/* like on the
+# deploy hook. Facts only, never secrets — the whitelist lives in
+# fleet_view.instance_row.
+
+FLEET_KEYS = "/apps-registry/fleet-keys.json"
+
+
+def _fleet_keys():
+    try:
+        with open(FLEET_KEYS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+@app.get("/fleet/status")
+def fleet_status():
+    # Same brake as the deploy hook (5 failures in 5 min → 1/min), with
+    # its own throttle namespace so fleet guesses and deploy guesses
+    # are counted apart.
+    key = f"fleet:{_client_ip()}"
+    if _deploy_blocked(key):
+        return {"error": "too many attempts — wait a minute"}, 429
+    auth = request.headers.get("Authorization", "")
+    presented = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not fleet_view.valid_key(presented, _fleet_keys()):
+        _deploy_failed(key)
+        # One indistinguishable answer for every failure — no chatter
+        # about which keys exist (same rule as the deploy hook).
+        return {"error": "denied"}, 403
+    _deploy_succeeded(key)
+
+    instances, pending = [], []
+    for name, inst in sorted(load_instances().items()):
+        state, _label, _detail = _instance_probe(name, inst)
+        instances.append(fleet_view.instance_row(name, inst, state))
+        if _pending_envelope(name):
+            pending.append(name)
+    return fleet_view.build_document(
+        node=external_host() or request.host.split(":")[0],
+        version=VERSION,
+        profiles=node_profiles(),
+        now_iso=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        core=_core_states(),
+        instances=instances,
+        dns_rows=(dns_check() or {}).get("rows"),
+        pending_names=pending,
+    )
 
 
 # ---------------------------------------------------------------------------

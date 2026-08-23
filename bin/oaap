@@ -140,7 +140,8 @@ case "$cmd" in
   edge)        exec python3 "$APP_DIR/appctl.py" edge "$@" ;;
   backup)      exec python3 "$APP_DIR/appctl.py" backup "$@" ;;
   user)        exec python3 "$APP_DIR/appctl.py" user "$@" ;;
+  fleet)       exec python3 "$APP_DIR/appctl.py" fleet "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)      exec bash "$APP_DIR/update.sh" "$@" ;;
-  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|remove|visibility|tile|config|address|throttle ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source|enable|disable|trust|rename|reconcile ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|remove|visibility|tile|config|address|throttle ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source|enable|disable|trust|rename|reconcile ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|fleet key issue|list|revoke <label>|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac

@@ -44,6 +44,15 @@
 		reverse_proxy portal:8000
 	}
 
+	# Fleet status (RFC-0021): read-only status document, authorized by
+	# a revocable fleet key, validated by the portal — no session, no
+	# identity headers.
+	handle /fleet/* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		reverse_proxy portal:8000
+	}
+
 	handle {
 		forward_auth identity:8000 {
 			uri /verify

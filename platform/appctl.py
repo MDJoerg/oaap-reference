@@ -54,6 +54,10 @@ EDGE_FILE = os.path.join(APPS_DIR, "edge.json")
 NODE_FILE = os.path.join(APPS_DIR, "node.json")   # node profiles (RFC-0011)
 DEPLOY_TOKENS = os.path.join(APPS_DIR, "deploy-tokens.json")
 DEPLOY_LOG = os.path.join(APPS_DIR, "deploy-log.jsonl")
+# fleet keys (RFC-0021): revocable bearer keys that grant exactly one
+# thing — reading GET /fleet/status. Digests only, like deploy tokens.
+FLEET_KEYS = os.path.join(APPS_DIR, "fleet-keys.json")
+FLEET_LOG = os.path.join(APPS_DIR, "fleet-log.jsonl")
 # short-lived, single-use permissions for artifact deployment (RFC-0019):
 # upload grants and envelope confirmations. Nothing long-lived lives here.
 ARTIFACT_GRANTS = os.path.join(APPS_DIR, "artifact-grants.json")
@@ -733,6 +737,13 @@ def _portal_site_body():
     # deploy hook (runtime spec 2.5): bearer token instead of session —
     # the portal validates the token, so no forward_auth here
     lines.append("\thandle /deploy/* {")
+    lines.append("\t\trequest_header -X-OAAP-User")
+    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines.append("\t\treverse_proxy portal:8000")
+    lines.append("\t}")
+    # fleet status (RFC-0021): read-only, guarded by a fleet key the
+    # portal validates — no session, no identity headers
+    lines.append("\thandle /fleet/* {")
     lines.append("\t\trequest_header -X-OAAP-User")
     lines.append("\t\trequest_header -X-OAAP-Roles")
     lines.append("\t\treverse_proxy portal:8000")
@@ -2392,6 +2403,86 @@ def audit_deploy(entry):
     entry["when"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(DEPLOY_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+# ------------------------------------------------ fleet keys (RFC-0021)
+# A fleet key grants exactly one thing: reading this node's status
+# document (GET /fleet/status). Issued and revoked here by server_admin
+# at the machine; the portal only ever sees the digests (the registry
+# mount is read-only there). The label says WHO watches — that is what
+# makes revocation meaningful.
+
+def load_fleet_keys():
+    try:
+        with open(FLEET_KEYS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_fleet_keys(keys):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = FLEET_KEYS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(keys, f, indent=2)
+    os.replace(tmp, FLEET_KEYS)
+
+
+def audit_fleet(entry):
+    """Issue and revoke are state changes and get a line; polls do not."""
+    import datetime
+    entry["when"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    os.makedirs(APPS_DIR, exist_ok=True)
+    with open(FLEET_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def cmd_fleet(args):
+    keys = load_fleet_keys()
+    if args.action == "list":
+        if not keys:
+            print("No fleet keys exist.")
+        for label, k in sorted(keys.items()):
+            print(f"{label}: created {k.get('created', '?')} "
+                  "(digest only — the key itself is not stored)")
+        return
+    label = args.label or die(
+        "'fleet key {issue|revoke}' needs a label naming the consumer, "
+        "e.g. fleetview@oaap-demo")
+    if args.action == "revoke":
+        if label not in keys:
+            die(f"no fleet key labelled '{label}'")
+        del keys[label]
+        save_fleet_keys(keys)
+        audit_fleet({"event": "revoke", "label": label})
+        print(f"Fleet key '{label}' revoked — takes effect immediately.")
+        return
+    # issue
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@._-]{0,63}", label):
+        die("label may use letters, digits, @ . _ - (max 64, starts "
+            "with a letter or digit)")
+    if label in keys:
+        die(f"a fleet key labelled '{label}' already exists — revoke it "
+            "first, or pick a label that names the new consumer")
+    import datetime
+    key = secrets.token_urlsafe(32)
+    keys[label] = {
+        "digest": hashlib.sha256(key.encode()).hexdigest(),
+        "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    save_fleet_keys(keys)
+    audit_fleet({"event": "issue", "label": label})
+    ext = load_external()
+    url = (f"https://{ext}/fleet/status" if ext
+           else "http://<lan-address>/fleet/status")
+    print(f"Fleet key '{label}' (shown ONCE — enter it as a secret "
+          "config value of the fleet overview app):")
+    print("")
+    print(f"  {key}")
+    print("")
+    print("It grants exactly one thing — reading this node's status document:")
+    print(f"  curl {url} -H \"Authorization: Bearer <key>\"")
+    print("Revoke it any time with: sudo oaap fleet key revoke " + label)
 
 
 def cmd_token(args):
@@ -4648,6 +4739,13 @@ def main():
                     help="accept an envelope widening reported as NOTE")
     pp.set_defaults(fn=cmd_promote)
     pt.set_defaults(fn=cmd_token)
+    pf = sub.add_parser("fleet",
+                        help="fleet keys: read-only /fleet/status access (RFC-0021)")
+    pf.add_argument("object", choices=["key"])
+    pf.add_argument("action", choices=["issue", "list", "revoke"])
+    pf.add_argument("label", nargs="?",
+                    help="who watches, e.g. fleetview@oaap-demo")
+    pf.set_defaults(fn=cmd_fleet)
     pd = sub.add_parser("process-deploys")
     pd.set_defaults(fn=cmd_process_deploys)
     pb = sub.add_parser("backup")
