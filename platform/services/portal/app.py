@@ -1245,9 +1245,13 @@ INSTANCE_EDIT_BODY = """
            placeholder="z. B. hub.meine-domain.de"></label>
     <p class="muted">Der Name muss selbst auf diesen Knoten zeigen (DNS-Eintrag
        und Portfreigabe bleiben Deine Sache). Das Zertifikat holt die Plattform
-       beim ersten Zugriff. Die automatische Adresse bleibt gültig.</p>
+       beim ersten Zugriff. Die automatische Adresse bleibt gültig —
+       <strong>sie gehört nicht in dieses Feld</strong>: Namen unter dem
+       Knotennamen entstehen von selbst und werden hier abgelehnt.
+       Hierher gehört ein <em>eigener</em> Name (z. B. eine Produkt-Domain).</p>
     <button>Hauptnamen speichern</button>
-    {% if i.address and not i.aliases %}<button name="op" value="remove" class="secondary">Hauptnamen entfernen</button>{% endif %}
+    {% if i.address and not i.aliases %}<button name="op" value="remove" class="secondary"
+        onclick="return confirm('Hauptnamen {{ i.address }} wirklich entfernen? Dieser Name kann in ausgelieferte Software eingebaut sein — er ist danach sofort nicht mehr erreichbar. Die automatische Adresse bleibt bestehen.')">Hauptnamen entfernen</button>{% endif %}
   </form>
   {% if i.address %}
   <h3>Aliasse</h3>
