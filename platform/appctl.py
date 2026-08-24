@@ -1354,6 +1354,7 @@ def config_entries(name, inst):
             "key": key,
             "label": c.get("label") or key,
             "secret": bool(c.get("secret")),
+            "multiline": bool(c.get("multiline")),
             "default": c.get("default", ""),
             "value": env.get(key, ""),
         })
@@ -1859,6 +1860,7 @@ def _install_from_dir(pkg, args, source):
         # portal can offer them for editing without the manifest at hand
         "config": [{"key": c["key"], "label": c.get("label", ""),
                     "secret": bool(c.get("secret")),
+                    "multiline": bool(c.get("multiline")),
                     "default": c.get("default", "")}
                    for c in (m.get("config") or [])
                    if c["key"] not in RESERVED_ENV],

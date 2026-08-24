@@ -257,5 +257,42 @@ label, lines = iv.source_view({"source": {"kind": "git", "url": "https://x/y",
 ok("Git ohne Angabe heisst Standardbranch",
    "Branch oder Tag: Standardbranch" in lines, str(lines))
 
+print("\n=== mehrzeilige Konfigurationswerte (Fund oaapx01, 2026-08-24) ===")
+# Joergs Befund beim Einrichten des KI-Gateways: Die Konfigurationsseite
+# bot nur einzeilige Felder an — fuer Listen (Bezugsquellen, Aliasse,
+# FleetViews Knoten) unbrauchbar. Gespeichert wird trotzdem einzeilig,
+# und zwar aus einem harten Grund: instance.env und Dockers --env-file
+# sind zeilenweise, ein Zeilenumbruch im Wert zerreisst beide.
+ok("Listenform wird zu Zeilen", iv.value_to_lines("a=1;b=2") == "a=1\nb=2",
+   iv.value_to_lines("a=1;b=2"))
+ok("leere Teile fallen weg", iv.value_to_lines("a;;b ; ") == "a\nb",
+   iv.value_to_lines("a;;b ; "))
+ok("nichts bleibt nichts", iv.value_to_lines("") == "")
+ok("Zeilen werden zur Listenform",
+   iv.lines_to_value("a=1\nb=2\n\n") == ("a=1;b=2", ""),
+   iv.lines_to_value("a=1\nb=2\n\n"))
+ok("Windows-Zeilenenden stoeren nicht",
+   iv.lines_to_value("a\r\nb")[0] == "a;b", iv.lines_to_value("a\r\nb"))
+ok("Rundreise ist verlustfrei",
+   iv.lines_to_value(iv.value_to_lines("x=1;y=2"))[0] == "x=1;y=2")
+wert, fehler = iv.lines_to_value("gut\nmit;semikolon")
+ok("ein Eintrag mit Trennzeichen wird abgelehnt", wert == "" and fehler, (wert, fehler))
+ok("und die Meldung nennt den Uebeltaeter", "mit;semikolon" in fehler, fehler)
+
+# Der Grund, warum nicht einfach Zeilen gespeichert werden — festgehalten,
+# damit es niemand "vereinfacht":
+_appctl = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "platform", "appctl.py"),
+                  encoding="utf-8").read()
+ok("die Werte gehen weiterhin als --env-file an Docker", "--env-file" in _appctl)
+ok("und werden zeilenweise zurueckgelesen",
+   'l.strip().split("=", 1) for l in f' in _appctl)
+ok("appctl merkt sich die Angabe in der Registry",
+   '"multiline": bool(c.get("multiline"))' in _appctl)
+
+_portal = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "platform", "services", "portal", "app.py"),
+                  encoding="utf-8").read()
+ok("die Konfigurationsseite bietet ein mehrzeiliges Feld an", "<textarea" in _portal)
+ok("und traegt die Angabe aus dem Manifest weiter", '"multiline": multiline' in _portal)
+
 print(f"\n{'ALLE PRUEFUNGEN BESTANDEN' if not fails else str(fails) + ' FEHLER'}")
 sys.exit(1 if fails else 0)

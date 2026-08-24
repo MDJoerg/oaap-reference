@@ -1493,14 +1493,19 @@ INSTANCE_EDIT_BODY = """
     <h2>Konfiguration</h2>
     {% for c in i.config %}
     <label>{{ c.label }}
-      {% if c.secret %}
+      {% if c.multiline %}
+      <textarea name="cfg-{{ c.key }}" rows="4" spellcheck="false"
+                style="width:100%;font-family:ui-monospace,monospace;font-size:.9rem"
+                placeholder="{{ ('gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt') if c.secret else 'eine Angabe je Zeile' }}">{{ c.value }}</textarea>
+      {% elif c.secret %}
       <input type="password" name="cfg-{{ c.key }}" value="" autocomplete="new-password"
              placeholder="{{ 'gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt' }}">
       {% else %}
       <input type="text" name="cfg-{{ c.key }}" value="{{ c.value }}">
       {% endif %}
     </label>
-    <p class="muted"><code>{{ c.key }}</code>{% if c.secret %} — vertraulich,
+    <p class="muted"><code>{{ c.key }}</code>{% if c.multiline %} — eine Angabe
+       je Zeile{% endif %}{% if c.secret %} — vertraulich,
        wird nie angezeigt{% endif %}</p>
     {% endfor %}
     <p class="muted">Diese Werte deklariert die App in ihrem Manifest; andere
@@ -3175,11 +3180,15 @@ def _instance_config(name, inst):
         if key in RESERVED_ENV:
             continue
         secret = bool(c.get("secret"))
+        multiline = bool(c.get("multiline"))
+        stored = env.get(key, "")
         rows.append({
             "key": key, "label": c.get("label") or key, "secret": secret,
+            "multiline": multiline,
             "is_set": bool(env.get(key)),
             # a secret value never leaves the server, not even prefilled
-            "value": "" if secret else env.get(key, ""),
+            "value": "" if secret else
+                     (iv.value_to_lines(stored) if multiline else stored),
         })
     return rows
 
@@ -3890,8 +3899,15 @@ def instance_config(name):
             continue
         # an empty secret field means "keep the stored value" -- there is
         # nothing to prefill it with, so blank cannot mean "clear it"
-        if c["secret"] and submitted == "":
+        if c["secret"] and submitted.strip() == "":
             continue
+        if c.get("multiline"):
+            # Zeilen -> gespeicherte Listenform. Ein Eintrag mit ';' wird
+            # abgelehnt statt zerschnitten (instance_view.lines_to_value).
+            joined, err = iv.lines_to_value(submitted)
+            if err:
+                return _inst_back(name, err=f"{c['label']}: {err}")
+            submitted = joined
         values[c["key"]] = submitted
     if not values:
         return _inst_back(name, msg="Keine Änderung.")

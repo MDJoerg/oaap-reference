@@ -217,3 +217,45 @@ def hidden_instances(instances):
     """
     return sorted(name for name, inst in instances.items()
                   if not tile_visible(inst))
+
+
+# --------------------------------------------------- mehrzeilige Konfiguration
+#
+# Manche Konfigurationswerte sind Listen: die Knoten von FleetView, die
+# Bezugsquellen und Aliasse des KI-Gateways. Bis 0.1.48 bot das Portal
+# dafür ein einzeiliges Eingabefeld an, und beide Apps erfanden
+# unabhängig voneinander dieselbe Notlösung — Einträge mit ';' trennen.
+# Zweimal dieselbe Notlösung ist das Zeichen, dass sie in die Plattform
+# gehört.
+#
+# Warum die Zeilen NICHT als Zeilen gespeichert werden: Die Werte einer
+# Instanz liegen in `instance.env` und gehen als `--env-file` an Docker.
+# Beides ist zeilenweise — ein Zeilenumbruch im Wert zerreißt die Datei
+# und würde beim nächsten Lesen still die halbe Konfiguration
+# verschlucken. Deshalb bleibt die Übertragung einzeilig: Das Portal
+# zeigt Zeilen, gespeichert wird die mit ';' verbundene Form. Apps, die
+# heute schon an ';' und Zeilenumbruch trennen, ändern sich nicht.
+LIST_SEPARATOR = ";"
+
+
+def value_to_lines(value):
+    """Gespeicherte Listenform -> was im Textfeld steht (eine Zeile je Eintrag)."""
+    return "\n".join(part.strip() for part in (value or "").split(LIST_SEPARATOR)
+                     if part.strip())
+
+
+def lines_to_value(text):
+    """Textfeld -> gespeicherte Listenform. Gibt (wert, fehler) zurück.
+
+    Ein Eintrag, der selbst ein ';' enthält, wird **abgelehnt statt
+    zerschnitten**: Stillschweigend zu zerteilen hieße, eine Adresse
+    oder einen Schlüssel zu zerstören und den Anwender raten zu lassen,
+    warum die App nichts mehr findet.
+    """
+    lines = [l.strip() for l in (text or "").replace("\r", "").split("\n")]
+    lines = [l for l in lines if l]
+    bad = [l for l in lines if LIST_SEPARATOR in l]
+    if bad:
+        return "", (f"Ein Eintrag darf kein '{LIST_SEPARATOR}' enthalten — "
+                    f"damit werden die Einträge getrennt. Betroffen: {bad[0]!r}")
+    return LIST_SEPARATOR.join(lines), ""
