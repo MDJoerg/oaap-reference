@@ -228,6 +228,32 @@ def teardown_link_network(a, b):
                    capture_output=True, text=True)
 
 
+def restore_links(name):
+    """Die erklärten Verbindungen EINER Instanz wiederherstellen.
+
+    Ein `docker run` setzt den Container auf genau ein Netz. Jedes
+    Neuerzeugen — Installation, Konfigurationsänderung, erneutes
+    Deployment — wirft ihn also aus seinen Link-Netzen, und die
+    Verbindung ist ab dann still tot: In der Registry steht sie, das
+    Netz existiert, aber der Container hängt nicht mehr daran. Genau
+    dieselbe Falle wie beim Gateway (siehe `connect_gateway`), nur
+    unauffälliger, weil sie erst beim nächsten Aufruf der anderen App
+    auffällt.
+
+    Deshalb hier dieselbe Antwort: auf jedem Weg, der Container
+    (neu) erzeugt, die Verbindungen dieser Instanz wieder aufbauen.
+    """
+    try:
+        reg = load_registry()
+    except Exception:
+        return
+    if name not in reg.get("instances", {}):
+        return          # frisch installiert: es gibt noch keine Verbindung
+    for partner in app_link_partners(reg, name):
+        if partner in reg.get("instances", {}):
+            setup_link_network(reg, name, partner)
+
+
 def reconcile_links(reg):
     """Bring the live link networks in line with the registry — used by
     the migration step so links survive a gateway/app recreate. Creates
@@ -1254,6 +1280,11 @@ def recreate_instance_containers(name, services, storage, endpoints=None):
         run(["docker", "run", "-d", "--name", s["container"],
              "--restart", "unless-stopped", "--network", net, *alias,
              "--env-file", env_path(name), *mounts, *publish, s["image"]])
+    # Erklärte App-zu-App-Verbindungen zurückholen: `docker run` kennt nur
+    # EIN Netz, also hat der neue Container seine Link-Netze verloren
+    # (RFC-0016). Ohne das ist eine Verbindung nach jeder
+    # Konfigurationsänderung still tot.
+    restore_links(name)
 
 
 ENDPOINT_PORT_RANGE = range(8200, 8300)

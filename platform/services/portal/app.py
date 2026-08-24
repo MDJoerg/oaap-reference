@@ -1660,9 +1660,17 @@ ACCESS_LOG = "/gateway-logs/external-access.log"
 # writes them — the one exception is the first-run wizard, which is
 # authorised by the setup token. Anything else would defeat the point:
 # a profile that the portal can grant itself is not a per-node decision.
+# ACHTUNG: Diese Tabelle muss dieselben Schlüssel tragen wie `PROFILES`
+# in appctl.py — `node_profiles()` verwirft alles, was hier fehlt. Ein
+# hier vergessenes Profil ist deshalb kein Schönheitsfehler: Der Knoten
+# hat es, das Portal sieht es nicht, und jede App, die es erwartet,
+# bleibt im Store gefiltert. `test_store_view.py` prüft den Abgleich.
 PROFILE_LABELS = {
     "dev": "Entwicklungsknoten — das Portal darf Test-Instanzen anlegen "
            "und aus einer noch nicht gelisteten Quelle installieren",
+    "exposed": "Exponierter Knoten — der Betreiber darf einer App einen "
+               "Nicht-HTTP-Port am Gateway vorbei freigeben (RFC-0015). "
+               "Sinnvoll nur, wo die Portweiterleitung des Routers steht.",
 }
 
 

@@ -8,7 +8,9 @@ tested apart from the rendering — `store_view.py` carries no Flask.
 
 Run: python3 test/test_store_view.py
 """
+import io
 import os
+import re
 import sys
 from datetime import date
 
@@ -205,6 +207,31 @@ ok("a pinned entry says so", e["pinned"] and e["ref"] == "v1.2.3")
 ok("the command carries path and ref",
    e["command"] == "sudo oaap app install https://example.invalid/repo "
                    "--path apps/x --ref v1.2.3", e["command"])
+
+print("\n=== the two profile tables must not drift apart ===")
+# Der Fund vom 2026-08-24 auf oaapx01: Der Knoten trug `exposed`, das
+# Portal zeigte "keine Profile", und LiveKit blieb im Store gefiltert —
+# weil `node_profiles()` alles verwirft, was nicht in PROFILE_LABELS
+# steht, und dort nur `dev` stand. Ein Profil, das die CLI kennt und das
+# Portal nicht, ist damit kein Schönheitsfehler, sondern macht Apps
+# unsichtbar. Also wird der Abgleich hier geprüft, nicht der Disziplin
+# überlassen: gelesen wird aus beiden Dateien, ohne sie zu importieren
+# (das Portal braucht Flask, appctl braucht root).
+def table_keys(path, marker):
+    text = io.open(path, encoding="utf-8").read()
+    body = text[text.index(marker):]
+    body = body[:body.index("\n}")]
+    return set(re.findall(r'^\s{4}"([a-z0-9_-]+)":', body, re.M))
+
+
+cli = table_keys(os.path.join(HERE, "..", "platform", "appctl.py"), "PROFILES = {")
+portal = table_keys(os.path.join(HERE, "..", "platform", "services", "portal", "app.py"),
+                    "PROFILE_LABELS = {")
+ok("the CLI knows at least dev and exposed", {"dev", "exposed"} <= cli, sorted(cli))
+ok("the portal labels every profile the CLI knows", cli <= portal,
+   f"missing in the portal: {sorted(cli - portal)}")
+ok("and invents none of its own", portal <= cli,
+   f"unknown to the CLI: {sorted(portal - cli)}")
 
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)

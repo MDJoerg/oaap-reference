@@ -86,5 +86,31 @@ ok("es fasst nichts an, was es nicht vorfindet",
 ok("und es bricht den Update-Lauf nicht ab, wenn ein Schritt scheitert",
    "|| say" in update[update.find("run_migrations()"):][:600], "")
 
+print("\n=== was ein Container beim Neuerzeugen verliert, muss zurückkommen ===")
+# Derselbe Fehlertyp wie oben, gefunden auf oaapx01 am 2026-08-24:
+# `oaap app link add ai-gateway ollama` legte das Netz an und hängte
+# beide Container hinein — und die nächste Konfigurationsänderung am
+# Gateway erzeugte dessen Container neu. `docker run` kennt genau EIN
+# Netz, also war die Verbindung danach still tot: in der Registry
+# eingetragen, das Netz vorhanden, der Container nicht mehr daran.
+# Auffallen kann das erst, wenn die andere App gerufen wird.
+#
+# Für das Gateway-Netz war die Lehre schon gezogen (`connect_gateway`
+# wird auf jedem erzeugenden Weg gerufen); für App-zu-App-Verbindungen
+# fehlte sie. Diese Prüfung hält beides zusammen.
+appctl = open(os.path.join(PLATFORM, "appctl.py"), encoding="utf-8").read()
+body = appctl[appctl.index("def recreate_instance_containers("):]
+body = body[:body.index("\nENDPOINT_PORT_RANGE")]
+ok("der erzeugende Weg holt das Gateway zurück ins Instanznetz",
+   "connect_gateway(" in body)
+ok("und ebenso die erklärten App-zu-App-Verbindungen",
+   "restore_links(" in body,
+   "recreate_instance_containers ruft restore_links nicht — jede "
+   "Konfigurationsänderung tötet damit die Links dieser Instanz")
+ok("restore_links gibt es auch wirklich", "def restore_links(" in appctl)
+ok("es fragt die Registry nach den Partnern",
+   "app_link_partners(" in appctl[appctl.index("def restore_links("):]
+   [:appctl[appctl.index("def restore_links("):].index("\ndef reconcile_links")])
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)
