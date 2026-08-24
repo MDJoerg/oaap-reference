@@ -12,6 +12,7 @@ built, which is the point of the three-phase exchange.
 Run: python3 test/test_artifact_deploy.py
 """
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -235,6 +236,51 @@ check("grant carries the announced facts",
       grant and grant["artifact_sha256"] == sha
       and grant["manifest_sha"] == hashlib.sha256(yaml.safe_dump(bumped).encode()).hexdigest(),
       grant)
+
+print("\n-- confirm, then raise the version: the loop of 2026-08-24")
+# Real case on oaapx01: refuse -> the administrator confirms -> the
+# client raises the version (our own deployment sheet told it to) ->
+# the confirmation no longer covers the manifest -> refuse. Three
+# rounds before a human broke it by hand. The client never sees the
+# portal, so the way out has to be in the refusal sentence itself.
+wide1 = json.loads(json.dumps(widened))
+wide1["app"]["version"] = "0.3.0"
+try:
+    m.announce_artifact("demo-test", yaml.safe_dump(wide1), sha, 10, dig)
+    check("widening refused", False, "was accepted")
+except m.ArtifactRejected as e:
+    check("the refusal says to send THIS package again unchanged",
+          "unchanged" in str(e) and "Do not raise the version" in str(e), e)
+
+# the administrator confirms in the portal
+grants = m.load_grants()
+grants["pending:demo-test"]["payload"]["confirmed"] = True
+m.save_grants(grants)
+
+# ... and the client dutifully raises the version instead of resending
+wide2 = json.loads(json.dumps(widened))
+wide2["app"]["version"] = "0.3.1"
+try:
+    m.announce_artifact("demo-test", yaml.safe_dump(wide2), sha, 10, dig)
+    check("the raised version is refused", False, "was accepted")
+except m.ArtifactRejected as e:
+    txt = str(e)
+    check("the refusal names the confirmed version", "0.3.0" in txt, txt)
+    check("and says to announce exactly that one again",
+          "byte for byte unchanged" in txt, txt)
+    check("and kills the reflex that causes the loop",
+          "not installed" in txt and "INSTALLED" in txt, txt)
+
+# the way out works: announce the confirmed manifest again, unchanged
+grants = m.load_grants()
+grants["pending:demo-test"]["payload"] = {
+    "manifest_sha": hashlib.sha256(yaml.safe_dump(wide1).encode()).hexdigest(),
+    "reasons": ["routes become reachable without login: /"],
+    "version": "0.3.0", "confirmed": True}
+m.save_grants(grants)
+v = m.announce_artifact("demo-test", yaml.safe_dump(wide1), sha, 10, dig,
+                        confirmed=True)
+check("re-announcing the confirmed package installs it", v == "0.3.0", v)
 
 print("\n-- the announcement binds the upload")
 zpath = zip_with({"oaap-app.yaml": yaml.safe_dump(bumped)},

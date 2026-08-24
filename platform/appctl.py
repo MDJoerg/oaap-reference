@@ -2968,16 +2968,42 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
         # manifest in the portal — not "the next deployment, whatever
         # it turns out to be"
         pending = _grants_prune(load_grants())
+        prev = (pending.get(f"pending:{name}") or {}).get("payload") or {}
+        # A confirmation that was already given, for a DIFFERENT package.
+        # This is the loop that cost an afternoon on oaapx01 (2026-08-24):
+        # refuse -> human confirms -> the client raises the version as our
+        # own deployment sheet told it to -> different manifest -> the
+        # confirmation no longer applies -> refuse. Three rounds before a
+        # human broke it by hand. The client never sees the portal, so the
+        # way out has to be IN THIS SENTENCE.
+        overtaken = (prev.get("confirmed")
+                     and prev.get("manifest_sha") != manifest_sha)
         pending[f"pending:{name}"] = {
             "kind": "pending", "instance": name, "attempts": 0,
             "expires": _now() + 7 * 24 * 3600,
             "payload": {"manifest_sha": manifest_sha, "reasons": confirm,
                         "version": m["app"]["version"]}}
         save_grants(pending)
+        if overtaken:
+            raise ArtifactRejected(
+                f"an administrator confirmed version {prev.get('version')}, "
+                f"but you have now announced {m['app']['version']} — a "
+                "confirmation covers exactly the manifest it was given for, "
+                f"so it does not cover this one. Announce {prev.get('version')} "
+                "again, byte for byte unchanged, and it will install. "
+                "Raising the version does NOT help here: the rule that "
+                "forbids an unchanged version compares against what is "
+                f"INSTALLED, and {prev.get('version')} is not installed. "
+                "Your new announcement is now the one waiting for "
+                "confirmation (" + "; ".join(confirm) + ")")
         raise ArtifactRejected(
             "this deployment would widen what the instance may reach or who "
             "may reach it (" + "; ".join(confirm) + ") — it needs an "
-            "administrator's confirmation in the portal")
+            "administrator's confirmation in the portal. The confirmation is "
+            "bound to THIS manifest: once it is given, announce and upload "
+            "exactly this package again, unchanged. Do not raise the version "
+            "in between — a different manifest is a different deployment and "
+            "the confirmation would not cover it")
     grant_create("upload", name, digest,
                  {"manifest_sha": manifest_sha, "artifact_sha256": artifact_sha.lower(),
                   "bytes": int(artifact_bytes), "version": m["app"]["version"],
