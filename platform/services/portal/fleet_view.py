@@ -1,4 +1,4 @@
-"""Fleet status document (RFC-0021, spec `oaap.fleet.status` 0.1).
+"""Fleet status document (RFC-0021, spec `oaap.fleet.status` 0.3).
 
 The rules live here, Flask-free, so they are testable without a node:
 which bearer key is valid, which facts an instance row may carry, and
@@ -13,7 +13,7 @@ values, no source URLs (a source URL has already leaked a PAT once).
 import hashlib
 import hmac
 
-SCHEMA = "oaap.fleet.status/0.2"
+SCHEMA = "oaap.fleet.status/0.3"
 
 # The document's state vocabulary. The health page grew two spellings
 # ("err" from probes, "error" from the worker); consumers get one.
@@ -45,7 +45,43 @@ def valid_key(presented, keys):
     return found
 
 
-def instance_row(name, inst, state):
+def auto_verdict(name, inst, state, node_host):
+    """The instance's automatic name and the node's verdict on it (0.3).
+
+    Returns (name, state) or ("", "") when the node publishes no
+    external hostname — then there is no automatic name to speak about
+    and both fields stay out of the document.
+
+    The question asked here is deliberately narrow: **is the instance
+    reachable under this name on this node?** Not whether the name
+    resolves for some client, not whether TLS is in place, not whether
+    anything outside gets in — those are reach questions (RFC-0015).
+
+    Why this and not a DNS verdict: the automatic name is served by a
+    wildcard record, and a wildcard answers for every name under it,
+    including names nobody ever installed. A DNS check there could
+    never say anything the node hostname's own check does not already
+    say. What CAN fail is the route: `write_external_caddy` emits a
+    site per instance only for entries that carry routes and a service
+    port — an instance installed before route capture is skipped, and
+    its automatic name then lands on the catch-all instead of the app.
+    That is a real, silent failure, and this is where it becomes
+    visible.
+    """
+    if not node_host or not name:
+        return "", ""
+    auto = f"{name}.{node_host}"
+    if not (inst.get("routes") and inst.get("svc_port")):
+        # No site was generated for this name — it lands on the
+        # catch-all, not on the app.
+        return auto, "error"
+    st = normalize_state(state)
+    if st in ("ok", "unknown"):
+        return auto, st
+    return auto, "warn"
+
+
+def instance_row(name, inst, state, node_host=""):
     """One instance as facts — a whitelist of safe fields.
 
     `inst` is the raw registry entry and may contain a source URL with
@@ -68,6 +104,11 @@ def instance_row(name, inst, state):
     address = inst.get("address") or ""
     if address:
         row["address"] = address
+    # 0.3: the automatic name `<instance>.<node>` and the verdict on it.
+    auto_name, auto_state = auto_verdict(name, inst, state, node_host)
+    if auto_name:
+        row["auto_address"] = auto_name
+        row["auto_state"] = auto_state
     return row
 
 

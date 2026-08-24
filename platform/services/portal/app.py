@@ -2042,9 +2042,18 @@ PUBLIC_IP_SERVICES = ("https://api.ipify.org", "https://checkip.amazonaws.com")
 
 
 def published_names():
-    """Names this node hands out to the world, with their origin. An
-    instance's canonical name and every alias (RFC-0018) are all published
-    and all watched."""
+    """Names this node has in DNS, with their origin — the node hostname
+    plus every instance's REGISTERED canonical name and its aliases
+    (RFC-0018).
+
+    Deliberately without the automatic names `<instance>.<node>`: they
+    are served by the wildcard record that already covers the node
+    hostname, so a lookup on one of them answers for every name under
+    it — including names nobody ever installed. There is nothing to
+    compare, and a green verdict would be worthless. What can actually
+    fail for an automatic name is the ROUTE, and that is reported per
+    instance as `auto_state` in the fleet document (spec 0.3, rule 7).
+    """
     names = []
     host = external_host()
     if host:
@@ -2424,14 +2433,18 @@ def fleet_status():
     _deploy_succeeded(key)
 
     instances, pending = [], []
+    # The node's registered external hostname — the automatic names of
+    # all instances hang off it (schema 0.3). Empty on a LAN-only node;
+    # then instance rows carry no automatic name at all.
+    ext = external_host()
     for name, inst in sorted(load_instances().items()):
         state, _label, _detail = _instance_probe(name, inst)
-        instances.append(fleet_view.instance_row(name, inst, state))
+        instances.append(fleet_view.instance_row(name, inst, state, ext))
         if _pending_envelope(name):
             pending.append(name)
     dns = dns_check() or {}
     return fleet_view.build_document(
-        node=external_host() or request.host.split(":")[0],
+        node=ext or request.host.split(":")[0],
         version=VERSION,
         profiles=node_profiles(),
         now_iso=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

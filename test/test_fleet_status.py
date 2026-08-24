@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fleet status rules (RFC-0021, spec oaap.fleet.status 0.1).
+"""Fleet status rules (RFC-0021, spec oaap.fleet.status 0.3).
 
 Two halves, both without docker and without a node:
 
@@ -102,6 +102,39 @@ check("'err' is normalized to 'error'", row["state"] == "error")
 check("empty address/origin are omitted",
       "address" not in row and "origin" not in row)
 
+print("\n-- the automatic name and the verdict on it (schema 0.3)")
+# Die Frage ist bewusst eng: Ist die Instanz UNTER DIESEM NAMEN AUF
+# DIESEM KNOTEN erreichbar? Ein DNS-Urteil ist hier unmoeglich — der
+# Wildcard antwortet fuer jeden Namen darunter, installiert oder nicht.
+routed = {"app_name": "a", "routes": [{"path": "/"}], "svc_port": 8000}
+row = fv.instance_row("bdt-app", routed, "ok", "oaap.joomp.de")
+check("the automatic name is built from instance and node",
+      row["auto_address"] == "bdt-app.oaap.joomp.de"
+      and row["auto_state"] == "ok")
+row = fv.instance_row("bdt-app", routed, "err", "oaap.joomp.de")
+check("an unhealthy instance behind an existing route is 'warn'",
+      row["auto_state"] == "warn")
+row = fv.instance_row("bdt-app", routed, "unknown", "oaap.joomp.de")
+check("an unknown probe stays unknown", row["auto_state"] == "unknown")
+
+# Der echte, stille Fehlerfall: write_external_caddy erzeugt fuer eine
+# Instanz ohne erfasste Routen keine Site — ihr automatischer Name
+# landet dann auf dem Auffangeintrag statt bei der App.
+row = fv.instance_row("alt", {"app_name": "alt", "svc_port": 8000}, "ok",
+                      "oaap.joomp.de")
+check("no captured route means 'error', however healthy the container is",
+      row["auto_address"] == "alt.oaap.joomp.de"
+      and row["auto_state"] == "error")
+row = fv.instance_row("alt", {"app_name": "alt", "routes": [{"path": "/"}]},
+                      "ok", "oaap.joomp.de")
+check("no service port likewise", row["auto_state"] == "error")
+
+row = fv.instance_row("bdt-app", routed, "ok", "")
+check("a LAN-only node has no automatic name — both fields absent",
+      "auto_address" not in row and "auto_state" not in row)
+check("0.2 consumers keep working: the row is otherwise unchanged",
+      row["instance"] == "bdt-app" and row["state"] == "ok")
+
 print("\n-- attention list")
 core = [{"name": "Identity", "state": "ok"},
         {"name": "Deploy-Worker", "state": "error"}]
@@ -149,7 +182,7 @@ doc = fv.build_document(node="oaap.joomp.de", version="0.1.41",
                         profiles=["dev"], now_iso="2026-08-23T10:15:00Z",
                         core=core, instances=instances, dns_rows=dns,
                         pending_names=["b-test"], public_ip="203.0.113.7")
-check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.2")
+check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.3")
 check("names and public_ip carried",
       len(doc["names"]) == 3 and doc["public_ip"] == "203.0.113.7")
 check("no public_ip -> field absent",
