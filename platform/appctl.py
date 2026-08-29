@@ -39,6 +39,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 
@@ -75,6 +76,31 @@ ARTIFACT_GRANTS = os.path.join(APPS_DIR, "artifact-grants.json")
 AUDIT_DIR = os.path.join(DATA_DIR, "data", "audit")
 TENANT_LOG = os.path.join(AUDIT_DIR, "tenant-log.jsonl")
 SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
+# A request the worker has picked up lives here until it is answered
+# (RFC-0024 §5). It is the ONLY state the worker keeps between taking a
+# request and finishing it — and it is what lets anyone else say
+# "running" instead of guessing, and lets the next run clean up after a
+# worker that died mid-build.
+SPOOL_CLAIMS = os.path.join(SPOOL_DIR, "claims")
+# How long one deploy request may take before it is called off. A build
+# that hangs used to block every later deployment for every instance,
+# with nothing anywhere saying so (RFC-0024). A recorded failure is
+# strictly better than silence.
+DEPLOY_MAX_SECONDS = int(os.environ.get("OAAP_DEPLOY_MAX_SECONDS") or 1200)
+TIMED_OUT = (f"aborted after the {DEPLOY_MAX_SECONDS // 60} minute time "
+             "limit — the build was stopped, nothing was left running")
+
+
+class DeployTimeout(Exception):
+    """One deploy request outlasted its budget (RFC-0024 §5).
+
+    Raised in place of subprocess.TimeoutExpired so that every branch of
+    the worker — each of which already turns an exception into the
+    request's failure message — reports the time limit in words instead
+    of a command line.
+    """
+
+
 PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
@@ -402,8 +428,22 @@ def die(msg):
     sys.exit(1)
 
 
+# Set by the deploy worker for the duration of ONE request (RFC-0024
+# §5). Every command below then inherits what is left of that request's
+# time budget, so the limit bites where the time is actually spent — in
+# a docker build — and the child process is killed rather than merely
+# abandoned. None outside the worker: an interactive `oaap app install`
+# waits as long as the operator lets it.
+DEADLINE = None
+
+
 def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
+    if DEADLINE is not None and "timeout" not in kw:
+        kw["timeout"] = max(1.0, DEADLINE - time.time())
+    try:
+        return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw)
+    except subprocess.TimeoutExpired:
+        raise DeployTimeout(TIMED_OUT) from None
 
 
 def load_registry():
@@ -3564,6 +3604,28 @@ def artifact_prune(name, keep=ARTIFACT_KEEP):
             pass
 
 
+def artifact_remove(inst, name, want):
+    """Delete one retained package — never the one in service.
+
+    RFC-0024 §6. The package an instance runs from is not a copy of
+    something else: backup completeness (RFC-0019 §4), rollback and
+    promotion (RFC-0020) all read exactly that file. Deleting it would
+    leave a working instance that cannot be reproduced, so the refusal
+    is by name and says why.
+    """
+    if want not in artifact_list(name):
+        raise ValueError("no such retained artifact")
+    running = ((inst or {}).get("source") or {}).get("stored") or ""
+    if want == running:
+        raise ValueError(
+            f"'{want}' is the package this instance runs from — it stays. "
+            "Backup, rollback and promotion all read it; deleting it would "
+            "leave an instance nobody can rebuild. Deploy another version "
+            "first, then this one can go.")
+    os.remove(os.path.join(artifact_dir(name), want))
+    return f"deleted retained package {want}"
+
+
 def source_package_arg(name, src):
     """The 'package' argument that reinstalls from a recorded source."""
     if (src or {}).get("kind") == "artifact":
@@ -4424,6 +4486,7 @@ TENANT_AUDITED = {
     "redeploy": "instance.deploy",
     "artifact": "instance.deploy",
     "rollback": "instance.rollback",
+    "artifact-remove": "instance.artifact",
     "promote": "instance.promote",
     "remove": "instance.remove",
     "token": "token.change",
@@ -4435,26 +4498,95 @@ TENANT_AUDITED = {
 }
 
 
+def reap_stale_claims(results):
+    """Answer requests whose worker died mid-flight (RFC-0024 §5).
+
+    A claim older than the time limit belongs to a run that is gone: the
+    limit is enforced on every command the worker issues, so a live run
+    cannot outlast it. Without this, such a request would sit in
+    `claims/` forever — the caller polling its id would be told "running"
+    for all time, and the health page would report a queue that never
+    drains. A recorded failure is the honest answer.
+    """
+    cutoff = time.time() - DEPLOY_MAX_SECONDS - 60
+    try:
+        claims = os.listdir(SPOOL_CLAIMS)
+    except OSError:
+        return
+    for fn in claims:
+        p = os.path.join(SPOOL_CLAIMS, fn)
+        try:
+            if os.path.getmtime(p) > cutoff:
+                continue
+            with open(p, encoding="utf-8") as f:
+                req = json.load(f)
+        except (OSError, ValueError):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        rid = req.get("id", "") or fn[:-5]
+        record = {"instance": req.get("instance", "") or "(dieser Knoten)",
+                  "ok": False, "id": rid, "message": TIMED_OUT,
+                  "revision": "", "version": "", "via": "deploy worker"}
+        audit_deploy(record)
+        res_tmp = os.path.join(results, f"{rid}.tmp")
+        with open(res_tmp, "w", encoding="utf-8") as f:
+            json.dump({"ok": False, "message": TIMED_OUT, "revision": "",
+                       "version": "", "id": rid}, f)
+        os.replace(res_tmp, os.path.join(results, f"{rid}.json"))
+        os.remove(p)
+        # the package that came with it has no owner left either
+        try:
+            os.remove(os.path.join(SPOOL_DIR, "uploads", f"{rid}.zip"))
+        except OSError:
+            pass
+        print(f"deploy {req.get('instance', '')}: FAILED — {TIMED_OUT}")
+
+
 def cmd_process_deploys(_args):
     """Run queued deploy requests (invoked by the oaap-deployd path unit)."""
+    global DEADLINE
     import argparse as _argparse
     import contextlib
     import io
-    import time
 
     queue = os.path.join(SPOOL_DIR, "queue")
     results = os.path.join(SPOOL_DIR, "results")
     os.makedirs(queue, exist_ok=True)
     os.makedirs(results, exist_ok=True)
+    os.makedirs(SPOOL_CLAIMS, exist_ok=True)
+    os.chmod(SPOOL_CLAIMS, 0o700)   # a request may carry configuration values
     # prune stale result files (the requester picks them up within seconds)
     now = time.time()
     for f in os.listdir(results):
         p = os.path.join(results, f)
         if now - os.path.getmtime(p) > 3600:
             os.remove(p)
+    reap_stale_claims(results)
 
     for req_file in sorted(os.listdir(queue)):
         req_path = os.path.join(queue, req_file)
+        # Claim it FIRST, by moving it out of the queue in one atomic
+        # step (RFC-0024 §5). Three things follow from that: the portal
+        # can offer "Abbrechen" for anything still in the queue without
+        # racing us -- whoever moves the file first wins and the other
+        # side finds it gone; anybody can see that a request is running
+        # and since when; and a worker that dies leaves a claim the next
+        # run can answer instead of a request nobody ever hears about.
+        claim_path = os.path.join(SPOOL_CLAIMS, req_file)
+        try:
+            os.replace(req_path, claim_path)
+        except OSError:
+            continue            # withdrawn, or another worker took it
+        # A rename keeps the old timestamp, which would date the claim
+        # to when the request was QUEUED. Then a request that waited
+        # behind a long build would look overdue the moment it started.
+        # The claim is stamped now, so "läuft seit" and the time limit
+        # both count actual work.
+        os.utime(claim_path, None)
+        req_path = claim_path
         try:
             with open(req_path, encoding="utf-8") as f:
                 req = json.load(f)
@@ -4464,10 +4596,12 @@ def cmd_process_deploys(_args):
         name = req.get("instance", "")
         rid = req.get("id", "")
         action = req.get("action", "redeploy")
+        DEADLINE = time.time() + DEPLOY_MAX_SECONDS
         reg = load_registry()
         inst = reg["instances"].get(name)
         tokens = load_tokens()
         ok, msg, revision = False, "", ""
+        retry = False        # rollback onto the running package
 
         # Who queued this, and which tenant they may act in (spec 2.3
         # rule 3). Derived HERE, from identity's own user store, never
@@ -4697,8 +4831,16 @@ def cmd_process_deploys(_args):
         elif action == "rollback":
             # Reinstalling a retained package. Nothing new is admitted
             # here — only something this node already accepted once.
+            #
+            # Rolling forward onto the package already in service is the
+            # same act with a different intention: "Erneut ausrollen"
+            # (RFC-0024 §4). It deliberately reuses this path, checks
+            # included — but it is NOT called a rollback, because the log
+            # has to preserve the difference between going back and
+            # trying again.
             want = str(req.get("artifact") or "")
             path = os.path.join(artifact_dir(name), want)
+            retry = (want == ((inst or {}).get("source") or {}).get("stored"))
             if not inst:
                 msg = "unknown instance"
             elif want not in artifact_list(name):
@@ -4709,12 +4851,28 @@ def cmd_process_deploys(_args):
                         name, path, None, channel=inst.get("channel", "test"),
                         path=(inst.get("source") or {}).get("path", ""))
                     revision = sha[:12]
-                    ok, msg = True, f"rolled back to {want} ({version})"
+                    ok = True
+                    msg = (f"rolled out {want} again ({version})" if retry
+                           else f"rolled back to {want} ({version})")
                 except ArtifactRejected as e:
                     msg = str(e)
                 except SystemExit as e:
                     msg = f"install refused: {e}"
                 except Exception as e:
+                    msg = str(e)
+        elif action == "artifact-remove":
+            # Deleting one retained package (RFC-0024 §6). Applied here
+            # because the portal's registry mount is read-only — and
+            # re-checked here, because the spool is data, not trust: the
+            # package in service may have changed between the page the
+            # operator looked at and the click.
+            if not inst:
+                msg = "unknown instance"
+            else:
+                try:
+                    msg = artifact_remove(inst, name, str(req.get("artifact") or ""))
+                    ok = True
+                except (ValueError, OSError) as e:
                     msg = str(e)
         elif action == "promote":
             # Ship the tested artifact to production (RFC-0020). The
@@ -5213,9 +5371,14 @@ def cmd_process_deploys(_args):
                "endpoint": "portal", "link": "portal",
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
+               "artifact-remove": "portal",
                "grant": "portal", "promote": "portal"}.get(action, "deploy-hook")
+        # The request id travels into the log, not only into the result
+        # file (RFC-0024 §1). Result files are pruned after an hour; the
+        # log is not — so a client that comes back the next morning can
+        # still learn the outcome of the deployment it started.
         record = {"instance": name or "(dieser Knoten)", "ok": ok,
-                  "message": msg, "revision": revision,
+                  "id": rid, "message": msg, "revision": revision,
                   "version": version, "via": via}
         if store_src:
             # Which list an app came from, and — for an unverified
@@ -5240,14 +5403,19 @@ def cmd_process_deploys(_args):
         # tenant of the instance -- including when a server_admin did
         # it, which is the whole point: the customer has to be able to
         # see the operator's actions in their own log (RFC-0022 §6).
-        if action in TENANT_AUDITED:
+        # "Erneut ausrollen" reuses the rollback path but is a
+        # deployment, not a step back — the tenant's log has to say which
+        # of the two happened (RFC-0024 §4).
+        audited = TENANT_AUDITED.get(
+            "artifact" if (action == "rollback" and retry) else action)
+        if audited:
             tid = audit_tenant_id
             if not tid:
                 after = load_registry().get("instances", {}).get(name) or {}
                 tid = (resolve_tenant(after.get("tenant"))
                        or resolve_tenant((inst or {}).get("tenant"))
                        or ensure_default_tenant())
-            audit_tenant(TENANT_AUDITED[action], tid, name,
+            audit_tenant(audited, tid, name,
                          "ok" if ok else "denied",
                          who=actor or (req.get("via") or "deploy hook"),
                          role=act_role or "-",
@@ -5256,9 +5424,10 @@ def cmd_process_deploys(_args):
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:
                 json.dump({"ok": ok, "message": msg, "revision": revision,
-                           "version": version}, f)
+                           "version": version, "id": rid}, f)
             os.replace(res_tmp, os.path.join(results, f"{rid}.json"))
-        os.remove(req_path)
+        os.remove(req_path)          # the claim: this request is answered
+        DEADLINE = None
         print(f"deploy {name}: {'OK' if ok else 'FAILED'} — {msg}")
 
 

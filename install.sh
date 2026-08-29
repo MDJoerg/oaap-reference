@@ -632,7 +632,7 @@ install -m 0755 "$SCRIPT_DIR/bin/oaap" /usr/local/bin/oaap
 # Deploy-hook worker (oaap.apps.runtime 2.5): the portal queues deploy
 # requests in the spool; a systemd path unit runs the host-side worker
 # the moment a request arrives.
-mkdir -p "$OAAP_DATA_DIR/data/deploy-spool/queue" "$OAAP_DATA_DIR/data/deploy-spool/results"
+mkdir -p "$OAAP_DATA_DIR/data/deploy-spool/queue" "$OAAP_DATA_DIR/data/deploy-spool/results" "$OAAP_DATA_DIR/data/deploy-spool/claims"
 PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
 if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
   cat > /etc/systemd/system/oaap-deployd.service <<EOF

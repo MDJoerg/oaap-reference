@@ -1463,6 +1463,36 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'deployment' }}">
+{% if i.deploy_now %}
+<div class="card">
+  <h2>{% if i.deploy_now.state == "running" %}Deployment läuft
+      {% elif i.deploy_now.state == "stale" %}Deployment abgebrochen
+      {% else %}Deployment wartet{% endif %}</h2>
+  <p>{% if i.deploy_now.state == "running" %}⏳ Seit
+     <strong>{{ i.deploy_now.ago }}</strong> in Arbeit
+     ({{ i.deploy_now.label }}). Das Ergebnis erscheint im Deploy-Protokoll
+     auf der Gesundheitsseite.
+     {% elif i.deploy_now.state == "stale" %}⚠️ Vor
+     <strong>{{ i.deploy_now.ago }}</strong> angefangen
+     ({{ i.deploy_now.label }}) und nie abgeschlossen — der Deploy-Worker ist
+     mittendrin ausgefallen. Beim nächsten Deployment wird das als
+     fehlgeschlagen verbucht; es läuft nichts mehr.
+     {% else %}⏳ Seit <strong>{{ i.deploy_now.ago }}</strong> in der
+     Warteschlange ({{ i.deploy_now.label }}) — der Deploy-Worker hat sie
+     noch nicht angefasst.{% endif %}</p>
+  {% if i.deploy_now.state == "queued" %}
+  <form method="post" action="/instances/{{ i.name }}/deploy/cancel">
+    <input type="hidden" name="tab" value="deployment">
+    <input type="hidden" name="deployment" value="{{ i.deploy_now.id }}">
+    <button class="secondary">Abbrechen</button>
+  </form>
+  {% elif i.deploy_now.state == "running" %}
+  <p class="muted">Ein angelaufenes Deployment wird nicht abgebrochen — ein
+     halb gebauter Stand ist schlimmer als warten. Es endet spätestens nach
+     {{ i.deploy_limit }} Minuten, dann steht das Ergebnis im Protokoll.</p>
+  {% endif %}
+</div>
+{% endif %}
 {% if i.is_test %}
 <div class="card">
   <h2>Deploy-Token</h2>
@@ -1496,6 +1526,17 @@ INSTANCE_EDIT_BODY = """
      <code>POST {{ i.hook_url }}/announce</code> mit Manifest, Prüfsumme und
      Größe — die Antwort enthält ein Einmal-Token —, dann
      <code>PUT {{ i.hook_url }}/artifact</code> mit dem Paket.</p>
+  <p class="muted">Dauert der Bau länger als zwei Minuten, antwortet der Hook
+     mit <code>202</code> und nennt im Feld <code>deployment</code> die
+     Kennung dieses Deployments. Damit fragt die KI den Ausgang ab:<br>
+     <code>GET {{ i.hook_url }}/status?deployment=&lt;Kennung&gt;</code> —
+     die Antwort trägt <code>state</code> mit <code>queued</code>,
+     <code>running</code> oder <code>done</code>. <strong>Ohne</strong>
+     Kennung antwortet derselbe Aufruf über die Instanz, meldet aber ebenfalls
+     ein noch laufendes Deployment als solches statt das vorige Ergebnis.<br>
+     Ein Deployment, das noch wartet, lässt sich zurückziehen mit
+     <code>POST {{ i.hook_url }}/cancel?deployment=&lt;Kennung&gt;</code>;
+     ein angelaufenes nicht (RFC-0024).</p>
 </div>
 {% else %}
 <div class="card">
@@ -1560,18 +1601,35 @@ INSTANCE_EDIT_BODY = """
     <tr><th>Paket</th><th>Empfangen</th><th></th></tr>
     {% for a in i.artifacts %}
     <tr>
-      <td><code>{{ a.file }}</code>{% if a.running %} <span class="badge">läuft</span>{% endif %}</td>
+      <td><code>{{ a.file }}</code>{% if a.running %}
+          <span class="badge">in Betrieb</span>{% endif %}</td>
       <td>{{ a.received }}</td>
-      <td>{% if not a.running %}
-        <form method="post" action="/instances/{{ i.name }}/rollback">
+      <td>
+        <form method="post" action="/instances/{{ i.name }}/rollback"
+              style="display:inline">
           <input type="hidden" name="tab" value="deployment">
           <input type="hidden" name="artifact" value="{{ a.file }}">
-          <button class="secondary">Hierauf zurück</button>
+          <button class="secondary">{{ "Erneut ausrollen" if a.running
+                                       else "Hierauf zurück" }}</button>
         </form>
-      {% endif %}</td>
+        {% if not a.running %}
+        <form method="post" action="/instances/{{ i.name }}/artifact-delete"
+              style="display:inline"
+              onsubmit="return confirm('{{ a.file }} endgültig löschen? Auf dieses Paket kann danach nicht mehr zurückgesetzt werden.');">
+          <input type="hidden" name="tab" value="deployment">
+          <input type="hidden" name="artifact" value="{{ a.file }}">
+          <button class="secondary">Löschen</button>
+        </form>
+        {% endif %}
+      </td>
     </tr>
     {% endfor %}
   </table>
+  <p class="muted"><strong>In Betrieb</strong> heißt: aus diesem Paket läuft
+     die Instanz gerade. „Erneut ausrollen" baut genau diese Bytes noch
+     einmal — kein neues Paket, keine neue Übertragung. Gelöscht werden kann
+     jedes Paket außer dem in Betrieb: Backup, Rückschritt und die Übernahme
+     nach Produktiv lesen genau diese Datei.</p>
 </div>
 {% endif %}
 </section>
@@ -2874,6 +2932,11 @@ import uuid as _uuid
 SPOOL_DIR = "/deploy-spool"
 SPOOL_QUEUE = os.path.join(SPOOL_DIR, "queue")
 SPOOL_RESULTS = os.path.join(SPOOL_DIR, "results")
+# A request the worker has taken up, moved out of the queue by the
+# worker itself (RFC-0024 §5). Reading it is how this side can say
+# "running" rather than "not finished yet" — and how withdrawing a
+# request that has not started can be offered without racing the worker.
+SPOOL_CLAIMS = os.path.join(SPOOL_DIR, "claims")
 DEPLOY_THROTTLE = os.path.join(SPOOL_DIR, ".throttle.json")
 DEPLOY_TOKENS = "/apps-registry/deploy-tokens.json"
 DEPLOY_LOG = "/apps-registry/deploy-log.jsonl"
@@ -2884,6 +2947,47 @@ DENIED = {"error": "unknown instance or invalid token"}
 def _client_ip():
     fwd = request.headers.get("X-Forwarded-For", "")
     return fwd.split(",")[0].strip() or request.remote_addr or "?"
+
+
+# --------------------------------------- deployment state (RFC-0024 §2)
+# The rules live in deploy_state.py, without Flask around them: what
+# counts as a deployment, when a claim belongs to a worker that died,
+# and what may still be withdrawn. Here only the paths of THIS node are
+# put in front of them.
+from deploy_state import (ACTION_LABEL, DEPLOY_ACTIONS,  # noqa: E402,F401
+                          DEPLOY_MAX_MINUTES, TIMED_OUT, ago as _ago)
+import deploy_state as _ds  # noqa: E402
+
+
+def _in_flight(name=""):
+    return _ds.in_flight(SPOOL_QUEUE, SPOOL_CLAIMS, name)
+
+
+def _deploy_in_flight(name):
+    """The one deployment this instance has under way, if any."""
+    return _ds.deployment(_in_flight(name))
+
+
+def _deploy_now(name):
+    """The same, dressed for the instance page."""
+    return _ds.for_page(_in_flight(name))
+
+
+def _withdraw(name, rid):
+    return _ds.withdraw(SPOOL_QUEUE, SPOOL_UPLOADS, name, rid,
+                        _in_flight(name))
+
+
+def _log_entry(name, rid=""):
+    """The deploy-log line for one request id, or the instance's last."""
+    for entry in recent_deploys(limit=200 if rid else 50):
+        if name and entry.get("instance") != name:
+            continue
+        if not rid:
+            return entry
+        if entry.get("id") == rid:
+            return entry
+    return None
 
 
 def _throttle_load():
@@ -3037,15 +3141,18 @@ def deploy_hook(name):
             finally:
                 os.remove(res_path)
             body = {"ok": res.get("ok", False), "instance": name,
+                    "deployment": rid, "state": "done",
                     "version": res.get("version", ""),
                     "revision": res.get("revision", ""),
                     "message": res.get("message", ""),
                     "url": _entry_url(name, inst)}
             return body, (200 if res.get("ok") else 502)
         _time.sleep(2)
-    return {"ok": None, "instance": name,
+    # The id is what makes the poll below answer about THIS deployment
+    # rather than about whatever this instance did last (RFC-0024 §1).
+    return {"ok": None, "instance": name, "deployment": rid, "state": "running",
             "message": "deployment is still running — poll GET "
-                       f"/deploy/{name}/status"}, 202
+                       f"/deploy/{name}/status?deployment={rid}"}, 202
 
 
 # --------------------------------------- artifact deployment (RFC-0019)
@@ -3179,10 +3286,12 @@ def deploy_artifact(name):
                                      "path": (request.args.get("path") or "").strip()},
                          DEPLOY_WAIT_SECONDS)
     if res is None:
-        return {"ok": None, "instance": name,
+        return {"ok": None, "instance": name, "deployment": rid,
+                "state": "running",
                 "message": "deployment is still running — poll GET "
-                           f"/deploy/{name}/status"}, 202
+                           f"/deploy/{name}/status?deployment={rid}"}, 202
     body = {"ok": res.get("ok", False), "instance": name,
+            "deployment": rid, "state": "done",
             "version": res.get("version", ""),
             "revision": res.get("revision", ""),
             "message": res.get("message", ""),
@@ -3192,14 +3301,65 @@ def deploy_artifact(name):
 
 @app.get("/deploy/<name>/status")
 def deploy_status(name):
+    """What became of a deployment (RFC-0024 §2).
+
+    With `?deployment=<id>` this answers about THAT request. Without it,
+    about the instance — but either way it now carries an explicit
+    `state`, and a deployment still in flight is reported as such.
+
+    That last part is the fix for a silent wrong answer: this endpoint
+    used to return the instance's most recent log line, so a client
+    polling after a 202 was handed the PREVIOUS deployment's success
+    while its own was still building. It read `ok: true` and stopped
+    looking.
+    """
     inst, err = _deploy_auth(name)
     if err:
         return inst, err
-    for entry in recent_deploys(limit=50):
-        if entry.get("instance") == name:
-            entry["url"] = _entry_url(name, inst)
-            return entry, 200
-    return {"instance": name, "message": "no deployment recorded yet"}, 200
+    rid = (request.args.get("deployment") or "").strip()
+    if rid and not _re.fullmatch(r"[0-9a-f]{6,64}", rid):
+        return {"instance": name, "state": "unknown",
+                "message": "malformed deployment id"}, 400
+
+    for e in _in_flight(name):
+        if rid and e["id"] != rid:
+            continue
+        if not rid and e["action"] not in DEPLOY_ACTIONS:
+            continue
+        if e["state"] == "stale":
+            return {"instance": name, "deployment": e["id"], "ok": False,
+                    "state": "done", "message": TIMED_OUT}, 200
+        return {"instance": name, "deployment": e["id"], "state": e["state"],
+                "since": e["since"],
+                "message": ("deployment is running" if e["state"] == "running"
+                            else "deployment is queued")}, 200
+
+    entry = _log_entry(name, rid)
+    if entry is None:
+        return {"instance": name, "deployment": rid,
+                "state": "unknown" if rid else "none",
+                "message": ("no deployment with that id on this node" if rid
+                            else "no deployment recorded yet")}, 200
+    entry["state"] = "done"
+    entry["url"] = _entry_url(name, inst)
+    return entry, 200
+
+
+@app.post("/deploy/<name>/cancel")
+def deploy_cancel_hook(name):
+    """Withdraw a deployment that has not started (RFC-0024 §5)."""
+    inst, err = _deploy_auth(name)
+    if err:
+        return inst, err
+    rid = (request.args.get("deployment") or "").strip()
+    if not _re.fullmatch(r"[0-9a-f]{6,64}", rid or ""):
+        return {"instance": name, "message": "name the deployment to withdraw "
+                                             "as ?deployment=<id>"}, 400
+    withdrawn, why, _started = _withdraw(name, rid)
+    return ({"ok": withdrawn, "instance": name, "deployment": rid,
+             "message": why}, 200 if withdrawn else 409)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -3272,34 +3432,51 @@ def deploy_worker_state():
     had no effect.
     """
     name = "Deploy-Worker"
-    try:
-        waiting = [os.path.join(SPOOL_QUEUE, fn)
-                   for fn in os.listdir(SPOOL_QUEUE) if fn.endswith(".json")]
-    except OSError:
+    if not os.path.isdir(SPOOL_QUEUE):
         return {"name": name, "state": "unknown", "label": "Unbekannt",
                 "detail": "Warteschlange nicht lesbar"}
-    if not waiting:
+    entries = _in_flight()
+    if not entries:
         return {"name": name, "state": "ok", "label": "Gesund",
                 "detail": "Warteschlange leer"}
-    now = _time.time()
-    ages = []
-    for p in waiting:
-        try:
-            ages.append(now - os.path.getmtime(p))
-        except OSError:
-            pass
-    oldest = max(ages) if ages else 0
-    if oldest > WORKER_STUCK_SECONDS:
+    # Waiting and working are different symptoms and get different
+    # verdicts (RFC-0024 §3). A request nobody picks up means the worker
+    # is gone — that is the failure this check was built for. A build
+    # that has been running for twelve minutes means the worker is fine
+    # and busy; calling that "Steht" would send the operator to
+    # systemctl for no reason.
+    waiting = [e for e in entries if e["state"] == "queued"]
+    running = [e for e in entries if e["state"] == "running"]
+    stale = [e for e in entries if e["state"] == "stale"]
+    if stale:
+        return {"name": name, "state": "error", "label": "Steht",
+                "detail": (f"{len(stale)} Anfrage(n) wurden angefangen und nie "
+                           "abgeschlossen — der Worker ist mittendrin "
+                           "ausgefallen. Sie werden beim nächsten Lauf als "
+                           "fehlgeschlagen verbucht; auf der Maschine prüfen "
+                           "mit 'systemctl status oaap-deployd.service'")}
+    oldest_wait = max((e["since"] for e in waiting), default=0)
+    if oldest_wait > WORKER_STUCK_SECONDS and not running:
         return {
             "name": name, "state": "error", "label": "Steht",
             "detail": (f"{len(waiting)} Anfrage(n) warten, die älteste seit "
-                       f"{int(oldest // 60)} Minuten — auf der Maschine prüfen "
-                       "mit 'systemctl status oaap-deployd.path'; wieder in "
-                       "Gang bringen mit 'systemctl reset-failed "
-                       "oaap-deployd.service oaap-deployd.path && systemctl "
-                       "start oaap-deployd.path'")}
-    return {"name": name, "state": "ok", "label": "Arbeitet",
-            "detail": f"{len(waiting)} Anfrage(n) in Arbeit"}
+                       f"{oldest_wait // 60} Minuten, und keine ist in "
+                       "Arbeit — auf der Maschine prüfen mit 'systemctl "
+                       "status oaap-deployd.path'; wieder in Gang bringen "
+                       "mit 'systemctl reset-failed oaap-deployd.service "
+                       "oaap-deployd.path && systemctl start "
+                       "oaap-deployd.path'")}
+    # Say WHAT is going on, not just how much: a running deployment is
+    # the answer to "warum tut sich gerade nichts" (RFC-0024 §3).
+    if running:
+        r = running[0]
+        detail = (f"{r['instance'] or 'Knoten'}: {r['action']} läuft seit "
+                  f"{_ago(r['since'])}")
+        if waiting:
+            detail += f", {len(waiting)} weitere warten"
+    else:
+        detail = f"{len(waiting)} Anfrage(n) warten"
+    return {"name": name, "state": "ok", "label": "Arbeitet", "detail": detail}
 
 
 def pending_installs():
@@ -3308,21 +3485,10 @@ def pending_installs():
     Without this the store page offers "Installieren" again while the
     worker is still pulling images — a second click then fails
     (Jörgs Befund 2026-08-06)."""
-    pending = set()
-    try:
-        for fn in os.listdir(SPOOL_QUEUE):
-            if not fn.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(SPOOL_QUEUE, fn), encoding="utf-8") as f:
-                    req = json.load(f)
-            except (OSError, ValueError):
-                continue
-            if req.get("action") == "install":
-                pending.add(req.get("instance"))
-    except OSError:
-        pass
-    return pending
+    # Both directories: since RFC-0024 the worker moves a request it
+    # has taken up out of the queue, so looking only there would call an
+    # install "finished" the moment it actually STARTS.
+    return {e["instance"] for e in _in_flight() if e["action"] == "install"}
 
 
 
@@ -3901,6 +4067,8 @@ def instance_detail(name):
          "is_test": inst.get("channel") == "test",
          "token_created": _token_created(name),
          "artifacts": _artifacts(name, inst),
+         "deploy_now": _deploy_now(name),
+         "deploy_limit": DEPLOY_MAX_MINUTES,
          "promote": _promote_view(name, inst),
          "pending": _pending_envelope(name),
          "hook_url": _hook_url(name),
@@ -4263,6 +4431,48 @@ def instance_rollback(name):
         return _inst_back(name, err="Unbekanntes Paket.")
     return _queue_and_redirect(name, {"action": "rollback", "artifact": artifact},
                                CREATE_WAIT_SECONDS)
+
+
+@app.post("/instances/<name>/artifact-delete")
+def instance_artifact_delete(name):
+    """Delete one retained package — never the one in service (RFC-0024 §6)."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    artifact = request.form.get("artifact", "").strip()
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
+        return _inst_back(name, err="Unbekanntes Paket.")
+    # The host decides: /apps-registry is mounted read-only here, and the
+    # rule "not the one in service" has to be re-checked where the
+    # registry is authoritative anyway.
+    return _queue_and_redirect(name, {"action": "artifact-remove",
+                                      "artifact": artifact},
+                               VISIBILITY_WAIT_SECONDS)
+
+
+@app.post("/instances/<name>/deploy/cancel")
+def instance_deploy_cancel(name):
+    """Withdraw a deployment that is still waiting (RFC-0024 §5)."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    rid = request.form.get("deployment", "").strip()
+    if not _re.fullmatch(r"[0-9a-f]{6,64}", rid or ""):
+        return _inst_back(name, err="Unbekanntes Deployment.")
+    done, _why, started = _withdraw(name, rid)
+    if done:
+        return _inst_back(name, msg="Das Deployment wurde zurückgezogen, "
+                                    "bevor es angefangen hat.")
+    return _inst_back(
+        name,
+        err=("Das Deployment ist bereits angelaufen und wird nicht "
+             "abgebrochen — ein halb gebauter Stand ist schlimmer als "
+             f"warten. Es endet spätestens nach {DEPLOY_MAX_MINUTES} Minuten."
+             if started else
+             "Dieses Deployment wartet nicht (mehr) — sieh im Deploy-Protokoll "
+             "auf der Gesundheitsseite nach, wie es ausgegangen ist."))
 
 
 @app.post("/instances/<name>/token")
