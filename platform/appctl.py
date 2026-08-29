@@ -878,9 +878,14 @@ def cmd_migrate_tenant_routes(_args):
             continue
         path = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
         body = _read_file(path) or ""
-        # A site with no forward_auth at all is all-public and has
-        # nothing to scope; leave it exactly as it is.
-        if "forward_auth" not in body or "&tenant=" in body:
+        # Not every forward_auth authenticates: a PUBLIC route with a
+        # rate brake (RFC-0010) has one too, pointing at /throttle. Ask
+        # for the authentication call by name, or a public throttled
+        # instance is found "stale" on every single update, rewritten,
+        # and found stale again -- it has no session to scope and will
+        # never grow the parameter. (Found on oaap-test, 2026-08-29:
+        # forgejo was rewritten by every run.)
+        if "/verify?" not in body or "&tenant=" in body:
             continue
         stale.append((name, inst, path))
     if not stale:
@@ -899,9 +904,12 @@ def cmd_migrate_tenant_routes(_args):
     refresh_generated_sites()
     reload_gateway()
     print(f"  {len(stale)} instance site(s) rewritten.")
-    print("  Nothing changes while this node has one tenant: every route "
-          "now")
-    print("  names the tenant it already belonged to.")
+    if single_tenant():
+        print("  Nothing changes for anyone: every route now names the")
+        print("  tenant it already belonged to.")
+    else:
+        print("  Every authenticated route now names the tenant of its")
+        print("  instance, and is refused to sessions from another one.")
 
 
 def cmd_tenant(args):

@@ -201,6 +201,47 @@ check("und beim zweiten Lauf passiert nichts und wird nichts gesagt",
       out2 == "")
 
 
+print("\n=== eine oeffentliche App mit Bremse ist nicht 'veraltet' ===")
+# Befund aus der Inbetriebnahme (29.08., oaap-test): forgejo ist
+# oeffentlich und gedrosselt. Die Drosselung (RFC-0010) benutzt
+# ebenfalls forward_auth -- nur zeigt sie auf /throttle, nicht auf
+# /verify. Die Migration hielt das fuer eine Datei ohne Mandanten,
+# schrieb sie neu, fand sie beim naechsten Lauf wieder: Sie kann den
+# Mandanten nie bekommen, weil es keine Sitzung einzuordnen gibt.
+
+reg = m.load_registry()
+reg["instances"]["oeffentlich"] = {
+    "app_id": "pub", "app_name": "Oeffentlich", "version": "1.0",
+    "channel": "production", "container": "oaap-app-pub", "port": 8110,
+    "svc_port": 3000, "tenant": DEFAULT,
+    "throttle": {"limit": 300, "window": 60},
+    "routes": [{"path": "/", "roles": ["public"]}],
+}
+m.save_registry(reg)
+pub_site = os.path.join(m.CADDY_APPS_DIR, "oeffentlich.caddy")
+with open(pub_site, "w", encoding="utf-8") as f:
+    f.write(m.caddy_site(8110, reg["instances"]["oeffentlich"]["routes"],
+                         "oaap-app-pub", 3000, scope="oeffentlich",
+                         throttle=m.throttle_of(reg["instances"]["oeffentlich"]),
+                         tenant=DEFAULT))
+site_text = open(pub_site, encoding="utf-8").read()
+check("die Bremse benutzt forward_auth, aber nicht /verify",
+      "forward_auth" in site_text and "/throttle?" in site_text
+      and "/verify?" not in site_text)
+check("und die Datei traegt folglich keinen Mandanten",
+      "&tenant=" not in site_text,
+      "auf einer oeffentlichen Route gibt es keine Sitzung einzuordnen")
+
+before = open(pub_site, encoding="utf-8").read()
+out, _ = capture(m.cmd_migrate_tenant_routes, None)
+check("die Migration fasst sie nicht an",
+      open(pub_site, encoding="utf-8").read() == before
+      and "oeffentlich" not in out,
+      "sonst wird sie bei jedem Update neu geschrieben und nie fertig")
+out2, _ = capture(m.cmd_migrate_tenant_routes, None)
+check("und bleibt auch beim zweiten Lauf still", out2 == "")
+
+
 print("\n=== in welchem Mandanten jemand handelt, sagt sein Datensatz ===")
 
 write_users([
