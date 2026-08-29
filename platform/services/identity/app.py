@@ -46,6 +46,29 @@ app.config.update(
 )
 
 EXTERNAL_HOST_FILE = "/platform-apps/external.json"
+# Accounts and tenants of this node (oaap.core.tenant 0.1). Identity
+# READS this file and never writes it — appctl on the host owns it. The
+# mount is read-only, which makes that structural rather than a promise.
+TENANTS_FILE = "/platform-apps/tenants.json"
+
+
+def default_tenant_id():
+    """The default tenant's UUID, or '' when the node has none yet.
+
+    Empty is a normal state, not an error: identity may start before
+    the host-side migration has run. Everything here then reads the
+    absent tenant as the default one (spec 2.2), which is exactly what
+    a single-tenant node means anyway.
+    """
+    try:
+        with open(TENANTS_FILE, encoding="utf-8") as f:
+            tenants = (json.load(f) or {}).get("tenants") or {}
+    except (OSError, ValueError):
+        return ""
+    for tid, t in sorted(tenants.items()):
+        if t.get("label") == "default":
+            return tid
+    return ""
 
 
 def _external_host():
@@ -104,7 +127,45 @@ def load_users():
         u.setdefault("session_epoch", 0)
         # RFC-0007: free-form visibility group tags.
         u.setdefault("groups", [])
+        # oaap.core.tenant 1.1: which tenant this user belongs to.
+        # Empty means the default tenant — that is the reading rule for
+        # every record written before tenants existed, and it is why
+        # this migration cannot break a running node.
+        u.setdefault("tenant", "")
     return users
+
+
+def _migrate_tenant_once():
+    """oaap.core.tenant 1.5 step 2: every existing user joins the
+    default tenant.
+
+    Strictly speaking this changes no behaviour — an absent tenant
+    already READS as the default one (spec 2.2). It is done anyway so
+    that the stored data says what is true, and so `oaap tenant check`
+    can tell "belongs to the default tenant" apart from "was never
+    asked". Nothing is displayed: on a one-tenant node the user must
+    not learn that tenants exist.
+
+    Skipped without a flag while the tenant store is missing — identity
+    can start before the host migration ran, and the next start does
+    it. Never guesses an id.
+    """
+    state = _load(STATE_FILE, {})
+    if state.get("tenant_migrated"):
+        return
+    tid = default_tenant_id()
+    if not tid:
+        return
+    users = load_users()
+    changed = False
+    for u in users:
+        if not u.get("tenant"):
+            u["tenant"] = tid
+            changed = True
+    if changed:
+        _save(USERS_FILE, users)
+    state["tenant_migrated"] = True
+    _save(STATE_FILE, state)
 
 
 def _migrate_server_admin_once():
@@ -133,6 +194,7 @@ def _migrate_server_admin_once():
 
 
 _migrate_server_admin_once()
+_migrate_tenant_once()
 
 
 def find_user(users, username):
@@ -622,6 +684,11 @@ def internal_setup():
         # single-operator install.
         "roles": ["server_admin", "admin", "keyuser"],
         "groups": [],
+        # The first user of a fresh node joins its default tenant. May
+        # be empty here when the node is being set up before the first
+        # `oaap update`; the migration above fills it in later, and the
+        # reading rule covers the gap in the meantime.
+        "tenant": default_tenant_id(),
         "active": True,
     }])
     _save(STATE_FILE, {"setup_done": True, "server_admin_migrated": True})
@@ -673,6 +740,10 @@ def users_create():
         "password_hash": generate_password_hash(body["password"]),
         "roles": roles,
         "groups": groups,
+        # A user is created INTO the tenant of the node's single tenant
+        # (spec 1.4). From 0.2 an administrator creating a user chooses
+        # which tenant, and this is where that choice arrives.
+        "tenant": default_tenant_id(),
         "active": True,
     })
     _save(USERS_FILE, users)

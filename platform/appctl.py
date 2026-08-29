@@ -39,6 +39,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 
 import yaml
@@ -52,6 +53,10 @@ STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
 EXTERNAL_FILE = os.path.join(APPS_DIR, "external.json")
 EDGE_FILE = os.path.join(APPS_DIR, "edge.json")
 NODE_FILE = os.path.join(APPS_DIR, "node.json")   # node profiles (RFC-0011)
+# accounts and tenants of THIS node (oaap.core.tenant 0.1, RFC-0022).
+# Lives beside the registry because identity and portal already mount
+# this directory read-only -- both must read it, neither may write it.
+TENANTS_FILE = os.path.join(APPS_DIR, "tenants.json")
 DEPLOY_TOKENS = os.path.join(APPS_DIR, "deploy-tokens.json")
 DEPLOY_LOG = os.path.join(APPS_DIR, "deploy-log.jsonl")
 # fleet keys (RFC-0021): revocable bearer keys that grant exactly one
@@ -407,6 +412,280 @@ def save_registry(reg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=2)
     os.replace(tmp, REGISTRY)
+
+
+# ------------------------------------------- tenancy (oaap.core.tenant 0.1)
+# RFC-0022 stage 2, and the whole of it: every record that belongs to
+# SOMEBODY carries a tenant, and while this node has exactly one tenant,
+# nothing anywhere says so. Building it before it is needed is the point
+# -- carrying the dimension costs a field, retrofitting it costs a
+# weekend, and that weekend would fall on the day a second customer is
+# waiting to be onboarded.
+#
+# Everything internal refers to the tenant's UUID, never to its label.
+# From 0.2 the label appears in hostnames, and a hostname is public
+# (Certificate Transparency), so it has to stay changeable without a
+# data migration.
+
+DEFAULT_TENANT_LABEL = "default"
+TENANT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+
+
+def _iso_now():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(
+        timespec="seconds")
+
+
+def load_tenants():
+    """{uuid: record} -- empty dict on a node not yet migrated."""
+    try:
+        with open(TENANTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    tenants = data.get("tenants") if isinstance(data, dict) else None
+    return tenants if isinstance(tenants, dict) else {}
+
+
+def save_tenants(tenants):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = TENANTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"tenants": tenants}, f, indent=2)
+    os.replace(tmp, TENANTS_FILE)
+    # identity and portal read this file through a read-only mount; it
+    # carries no secret, only names and references.
+    os.chmod(TENANTS_FILE, 0o644)
+
+
+def default_tenant_id():
+    """The default tenant's UUID, or '' when this node has none yet.
+
+    Looked up by label rather than being a well-known constant on
+    purpose: two nodes' default tenants are DIFFERENT tenants (spec
+    1.2), and a shared identifier would invite exactly the merge that
+    RFC-0022 D1 forbids.
+    """
+    for tid, t in sorted(load_tenants().items()):
+        if t.get("label") == DEFAULT_TENANT_LABEL:
+            return tid
+    return ""
+
+
+def ensure_default_tenant():
+    """Create the account reference and the default tenant, once.
+
+    Returns its id. Idempotent, and silent -- this runs on every update.
+    """
+    tid = default_tenant_id()
+    if tid:
+        return tid
+    tenants = load_tenants()
+    tid = str(uuid.uuid4())
+    tenants[tid] = {
+        "label": DEFAULT_TENANT_LABEL,
+        "name": "",
+        # The account lives on the central management node (RFC-0022
+        # Q1). A node holds an opaque reference plus a cached display
+        # name and nothing else: no members, no delegation, and above
+        # all no cross-node write path.
+        "account": str(uuid.uuid4()),
+        "account_name": "",
+        "created": _iso_now(),
+    }
+    save_tenants(tenants)
+    return tid
+
+
+def resolve_tenant(ref):
+    """Resolve a stored tenant reference (spec 2.2). None if unknown.
+
+    Two rules, and the difference between them is the entire safety
+    argument of this version:
+
+      - ABSENT means the default tenant. That is how every record
+        written before this version reads, and it is what makes the
+        migration a no-op for anyone who never asked for tenants.
+
+      - UNKNOWN never means the default tenant. A reference this node
+        does not have is refused, not healed. Mapping it onto `default`
+        would move a customer's users or instances into the OPERATOR's
+        own tenant -- a data leak dressed up as robustness.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return default_tenant_id() or None
+    return ref if ref in load_tenants() else None
+
+
+def tenant_label(tid):
+    return (load_tenants().get(tid) or {}).get("label", "")
+
+
+def single_tenant():
+    """True while tenants must stay invisible (spec 2.3, the acceptance
+    criterion). Every surface asks this before mentioning a tenant."""
+    return len(load_tenants()) <= 1
+
+
+def tenant_for_new_instance(inst, permit=None):
+    """Which tenant an instance being (re)installed belongs to.
+
+    Ordered so that a redeploy can never move an instance between
+    tenants: what the instance already says wins over everything. Then
+    the creation permit -- the only record that names a tenant before
+    an instance exists (spec 1.4) -- and only then the default.
+
+    One function on purpose: 0.2 adds "the tenant the installing admin
+    is acting in", and this is the single place that has to learn it.
+    """
+    existing = (inst or {}).get("tenant")
+    if existing:
+        return existing
+    granted = (permit or {}).get("tenant")
+    if granted:
+        return granted
+    return ensure_default_tenant()
+
+
+def _identity_users_path():
+    return os.path.join(DATA_DIR, "data", "identity", "users.json")
+
+
+def _read_identity_users():
+    """Read-only peek at the user store, for counting.
+
+    appctl never WRITES this file: identity owns it and rewrites it on
+    every user change. Two writers to one JSON file is a lost update
+    waiting for the day two admins click at the same moment.
+    """
+    try:
+        with open(_identity_users_path(), encoding="utf-8") as f:
+            users = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return users if isinstance(users, list) else []
+
+
+def cmd_migrate_tenants(_args):
+    """Give this node its default tenant and stamp what appctl owns.
+
+    Called from migrate.sh on every `oaap update`. Idempotent, and
+    quiet when there is nothing to do -- like every step in there.
+
+    What is stamped here: the instance registry and open creation
+    permits. NOT the user store (identity migrates its own, see
+    _migrate_tenant_once there) and NOT deploy tokens, which store no
+    tenant at all -- a token is bound to one instance and the instance
+    already knows. A tenant reference stored twice is one that can
+    disagree with itself, and the day it does, the wrong copy decides
+    who may write into whose instance.
+    """
+    created = not default_tenant_id()
+    tid = ensure_default_tenant()
+
+    reg = load_registry()
+    stamped = 0
+    for inst in reg.get("instances", {}).values():
+        if not inst.get("tenant"):
+            inst["tenant"] = tid
+            stamped += 1
+    if stamped:
+        save_registry(reg)
+
+    grants = _grants_prune(load_grants())
+    permits = 0
+    for g in grants.values():
+        if g.get("kind") == "create" and not (g.get("payload") or {}).get("tenant"):
+            g.setdefault("payload", {})["tenant"] = tid
+            permits += 1
+    if permits:
+        save_grants(grants)
+
+    if created or stamped or permits:
+        print("")
+        print("Preparing this node for tenants (RFC-0022 stage 2) ...")
+        if created:
+            print("  Default tenant created.")
+        if stamped:
+            print(f"  {stamped} app instance(s) assigned to it.")
+        if permits:
+            print(f"  {permits} open creation permit(s) assigned to it.")
+        print("  Nothing changes for anyone: this node has one tenant.")
+
+
+def cmd_tenant(args):
+    """Read-only view of this node's tenants (spec 2.1).
+
+    Creating, renaming and deleting arrives in 0.2 together with
+    `tenant_admin` and the audit log. A second tenant that nobody can
+    administer would be worse than none.
+    """
+    tenants = load_tenants()
+    if not tenants:
+        die("this node has no tenant store yet -- run `oaap update`")
+
+    if args.action == "list":
+        for _tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
+            print(f"{t.get('label','?'):<20} {t.get('name') or '(no name)'}")
+        if single_tenant():
+            print("")
+            print("This node has one tenant, so tenants are not in use here:")
+            print("no screen, no address and no command output mentions them.")
+        return
+
+    if args.action == "check":
+        # The integrity check of spec 3.2. It REPORTS, it never repairs
+        # -- repairing an unknown tenant means guessing whose data this
+        # is, and the only safe guess is none.
+        problems = []
+        for name, inst in sorted(load_registry().get("instances", {}).items()):
+            if resolve_tenant(inst.get("tenant")) is None:
+                problems.append(f"app instance '{name}' names an unknown tenant "
+                                f"({inst.get('tenant')})")
+        for u in _read_identity_users():
+            if resolve_tenant(u.get("tenant")) is None:
+                problems.append(f"user '{u.get('username','?')}' names an unknown "
+                                f"tenant ({u.get('tenant')})")
+        for g in _grants_prune(load_grants()).values():
+            if g.get("kind") != "create":
+                continue
+            ref = (g.get("payload") or {}).get("tenant")
+            if resolve_tenant(ref) is None:
+                problems.append(f"creation permit for '{g.get('instance','?')}' "
+                                f"names an unknown tenant ({ref})")
+        if not problems:
+            print(f"All records resolve. Tenants on this node: {len(tenants)}.")
+            return
+        print("Records naming a tenant this node does not have:")
+        for line in problems:
+            print(f"  {line}")
+        print("")
+        print("Nothing was changed. An unknown tenant is never mapped onto the")
+        print("default one -- that would move somebody's data into the")
+        print("operator's own tenant. Restore the tenant store, or reassign")
+        print("these records deliberately.")
+        sys.exit(1)
+
+    # action == "show"
+    label = args.name or DEFAULT_TENANT_LABEL
+    match = [(tid, t) for tid, t in tenants.items() if t.get("label") == label]
+    if not match:
+        die(f"no tenant with label '{label}'")
+    tid, t = match[0]
+    default = default_tenant_id()
+    instances = sum(1 for i in load_registry().get("instances", {}).values()
+                    if (i.get("tenant") or default) == tid)
+    users = sum(1 for u in _read_identity_users()
+                if (u.get("tenant") or default) == tid)
+    print(f"Tenant:    {t.get('label','?')}")
+    print(f"Name:      {t.get('name') or '(none)'}")
+    print(f"Account:   {t.get('account_name') or '(reference only)'}")
+    print(f"Created:   {t.get('created','?')}")
+    # Counts, not names: this is an inventory, not a data export.
+    print(f"Users:     {users}")
+    print(f"Instances: {instances}")
 
 
 # ------------------------------------------------ node profiles (RFC-0011)
@@ -1823,6 +2102,15 @@ def _install_from_dir(pkg, args, source):
 
     reg["instances"][name] = {
         "app_id": app["id"], "app_name": app["name"],
+        # Which tenant this instance belongs to (oaap.core.tenant 1.4).
+        # Note where it sits: ABOVE the "survives redeploy" block at the
+        # end of this function, because it is not an operator override
+        # that may be re-decided — it is who the instance BELONGS to. A
+        # redeploy must never be able to move an instance from one
+        # customer to another, so the existing value always wins. From
+        # 0.2 a creation permit may name a different tenant here; today
+        # there is only one to name.
+        "tenant": tenant_for_new_instance(inst),
         "version": app["version"], "channel": channel,
         # what the app IS (runtime spec 2.10) — decides the launchpad
         # tile. Read from the MANIFEST at install time, never from a
@@ -3935,8 +4223,14 @@ def cmd_process_deploys(_args):
             elif not re.fullmatch(r"[0-9a-f]{64}", req.get("digest", "")):
                 msg = "malformed grant digest"
             else:
+                # The permit is the ONE record that must store its
+                # tenant: it is issued before the instance exists, so
+                # there is nothing to derive it from (oaap.core.tenant
+                # 1.4). Today that is always the default tenant; from
+                # 0.2 the issuing admin chooses.
                 grant_create("create", name, req["digest"],
-                             {"channel": "test", "by": req.get("by", "?")},
+                             {"channel": "test", "by": req.get("by", "?"),
+                              "tenant": ensure_default_tenant()},
                              ttl=CREATE_GRANT_TTL)
                 ok = True
                 msg = (f"creation grant issued for '{name}', single use, "
@@ -4785,6 +5079,15 @@ def main():
     pmn = sub.add_parser("migrate-networks",
                          help="internal: isolate app networks + reconnect the gateway (RFC-0016)")
     pmn.set_defaults(fn=cmd_migrate_networks)
+    pmt = sub.add_parser("migrate-tenants",
+                         help="internal: create the default tenant and stamp "
+                              "what belongs to it (RFC-0022 stage 2)")
+    pmt.set_defaults(fn=cmd_migrate_tenants)
+    pten = sub.add_parser("tenant", help="accounts and tenants of this node "
+                                         "(oaap.core.tenant)")
+    pten.add_argument("action", choices=["list", "show", "check"])
+    pten.add_argument("name", nargs="?", help="tenant label (default: 'default')")
+    pten.set_defaults(fn=cmd_tenant)
     pep = sub.add_parser("endpoint", help="non-HTTP endpoints (RFC-0015)")
     pep.add_argument("action", choices=["list", "allow", "deny"])
     pep.add_argument("name", help="instance name")
@@ -4913,7 +5216,10 @@ def main():
     # what 'oaap status' prints anyway — everything else changes the node.
     read_only = (args.cmd == "convert"
                  or (args.cmd == "node" and args.action == "show")
-                 or (args.cmd == "store" and args.action == "list"))
+                 or (args.cmd == "store" and args.action == "list")
+                 # `tenant` only ever reads — including `check`, which
+                 # reports and deliberately repairs nothing.
+                 or args.cmd == "tenant")
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:

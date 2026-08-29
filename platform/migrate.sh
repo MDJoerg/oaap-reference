@@ -120,3 +120,12 @@ say ""
 say "Checking store sources ..."
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store reconcile \
   2>&1 | sed 's/^/  /' || say "  WARNING: store sources could not be checked."
+
+# --- tenants (RFC-0022 stage 2, oaap.core.tenant 1.5) ---
+# Give the node its default tenant and assign what already exists to it.
+# Silent when there is nothing to do, which is every run after the first.
+# It has to run BEFORE identity stamps its own users: identity reads the
+# tenant store through a read-only mount and skips its migration while
+# the file is not there yet.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenants \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the tenant migration did not complete."
