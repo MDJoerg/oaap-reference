@@ -340,6 +340,52 @@ check("'tenant list' sagt jetzt nicht mehr, dass Mandanten unbenutzt sind",
       "not in use here" not in out and "k7f3" in out)
 
 
+print("\n=== eine Pruefung, die nicht lesen kann, besteht nicht ===")
+# Befund aus der Inbetriebnahme auf oaap-test (29.08.): `oaap tenant
+# check` laeuft ohne root und meldete "alles loest auf" -- ohne den
+# Benutzerspeicher (0600, root) auch nur geoeffnet zu haben. Und
+# `tenant show` schrieb "Users: 0" auf einen Knoten mit acht.
+
+import stat as _stat
+
+users_path = m._identity_users_path()
+os.makedirs(os.path.dirname(users_path), exist_ok=True)
+write_users([user("joerg", ["server_admin"], DEFAULT)])
+
+check("ein lesbarer Speicher wird gelesen",
+      m._read_identity_users() == [user("joerg", ["server_admin"], DEFAULT)])
+
+os.remove(users_path)
+check("ein Knoten vor dem ersten Benutzer zaehlt ehrlich null",
+      m._read_identity_users() == [],
+      "nicht vorhanden ist etwas anderes als nicht lesbar")
+
+write_users([user("joerg", ["server_admin"], DEFAULT)])
+broken = users_path + ".orig"
+os.rename(users_path, broken)
+with open(users_path, "w", encoding="utf-8") as f:
+    f.write("{kaputt")
+check("ein unlesbarer Speicher ist NICHT die leere Liste",
+      m._read_identity_users() is None,
+      "sonst besteht eine Pruefung, die nichts angesehen hat")
+
+out, code = capture(m.cmd_tenant, Args("check"))
+check("'tenant check' besteht dann nicht, sondern sagt warum",
+      code == 1 and "could not be read" in out and "sudo oaap tenant check" in out)
+
+out, _ = capture(m.cmd_tenant, Args("show"))
+check("'tenant show' schreibt keine erfundene Null",
+      "Users:     0" not in out and "not readable" in out)
+
+os.remove(users_path)
+os.rename(broken, users_path)
+out, code = capture(m.cmd_tenant, Args("check"))
+check("mit lesbarem Speicher prueft sie die Benutzer wieder mit",
+      "could not be read" not in out,
+      "sie meldet hier weiter die verwaiste Instanz von oben — das ist "
+      "der Befund, um den es geht, und nicht das Leseproblem")
+
+
 print("\n=== was die Quelltexte versprechen muessen ===")
 
 

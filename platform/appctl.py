@@ -681,7 +681,7 @@ def acting_tenant(username, requested=""):
     spool is data and not trust -- the same rule the store install path
     already follows.
     """
-    u = next((x for x in _read_identity_users()
+    u = next((x for x in (_read_identity_users() or [])
               if x.get("username") == (username or "")), None)
     roles = set((u or {}).get("roles") or [])
     if "server_admin" in roles:
@@ -740,6 +740,18 @@ def _identity_users_path():
 def _read_identity_users():
     """Read-only peek at the user store, for counting.
 
+    Returns None when the store EXISTS but could not be read -- which on
+    a real node almost always means "not root", because identity keeps
+    it at 0600. That is deliberately not the same answer as [], and the
+    difference matters: counting an unreadable store as empty made
+    `tenant check` report that every record resolves without having
+    looked at a single user, and `tenant show` print "Users: 0" on a
+    node with eight. A check that cannot see half of what it checks has
+    to say so, not pass.
+
+    A store that is simply not there yet reads as [] -- that is a node
+    before its first user, and it is an honest zero.
+
     appctl never WRITES this file: identity owns it and rewrites it on
     every user change. Two writers to one JSON file is a lost update
     waiting for the day two admins click at the same moment.
@@ -747,8 +759,10 @@ def _read_identity_users():
     try:
         with open(_identity_users_path(), encoding="utf-8") as f:
             users = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError):
+        return None
     return users if isinstance(users, list) else []
 
 
@@ -1048,7 +1062,16 @@ def cmd_tenant(args):
             if resolve_tenant(inst.get("tenant")) is None:
                 problems.append(f"app instance '{name}' names an unknown tenant "
                                 f"({inst.get('tenant')})")
-        for u in _read_identity_users():
+        users = _read_identity_users()
+        if users is None:
+            # Not a finding about the data -- a finding about this run.
+            # Reported as a failure anyway: "everything resolves" would
+            # be a claim about records nobody looked at.
+            print("The user store could not be read, so users were not "
+                  "checked at all.")
+            print("Run it as root:  sudo oaap tenant check")
+            sys.exit(1)
+        for u in users:
             if resolve_tenant(u.get("tenant")) is None:
                 problems.append(f"user '{u.get('username','?')}' names an unknown "
                                 f"tenant ({u.get('tenant')})")
@@ -1081,8 +1104,9 @@ def cmd_tenant(args):
     default = default_tenant_id()
     instances = sum(1 for i in load_registry().get("instances", {}).values()
                     if (i.get("tenant") or default) == tid)
-    users = sum(1 for u in _read_identity_users()
-                if (u.get("tenant") or default) == tid)
+    stored = _read_identity_users()
+    users = ("(not readable — run as root)" if stored is None else
+             sum(1 for u in stored if (u.get("tenant") or default) == tid))
     aliases = former_labels(t)
     print(f"Tenant:    {t.get('label','?')}")
     if aliases:
