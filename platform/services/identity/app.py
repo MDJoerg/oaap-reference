@@ -30,8 +30,16 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 # (users, groups, edge/external routing, backup, visibility bypass) and
 # is never forwarded to apps as something app-specific — see RFC-0008.
 # admin is unchanged: an app-facing role only, carrying no platform
-# authority by itself.
-ASSIGNABLE_ROLES = ("server_admin", "admin", "keyuser", "user", "guest", "partner")
+# authority by itself. tenant_admin (oaap.core.tenant 2.3) is the half
+# RFC-0008 left open: platform authority INSIDE ONE TENANT -- the
+# tenant of the holder's own record, never one named in a request.
+ASSIGNABLE_ROLES = ("server_admin", "tenant_admin", "admin", "keyuser",
+                    "user", "guest", "partner")
+# Roles whose authority reaches past a tenant. server_admin administers
+# the node; partner reads the health page, which lists every instance on
+# the machine. A tenant_admin may grant neither -- otherwise the role is
+# a two-step path out of its own tenant (oaap.core.tenant 2.3 rule 1).
+NODE_WIDE_ROLES = frozenset({"server_admin", "partner"})
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
 # Free-form visibility tags (RFC-0007) — no registry, a group exists
 # the moment any user carries it. Kept short and simple like usernames.
@@ -69,6 +77,104 @@ def default_tenant_id():
         if t.get("label") == "default":
             return tid
     return ""
+
+
+def known_tenants():
+    try:
+        with open(TENANTS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("tenants") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve_tenant(ref):
+    """Spec 2.5, and the difference between the two rules is the whole
+    safety argument: ABSENT means the default tenant (that is how every
+    record written before tenants existed reads), UNKNOWN means None --
+    refused, never healed onto the default one. Mapping an unknown
+    tenant onto `default` would move a customer's user into the
+    OPERATOR's tenant, which is a data leak wearing the clothes of
+    robustness.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return default_tenant_id() or ""
+    return ref if ref in known_tenants() else None
+
+
+def single_tenant():
+    """While true, nothing about tenants may be visible anywhere."""
+    return len(known_tenants()) <= 1
+
+
+AUDIT_LOG = "/audit/tenant-log.jsonl"
+
+
+def audit(action, tenant, subject, result="ok", who="?", role="-", detail=""):
+    """One line in the tenant audit log (oaap.core.tenant 1.7).
+
+    Identity writes here because user administration is the one state
+    change that never passes through the host -- appctl writes
+    everything else into the same file. Both only ever APPEND single
+    short lines, and nothing rewrites the file, which is what makes two
+    writers safe. A failure to write must not fail the operation: the
+    log is a record, not a lock. It is reported instead.
+    """
+    import datetime
+    entry = {"when": datetime.datetime.now(datetime.timezone.utc)
+                              .isoformat(timespec="seconds"),
+             "who": who or "?", "role": role or "-", "action": action,
+             "tenant": tenant or "", "tenant_label": _label_of(tenant),
+             "subject": subject, "result": result}
+    if detail:
+        entry["detail"] = detail
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"WARNING: could not write the tenant audit log: {e}", flush=True)
+
+
+def _label_of(tid):
+    return (known_tenants().get(tid or "") or {}).get("label", "")
+
+
+def authority(actor_name):
+    """What an actor may do, and where (spec 2.3).
+
+    Returns (role, tenant, error). `role` is "server_admin" (everything,
+    RFC-0022 D5), "tenant_admin" (their own tenant and nothing else) or
+    "" (nothing). The tenant comes from the ACTOR'S OWN RECORD -- a
+    tenant that arrives in a request is a tenant the caller chose, and a
+    caller who chooses their own tenant has no boundary.
+    """
+    u = find_user(load_users(), actor_name or "")
+    if not u or not u.get("active", True):
+        return "", "", "Der handelnde Benutzer ist unbekannt oder inaktiv."
+    roles = set(u.get("roles") or [])
+    if "server_admin" in roles:
+        return "server_admin", resolve_tenant(u.get("tenant")) or "", ""
+    if "tenant_admin" not in roles:
+        return "", "", "Benutzerverwaltung erfordert server_admin oder tenant_admin."
+    own = resolve_tenant(u.get("tenant"))
+    if own is None:
+        return ("tenant_admin", "",
+                "Dein Konto nennt einen Mandanten, den dieser Knoten nicht hat.")
+    return "tenant_admin", own, ""
+
+
+def may_see(role, actor_tenant, u):
+    """Whether an actor may see/act on one user record.
+
+    A tenant_admin sees their own tenant only. Everyone else who got
+    this far is a server_admin, who sees everything (D5) -- and whose
+    every action lands in the customer's own audit log, which is the
+    counterweight.
+    """
+    if role != "tenant_admin":
+        return True
+    return (resolve_tenant(u.get("tenant")) or "") == actor_tenant
 
 
 def _external_host():
@@ -209,9 +315,17 @@ def session_username():
 
 
 def public_user(u):
-    """User record for list/UI use — never the password hash (spec 5.7)."""
+    """User record for list/UI use — never the password hash (spec 5.7).
+
+    Carries the tenant since oaap.core.tenant 0.2: the portal has to be
+    able to show a tenant_admin their own tenant and nobody else's, and
+    it cannot filter by something it is not told. This record goes to
+    the portal over the key-protected internal API and to `oaap user
+    list` on the machine — never to an app, and never into a header.
+    """
     return {"username": u["username"], "display_name": u["display_name"],
-            "roles": u["roles"], "groups": u["groups"], "active": u["active"]}
+            "roles": u["roles"], "groups": u["groups"], "active": u["active"],
+            "tenant": u.get("tenant", "")}
 
 
 def other_active_server_admin_exists(users, username):
@@ -370,6 +484,23 @@ def verify():
     if (required_groups and "server_admin" not in user["roles"]
             and not set(required_groups.split(",")) & set(user["groups"])):
         return "Forbidden: not in a visibility group for this app", 403
+    # The tenant boundary (oaap.core.tenant 3.1), enforced here and
+    # nowhere else: the instance's tenant arrives as a parameter from
+    # the generated gateway config, and a session from another tenant is
+    # refused BEFORE the app is reached. An app that filtered by tenant
+    # itself would be one bug away from a leak between customers.
+    #
+    # server_admin passes (RFC-0022 D5: the operator may reach
+    # everything, and the audit log is the counterweight, not a barrier
+    # that would be a lie). Comparison is on the RESOLVED value on both
+    # sides, so an instance naming a tenant this node does not have
+    # matches nobody -- fail closed, exactly as spec 2.5 requires.
+    required_tenant = request.args.get("tenant", "")
+    if required_tenant and "server_admin" not in user["roles"]:
+        want = resolve_tenant(required_tenant)
+        mine = resolve_tenant(user.get("tenant"))
+        if want is None or mine is None or want != mine:
+            return "Forbidden: this app belongs to another tenant", 403
     return "", 204, {
         "X-OAAP-User": user["username"],
         "X-OAAP-Roles": ",".join(user["roles"]),
@@ -713,14 +844,50 @@ def _validated_groups(raw):
     return sorted(set(groups))
 
 
+def _actor(body_or_args):
+    """The user this call is made ON BEHALF OF, from the portal.
+
+    Required, and deliberately so: without it identity cannot tell a
+    server_admin from a tenant_admin, and would have to assume the more
+    powerful one. The internal API is key-protected, but a boundary
+    that depends on the caller remembering to mention itself is not a
+    boundary.
+    """
+    return str(body_or_args.get("actor") or "").strip()
+
+
 @app.get("/internal/users")
 def users_list():
-    return {"users": [public_user(u) for u in load_users()]}
+    """The users this actor may see (spec 2.4).
+
+    Three answers, not two: a server_admin sees the node, a
+    tenant_admin sees their own tenant, and anybody else sees only
+    themselves -- which is what the portal needs to look up its own
+    caller's visibility groups without being an administration call.
+    """
+    actor_name = _actor(request.args)
+    if not actor_name:
+        return {"error": "actor fehlt."}, 400
+    role, actor_tenant, _err = authority(actor_name)
+    users = load_users()
+    if role == "server_admin":
+        visible = users
+    elif role == "tenant_admin":
+        visible = [u for u in users if may_see(role, actor_tenant, u)]
+    else:
+        visible = [u for u in users if u["username"] == actor_name]
+    return {"users": [public_user(u) for u in visible],
+            "scope": role or "self",
+            "tenant": actor_tenant if role == "tenant_admin" else ""}
 
 
 @app.post("/internal/users")
 def users_create():
     body = request.get_json(force=True)
+    actor_name = _actor(body)
+    role, actor_tenant, err = authority(actor_name)
+    if not role:
+        return {"error": err or "Nicht berechtigt."}, 403
     users = load_users()
     username = (body.get("username") or "").strip()
     if not USERNAME_RE.fullmatch(username):
@@ -734,29 +901,59 @@ def users_create():
         groups = _validated_groups(body.get("groups"))
     except ValueError as e:
         return {"error": str(e)}, 400
+    # Which tenant the account is created into (spec 2.2). A
+    # server_admin may name one; anyone else gets their own, whatever
+    # the request says -- rule 3 of oaap.core.tenant 2.3, and the
+    # reason the role cannot walk out of its tenant.
+    if role == "server_admin":
+        tenant = resolve_tenant(body.get("tenant") or "")
+        if tenant is None:
+            return {"error": "Diesen Mandanten gibt es auf diesem Knoten nicht."}, 400
+    else:
+        tenant = actor_tenant
+    # Rule 1 of spec 2.3: a tenant_admin may not grant a node-wide role.
+    # Without that the role is a two-step path out of its tenant --
+    # create an account, give it server_admin (the node) or partner
+    # (the health page, which names every instance on the machine),
+    # sign in as it. Granting tenant_admin IS allowed, because `tenant`
+    # above is already forced to the actor's own: the new administrator
+    # cannot land anywhere else.
+    if role == "tenant_admin" and NODE_WIDE_ROLES & set(roles):
+        return {"error": "Ein tenant_admin darf server_admin und partner "
+                         "nicht vergeben."}, 403
     users.append({
         "username": username,
         "display_name": (body.get("display_name") or "").strip(),
         "password_hash": generate_password_hash(body["password"]),
         "roles": roles,
         "groups": groups,
-        # A user is created INTO the tenant of the node's single tenant
-        # (spec 1.4). From 0.2 an administrator creating a user chooses
-        # which tenant, and this is where that choice arrives.
-        "tenant": default_tenant_id(),
+        "tenant": tenant,
         "active": True,
     })
     _save(USERS_FILE, users)
+    audit("user.create", tenant, username, who=actor_name, role=role,
+          detail="roles: " + ",".join(roles))
     return {"ok": True}, 201
 
 
 @app.put("/internal/users/<username>")
 def users_update(username):
     body = request.get_json(force=True)
+    actor_name = _actor(body)
+    role, actor_tenant, err = authority(actor_name)
+    if not role:
+        return {"error": err or "Nicht berechtigt."}, 403
     users = load_users()
     u = find_user(users, username)
-    if not u:
+    # "Not found", not "forbidden", for a user of another tenant: the
+    # difference between the two answers tells a tenant_admin that the
+    # name exists somewhere on this node, which is already information
+    # across the boundary (spec 2.3 rule 2).
+    if not u or not may_see(role, actor_tenant, u):
         return {"error": "Benutzer nicht gefunden."}, 404
+    if role == "tenant_admin" and NODE_WIDE_ROLES & set(body.get("roles") or []):
+        return {"error": "Ein tenant_admin darf server_admin und partner "
+                         "nicht vergeben."}, 403
     try:
         roles = _validated_roles(body.get("roles"))
         groups = _validated_groups(body.get("groups"))
@@ -771,23 +968,40 @@ def users_update(username):
     if loses_server_admin and not other_active_server_admin_exists(users, username):
         return {"error": "Das ist der letzte aktive server_admin — "
                          "bitte zuerst jemand anderem server_admin geben."}, 409
+    was_roles, was_active = list(u["roles"]), u["active"]
     u["roles"] = roles
     u["groups"] = groups
     u["active"] = active
     u["display_name"] = (body.get("display_name") or "").strip()
+    # The tenant is deliberately NOT settable here (spec 2.2): moving a
+    # user between tenants is moving a person between customers, and the
+    # honest form of that is a new account, not a field edit.
     _save(USERS_FILE, users)
+    detail = "roles: " + ",".join(roles)
+    if set(was_roles) != set(roles):
+        detail += " (was " + ",".join(was_roles) + ")"
+    if was_active != active:
+        detail += "; deactivated" if not active else "; reactivated"
+    audit("user.change", resolve_tenant(u.get("tenant")) or "", username,
+          who=actor_name, role=role, detail=detail)
     return {"ok": True}
 
 
 @app.post("/internal/users/<username>/password")
 def users_set_password(username):
     body = request.get_json(force=True)
+    actor_name = _actor(body)
+    role, actor_tenant, err = authority(actor_name)
+    if not role:
+        return {"error": err or "Nicht berechtigt."}, 403
     users = load_users()
     u = find_user(users, username)
-    if not u:
+    if not u or not may_see(role, actor_tenant, u):
         return {"error": "Benutzer nicht gefunden."}, 404
     if len(body.get("password") or "") < 8:
         return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
     u["password_hash"] = generate_password_hash(body["password"])
     _save(USERS_FILE, users)
+    audit("user.password", resolve_tenant(u.get("tenant")) or "", username,
+          who=actor_name, role=role)
     return {"ok": True}

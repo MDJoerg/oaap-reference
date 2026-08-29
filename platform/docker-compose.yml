@@ -37,8 +37,15 @@ services:
     volumes:
       - "${OAAP_DATA_DIR}/data/identity:/data"
       # read-only: external.json — the session cookie must span the
-      # app subdomains of the registered external hostname
+      # app subdomains of the registered external hostname, and
+      # tenants.json — identity reads the tenant store, appctl owns it
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+      # writable, and the only thing identity writes outside its own
+      # data: the tenant audit log (oaap.core.tenant 1.7). User
+      # administration is the one state change that never passes the
+      # host, so identity has to be able to append here. Its own
+      # directory rather than the registry, which stays read-only.
+      - "${OAAP_DATA_DIR}/data/audit:/audit"
 
   portal:
     build: ./services/portal
@@ -49,6 +56,9 @@ services:
     volumes:
       # read-only view of the app-instance registry for launchpad tiles
       - "${OAAP_DATA_DIR}/apps:/apps-registry:ro"
+      # read-only view of the tenant audit log — the portal shows it and
+      # never adds to it (oaap.core.tenant 1.7)
+      - "${OAAP_DATA_DIR}/data/audit:/audit:ro"
       # read-only view of the gateway's external access log (health page)
       - "${OAAP_DATA_DIR}/data/gateway/logs:/gateway-logs:ro"
       # deploy hook (runtime spec 2.5): the portal queues requests here,

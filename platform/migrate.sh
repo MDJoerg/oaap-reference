@@ -129,3 +129,21 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" store reconcile \
 # the file is not there yet.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenants \
   2>&1 | sed 's/^/  /' || say "  WARNING: the tenant migration did not complete."
+
+# The tenant audit log (oaap.core.tenant 1.7) is written by two
+# processes -- this host and the identity container -- so the directory
+# has to exist before either is asked to append to it. Created here
+# rather than in install.sh alone, because every node in the field
+# reaches this file by updating, not by installing.
+mkdir -p "$OAAP_DATA_DIR/data/audit"
+
+# --- the tenant boundary in the generated gateway sites (0.2, spec 3.1) ---
+# The boundary is enforced at the gateway: every authenticated route
+# carries its instance's tenant. Sites generated before 0.2 do not, so
+# they are rewritten once. Quiet and idempotent afterwards -- and it
+# runs before anyone can create a second tenant, which is what keeps
+# there from being a window in which the boundary is merely intended.
+say ""
+say "Checking the tenant boundary in the gateway sites ..."
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-routes \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."

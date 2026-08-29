@@ -23,6 +23,7 @@ python3 test/test_tile.py
 python3 test/test_instance_page.py   # braucht jinja2
 python3 test/test_artifact_deploy.py
 python3 test/test_tenant.py
+python3 test/test_tenant_boundary.py
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```

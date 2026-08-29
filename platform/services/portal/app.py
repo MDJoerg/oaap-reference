@@ -45,7 +45,14 @@ INTERNAL.headers[
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
 REGISTRY = "/apps-registry/registry.json"
 
-ALL_ROLES = ("server_admin", "admin", "keyuser", "user", "guest", "partner")
+ALL_ROLES = ("server_admin", "tenant_admin", "admin", "keyuser", "user",
+             "guest", "partner")
+# Roles whose authority reaches past a tenant: server_admin administers
+# the node, and partner sees the health page — which lists every
+# instance on the machine. A tenant_admin may hand out neither, or the
+# boundary has a second door (oaap.core.tenant 2.3 rule 1). Kept in
+# step with the same list in identity, which does the refusing.
+NODE_WIDE_ROLES = ("server_admin", "partner")
 CHANNEL_LABELS = {"test": "Test", "production": "Produktiv"}
 
 # Hexagon mark per design guidelines (assets/logo.svg, white for the
@@ -190,10 +197,11 @@ LAYOUT = STYLE + """
   </a>
   <nav class="main">
     <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
-    {% if is_server_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
+    {% if is_user_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
     {% if is_server_admin %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
-    {% if is_server_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
+    {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
+    {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
   <div class="userbox">
     <span class="who">{{ user }}<br><small>{{ roles }}</small></span>
@@ -255,13 +263,16 @@ USERS_LIST_BODY = """
 </div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if scope_note %}<p class="muted">Mandant <strong>{{ scope_note }}</strong> —
+   Du siehst und verwaltest die Benutzer dieses Mandanten.</p>{% endif %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Benutzername</th><th>Anzeigename</th><th>Rollen</th><th>Gruppen</th><th>Status</th><th></th></tr>
+  <tr><th>Benutzername</th><th>Anzeigename</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Rollen</th><th>Gruppen</th><th>Status</th><th></th></tr>
   {% for u in users %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/users/{{ u.username }}">{{ u.username }}</a></td>
     <td>{{ u.display_name }}</td>
+    {% if show_tenant %}<td class="muted">{{ labels.get(u.tenant or default_tenant, "?") }}</td>{% endif %}
     <td>{{ u.roles|join(", ") }}</td>
     <td class="muted">{{ u.groups|join(", ") if u.groups else "–" }}</td>
     <td><span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span></td>
@@ -287,6 +298,12 @@ USER_EDIT_BODY = """
   <div class="card">
     <h2>Stammdaten</h2>
     <label>Anzeigename <input type="text" name="display_name" value="{{ u.display_name }}"></label>
+    {% if tenant_of %}
+    <p class="muted">Mandant: <strong>{{ tenant_of }}</strong> — steht beim
+       Anlegen fest und ändert sich nicht. Jemanden in einen anderen Mandanten
+       zu versetzen heißt, ihn zu einem anderen Kunden zu versetzen; die
+       ehrliche Form davon ist ein neues Konto.</p>
+    {% endif %}
   </div>
   <div class="card">
     <h2>Rollen</h2>
@@ -338,6 +355,16 @@ USER_NEW_BODY = """
     <label>Anzeigename <input type="text" name="display_name" value="{{ form.display_name }}"></label>
     <label>Startpasswort (mind. 8 Zeichen) <input type="password" name="password"
            minlength="8" required autocomplete="new-password"></label>
+    {% if tenants %}
+    <label>Mandant
+      <select name="tenant">
+        {% for t in tenants %}
+        <option value="{{ t.id }}" {{ 'selected' if t.id == form.tenant }}>{{ t.name }}{% if t.name != t.label %} ({{ t.label }}){% endif %}</option>
+        {% endfor %}
+      </select></label>
+    <p class="muted">Der Mandant steht mit dem Anlegen fest und lässt sich
+       danach nicht mehr ändern.</p>
+    {% endif %}
   </div>
   <div class="card">
     <h2>Rollen</h2>
@@ -879,6 +906,66 @@ STORE_APP_BODY = """
 
 # Floorplan "Listenbericht" — installed app instances and their
 # visibility setting (RFC-0007). server_admin only.
+# Floorplan "Listenbericht". Shown only where there is more than one
+# tenant — the menu entry that leads here is hidden otherwise, and the
+# route says the same thing again for anyone who typed the address.
+TENANT_BODY = """
+<h1>{{ "Mandanten" if is_server_admin else "Mandant" }}</h1>
+{% if not is_server_admin %}
+<div class="card">
+  <h2>{{ me.name }}</h2>
+  <p class="muted">Kürzel <code>{{ me.label }}</code>, angelegt {{ me.created }}.</p>
+  <p>{{ me.users }} Benutzer, {{ me.instances }} Instanz(en).</p>
+  {% if host %}
+  <p class="muted">Apps dieses Mandanten sind erreichbar unter
+     <code>&lt;instanz&gt;.{{ me.label }}.{{ host }}</code>.</p>
+  {% endif %}
+</div>
+{% else %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+  <tr><th>Kürzel</th><th>Name</th><th>Benutzer</th><th>Instanzen</th><th>Angelegt</th></tr>
+  {% for t in tenants %}
+  <tr><td><code>{{ t.label }}</code></td><td>{{ t.name }}</td>
+      <td>{{ t.users }}</td><td>{{ t.instances }}</td>
+      <td class="muted">{{ t.created }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+<p class="muted">Angelegt und umbenannt werden Mandanten an der Maschine:
+   <code>sudo oaap tenant create &lt;kürzel&gt;</code>. Das Kürzel steht im
+   Hostnamen und damit im öffentlichen Certificate-Transparency-Log — für
+   einen vertraulichen Kunden also eines wählen, das nichts verrät.</p>
+{% endif %}
+
+<h2>Protokoll</h2>
+<p class="muted">Jede Zustandsänderung an {{ "einem Mandanten" if is_server_admin
+   else "diesem Mandanten" }} — wer, wann, was, mit welchem Ergebnis.
+   <strong>Auch die des Betreibers.</strong> Ein <code>server_admin</code> darf
+   auf diesem Knoten alles; das Gegengewicht ist nicht eine Schranke, die es
+   nicht gibt, sondern dass hier steht, was getan wurde. Lesen wird nicht
+   protokolliert, nur Ändern.</p>
+{% if entries %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+  <tr><th>Wann</th>{% if is_server_admin %}<th>Mandant</th>{% endif %}<th>Wer</th><th>Rolle</th><th>Was</th><th>Betrifft</th><th>Ergebnis</th></tr>
+  {% for e in entries %}
+  <tr>
+    <td class="muted">{{ e.when }}</td>
+    {% if is_server_admin %}<td>{{ e.tenant_label or "–" }}</td>{% endif %}
+    <td>{{ e.who }}</td><td class="muted">{{ e.role }}</td>
+    <td><code>{{ e.action }}</code></td>
+    <td>{{ e.subject }}</td>
+    <td>{{ e.result }}{% if e.detail %} <span class="muted">— {{ e.detail }}</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}
+<div class="card"><p class="muted">Noch keine Einträge.</p></div>
+{% endif %}
+"""
+
 INSTANCES_LIST_BODY = """
 <h1>Instanzen</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -889,14 +976,17 @@ INSTANCES_LIST_BODY = """
    <span class="muted">möglich, weil dieser Knoten das Profil
    <code>dev</code> trägt (RFC-0011)</span></p>
 {% endif %}
+{% if scope_note %}<p class="muted">Mandant <strong>{{ scope_note }}</strong> —
+   Du siehst und verwaltest die Instanzen dieses Mandanten.</p>{% endif %}
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Instanz</th><th>App</th><th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
+  <tr><th>Instanz</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/instances/{{ i.name }}">{{ i.name }}</a></td>
     <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
+    {% if show_tenant %}<td class="muted">{{ i.tenant or "?" }}</td>{% endif %}
     <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span></td>
     <td>{{ i.visibility_label }}</td>
     <td>{{ "ja" if i.tile_visible else "nein" }}{% if i.tile_mode != "auto" %}
@@ -929,10 +1019,11 @@ Routen und Rollen der Instanz bleiben davon unberührt.</p>
      (RFC-0019).</p>
   {% if grants %}
   <table class="mini">
-    <tr><th>Offen für</th><th>Läuft ab in</th><th></th></tr>
+    <tr><th>Offen für</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Läuft ab in</th><th></th></tr>
     {% for gr in grants %}
     <tr>
       <td><code>{{ gr.instance }}</code></td>
+      {% if show_tenant %}<td class="muted">{{ gr.tenant or "?" }}</td>{% endif %}
       <td>{{ gr.minutes }} Minuten</td>
       <td><form method="post" action="/instances/grant">
         <input type="hidden" name="op" value="revoke">
@@ -1634,15 +1725,157 @@ def caller_groups():
     return set(u.get("groups") or []) if u else set()
 
 
+# Accounts and tenants of this node (oaap.core.tenant). The portal
+# READS both files and writes neither: the registry mount is read-only,
+# and the audit log is mounted read-only on purpose -- the portal shows
+# it, appctl and identity write it.
+TENANTS_FILE = "/apps-registry/tenants.json"
+AUDIT_LOG = "/audit/tenant-log.jsonl"
+
+
+def caller_name():
+    return request.headers.get("X-OAAP-User", "")
+
+
+def load_tenants():
+    try:
+        with open(TENANTS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("tenants") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def default_tenant_id():
+    for tid, t in sorted(load_tenants().items()):
+        if t.get("label") == "default":
+            return tid
+    return ""
+
+
+def resolve_tenant(ref):
+    """Absent means the default tenant; UNKNOWN never does (spec 2.5)."""
+    ref = (ref or "").strip()
+    if not ref:
+        return default_tenant_id() or ""
+    return ref if ref in load_tenants() else None
+
+
+def tenant_label(tid):
+    return (load_tenants().get(tid or "") or {}).get("label", "")
+
+
+def tenant_name(tid):
+    t = load_tenants().get(tid or "") or {}
+    return t.get("name") or t.get("label", "")
+
+
+def multi_tenant():
+    """Whether this node uses tenants at all.
+
+    Everything tenant-shaped in this file asks first. On a node with one
+    tenant nothing may appear: no column, no menu entry, no sentence.
+    That is not politeness, it is the acceptance criterion the
+    capability was built against.
+    """
+    return len(load_tenants()) > 1
+
+
+def caller_record():
+    """The calling user's own record, from identity.
+
+    Scoped by identity itself: a caller who is no kind of administrator
+    gets exactly one record back, their own.
+    """
+    name = caller_name()
+    if not name:
+        return None
+    return next((u for u in identity_users() if u["username"] == name), None)
+
+
+def caller_scope():
+    """(role, tenant) for the caller -- the two facts every page needs.
+
+    role is "server_admin" (the node), "tenant_admin" (one tenant) or ""
+    (neither). The tenant always comes from the caller's OWN record, so
+    there is no request in which a caller can name a different one.
+    """
+    roles = caller_roles()
+    u = caller_record() or {}
+    mine = resolve_tenant(u.get("tenant")) or ""
+    if "server_admin" in roles:
+        return "server_admin", mine
+    if "tenant_admin" in roles:
+        return "tenant_admin", mine
+    return "", mine
+
+
+def require_user_admin():
+    """User administration: the node's administrator, or a tenant's."""
+    if not (caller_roles() & {"server_admin", "tenant_admin"}):
+        return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
+                "tenant_admin."), 403
+    return None
+
+
+def visible_instances():
+    """The instances this caller may administer.
+
+    A server_admin sees the node. A tenant_admin sees their own tenant
+    and learns nothing about the existence of any other -- not a count,
+    not a name. Everyone else sees nothing here; the launchpad is a
+    different question and asks it separately.
+    """
+    role, mine = caller_scope()
+    everything = load_instances()
+    if role == "server_admin":
+        return everything
+    if role != "tenant_admin":
+        return {}
+    return {n: i for n, i in everything.items()
+            if (resolve_tenant(i.get("tenant")) or "") == mine}
+
+
+def read_audit(tenant=None, limit=200):
+    """The tenant audit log (oaap.core.tenant 1.7), newest first.
+
+    A damaged line is skipped rather than fatal: this is a record, and
+    a record that refuses to be read because of one bad byte protects
+    nobody.
+    """
+    out = []
+    try:
+        with open(AUDIT_LOG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if tenant is not None and e.get("tenant") != tenant:
+                    continue
+                out.append(e)
+    except OSError:
+        return []
+    return list(reversed(out[-limit:]))
+
+
 def page(body_template, title, active, status=200, **ctx):
     body = render_template_string(body_template, **ctx)
     roles = request.headers.get("X-OAAP-Roles", "")
     caller = caller_roles()
+    multi = multi_tenant()
     return render_template_string(
         LAYOUT,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
         is_server_admin="server_admin" in caller,
+        # Who may reach user administration and the instance list — the
+        # node's administrator or a tenant's. On a single-tenant node
+        # nobody holds tenant_admin, so this reads exactly as before.
+        is_user_admin=bool(caller & {"server_admin", "tenant_admin"}),
+        show_tenant=multi,
         can_health=bool(caller & {"server_admin", "partner"}),
         version=VERSION,
     ), status
@@ -1731,7 +1964,7 @@ def edge_tls_ask():
 import instance_view as iv  # noqa: E402
 
 
-def launchpad_tiles(user_roles, user_groups, host):
+def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
     """Role- and group-filtered app tiles from the instance registry
     (spec 2.5, RFC-0007). The filter is UX only — the gateway enforces
     both on every request regardless of what the portal shows (mirrored
@@ -1757,6 +1990,13 @@ def launchpad_tiles(user_roles, user_groups, host):
     is_server_admin = "server_admin" in user_roles
     tiles, hidden = [], 0
     for name, inst in sorted(load_instances().items()):
+        # The tenant boundary, before role and group: an app of another
+        # tenant is not "hidden" from this caller, it is none of their
+        # business, and the gateway would refuse them anyway (spec 3.1).
+        # A server_admin sees the node, as everywhere (RFC-0022 D5).
+        if (user_tenant is not None and not is_server_admin
+                and (resolve_tenant(inst.get("tenant")) or "") != user_tenant):
+            continue
         allowed = set(inst.get("roles") or [])
         if allowed and not user_roles & allowed:
             continue
@@ -1819,8 +2059,13 @@ def setup_done() -> bool:
 @app.get("/")
 def dashboard():
     roles = caller_roles()
+    # Which tenant this caller belongs to — asked once, here, and only
+    # where it can change what is shown. On a node with one tenant it
+    # is the same answer for everybody and changes nothing.
+    mine = caller_scope()[1] if multi_tenant() else None
     tiles, hidden = launchpad_tiles(roles, caller_groups(),
-                                    request.host.split(":")[0])
+                                    request.host.split(":")[0],
+                                    user_tenant=mine)
     # Only a server_admin is told about tileless instances: they are the
     # only ones who can do anything about it, and everybody else would
     # be told to miss something they were never meant to operate.
@@ -1829,20 +2074,56 @@ def dashboard():
 
 
 # ---------------------------------------------------------------------------
-# User management (spec oaap.core.identity 2.4) — server_admin only
-# (RFC-0008: this operates on the server itself, not on one app's own
-# data), floorplans "Listenbericht" and "Objektseite". The gateway has
-# already authenticated the caller; the portal checks the server_admin
-# role and delegates the operations to identity's internal API.
+# User management (spec oaap.core.identity 2.4) — server_admin for the
+# node, tenant_admin for one tenant (RFC-0008 + oaap.core.tenant 2.3),
+# floorplans "Listenbericht" and "Objektseite". The gateway has already
+# authenticated the caller; the portal checks the role and delegates the
+# operations to identity's internal API — which checks the tenant
+# boundary again, on its own store, because that is where the actor's
+# record is and a rule kept in two places eventually disagrees.
 
-def require_server_admin():
-    if "server_admin" not in caller_roles():
-        return "Zugriff verweigert: erfordert die Rolle server_admin.", 403
-    return None
+def require_instance_admin(name):
+    """The node's administrator, or the tenant_admin of THIS instance.
+
+    An instance of another tenant is answered as one that does not
+    exist. "Forbidden" would confirm that the name is taken on this
+    node, and that is already an answer across the boundary
+    (oaap.core.tenant 2.3 rule 2).
+    """
+    if "server_admin" in caller_roles():
+        return None
+    if "tenant_admin" not in caller_roles():
+        return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
+                "tenant_admin."), 403
+    if name in visible_instances():
+        return None
+    return "Instanz nicht gefunden.", 404
 
 
 def identity_users():
-    return INTERNAL.get(f"{IDENTITY}/internal/users", timeout=5).json()["users"]
+    """The users this caller may see — identity does the filtering.
+
+    The actor travels with the request because identity, not the portal,
+    owns the boundary: a tenant_admin gets their tenant, a server_admin
+    gets the node, anybody else gets their own record. Filtering here
+    instead would put the same rule in two places, and the day the two
+    disagree the more generous one wins.
+    """
+    name = caller_name()
+    if not name:
+        # No verified caller (a public surface): there is nobody to
+        # scope to, and asking identity would only get a 400.
+        return []
+    # Cached for the duration of ONE request: several helpers on the
+    # same page ask this question, and the answer cannot change halfway
+    # through rendering.
+    cached = g.get("identity_users")
+    if cached is None:
+        cached = INTERNAL.get(f"{IDENTITY}/internal/users",
+                              params={"actor": name},
+                              timeout=5).json().get("users", [])
+        g.identity_users = cached
+    return cached
 
 
 def _parse_groups(raw):
@@ -1850,28 +2131,71 @@ def _parse_groups(raw):
     return sorted({g.strip().lower() for g in raw.split(",") if g.strip()})
 
 
+def _role_choices():
+    """Which roles this caller may hand out.
+
+    A tenant_admin never sees the node-wide roles in the list — not as
+    a disabled checkbox either. Identity refuses them regardless (spec
+    2.3 rule 1); leaving them out of the form is so that nobody is
+    invited to try.
+    """
+    if "server_admin" in caller_roles():
+        return ALL_ROLES
+    return tuple(r for r in ALL_ROLES if r not in NODE_WIDE_ROLES)
+
+
+def _tenant_choices():
+    """The tenants a new user may be created into.
+
+    Empty on a single-tenant node and for a tenant_admin: in both cases
+    there is exactly one answer and no question to ask. Only a
+    server_admin on a node with several tenants gets a choice, and
+    identity checks the answer again.
+    """
+    role, _mine = caller_scope()
+    if role != "server_admin" or not multi_tenant():
+        return []
+    return sorted(({"id": tid, "label": t.get("label", ""),
+                    "name": t.get("name") or t.get("label", "")}
+                   for tid, t in load_tenants().items()),
+                  key=lambda t: t["label"])
+
+
+def _new_user_form():
+    return {"username": "", "display_name": "", "roles": ["user"],
+            "groups": [], "tenant": ""}
+
+
 @app.get("/users")
 def users_list():
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
-    return page(USERS_LIST_BODY, "Benutzer", "users", users=identity_users(),
+    role, mine = caller_scope()
+    users = identity_users()
+    return page(USERS_LIST_BODY, "Benutzer", "users", users=users,
+                # Named only where there is more than one to name.
+                show_tenant=multi_tenant() and role == "server_admin",
+                labels={t: tenant_label(t) for t in load_tenants()},
+                default_tenant=default_tenant_id(),
+                scope_note=(tenant_name(mine) if role == "tenant_admin"
+                            and multi_tenant() else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
 
 @app.get("/users/new")
 def users_new():
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
     return page(USER_NEW_BODY, "Benutzer anlegen", "users",
-                all_roles=ALL_ROLES, error=None,
-                form={"username": "", "display_name": "", "roles": ["user"], "groups": []})
+                all_roles=_role_choices(), tenants=_tenant_choices(),
+                error=None, form=_new_user_form())
 
 
 @app.post("/users/create")
 def users_create():
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
     form = {
@@ -1879,35 +2203,45 @@ def users_create():
         "display_name": request.form.get("display_name", ""),
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
+        "tenant": request.form.get("tenant", ""),
     }
+    # The tenant travels as a WISH. Identity decides: a server_admin may
+    # name one, anybody else is put in their own whatever this form
+    # says. The rule lives there, once, where the actor's own record is.
     resp = INTERNAL.post(f"{IDENTITY}/internal/users", json={
-        **form, "password": request.form.get("password", ""),
+        **form, "actor": caller_name(),
+        "password": request.form.get("password", ""),
     }, timeout=5)
     if resp.status_code == 201:
         created = quote("Benutzer " + form["username"] + " wurde angelegt.")
         return redirect(f"/users?msg={created}", code=303)
     # Validation error: stay on the page, keep the inputs (guidelines 6.2)
     return page(USER_NEW_BODY, "Benutzer anlegen", "users", status=resp.status_code,
-                all_roles=ALL_ROLES, form=form,
+                all_roles=_role_choices(), tenants=_tenant_choices(), form=form,
                 error=resp.json().get("error", "Anlegen fehlgeschlagen."))
 
 
 @app.get("/users/<username>")
 def users_detail(username):
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
+    # identity_users() is already scoped to what this caller may see, so
+    # a user of another tenant is simply not in the list — the same
+    # answer as one who does not exist, deliberately.
     u = next((x for x in identity_users() if x["username"] == username), None)
     if not u:
         return redirect(f"/users?err={quote('Benutzer nicht gefunden.')}", code=303)
     return page(USER_EDIT_BODY, f"Benutzer {username}", "users", u=u,
-                all_roles=ALL_ROLES, msg=request.args.get("msg"),
-                error=request.args.get("err"))
+                all_roles=_role_choices(),
+                tenant_of=(tenant_name(resolve_tenant(u.get("tenant")))
+                           if multi_tenant() else ""),
+                msg=request.args.get("msg"), error=request.args.get("err"))
 
 
 @app.post("/users/<username>/update")
 def users_update(username):
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
     resp = INTERNAL.put(f"{IDENTITY}/internal/users/{username}", json={
@@ -1915,6 +2249,7 @@ def users_update(username):
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
         "active": request.form.get("active") == "on",
+        "actor": caller_name(),
     }, timeout=5)
     if resp.status_code == 200:
         return redirect(f"/users/{username}?msg={quote('Gespeichert.')}", code=303)
@@ -1923,15 +2258,66 @@ def users_update(username):
 
 @app.post("/users/<username>/password")
 def users_password(username):
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
     resp = INTERNAL.post(f"{IDENTITY}/internal/users/{username}/password", json={
         "password": request.form.get("password", ""),
+        "actor": caller_name(),
     }, timeout=5)
     if resp.status_code == 200:
         return redirect(f"/users/{username}?msg={quote('Passwort wurde gesetzt.')}", code=303)
     return redirect(f"/users/{username}?err={quote(resp.json().get('error', 'Passwort setzen fehlgeschlagen.'))}", code=303)
+
+
+# --- the tenant page (oaap.core.tenant 2.1/1.7) ----------------------------
+# Two readings of one page: a tenant_admin sees their own tenant and its
+# log; a server_admin sees every tenant and every entry. Nobody sees a
+# tenant they are not in — not its name, not its size, not that it
+# exists.
+
+@app.get("/tenant")
+def tenant_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not multi_tenant():
+        # Typed by hand on a node that has no tenants in use. Saying
+        # "there is nothing here" is the honest answer and keeps the
+        # invisibility rule intact.
+        return redirect("/", code=303)
+    role, mine = caller_scope()
+    tenants = load_tenants()
+    users = identity_users()
+    instances = load_instances()
+
+    def counts(tid):
+        return (sum(1 for u in users
+                    if (resolve_tenant(u.get("tenant")) or "") == tid),
+                sum(1 for i in instances.values()
+                    if (resolve_tenant(i.get("tenant")) or "") == tid))
+
+    if role == "server_admin":
+        rows = []
+        for tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
+            n_users, n_inst = counts(tid)
+            rows.append({"label": t.get("label", "?"),
+                         "name": t.get("name") or "—",
+                         "created": t.get("created", "?"),
+                         "users": n_users, "instances": n_inst})
+        return page(TENANT_BODY, "Mandanten", "tenant", tenants=rows, me=None,
+                    is_server_admin=True, host=external_host(),
+                    entries=read_audit())
+    t = tenants.get(mine) or {}
+    n_users, n_inst = counts(mine)
+    me = {"label": t.get("label", "?"), "name": t.get("name") or t.get("label", "?"),
+          "created": t.get("created", "?"), "users": n_users, "instances": n_inst}
+    # The tenant is taken from the caller's own record, so the log they
+    # get is theirs by construction — there is no parameter to tamper
+    # with and therefore no other tenant's log to ask for.
+    return page(TENANT_BODY, "Mandant", "tenant", tenants=[], me=me,
+                is_server_admin=False, host=external_host(),
+                entries=read_audit(mine))
 
 
 # ---------------------------------------------------------------------------
@@ -3195,11 +3581,12 @@ def _instance_config(name, inst):
 
 @app.get("/instances")
 def instances_list():
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
+    role, mine = caller_scope()
     rows = []
-    for name, inst in sorted(load_instances().items()):
+    for name, inst in sorted(visible_instances().items()):
         groups = _instance_groups(inst)
         channel = inst.get("channel", "production")
         rows.append({
@@ -3209,9 +3596,13 @@ def instances_list():
             "visibility_label": "Alle" if not groups else "Gruppen: " + ", ".join(groups),
             "tile_visible": iv.tile_visible(inst),
             "tile_mode": iv.tile_mode(inst),
+            "tenant": tenant_label(resolve_tenant(inst.get("tenant"))),
         })
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
                 can_create="dev" in node_profiles(),
+                show_tenant=multi_tenant() and role == "server_admin",
+                scope_note=(tenant_name(mine) if role == "tenant_admin"
+                            and multi_tenant() else ""),
                 grants=_open_creation_grants(),
                 grant_minutes=CREATE_GRANT_MINUTES,
                 msg=request.args.get("msg"), error=request.args.get("err"))
@@ -3238,18 +3629,26 @@ def _open_creation_grants():
     except (OSError, ValueError):
         return []
     now = _time.time()
+    role, mine = caller_scope()
     out = []
     for entry in grants.values():
         if entry.get("kind") != "create" or entry.get("expires", 0) <= now:
             continue
+        # A permit names the tenant it was issued for (spec 1.4), which
+        # is exactly what makes it filterable here: a tenant_admin must
+        # not learn that a name is spoken for in somebody else's tenant.
+        held = resolve_tenant((entry.get("payload") or {}).get("tenant"))
+        if role != "server_admin" and held != mine:
+            continue
         out.append({"instance": entry.get("instance", ""),
-                    "minutes": max(1, int((entry["expires"] - now) // 60))})
+                    "minutes": max(1, int((entry["expires"] - now) // 60)),
+                    "tenant": tenant_label(held)})
     return sorted(out, key=lambda e: e["instance"])
 
 
 @app.post("/instances/grant")
 def instance_grant():
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
     name = (request.form.get("name") or "").strip().lower()
@@ -3267,17 +3666,29 @@ def instance_grant():
         return redirect(f"/instances?{'msg' if res.get('ok') else 'err'}="
                         + quote(res.get("message", "")), code=303)
     if name in load_instances():
-        return redirect("/instances?err="
-                        + quote(f"Eine Instanz namens „{name}“ gibt es schon — "
-                                "sie braucht ein Deploy-Token, keine Anlege-Erlaubnis."),
-                        code=303)
+        # Instance names are unique per NODE, not per tenant — a name
+        # already taken cannot be hidden from a tenant_admin without
+        # failing later and more confusingly. So it is said plainly, and
+        # without saying whose it is: the collision is the fact, the
+        # owner is not.
+        if name in visible_instances():
+            err = (f"Eine Instanz namens „{name}“ gibt es schon — "
+                   "sie braucht ein Deploy-Token, keine Anlege-Erlaubnis.")
+        else:
+            err = (f"Der Name „{name}“ ist auf diesem Knoten schon vergeben — "
+                   "bitte einen anderen wählen.")
+        return redirect("/instances?err=" + quote(err), code=303)
     # Same shape as the deploy token: the portal mints the secret and
     # hands the host only its digest, so the readable value never
     # touches the spool or the filesystem.
     grant = secrets.token_urlsafe(32)
+    # The tenant travels as a wish and is decided on the host from the
+    # issuer's own record — the same rule as everywhere else, checked
+    # where the user store actually is (spec 2.3 rule 3).
     res = _queue_and_wait(name, {
         "action": "grant", "op": "create",
         "digest": hashlib.sha256(grant.encode()).hexdigest(),
+        "tenant": request.form.get("tenant", ""),
     }, TOKEN_WAIT_SECONDS)
     if res is None:
         return redirect("/instances?err="
@@ -3320,8 +3731,12 @@ def _require_dev_node():
 
     Here for a readable answer, and again on the host, where the
     decision actually is: the spool is data, not trust.
+
+    A tenant_admin may create instances too (oaap.core.tenant 2.3) --
+    the host puts the new one in THEIR tenant, so a workbench node with
+    several tenants does not become a way into somebody else's.
     """
-    denied = require_server_admin()
+    denied = require_user_admin()
     if denied:
         return denied
     if "dev" not in node_profiles():
@@ -3455,7 +3870,7 @@ def _inst_back(name, msg="", err=""):
 
 @app.get("/instances/<name>")
 def instance_detail(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     inst = load_instances().get(name)
@@ -3534,7 +3949,7 @@ def instance_endpoint(name):
     """Grant or revoke a non-HTTP endpoint (RFC-0015). server_admin only;
     queued through the spool worker, which re-checks the 'exposed' node
     profile — the button is not the boundary."""
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3551,7 +3966,7 @@ def instance_endpoint(name):
 def instance_link(name):
     """Declare or drop an app-to-app link (RFC-0016). server_admin only;
     queued through the spool worker like every other instance write."""
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3566,7 +3981,7 @@ def instance_link(name):
 
 @app.post("/instances/<name>/visibility")
 def instance_visibility(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3588,7 +4003,7 @@ def instance_tile(name):
     read-only — even though this one touches nothing but one registry
     field. The host re-checks the mode: the spool is data, not trust.
     """
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3673,7 +4088,7 @@ def _throttle_view(inst):
 
 @app.post("/instances/<name>/address")
 def instance_address(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3696,7 +4111,7 @@ def instance_address(name):
 
 @app.post("/instances/<name>/throttle")
 def instance_throttle(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3713,7 +4128,7 @@ REMOVE_WAIT_SECONDS = 60  # stops a container and rewrites gateway config
 
 @app.post("/instances/<name>/remove")
 def instance_remove(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3756,7 +4171,7 @@ def instance_envelope(name):
     the instance: it says yes to THIS change, never to whatever the next
     upload turns out to contain.
     """
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3801,7 +4216,7 @@ def instance_promote(name):
     include. The portal only forwards it — the host re-checks channel,
     app id, version and envelope before it installs.
     """
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     inst = load_instances().get(name)
@@ -3838,7 +4253,7 @@ def instance_promote(name):
 @app.post("/instances/<name>/rollback")
 def instance_rollback(name):
     """Reinstall a retained package (RFC-0019 §4)."""
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     if not load_instances().get(name):
@@ -3852,7 +4267,7 @@ def instance_rollback(name):
 
 @app.post("/instances/<name>/token")
 def instance_token(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     inst = load_instances().get(name)
@@ -3886,7 +4301,7 @@ def instance_token(name):
 
 @app.post("/instances/<name>/config")
 def instance_config(name):
-    denied = require_server_admin()
+    denied = require_instance_admin(name)
     if denied:
         return denied
     inst = load_instances().get(name)

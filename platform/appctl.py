@@ -66,6 +66,14 @@ FLEET_LOG = os.path.join(APPS_DIR, "fleet-log.jsonl")
 # short-lived, single-use permissions for artifact deployment (RFC-0019):
 # upload grants and envelope confirmations. Nothing long-lived lives here.
 ARTIFACT_GRANTS = os.path.join(APPS_DIR, "artifact-grants.json")
+# the tenant audit log (oaap.core.tenant 1.7). NOT beside the registry:
+# identity has to append to it too -- user administration is the one
+# state change that never passes through the host -- and identity's
+# view of the registry directory is read-only, deliberately. So the log
+# gets its own directory, mounted writable into identity and read-only
+# into the portal.
+AUDIT_DIR = os.path.join(DATA_DIR, "data", "audit")
+TENANT_LOG = os.path.join(AUDIT_DIR, "tenant-log.jsonl")
 SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
 PORT_RANGE = range(8100, 8200)
 ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
@@ -523,10 +531,186 @@ def tenant_label(tid):
     return (load_tenants().get(tid) or {}).get("label", "")
 
 
+# How long a renamed tenant keeps answering under its old label. An
+# address change on this platform has cost a live customer once already
+# (hub.bdt.joomp.de, 2026-08-23); the grace period is the lesson.
+RENAME_GRACE_DAYS = 30
+
+
+def _in_days(days):
+    import datetime
+    return (datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def former_labels(t):
+    """The unexpired former labels of a tenant record (spec 1.6).
+
+    Compared as ISO strings, which is only sound because every
+    timestamp here is written by _iso_now() in UTC with the same
+    precision. Anything else in that field sorts as expired, which is
+    the safe direction.
+    """
+    now = _iso_now()
+    return [f.get("label", "") for f in (t.get("former_labels") or [])
+            if f.get("label") and str(f.get("until", "")) > now]
+
+
+def tenant_host_prefixes(tid):
+    """The host label parts instances of this tenant answer under.
+
+    The default tenant's prefix is the empty string -- its label IS the
+    absence of a label, so `<instance>.<node>` stays exactly as RFC-0018
+    describes it and nothing on an existing node moves. Every other
+    tenant contributes its current label first, then each unexpired
+    former one (spec 1.6, 2.4).
+
+    Empty list for a tenant this node does not have: an instance whose
+    tenant does not resolve gets no external name at all. Fail closed
+    (spec 2.5) -- serving it under the operator's own names would be the
+    exact substitution the resolution rules exist to prevent.
+    """
+    t = load_tenants().get(tid)
+    if not t:
+        return []
+    if t.get("label") == DEFAULT_TENANT_LABEL:
+        return [""]
+    return [t.get("label", "")] + former_labels(t)
+
+
+def tenant_by_label(label, include_former=True):
+    """(id, record) for a label. Former labels resolve too, for as long
+    as they are unexpired -- otherwise a rename would break the very
+    commands an operator reaches for right after renaming."""
+    label = (label or "").strip().lower()
+    if not label:
+        return None, None
+    for tid, t in sorted(load_tenants().items()):
+        if t.get("label") == label:
+            return tid, t
+        if include_former and label in former_labels(t):
+            return tid, t
+    return None, None
+
+
+def label_is_free(label):
+    """A label may be taken by a current tenant OR by an unexpired
+    former one -- reusing a name that still routes somewhere else would
+    silently hand one tenant another's traffic."""
+    tid, _t = tenant_by_label(label, include_former=True)
+    return tid is None
+
+
 def single_tenant():
     """True while tenants must stay invisible (spec 2.3, the acceptance
     criterion). Every surface asks this before mentioning a tenant."""
     return len(load_tenants()) <= 1
+
+
+def audit_tenant(action, tenant, subject="", result="ok", who="root",
+                 role="root", detail=""):
+    """Append one line to the tenant audit log (spec 1.7).
+
+    Two processes append here: this file, for everything that happens
+    on the host or through the portal's worker, and identity, for user
+    administration -- the one state change that never passes the host.
+    A single short line opened with "a" is appended atomically enough
+    for that, and nothing ever rewrites the file, which is the other
+    half of why two writers are safe.
+
+    A server_admin action inside a tenant is filed in THAT tenant's
+    log, not in a separate operator log. The customer has to be able to
+    see it: it is the entire counterweight to "server_admin may do
+    everything" (RFC-0022 D5), and a counterweight the customer cannot
+    read is not one.
+    """
+    os.makedirs(AUDIT_DIR, exist_ok=True)
+    entry = {"when": _iso_now(), "who": who or "root", "role": role or "root",
+             "action": action, "tenant": tenant or "",
+             "tenant_label": tenant_label(tenant), "subject": subject,
+             "result": result}
+    if detail:
+        entry["detail"] = detail
+    with open(TENANT_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        os.chmod(TENANT_LOG, 0o644)
+    except OSError:
+        pass
+    return entry
+
+
+def read_tenant_log(tenant=None, limit=50):
+    """The audit log, oldest first, optionally one tenant's entries.
+
+    A damaged line is skipped, never fatal: this file is a record, and
+    a record that refuses to be read because of one bad byte protects
+    nobody.
+    """
+    out = []
+    try:
+        with open(TENANT_LOG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if tenant and entry.get("tenant") != tenant:
+                    continue
+                out.append(entry)
+    except OSError:
+        return []
+    return out[-limit:] if limit else out
+
+
+def acting_tenant(username, requested=""):
+    """Which tenant a portal-initiated action happens in, and by what
+    authority. Returns (tenant_id, role, error) -- tenant_id None means
+    refuse, and `error` says why in one sentence.
+
+    Spec 2.3 rule 3: the tenant comes from the ACTOR'S OWN RECORD, never
+    from the request. A tenant that arrives in a request is a tenant the
+    caller chose, and a caller who may choose their tenant has no
+    boundary. The single exception is server_admin, who may do
+    everything anyway (RFC-0022 D5) and whose choice is recorded.
+
+    Resolved here on the host, from identity's own store, because the
+    spool is data and not trust -- the same rule the store install path
+    already follows.
+    """
+    u = next((x for x in _read_identity_users()
+              if x.get("username") == (username or "")), None)
+    roles = set((u or {}).get("roles") or [])
+    if "server_admin" in roles:
+        if requested:
+            tid = resolve_tenant(requested)
+            return (tid, "server_admin",
+                    "" if tid else "that tenant does not exist on this node")
+        return ensure_default_tenant(), "server_admin", ""
+    if not u or "tenant_admin" not in roles:
+        return None, "", "requires server_admin or tenant_admin"
+    own = resolve_tenant(u.get("tenant"))
+    if not own:
+        return (None, "tenant_admin",
+                "your account names a tenant this node does not have")
+    if requested and requested != own:
+        return (None, "tenant_admin",
+                "a tenant_admin acts only in their own tenant")
+    return own, "tenant_admin", ""
+
+
+def instance_tenant_ref(inst):
+    """The tenant reference to hand the gateway for an instance.
+
+    Deliberately the STORED value, unresolved: if it names a tenant
+    this node does not have, identity refuses everyone but a
+    server_admin, which is the fail-closed answer spec 2.5 asks for.
+    Only a record with no reference at all reads as the default tenant.
+    """
+    return (inst or {}).get("tenant") or default_tenant_id()
 
 
 def tenant_for_new_instance(inst, permit=None):
@@ -615,20 +799,240 @@ def cmd_migrate_tenants(_args):
         print("  Nothing changes for anyone: this node has one tenant.")
 
 
-def cmd_tenant(args):
-    """Read-only view of this node's tenants (spec 2.1).
+def zone_probe(label):
+    """Does `<label>.<node host>` resolve to this node? (spec 2.4)
 
-    Creating, renaming and deleting arrives in 0.2 together with
-    `tenant_admin` and the audit log. A second tenant that nobody can
-    administer would be worse than none.
+    Returns a sentence for the operator, never a verdict that stops
+    them. A two-level name below the node's own name is a property of
+    the ZONE, not of DNS -- a wildcard matches exactly one label, so
+    *.example.org does not cover a.b.example.org. Measured before a
+    tenant is created rather than discovered when its apps are
+    unreachable. A node with no external hostname has no zone to check,
+    and an operator may be about to fix their DNS: this warns, it does
+    not refuse.
+    """
+    host = load_external()
+    if not host:
+        return ("This node has no external hostname, so there is nothing to "
+                "check yet. When you register one, verify that "
+                f"<instance>.{label}.<node> resolves before publishing it.")
+    import socket
+    probe = f"probe.{label}.{host}"
+    try:
+        socket.getaddrinfo(probe, None)
+    except OSError:
+        return (f"WARNING: '{probe}' does not resolve. Instances of this "
+                f"tenant will be published as <instance>.{label}.{host}, and "
+                "a DNS wildcard covers exactly ONE label -- so *." + host +
+                " does not cover this. Add a wildcard for *." + label + "." +
+                host + " (or a record per instance) before publishing "
+                "anything.")
+    return (f"Two-level names under {host} resolve -- instances of this "
+            f"tenant can be published as <instance>.{label}.{host}.")
+
+
+def _tenant_write_common(label, action):
+    if not TENANT_LABEL_RE.fullmatch(label or ""):
+        die("tenant label: lowercase letters, digits and hyphens, starting "
+            "with a letter or digit, at most 31 characters")
+    if label == DEFAULT_TENANT_LABEL:
+        die(f"'{DEFAULT_TENANT_LABEL}' is this node's own tenant and is not "
+            f"available to {action}")
+    if not label_is_free(label):
+        die(f"the label '{label}' is already taken on this node (a former "
+            "label still inside its grace period counts as taken)")
+
+
+def cmd_migrate_tenant_routes(_args):
+    """Put the tenant boundary into gateway sites written before 0.2.
+
+    Every authenticated route is verified against its instance's tenant
+    (spec 3.1), and that parameter is generated INTO the site files. A
+    node updating from 0.1 has files without it, so they are rewritten
+    once, here, on the update that brings the second tenant within
+    reach -- there must be no window in which the boundary is merely
+    intended.
+
+    Idempotent and silent afterwards, like every step in migrate.sh:
+    it looks at what is on disk and does nothing when the answer is
+    already there.
+    """
+    reg = load_registry()
+    stale = []
+    for name, inst in sorted(reg.get("instances", {}).items()):
+        if not inst.get("routes") or not inst.get("svc_port"):
+            continue
+        path = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
+        body = _read_file(path) or ""
+        # A site with no forward_auth at all is all-public and has
+        # nothing to scope; leave it exactly as it is.
+        if "forward_auth" not in body or "&tenant=" in body:
+            continue
+        stale.append((name, inst, path))
+    if not stale:
+        return
+    print("")
+    print("Adding the tenant boundary to the gateway sites "
+          "(oaap.core.tenant 0.2) ...")
+    for name, inst, path in stale:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
+                               inst["svc_port"],
+                               (inst.get("visibility") or {}).get("groups"),
+                               name, throttle_of(inst),
+                               services=route_targets(inst),
+                               tenant=instance_tenant_ref(inst)))
+    refresh_generated_sites()
+    reload_gateway()
+    print(f"  {len(stale)} instance site(s) rewritten.")
+    print("  Nothing changes while this node has one tenant: every route "
+          "now")
+    print("  names the tenant it already belonged to.")
+
+
+def cmd_tenant(args):
+    """This node's tenants (spec 2.1/2.2).
+
+    Deleting a tenant is deliberately absent: a tenant holds users,
+    instances and their data, so removing it is an export-then-destroy
+    operation and gets its own round.
     """
     tenants = load_tenants()
     if not tenants:
         die("this node has no tenant store yet -- run `oaap update`")
 
+    if args.action == "create":
+        label = (args.name or "").strip().lower()
+        _tenant_write_common(label, "create")
+        tid = str(uuid.uuid4())
+        tenants[tid] = {
+            "label": label,
+            "name": args.title or "",
+            # The account lives on the central management node (RFC-0022
+            # Q1). Without one given, this tenant is its own account --
+            # honest about what it is rather than pretending to a
+            # registry that does not exist here.
+            "account": args.account or str(uuid.uuid4()),
+            "account_name": args.account_name or "",
+            "created": _iso_now(),
+            "former_labels": [],
+        }
+        save_tenants(tenants)
+        audit_tenant("tenant.create", tid, label)
+        print(f"Tenant '{label}' created.")
+        print("")
+        # Spec 3.4: said at the moment the label is chosen, not in a
+        # document nobody opens on the day it would have mattered.
+        print("The label is PUBLIC. It becomes part of the hostnames of this")
+        print("tenant's instances and therefore appears in Certificate")
+        print("Transparency logs, which anyone can read. If this customer is")
+        print("confidential, choose a label that says nothing about them --")
+        print(f"  sudo oaap tenant rename {label} <opaque-label>")
+        print("changes it while the old one keeps working for a while.")
+        print("")
+        print(zone_probe(label))
+        if len(tenants) == 2:
+            print("")
+            print("This node now has more than one tenant, so tenants become")
+            print("visible: the portal shows every caller their own tenant")
+            print("only, and this tenant's instances answer under their own")
+            print("names. Nothing about the existing tenant changes.")
+        print("")
+        print("Next, give it its first administrator: create a user in the")
+        print(f"portal with tenant '{label}' and role tenant_admin. From")
+        print("there the tenant administers itself.")
+        return
+
+    if args.action == "rename":
+        old = (args.name or "").strip().lower()
+        new = (args.target or "").strip().lower()
+        tid, _found = tenant_by_label(old, include_former=False)
+        if not tid:
+            die(f"no tenant with the current label '{old}'")
+        # From the dict that gets saved, not from the lookup's own copy:
+        # editing a record nobody writes back is a rename that reports
+        # success and changes nothing.
+        t = tenants[tid]
+        if t.get("label") == DEFAULT_TENANT_LABEL:
+            die("the default tenant belongs to this node itself and cannot be "
+                "renamed -- its label is the ABSENCE of a label in every "
+                "hostname, so renaming it would move every address on this "
+                "node at once")
+        _tenant_write_common(new, "rename to")
+        grace = max(0, int(args.grace_days))
+        host = load_external() or "<node>"
+        insts = sorted(n for n, i in load_registry().get("instances", {}).items()
+                       if i.get("tenant") == tid)
+        # Named consequences before the act, in the same voice instance
+        # address removal already uses. This platform has paid for a
+        # silent address change once (hub.bdt.joomp.de, 2026-08-23).
+        print(f"Renaming '{old}' to '{new}' changes every address of this "
+              "tenant:")
+        for n in insts:
+            print(f"  {n}.{old}.{host}  ->  {n}.{new}.{host}")
+        if not insts:
+            print("  (no instances yet -- nothing is published under it today)")
+        print("")
+        print(f"The old label keeps answering for {grace} more day(s); after "
+              "that,")
+        print("anything still pointing at it stops resolving here.")
+        print("A certificate for each new name is obtained on first contact.")
+        print("")
+        print(zone_probe(new))
+        if not args.yes:
+            print("")
+            die("nothing was changed -- repeat with --yes when the list above "
+                "is what you want")
+        former = [f for f in (t.get("former_labels") or [])
+                  if str(f.get("until", "")) > _iso_now()]
+        if grace:
+            former.append({"label": old, "until": _in_days(grace)})
+        t["former_labels"] = former
+        t["label"] = new
+        save_tenants(tenants)
+        audit_tenant("tenant.rename", tid, new, detail=f"was '{old}'")
+        refresh_generated_sites()
+        reload_gateway()
+        print("")
+        print(f"Renamed. Instances of this tenant now answer under "
+              f"<instance>.{new}.{host}"
+              + (f" and, until the grace period ends, <instance>.{old}.{host}."
+                 if grace else "."))
+        return
+
+    if args.action == "log":
+        # Reading is not an event. Only state changes are recorded
+        # (spec 1.7) -- a log that also logs its readers grows faster
+        # than it is read and buries what matters.
+        tid = None
+        if args.name:
+            tid, _t = tenant_by_label(args.name)
+            if not tid:
+                die(f"no tenant with label '{args.name}'")
+        entries = read_tenant_log(tid, limit=max(1, int(args.count)))
+        if not entries:
+            print("No entries yet." if not tid else
+                  f"No entries for '{args.name}' yet.")
+            return
+        for e in entries:
+            who = f"{e.get('who','?')} ({e.get('role','?')})"
+            where = e.get("tenant_label") or e.get("tenant", "")[:8] or "-"
+            line = (f"{e.get('when','?')}  {where:<16} {who:<28} "
+                    f"{e.get('action','?')}  {e.get('subject','')}")
+            if e.get("result") != "ok":
+                line += f"  [{e.get('result')}]"
+            if e.get("detail"):
+                line += f"  -- {e['detail']}"
+            print(line.rstrip())
+        return
+
     if args.action == "list":
         for _tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
-            print(f"{t.get('label','?'):<20} {t.get('name') or '(no name)'}")
+            extra = ""
+            aliases = former_labels(t)
+            if aliases:
+                extra = f"   (also answers as: {', '.join(aliases)})"
+            print(f"{t.get('label','?'):<20} {t.get('name') or '(no name)'}{extra}")
         if single_tenant():
             print("")
             print("This node has one tenant, so tenants are not in use here:")
@@ -679,7 +1083,10 @@ def cmd_tenant(args):
                     if (i.get("tenant") or default) == tid)
     users = sum(1 for u in _read_identity_users()
                 if (u.get("tenant") or default) == tid)
+    aliases = former_labels(t)
     print(f"Tenant:    {t.get('label','?')}")
+    if aliases:
+        print(f"Also as:   {', '.join(aliases)} (former labels, still routing)")
     print(f"Name:      {t.get('name') or '(none)'}")
     print(f"Account:   {t.get('account_name') or '(reference only)'}")
     print(f"Created:   {t.get('created','?')}")
@@ -972,7 +1379,7 @@ _AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
 
 
 def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
-              edge="", services=None):
+              edge="", services=None, tenant=""):
     """Shared handler block for one app instance (LAN and external sites).
 
     /auth/* is reserved on every entry point, not only the portal apex
@@ -991,6 +1398,17 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     groups: optional visibility restriction (RFC-0007) from the
     instance's registry entry — an ADDITIONAL check alongside roles,
     added to every non-public route's forward_auth call.
+
+    tenant: the instance's tenant id (oaap.core.tenant 3.1). This is
+    where the boundary of belonging is actually enforced — at the
+    gateway, before the app is reached, never inside the app. It is
+    written out ALWAYS, even while the node has one tenant: a file that
+    already carries the answer needs no rewriting on the day a second
+    tenant appears, and there is no window in which the boundary is
+    merely intended. The RAW stored value is passed, not a resolved
+    one, so an instance whose tenant this node does not have refuses
+    everyone but a server_admin instead of quietly falling back to the
+    operator's own tenant (spec 2.5).
 
     services: for a multi-container app (RFC-0016), a map service name ->
     (container, port); each route is proxied to the container of its
@@ -1018,6 +1436,8 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
             uri = f"/verify?roles={','.join(sorted(set(roles)))}"
             if groups:
                 uri += f"&groups={','.join(sorted(set(groups)))}"
+            if tenant:
+                uri += f"&tenant={tenant}"
             lines.append("\t\tforward_auth identity:8000 {")
             lines.append(f"\t\t\turi {uri}")
             lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
@@ -1042,7 +1462,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
 
 
 def caddy_site(port, routes, container, svc_port, groups=None, scope="",
-               throttle=None, services=None):
+               throttle=None, services=None, tenant=""):
     """Generate a LAN gateway listener for one app instance.
 
     The throttle scope is the instance name on every entry point, so a
@@ -1051,7 +1471,7 @@ def caddy_site(port, routes, container, svc_port, groups=None, scope="",
     """
     lines = ([f":{port} {{"]
              + site_body(routes, container, svc_port, groups, scope, throttle,
-                         services=services)
+                         services=services, tenant=tenant)
              + ["}"])
     return "\n".join(lines) + "\n"
 
@@ -1157,7 +1577,16 @@ def write_external_caddy():
     if not edge:
         # The bare :80 catch-all would happily serve plain HTTP for the
         # external names — redirect them to HTTPS explicitly.
-        lines.append(f"http://{host}, http://*.{host} {{")
+        # A DNS wildcard matches exactly one label, and so does
+        # Caddy's: *.host does not cover <instance>.<label>.<host>.
+        # Every tenant label therefore needs its own redirect line, or
+        # those names answer plain HTTP into the catch-all.
+        redirs = [f"http://{host}", f"http://*.{host}"]
+        for _tid in sorted(load_tenants()):
+            for _prefix in tenant_host_prefixes(_tid):
+                if _prefix:
+                    redirs.append(f"http://*.{_prefix}.{host}")
+        lines.append(", ".join(redirs) + " {")
         lines.append("\tredir https://{host}{uri} permanent")
         lines.append("}")
     skipped = []
@@ -1166,15 +1595,25 @@ def write_external_caddy():
         if not routes or not inst.get("svc_port"):
             skipped.append(name)
             continue
-        lines.append(f"{scheme}://{name}.{host} {{")
-        if edge:
-            lines += _edge_guard(edge)
-        lines += _LOG_BLOCK
+        # An instance of the default tenant keeps <instance>.<node>; any
+        # other tenant puts its label in between, once per label it still
+        # answers under (oaap.core.tenant 2.4). A tenant this node does
+        # not have yields no prefix at all -- the instance then gets no
+        # external name, which is the fail-closed direction: the
+        # alternative is publishing somebody else's app under the
+        # operator's own name.
         groups = (inst.get("visibility") or {}).get("groups")
-        lines += site_body(routes, inst["container"], inst["svc_port"], groups,
-                           name, throttle_of(inst), edge,
-                           services=route_targets(inst))
-        lines.append("}")
+        for prefix in tenant_host_prefixes(resolve_tenant(inst.get("tenant"))):
+            fqdn = f"{name}.{prefix}.{host}" if prefix else f"{name}.{host}"
+            lines.append(f"{scheme}://{fqdn} {{")
+            if edge:
+                lines += _edge_guard(edge)
+            lines += _LOG_BLOCK
+            lines += site_body(routes, inst["container"], inst["svc_port"],
+                               groups, name, throttle_of(inst), edge,
+                               services=route_targets(inst),
+                               tenant=instance_tenant_ref(inst))
+            lines.append("}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return skipped
@@ -1226,7 +1665,8 @@ def write_instance_address_caddy():
             lines += site_body(inst["routes"], inst["container"], inst["svc_port"],
                                (inst.get("visibility") or {}).get("groups"),
                                name, throttle_of(inst), edge,
-                               services=route_targets(inst))
+                               services=route_targets(inst),
+                               tenant=instance_tenant_ref(inst))
             lines.append("}")
             if not edge:
                 lines.append(f"http://{host} {{")
@@ -1774,7 +2214,8 @@ def cmd_throttle(args):
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst), services=route_targets(inst)))
+                           throttle_of(inst), services=route_targets(inst),
+                           tenant=instance_tenant_ref(inst)))
     refresh_generated_sites()
     reload_gateway()
 
@@ -1925,6 +2366,24 @@ def cmd_address(args):
           "at their own pace.")
 
 
+def resolve_tenant_arg(label):
+    """Turn a --tenant label from the command line into an id.
+
+    Empty means "say nothing" -- the caller did not choose, so the
+    ordinary rules decide. A label this node does not have is a typo
+    worth stopping for: creating the instance in the operator's own
+    tenant instead would be the silent substitution the whole
+    resolution rule exists to prevent.
+    """
+    if not label:
+        return ""
+    tid, _t = tenant_by_label(label)
+    if not tid:
+        die(f"no tenant with label '{label}' on this node "
+            "(see: oaap tenant list)")
+    return tid
+
+
 def cmd_install(args):
     # Store integration: the package may be a Git URL (+ --path inside
     # the repo) instead of a local directory.
@@ -2020,6 +2479,13 @@ def _install_from_dir(pkg, args, source):
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
         die("instance name: lowercase [a-z0-9-]")
     channel = args.channel
+    # A tenant chosen for this install: a label from the command line, an
+    # id from a creation permit, or nothing. Only consulted for a NEW
+    # instance -- what an existing one says always wins, so a redeploy
+    # can never carry an instance from one customer to another.
+    chosen = str(getattr(args, "tenant", "") or "")
+    chosen_tenant = (chosen if chosen in load_tenants()
+                     else resolve_tenant_arg(chosen))
     reg = load_registry()
     inst = reg["instances"].get(name)
     if inst and inst["channel"] == "production" and inst["version"] == app["version"]:
@@ -2097,7 +2563,9 @@ def _install_from_dir(pkg, args, source):
                            visibility.get("groups"), name,
                            throttle_of(inst or {}),
                            services=(route_targets({"services": services})
-                                     if multi else None)))
+                                     if multi else None),
+                           tenant=tenant_for_new_instance(
+                               inst, permit={"tenant": chosen_tenant})))
     reload_gateway()
 
     reg["instances"][name] = {
@@ -2110,7 +2578,7 @@ def _install_from_dir(pkg, args, source):
         # customer to another, so the existing value always wins. From
         # 0.2 a creation permit may name a different tenant here; today
         # there is only one to name.
-        "tenant": tenant_for_new_instance(inst),
+        "tenant": tenant_for_new_instance(inst, permit={"tenant": chosen_tenant}),
         "version": app["version"], "channel": channel,
         # what the app IS (runtime spec 2.10) — decides the launchpad
         # tile. Read from the MANIFEST at install time, never from a
@@ -2443,7 +2911,8 @@ def cmd_visibility(args):
     with open(os.path.join(CADDY_APPS_DIR, f"{args.name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"], groups, args.name,
-                           throttle_of(inst), services=route_targets(inst)))
+                           throttle_of(inst), services=route_targets(inst),
+                           tenant=instance_tenant_ref(inst)))
     refresh_generated_sites()
     reload_gateway()
     if groups:
@@ -3334,7 +3803,8 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
     return m["app"]["version"]
 
 
-def install_artifact(name, zip_path, grant, channel="test", path="", origin=""):
+def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
+                     permit=None):
     """Phase 3: verify the upload against its grant, then install.
 
     `grant` is positional and mandatory on purpose. It was optional
@@ -3385,8 +3855,13 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin=""):
             # where production got it from (RFC-0020) — so "what runs
             # here?" is answerable with a test instance and a checksum
             source["promoted_from"] = origin
+        # The creation permit is the ONE record that names a tenant
+        # before the instance exists (oaap.core.tenant 1.4), and this is
+        # where that choice finally lands. Empty for a redeploy, which
+        # is right: the instance already knows, and what it says wins.
         ns = argparse.Namespace(package=pkg, path="", ref="", name=name,
-                                channel=channel, store_source="")
+                                channel=channel, store_source="",
+                                tenant=(permit or {}).get("tenant", ""))
         try:
             _install_from_dir(pkg, ns, source)
         except BaseException:
@@ -3907,6 +4382,27 @@ def _store_lookup(app_id, source_id="", prefer=""):
             entry.get("version", ""), src)
 
 
+# Which worker actions are state changes worth a line in a tenant's
+# audit log, and what to call them there (spec 1.7). Deliberately not
+# "everything": reading is not an event, and a log nobody can read
+# through protects nobody.
+TENANT_AUDITED = {
+    "install": "instance.install",
+    "create": "instance.create",
+    "redeploy": "instance.deploy",
+    "artifact": "instance.deploy",
+    "rollback": "instance.rollback",
+    "promote": "instance.promote",
+    "remove": "instance.remove",
+    "token": "token.change",
+    "grant": "permit.change",
+    "visibility": "instance.visibility",
+    "endpoint": "instance.endpoint",
+    "address": "instance.address",
+    "config": "instance.config",
+}
+
+
 def cmd_process_deploys(_args):
     """Run queued deploy requests (invoked by the oaap-deployd path unit)."""
     import argparse as _argparse
@@ -3941,11 +4437,28 @@ def cmd_process_deploys(_args):
         tokens = load_tokens()
         ok, msg, revision = False, "", ""
 
+        # Who queued this, and which tenant they may act in (spec 2.3
+        # rule 3). Derived HERE, from identity's own user store, never
+        # from the request -- the spool is data, not trust, the same
+        # rule the store install path already follows. An unauthenticated
+        # request (the deploy hook, which carries a token and no user)
+        # names nobody and is left to its own checks.
+        actor = str(req.get("by") or "")
+        act_tenant, act_role, _act_err = (acting_tenant(actor) if actor
+                                          else (None, "", ""))
+        audit_tenant_id = None
+        cross_tenant = (inst is not None and act_role == "tenant_admin"
+                        and resolve_tenant(inst.get("tenant")) != act_tenant)
+
         def run_install(src, channel):
             ns = _argparse.Namespace(
                 package=source_package_arg(name, src), path=src.get("path", ""),
                 ref=src.get("ref", ""), name=name, channel=channel,
-                store_source=src.get("store_source", ""))
+                store_source=src.get("store_source", ""),
+                # Only consulted when the instance is NEW: a redeploy
+                # keeps whatever the instance already says, so this can
+                # never move one between tenants.
+                tenant=act_tenant or "")
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -3962,7 +4475,12 @@ def cmd_process_deploys(_args):
 
         # Re-validate on the host — the spool is data, not trust.
         store_src = None
-        if action == "install":
+        if cross_tenant:
+            # Answered as if the instance were not there: telling a
+            # tenant_admin that the name exists elsewhere on the node is
+            # already an answer across the boundary (spec 2.3 rule 2).
+            msg = "unknown instance"
+        elif action == "install":
             # One-click store install (spec 2.6): the request names an
             # app id and at most a source id; what gets installed is
             # decided by resolving it against the CONFIGURED store
@@ -4109,8 +4627,9 @@ def cmd_process_deploys(_args):
                 elif creating and not has_profile("dev"):
                     msg = ("this node has no profile 'dev' — creating "
                            "instances is a development act (RFC-0011)")
-                elif creating and grant_spend(
-                        "create", name, grant.get("create_digest") or "") is None:
+                elif creating and (create_permit := grant_spend(
+                        "create", name,
+                        grant.get("create_digest") or "")) is None:
                     msg = ("the creation grant is spent or expired — have an "
                            "administrator issue a new one in the portal")
                 elif not creating and not inst:
@@ -4122,7 +4641,8 @@ def cmd_process_deploys(_args):
                 else:
                     version, sha = install_artifact(
                         name, up, grant, channel="test",
-                        path=req.get("path") or "")
+                        path=req.get("path") or "",
+                        permit=create_permit if creating else None)
                     revision = sha[:12]
                     ok = True
                     msg = (f"test instance created from uploaded artifact ({version})"
@@ -4226,15 +4746,33 @@ def cmd_process_deploys(_args):
                 # The permit is the ONE record that must store its
                 # tenant: it is issued before the instance exists, so
                 # there is nothing to derive it from (oaap.core.tenant
-                # 1.4). Today that is always the default tenant; from
-                # 0.2 the issuing admin chooses.
-                grant_create("create", name, req["digest"],
-                             {"channel": "test", "by": req.get("by", "?"),
-                              "tenant": ensure_default_tenant()},
-                             ttl=CREATE_GRANT_TTL)
-                ok = True
-                msg = (f"creation grant issued for '{name}', single use, "
-                       f"{CREATE_GRANT_TTL // 60} minutes")
+                # 1.4) -- and therefore the one place a human chooses.
+                # The choice is bounded by who is choosing: a
+                # server_admin may name any tenant, anyone else gets
+                # their own and nothing else.
+                permit_tenant, permit_err = act_tenant, _act_err
+                if actor and act_role == "server_admin" and req.get("tenant"):
+                    permit_tenant, _r, permit_err = acting_tenant(
+                        actor, str(req.get("tenant")))
+                if not permit_tenant and not actor:
+                    permit_tenant = ensure_default_tenant()
+                audit_tenant_id = permit_tenant
+                if not permit_tenant:
+                    # No permit at all rather than one in the operator's
+                    # tenant: a permit is a licence to create an instance
+                    # SOMEWHERE, and guessing where is the one mistake
+                    # this record exists to make impossible.
+                    msg = permit_err or "no tenant to issue this permit in"
+                else:
+                    grant_create("create", name, req["digest"],
+                                 {"channel": "test", "by": req.get("by", "?"),
+                                  "tenant": permit_tenant},
+                                 ttl=CREATE_GRANT_TTL)
+                    ok = True
+                    label = tenant_label(permit_tenant)
+                    msg = (f"creation grant issued for '{name}', single use, "
+                           f"{CREATE_GRANT_TTL // 60} minutes"
+                           + ("" if single_tenant() else f", tenant '{label}'"))
         elif action == "envelope":
             # An administrator confirms one specific pending announcement
             # in the portal (RFC-0019 decision 5). Bound to the manifest
@@ -4340,7 +4878,8 @@ def cmd_process_deploys(_args):
                 with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
                     f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                                        inst["svc_port"], groups, name,
-                                       throttle_of(inst), services=route_targets(inst)))
+                                       throttle_of(inst), services=route_targets(inst),
+                                       tenant=instance_tenant_ref(inst)))
                 refresh_generated_sites()
                 reload_gateway()
                 ok = True
@@ -4592,7 +5131,8 @@ def cmd_process_deploys(_args):
                                            inst["container"], inst["svc_port"],
                                            (inst.get("visibility") or {}).get("groups"),
                                            name, throttle_of(inst),
-                                           services=route_targets(inst)))
+                                           services=route_targets(inst),
+                                           tenant=instance_tenant_ref(inst)))
                     refresh_generated_sites()
                     reload_gateway()
                     t = throttle_of(inst)
@@ -4661,6 +5201,25 @@ def cmd_process_deploys(_args):
                 # confirmed something they did not.
                 record["confirmed_by"] = req.get("by", "?")
         audit_deploy(record)
+        # ... and one line in the tenant's own audit log for the actions
+        # that change who owns or reaches what (spec 1.7). Written HERE,
+        # at the one point every worker action passes through, so a new
+        # action cannot quietly forget to be recorded. Filed in the
+        # tenant of the instance -- including when a server_admin did
+        # it, which is the whole point: the customer has to be able to
+        # see the operator's actions in their own log (RFC-0022 §6).
+        if action in TENANT_AUDITED:
+            tid = audit_tenant_id
+            if not tid:
+                after = load_registry().get("instances", {}).get(name) or {}
+                tid = (resolve_tenant(after.get("tenant"))
+                       or resolve_tenant((inst or {}).get("tenant"))
+                       or ensure_default_tenant())
+            audit_tenant(TENANT_AUDITED[action], tid, name,
+                         "ok" if ok else "denied",
+                         who=actor or (req.get("via") or "deploy hook"),
+                         role=act_role or "-",
+                         detail="" if ok else msg)
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:
@@ -4826,7 +5385,8 @@ def _deploy_from_registry(name, inst):
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst), services=route_targets(inst)))
+                           throttle_of(inst), services=route_targets(inst),
+                           tenant=instance_tenant_ref(inst)))
     print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
           f"channel {inst['channel']}, port {inst['port']})")
     # The instance's own public names travel with it (RFC-0009/0018): they
@@ -5058,6 +5618,10 @@ def main():
     pi.add_argument("--ref", default="", help="git branch/tag to install from (git sources)")
     pi.add_argument("--name")
     pi.add_argument("--channel", choices=["production", "test"], default="production")
+    pi.add_argument("--tenant", default="",
+                    help="tenant label for a NEW instance (default: this "
+                         "node's own). Ignored on a redeploy — an instance "
+                         "never changes tenant")
     pi.set_defaults(fn=cmd_install)
     pl = sub.add_parser("list")
     pl.set_defaults(fn=cmd_list)
@@ -5083,10 +5647,30 @@ def main():
                          help="internal: create the default tenant and stamp "
                               "what belongs to it (RFC-0022 stage 2)")
     pmt.set_defaults(fn=cmd_migrate_tenants)
+    pmr = sub.add_parser("migrate-tenant-routes",
+                         help="internal: put the tenant boundary into gateway "
+                              "sites written before oaap.core.tenant 0.2")
+    pmr.set_defaults(fn=cmd_migrate_tenant_routes)
     pten = sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
-    pten.add_argument("action", choices=["list", "show", "check"])
+    pten.add_argument("action",
+                      choices=["list", "show", "check", "log", "create", "rename"])
     pten.add_argument("name", nargs="?", help="tenant label (default: 'default')")
+    pten.add_argument("target", nargs="?", help="the new label, for 'rename'")
+    pten.add_argument("--name", dest="title", default="",
+                      help="the customer's name in plain words, e.g. 'Kunde Meier GmbH'")
+    pten.add_argument("--account", default="",
+                      help="account reference (UUID) this tenant belongs to")
+    pten.add_argument("--account-name", dest="account_name", default="",
+                      help="cached display name of that account")
+    pten.add_argument("--grace-days", dest="grace_days", type=int,
+                      default=RENAME_GRACE_DAYS,
+                      help=f"how long the old label keeps answering after a "
+                           f"rename (default {RENAME_GRACE_DAYS})")
+    pten.add_argument("--yes", action="store_true",
+                      help="carry out a rename after reading its consequences")
+    pten.add_argument("-n", dest="count", type=int, default=50,
+                      help="how many audit entries to show (default 50)")
     pten.set_defaults(fn=cmd_tenant)
     pep = sub.add_parser("endpoint", help="non-HTTP endpoints (RFC-0015)")
     pep.add_argument("action", choices=["list", "allow", "deny"])
@@ -5217,9 +5801,12 @@ def main():
     read_only = (args.cmd == "convert"
                  or (args.cmd == "node" and args.action == "show")
                  or (args.cmd == "store" and args.action == "list")
-                 # `tenant` only ever reads — including `check`, which
-                 # reports and deliberately repairs nothing.
-                 or args.cmd == "tenant")
+                 # `tenant` reads without root — including `check`, which
+                 # reports and deliberately repairs nothing. Creating and
+                 # renaming change the node and need root like everything
+                 # else that does.
+                 or (args.cmd == "tenant"
+                     and args.action in ("list", "show", "check", "log")))
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:

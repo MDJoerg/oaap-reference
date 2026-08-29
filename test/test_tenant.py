@@ -243,11 +243,20 @@ def read(path):
 
 
 ident = read("services/identity/app.py")
-pub = ident[ident.find("def public_user("):]
-pub = pub[:pub.find("\ndef ", 1)]
-check("public_user() reicht den Mandanten nicht heraus",
-      "tenant" not in pub,
-      "eine App darf nie erfahren, dass sie in einem Mandanten lebt")
+# Seit 0.2 gibt public_user() den Mandanten heraus -- aber nur an das
+# Portal ueber die schluesselgeschuetzte interne Schnittstelle und an
+# `oaap user list` auf der Maschine. Was zaehlt, ist die andere Haelfte:
+# in eine APP darf er nie geraten. Die Antwort von /verify ist die
+# einzige Stelle, an der Identitaet eine App ueberhaupt erreicht.
+verify = ident[ident.find("def verify():"):]
+verify = verify[:verify.find("@app.", 1)]
+headers = verify[verify.find(", 204"):]
+check("keine App erfaehrt je ihren Mandanten",
+      "X-OAAP-Tenant" not in ident and "tenant" not in headers,
+      "die Kopfzeilen an die App tragen Benutzer und Rollen, sonst nichts")
+check("aber das Portal erfaehrt ihn — sonst koennte es nicht filtern",
+      "u.get(\"tenant\", \"\")" in ident,
+      "es muss einem tenant_admin dessen eigenen Mandanten zeigen koennen")
 
 fleet = read("services/portal/fleet_view.py")
 check("die Flotten-Auskunft nennt keinen Mandanten", "tenant" not in fleet,
