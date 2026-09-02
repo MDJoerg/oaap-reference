@@ -111,7 +111,7 @@ ok("im Standard-Mandanten aendert sich nichts",
                          ext_host=HOST) == ["bdt-hub." + HOST])
 
 print("")
-print("Ein Umbenennen des Mandanten fasst nichts Internes an")
+print("Ein Umbenennen des Mandanten zieht die Kennungen mit")
 
 reg = m.load_registry()
 reg["instances"]["cls-viewer"] = {
@@ -125,51 +125,67 @@ out = rename("cls", "abc")
 ok("die Vorschau nennt die Instanz beim Namen des Kunden",
    "viewer.cls." in out and "viewer.abc." in out
    and "cls-viewer.cls." not in out, out[:400])
-ok("und sagt ausdruecklich, dass nichts umgebaut wird",
-   "Not touched" in out and "cls" in out, out[:600])
-ok("der Kurzname bleibt nach dem Umbenennen stehen",
-   m.tenant_slug(cls_id) == "cls",
-   "sonst muesste jedes Umbenennen Container und Verzeichnisse mitnehmen")
-ok("der Schluessel der Instanz bleibt damit auch stehen",
-   "cls-viewer" in m.load_registry()["instances"])
-ok("die Adresse folgt aber dem neuen Kuerzel",
-   m.instance_auto_hosts("cls-viewer", m.load_registry()["instances"]["cls-viewer"],
+ok("und sagt, dass die Apps neu gebaut werden und neu starten",
+   "REBUILT" in out and "restart" in out, out[:800])
+ok("und dass trotzdem nichts auf der Platte verschoben wird",
+   "Nothing moves on disk" in out, out[:800])
+ok("die alten Deploy-Adressen bekommen eine Schonfrist genannt",
+   "old deploy addresses keep working" in out, out[:800])
+# Seit RFC-0026 D2b folgen Kennungen dem AKTUELLEN Kuerzel: der
+# eingefrorene Kurzname aus RFC-0025 ist zurueckgezogen, weil die Daten
+# nicht mehr am Namen haengen. Eine Umbenennung baut Container neu -
+# und verschiebt nichts.
+ok("der Kurzname folgt dem neuen Kuerzel", m.tenant_slug(cls_id) == "abc")
+reg_nach = m.load_registry()["instances"]
+ok("die Instanz traegt jetzt den neuen Schluessel",
+   "abc-viewer" in reg_nach and "cls-viewer" not in reg_nach,
+   sorted(reg_nach))
+ok("sie heisst aber unveraendert wie vorher",
+   m.instance_name("abc-viewer", reg_nach["abc-viewer"]) == "viewer")
+ok("die Adresse folgt dem neuen Kuerzel",
+   m.instance_auto_hosts("abc-viewer", reg_nach["abc-viewer"],
                          ext_host=HOST)[0] == "viewer.abc." + HOST)
 ok("und das alte Kuerzel antwortet die Schonfrist ueber weiter",
    "viewer.cls." + HOST
-   in m.instance_auto_hosts("cls-viewer",
-                            m.load_registry()["instances"]["cls-viewer"],
+   in m.instance_auto_hosts("abc-viewer", reg_nach["abc-viewer"],
                             ext_host=HOST))
+ok("die alte Deploy-Adresse gilt die Schonfrist ueber auch",
+   m.resolve_deploy_target(m.load_registry(), "cls-viewer") == "abc-viewer",
+   "sonst braeche jede ausgelieferte Pipeline mit der Umbenennung")
 
 print("")
 print("Ein freigewordenes Kuerzel macht keinen zweiten Anspruch")
 
-# Ein Mandant wird ohne Schonfrist umbenannt -- sein altes Kuerzel ist
-# danach sofort frei, sein KURZNAME aber bleibt bei ihm.
+# Ein Kuerzel, das frei geworden ist, darf ein neuer Mandant nehmen --
+# und weil Kennungen seit RFC-0026 dem AKTUELLEN Kuerzel folgen, ist
+# damit auch der Schluessel eindeutig. Der Praege-Mechanismus mit
+# Zaehlsuffix aus RFC-0025 ist damit weg: Zwei Mandanten koennen
+# dasselbe Kuerzel gar nicht gleichzeitig fuehren.
 alt_id = make_tenant("tmp")
 rename("tmp", "tmp-neu", grace=0)
 ok("nach dem Umbenennen ohne Schonfrist ist das Kuerzel frei",
    m.label_is_free("tmp"))
-ok("der Kurzname gehoert aber weiter dem alten Mandanten",
-   m.tenant_slug(alt_id) == "tmp")
+ok("der alte Mandant fuehrt jetzt das neue Kuerzel",
+   m.tenant_slug(alt_id) == "tmp-neu")
 
 zwei_id = make_tenant("tmp")
 ok("ein neuer Mandant darf das freie Kuerzel nehmen",
    m.tenant_label(zwei_id) == "tmp")
-ok("bekommt aber einen anderen Kurznamen",
-   m.tenant_slug(zwei_id) == "tmp-2",
-   "sonst schrieben beide in dieselben Verzeichnisse")
-ok("und damit einen anderen Schluessel",
-   m.instance_key(zwei_id, "viewer") == "tmp-2-viewer")
-ok("waehrend der alte seinen behaelt",
-   m.instance_key(alt_id, "viewer") == "tmp-viewer")
+ok("und bekommt es auch als Kennung",
+   m.tenant_slug(zwei_id) == "tmp")
+ok("die beiden Schluessel bleiben trotzdem verschieden",
+   m.instance_key(zwei_id, "viewer") != m.instance_key(alt_id, "viewer"),
+   "weil zwei Mandanten dasselbe Kuerzel nie gleichzeitig fuehren")
+ok("kein Zaehlsuffix mehr noetig",
+   not hasattr(m, "mint_slug"),
+   "die Praegung aus RFC-0025 ist mit dem eingefrorenen Kurznamen weg")
 
 print("")
 print("Denselben Namen zweimal im selben Mandanten gibt es nicht")
 
 key, found = m.find_instance(m.load_registry(), cls_id, "viewer")
 ok("die Suche findet die Instanz an ihrem Mandanten-Namen",
-   key == "cls-viewer" and found is not None)
+   key == "abc-viewer" and found is not None)
 ok("und im falschen Mandanten nicht",
    m.find_instance(m.load_registry(), meier_id, "viewer") == ("", None))
 ok("eine Instanz von vor der Umstellung ist ihr eigener Name",
@@ -183,37 +199,22 @@ reg["instances"]["altbestand"] = {
     "app_id": "alt", "app_name": "Alt", "tenant": meier_id,
     "version": "1", "channel": "test", "port": 8501}
 m.save_registry(reg)
-tenants = m.load_tenants()
-for t in tenants.values():
-    t.pop("slug", None)
-m.save_tenants(tenants)
-
 buf = _io.StringIO()
 with contextlib.redirect_stdout(buf):
     m.cmd_migrate_tenants(None)
 bericht = buf.getvalue()
-ok("sie vergibt fehlende Kurznamen", "short name" in bericht, bericht)
-ok("und zwar das Kuerzel selbst, nicht eine Variante davon",
-   m.tenant_slug(meier_id) == "meier"
-   and not any(m.tenant_slug(t).endswith("-2") for t in m.load_tenants()),
-   "am echten Knoten kam hier zuerst 'cls-2' heraus: die Praegung sah "
-   "den Mandanten, fuer den sie praegte, als Kollision mit sich selbst")
-vorher = m.tenant_slug(meier_id)
-with contextlib.redirect_stdout(_io.StringIO()):
-    m.cmd_migrate_tenants(None)
-ok("ein einmal gesetzter Kurzname wird von der Migration nie ueberschrieben",
-   m.tenant_slug(meier_id) == vorher,
-   "er ist eingefroren -- auch gegen die eigene Migration")
-ok("und sagt ausdruecklich, dass nichts umbenannt wurde",
-   "nothing renamed" in bericht, bericht)
 reg = m.load_registry()
-ok("bestehende Schluessel bleiben unangetastet",
-   "cls-viewer" in reg["instances"] and "altbestand" in reg["instances"])
 ok("eine Instanz ohne Namen bekommt ihren Schluessel als Namen",
    reg["instances"]["altbestand"]["name"] == "altbestand")
-ok("und behaelt ihn danach",
-   m.instance_auto_hosts("altbestand", reg["instances"]["altbestand"],
-                         ext_host=HOST)[0] == "altbestand.meier." + HOST)
+ok("die Migration sagt, was sie getan hat",
+   "recorded under the name" in bericht, bericht)
+ok("bestehende Schluessel bleiben unangetastet",
+   "abc-viewer" in reg["instances"] and "altbestand" in reg["instances"],
+   "die Umstellung benennt nichts um -- Schluessel muessen eindeutig "
+   "sein, nicht einheitlich")
+ok("und der Kurzname aus RFC-0025 ist aus den Datensaetzen entfernt",
+   not any("slug" in t for t in m.load_tenants().values()),
+   "ein gespeicherter Kurzname koennte nur noch dem Kuerzel widersprechen")
 buf2 = _io.StringIO()
 with contextlib.redirect_stdout(buf2):
     m.cmd_migrate_tenants(None)

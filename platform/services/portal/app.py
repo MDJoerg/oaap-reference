@@ -3104,6 +3104,34 @@ def _valid_creation_grant(name):
     return digest
 
 
+def _former_keys(inst):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return [f.get("key", "") for f in (inst or {}).get("former_keys") or []
+            if f.get("key") and str(f.get("until", "")) > now]
+
+
+def deploy_target(given):
+    """Which instance a deploy address names (RFC-0026 3.4).
+
+    The current key, a key it answered under until recently, or its
+    identity -- which never changes at all. Without the second, renaming
+    anything would break every pipeline and every briefing carrying the
+    address, which is the failure this platform has already paid for
+    once (hub.bdt.joomp.de, 2026-08-23).
+
+    Returns the given name unchanged when nothing matches: the caller's
+    own checks then answer, and they answer the same way they always
+    did for a name that is simply not here.
+    """
+    instances = load_instances()
+    if given in instances:
+        return given
+    for key, inst in instances.items():
+        if given == inst.get("id") or given in _former_keys(inst):
+            return key
+    return given
+
+
 def _deploy_auth(name, allow_creation=False):
     """One indistinguishable answer for every failure (spec test 13).
 
@@ -3159,6 +3187,7 @@ def recent_deploys(limit=5):
 
 @app.post("/deploy/<name>")
 def deploy_hook(name):
+    name = deploy_target(name)
     inst, err = _deploy_auth(name)
     if err:
         return inst, err
@@ -3240,6 +3269,7 @@ def _valid_upload_grant(name):
 
 @app.post("/deploy/<name>/announce")
 def deploy_announce(name):
+    name = deploy_target(name)
     # The one place that also accepts an instance creation grant: before
     # the instance exists there is no deploy token, so the operator's
     # single-use permission stands in for one (RFC-0019, Studio
@@ -3351,6 +3381,7 @@ def deploy_status(name):
     while its own was still building. It read `ok: true` and stopped
     looking.
     """
+    name = deploy_target(name)
     inst, err = _deploy_auth(name)
     if err:
         return inst, err
@@ -3386,6 +3417,7 @@ def deploy_status(name):
 @app.post("/deploy/<name>/cancel")
 def deploy_cancel_hook(name):
     """Withdraw a deployment that has not started (RFC-0024 §5)."""
+    name = deploy_target(name)
     inst, err = _deploy_auth(name)
     if err:
         return inst, err

@@ -137,6 +137,16 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenants \
 # reaches this file by updating, not by installing.
 mkdir -p "$OAAP_DATA_DIR/data/audit"
 
+# --- instance data under its tenant (RFC-0026) ---
+# The one migration here that moves DATA. Written to be interruptible:
+# one instance at a time, moved with a rename (a directory-entry change
+# within one filesystem, never a copy), the registry saved after each,
+# nothing deleted. Each moved instance is recreated immediately, because
+# a bind mount follows the inode until something restarts the container
+# and Docker re-resolves the old path into an empty directory.
+# Silent after the first run, like every step in here.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-instance-dirs   2>&1 | sed 's/^/  /' || say "  WARNING: instance data could not be moved — check 'oaap app list'."
+
 # --- the tenant boundary in the generated gateway sites (0.2, spec 3.1) ---
 # The boundary is enforced at the gateway: every authenticated route
 # carries its instance's tenant. Sites generated before 0.2 do not, so

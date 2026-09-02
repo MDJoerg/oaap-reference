@@ -47,7 +47,11 @@ import yaml
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
-APPS_DIR = os.path.join(DATA_DIR, "apps")          # app instances
+APPS_DIR = os.path.join(DATA_DIR, "apps")          # platform files (registry etc.)
+# Where instance data lives (RFC-0026): tenants/<tenant-id>/instances/
+# /<instance-id>/. Identities, not names -- so renaming a tenant or an
+# instance moves nothing, and everything one tenant owns is one subtree.
+TENANTS_DIR = os.path.join(DATA_DIR, "tenants")
 CADDY_APPS_DIR = os.path.join(APP_DIR, "apps-caddy")
 REGISTRY = os.path.join(APPS_DIR, "registry.json")
 STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
@@ -451,7 +455,7 @@ def load_registry():
         with open(REGISTRY, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"instances": {}}
+        return {"instances": {}, "retained": {}}
 
 
 def save_registry(reg):
@@ -533,10 +537,6 @@ def ensure_default_tenant():
     tid = str(uuid.uuid4())
     tenants[tid] = {
         "label": DEFAULT_TENANT_LABEL,
-        # The default tenant's slug is the ABSENCE of one, like its
-        # label in a hostname (RFC-0025 §8.1) -- that is what leaves
-        # every existing key, address and deploy URL untouched.
-        "slug": "",
         "name": "",
         # The account lives on the central management node (RFC-0022
         # Q1). A node holds an opaque reference plus a cached display
@@ -646,57 +646,35 @@ def instance_auto_hosts(name, inst, ext_host=None):
     # `viewer.cls.<node>`, not `cls-viewer.cls.<node>` (RFC-0025 §8.1).
     # The key exists so identifiers do not collide; the address does not
     # need it, because the label already says which tenant this is.
-    local = instance_name(name, inst)
+    #
+    # Current name first, then the ones it answered under until
+    # recently -- the same grace a renamed tenant label gets, for the
+    # same reason (RFC-0026 3.3).
+    names = [instance_name(name, inst)] + former_names(inst)
+    prefixes = tenant_host_prefixes(resolve_tenant((inst or {}).get("tenant")))
     return [f"{local}.{p}.{ext}" if p else f"{local}.{ext}"
-            for p in tenant_host_prefixes(resolve_tenant((inst or {}).get("tenant")))]
+            for local in names for p in prefixes]
 
 
 def tenant_slug(tid):
-    """The tenant's frozen short name — what node-wide identifiers use.
+    """What node-wide identifiers of this tenant's instances start with.
 
-    Minted once when the tenant is created and never changed again, not
-    even by `tenant rename` (RFC-0025 §8.1). That is the whole point:
-    deriving container names, networks and directories from the CURRENT
-    label would turn every rename into a migration with downtime, and
-    RFC-0022 Q3 promises the opposite. Deriving them from the UUID would
-    be stable but would stop `docker ps` from answering whose container
-    something is.
+    The tenant's CURRENT label, and the default tenant's is the empty
+    string -- exactly as its label is the absence of a label in a
+    hostname (spec 1.2). That is what keeps every existing key, address
+    and deploy URL on a single-tenant node unchanged.
 
-    The default tenant's slug is the empty string, exactly as its label
-    is the ABSENCE of a label in a hostname (spec 1.2). That is what
-    keeps every existing key, address and deploy URL unchanged.
-
-    Falls back to the label for tenant records written before 0.1.58;
-    the migration fills it in on the next update.
+    RFC-0025 §8.1 froze this so that a rename would not have to move
+    data. RFC-0026 moves the data under an identity instead
+    (`instance_dir`), and once it hangs off an id rather than a name,
+    freezing bought nothing but drift between what a container is called
+    and who owns it. A rename now re-keys and restarts, which the rename
+    dialog says before it does it.
     """
     t = load_tenants().get(tid or "") or {}
     if t.get("label") == DEFAULT_TENANT_LABEL:
         return ""
-    slug = t.get("slug")
-    return slug if slug is not None else t.get("label", "")
-
-
-def taken_slugs(tenants=None):
-    return {(t.get("slug") if t.get("slug") is not None else t.get("label", ""))
-            for t in (tenants if tenants is not None else load_tenants()).values()}
-
-
-def mint_slug(label, tenants=None):
-    """A free short name for a new tenant, from its first label.
-
-    A discriminator is only needed when a slug is already held -- which
-    happens when a tenant was renamed and a later one takes the freed
-    label, or when a tenant was deleted and recreated. Rare, and it must
-    not silently produce two tenants that write into the same
-    directories.
-    """
-    taken = taken_slugs(tenants)
-    if label not in taken:
-        return label
-    i = 2
-    while f"{label}-{i}" in taken:
-        i += 1
-    return f"{label}-{i}"
+    return t.get("label", "")
 
 
 def instance_key(tenant, name):
@@ -810,6 +788,85 @@ def retained_data_refusal(name, tenant):
             f"node and cannot be handed to a new one — an administrator "
             f"removes it with 'sudo oaap app purge {name} --yes', or "
             f"choose a different name")
+
+
+def former_names(inst):
+    """The unexpired former names of an instance (RFC-0026 3.3).
+
+    The sibling of `former_labels` on a tenant, and for the same reason:
+    a name that was published is a name somebody wrote down. It keeps
+    answering for a grace period instead of disappearing the moment
+    somebody renames something.
+    """
+    now = _iso_now()
+    return [f.get("name", "") for f in (inst or {}).get("former_names") or []
+            if f.get("name") and str(f.get("until", "")) > now]
+
+
+def former_keys(inst):
+    """The unexpired former node keys of an instance.
+
+    Kept apart from former_names on purpose: a key changes when the
+    INSTANCE is renamed and also when its TENANT is, and the deploy
+    address is built from the key. Deriving it from the names would
+    have to guess which label was current when.
+    """
+    now = _iso_now()
+    return [f.get("key", "") for f in (inst or {}).get("former_keys") or []
+            if f.get("key") and str(f.get("until", "")) > now]
+
+
+def resolve_deploy_target(reg, given):
+    """Which instance a deploy address names (RFC-0026 3.4).
+
+    The current key, or one this instance answered under until recently.
+    Without the second, renaming anything would break every pipeline and
+    every briefing that carries the address -- the failure this platform
+    has already paid for once (hub.bdt.joomp.de, 2026-08-23).
+    """
+    if given in (reg.get("instances") or {}):
+        return given
+    for key, inst in (reg.get("instances") or {}).items():
+        if given in former_keys(inst) or given == inst.get("id"):
+            return key
+    return ""
+
+
+def retained_key(tenant, name):
+    """How a retained instance is filed: by tenant and by the name the
+    customer used. Those two are what a reinstall knows."""
+    return f"{tenant}|{name}"
+
+
+def retained_record(reg, tenant, name):
+    return (reg.get("retained") or {}).get(retained_key(tenant, name))
+
+
+def instance_identity(reg, key, tenant, name):
+    """The identity this install writes under (RFC-0026 3.1).
+
+    Three cases, in this order:
+
+    * the instance exists -- its identity is its own and cannot change,
+      which is what keeps a redeploy from moving anyone's data;
+    * data was left behind by a removal of the same name in the same
+      tenant -- the identity comes back with it, which is what keeps
+      the promise that reinstalling under the same name recovers the
+      data (`oaap app remove` without --purge says exactly that);
+    * otherwise a new identity, minted once.
+
+    Deliberately NOT persisted here: a half-finished install must not
+    leave a stub in the registry that `oaap app list` then trips over.
+    The caller passes the result down and the registry entry is written
+    at the end, as it always was.
+    """
+    inst = (reg.get("instances") or {}).get(key)
+    if inst and inst.get("id"):
+        return {"id": inst["id"], "tenant": inst.get("tenant") or tenant}
+    kept = retained_record(reg, tenant, name)
+    if kept and kept.get("id"):
+        return {"id": kept["id"], "tenant": tenant}
+    return {"id": new_instance_id(), "tenant": tenant}
 
 
 def tenant_by_label(label, include_former=True):
@@ -1020,6 +1077,156 @@ def _read_identity_users():
     return users if isinstance(users, list) else []
 
 
+def name_links(reg=None, tenants=None):
+    """The readable paths beside the identities (RFC-0026 3.2).
+
+    Returns {link path: target path}. Pure, so the layout can be checked
+    without a filesystem that supports symlinks -- Windows does not,
+    without extra rights, and these rules should be testable anywhere.
+    """
+    reg = reg if reg is not None else load_registry()
+    tenants = tenants if tenants is not None else load_tenants()
+    links = {}
+    for tid, t in tenants.items():
+        label = t.get("label") or ""
+        if label:
+            links[os.path.join(TENANTS_DIR, "by-label", label)] = tenant_dir(tid)
+    for key, inst in (reg.get("instances") or {}).items():
+        tid, iid = resolve_tenant(inst.get("tenant")), inst.get("id")
+        if not tid or not iid:
+            continue
+        links[os.path.join(tenant_dir(tid), "by-name", instance_name(key, inst))] =             os.path.join(tenant_dir(tid), "instances", iid)
+    return links
+
+
+def refresh_name_links(reg=None, tenants=None):
+    """Lay the readable paths down, best effort.
+
+    Best effort on purpose: a symlink is a convenience for whoever has
+    to read a path at two in the morning, never something the platform
+    depends on. A filesystem that refuses them changes nothing about
+    how the node runs.
+    """
+    wanted = name_links(reg, tenants)
+    for root in (os.path.join(TENANTS_DIR, "by-label"),):
+        _prune_links(root, wanted)
+    for tid in (tenants if tenants is not None else load_tenants()):
+        _prune_links(os.path.join(tenant_dir(tid), "by-name"), wanted)
+    made = 0
+    for link, target in wanted.items():
+        try:
+            os.makedirs(os.path.dirname(link), exist_ok=True)
+            if os.path.islink(link):
+                if os.readlink(link) == target:
+                    continue
+                os.remove(link)
+            elif os.path.exists(link):
+                continue
+            os.symlink(target, link)
+            made += 1
+        except OSError:
+            return made          # unsupported here; not a failure
+    return made
+
+
+def _prune_links(root, wanted):
+    """Drop readable paths that name something that is gone."""
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for e in entries:
+        path = os.path.join(root, e)
+        if os.path.islink(path) and path not in wanted:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def cmd_migrate_instance_dirs(_args):
+    """Move instance data into the tenant tree (RFC-0026 3.2).
+
+    The one migration in this platform that moves data rather than
+    adding a field, so it is written to be interruptible: one instance
+    at a time, each one moved with a rename (a directory-entry change
+    within one filesystem, not a copy), the registry written after each
+    move, and nothing deleted at any point. Interrupt it and the next
+    run continues where it stopped, because an instance that has
+    already moved carries its id and is skipped.
+
+    Containers are NOT recreated here. They are still running with the
+    old mount and keep working until the next deployment or a restart,
+    which is why this can run on a live node -- but the caller is told,
+    because a container that has not been recreated still writes to the
+    old path.
+    """
+    reg = load_registry()
+    moved, minted, recreated, skipped = 0, 0, 0, []
+    for key, inst in sorted(reg.get("instances", {}).items()):
+        tid = resolve_tenant(inst.get("tenant"))
+        if not tid:
+            skipped.append(f"{key} (names a tenant this node does not have)")
+            continue
+        if inst.get("id"):
+            continue                       # already in the tree
+        old = os.path.join(APPS_DIR, key)
+        iid = new_instance_id()
+        new = os.path.join(tenant_dir(tid), "instances", iid)
+        if os.path.isdir(old):
+            os.makedirs(os.path.dirname(new), exist_ok=True)
+            try:
+                os.rename(old, new)
+            except OSError as e:
+                # Across filesystems rename fails; copying gigabytes
+                # silently is not this function's decision to make.
+                skipped.append(f"{key} ({e})")
+                continue
+            marker = os.path.join(new, TENANT_MARKER)
+            if os.path.exists(marker):
+                os.remove(marker)          # the path says it now
+            moved += 1
+        else:
+            os.makedirs(new, exist_ok=True)
+        inst["id"] = iid
+        minted += 1
+        save_registry(reg)                 # after each one, on purpose
+        # Recreated immediately, and this is not optional. A bind mount
+        # follows the inode, so a container keeps writing to the moved
+        # directory and nothing breaks -- until someone restarts it,
+        # whereupon Docker re-resolves the OLD path, creates it empty,
+        # and the app looks wiped. Leaving that window open would be the
+        # worst kind of bug: silent, delayed, and data-shaped.
+        if os.path.isdir(new) and inst.get("services"):
+            try:
+                recreate_instance_containers(key, instance_services(inst),
+                                             inst.get("storage") or [],
+                                             inst.get("endpoints") or [],
+                                             inst=inst)
+                recreated += 1
+            except Exception as e:        # noqa: BLE001 - reported, not fatal
+                skipped.append(f"{key} (moved, but not recreated: {e})")
+    links = refresh_name_links(reg)
+    if minted or skipped:
+        print("")
+        print("Moving instance data under its tenant (RFC-0026) ...")
+        if moved:
+            print(f"  {moved} instance director(ies) moved into "
+                  f"tenants/<tenant>/instances/<id>/.")
+        if minted:
+            print(f"  {minted} instance(s) given their identity.")
+        if links:
+            print(f"  {links} readable path(s) laid down under "
+                  f"tenants/by-label/.")
+        for line in skipped:
+            print(f"  NOT moved: {line}")
+        if recreated:
+            print(f"  {recreated} instance(s) recreated on the new path.")
+        if moved:
+            refresh_generated_sites()
+            reload_gateway()
+
+
 def cmd_migrate_tenants(_args):
     """Give this node its default tenant and stamp what appctl owns.
 
@@ -1037,25 +1244,15 @@ def cmd_migrate_tenants(_args):
     created = not default_tenant_id()
     tid = ensure_default_tenant()
 
-    # Every tenant gets its frozen short name (RFC-0025 8.3). The
-    # migration renames NOTHING: the default tenant's slug is empty, and
-    # every other tenant's is simply its current label. Instances keep
-    # the keys they already have -- keys only have to be unique, not
-    # uniform -- so no container is rebuilt and no directory moves.
+    # The frozen short name of RFC-0025 is withdrawn (RFC-0026 D2b):
+    # identifiers follow the current label again, so a stored slug is
+    # something that can only disagree with it. Cleared where it was
+    # written, once.
     tenants = load_tenants()
     slugged = 0
-    for t_id, t in sorted(tenants.items()):
-        if t.get("slug") is not None:
-            continue
-        # The label itself, not a minted one: `mint_slug` looks at what
-        # is taken, and a record without a slug counts under its own
-        # label -- so minting here made every tenant collide with
-        # itself and come out as `<label>-2`. Seen on oaapx01 within a
-        # minute of the update (2026-09-02). A label is unique per node
-        # by construction, so at migration time it IS the free slug.
-        t["slug"] = ("" if t.get("label") == DEFAULT_TENANT_LABEL
-                     else t.get("label", ""))
-        slugged += 1
+    for t in tenants.values():
+        if t.pop("slug", None) is not None:
+            slugged += 1
     if slugged:
         save_tenants(tenants)
 
@@ -1112,8 +1309,8 @@ def cmd_migrate_tenants(_args):
             print(f"  {marked} instance data director(ies) marked with their "
                   f"tenant.")
         if slugged:
-            print(f"  {slugged} tenant(s) given their short name "
-                  f"(RFC-0025) -- nothing renamed.")
+            print(f"  {slugged} tenant(s): the frozen short name of RFC-0025 "
+                  f"withdrawn (RFC-0026).")
         if named:
             print(f"  {named} instance(s) recorded under the name they "
                   f"already had.")
@@ -1237,10 +1434,6 @@ def cmd_tenant(args):
         tid = str(uuid.uuid4())
         tenants[tid] = {
             "label": label,
-            # Frozen at creation, never touched by `tenant rename`
-            # (RFC-0025 §8.1). Node-wide identifiers hang off this, so
-            # a rename stays a renaming instead of becoming a migration.
-            "slug": mint_slug(label, tenants),
             "name": args.title or "",
             # The account lives on the central management node (RFC-0022
             # Q1). Without one given, this tenant is its own account --
@@ -1254,10 +1447,6 @@ def cmd_tenant(args):
         save_tenants(tenants)
         audit_tenant("tenant.create", tid, label)
         print(f"Tenant '{label}' created.")
-        slug = tenants[tid]["slug"]
-        if slug != label:
-            print(f"Its short name is '{slug}' -- '{label}' is already held "
-                  f"by another tenant's identifiers.")
         print("")
         # Spec 3.4: said at the moment the label is chosen, not in a
         # document nobody opens on the day it would have mattered.
@@ -1316,18 +1505,22 @@ def cmd_tenant(args):
               "that,")
         print("anything still pointing at it stops resolving here.")
         print("A certificate for each new name is obtained on first contact.")
-        slug = tenant_slug(tid)
-        if slug and insts:
+        if insts:
             print("")
-            # Said out loud, because it is the trade RFC-0025 §8.1 made:
-            # a rename stays a renaming instead of becoming a migration,
-            # and the price is identifiers that keep the old short name.
-            print(f"Not touched: containers, networks, data directories and "
-                  f"deploy URLs keep")
-            print(f"the short name '{slug}'. Nothing is rebuilt and nothing "
-                  f"moves -- that is")
-            print(f"why this is a rename and not an outage. Deploy addresses "
-                  f"stay valid.")
+            # The trade RFC-0026 D2b makes, named before it is made: no
+            # drift between what a container is called and who owns it,
+            # paid for with a restart of this tenant's apps.
+            print(f"Identifiers follow the new label: containers, networks "
+                  f"and deploy")
+            print(f"addresses become '{new}-<name>'. These {len(insts)} app(s) "
+                  f"are REBUILT and")
+            print("therefore restart. The old deploy addresses keep working "
+                  f"for {grace} day(s).")
+            print("")
+            print("Nothing moves on disk. The data hangs off each instance's "
+                  "identity,")
+            print("not off any name — which is why this is a restart and not "
+                  "a migration.")
         print("")
         print(zone_probe(new))
         if not args.yes:
@@ -1341,8 +1534,17 @@ def cmd_tenant(args):
         t["former_labels"] = former
         t["label"] = new
         save_tenants(tenants)
+        # Identifiers follow the label, so every instance of this tenant
+        # moves to a new key -- registry, containers, network, gateway
+        # file, token and permits. The DATA stays exactly where it is.
+        reg = load_registry()
+        for key in [k for k, i in sorted(reg["instances"].items())
+                    if resolve_tenant(i.get("tenant")) == tid]:
+            local = instance_name(key, reg["instances"][key])
+            rekey_instance(reg, key, instance_key(tid, local), grace)
         audit_tenant("tenant.rename", tid, new, detail=f"was '{old}'")
         refresh_generated_sites()
+        refresh_name_links()
         reload_gateway()
         print("")
         print(f"Renamed. Instances of this tenant now answer under "
@@ -2265,24 +2467,56 @@ def reload_gateway():
 RESERVED_ENV = {"OAAP_APP_SECRET"}  # platform-owned, never operator-editable
 
 
-def instance_dir(name):
-    return os.path.join(APPS_DIR, name)
+def tenant_dir(tid):
+    return os.path.join(TENANTS_DIR, tid)
 
 
-def env_path(name):
-    return os.path.join(instance_dir(name), "instance.env")
+def new_instance_id():
+    """An instance's identity: short hex, minted once, never changed.
+
+    Short rather than a full UUID because it appears in a path an
+    operator may have to read out loud, and 48 bits of randomness is
+    plenty to keep the instances of one node apart.
+    """
+    return uuid.uuid4().hex[:12]
 
 
-def load_env(name):
+def instance_dir(name, inst=None):
+    """Where this instance's data lives (RFC-0026 3.2).
+
+    `tenants/<tenant-id>/instances/<instance-id>/`. The path hangs off
+    IDENTITIES, never off names: that is what makes renaming a tenant or
+    an instance a rename instead of a data migration, and what puts
+    everything one tenant owns under one subtree.
+
+    A record written before 0.1.60 has no id and keeps the flat
+    `apps/<key>/` it was installed into. Reading those has to keep
+    working until the migration has moved them -- and after that this
+    branch is dead.
+    """
+    if inst is None:
+        inst = load_registry()["instances"].get(name) or {}
+    iid = (inst or {}).get("id")
+    tid = resolve_tenant((inst or {}).get("tenant")) if inst else None
+    if not iid or not tid:
+        return os.path.join(APPS_DIR, name)
+    return os.path.join(tenant_dir(tid), "instances", iid)
+
+
+def env_path(name, inst=None):
+    return os.path.join(instance_dir(name, inst), "instance.env")
+
+
+def load_env(name, inst=None):
     try:
-        with open(env_path(name), encoding="utf-8") as f:
+        with open(env_path(name, inst), encoding="utf-8") as f:
             return dict(l.strip().split("=", 1) for l in f if "=" in l)
     except OSError:
         return {}
 
 
-def save_env(name, env):
-    path = env_path(name)
+def save_env(name, env, inst=None):
+    path = env_path(name, inst)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2323,7 +2557,8 @@ def _endpoint_publish(endpoints, svc_name, primary):
     return args
 
 
-def recreate_instance_containers(name, services, storage, endpoints=None):
+def recreate_instance_containers(name, services, storage, endpoints=None,
+                                 inst=None):
     """(Re)create ALL of an instance's service containers on its own
     network (RFC-0016), from their recorded shape. Storage entries go to
     the service named in `service`, defaulting to the primary (services
@@ -2342,7 +2577,7 @@ def recreate_instance_containers(name, services, storage, endpoints=None):
         for st in storage or []:
             if (st.get("service") or primary) != s["service"]:
                 continue
-            host = os.path.join(instance_dir(name), "storage", st["name"])
+            host = os.path.join(instance_dir(name, inst), "storage", st["name"])
             os.makedirs(host, exist_ok=True)
             if uid is not None:
                 os.chown(host, uid, uid)
@@ -2358,7 +2593,7 @@ def recreate_instance_containers(name, services, storage, endpoints=None):
                        capture_output=True, text=True)
         run(["docker", "run", "-d", "--name", s["container"],
              "--restart", "unless-stopped", "--network", net, *alias,
-             "--env-file", env_path(name), *mounts, *publish, s["image"]])
+             "--env-file", env_path(name, inst), *mounts, *publish, s["image"]])
     # Erklärte App-zu-App-Verbindungen zurückholen: `docker run` kennt nur
     # EIN Netz, also hat der neue Container seine Link-Netze verloren
     # (RFC-0016). Ohne das ist eine Verbindung nach jeder
@@ -2944,20 +3179,29 @@ def _install_from_dir(pkg, args, source):
     used = {i["port"] for i in reg["instances"].values()}
     port = inst["port"] if inst else next(p for p in PORT_RANGE if p not in used)
 
-    os.makedirs(instance_dir(name), exist_ok=True)
-    # Stamp before anything is written into the directory, so a crash
-    # halfway through leaves attributable data rather than anonymous data.
-    stamp_data_tenant(name, tenant_for_new_instance(
-        inst, permit={"tenant": chosen_tenant}))
+    # The identity BEFORE any path is touched (RFC-0026 3.1): the
+    # directory hangs off it, so it has to be settled first. Handed in
+    # by the artifact path, which already had to know it to file the
+    # uploaded package.
+    ident = getattr(args, "ident", None) or instance_identity(
+        reg, name, tenant_for_new_instance(inst, permit={"tenant": chosen_tenant}),
+        local)
+    os.makedirs(instance_dir(name, ident), exist_ok=True)
+    # The marker of 0.1.56 is written for as long as any instance still
+    # lives in the flat layout. Under the tenant tree the path itself
+    # says whose data this is, so the marker is redundant there -- and
+    # the migration is what makes it so.
+    if instance_dir(name, ident).startswith(APPS_DIR):
+        stamp_data_tenant(name, ident["tenant"])
 
     # stable per-instance secret, never inside storage mounts. Existing
     # values win over manifest defaults: a redeploy must not undo what
     # the operator configured ('oaap app config').
-    env = load_env(name)
+    env = load_env(name, ident)
     env.setdefault("OAAP_APP_SECRET", secrets.token_hex(32))
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
-    save_env(name, env)
+    save_env(name, env, ident)
 
     # a granted non-HTTP endpoint (RFC-0015) survives redeploy like the
     # address and visibility do — the operator's decision to open a port
@@ -2967,7 +3211,8 @@ def _install_from_dir(pkg, args, source):
 
     # per-instance storage, writable for the container user (guarantee 4);
     # every service container lands on the instance's own network (RFC-0016)
-    recreate_instance_containers(name, services, m.get("storage") or [], granted)
+    recreate_instance_containers(name, services, m.get("storage") or [], granted,
+                                 inst=ident)
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance
@@ -2993,7 +3238,12 @@ def _install_from_dir(pkg, args, source):
         # customer to another, so the existing value always wins. From
         # 0.2 a creation permit may name a different tenant here; today
         # there is only one to name.
-        "tenant": tenant_for_new_instance(inst, permit={"tenant": chosen_tenant}),
+        "tenant": ident["tenant"],
+        # The identity everything on disk hangs off (RFC-0026 3.1).
+        # Minted once and never changed -- not by a redeploy, not by a
+        # rename, not by renaming the tenant. It is the reason a rename
+        # is a rename and not a data migration.
+        "id": ident["id"],
         # What this instance is called INSIDE its tenant (RFC-0025
         # 8.1). The registry KEY carries the tenant's frozen short name
         # so identifiers cannot collide across customers; this is the
@@ -3088,9 +3338,21 @@ def cmd_list(_args):
     reg = load_registry()
     if not reg["instances"]:
         print("No app instances installed.")
-        return
     for name, i in sorted(reg["instances"].items()):
         print(f"{name}: {i['app_name']} {i['version']} [{i['channel']}] port {i['port']} ({i['container']})")
+    # Data an operator still owes somebody an answer about. It used to
+    # be invisible: `oaap app remove` said where it kept it, once, and
+    # after that nothing ever mentioned it again.
+    kept = reg.get("retained") or {}
+    if kept:
+        print("")
+        print("Data left behind by removed instances:")
+        for v in sorted(kept.values(), key=lambda x: x.get("name", "")):
+            label = tenant_label(v.get("tenant"))
+            print(f"  {v.get('name', '?')}"
+                  + (f" (tenant '{label}')" if label and label != DEFAULT_TENANT_LABEL else "")
+                  + f" — removed {v.get('removed', '?')[:10]}, "
+                    f"reinstalling under the same name recovers it")
 
 
 def remove_instance(reg, name, purge):
@@ -3105,6 +3367,7 @@ def remove_instance(reg, name, purge):
     # links others declared to it get torn down.
     partners = app_link_partners(reg, name)
     inst = reg["instances"].pop(name)
+    data_dir = instance_dir(name, inst)
     # drop any link this instance held from the OTHER side's registry entry
     for other in reg["instances"].values():
         if name in (other.get("links") or []):
@@ -3127,10 +3390,26 @@ def remove_instance(reg, name, purge):
     reload_gateway()
     drop_token(name, "instance removed")
     grants_drop_for(name, "instance removed")
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    local = instance_name(name, inst)
+    kept = reg.setdefault("retained", {})
     if purge:
-        shutil.rmtree(os.path.join(APPS_DIR, name), ignore_errors=True)
-        return f"removed '{name}' including data"
-    return f"removed '{name}'; data kept at {os.path.join(APPS_DIR, name)}"
+        shutil.rmtree(data_dir, ignore_errors=True)
+        kept.pop(retained_key(tid, local), None)
+        save_registry(reg)
+        return f"removed '{local}' including data"
+    # What is left behind, and under which identity. Without this note
+    # the data would be unreachable the moment the registry entry is
+    # gone: the directory hangs off the instance id, and a reinstall
+    # would mint a new one. The promise in the sentence below -- that
+    # reinstalling under the same name finds its data again -- is kept
+    # by exactly this record (RFC-0026 3.2).
+    if inst.get("id"):
+        kept[retained_key(tid, local)] = {
+            "id": inst["id"], "name": local, "tenant": tid,
+            "app_name": inst.get("app_name", ""), "removed": _iso_now()}
+        save_registry(reg)
+    return f"removed '{local}'; data kept at {data_dir}"
 
 
 def cmd_purge(args):
@@ -3151,13 +3430,33 @@ def cmd_purge(args):
     be able to see.
     """
     name = args.name
-    if name in load_registry()["instances"]:
+    reg = load_registry()
+    if name in reg["instances"]:
         die(f"'{name}' is an installed instance — remove it first "
             f"('oaap app remove {name} --purge' deletes it with its data)")
-    held = retained_data_tenant(name)
-    if held is None:
-        die(f"no data left behind under the name '{name}'")
-    d = instance_dir(name)
+
+    # Two places to look, because two layouts exist while the migration
+    # is unfinished: a note left by `oaap app remove` (the tenant tree),
+    # and a bare directory under the old flat layout.
+    matches = [(k, v) for k, v in (reg.get("retained") or {}).items()
+               if v.get("name") == name]
+    if len(matches) > 1:
+        print(f"Several tenants left data behind under the name '{name}':")
+        for k, v in sorted(matches):
+            print(f"  tenant '{tenant_label(v.get('tenant'))}' — removed "
+                  f"{v.get('removed', '?')}")
+        die("name the tenant: oaap app purge <name> --tenant <label> --yes")
+    if matches:
+        rkey, rec = matches[0]
+        held = rec.get("tenant") or ""
+        d = os.path.join(tenant_dir(held), "instances", rec["id"])
+    else:
+        rkey, rec = "", None
+        held = retained_data_tenant(name)
+        if held is None:
+            die(f"no data left behind under the name '{name}'")
+        d = os.path.join(APPS_DIR, name)
+
     if not args.yes:
         label = tenant_label(held) if held else ""
         whose = f"tenant '{label}'" if label else "an unknown tenant"
@@ -3167,9 +3466,151 @@ def cmd_purge(args):
         print(f"Repeat with --yes to carry it out: oaap app purge {name} --yes")
         return
     shutil.rmtree(d, ignore_errors=True)
+    if rkey:
+        reg.setdefault("retained", {}).pop(rkey, None)
+        save_registry(reg)
     audit_tenant("instance.purge", held or None, subject=name,
                  who=os.environ.get("SUDO_USER") or "root")
     print(f"Deleted the data left behind under '{name}' ({d}).")
+
+
+def rekey_instance(reg, old_key, new_key, grace):
+    """Move an instance from one node key to another (RFC-0026 3.5).
+
+    Everything node-scoped is keyed by the key, so all of it moves
+    together: the registry entry, the deploy token, any creation permit,
+    the links other instances declared to it, the containers and the
+    per-app network. The DATA does not move -- it hangs off the
+    instance's identity, which is the whole reason this is offerable.
+
+    The old key keeps answering the deploy hook for `grace` days.
+    """
+    inst = reg["instances"].pop(old_key)
+    # Pin the name BEFORE the key moves. An instance from before 0.1.58
+    # has no stored name and falls back to its key -- so re-keying it
+    # would silently rename it too, and its address would follow. Caught
+    # by test_tenant_boundary the first time a tenant rename re-keyed
+    # anything (2026-09-02).
+    inst["name"] = instance_name(old_key, inst)
+    entry = {"key": old_key, "until": _in_days(grace)} if grace else None
+    keys = [f for f in (inst.get("former_keys") or [])
+            if str(f.get("until", "")) > _iso_now() and f.get("key") != new_key]
+    if entry:
+        keys.append(entry)
+    inst["former_keys"] = keys
+    reg["instances"][new_key] = inst
+
+    # Links others declared TO this instance name the key.
+    for other in reg["instances"].values():
+        links = other.get("links") or []
+        if old_key in links:
+            other["links"] = [new_key if x == old_key else x for x in links]
+
+    old_site = os.path.join(CADDY_APPS_DIR, f"{old_key}.caddy")
+    if os.path.isfile(old_site):
+        os.remove(old_site)
+
+    # A record that never got containers -- one restored from a backup,
+    # or half-installed -- has nothing to rebuild, and saying so beats
+    # failing a rename over it.
+    if inst.get("image") or inst.get("services"):
+        # Old containers and network first: their names come from the
+        # key, and two sets under two names would both be running.
+        for svc in instance_services(inst):
+            subprocess.run(["docker", "rm", "-f", svc["container"]],
+                           capture_output=True, text=True)
+        remove_app_network(old_key)
+        # The stored service list carries container names built from the
+        # old key; they are rebuilt from the new one.
+        services = instance_services(inst)
+        for svc in services:
+            svc["container"] = (f"oaap-app-{new_key}" if len(services) == 1
+                                else f"oaap-app-{new_key}-{svc['service']}")
+        recreate_instance_containers(new_key, services,
+                                     inst.get("storage") or [],
+                                     inst.get("endpoints") or [], inst=inst)
+        inst["services"] = services
+        inst["container"] = services[0]["container"]
+
+    token_rekey(old_key, new_key)
+    grants_rekey(old_key, new_key)
+    save_registry(reg)
+    return inst
+
+
+def cmd_rename(args):
+    """Give an instance a different name (RFC-0026 3.3).
+
+    What changes: what the portal shows, what the address publishes, and
+    the node key every identifier is built from. What does NOT change:
+    the data, because it hangs off the instance's identity and not off
+    any name. That is what turns this from a migration into a restart.
+    """
+    old, new = args.name, (args.target or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", new):
+        die("instance name: lowercase letters, digits and hyphens")
+    reg = load_registry()
+    key = old if old in reg["instances"] else ""
+    if not key:
+        for k, i in reg["instances"].items():
+            if instance_name(k, i) == old:
+                key = k
+                break
+    if not key:
+        die(f"no instance named '{old}'")
+    inst = reg["instances"][key]
+    tid = resolve_tenant(inst.get("tenant"))
+    local = instance_name(key, inst)
+    if new == local:
+        die(f"'{local}' is already its name")
+    taken_key, taken = find_instance(reg, tid, new)
+    if taken is not None:
+        die(f"an instance named '{new}' already exists")
+    new_key = instance_key(tid, new)
+    if new_key in reg["instances"]:
+        die(f"an instance named '{new}' already exists")
+
+    grace = max(0, int(args.grace_days))
+    host = load_external() or "<node>"
+    print(f"Renaming '{local}' to '{new}' changes what it is called and where "
+          "it answers:")
+    for a in instance_auto_hosts(key, inst, ext_host=host)[:1]:
+        print(f"  {a}  ->  {instance_auto_hosts(new_key, dict(inst, name=new), ext_host=host)[0]}")
+    print(f"  deploy hook /deploy/{key}  ->  /deploy/{new_key}")
+    if inst.get("address"):
+        print(f"  its own hostname {inst['address']} is NOT touched")
+    print("")
+    print(f"The old name keeps answering for {grace} more day(s) — the address "
+          "and the")
+    print("deploy hook both. A certificate for the new name is obtained on "
+          "first contact.")
+    print("")
+    print("The container and the network are rebuilt, so this app restarts. "
+          "Its DATA")
+    print("is not moved and not touched: it hangs off the instance's identity, "
+          "not")
+    print("off its name.")
+    if not args.yes:
+        print("")
+        die("nothing was changed — repeat with --yes when the above is what "
+            "you want")
+
+    names = [f for f in (inst.get("former_names") or [])
+             if str(f.get("until", "")) > _iso_now() and f.get("name") != new]
+    if grace:
+        names.append({"name": local, "until": _in_days(grace)})
+    inst["former_names"] = names
+    inst["name"] = new
+    rekey_instance(reg, key, new_key, grace)
+    refresh_generated_sites()
+    refresh_name_links()
+    reload_gateway()
+    audit_tenant("instance.rename", tid, subject=new, detail=f"was '{local}'",
+                 who=os.environ.get("SUDO_USER") or "root")
+    print("")
+    print(f"Renamed. '{new}' answers at "
+          f"{instance_auto_hosts(new_key, inst, ext_host=host)[0]}"
+          + (f", and at the old name for {grace} more day(s)." if grace else "."))
 
 
 def cmd_remove(args):
@@ -3706,6 +4147,20 @@ def drop_token(name, reason):
         print(f"Deploy token for '{name}' invalidated ({reason}).")
 
 
+def token_rekey(old, new):
+    """Carry a deploy token over to a renamed instance.
+
+    Dropping it instead would be the safe-looking choice and the wrong
+    one: a rename is not a change of who may deploy, and forcing a new
+    token would send an operator to re-paste a secret into a pipeline
+    for a reason that has nothing to do with trust.
+    """
+    tokens = load_tokens()
+    if old in tokens:
+        tokens[new] = tokens.pop(old)
+        save_tokens(tokens)
+
+
 def audit_deploy(entry):
     import datetime
     entry["when"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3951,13 +4406,13 @@ def package_root(unpacked, path=""):
         "of the ZIP (or in a single top-level folder)")
 
 
-def artifact_dir(name):
-    return os.path.join(instance_dir(name), "artifacts")
+def artifact_dir(name, inst=None):
+    return os.path.join(instance_dir(name, inst), "artifacts")
 
 
-def artifact_list(name):
+def artifact_list(name, inst=None):
     """Retained artifacts, newest first."""
-    d = artifact_dir(name)
+    d = artifact_dir(name, inst)
     try:
         files = [f for f in os.listdir(d) if f.endswith(".zip")]
     except OSError:
@@ -3966,9 +4421,9 @@ def artifact_list(name):
                   reverse=True)
 
 
-def artifact_store(name, src_path, version, sha):
+def artifact_store(name, src_path, version, sha, inst=None):
     """Keep the artifact so it stays a real source (RFC-0019 §4)."""
-    d = artifact_dir(name)
+    d = artifact_dir(name, inst)
     os.makedirs(d, exist_ok=True)
     fn = f"{version}-{sha[:12]}.zip"
     dst = os.path.join(d, fn)
@@ -3982,9 +4437,9 @@ def artifact_store(name, src_path, version, sha):
     return fn
 
 
-def artifact_prune(name, keep=ARTIFACT_KEEP):
-    d = artifact_dir(name)
-    for old in artifact_list(name)[keep:]:
+def artifact_prune(name, keep=ARTIFACT_KEEP, inst=None):
+    d = artifact_dir(name, inst)
+    for old in artifact_list(name, inst)[keep:]:
         try:
             os.remove(os.path.join(d, old))
         except OSError:
@@ -4160,6 +4615,26 @@ def grants_drop_for(instance, reason=""):
         print(f"Artifact grants for '{instance}' dropped ({reason}).")
 
 
+def grants_rekey(old, new):
+    """Carry open grants over to a renamed instance -- same reasoning as
+    token_rekey, plus one of its own: a creation permit names a key that
+    was chosen before the instance existed, and letting it point at the
+    old one would leave a licence to create something under a name that
+    is now taken."""
+    grants = _grants_prune(load_grants())
+    changed = False
+    for key in list(grants):
+        g = grants[key]
+        if g.get("instance") != old:
+            continue
+        g["instance"] = new
+        if key.startswith("pending:"):
+            grants[f"pending:{new}"] = grants.pop(key)
+        changed = True
+    if changed:
+        save_grants(grants)
+
+
 def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
                       digest, confirmed=False, create_digest=""):
     """Phase 1+2: validate the announcement, issue the upload grant.
@@ -4295,6 +4770,16 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
     A caller with nothing to verify against — the CLI, a rollback, an
     administrator creating an instance — has to say so by passing None.
     """
+    # Settled once, here, because the uploaded package is filed under
+    # the instance's identity and the install that follows must use the
+    # same one (RFC-0026 3.1). Minting it twice would file the package
+    # in one directory and start the container on another.
+    _reg = load_registry()
+    _existing = _reg["instances"].get(name)
+    _tenant = (tenant_for_new_instance(_existing, permit=permit)
+               if _existing is None else _existing.get("tenant"))
+    ident = instance_identity(_reg, name, _tenant,
+                              (permit or {}).get("name", "") or name)
     size = os.path.getsize(zip_path)
     if grant is not None:
         if size != grant.get("bytes"):
@@ -4328,7 +4813,7 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                     "announced one — announce the manifest you are shipping")
         m = yaml.safe_load(manifest_bytes.decode("utf-8"))
         version = m["app"]["version"]
-        stored = artifact_store(name, zip_path, version, sha)
+        stored = artifact_store(name, zip_path, version, sha, inst=ident)
         source = {"kind": "artifact", "version": version, "sha256": sha,
                   "stored": stored, "path": path,
                   "received": _stamp()}
@@ -4346,7 +4831,7 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
         # from the permit, which is the only record that knows it that
         # early (RFC-0025 8.1).
         ns = argparse.Namespace(package=pkg, path="", ref="",
-                                key=name,
+                                ident=ident, key=name,
                                 name=(permit or {}).get("name", "") or name,
                                 channel=channel, store_source="",
                                 tenant=(permit or {}).get("tenant", ""))
@@ -4354,11 +4839,11 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
             _install_from_dir(pkg, ns, source)
         except BaseException:
             try:
-                os.remove(os.path.join(artifact_dir(name), stored))
+                os.remove(os.path.join(artifact_dir(name, ident), stored))
             except OSError:
                 pass
             raise
-        artifact_prune(name)
+        artifact_prune(name, inst=ident)
         return version, sha
     finally:
         shutil.rmtree(unpacked, ignore_errors=True)
@@ -6284,6 +6769,17 @@ def main():
     pi.set_defaults(fn=cmd_install)
     pl = sub.add_parser("list")
     pl.set_defaults(fn=cmd_list)
+    prn = sub.add_parser("rename",
+                         help="give an instance a different name (RFC-0026)")
+    prn.add_argument("name")
+    prn.add_argument("target", help="the new name")
+    prn.add_argument("--grace-days", dest="grace_days", type=int,
+                     default=RENAME_GRACE_DAYS,
+                     help=f"how long the old name keeps answering "
+                          f"(default {RENAME_GRACE_DAYS})")
+    prn.add_argument("--yes", action="store_true",
+                     help="carry it out after reading the consequences")
+    prn.set_defaults(fn=cmd_rename)
     pr = sub.add_parser("remove")
     pr.add_argument("name")
     pr.add_argument("--purge", action="store_true")
@@ -6308,6 +6804,9 @@ def main():
     pmn = sub.add_parser("migrate-networks",
                          help="internal: isolate app networks + reconnect the gateway (RFC-0016)")
     pmn.set_defaults(fn=cmd_migrate_networks)
+    pmi = sub.add_parser("migrate-instance-dirs",
+                         help="move instance data under its tenant (RFC-0026)")
+    pmi.set_defaults(fn=cmd_migrate_instance_dirs)
     pmt = sub.add_parser("migrate-tenants",
                          help="internal: create the default tenant and stamp "
                               "what belongs to it (RFC-0022 stage 2)")
