@@ -1686,10 +1686,15 @@ INSTANCE_EDIT_BODY = """
        lässt sich nicht rückgängig machen — eine erneute Installation legt
        eine frische Instanz an.</p>
     <label class="checkline"><input type="radio" name="purge" value=""
-           checked>Daten behalten (liegen weiter auf dem Server und werden
-           bei einer Neuinstallation gleichen Namens wiederverwendet)</label>
-    <label class="checkline"><input type="radio" name="purge" value="1">Daten
-           ebenfalls <strong>unwiderruflich löschen</strong></label>
+           {{ '' if purge_wanted else 'checked' }}>Daten behalten (liegen
+           weiter auf dem Server und werden bei einer Neuinstallation
+           gleichen Namens wiederverwendet)</label>
+    <label class="checkline"><input type="radio" name="purge" value="1"
+           {{ 'checked' if purge_wanted }}>Daten ebenfalls
+           <strong>unwiderruflich löschen</strong></label>
+    {% if purge_wanted %}<p class="err" style="margin:.2rem 0 0">Die Wahl
+    <strong>Daten löschen</strong> steht noch — sie wurde durch die
+    Fehlermeldung nicht zurückgesetzt.</p>{% endif %}
     <label>Zum Bestätigen den Instanznamen eintippen: <code>{{ i.name }}</code>
       <input type="text" name="confirm" autocomplete="off" placeholder="{{ i.name }}"></label>
     <button class="secondary">Entfernen</button>
@@ -4080,13 +4085,27 @@ def _tab(default=""):
     return iv.valid_tab(request.values.get("tab"), default)
 
 
-def _inst_back(name, msg="", err=""):
-    """Post/Redirect/Get back to the instance page, same section."""
+def _inst_back(name, msg="", err="", keep=()):
+    """Post/Redirect/Get back to the instance page, same section.
+
+    `keep` names form fields whose value has to survive the round trip.
+    Post/Redirect/Get otherwise throws the whole submission away, and a
+    form that comes back at its DEFAULT after a refused submission is
+    not merely inconvenient: whoever fixes the field the message
+    complains about then submits something they did not choose. Found
+    2026-09-02 on the removal form, where "delete the data as well" fell
+    back to "keep the data" after the confirmation field was left empty
+    (Jörgs Befund).
+    """
     q = []
     if msg:
         q.append("msg=" + quote(msg))
     if err:
         q.append("err=" + quote(err))
+    for field in keep:
+        value = (request.form.get(field) or "").strip()
+        if value:
+            q.append(f"{field}=" + quote(value))
     tab = _tab()
     if tab:
         q.append("tab=" + tab)
@@ -4152,6 +4171,10 @@ def instance_detail(name):
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
+                # Carried back by _inst_back after a refused removal, so
+                # the destructive choice does not quietly revert to the
+                # safe default while the operator fixes another field.
+                purge_wanted=bool(request.args.get("purge")),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
 
@@ -4375,7 +4398,8 @@ def instance_remove(name):
     # destructive control in this UI; the host checks it a second time.
     if (request.form.get("confirm") or "").strip() != name:
         return _inst_back(name,
-                          err="Zum Entfernen bitte den Instanznamen eintippen.")
+                          err="Zum Entfernen bitte den Instanznamen eintippen.",
+                          keep=("purge",))
     res = _queue_and_wait(name, {"action": "remove",
                                  "confirm": name,
                                  "purge": bool(request.form.get("purge"))},

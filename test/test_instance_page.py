@@ -118,8 +118,10 @@ def render(tab, inst=None, **over):
         "throttle_mode": "default", "throttle_rate": "",
         "throttle_default": "300 Anfragen pro 60 Sekunden",
     }
+    purge_wanted = over.pop("purge_wanted", False)
     i.update(over)
-    return BODY.render(i=i, tabs=iv.TABS, tab=tab, msg=None, error=None)
+    return BODY.render(i=i, tabs=iv.TABS, tab=tab, msg=None, error=None,
+                       purge_wanted=purge_wanted)
 
 
 def panels(html):
@@ -293,6 +295,47 @@ _portal = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                   encoding="utf-8").read()
 ok("die Konfigurationsseite bietet ein mehrzeiliges Feld an", "<textarea" in _portal)
 ok("und traegt die Angabe aus dem Manifest weiter", '"multiline": multiline' in _portal)
+
+
+# --- die getroffene Wahl ueberlebt eine Fehlermeldung (Joerg, 02.09.) ----
+# Befund: Im Entfernen-Abschnitt "Daten loeschen" gewaehlt, den
+# Instanznamen aber nicht eingetippt -> Fehlermeldung -> und die Wahl
+# stand wieder auf "Daten behalten". Wer dann nur den Namen nachtraegt
+# und erneut klickt, loest etwas anderes aus, als er gewaehlt hat. Die
+# sichere Richtung, aber die falsche Antwort: eine Wahl, die sich hinter
+# dem Ruecken des Bedieners aendert, ist ein Fehler, kein Schutz.
+print("")
+print("Der Entfernen-Abschnitt")
+
+
+def flat(html):
+    return " ".join(html.split())
+
+
+vorgabe = flat(render("verwaltung"))
+ok("vorgabegemaess steht die Wahl auf 'Daten behalten'",
+   'name="purge" value="" checked' in vorgabe,
+   "die sichere Vorgabe bleibt die Vorgabe")
+ok("und 'Daten loeschen' ist dann nicht gesetzt",
+   'name="purge" value="1" checked' not in vorgabe)
+
+erneut = flat(render("verwaltung", purge_wanted=True))
+ok("nach einer Fehlermeldung steht 'Daten loeschen' weiterhin",
+   'name="purge" value="1" checked' in erneut, erneut[:200])
+ok("und 'Daten behalten' ist dann NICHT gesetzt",
+   'name="purge" value="" checked' not in erneut, erneut[:200])
+ok("die Seite sagt ausdruecklich, dass die Wahl noch steht",
+   "steht noch" in erneut)
+ok("ohne Fehlermeldung erscheint dieser Hinweis nicht",
+   "steht noch" not in vorgabe)
+
+_portal_src = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "platform", "services", "portal",
+                                   "app.py"), encoding="utf-8").read()
+ok("der Umweg ueber Post/Redirect/Get traegt das Feld mit",
+   'keep=("purge",)' in _portal_src and "def _inst_back(name, msg=" in _portal_src
+   and "keep=()" in _portal_src,
+   "sonst geht die Wahl beim Weiterleiten verloren")
 
 print(f"\n{'ALLE PRUEFUNGEN BESTANDEN' if not fails else str(fails) + ' FEHLER'}")
 sys.exit(1 if fails else 0)
