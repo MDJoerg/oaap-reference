@@ -177,6 +177,23 @@ check("auch die LAN-Adresse der Instanz ist eingegrenzt",
       f"&tenant={KUNDE}" in site,
       "sonst waere der Umweg ueber den Port die Luecke")
 
+# RFC-0027 D5: dieselbe erzeugte Datei sagt jetzt auch, WELCHE Instanz
+# das ist -- damit ein API-Schluessel auf eine App begrenzt werden kann.
+# Geprueft wird hier nur die Erzeugung; was identity damit macht, steht
+# in test_api_keys.py.
+body_i = "\n".join(m.site_body(reg["instances"]["viewer"]["routes"],
+                                "oaap-viewer", 8080, tenant=KUNDE,
+                                scope="viewer"))
+check("jede angemeldete Route nennt auch die Instanz (RFC-0027 D5)",
+      "&instance=viewer" in body_i)
+check("die oeffentliche Route nennt sie nicht",
+      body_i.count("&instance=viewer") == 1,
+      "dort gibt es keine Sitzung und keinen Schluessel einzuordnen")
+check("ohne Instanzangabe wird der Parameter weggelassen",
+      "&instance=" not in body,
+      "ein begrenzter Schluessel scheitert dann geschlossen -- das ist die "
+      "richtige Richtung fuer eine Datei von vor dieser Fassung")
+
 check("was gespeichert ist, wird durchgereicht — nicht was aufloest",
       m.instance_tenant_ref(reg["instances"]["verwaist"])
       == "00000000-0000-4000-8000-000000000000",

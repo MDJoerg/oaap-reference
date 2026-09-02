@@ -1363,7 +1363,7 @@ def _tenant_write_common(label, action):
 
 
 def cmd_migrate_tenant_routes(_args):
-    """Put the tenant boundary into gateway sites written before 0.2.
+    """Put the generated parameters into sites written before them.
 
     Every authenticated route is verified against its instance's tenant
     (spec 3.1), and that parameter is generated INTO the site files. A
@@ -1390,14 +1390,22 @@ def cmd_migrate_tenant_routes(_args):
         # and found stale again -- it has no session to scope and will
         # never grow the parameter. (Found on oaap-test, 2026-08-29:
         # forgejo was rewritten by every run.)
-        if "/verify?" not in body or "&tenant=" in body:
+        if "/verify?" not in body:
+            continue
+        # Two parameters are generated into every authentication call
+        # now: the tenant (0.2) and the instance (RFC-0027 D5, so a key
+        # can be limited to one app). A site missing either is rewritten
+        # once. Both are carried by the same step rather than a second
+        # near-identical one -- a migration that only ever regenerates
+        # sites should stay one migration.
+        if "&tenant=" in body and "&instance=" in body:
             continue
         stale.append((name, inst, path))
     if not stale:
         return
     print("")
-    print("Adding the tenant boundary to the gateway sites "
-          "(oaap.core.tenant 0.2) ...")
+    print("Bringing the gateway sites up to date (tenant boundary, "
+          "instance scope) ...")
     for name, inst, path in stale:
         with open(path, "w", encoding="utf-8") as f:
             f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
@@ -2001,6 +2009,13 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
                 uri += f"&groups={','.join(sorted(set(groups)))}"
             if tenant:
                 uri += f"&tenant={tenant}"
+            # RFC-0027 D5: which instance this is, so an API key can be
+            # limited to one app. A key WITHOUT a limit ignores this; a
+            # key WITH one refuses wherever the parameter is absent, so
+            # a site generated before this version fails closed rather
+            # than quietly granting the whole node.
+            if scope:
+                uri += f"&instance={scope}"
             lines.append("\t\tforward_auth identity:8000 {")
             lines.append(f"\t\t\turi {uri}")
             lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
@@ -3951,6 +3966,158 @@ def _identity_exec(script, env=None):
     except subprocess.CalledProcessError as e:
         die(f"cannot reach the identity container ({IDENTITY_CONTAINER}): "
             f"{(e.stderr or str(e)).strip()}")
+
+
+def _key_row(k):
+    scope = k.get("instance") or "all instances"
+    used = (k.get("last_used") or "")[:10] or "never used"
+    state = "REVOKED" if k.get("revoked") else f"until {k['expires'][:10]}"
+    return (f"{k['id']:<10} {k['principal']:<22} {','.join(k['roles']):<24} "
+            f"{scope:<20} {state:<18} {used}")
+
+
+def cmd_machine(args):
+    """Machine principals (RFC-0027 3.1) -- users that cannot log in.
+
+    Deliberately its own verb even though the storage is the shared
+    user store: creating one is a different act from creating a person
+    (there is no password to set, and there never will be).
+    """
+    if args.action == "list":
+        out = _identity_exec(
+            "import json, app as m\n"
+            "print(json.dumps([m.public_user(u) for u in m.load_users()\n"
+            "                  if u.get('kind') == 'machine']))\n")
+        machines = json.loads(out)
+        if not machines:
+            print("No machine principals on this node.")
+            return
+        for u in machines:
+            groups = ",".join(u.get("groups") or []) or "-"
+            status = "active" if u["active"] else "INACTIVE"
+            print(f"{u['username']:<24} roles={','.join(u['roles']):<24} "
+                  f"groups={groups:<18} {status}")
+        return
+
+    name = (args.name or "").strip().lower()
+    if not name:
+        die("'machine add' needs a name, e.g. 'oaap machine add terminal-3'")
+    roles = sorted({r.strip() for r in (args.roles or "user").split(",")
+                    if r.strip()})
+    if "server_admin" in roles:
+        die("a machine principal may not hold server_admin (RFC-0027 D2)")
+    groups = sorted({g.strip().lower() for g in (args.groups or "").split(",")
+                     if g.strip()})
+    tid = resolve_tenant(args.tenant or "") if args.tenant else ensure_default_tenant()
+    if tid is None:
+        die(f"this node has no tenant '{args.tenant}'")
+    out = _identity_exec(
+        "import json, os, sys, app as m\n"
+        "users = m.load_users()\n"
+        "name = os.environ['OAAP_M_NAME']\n"
+        "if m.find_user(users, name):\n"
+        "    print('exists', file=sys.stderr); sys.exit(1)\n"
+        "users.append({'username': name, 'display_name': os.environ['OAAP_M_TITLE'],\n"
+        "              'password_hash': '', 'kind': 'machine',\n"
+        "              'roles': json.loads(os.environ['OAAP_M_ROLES']),\n"
+        "              'groups': json.loads(os.environ['OAAP_M_GROUPS']),\n"
+        "              'tenant': os.environ['OAAP_M_TENANT'], 'active': True})\n"
+        "m._save(m.USERS_FILE, users)\n"
+        "print('ok')\n",
+        {"OAAP_M_NAME": name, "OAAP_M_TITLE": args.title or "",
+         "OAAP_M_ROLES": json.dumps(roles), "OAAP_M_GROUPS": json.dumps(groups),
+         "OAAP_M_TENANT": tid})
+    if "ok" not in out:
+        die(f"a principal named '{name}' already exists")
+    audit_tenant("machine.create", tid, subject=name,
+                 detail="roles: " + ",".join(roles),
+                 who=os.environ.get("SUDO_USER") or "root")
+    print(f"Machine principal '{name}' created in tenant "
+          f"'{tenant_label(tid) or 'default'}' with roles {','.join(roles)}.")
+    print("It has no password and cannot use the login form. Give it a key:")
+    print(f"  sudo oaap key issue {name}")
+
+
+def cmd_key(args):
+    """API keys (RFC-0027). The secret is printed once and never again."""
+    if args.action == "list":
+        out = _identity_exec(
+            "import json, app as m\n"
+            "print(json.dumps([m.public_key(k) for k in m.load_keys()]))\n")
+        keys = json.loads(out)
+        if not keys:
+            print("No API keys on this node.")
+            return
+        print(f"{'ID':<10} {'PRINCIPAL':<22} {'ROLES':<24} {'SCOPE':<20} "
+              f"{'VALID':<18} LAST USED")
+        for k in sorted(keys, key=lambda k: (k["revoked"], k["principal"])):
+            print(_key_row(k))
+        return
+
+    if args.action == "revoke":
+        if not args.name:
+            die("'key revoke' needs a key id -- see 'oaap key list'")
+        out = _identity_exec(
+            "import json, os, app as m\n"
+            "rec = m.revoke_key(os.environ['OAAP_K_ID'])\n"
+            "print(json.dumps(m.public_key(rec) if rec else None))\n",
+            {"OAAP_K_ID": args.name})
+        rec = json.loads(out)
+        if rec is None:
+            die(f"no key with id '{args.name}'")
+        audit_tenant("key.revoke", rec.get("tenant") or "",
+                     subject=rec["principal"], detail=f"key {rec['id']}",
+                     who=os.environ.get("SUDO_USER") or "root")
+        print(f"Key {rec['id']} for '{rec['principal']}' is revoked. Every "
+              "request presenting it fails from now on.")
+        return
+
+    # issue
+    if not args.name:
+        die("'key issue' needs a principal, e.g. 'oaap key issue terminal-3'")
+    roles = sorted({r.strip() for r in (args.roles or "user").split(",")
+                    if r.strip()})
+    out = _identity_exec(
+        "import json, os, sys, app as m\n"
+        "try:\n"
+        "    rec, secret = m.issue_key(m.load_users(), os.environ['OAAP_K_P'],\n"
+        "        json.loads(os.environ['OAAP_K_ROLES']), os.environ['OAAP_K_INST'],\n"
+        "        os.environ['OAAP_K_LABEL'], int(os.environ['OAAP_K_DAYS']), 'root')\n"
+        "except ValueError as e:\n"
+        "    print(str(e), file=sys.stderr); sys.exit(1)\n"
+        "print(json.dumps({'key': m.public_key(rec), 'secret': secret}))\n",
+        {"OAAP_K_P": args.name, "OAAP_K_ROLES": json.dumps(roles),
+         "OAAP_K_INST": args.instance or "", "OAAP_K_LABEL": args.label or "",
+         "OAAP_K_DAYS": str(args.days)})
+    res = json.loads(out)
+    rec, secret = res["key"], res["secret"]
+    audit_tenant("key.issue", rec.get("tenant") or "", subject=rec["principal"],
+                 detail=f"key {rec['id']}, roles: " + ",".join(rec["roles"]),
+                 who=os.environ.get("SUDO_USER") or "root")
+    print("")
+    print(f"Key {rec['id']} for '{rec['principal']}', roles "
+          f"{','.join(rec['roles'])}, valid until {rec['expires'][:10]}.")
+    if rec.get("instance"):
+        print(f"Limited to instance '{rec['instance']}' -- it is refused "
+              "anywhere else.")
+    else:
+        print("NOT limited to an instance. It reaches everything its roles "
+              "allow --")
+        print("and every app it reaches SEES this header, exactly as it sees "
+              "a session")
+        print("cookie today. Limit it with --instance unless something "
+              "really needs")
+        print("more than one app.")
+    print("")
+    print("  " + secret)
+    print("")
+    print("This is the ONLY time the secret is shown. It is stored hashed; "
+          "nobody,")
+    print("including this machine, can print it again. Lost it? Issue a new "
+          "one and")
+    print(f"revoke this: sudo oaap key revoke {rec['id']}")
+    print("")
+    print("Use it as:  Authorization: Bearer " + "oaapk_" + rec["id"] + "_...")
 
 
 def cmd_user(args):
@@ -6922,6 +7089,29 @@ def main():
     pth.add_argument("rate", nargs="?",
                      help="<requests>/<seconds> per client address, e.g. 300/60")
     pth.set_defaults(fn=cmd_throttle)
+    pm = sub.add_parser("machine", help="machine principals (RFC-0027) -- "
+                        "accounts that authenticate by key, never by password")
+    pm.add_argument("action", choices=["add", "list"])
+    pm.add_argument("name", nargs="?")
+    pm.add_argument("--roles", default="user",
+                    help="comma-separated, default 'user'; server_admin refused")
+    pm.add_argument("--groups", default="",
+                    help="comma-separated visibility groups (RFC-0007)")
+    pm.add_argument("--tenant", default="",
+                    help="tenant label or id; default is this node's default tenant")
+    pm.add_argument("--title", default="", help="display name")
+    pm.set_defaults(fn=cmd_machine)
+    pk = sub.add_parser("key", help="API keys (RFC-0027) -- issue, list, revoke")
+    pk.add_argument("action", choices=["issue", "list", "revoke"])
+    pk.add_argument("name", nargs="?",
+                    help="principal for 'issue', key id for 'revoke'")
+    pk.add_argument("--roles", default="user", help="comma-separated")
+    pk.add_argument("--instance", default="",
+                    help="limit the key to one instance (recommended)")
+    pk.add_argument("--label", default="", help="what this key is for")
+    pk.add_argument("--days", type=int, default=90,
+                    help="validity in days (1-365, default 90)")
+    pk.set_defaults(fn=cmd_key)
     pu = sub.add_parser("user")
     pu.add_argument("action", choices=["list", "password"])
     pu.add_argument("username", nargs="?")

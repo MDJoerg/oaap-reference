@@ -21,7 +21,11 @@ from flask import Flask, redirect, render_template_string, request, session
 from flask.sessions import SecureCookieSessionInterface
 from werkzeug.security import check_password_hash, generate_password_hash
 
-DATA_DIR = "/data"
+# The mount inside the container. Overridable only so that a test can
+# drive this service without inventing a /data on the developer's
+# machine -- the variable is never set in production, and appctl reads
+# its own data directory the same way.
+DATA_DIR = os.environ.get("OAAP_IDENTITY_DATA_DIR", "/data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
@@ -44,6 +48,24 @@ USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
 # Free-form visibility tags (RFC-0007) — no registry, a group exists
 # the moment any user carries it. Kept short and simple like usernames.
 GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
+
+# API keys (RFC-0027). A key is the second way to answer the one
+# question /verify asks -- WHICH PRINCIPAL IS THIS -- and nothing after
+# that answer knows the difference: roles, visibility groups, tenant and
+# the two headers are the same code for a cookie and for a key.
+#
+# Presented as `Authorization: Bearer oaapk_<id>_<secret>`. The id
+# travels in clear so the audit log and the portal can name a key
+# without ever holding its secret; only a hash of the secret is stored.
+KEYS_FILE = os.path.join(DATA_DIR, "api-keys.json")
+KEY_TOKEN_RE = re.compile(r"^oaapk_([0-9a-f]{8})_([A-Za-z0-9_-]{22,})$")
+KEY_DEFAULT_DAYS, KEY_MAX_DAYS = 90, 365
+# RFC-0027 D2: no key ever carries platform authority. A leaked
+# server_admin key is the whole node, and unlike a password it lives in
+# a config file, a CI variable, a screenshot. Enforced twice -- refused
+# at issue, and filtered again at use, because a role can be added to a
+# principal after its key was written.
+KEY_FORBIDDEN_ROLES = frozenset({"server_admin"})
 
 app = Flask(__name__)
 app.secret_key = os.environ["SESSION_SECRET"]
@@ -233,6 +255,13 @@ def load_users():
         u.setdefault("session_epoch", 0)
         # RFC-0007: free-form visibility group tags.
         u.setdefault("groups", [])
+        # RFC-0027 D1 (Joerg, 2026-09-02): machine principals are
+        # users with a kind, not a parallel species -- so tenant,
+        # roles, visibility groups, deactivation and audit all apply
+        # without a second implementation, and the tenant check stays
+        # in ONE place. A machine has no password and cannot use the
+        # login form; it authenticates by key only.
+        u.setdefault("kind", "human")
         # oaap.core.tenant 1.1: which tenant this user belongs to.
         # Empty means the default tenant — that is the reading rule for
         # every record written before tenants existed, and it is why
@@ -325,7 +354,7 @@ def public_user(u):
     """
     return {"username": u["username"], "display_name": u["display_name"],
             "roles": u["roles"], "groups": u["groups"], "active": u["active"],
-            "tenant": u.get("tenant", "")}
+            "tenant": u.get("tenant", ""), "kind": u.get("kind", "human")}
 
 
 def other_active_server_admin_exists(users, username):
@@ -377,6 +406,214 @@ def _login_succeeded(key):
     if key in table:
         del table[key]
         _save(THROTTLE_FILE, table)
+
+
+# ----------------------------------------------------------- API keys
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _in_days_iso(days):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(time.time() + days * 86400))
+
+
+def load_keys():
+    keys = _load(KEYS_FILE, [])
+    for k in keys:
+        k.setdefault("instance", "")
+        k.setdefault("label", "")
+        k.setdefault("revoked", False)
+        k.setdefault("last_used", "")
+    return keys
+
+
+def public_key(k):
+    """A key record without its hash -- for the portal and the CLI.
+
+    Same rule as public_user: the secret never leaves this module, and
+    it left exactly once, at creation.
+    """
+    return {"id": k["id"], "principal": k["principal"],
+            "tenant": k.get("tenant", ""), "roles": k["roles"],
+            "instance": k.get("instance", ""), "label": k.get("label", ""),
+            "created": k.get("created", ""), "expires": k.get("expires", ""),
+            "last_used": k.get("last_used", ""),
+            "created_by": k.get("created_by", ""),
+            "revoked": bool(k.get("revoked"))}
+
+
+def issue_key(users, principal, roles, instance, label, days, created_by):
+    """Mint one key. Returns (record, secret) -- the secret is the only
+    time the caller ever sees it.
+
+    Two ceilings, both checked here and the second one again at use
+    (RFC-0027 3.3): a key may not carry more than its PRINCIPAL holds,
+    and the caller may not grant more than they hold themselves.
+    """
+    u = find_user(users, principal)
+    if not u:
+        raise ValueError(f"Diesen Prinzipal gibt es nicht: '{principal}'.")
+    if not u["active"]:
+        raise ValueError(f"'{principal}' ist deaktiviert.")
+    wanted = {r for r in (roles or []) if r in ASSIGNABLE_ROLES}
+    if not wanted:
+        raise ValueError("Mindestens eine gueltige Rolle ist erforderlich.")
+    if wanted & KEY_FORBIDDEN_ROLES:
+        raise ValueError("Ein Schluessel darf server_admin nicht tragen "
+                         "(RFC-0027 D2).")
+    if not wanted <= set(u["roles"]):
+        raise ValueError(f"'{principal}' haelt diese Rollen selbst nicht: "
+                         + ",".join(sorted(wanted - set(u["roles"]))))
+    # `days or DEFAULT` would read 0 as "unset" and quietly hand out 90
+    # days to a caller who meant "never". Absent and zero are different
+    # answers, and only one of them is a request we refuse out loud.
+    if days is None or days == "":
+        days = KEY_DEFAULT_DAYS
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        raise ValueError("Gueltigkeit in Tagen muss eine Zahl sein.")
+    if not 1 <= days <= KEY_MAX_DAYS:
+        raise ValueError(f"Gueltigkeit: 1 bis {KEY_MAX_DAYS} Tage "
+                         "(RFC-0027 D3 -- 'nie' gibt es nicht).")
+    keys = load_keys()
+    while True:
+        kid = secrets.token_hex(4)
+        if not any(k["id"] == kid for k in keys):
+            break
+    secret = secrets.token_urlsafe(32)
+    rec = {"id": kid, "principal": principal, "tenant": u.get("tenant", ""),
+           "roles": sorted(wanted), "instance": (instance or "").strip(),
+           "label": (label or "").strip(),
+           "hash": generate_password_hash(secret),
+           "created": _now_iso(), "expires": _in_days_iso(days),
+           "last_used": "", "created_by": created_by, "revoked": False}
+    keys.append(rec)
+    _save(KEYS_FILE, keys)
+    return rec, f"oaapk_{kid}_{secret}"
+
+
+def revoke_key(kid):
+    """Immediate, by the same reasoning that produced session_epoch: a
+    credential you cannot withdraw within seconds is one you do not
+    really control. The record is kept -- a revoked key that vanished
+    would take its own history with it."""
+    keys = load_keys()
+    rec = next((k for k in keys if k["id"] == kid), None)
+    if rec is None:
+        return None
+    rec["revoked"] = True
+    rec["revoked_at"] = _now_iso()
+    _save(KEYS_FILE, keys)
+    return rec
+
+
+def _touch_key(kid):
+    """Record that a key was used -- at most once an hour.
+
+    last_used answers "is this key still needed" without archaeology,
+    which is what makes rotation possible at all. Writing it on every
+    request would put a file write in front of every single call, so
+    the resolution is deliberately coarse.
+    """
+    now = _now_iso()
+    keys = load_keys()
+    rec = next((k for k in keys if k["id"] == kid), None)
+    if rec is None or rec["last_used"][:13] == now[:13]:
+        return
+    rec["last_used"] = now
+    _save(KEYS_FILE, keys)
+
+
+def _key_refusal(code, detail, status=401):
+    """A machine gets an answer, never a redirect to a login form.
+
+    That is the one place where the two methods must NOT look alike: a
+    script following a 303 to /auth/login would receive an HTML page
+    with status 200 and call it success.
+    """
+    return (detail, status,
+            {"WWW-Authenticate": 'Bearer error="' + code
+                                 + '", error_description="' + detail + '"'})
+
+
+def _by_key(token, instance):
+    """Method `key` (RFC-0027 3.2): which principal is this bearer?"""
+    m = KEY_TOKEN_RE.fullmatch(token)
+    if not m:
+        return None, "key", _key_refusal("invalid_token",
+                                         "malformed key")
+    kid, secret = m.group(1), m.group(2)
+    # Two brakes (RFC-0010 reused): one on the key id, one on the
+    # client. The second is the one that matters -- an attacker
+    # enumerating ids never repeats one, so a per-id brake alone would
+    # never fire.
+    brakes = ["key|" + kid, "keyclient|" + _client_ip()]
+    if any(_login_blocked(b) for b in brakes):
+        return None, "key", _key_refusal("invalid_token",
+                                         "too many failed attempts", 429)
+    rec = next((k for k in load_keys() if k["id"] == kid), None)
+    if (rec is None or rec["revoked"]
+            or not check_password_hash(rec["hash"], secret)):
+        for b in brakes:
+            _login_failed(b)
+        return None, "key", _key_refusal("invalid_token",
+                                         "unknown or revoked key")
+    if rec.get("expires") and rec["expires"] <= _now_iso():
+        return None, "key", _key_refusal(
+            "invalid_token", "the key expired on " + rec["expires"][:10])
+    # Instance scoping (RFC-0027 D5). Fail CLOSED where the gateway did
+    # not say which instance this is: a site generated before this
+    # version passes no `instance`, and a scoped key must refuse there
+    # rather than silently reach everything.
+    if rec.get("instance") and rec["instance"] != instance:
+        return None, "key", _key_refusal(
+            "insufficient_scope",
+            "this key is limited to instance '" + rec["instance"] + "'", 403)
+    user = find_user(load_users(), rec["principal"])
+    if not user or not user["active"]:
+        return None, "key", _key_refusal(
+            "invalid_token", "the principal is gone or deactivated")
+    for b in brakes:
+        _login_succeeded(b)
+    _touch_key(kid)
+    # Roles come from the LIVE user store on every request, exactly as
+    # for a session (spec 2.3). A key can only ever narrow: taking a
+    # role off the principal takes it off every key it ever issued.
+    effective = sorted((set(rec["roles"]) & set(user["roles"]))
+                       - KEY_FORBIDDEN_ROLES)
+    return dict(user, roles=effective), "key", None
+
+
+def _by_session():
+    """Method `session` (RFC-0027 3.2): the browser cookie, unchanged."""
+    username = session_username()
+    user = find_user(load_users(), username) if username else None
+    if (not user or not user["active"]
+            or session.get("epoch") != user.get("session_epoch", 0)):
+        session.clear()
+        return None, "session", redirect("/auth/login", code=303)
+    return user, "session", None
+
+
+def resolve_principal(instance=""):
+    """WHICH PRINCIPAL IS THIS? -- and nothing else (RFC-0027 3.2).
+
+    An ordered list of methods, not a branch. Everything after this
+    answer -- roles, visibility groups, the tenant boundary, the two
+    headers -- is written once and shared. That is what lets a
+    customer's own identity provider become a third method later
+    instead of a rewrite.
+
+    Returns (user, method, refusal). Exactly one of user and refusal is
+    set.
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return _by_key(auth[7:].strip(), instance)
+    return _by_session()
 
 
 # Look & feel per oaap-design/docs/design-guidelines.md v0.1 (blue,
@@ -470,13 +707,16 @@ def verify():
     the true administrator sees every instance regardless of
     visibility). Roles and groups always come from the current user
     store, never from the session (spec 2.3).
+
+    Since RFC-0027 the caller may present a session cookie OR an API
+    key; resolve_principal() answers which principal it is, and
+    EVERYTHING BELOW IS UNCHANGED for both. Optional ?instance=<key>
+    lets a key be limited to one app.
     """
-    username = session_username()
-    user = find_user(load_users(), username) if username else None
-    if (not user or not user["active"]
-            or session.get("epoch") != user.get("session_epoch", 0)):
-        session.clear()
-        return redirect("/auth/login", code=303)
+    user, _method, refusal = resolve_principal(
+        request.args.get("instance", ""))
+    if refusal is not None:
+        return refusal
     required = request.args.get("roles", "")
     if required and not set(required.split(",")) & set(user["roles"]):
         return "Forbidden: missing role", 403
@@ -524,7 +764,12 @@ def login():
             has_users=bool(users)), 429
     u = find_user(users, username)
     # Generic error either way — no username enumeration (spec 4.4).
-    if u and u["active"] and check_password_hash(u["password_hash"], password):
+    # A machine principal has no password (RFC-0027 3.1) and must not
+    # be able to acquire a session by any route -- said explicitly here
+    # rather than relying on check_password_hash refusing an empty
+    # stored hash, which is a library behaviour, not a decision of ours.
+    if (u and u["active"] and u.get("kind", "human") != "machine"
+            and check_password_hash(u["password_hash"], password)):
         _login_succeeded(throttle_key)
         session["user"] = u["username"]
         session["epoch"] = u.get("session_epoch", 0)
@@ -856,6 +1101,96 @@ def _actor(body_or_args):
     return str(body_or_args.get("actor") or "").strip()
 
 
+def _key_visible(role, actor_tenant, actor_name, k):
+    """Who may see a key: the node (server_admin), one tenant
+    (tenant_admin), or one's own (anybody else).
+
+    Same three answers as users_list, and for the same reason -- a
+    portal that cannot ask "which of these are mine" would have to be
+    told, and being told is not a boundary.
+    """
+    if role == "server_admin":
+        return True
+    if role == "tenant_admin":
+        return resolve_tenant(k.get("tenant")) == actor_tenant
+    return k.get("principal") == actor_name
+
+
+@app.get("/internal/keys")
+def keys_list():
+    actor_name = _actor(request.args)
+    if not actor_name:
+        return {"error": "actor fehlt."}, 400
+    role, actor_tenant, _err = authority(actor_name)
+    keys = [k for k in load_keys()
+            if _key_visible(role, actor_tenant, actor_name, k)]
+    return {"keys": [public_key(k) for k in keys],
+            "scope": role or "self"}
+
+
+@app.post("/internal/keys")
+def keys_create():
+    """Issue one key. The secret is in this response and nowhere else,
+    ever again (RFC-0027 3.3)."""
+    body = request.get_json(force=True)
+    actor_name = _actor(body)
+    role, actor_tenant, err = authority(actor_name)
+    if not role:
+        return {"error": err or "Nicht berechtigt."}, 403
+    users = load_users()
+    principal = (body.get("principal") or "").strip()
+    target = find_user(users, principal)
+    if not target:
+        return {"error": f"Diesen Prinzipal gibt es nicht: '{principal}'."}, 404
+    # RFC-0027 D4: a tenant_admin issues inside their own tenant and
+    # nowhere else. Checked against the ACTOR'S record, never against a
+    # tenant named in the request.
+    if not may_see(role, actor_tenant, target):
+        return {"error": "Dieser Prinzipal gehoert zu einem anderen "
+                         "Mandanten."}, 403
+    actor = find_user(users, actor_name)
+    wanted = {r for r in (body.get("roles") or []) if r in ASSIGNABLE_ROLES}
+    # The second ceiling (RFC-0027 3.3): nobody hands out authority they
+    # do not hold. Without this a tenant_admin could mint a key with a
+    # role they cannot otherwise grant.
+    excess = wanted - set((actor or {}).get("roles") or [])
+    if excess:
+        return {"error": "Sie koennen keine Rolle vergeben, die Sie selbst "
+                         "nicht halten: " + ",".join(sorted(excess))}, 403
+    try:
+        rec, secret = issue_key(
+            users, principal, sorted(wanted), body.get("instance") or "",
+            body.get("label") or "", body.get("days"), actor_name)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    audit("key.issue", rec["tenant"], principal, who=actor_name, role=role,
+          detail=f"key {rec['id']}, roles: " + ",".join(rec["roles"])
+                 + (f", instance {rec['instance']}" if rec["instance"] else "")
+                 + f", expires {rec['expires'][:10]}")
+    return {"ok": True, "key": public_key(rec), "secret": secret}, 201
+
+
+@app.post("/internal/keys/<kid>/revoke")
+def keys_revoke(kid):
+    body = request.get_json(force=True, silent=True) or {}
+    actor_name = _actor(body)
+    role, actor_tenant, err = authority(actor_name)
+    if not role:
+        return {"error": err or "Nicht berechtigt."}, 403
+    rec = next((k for k in load_keys() if k["id"] == kid), None)
+    if rec is None:
+        return {"error": f"Diesen Schluessel gibt es nicht: '{kid}'."}, 404
+    if not _key_visible(role, actor_tenant, actor_name, rec):
+        return {"error": "Dieser Schluessel gehoert zu einem anderen "
+                         "Mandanten."}, 403
+    if rec["revoked"]:
+        return {"ok": True, "already": True}
+    revoke_key(kid)
+    audit("key.revoke", rec.get("tenant", ""), rec["principal"],
+          who=actor_name, role=role, detail=f"key {kid}")
+    return {"ok": True}
+
+
 @app.get("/internal/users")
 def users_list():
     """The users this actor may see (spec 2.4).
@@ -894,7 +1229,11 @@ def users_create():
         return {"error": "Benutzername: Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)."}, 400
     if find_user(users, username):
         return {"error": f"Benutzer '{username}' existiert bereits."}, 409
-    if len(body.get("password") or "") < 8:
+    # A machine principal (RFC-0027 3.1) has no password at all -- it
+    # authenticates by key and cannot use the login form. Giving it an
+    # unusable password instead would leave a hash nobody can explain.
+    kind = "machine" if (body.get("kind") == "machine") else "human"
+    if kind == "human" and len(body.get("password") or "") < 8:
         return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
     try:
         roles = _validated_roles(body.get("roles"))
@@ -921,10 +1260,18 @@ def users_create():
     if role == "tenant_admin" and NODE_WIDE_ROLES & set(roles):
         return {"error": "Ein tenant_admin darf server_admin und partner "
                          "nicht vergeben."}, 403
+    # server_admin on a machine is refused for the same reason a key
+    # may not carry it (RFC-0027 D2): nothing that authenticates from a
+    # config file should hold the node.
+    if kind == "machine" and "server_admin" in roles:
+        return {"error": "Ein Maschinen-Prinzipal darf server_admin nicht "
+                         "halten (RFC-0027 D2)."}, 400
     users.append({
         "username": username,
         "display_name": (body.get("display_name") or "").strip(),
-        "password_hash": generate_password_hash(body["password"]),
+        "password_hash": ("" if kind == "machine"
+                          else generate_password_hash(body["password"])),
+        "kind": kind,
         "roles": roles,
         "groups": groups,
         "tenant": tenant,
@@ -932,7 +1279,8 @@ def users_create():
     })
     _save(USERS_FILE, users)
     audit("user.create", tenant, username, who=actor_name, role=role,
-          detail="roles: " + ",".join(roles))
+          detail=("machine, " if kind == "machine" else "")
+                 + "roles: " + ",".join(roles))
     return {"ok": True}, 201
 
 
