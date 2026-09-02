@@ -642,6 +642,81 @@ def instance_auto_hosts(name, inst, ext_host=None):
             for p in tenant_host_prefixes(resolve_tenant((inst or {}).get("tenant")))]
 
 
+# Which tenant the DATA under an instance directory belonged to
+# (oaap.core.tenant 1.4). Not mounted into any container: only
+# `<instance-dir>/storage/<name>` is, so an app can neither read nor
+# forge this.
+TENANT_MARKER = ".tenant"
+
+
+def stamp_data_tenant(name, tid):
+    """Record on disk whose data this directory holds.
+
+    Written on every install, so a node heals forward: the file is the
+    only thing that survives `oaap app remove` without --purge, and
+    without it a directory left behind cannot be attributed to anyone.
+    """
+    if not tid:
+        return
+    path = os.path.join(instance_dir(name), TENANT_MARKER)
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(tid + "\n")
+    os.replace(tmp, path)
+
+
+def retained_data_tenant(name):
+    """Whose data is lying under this instance name.
+
+    Three answers, and they are not the same:
+
+    * ``None`` -- there is no directory. Nothing to inherit.
+    * ``""``   -- a directory without a marker: data written before
+      0.1.56, which cannot be attributed to anyone.
+    * a tenant id -- the data of that tenant.
+    """
+    d = instance_dir(name)
+    if not os.path.isdir(d):
+        return None
+    try:
+        with open(os.path.join(d, TENANT_MARKER), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def retained_data_refusal(name, tenant):
+    """Why this tenant may not take over the data left under this name.
+
+    `oaap app remove` keeps an instance's storage and its instance.env
+    by default -- deliberately, because reinstalling under the same name
+    is how an operator repairs an app without losing its data. With one
+    tenant that is exactly right.
+
+    Across tenants it is a leak. Instance names are unique per NODE and
+    not per tenant (spec 2.4), so a name one customer gives up can be
+    taken by the next -- and the install would mount the previous
+    customer's storage and read their secrets out of instance.env,
+    because existing values win over manifest defaults.
+
+    Returns a refusal string, or "" when the install may proceed. The
+    message never names the other tenant: that a name is encumbered is a
+    fact the boundary cannot hide, whose it is is not (spec 2.4).
+    """
+    held = retained_data_tenant(name)
+    if held is None or (tenant and held == tenant):
+        return ""
+    if held == "" and single_tenant():
+        # A node with one tenant has nothing to cross. This is what
+        # keeps every existing installation behaving exactly as before.
+        return ""
+    return (f"data of an earlier instance named '{name}' is still on this "
+            f"node and cannot be handed to a new one — an administrator "
+            f"removes it with 'sudo oaap app purge {name} --yes', or "
+            f"choose a different name")
+
+
 def tenant_by_label(label, include_former=True):
     """(id, record) for a label. Former labels resolve too, for as long
     as they are unexpired -- otherwise a rename would break the very
@@ -876,6 +951,20 @@ def cmd_migrate_tenants(_args):
     if stamped:
         save_registry(reg)
 
+    # And on disk, beside the data itself (1.4). The registry entry
+    # disappears when an instance is removed; the data does not, and an
+    # unattributed directory is exactly what the next tenant to take
+    # that name must not inherit. Cheap, idempotent, and it makes every
+    # instance that exists TODAY attributable -- only directories whose
+    # instance was already gone stay anonymous, and those are refused.
+    marked = 0
+    for name, inst in reg.get("instances", {}).items():
+        held = retained_data_tenant(name)
+        own = resolve_tenant(inst.get("tenant")) or tid
+        if held is not None and held != own:
+            stamp_data_tenant(name, own)
+            marked += 1
+
     grants = _grants_prune(load_grants())
     permits = 0
     for g in grants.values():
@@ -885,7 +974,7 @@ def cmd_migrate_tenants(_args):
     if permits:
         save_grants(grants)
 
-    if created or stamped or permits:
+    if created or stamped or permits or marked:
         print("")
         print("Preparing this node for tenants (RFC-0022 stage 2) ...")
         if created:
@@ -894,7 +983,11 @@ def cmd_migrate_tenants(_args):
             print(f"  {stamped} app instance(s) assigned to it.")
         if permits:
             print(f"  {permits} open creation permit(s) assigned to it.")
-        print("  Nothing changes for anyone: this node has one tenant.")
+        if marked:
+            print(f"  {marked} instance data director(ies) marked with their "
+                  f"tenant.")
+        if single_tenant():
+            print("  Nothing changes for anyone: this node has one tenant.")
 
 
 def zone_probe(label):
@@ -2611,6 +2704,14 @@ def _install_from_dir(pkg, args, source):
                      else resolve_tenant_arg(chosen))
     reg = load_registry()
     inst = reg["instances"].get(name)
+    if not inst:
+        # A NEW instance only: a redeploy keeps its own data by
+        # definition, and its tenant cannot change (see
+        # tenant_for_new_instance).
+        refusal = retained_data_refusal(
+            name, tenant_for_new_instance(None, permit={"tenant": chosen_tenant}))
+        if refusal:
+            die(refusal)
     if inst and inst["channel"] == "production" and inst["version"] == app["version"]:
         die(f"production instance '{name}' already runs version {app['version']} — bump the version (spec: redeploy semantics)")
 
@@ -2657,6 +2758,10 @@ def _install_from_dir(pkg, args, source):
     port = inst["port"] if inst else next(p for p in PORT_RANGE if p not in used)
 
     os.makedirs(instance_dir(name), exist_ok=True)
+    # Stamp before anything is written into the directory, so a crash
+    # halfway through leaves attributable data rather than anonymous data.
+    stamp_data_tenant(name, tenant_for_new_instance(
+        inst, permit={"tenant": chosen_tenant}))
 
     # stable per-instance secret, never inside storage mounts. Existing
     # values win over manifest defaults: a redeploy must not undo what
@@ -2833,6 +2938,45 @@ def remove_instance(reg, name, purge):
         shutil.rmtree(os.path.join(APPS_DIR, name), ignore_errors=True)
         return f"removed '{name}' including data"
     return f"removed '{name}'; data kept at {os.path.join(APPS_DIR, name)}"
+
+
+def cmd_purge(args):
+    """Delete data left behind by a removed instance (spec 1.4).
+
+    `oaap app remove` keeps storage and instance.env unless --purge was
+    asked for, and until 0.1.56 there was no command to get rid of them
+    afterwards -- only `rm -rf` by hand. That mattered the moment
+    instance names became reusable across tenants: the refusal to hand
+    one tenant's data to another has to name a way out, and "delete this
+    directory yourself" is not one.
+
+    Deliberately root-only and deliberately not in the portal: this
+    destroys data that a customer may still be owed, and the node
+    operator is the one who can answer for it. The deletion is written
+    to the audit log of the tenant the data belonged to (1.7) -- that
+    log is the customer's, and this is exactly the kind of act they must
+    be able to see.
+    """
+    name = args.name
+    if name in load_registry()["instances"]:
+        die(f"'{name}' is an installed instance — remove it first "
+            f"('oaap app remove {name} --purge' deletes it with its data)")
+    held = retained_data_tenant(name)
+    if held is None:
+        die(f"no data left behind under the name '{name}'")
+    d = instance_dir(name)
+    if not args.yes:
+        label = tenant_label(held) if held else ""
+        whose = f"tenant '{label}'" if label else "an unknown tenant"
+        print(f"This deletes {d} and everything in it —")
+        print(f"the storage and the configured secrets of {whose}.")
+        print("There is no undo and no backup taken here.")
+        print(f"Repeat with --yes to carry it out: oaap app purge {name} --yes")
+        return
+    shutil.rmtree(d, ignore_errors=True)
+    audit_tenant("instance.purge", held or None, subject=name,
+                 who=os.environ.get("SUDO_USER") or "root")
+    print(f"Deleted the data left behind under '{name}' ({d}).")
 
 
 def cmd_remove(args):
@@ -5903,6 +6047,12 @@ def main():
     pr.add_argument("name")
     pr.add_argument("--purge", action="store_true")
     pr.set_defaults(fn=cmd_remove)
+    ppu = sub.add_parser("purge",
+                         help="delete data left behind by a removed instance")
+    ppu.add_argument("name")
+    ppu.add_argument("--yes", action="store_true",
+                     help="carry it out after reading what is deleted")
+    ppu.set_defaults(fn=cmd_purge)
     pv = sub.add_parser("visibility")
     pv.add_argument("name")
     pv.add_argument("mode", choices=["all", "groups"])
