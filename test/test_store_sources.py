@@ -421,6 +421,43 @@ ok("an update does not bring it back",
 res = portal("frisieren", source_id=new_id)
 ok("an unknown operation is refused", not res["ok"], str(res))
 
+# --- "not readable" is not "not configured" (2026-09-02) --------------
+# The same class of bug `tenant check` had with the user store (0.1.51):
+# the source list is 0600 and owned by root, so a non-root reader saw
+# an OSError, called it "no sources", and printed "Add one with: sudo
+# oaap store add-source" on a node that had two. A reader that cannot
+# see its subject has to say so, not pass.
+import builtins  # noqa: E402
+
+real_open = builtins.open
+
+
+def refuse_sources(path, *a, **kw):
+    if str(path) == appctl.STORE_SOURCES:
+        raise PermissionError(13, "Permission denied")
+    return real_open(path, *a, **kw)
+
+
+builtins.open = refuse_sources
+try:
+    raised = False
+    try:
+        appctl.load_sources()
+    except appctl.SourcesUnreadable:
+        raised = True
+    ok("an unreadable source list raises instead of reading as empty", raised)
+    survived, out = run(appctl.cmd_store, Args(action="list"))
+    ok("'store list' fails loudly and names the way out",
+       not survived and "sudo oaap store list" in out, out)
+    ok("and never claims there are none",
+       "No store sources configured" not in out, out)
+finally:
+    builtins.open = real_open
+
+ok("a source list that is simply absent still reads as empty",
+   (os.remove(appctl.STORE_SOURCES) if os.path.exists(appctl.STORE_SOURCES)
+    else None) is None and appctl.load_sources()[0] == [])
+
 srv.shutdown()
 shutil.rmtree(DATA, ignore_errors=True)
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")

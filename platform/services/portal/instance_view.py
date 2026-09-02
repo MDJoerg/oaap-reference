@@ -40,6 +40,45 @@ CLASS_LABEL = {
 }
 
 
+# The default tenant's label is the ABSENCE of a label in a hostname
+# (oaap.core.tenant 1.2/2.4).
+DEFAULT_TENANT_LABEL = "default"
+
+
+def auto_host(name, inst, tenants, node_host):
+    """The automatic address of an instance — the name the GATEWAY uses.
+
+    `<instance>.<node>` in the default tenant, `<instance>.<label>.<node>`
+    in every other one (oaap.core.tenant 2.4). The portal has to compute
+    it exactly as the gateway writes it, or it prints and links a host
+    that answers nowhere — which is what a tenant's launchpad tile did
+    before this function existed.
+
+    Three answers, and the third is the point:
+
+    * a node with no external hostname has no automatic address at all;
+    * an instance with no tenant reference is in the default tenant
+      (2.5), and keeps the plain name;
+    * an instance naming a tenant this node does NOT have gets **no**
+      name. Fail closed, as at the gateway: the alternative is
+      publishing a customer's app under the operator's own name.
+
+    `tenants` is the node's tenant map, `{id: {"label": ...}}`.
+    """
+    if not node_host:
+        return ""
+    ref = str((inst or {}).get("tenant") or "").strip()
+    if not ref:
+        return f"{name}.{node_host}"
+    tenant = (tenants or {}).get(ref)
+    if tenant is None:
+        return ""
+    label = tenant.get("label", "")
+    if label and label != DEFAULT_TENANT_LABEL:
+        return f"{name}.{label}.{node_host}"
+    return f"{name}.{node_host}"
+
+
 def app_class(inst):
     """The instance's declared class, normalised.
 

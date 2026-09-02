@@ -199,7 +199,7 @@ LAYOUT = STYLE + """
     <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
     {% if is_user_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
-    {% if is_server_admin %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
+    {% if can_store %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
@@ -554,7 +554,8 @@ STORE_BODY = """
 </style>
 <div class="pagehead"><h1>Store</h1>
   <span><span class="muted" style="margin-right:.8rem">{{ apps|length }} von
-    {{ total }} Apps</span><a class="btn" href="/store/sources">Quellen</a></span></div>
+    {{ total }} Apps</span>{% if can_sources %}<a class="btn"
+    href="/store/sources">Quellen</a>{% endif %}</span></div>
 {% if msg %}
 <div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
 {% endif %}
@@ -625,8 +626,9 @@ STORE_BODY = """
 {% if not apps %}
 <div class="card"><p class="muted" style="margin:0">
   {% if total %}Kein Treffer — mit „Zurücksetzen" siehst Du wieder alles.
-  {% else %}Keine App gefunden. Store-Quellen verwaltet die Administration
-  auf der Maschine: <code>sudo oaap store list</code>.{% endif %}</p></div>
+  {% else %}Keine App gefunden.{% if can_sources %} Store-Quellen verwaltet
+  die Administration auf der Maschine: <code>sudo oaap store list</code>.
+  {% endif %}{% endif %}</p></div>
 {% endif %}
 <div class="tiles">
   {% for a in apps %}
@@ -660,8 +662,9 @@ STORE_BODY = """
 </div>
 <p class="muted">Nennen mehrere Quellen dieselbe App, gewinnt die höchste
 Vertrauensklasse — nicht die zuerst eingetragene Quelle (RFC-0012 §3).
-Quellen verwaltet die Administration auf der Maschine mit
-<code>sudo oaap store list|add-source|remove-source|enable|disable|trust</code>.</p>
+{% if can_sources %}Quellen verwaltet die Administration auf der Maschine mit
+<code>sudo oaap store list|add-source|remove-source|enable|disable|trust</code>.
+{% else %}Welche Quellen dieser Knoten führt, entscheidet der Betreiber.{% endif %}</p>
 """
 
 # Floorplan "Listenbericht" — store sources (RFC-0012 §7). server_admin
@@ -1933,6 +1936,10 @@ def page(body_template, title, active, status=200, **ctx):
         # node's administrator or a tenant's. On a single-tenant node
         # nobody holds tenant_admin, so this reads exactly as before.
         is_user_admin=bool(caller & {"server_admin", "tenant_admin"}),
+        # The catalogue is for whoever may install into a tenant
+        # (RFC-0022 §4); the SOURCES stay the node operator's
+        # (oaap.core.portal 2.6). Two rights, therefore two flags.
+        can_store=bool(caller & {"server_admin", "tenant_admin"}),
         show_tenant=multi,
         can_health=bool(caller & {"server_admin", "partner"}),
         version=VERSION,
@@ -1985,6 +1992,17 @@ def external_host():
             return json.load(f).get("host", "")
     except (OSError, ValueError):
         return ""
+
+
+def instance_auto_host(name, inst):
+    """The automatic address of an instance — the I/O around
+    `instance_view.auto_host`, where the rule (and the reason for it)
+    lives. Every place that prints or links an instance's generated
+    address goes through here: the tenant label belongs in that name
+    (oaap.core.tenant 2.4), and leaving it out names a host that
+    answers nowhere.
+    """
+    return iv.auto_host(name, inst, load_tenants(), external_host())
 
 
 @app.get("/edge/tls-ask")
@@ -2107,7 +2125,11 @@ def _tile_url(name, inst, host, ext, on_lan):
     # (RFC-0009), otherwise its subdomain of this node
     if inst.get("address"):
         return f"https://{inst['address']}/"
-    return f"https://{name}.{ext}/"
+    auto = instance_auto_host(name, inst)
+    # No automatic name means the record names a tenant this node does
+    # not have (see instance_auto_host). Inside, the port still answers;
+    # a link to a hostname that resolves nowhere would not.
+    return f"https://{auto}/" if auto else f"http://{host}:{inst['port']}/"
 
 
 def setup_done() -> bool:
@@ -3095,9 +3117,9 @@ def _deploy_auth(name, allow_creation=False):
 
 
 def _entry_url(name, inst):
-    ext = external_host()
-    if ext:
-        return f"https://{name}.{ext}/"
+    auto = instance_auto_host(name, inst or {})
+    if auto:
+        return f"https://{auto}/"
     # `inst` can be empty when a creation failed — then there is no port
     # and no address to name, and saying so beats a 500
     port = (inst or {}).get("port")
@@ -3488,9 +3510,37 @@ def pending_installs():
     # Both directories: since RFC-0024 the worker moves a request it
     # has taken up out of the queue, so looking only there would call an
     # install "finished" the moment it actually STARTS.
-    return {e["instance"] for e in _in_flight() if e["action"] == "install"}
+    names = {e["instance"] for e in _in_flight() if e["action"] == "install"}
+    # Same boundary as `installed` above. A name with no instance yet
+    # cannot be attributed to a tenant and stays in: it is what keeps a
+    # second click from colliding with a running install.
+    known, mine = load_instances(), visible_instances()
+    return {n for n in names if n not in known or n in mine}
 
 
+
+
+def require_store():
+    """Who may look at the catalogue and install from it.
+
+    The node's administrator, or a tenant's — RFC-0022 §4 puts
+    "install and remove app instances of their tenant" on
+    `tenant_admin`, and a catalogue they cannot open makes that right
+    unusable. What stays with the node operator is the SOURCE list
+    (2.6): choosing where packages come from is a node decision, and a
+    tenant may not add one.
+    """
+    if not (caller_roles() & {"server_admin", "tenant_admin"}):
+        return ("Zugriff verweigert: der Store erfordert die Rolle "
+                "server_admin oder tenant_admin."), 403
+    return None
+
+
+def require_store_sources():
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: Store-Quellen erfordern die Rolle "
+                "server_admin."), 403
+    return None
 
 
 def store_catalogue():
@@ -3509,8 +3559,12 @@ def store_catalogue():
             continue
         fetched.append((dict(src, name=src["name"] or data.get("name") or src["id"]),
                         data))
+    # Through the boundary, like every other list in this portal: an
+    # app installed in somebody else's tenant must not read as
+    # "installed" here (oaap.core.tenant 2.3 rule 2). A server_admin
+    # sees the node, so for them this is the whole registry.
     installed = {inst.get("app_id"): inst.get("version")
-                 for inst in load_instances().values()}
+                 for inst in visible_instances().values()}
     return merge_catalogue(fetched, installed, pending_installs(),
                            node_profiles()), errors
 
@@ -3534,6 +3588,7 @@ def store_page(msg=None, msg_ok=True, status=200):
     hidden_profile = sum(1 for e in entries if not e["profile_fit"])
     hidden_archived = sum(1 for e in entries if e["status"] == "archived")
     return page(STORE_BODY, "Store", "store", status=status,
+                can_sources="server_admin" in caller_roles(),
                 apps=shown, total=len(entries), errors=errors, f=f,
                 filtered=any(v for k, v in f.items()
                              if k not in ("all_status", "all_profiles")),
@@ -3556,8 +3611,9 @@ def store_page(msg=None, msg_ok=True, status=200):
 
 @app.get("/store")
 def store():
-    if "server_admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    denied = require_store()
+    if denied:
+        return denied
     return store_page()
 
 
@@ -3568,8 +3624,9 @@ SOURCE_WAIT_SECONDS = 20   # a small JSON file, no docker work
 def store_sources():
     """Store sources in the portal (RFC-0012 §7) — closes step 4 of
     `portal-statt-cli.md`. The CLI keeps working unchanged."""
-    if "server_admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    denied = require_store_sources()
+    if denied:
+        return denied
     return page(STORE_SOURCES_BODY, "Store-Quellen", "store",
                 sources=all_sources(), msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
@@ -3577,8 +3634,9 @@ def store_sources():
 
 @app.post("/store/sources")
 def store_sources_change():
-    if "server_admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    denied = require_store_sources()
+    if denied:
+        return denied
     op = request.form.get("op", "")
     if op not in ("add", "remove", "enable", "disable", "rename", "trust"):
         return redirect("/store/sources?err=1&msg="
@@ -3611,8 +3669,9 @@ def store_sources_change():
 def store_app(source_id, app_id):
     """Object page for one app (§6) — the reason the format carries
     presentation fields at all; without it they would be decoration."""
-    if "server_admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    denied = require_store()
+    if denied:
+        return denied
     entries, _errors = store_catalogue()
     a = next((e for e in entries
               if e["id"] == app_id and e["source"]["id"] == source_id), None)
@@ -3628,8 +3687,9 @@ def store_app(source_id, app_id):
 
 @app.post("/store/install")
 def store_install():
-    if "server_admin" not in caller_roles():
-        return "Zugriff verweigert: der Store erfordert die Rolle server_admin.", 403
+    denied = require_store()
+    if denied:
+        return denied
     app_id = request.form.get("app_id", "").strip()
     source_id = request.form.get("source_id", "").strip()
 
@@ -4044,7 +4104,7 @@ def instance_detail(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     groups = _instance_groups(inst)
     address = inst.get("address", "")
-    auto = f"{name}.{external_host()}" if external_host() else ""
+    auto = instance_auto_host(name, inst)
     source_label, source_lines = iv.source_view(inst)
     i = {"name": name, "app_name": inst.get("app_name", name),
          "version": inst.get("version", "?"),

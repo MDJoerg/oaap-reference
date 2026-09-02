@@ -742,6 +742,26 @@ def acting_tenant(username, requested=""):
     return own, "tenant_admin", ""
 
 
+def cross_tenant_refusal(action, name):
+    """What a request touching another tenant's instance is told.
+
+    Two answers, and the difference is the whole point:
+
+    * By default the instance is answered as one that does NOT EXIST.
+      Telling a tenant_admin that the name is taken elsewhere on the
+      node is already an answer across the boundary (spec 2.3 rule 2).
+    * A store install is the exception, because it would CREATE an
+      instance under that name, and a name taken on this node has to be
+      refused as taken (spec 2.4) -- the collision is the fact, the
+      owner is not. "unknown instance" there would send a tenant_admin
+      hunting for a bug in their own tenant; the portal's create path
+      has always answered this way, and the store path now agrees.
+    """
+    if action == "install":
+        return f"an instance named '{name}' already exists"
+    return "unknown instance"
+
+
 def instance_tenant_ref(inst):
     """The tenant reference to hand the gateway for an instance.
 
@@ -4322,6 +4342,10 @@ def migrate_source(entry):
     return out, out != before
 
 
+class SourcesUnreadable(Exception):
+    """The source list is there but this process may not read it."""
+
+
 def load_sources():
     """Store sources in the object form of RFC-0012 §2.
 
@@ -4330,11 +4354,20 @@ def load_sources():
     anyone runs an update. The migration reaches disk the next time
     something writes the file.
 
-    Returns (sources, removed_shipped, migrated).
+    Returns (sources, removed_shipped, migrated). Raises
+    SourcesUnreadable when the file EXISTS but this process may not read
+    it -- on a real node that means "not root", because the file is
+    0600. Reporting that as "no sources configured" is the same mistake
+    `tenant check` made with the user store (0.1.51): a reader that
+    cannot see its subject must say so, not pass.
     """
     try:
         with open(STORE_SOURCES, encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except PermissionError:
+        raise SourcesUnreadable(STORE_SOURCES)
     except (OSError, ValueError):
         data = {}
     sources, migrated, seen = [], False, set()
@@ -4642,10 +4675,7 @@ def cmd_process_deploys(_args):
         # Re-validate on the host — the spool is data, not trust.
         store_src = None
         if cross_tenant:
-            # Answered as if the instance were not there: telling a
-            # tenant_admin that the name exists elsewhere on the node is
-            # already an answer across the boundary (spec 2.3 rule 2).
-            msg = "unknown instance"
+            msg = cross_tenant_refusal(action, name)
         elif action == "install":
             # One-click store install (spec 2.6): the request names an
             # app id and at most a source id; what gets installed is
@@ -5744,12 +5774,17 @@ def source_trust(src, want):
 
 def cmd_store(args):
     """Manage store sources (RFC-0012 §2/§3/§4)."""
-    sources, removed, migrated = load_sources()
+    try:
+        sources, removed, migrated = load_sources()
+    except SourcesUnreadable:
+        die(f"cannot read the store source list ({STORE_SOURCES}) -- "
+            f"try 'sudo oaap store {args.action}'")
     target = args.target or ""
 
     if args.action == "list":
         if not sources:
-            print("No store sources configured. Add one with: sudo oaap store add-source <url>")
+            print("No store sources configured. Add one with: "
+                  "sudo oaap store add-source <url>")
         for i, s in enumerate(sources, 1):
             flags = [TRUST_LABEL[s["trust"]]]
             if not s.get("enabled", True):

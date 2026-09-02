@@ -593,6 +593,26 @@ else:
           "Certificate-Transparency" in all_page)
 
 
+print("")
+print("=== was eine Anfrage ueber die Grenze zu hoeren bekommt ===")
+
+# Zwei Antworten, und der Unterschied ist die ganze Regel. Der Anlass
+# (2026-09-02): Seit der Store auch dem tenant_admin offensteht, kann
+# eine Installation auf einen Namen treffen, den ein FREMDER Mandant
+# schon fuehrt. "unknown instance" haette den Kunden in seinem eigenen
+# Mandanten nach einem Fehler suchen lassen, den es dort nicht gibt.
+check("eine fremde Instanz gibt es fuer den Aufrufer schlicht nicht",
+      m.cross_tenant_refusal("redeploy", "studio") == "unknown instance")
+check("auch beim Entfernen und beim Konfigurieren",
+      m.cross_tenant_refusal("remove", "studio") == "unknown instance"
+      and m.cross_tenant_refusal("config", "studio") == "unknown instance")
+check("eine Installation dagegen hoert, dass der Name vergeben ist",
+      m.cross_tenant_refusal("install", "studio")
+      == "an instance named 'studio' already exists")
+check("und erfaehrt dabei nicht, wem er gehoert",
+      "tenant" not in m.cross_tenant_refusal("install", "studio")
+      and "cls" not in m.cross_tenant_refusal("install", "studio"))
+
 print(f"\n{ok} bestanden, {fail} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail else "PRUEFUNGEN FEHLGESCHLAGEN")
 sys.exit(1 if fail else 0)
