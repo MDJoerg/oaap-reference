@@ -1678,6 +1678,32 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'verwaltung' }}">
+<form method="post" action="/instances/{{ i.key }}/rename">
+  <input type="hidden" name="tab" value="verwaltung">
+  <div class="card">
+    <h2>Instanz umbenennen</h2>
+    <p>Der Name steht in der Adresse dieser Instanz. Ein neuer Name
+       aendert sie: <code>{{ i.auto_address }}</code> wird
+       <code>&lt;neuer Name&gt;{{ i.auto_suffix }}</code>. Der alte Name
+       antwortet noch <strong>{{ i.rename_grace }} Tage</strong> weiter —
+       die Adresse und die Deploy-Adresse.</p>
+    <p class="muted">Die App wird dabei <strong>neu gebaut und startet
+       neu</strong> (Sekunden). Ihre <strong>Daten werden nicht bewegt</strong>
+       und nicht angefasst: Sie haengen an der Kennung der Instanz, nicht
+       an ihrem Namen.{% if i.address %} Der eigene Hostname
+       <code>{{ i.address }}</code> bleibt unveraendert.{% endif %}</p>
+    <label>Neuer Name
+      <input type="text" name="new" autocomplete="off"
+             pattern="[a-z0-9][a-z0-9-]*" value="{{ rename_wanted }}"
+             placeholder="{{ i.name }}"></label>
+    <label>Zum Bestaetigen den heutigen Namen eintippen:
+      <code>{{ i.name }}</code>
+      <input type="text" name="confirm" autocomplete="off"
+             placeholder="{{ i.name }}"></label>
+    <button class="secondary">Umbenennen</button>
+  </div>
+</form>
+
 <form method="post" action="/instances/{{ i.key }}/remove">
   <input type="hidden" name="tab" value="verwaltung">
   <div class="card">
@@ -3801,6 +3827,7 @@ def store_install():
 # process-deploys), which updates the registry, regenerates that
 # instance's Caddy site(s) and reloads the gateway.
 
+RENAME_WAIT_SECONDS = 90   # recreates the containers and the network
 VISIBILITY_WAIT_SECONDS = 20  # registry+Caddy+reload only, no docker work
 LINK_WAIT_SECONDS = 30  # creates/removes a network and connects containers
 ENDPOINT_WAIT_SECONDS = 90  # recreates the instance's containers with a port map
@@ -4190,6 +4217,11 @@ def instance_detail(name):
          "channel_label": CHANNEL_LABELS.get(inst.get("channel", ""),
                                              inst.get("channel", "?")),
          "address_host": address or auto,
+         # For the rename card: what the address looks like today and
+         # what stays after the name is swapped out of it.
+         "auto_address": auto,
+         "auto_suffix": auto[len(local_name(name, inst)):] if auto else "",
+         "rename_grace": RENAME_GRACE_DAYS,
          "address_url": f"https://{address or auto}" if (address or auto) else "",
          "visibility_label": iv.visibility_label(inst),
          "tile_visible": iv.tile_visible(inst),
@@ -4231,6 +4263,7 @@ def instance_detail(name):
                 # the destructive choice does not quietly revert to the
                 # safe default while the operator fixes another field.
                 purge_wanted=bool(request.args.get("purge")),
+                rename_wanted=request.args.get("new", ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
 
@@ -4441,6 +4474,45 @@ def instance_throttle(name):
 
 
 REMOVE_WAIT_SECONDS = 60  # stops a container and rewrites gateway config
+
+
+RENAME_GRACE_DAYS = 30   # mirrors appctl.RENAME_GRACE_DAYS
+
+
+@app.post("/instances/<name>/rename")
+def instance_rename(name):
+    """Give an instance a different name (RFC-0026 3.3).
+
+    Typing the CURRENT name to confirm, like removal does: this changes
+    the address the app answers at, and an address this platform has
+    already paid for losing once (hub.bdt.joomp.de, 2026-08-23).
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    new = (request.form.get("new") or "").strip().lower()
+    shown = local_name(name, inst)
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", new):
+        return _inst_back(name, keep=("new",),
+                          err="Instanzname: Kleinbuchstaben, Ziffern, Bindestriche.")
+    if (request.form.get("confirm") or "").strip() != shown:
+        return _inst_back(name, keep=("new",),
+                          err="Zum Umbenennen bitte den heutigen Namen eintippen.")
+    res = _queue_and_wait(name, {"action": "rename", "new": new},
+                          RENAME_WAIT_SECONDS)
+    if res is None:
+        return redirect(f"/instances?msg={quote('Das Umbenennen laeuft noch — die Liste zeigt gleich den tatsaechlichen Stand.')}",
+                        code=303)
+    if not res.get("ok"):
+        return _inst_back(name, keep=("new",),
+                          err=res.get("message", "Umbenennen fehlgeschlagen."))
+    return redirect(f"/instances/{res.get('key') or name}"
+                    f"?tab=verwaltung&msg={quote(res.get('message', 'Umbenannt.'))}",
+                    code=303)
 
 
 @app.post("/instances/<name>/remove")

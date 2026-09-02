@@ -3538,6 +3538,55 @@ def rekey_instance(reg, old_key, new_key, grace):
     return inst
 
 
+def rename_check(reg, given, new):
+    """Resolve and validate a rename. Returns (key, error).
+
+    Shared by the CLI and the portal's host-side worker so both refuse
+    exactly the same things -- the spool is data, not trust, and a rule
+    kept in two places eventually disagrees with itself.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", new or ""):
+        return "", "instance name: lowercase letters, digits and hyphens"
+    key = given if given in reg["instances"] else ""
+    if not key:
+        for k, i in reg["instances"].items():
+            if instance_name(k, i) == given:
+                key = k
+                break
+    if not key:
+        return "", f"no instance named '{given}'"
+    inst = reg["instances"][key]
+    tid = resolve_tenant(inst.get("tenant"))
+    if instance_name(key, inst) == new:
+        return "", f"'{new}' is already its name"
+    if find_instance(reg, tid, new)[1] is not None:
+        return "", f"an instance named '{new}' already exists"
+    if instance_key(tid, new) in reg["instances"]:
+        return "", f"an instance named '{new}' already exists"
+    return key, ""
+
+
+def rename_instance(reg, key, new, grace, who="root"):
+    """Carry out a checked rename. Returns the new key."""
+    inst = reg["instances"][key]
+    tid = resolve_tenant(inst.get("tenant"))
+    local = instance_name(key, inst)
+    names = [f for f in (inst.get("former_names") or [])
+             if str(f.get("until", "")) > _iso_now() and f.get("name") != new]
+    if grace:
+        names.append({"name": local, "until": _in_days(grace)})
+    inst["former_names"] = names
+    inst["name"] = new
+    new_key = instance_key(tid, new)
+    rekey_instance(reg, key, new_key, grace)
+    refresh_generated_sites()
+    refresh_name_links()
+    reload_gateway()
+    audit_tenant("instance.rename", tid, subject=new, detail=f"was '{local}'",
+                 who=who)
+    return new_key
+
+
 def cmd_rename(args):
     """Give an instance a different name (RFC-0026 3.3).
 
@@ -3547,28 +3596,14 @@ def cmd_rename(args):
     any name. That is what turns this from a migration into a restart.
     """
     old, new = args.name, (args.target or "").strip().lower()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", new):
-        die("instance name: lowercase letters, digits and hyphens")
     reg = load_registry()
-    key = old if old in reg["instances"] else ""
-    if not key:
-        for k, i in reg["instances"].items():
-            if instance_name(k, i) == old:
-                key = k
-                break
-    if not key:
-        die(f"no instance named '{old}'")
+    key, err = rename_check(reg, old, new)
+    if err:
+        die(err)
     inst = reg["instances"][key]
     tid = resolve_tenant(inst.get("tenant"))
     local = instance_name(key, inst)
-    if new == local:
-        die(f"'{local}' is already its name")
-    taken_key, taken = find_instance(reg, tid, new)
-    if taken is not None:
-        die(f"an instance named '{new}' already exists")
     new_key = instance_key(tid, new)
-    if new_key in reg["instances"]:
-        die(f"an instance named '{new}' already exists")
 
     grace = max(0, int(args.grace_days))
     host = load_external() or "<node>"
@@ -3595,18 +3630,8 @@ def cmd_rename(args):
         die("nothing was changed — repeat with --yes when the above is what "
             "you want")
 
-    names = [f for f in (inst.get("former_names") or [])
-             if str(f.get("until", "")) > _iso_now() and f.get("name") != new]
-    if grace:
-        names.append({"name": local, "until": _in_days(grace)})
-    inst["former_names"] = names
-    inst["name"] = new
-    rekey_instance(reg, key, new_key, grace)
-    refresh_generated_sites()
-    refresh_name_links()
-    reload_gateway()
-    audit_tenant("instance.rename", tid, subject=new, detail=f"was '{local}'",
-                 who=os.environ.get("SUDO_USER") or "root")
+    rename_instance(reg, key, new, grace,
+                    who=os.environ.get("SUDO_USER") or "root")
     print("")
     print(f"Renamed. '{new}' answers at "
           f"{instance_auto_hosts(new_key, inst, ext_host=host)[0]}"
@@ -5381,6 +5406,7 @@ TENANT_AUDITED = {
     "artifact-remove": "instance.artifact",
     "promote": "instance.promote",
     "remove": "instance.remove",
+    "rename": "instance.rename",
     "token": "token.change",
     "grant": "permit.change",
     "visibility": "instance.visibility",
@@ -5889,6 +5915,26 @@ def cmd_process_deploys(_args):
                                + ("" if single_tenant()
                                   else f", tenant '{label}', deploy under "
                                        f"'{key}'"))
+        elif action == "rename":
+            # RFC-0026 3.3. The tenant boundary is already handled: a
+            # cross-tenant request never reaches here (see cross_tenant
+            # above), and the new name is checked within THIS instance's
+            # tenant, so one customer's choice of words cannot block
+            # another's.
+            new_name = str(req.get("new") or "").strip().lower()
+            key, err = rename_check(reg, name, new_name)
+            if err:
+                msg = err
+            else:
+                try:
+                    name = rename_instance(reg, key, new_name,
+                                           RENAME_GRACE_DAYS,
+                                           who=req.get("by", "root"))
+                    ok = True
+                    msg = (f"renamed to '{new_name}'; the old name keeps "
+                           f"answering for {RENAME_GRACE_DAYS} days")
+                except Exception as e:   # noqa: BLE001 - reported, not fatal
+                    msg = f"rename failed: {e}"
         elif action == "envelope":
             # An administrator confirms one specific pending announcement
             # in the portal (RFC-0019 decision 5). Bound to the manifest

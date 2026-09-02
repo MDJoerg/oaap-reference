@@ -123,9 +123,12 @@ def render(tab, inst=None, **over):
         "throttle_default": "300 Anfragen pro 60 Sekunden",
     }
     purge_wanted = over.pop("purge_wanted", False)
+    rename_wanted = over.pop("rename_wanted", "")
+    i.setdefault("auto_suffix", ".knoten.example.de")
+    i.setdefault("rename_grace", 30)
     i.update(over)
     return BODY.render(i=i, tabs=iv.TABS, tab=tab, msg=None, error=None,
-                       purge_wanted=purge_wanted)
+                       purge_wanted=purge_wanted, rename_wanted=rename_wanted)
 
 
 def panels(html):
@@ -250,7 +253,19 @@ h = render("verwaltung")
 letzter = h[h.rfind('<section class="panel '):]
 ok("„Instanz entfernen“ steht im letzten Abschnitt", "Instanz entfernen" in letzter)
 ok("und der ist sichtbar, wenn man ihn waehlt", 'class="panel active"' in letzter)
-ok("sonst steht dort nichts weiter", letzter.count("<h2>") == 1,
+# Seit RFC-0026 steht dort auch das Umbenennen: es ist von derselben
+# Klasse, weil es die Adresse aendert, unter der die App erreichbar ist.
+# Was zaehlt, ist die Reihenfolge -- das Unwiderrufliche zuletzt -- und
+# dass jede dieser Aktionen den heutigen Namen verlangt
+# (Design-Guidelines 6.2.2).
+ok("dort steht nichts Alltaegliches",
+   letzter.count("<h2>") == 2
+   and "Instanz umbenennen" in letzter, letzter.count("<h2>"))
+ok("und das Unwiderrufliche steht zuletzt",
+   letzter.index("Instanz umbenennen") < letzter.index("Instanz entfernen"))
+ok("beide verlangen den heutigen Namen",
+   letzter.count('name="confirm"') == 2)
+ok("kein taeglicher Kram daneben", letzter.count("<h2>") == 2,
    str(letzter.count("<h2>")))
 ok("der Reiter ist als heikel gekennzeichnet", "danger" in h)
 
@@ -321,6 +336,29 @@ ok("jede Aktion zeigt auf den Schluessel",
    "sonst 404, sobald Name und Schluessel auseinandergehen")
 ok("die Ueberschrift nennt den Namen des Kunden",
    "<h1>viewer</h1>" in gemischt, gemischt[:300])
+
+print("")
+print("Der Umbenennen-Abschnitt (RFC-0026)")
+
+um = render("verwaltung", key="cls-viewer", name="viewer",
+            auto_address="viewer.cls.knoten.example.de",
+            auto_suffix=".cls.knoten.example.de")
+ok("er liegt im letzten Reiter, neben dem Entfernen",
+   "/instances/cls-viewer/rename" in um and "/instances/cls-viewer/remove" in um)
+ok("die Seite zeigt, welche Adresse sich aendert",
+   "viewer.cls.knoten.example.de" in um)
+ok("sie nennt die Schonfrist des alten Namens", "30 Tage" in um)
+ok("sie sagt, dass die App neu startet", "startet" in um)
+ok("und dass die Daten nicht bewegt werden", "nicht bewegt" in um,
+   "das ist der Grund, warum das ueberhaupt anbietbar ist")
+ok("bestaetigt wird mit dem HEUTIGEN Namen",
+   'name="confirm"' in " ".join(um.split()))
+zurueck = render("verwaltung", key="cls-viewer", name="viewer",
+                 rename_wanted="modelle")
+ok("ein abgelehnter Versuch behaelt den eingetippten neuen Namen",
+   'value="modelle"' in " ".join(zurueck.split()),
+   "dieselbe Regel wie beim Entfernen -- eine Eingabe darf nicht "
+   "hinter dem Ruecken verschwinden")
 
 print("")
 print("Der Entfernen-Abschnitt")
