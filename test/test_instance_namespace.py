@@ -193,6 +193,17 @@ with contextlib.redirect_stdout(buf):
     m.cmd_migrate_tenants(None)
 bericht = buf.getvalue()
 ok("sie vergibt fehlende Kurznamen", "short name" in bericht, bericht)
+ok("und zwar das Kuerzel selbst, nicht eine Variante davon",
+   m.tenant_slug(meier_id) == "meier"
+   and not any(m.tenant_slug(t).endswith("-2") for t in m.load_tenants()),
+   "am echten Knoten kam hier zuerst 'cls-2' heraus: die Praegung sah "
+   "den Mandanten, fuer den sie praegte, als Kollision mit sich selbst")
+vorher = m.tenant_slug(meier_id)
+with contextlib.redirect_stdout(_io.StringIO()):
+    m.cmd_migrate_tenants(None)
+ok("ein einmal gesetzter Kurzname wird von der Migration nie ueberschrieben",
+   m.tenant_slug(meier_id) == vorher,
+   "er ist eingefroren -- auch gegen die eigene Migration")
 ok("und sagt ausdruecklich, dass nichts umbenannt wurde",
    "nothing renamed" in bericht, bericht)
 reg = m.load_registry()

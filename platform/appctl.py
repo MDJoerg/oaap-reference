@@ -1047,8 +1047,14 @@ def cmd_migrate_tenants(_args):
     for t_id, t in sorted(tenants.items()):
         if t.get("slug") is not None:
             continue
+        # The label itself, not a minted one: `mint_slug` looks at what
+        # is taken, and a record without a slug counts under its own
+        # label -- so minting here made every tenant collide with
+        # itself and come out as `<label>-2`. Seen on oaapx01 within a
+        # minute of the update (2026-09-02). A label is unique per node
+        # by construction, so at migration time it IS the free slug.
         t["slug"] = ("" if t.get("label") == DEFAULT_TENANT_LABEL
-                     else mint_slug(t.get("label", ""), tenants))
+                     else t.get("label", ""))
         slugged += 1
     if slugged:
         save_tenants(tenants)
