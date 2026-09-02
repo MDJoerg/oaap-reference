@@ -201,6 +201,7 @@ LAYOUT = STYLE + """
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
     {% if can_store %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
+    {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
   <div class="userbox">
@@ -259,7 +260,8 @@ DASHBOARD_BODY = """
 USERS_LIST_BODY = """
 <div class="pagehead">
   <h1>Benutzer</h1>
-  <a class="btn" href="/users/new">Benutzer anlegen</a>
+  <span><a class="btn" href="/users/new">Benutzer anlegen</a>
+        <a class="btn" href="/users/new?kind=machine">Maschine anlegen</a></span>
 </div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
@@ -271,7 +273,8 @@ USERS_LIST_BODY = """
   {% for u in users %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/users/{{ u.username }}">{{ u.username }}</a></td>
-    <td>{{ u.display_name }}</td>
+    <td>{{ u.display_name }}{% if u.kind == 'machine' %}
+        <span class="badge">Maschine</span>{% endif %}</td>
     {% if show_tenant %}<td class="muted">{{ labels.get(u.tenant or default_tenant, "?") }}</td>{% endif %}
     <td>{{ u.roles|join(", ") }}</td>
     <td class="muted">{{ u.groups|join(", ") if u.groups else "–" }}</td>
@@ -282,7 +285,11 @@ USERS_LIST_BODY = """
 </table>
 </div>
 <p class="muted">Benutzer werden nicht gelöscht, sondern deaktiviert —
-Apps können sie in ihren Daten referenzieren.</p>
+Apps können sie in ihren Daten referenzieren. Eine <strong>Maschine</strong>
+ist ein Konto ohne Passwort: ein Terminal, ein Leser, eine Automatisierung.
+Sie meldet sich nur mit einem Schlüssel an, den Du unter
+<a href="/keys">Zugänge</a> ausstellst — und deaktivieren entwertet
+augenblicklich jeden ihrer Schlüssel.</p>
 """
 
 # Floorplan "Objektseite" (design guidelines 6.2).
@@ -344,17 +351,28 @@ USER_EDIT_BODY = """
 
 USER_NEW_BODY = """
 <a class="back" href="/users">← Zurück zur Liste</a>
-<h1>Benutzer anlegen</h1>
+<h1>{{ 'Maschine anlegen' if form.kind == 'machine' else 'Benutzer anlegen' }}</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if form.kind == 'machine' %}
+<p class="muted">Eine Maschine ist ein Konto <strong>ohne Passwort</strong> —
+ein Terminal, ein RFID-Leser, eine Automatisierung. Sie kann sich am
+Anmeldeformular nicht anmelden; sie weist sich mit einem Schlüssel aus, den
+Du gleich danach ausstellst. Gib ihr <strong>so wenige Rollen wie möglich</strong>:
+was sie darf, darf jeder, der an ihr steht oder ihren Schlüssel hat.</p>
+{% endif %}
 <form method="post" action="/users/create">
+  <input type="hidden" name="kind" value="{{ form.kind }}">
   <div class="card">
     <h2>Stammdaten</h2>
-    <label>Benutzername <input type="text" name="username" required
+    <label>{{ 'Name der Maschine' if form.kind == 'machine' else 'Benutzername' }}
+           <input type="text" name="username" required
            value="{{ form.username }}" pattern="[a-z0-9][a-z0-9._-]{1,39}"
            title="Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)"></label>
     <label>Anzeigename <input type="text" name="display_name" value="{{ form.display_name }}"></label>
+    {% if form.kind != 'machine' %}
     <label>Startpasswort (mind. 8 Zeichen) <input type="password" name="password"
            minlength="8" required autocomplete="new-password"></label>
+    {% endif %}
     {% if tenants %}
     <label>Mandant
       <select name="tenant">
@@ -383,6 +401,183 @@ USER_NEW_BODY = """
     <button>Anlegen</button>
   </div>
 </form>
+"""
+
+# Floorplan "Listenbericht" (design guidelines 6.2).
+KEYS_LIST_BODY = """
+<div class="pagehead">
+  <h1>Zugänge</h1>
+  <a class="btn" href="/keys/new">Schlüssel ausstellen</a>
+</div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if scope_note %}<p class="muted">Mandant <strong>{{ scope_note }}</strong> —
+   Du siehst die Schlüssel dieses Mandanten.</p>{% endif %}
+{% if keys %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+  <tr><th>Kennung</th><th>Prinzipal</th><th>Wofür</th><th>Rollen</th>
+      <th>Gilt für</th><th>Gültig bis</th><th>Zuletzt benutzt</th><th></th></tr>
+  {% for k in keys %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/keys/{{ k.id }}"><code>{{ k.id }}</code></a></td>
+    <td>{{ k.principal }}</td>
+    <td class="muted">{{ k.label or "–" }}</td>
+    <td>{{ k.roles|join(", ") }}</td>
+    <td class="muted">{{ k.instance or "alle Instanzen" }}</td>
+    <td>{% if k.revoked %}<span class="badge off">entzogen</span>
+        {% elif k.expired %}<span class="badge off">abgelaufen</span>
+        {% else %}{{ k.expires[:10] }}{% endif %}</td>
+    <td class="muted">{{ k.last_used[:10] if k.last_used else "nie" }}</td>
+    <td><a class="rowaction" href="/keys/{{ k.id }}">Ansehen</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}
+<div class="card"><p>Noch kein Schlüssel ausgestellt.</p>
+<p class="muted">Ein Schlüssel lässt etwas, das kein Mensch ist, mit der
+Plattform sprechen: ein Terminal, ein Leser, eine Automatisierung. Er
+beantwortet dieselbe Frage wie eine Anmeldung — <em>wer bist du</em> — und
+bekommt deshalb auch nicht mehr Rechte als der Prinzipal, für den er
+ausgestellt ist.</p></div>
+{% endif %}
+<p class="muted">Ein Schlüssel wird nicht gelöscht, sondern entzogen — was
+mit ihm geschah, bleibt nachlesbar. Entziehen wirkt sofort.</p>
+"""
+
+# Floorplan "Dialogseite" (design guidelines 6.2).
+KEY_NEW_BODY = """
+<a class="back" href="/keys">← Zurück zur Liste</a>
+<h1>Schlüssel ausstellen</h1>
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if not principals %}
+<div class="card"><p>Es gibt hier noch keinen Prinzipal, für den sich ein
+Schlüssel ausstellen ließe.</p>
+<p class="muted">Lege zuerst unter <a href="/users">Benutzer</a> eine
+<strong>Maschine</strong> an — ein Konto ohne Passwort für ein Terminal, einen
+Leser oder eine Automatisierung.</p></div>
+{% else %}
+<form method="post" action="/keys/create">
+  <div class="card">
+    <h2>Für wen</h2>
+    <label>Prinzipal
+      <select name="principal">
+        {% for u in principals %}
+        <option value="{{ u.username }}" {{ 'selected' if u.username == form.principal }}>{{ u.username }}{% if u.kind == 'machine' %} (Maschine){% endif %} — {{ u.roles|join(", ") }}</option>
+        {% endfor %}
+      </select></label>
+    <p class="muted">Der Schlüssel kann nie mehr als der Prinzipal selbst.
+       Nimmst Du ihm später eine Rolle, verliert der Schlüssel sie im selben
+       Augenblick.</p>
+    <label>Wofür ist er <input type="text" name="label" value="{{ form.label }}"
+           placeholder="z. B. Terminal Packstation 3"></label>
+  </div>
+  <div class="card">
+    <h2>Rollen</h2>
+    <p class="roles">
+      {% for r in all_roles %}
+      <label><input type="checkbox" name="roles" value="{{ r }}"
+             {{ 'checked' if r in form.roles }}>{{ r }}</label>
+      {% endfor %}
+    </p>
+    <p class="muted">server_admin steht hier nicht zur Wahl und wird auch
+       abgelehnt, wenn jemand es versucht: ein durchgesickerter Schlüssel mit
+       dieser Rolle ist der ganze Server, und ein Schlüssel liegt in einer
+       Datei, nicht in einem Kopf.</p>
+  </div>
+  <div class="card">
+    <h2>Reichweite</h2>
+    <label>Auf eine Instanz begrenzen
+      <select name="instance">
+        <option value="">— keine Begrenzung —</option>
+        {% for i in instances %}
+        <option value="{{ i.key }}" {{ 'selected' if i.key == form.instance }}>{{ i.name }}</option>
+        {% endfor %}
+      </select></label>
+    <p class="muted">Begrenze ihn, wann immer es geht. Jede App, die er
+       erreicht, <strong>sieht</strong> ihn auch — genau wie sie heute schon
+       das Sitzungs-Cookie sieht. Ein begrenzter Schlüssel gibt einer App
+       damit nichts, was sie nicht ohnehin hätte; ein unbegrenzter gibt ihr
+       seine ganze Reichweite.</p>
+    <label>Gültig für (Tage, 1–365)
+      <input type="number" name="days" min="1" max="365"
+             value="{{ form.days }}"></label>
+    <p class="muted">„Nie ablaufen" gibt es nicht. Ein Schlüssel ohne Ablauf
+       überlebt die Menschen, die ihn ausgestellt haben, und die Gründe, aus
+       denen es ihn gab.</p>
+    <button>Schlüssel ausstellen</button>
+  </div>
+</form>
+{% endif %}
+"""
+
+# Floorplan "Objektseite" (design guidelines 6.2).
+KEY_DETAIL_BODY = """
+<a class="back" href="/keys">← Zurück zur Liste</a>
+<div class="pagehead">
+  <h1>Schlüssel {{ k.id }}</h1>
+  <span class="badge {{ 'off' if k.revoked or k.expired else '' }}">
+    {{ 'entzogen' if k.revoked else ('abgelaufen' if k.expired else 'gültig') }}</span>
+</div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<div class="card">
+  <h2>Was er ist</h2>
+  <table>
+    <tr><td>Prinzipal</td><td><strong>{{ k.principal }}</strong></td></tr>
+    <tr><td>Wofür</td><td>{{ k.label or "–" }}</td></tr>
+    <tr><td>Rollen</td><td>{{ k.roles|join(", ") }}</td></tr>
+    <tr><td>Gilt für</td><td>{{ k.instance or "alle Instanzen dieses Mandanten" }}</td></tr>
+    <tr><td>Ausgestellt</td><td>{{ k.created[:10] }} von {{ k.created_by }}</td></tr>
+    <tr><td>Gültig bis</td><td>{{ k.expires[:10] }}</td></tr>
+    <tr><td>Zuletzt benutzt</td>
+        <td>{{ k.last_used[:10] if k.last_used else "nie" }}</td></tr>
+  </table>
+  <p class="muted">Das Geheimnis lässt sich nicht erneut anzeigen — gespeichert
+     ist nur ein Hash. Wurde es verloren, ist der Weg: neuen ausstellen, diesen
+     entziehen.</p>
+</div>
+{% if not k.revoked %}
+<div class="card warn">
+  <h2>Entziehen</h2>
+  <p>Das wirkt <strong>sofort</strong> und lässt sich nicht rückgängig machen.
+     Alles, was diesen Schlüssel benutzt, hört im selben Augenblick auf zu
+     funktionieren{% if k.last_used %} — zuletzt war das am
+     {{ k.last_used[:10] }}{% endif %}.</p>
+  <form method="post" action="/keys/{{ k.id }}/revoke">
+    <label>Zur Sicherheit die Kennung <code>{{ k.id }}</code> eintippen
+      <input type="text" name="confirm" autocomplete="off" required></label>
+    <button>Endgültig entziehen</button>
+  </form>
+</div>
+{% endif %}
+"""
+
+KEY_SHOWN_BODY = """
+<div class="pagehead"><h1>Schlüssel {{ k.id }}</h1></div>
+<div class="card warn">
+  <h2>Das Geheimnis — jetzt oder nie</h2>
+  <p>Dies ist der einzige Moment, in dem es zu sehen ist. Gespeichert wird
+     nur ein Hash; niemand kann es später erneut anzeigen, auch diese
+     Maschine nicht.</p>
+  <p><code style="display:block;word-break:break-all;padding:.7rem;
+     font-size:1.05rem">{{ secret }}</code></p>
+  <p class="muted">Verwendung: als Kopfzeile
+     <code>Authorization: Bearer &lt;Geheimnis&gt;</code></p>
+</div>
+<div class="card">
+  <h2>Was ausgestellt wurde</h2>
+  <table>
+    <tr><td>Prinzipal</td><td><strong>{{ k.principal }}</strong></td></tr>
+    <tr><td>Rollen</td><td>{{ k.roles|join(", ") }}</td></tr>
+    <tr><td>Gilt für</td><td>{{ k.instance or "alle Instanzen dieses Mandanten" }}</td></tr>
+    <tr><td>Gültig bis</td><td>{{ k.expires[:10] }}</td></tr>
+  </table>
+  <p class="muted">Verloren? Stelle einen neuen aus und entziehe diesen —
+     das ist der ganze Weg, es gibt kein Nachreichen.</p>
+  <a class="btn" href="/keys">Fertig</a>
+</div>
 """
 
 HEALTH_BODY = """
@@ -2253,6 +2448,22 @@ def _parse_groups(raw):
     return sorted({g.strip().lower() for g in raw.split(",") if g.strip()})
 
 
+def _key_role_choices():
+    """Roles offerable ON A KEY -- never server_admin (RFC-0027 D2).
+
+    Identity refuses it regardless; leaving it out of the form is so
+    that nobody is invited to try, the same reasoning as _role_choices
+    and the node-wide roles.
+    """
+    return [r for r in _role_choices() if r != "server_admin"]
+
+
+def _instance_choices():
+    """Instances this caller may scope a key to -- their own tenant's."""
+    return [{"key": key, "name": local_name(key, inst)}
+            for key, inst in sorted(visible_instances().items())]
+
+
 def _role_choices():
     """Which roles this caller may hand out.
 
@@ -2288,6 +2499,136 @@ def _new_user_form():
             "groups": [], "tenant": ""}
 
 
+def _key_form(**over):
+    form = {"principal": "", "roles": ["user"], "instance": "",
+            "label": "", "days": 90}
+    form.update(over)
+    return form
+
+
+def identity_keys():
+    """The keys this caller may see -- identity decides, not the portal.
+
+    Same shape as identity_users(): the portal says who is asking and
+    is told the answer. A portal that filtered the list itself would be
+    a second place where the tenant boundary lives.
+    """
+    try:
+        r = INTERNAL.get(f"{IDENTITY}/internal/keys",
+                         params={"actor": caller_name()}, timeout=5)
+        return (r.json() or {}).get("keys", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
+@app.get("/keys")
+def keys_list():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    role, mine = caller_scope()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    keys = identity_keys()
+    for k in keys:
+        k["expired"] = bool(k.get("expires")) and k["expires"] <= now
+    keys.sort(key=lambda k: (k["revoked"] or k["expired"], k["principal"]))
+    return page(KEYS_LIST_BODY, "Zugänge", "keys", keys=keys,
+                scope_note=(tenant_name(mine) if role == "tenant_admin"
+                            and multi_tenant() else ""),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.get("/keys/new")
+def keys_new():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    return page(KEY_NEW_BODY, "Schlüssel ausstellen", "keys",
+                principals=identity_users(), all_roles=_key_role_choices(),
+                instances=_instance_choices(), form=_key_form(),
+                msg=request.args.get("msg"), error=None)
+
+
+@app.post("/keys/create")
+def keys_create():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    form = _key_form(
+        principal=request.form.get("principal", "").strip(),
+        roles=request.form.getlist("roles"),
+        instance=request.form.get("instance", "").strip(),
+        label=request.form.get("label", "").strip(),
+        days=request.form.get("days", "90"))
+    resp = INTERNAL.post(f"{IDENTITY}/internal/keys",
+                         json={**form, "actor": caller_name()}, timeout=5)
+    if resp.status_code == 201:
+        body = resp.json()
+        # The secret is rendered ONCE, straight from this response, and
+        # never put in a URL: a redirect would leave it in the browser
+        # history, the access log and anything the operator pastes.
+        return page(KEY_SHOWN_BODY, "Schlüssel ausgestellt", "keys",
+                    k=body["key"], secret=body["secret"])
+    return page(KEY_NEW_BODY, "Schlüssel ausstellen", "keys",
+                status=resp.status_code, principals=identity_users(),
+                all_roles=_key_role_choices(), instances=_instance_choices(),
+                form=form, msg=None,
+                error=(resp.json() or {}).get("error",
+                                              "Ausstellen fehlgeschlagen."))
+
+
+def _find_key(kid):
+    """One key from the list identity says this caller may see.
+
+    Deliberately filtered through the SAME call as the list: a lookup
+    that read every key and then checked would be a second place where
+    the boundary lives, and the second place is the one that rots.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for k in identity_keys():
+        if k["id"] == kid:
+            k["expired"] = bool(k.get("expires")) and k["expires"] <= now
+            return k
+    return None
+
+
+@app.get("/keys/<kid>")
+def keys_detail(kid):
+    denied = require_user_admin()
+    if denied:
+        return denied
+    k = _find_key(kid)
+    if k is None:
+        return redirect("/keys?err=" + quote(
+            "Diesen Schlüssel gibt es hier nicht."), code=303)
+    return page(KEY_DETAIL_BODY, "Schlüssel " + kid, "keys", k=k,
+                error=request.args.get("err"))
+
+
+@app.post("/keys/<kid>/revoke")
+def keys_revoke(kid):
+    denied = require_user_admin()
+    if denied:
+        return denied
+    # The same guard the instance page uses for its irreversible
+    # actions (design guidelines 6.2.2): the operator types the thing's
+    # own identifier. Checked here and not only in the browser, because
+    # a required attribute is a courtesy, not a control.
+    if request.form.get("confirm", "").strip() != kid:
+        return redirect(f"/keys/{kid}?err=" + quote(
+            "Die eingetippte Kennung stimmt nicht — es wurde nichts "
+            "entzogen."), code=303)
+    resp = INTERNAL.post(f"{IDENTITY}/internal/keys/{kid}/revoke",
+                         json={"actor": caller_name()}, timeout=5)
+    if resp.status_code == 200:
+        return redirect("/keys?msg=" + quote(
+            f"Schlüssel {kid} ist entzogen. Jede Anfrage damit scheitert ab "
+            "sofort."), code=303)
+    return redirect("/keys?err=" + quote(
+        (resp.json() or {}).get("error", "Entziehen fehlgeschlagen.")),
+        code=303)
+
+
 @app.get("/users")
 def users_list():
     denied = require_user_admin()
@@ -2310,9 +2651,14 @@ def users_new():
     denied = require_user_admin()
     if denied:
         return denied
-    return page(USER_NEW_BODY, "Benutzer anlegen", "users",
-                all_roles=_role_choices(), tenants=_tenant_choices(),
-                error=None, form=_new_user_form())
+    kind = "machine" if request.args.get("kind") == "machine" else "human"
+    return page(USER_NEW_BODY,
+                "Maschine anlegen" if kind == "machine" else "Benutzer anlegen",
+                "users",
+                all_roles=(_key_role_choices() if kind == "machine"
+                           else _role_choices()),
+                tenants=_tenant_choices(), error=None,
+                form=dict(_new_user_form(), kind=kind))
 
 
 @app.post("/users/create")
@@ -2326,6 +2672,8 @@ def users_create():
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
         "tenant": request.form.get("tenant", ""),
+        "kind": ("machine" if request.form.get("kind") == "machine"
+                 else "human"),
     }
     # The tenant travels as a WISH. Identity decides: a server_admin may
     # name one, anybody else is put in their own whatever this form
@@ -2335,11 +2683,20 @@ def users_create():
         "password": request.form.get("password", ""),
     }, timeout=5)
     if resp.status_code == 201:
+        if form["kind"] == "machine":
+            return redirect("/keys/new?msg=" + quote(
+                "Maschine " + form["username"] + " ist angelegt. Sie braucht "
+                "jetzt einen Schlüssel."), code=303)
         created = quote("Benutzer " + form["username"] + " wurde angelegt.")
         return redirect(f"/users?msg={created}", code=303)
     # Validation error: stay on the page, keep the inputs (guidelines 6.2)
-    return page(USER_NEW_BODY, "Benutzer anlegen", "users", status=resp.status_code,
-                all_roles=_role_choices(), tenants=_tenant_choices(), form=form,
+    return page(USER_NEW_BODY,
+                "Maschine anlegen" if form["kind"] == "machine"
+                else "Benutzer anlegen",
+                "users", status=resp.status_code,
+                all_roles=(_key_role_choices() if form["kind"] == "machine"
+                           else _role_choices()),
+                tenants=_tenant_choices(), form=form,
                 error=resp.json().get("error", "Anlegen fehlgeschlagen."))
 
 
