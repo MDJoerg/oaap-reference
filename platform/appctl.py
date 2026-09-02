@@ -618,6 +618,30 @@ def tenant_host_prefixes(tid):
     return [t.get("label", "")] + former_labels(t)
 
 
+def instance_auto_hosts(name, inst, ext_host=None):
+    """Every automatic address of an instance, the current one first.
+
+    `<instance>.<node>` in the default tenant, `<instance>.<label>.<node>`
+    in every other one, plus one name per unexpired former label
+    (spec 2.4). This is the ONE place that composes the name -- the
+    gateway writes its sites from it and every message that prints an
+    address reads from it, so the two cannot drift apart.
+
+    They did drift: until 0.1.54 the CLI and the portal both built
+    `<instance>.<node>` by hand, which is right for the default tenant
+    and names a host that answers nowhere for every other one.
+
+    Empty list when the node has no external hostname, and empty when
+    the instance names a tenant this node does not have -- fail closed,
+    as `tenant_host_prefixes` explains.
+    """
+    ext = load_external() if ext_host is None else ext_host
+    if not ext:
+        return []
+    return [f"{name}.{p}.{ext}" if p else f"{name}.{ext}"
+            for p in tenant_host_prefixes(resolve_tenant((inst or {}).get("tenant")))]
+
+
 def tenant_by_label(label, include_former=True):
     """(id, record) for a label. Former labels resolve too, for as long
     as they are unexpired -- otherwise a rename would break the very
@@ -1695,8 +1719,7 @@ def write_external_caddy():
         # alternative is publishing somebody else's app under the
         # operator's own name.
         groups = (inst.get("visibility") or {}).get("groups")
-        for prefix in tenant_host_prefixes(resolve_tenant(inst.get("tenant"))):
-            fqdn = f"{name}.{prefix}.{host}" if prefix else f"{name}.{host}"
+        for fqdn in instance_auto_hosts(name, inst, ext_host=host):
             lines.append(f"{scheme}://{fqdn} {{")
             if edge:
                 lines += _edge_guard(edge)
@@ -2326,9 +2349,13 @@ def check_instance_address(reg, name, inst, hostname):
         raise ValueError(f"{host} is this node's own external hostname (the "
                          "portal answers there) — choose a different name")
     if ext_host and host.endswith(f".{ext_host}"):
-        raise ValueError(f"names under {ext_host} are already generated "
-                         f"automatically — '{name}' is reachable at "
-                         f"{name}.{ext_host} without this")
+        autos = instance_auto_hosts(name, inst, ext_host=ext_host)
+        raise ValueError(
+            f"names under {ext_host} are already generated automatically — "
+            + (f"'{name}' is reachable at {autos[0]} without this" if autos
+               else f"'{name}' has none, because it names a tenant this node "
+                    f"does not have — repair that instead of setting an "
+                    f"address under {ext_host}"))
     for r in load_edge():
         if host == r["host"] or host.endswith(f".{r['host']}"):
             raise ValueError(f"{host} is covered by the edge route for "
@@ -2383,8 +2410,12 @@ def cmd_address(args):
         print(f"{name}: {addr}" if addr else f"{name}: no own hostname registered")
         for a in aliases:
             print(f"  alias: {a}")
-        if ext_host:
-            print(f"Automatic node address: {name}.{ext_host}")
+        autos = instance_auto_hosts(name, inst, ext_host=ext_host)
+        for auto in autos:
+            print(f"Automatic node address: {auto}")
+        if ext_host and not autos:
+            print("Automatic node address: none — this instance names a "
+                  "tenant this node does not have")
         return
 
     if args.action == "remove":
@@ -2400,8 +2431,8 @@ def cmd_address(args):
         write_instance_address_caddy()
         reload_gateway()
         print(f"Removed {old} from '{name}'.")
-        if ext_host:
-            print(f"Still reachable at https://{name}.{ext_host}/")
+        for auto in instance_auto_hosts(name, inst, ext_host=ext_host):
+            print(f"Still reachable at https://{auto}/")
         return
 
     if args.action == "alias-add":
@@ -2751,9 +2782,8 @@ def _install_from_dir(pkg, args, source):
     reload_gateway()
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
     print(f"Entry point: port {port} (through the gateway, login required)")
-    ext = load_external()
-    if ext:
-        print(f"External:    https://{name}.{ext}/")
+    for auto in instance_auto_hosts(name, reg["instances"][name]):
+        print(f"External:    https://{auto}/")
 
 
 def cmd_list(_args):

@@ -104,6 +104,43 @@ for label, tid, expected in (
        f"Portal={portal_name!r} Gateway={gateway_name!r} erwartet={expected!r}")
 
 print("")
+print("Dieselbe Adresse spricht auch die Kommandozeile aus")
+
+# Vier Stellen im CLI nannten die automatische Adresse: `app address
+# show`, die Meldung nach dem Entfernen einer eigenen Adresse, die
+# Zeile nach dem Installieren und die Ablehnung eines Namens, den es
+# ohnehin schon automatisch gibt. Alle vier rechneten `<instanz>.<knoten>`.
+inst_cls = {"tenant": cls_id}
+inst_std = {"tenant": default_id}
+ok("CLI: Standard-Mandant",
+   m.instance_auto_hosts("viewer", inst_std, ext_host=HOST)
+   == ["viewer." + HOST])
+ok("CLI: Kundenmandant traegt das Kuerzel",
+   m.instance_auto_hosts("viewer", inst_cls, ext_host=HOST)
+   == ["viewer.cls." + HOST])
+ok("CLI: unbekannter Mandant nennt gar keine Adresse",
+   m.instance_auto_hosts("viewer", {"tenant": "weg"}, ext_host=HOST) == [])
+ok("CLI: ohne externen Namen des Knotens ebenfalls keine",
+   m.instance_auto_hosts("viewer", inst_cls, ext_host="") == [])
+ok("CLI und Portal sagen dasselbe",
+   m.instance_auto_hosts("viewer", inst_cls, ext_host=HOST)[0]
+   == iv.auto_host("viewer", inst_cls, tenants, HOST))
+
+with open(os.path.join(HERE, "..", "platform", "appctl.py"),
+          encoding="utf-8") as f:
+    cli = f.read()
+import ast                                                     # noqa: E402
+
+helper = next(n for n in ast.parse(cli).body
+              if isinstance(n, ast.FunctionDef)
+              and n.name == "instance_auto_hosts")
+own = set(range(helper.lineno, (helper.end_lineno or helper.lineno) + 1))
+leftovers = [ln.strip() for i, ln in enumerate(cli.splitlines(), 1)
+             if i not in own
+             and ("{name}.{ext_host}" in ln or "{name}.{ext}" in ln)]
+ok("keine handgebaute Adresse mehr im CLI", not leftovers, leftovers)
+
+print("")
 print("Keine zweite Rechenstelle im Portal")
 
 APP_PY = os.path.join(HERE, "..", "platform", "services", "portal", "app.py")
