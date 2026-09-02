@@ -266,7 +266,10 @@ try:
 
     def render(deploy_now):
         return tpl.render(
-            i={"name": "demo", "is_test": True, "artifacts": [
+            # `key` ist die Kennung in der URL, `name` der Name im
+            # Mandanten (RFC-0025). Hier dieselbe Zeichenkette, weil die
+            # Instanz im Standard-Mandanten liegt.
+            i={"key": "demo", "name": "demo", "is_test": True, "artifacts": [
                    {"file": "0.20.6-cea3.zip", "running": True,
                     "received": "2026-08-29 19:48"},
                    {"file": "0.20.5-be79.zip", "running": False,

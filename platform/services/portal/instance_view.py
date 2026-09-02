@@ -67,16 +67,21 @@ def auto_host(name, inst, tenants, node_host):
     """
     if not node_host:
         return ""
+    # The name the tenant chose, never the node key: an instance keyed
+    # `cls-viewer` answers at `viewer.cls.<node>` (RFC-0025 §8.1). An
+    # instance from before 0.1.58 has no stored name and its key IS its
+    # name, which is why the fallback is exactly right.
+    local = (inst or {}).get("name") or name
     ref = str((inst or {}).get("tenant") or "").strip()
     if not ref:
-        return f"{name}.{node_host}"
+        return f"{local}.{node_host}"
     tenant = (tenants or {}).get(ref)
     if tenant is None:
         return ""
     label = tenant.get("label", "")
     if label and label != DEFAULT_TENANT_LABEL:
-        return f"{name}.{label}.{node_host}"
-    return f"{name}.{node_host}"
+        return f"{local}.{label}.{node_host}"
+    return f"{local}.{node_host}"
 
 
 def app_class(inst):

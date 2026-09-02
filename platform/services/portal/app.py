@@ -987,14 +987,14 @@ INSTANCES_LIST_BODY = """
   <tr><th>Instanz</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
-    <td><a class="rowaction" href="/instances/{{ i.name }}">{{ i.name }}</a></td>
+    <td><a class="rowaction" href="/instances/{{ i.key }}">{{ i.name }}</a></td>
     <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
     {% if show_tenant %}<td class="muted">{{ i.tenant or "?" }}</td>{% endif %}
     <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span></td>
     <td>{{ i.visibility_label }}</td>
     <td>{{ "ja" if i.tile_visible else "nein" }}{% if i.tile_mode != "auto" %}
         <span class="muted">(fest)</span>{% endif %}</td>
-    <td><a class="rowaction" href="/instances/{{ i.name }}">Bearbeiten</a></td>
+    <td><a class="rowaction" href="/instances/{{ i.key }}">Bearbeiten</a></td>
   </tr>
   {% endfor %}
 </table>
@@ -1191,13 +1191,13 @@ INSTANCE_EDIT_BODY = """
   <p class="muted">Die Bestätigung gilt für <em>genau dieses</em> Manifest, nicht
      für das nächste Deployment. Nach dem Zustimmen meldet die KI dieselbe
      Version erneut an und lädt hoch.</p>
-  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
+  <form method="post" action="/instances/{{ i.key }}/envelope" style="display:inline">
     <input type="hidden" name="tab" value="{{ tab }}">
     <input type="hidden" name="op" value="confirm">
     <input type="hidden" name="manifest_sha" value="{{ i.pending.manifest_sha }}">
     <button>Erweiterung bestätigen</button>
   </form>
-  <form method="post" action="/instances/{{ i.name }}/envelope" style="display:inline">
+  <form method="post" action="/instances/{{ i.key }}/envelope" style="display:inline">
     <input type="hidden" name="tab" value="{{ tab }}">
     <input type="hidden" name="op" value="reject">
     <button class="secondary">Verwerfen</button>
@@ -1206,7 +1206,7 @@ INSTANCE_EDIT_BODY = """
 {% endif %}
 <nav class="tabs">
   {% for key, label in tabs %}
-  <a href="/instances/{{ i.name }}?tab={{ key }}"
+  <a href="/instances/{{ i.key }}?tab={{ key }}"
      class="{{ 'active' if key == tab }}{{ ' danger' if key == 'verwaltung' }}">{{ label }}</a>
   {% endfor %}
 </nav>
@@ -1262,7 +1262,7 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'zugang' }}">
-<form method="post" action="/instances/{{ i.name }}/visibility">
+<form method="post" action="/instances/{{ i.key }}/visibility">
   <input type="hidden" name="tab" value="zugang">
   <div class="card">
     <h2>Sichtbarkeit</h2>
@@ -1278,7 +1278,7 @@ INSTANCE_EDIT_BODY = """
     <button>Speichern</button>
   </div>
 </form>
-<form method="post" action="/instances/{{ i.name }}/tile">
+<form method="post" action="/instances/{{ i.key }}/tile">
   <input type="hidden" name="tab" value="zugang">
   <div class="card">
     <h2>Kachel im Launchpad</h2>
@@ -1297,7 +1297,7 @@ INSTANCE_EDIT_BODY = """
   </div>
 </form>
 {% if i.has_public_route %}
-<form method="post" action="/instances/{{ i.name }}/throttle">
+<form method="post" action="/instances/{{ i.key }}/throttle">
   <input type="hidden" name="tab" value="zugang">
   <div class="card">
     <h2>Drosselung öffentlicher Routen</h2>
@@ -1333,7 +1333,7 @@ INSTANCE_EDIT_BODY = """
      einbaut und der einen Umzug überlebt) und beliebig viele
      <strong>Aliasse</strong>, die gleichwertig erreichbar sind. Alle Namen
      stehen unter demselben Schutz — ein Alias ist kein Schlupfloch.</p>
-  <form method="post" action="/instances/{{ i.name }}/address">
+  <form method="post" action="/instances/{{ i.key }}/address">
     <input type="hidden" name="tab" value="netz">
     <label>Hauptname <input type="text" name="hostname" value="{{ i.address }}"
            placeholder="z. B. hub.meine-domain.de"></label>
@@ -1353,7 +1353,7 @@ INSTANCE_EDIT_BODY = """
   <ul class="muted">
     {% for a in i.aliases %}
     <li><code>{{ a }}</code>
-      <form method="post" action="/instances/{{ i.name }}/address" style="display:inline">
+      <form method="post" action="/instances/{{ i.key }}/address" style="display:inline">
         <input type="hidden" name="tab" value="netz">
         <input type="hidden" name="op" value="alias-remove">
         <input type="hidden" name="hostname" value="{{ a }}">
@@ -1365,7 +1365,7 @@ INSTANCE_EDIT_BODY = """
   {% else %}
   <p class="muted">Noch keine Aliasse.</p>
   {% endif %}
-  <form method="post" action="/instances/{{ i.name }}/address">
+  <form method="post" action="/instances/{{ i.key }}/address">
     <input type="hidden" name="tab" value="netz">
     <input type="hidden" name="op" value="alias-add">
     <label>Alias hinzufügen <input type="text" name="hostname"
@@ -1394,14 +1394,14 @@ INSTANCE_EDIT_BODY = """
        Port auf Deinem Router auf diesen Knoten weiter ({{ e.protocol }}
        {{ e.host_port }}). Die Adresse ist knotenlokal — der Edge trägt sie nicht,
        und eine Wiederherstellung auf einer anderen Maschine bringt sie nicht mit.</p>
-    <form method="post" action="/instances/{{ i.name }}/endpoint">
+    <form method="post" action="/instances/{{ i.key }}/endpoint">
       <input type="hidden" name="tab" value="netz">
       <input type="hidden" name="op" value="deny">
       <input type="hidden" name="endpoint" value="{{ e.name }}">
       <button class="secondary">Port schließen</button>
     </form>
     {% elif i.node_exposed %}
-    <form method="post" action="/instances/{{ i.name }}/endpoint"
+    <form method="post" action="/instances/{{ i.key }}/endpoint"
           onsubmit="return confirm('Dieser Port läuft am Gateway vorbei — keine Anmeldung, keine Drosselung, kein Protokoll. Wirklich freigeben?');">
       <input type="hidden" name="tab" value="netz">
       <input type="hidden" name="op" value="allow">
@@ -1436,7 +1436,7 @@ INSTANCE_EDIT_BODY = """
     {% for t in i.links %}
     <tr>
       <td><code>{{ t }}</code></td>
-      <td><form method="post" action="/instances/{{ i.name }}/link">
+      <td><form method="post" action="/instances/{{ i.key }}/link">
         <input type="hidden" name="tab" value="netz">
         <input type="hidden" name="op" value="remove">
         <input type="hidden" name="target" value="{{ t }}">
@@ -1449,7 +1449,7 @@ INSTANCE_EDIT_BODY = """
   <p class="muted">Keine Verbindung — diese App ist vollständig isoliert.</p>
   {% endif %}
   {% if i.link_candidates %}
-  <form method="post" action="/instances/{{ i.name }}/link">
+  <form method="post" action="/instances/{{ i.key }}/link">
     <input type="hidden" name="tab" value="netz">
     <input type="hidden" name="op" value="add">
     <label>Verbindung erlauben zu
@@ -1484,7 +1484,7 @@ INSTANCE_EDIT_BODY = """
      Warteschlange ({{ i.deploy_now.label }}) — der Deploy-Worker hat sie
      noch nicht angefasst.{% endif %}</p>
   {% if i.deploy_now.state == "queued" %}
-  <form method="post" action="/instances/{{ i.name }}/deploy/cancel">
+  <form method="post" action="/instances/{{ i.key }}/deploy/cancel">
     <input type="hidden" name="tab" value="deployment">
     <input type="hidden" name="deployment" value="{{ i.deploy_now.id }}">
     <button class="secondary">Abbrechen</button>
@@ -1508,13 +1508,13 @@ INSTANCE_EDIT_BODY = """
   {% endif %}
   <p class="muted">Adresse für den Hook (an die KI weitergeben, sie ist nicht
      geheim):<br><code>{{ i.hook_url }}</code></p>
-  <form method="post" action="/instances/{{ i.name }}/token" style="display:inline">
+  <form method="post" action="/instances/{{ i.key }}/token" style="display:inline">
     <input type="hidden" name="tab" value="deployment">
     <input type="hidden" name="op" value="create">
     <button>{{ "Neues Token erzeugen" if i.token_created else "Token erzeugen" }}</button>
   </form>
   {% if i.token_created %}
-  <form method="post" action="/instances/{{ i.name }}/token" style="display:inline">
+  <form method="post" action="/instances/{{ i.key }}/token" style="display:inline">
     <input type="hidden" name="tab" value="deployment">
     <input type="hidden" name="op" value="revoke">
     <button class="secondary">Widerrufen</button>
@@ -1559,7 +1559,7 @@ INSTANCE_EDIT_BODY = """
      <strong>dieselben Bytes</strong>, keine erneute Übertragung, keine
      Zugangsdaten. Was produktiv geht, ist damit nachweislich das, was Du
      getestet hast (RFC-0020).</p>
-  <form method="post" action="/instances/{{ i.name }}/promote">
+  <form method="post" action="/instances/{{ i.key }}/promote">
     <input type="hidden" name="tab" value="deployment">
     {% if i.promote.targets %}
     <label>Bestehende Produktiv-Instanz
@@ -1608,7 +1608,7 @@ INSTANCE_EDIT_BODY = """
           <span class="badge">in Betrieb</span>{% endif %}</td>
       <td>{{ a.received }}</td>
       <td>
-        <form method="post" action="/instances/{{ i.name }}/rollback"
+        <form method="post" action="/instances/{{ i.key }}/rollback"
               style="display:inline">
           <input type="hidden" name="tab" value="deployment">
           <input type="hidden" name="artifact" value="{{ a.file }}">
@@ -1616,7 +1616,7 @@ INSTANCE_EDIT_BODY = """
                                        else "Hierauf zurück" }}</button>
         </form>
         {% if not a.running %}
-        <form method="post" action="/instances/{{ i.name }}/artifact-delete"
+        <form method="post" action="/instances/{{ i.key }}/artifact-delete"
               style="display:inline"
               onsubmit="return confirm('{{ a.file }} endgültig löschen? Auf dieses Paket kann danach nicht mehr zurückgesetzt werden.');">
           <input type="hidden" name="tab" value="deployment">
@@ -1639,7 +1639,7 @@ INSTANCE_EDIT_BODY = """
 
 <section class="panel {{ 'active' if tab == 'konfiguration' }}">
 {% if i.config %}
-<form method="post" action="/instances/{{ i.name }}/config">
+<form method="post" action="/instances/{{ i.key }}/config">
   <input type="hidden" name="tab" value="konfiguration">
   <div class="card">
     <h2>Konfiguration</h2>
@@ -1678,7 +1678,7 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'verwaltung' }}">
-<form method="post" action="/instances/{{ i.name }}/remove">
+<form method="post" action="/instances/{{ i.key }}/remove">
   <input type="hidden" name="tab" value="verwaltung">
   <div class="card">
     <h2>Instanz entfernen</h2>
@@ -1999,6 +1999,17 @@ def external_host():
         return ""
 
 
+def local_name(key, inst):
+    """What an instance is called inside its tenant (RFC-0025 8.1).
+
+    The registry KEY carries the tenant's short name so identifiers
+    cannot collide between customers; this is the word the customer
+    typed, and the only one they should ever have to read. An instance
+    from before 0.1.58 has no stored name and its key IS its name.
+    """
+    return (inst or {}).get("name") or key
+
+
 def instance_auto_host(name, inst):
     """The automatic address of an instance — the I/O around
     `instance_view.auto_host`, where the rule (and the reason for it)
@@ -2093,7 +2104,7 @@ def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
         channel = inst.get("channel", "production")
         tiles.append({
             "name": inst.get("app_name", name),
-            "instance": name,
+            "instance": local_name(name, inst),
             "version": inst.get("version", "?"),
             "channel": channel,
             "channel_label": CHANNEL_LABELS.get(channel, channel),
@@ -3821,7 +3832,8 @@ def instances_list():
         groups = _instance_groups(inst)
         channel = inst.get("channel", "production")
         rows.append({
-            "name": name, "app_name": inst.get("app_name", name),
+            "key": name, "name": local_name(name, inst),
+            "app_name": inst.get("app_name", name),
             "version": inst.get("version", "?"),
             "channel": channel, "channel_label": CHANNEL_LABELS.get(channel, channel),
             "visibility_label": "Alle" if not groups else "Gruppen: " + ", ".join(groups),
@@ -3871,7 +3883,10 @@ def _open_creation_grants():
         held = resolve_tenant((entry.get("payload") or {}).get("tenant"))
         if role != "server_admin" and held != mine:
             continue
-        out.append({"instance": entry.get("instance", ""),
+        payload = entry.get("payload") or {}
+        out.append({"instance": (payload.get("name")
+                                 or entry.get("instance", "")),
+                    "key": entry.get("instance", ""),
                     "minutes": max(1, int((entry["expires"] - now) // 60)),
                     "tenant": tenant_label(held)})
     return sorted(out, key=lambda e: e["instance"])
@@ -4014,7 +4029,13 @@ def instance_new():
     # when the field is left empty.
     if name and not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
         return _new_error("Instanzname: Kleinbuchstaben, Ziffern, Bindestriche.")
-    if name and name in load_instances():
+    # Only within what this caller may see: since RFC-0025 an instance
+    # name belongs to a tenant, so another customer holding `viewer`
+    # says nothing about whether this one may. The host decides for real
+    # -- it composes the key and refuses a collision there -- but
+    # answering here saves a round trip through the queue.
+    if name and any(local_name(k, i) == name
+                    for k, i in visible_instances().items()):
         return _new_error(f"Eine Instanz namens '{name}' gibt es bereits.")
     if not name and from_ == "store":
         name = app_id
@@ -4067,8 +4088,10 @@ def instance_new():
     if res is None:
         return redirect(f"/instances?msg={quote(f'Die Installation von {name} läuft noch — das Ergebnis steht im Deploy-Protokoll auf der Gesundheitsseite.')}", code=303)
     if res.get("ok"):
-        return redirect(f"/instances/{name}?msg={quote('Test-Instanz angelegt.')}",
-                        code=303)
+        # The key the host settled on, not the name that was typed: in a
+        # tenant they differ, and a link to the name would 404.
+        return redirect(f"/instances/{res.get('key') or name}"
+                        f"?msg={quote('Test-Instanz angelegt.')}", code=303)
     return _new_error(f"Anlegen fehlgeschlagen: "
                       f"{res.get('message', 'unbekannter Fehler')}")
 
@@ -4125,7 +4148,8 @@ def instance_detail(name):
     address = inst.get("address", "")
     auto = instance_auto_host(name, inst)
     source_label, source_lines = iv.source_view(inst)
-    i = {"name": name, "app_name": inst.get("app_name", name),
+    i = {"key": name, "name": local_name(name, inst),
+         "app_name": inst.get("app_name", name),
          "version": inst.get("version", "?"),
          # Objektkopf (design guidelines 6.2.1): the answers one would
          # otherwise have to hunt for across six sections
@@ -4396,7 +4420,11 @@ def instance_remove(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     # Typing the name is the guard against a misclick on the one
     # destructive control in this UI; the host checks it a second time.
-    if (request.form.get("confirm") or "").strip() != name:
+    # Typed against the name the page SHOWS -- the key is an
+    # identifier, and asking someone to retype `cls-viewer` when the
+    # heading says `viewer` would train them to copy without reading.
+    shown = local_name(name, load_instances().get(name))
+    if (request.form.get("confirm") or "").strip() != shown:
         return _inst_back(name,
                           err="Zum Entfernen bitte den Instanznamen eintippen.",
                           keep=("purge",))

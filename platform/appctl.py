@@ -533,6 +533,10 @@ def ensure_default_tenant():
     tid = str(uuid.uuid4())
     tenants[tid] = {
         "label": DEFAULT_TENANT_LABEL,
+        # The default tenant's slug is the ABSENCE of one, like its
+        # label in a hostname (RFC-0025 §8.1) -- that is what leaves
+        # every existing key, address and deploy URL untouched.
+        "slug": "",
         "name": "",
         # The account lives on the central management node (RFC-0022
         # Q1). A node holds an opaque reference plus a cached display
@@ -638,8 +642,99 @@ def instance_auto_hosts(name, inst, ext_host=None):
     ext = load_external() if ext_host is None else ext_host
     if not ext:
         return []
-    return [f"{name}.{p}.{ext}" if p else f"{name}.{ext}"
+    # The address carries the name the tenant chose, never the node key:
+    # `viewer.cls.<node>`, not `cls-viewer.cls.<node>` (RFC-0025 §8.1).
+    # The key exists so identifiers do not collide; the address does not
+    # need it, because the label already says which tenant this is.
+    local = instance_name(name, inst)
+    return [f"{local}.{p}.{ext}" if p else f"{local}.{ext}"
             for p in tenant_host_prefixes(resolve_tenant((inst or {}).get("tenant")))]
+
+
+def tenant_slug(tid):
+    """The tenant's frozen short name — what node-wide identifiers use.
+
+    Minted once when the tenant is created and never changed again, not
+    even by `tenant rename` (RFC-0025 §8.1). That is the whole point:
+    deriving container names, networks and directories from the CURRENT
+    label would turn every rename into a migration with downtime, and
+    RFC-0022 Q3 promises the opposite. Deriving them from the UUID would
+    be stable but would stop `docker ps` from answering whose container
+    something is.
+
+    The default tenant's slug is the empty string, exactly as its label
+    is the ABSENCE of a label in a hostname (spec 1.2). That is what
+    keeps every existing key, address and deploy URL unchanged.
+
+    Falls back to the label for tenant records written before 0.1.58;
+    the migration fills it in on the next update.
+    """
+    t = load_tenants().get(tid or "") or {}
+    if t.get("label") == DEFAULT_TENANT_LABEL:
+        return ""
+    slug = t.get("slug")
+    return slug if slug is not None else t.get("label", "")
+
+
+def taken_slugs(tenants=None):
+    return {(t.get("slug") if t.get("slug") is not None else t.get("label", ""))
+            for t in (tenants if tenants is not None else load_tenants()).values()}
+
+
+def mint_slug(label, tenants=None):
+    """A free short name for a new tenant, from its first label.
+
+    A discriminator is only needed when a slug is already held -- which
+    happens when a tenant was renamed and a later one takes the freed
+    label, or when a tenant was deleted and recreated. Rare, and it must
+    not silently produce two tenants that write into the same
+    directories.
+    """
+    taken = taken_slugs(tenants)
+    if label not in taken:
+        return label
+    i = 2
+    while f"{label}-{i}" in taken:
+        i += 1
+    return f"{label}-{i}"
+
+
+def instance_key(tenant, name):
+    """The node-wide identifier of an instance (RFC-0025 §8.1).
+
+    `<slug>-<name>`, or plain `<name>` in the default tenant. Everything
+    node-scoped is keyed by this and nothing else: the registry, the
+    containers, the per-app network, the gateway site file, the data
+    directory, the deploy token, the creation permit and the deploy
+    hook. Composed ONCE, at creation, and then stored as the registry
+    key -- never recomputed, so a rename cannot move an instance.
+    """
+    slug = tenant_slug(tenant) if tenant else ""
+    return f"{slug}-{name}" if slug else name
+
+
+def instance_name(key, inst=None):
+    """What the instance is called INSIDE its tenant.
+
+    Stored since 0.1.58. An instance from before that has no `name` and
+    its key is its name -- correct, because back then keys carried no
+    slug. Keys only have to be unique, not uniform (RFC-0025 §8.3).
+    """
+    return ((inst or {}).get("name") or key)
+
+
+def find_instance(reg, tenant, name):
+    """(key, record) of the instance called `name` inside `tenant`.
+
+    Not the same question as "is this key free": an instance created
+    before 0.1.58 has a bare key, so a tenant could otherwise end up
+    holding two instances both called `viewer` (RFC-0025 §8.4).
+    """
+    for key, inst in (reg.get("instances") or {}).items():
+        if (instance_name(key, inst) == name
+                and (resolve_tenant(inst.get("tenant")) or "") == (tenant or "")):
+            return key, inst
+    return "", None
 
 
 # Which tenant the DATA under an instance directory belonged to
@@ -942,13 +1037,37 @@ def cmd_migrate_tenants(_args):
     created = not default_tenant_id()
     tid = ensure_default_tenant()
 
+    # Every tenant gets its frozen short name (RFC-0025 8.3). The
+    # migration renames NOTHING: the default tenant's slug is empty, and
+    # every other tenant's is simply its current label. Instances keep
+    # the keys they already have -- keys only have to be unique, not
+    # uniform -- so no container is rebuilt and no directory moves.
+    tenants = load_tenants()
+    slugged = 0
+    for t_id, t in sorted(tenants.items()):
+        if t.get("slug") is not None:
+            continue
+        t["slug"] = ("" if t.get("label") == DEFAULT_TENANT_LABEL
+                     else mint_slug(t.get("label", ""), tenants))
+        slugged += 1
+    if slugged:
+        save_tenants(tenants)
+
     reg = load_registry()
     stamped = 0
     for inst in reg.get("instances", {}).values():
         if not inst.get("tenant"):
             inst["tenant"] = tid
             stamped += 1
-    if stamped:
+    # What each instance is called inside its tenant. Until now the key
+    # WAS the name, so that is the honest starting value -- and it stays
+    # right forever for instances that predate this.
+    named = 0
+    for key, inst in reg.get("instances", {}).items():
+        if not inst.get("name"):
+            inst["name"] = key
+            named += 1
+    if stamped or named:
         save_registry(reg)
 
     # And on disk, beside the data itself (1.4). The registry entry
@@ -974,7 +1093,7 @@ def cmd_migrate_tenants(_args):
     if permits:
         save_grants(grants)
 
-    if created or stamped or permits or marked:
+    if created or stamped or permits or marked or slugged or named:
         print("")
         print("Preparing this node for tenants (RFC-0022 stage 2) ...")
         if created:
@@ -986,6 +1105,12 @@ def cmd_migrate_tenants(_args):
         if marked:
             print(f"  {marked} instance data director(ies) marked with their "
                   f"tenant.")
+        if slugged:
+            print(f"  {slugged} tenant(s) given their short name "
+                  f"(RFC-0025) -- nothing renamed.")
+        if named:
+            print(f"  {named} instance(s) recorded under the name they "
+                  f"already had.")
         if single_tenant():
             print("  Nothing changes for anyone: this node has one tenant.")
 
@@ -1106,6 +1231,10 @@ def cmd_tenant(args):
         tid = str(uuid.uuid4())
         tenants[tid] = {
             "label": label,
+            # Frozen at creation, never touched by `tenant rename`
+            # (RFC-0025 §8.1). Node-wide identifiers hang off this, so
+            # a rename stays a renaming instead of becoming a migration.
+            "slug": mint_slug(label, tenants),
             "name": args.title or "",
             # The account lives on the central management node (RFC-0022
             # Q1). Without one given, this tenant is its own account --
@@ -1119,6 +1248,10 @@ def cmd_tenant(args):
         save_tenants(tenants)
         audit_tenant("tenant.create", tid, label)
         print(f"Tenant '{label}' created.")
+        slug = tenants[tid]["slug"]
+        if slug != label:
+            print(f"Its short name is '{slug}' -- '{label}' is already held "
+                  f"by another tenant's identifiers.")
         print("")
         # Spec 3.4: said at the moment the label is chosen, not in a
         # document nobody opens on the day it would have mattered.
@@ -1160,8 +1293,9 @@ def cmd_tenant(args):
         _tenant_write_common(new, "rename to")
         grace = max(0, int(args.grace_days))
         host = load_external() or "<node>"
-        insts = sorted(n for n, i in load_registry().get("instances", {}).items()
-                       if i.get("tenant") == tid)
+        insts = sorted(instance_name(k, i)
+                       for k, i in load_registry().get("instances", {}).items()
+                       if resolve_tenant(i.get("tenant")) == tid)
         # Named consequences before the act, in the same voice instance
         # address removal already uses. This platform has paid for a
         # silent address change once (hub.bdt.joomp.de, 2026-08-23).
@@ -1176,6 +1310,18 @@ def cmd_tenant(args):
               "that,")
         print("anything still pointing at it stops resolving here.")
         print("A certificate for each new name is obtained on first contact.")
+        slug = tenant_slug(tid)
+        if slug and insts:
+            print("")
+            # Said out loud, because it is the trade RFC-0025 §8.1 made:
+            # a rename stays a renaming instead of becoming a migration,
+            # and the price is identifiers that keep the old short name.
+            print(f"Not touched: containers, networks, data directories and "
+                  f"deploy URLs keep")
+            print(f"the short name '{slug}'. Nothing is rebuilt and nothing "
+                  f"moves -- that is")
+            print(f"why this is a rename and not an outage. Deploy addresses "
+                  f"stay valid.")
         print("")
         print(zone_probe(new))
         if not args.yes:
@@ -2691,8 +2837,13 @@ def _install_from_dir(pkg, args, source):
     validate_manifest(m)
 
     app = m["app"]
-    name = args.name or app["id"]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+    # What the caller asks for is the name INSIDE a tenant (RFC-0025
+    # 8.1). What the node stores it under is the KEY, which carries the
+    # tenant's frozen short name -- so two customers may both hold
+    # `viewer` without their containers, networks or directories
+    # colliding.
+    local = args.name or app["id"]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local):
         die("instance name: lowercase [a-z0-9-]")
     channel = args.channel
     # A tenant chosen for this install: a label from the command line, an
@@ -2703,7 +2854,37 @@ def _install_from_dir(pkg, args, source):
     chosen_tenant = (chosen if chosen in load_tenants()
                      else resolve_tenant_arg(chosen))
     reg = load_registry()
-    inst = reg["instances"].get(name)
+    # Which key this install writes under (RFC-0025 8.1). Three ways in,
+    # and they must all land on the same instance:
+    #
+    #   * `--key` -- the caller already holds the key. The artifact path
+    #     does: the creation permit fixed it before the instance
+    #     existed, and the uploaded package is filed under it.
+    #   * a name that IS a key in the registry -- a redeploy, and every
+    #     instance that predates 0.1.58, whose key is its name.
+    #   * otherwise a tenant-local name, which gets composed. Without
+    #     this order a second delivery to `cls-viewer` would set out to
+    #     create a `cls-cls-viewer`.
+    explicit = str(getattr(args, "key", "") or "")
+    if explicit:
+        name = explicit
+        inst = reg["instances"].get(name)
+        if inst is not None:
+            local = instance_name(name, inst)
+    elif local in reg["instances"]:
+        name, inst = local, reg["instances"][local]
+        local = instance_name(name, inst)
+    else:
+        target = tenant_for_new_instance(None, permit={"tenant": chosen_tenant})
+        found_key, found = find_instance(reg, target, local)
+        if found is not None:
+            name, inst = found_key, found
+        else:
+            name, inst = instance_key(target, local), None
+            if name in reg["instances"]:
+                # Says that the name is taken, never by whom
+                # (oaap.core.tenant 2.4).
+                die(f"an instance named '{local}' already exists")
     if not inst:
         # A NEW instance only: a redeploy keeps its own data by
         # definition, and its tenant cannot change (see
@@ -2807,6 +2988,12 @@ def _install_from_dir(pkg, args, source):
         # 0.2 a creation permit may name a different tenant here; today
         # there is only one to name.
         "tenant": tenant_for_new_instance(inst, permit={"tenant": chosen_tenant}),
+        # What this instance is called INSIDE its tenant (RFC-0025
+        # 8.1). The registry KEY carries the tenant's frozen short name
+        # so identifiers cannot collide across customers; this is the
+        # word the customer typed, and the one their address is built
+        # from.
+        "name": local,
         "version": app["version"], "channel": channel,
         # what the app IS (runtime spec 2.10) — decides the launchpad
         # tile. Read from the MANIFEST at install time, never from a
@@ -4147,7 +4334,14 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
         # before the instance exists (oaap.core.tenant 1.4), and this is
         # where that choice finally lands. Empty for a redeploy, which
         # is right: the instance already knows, and what it says wins.
-        ns = argparse.Namespace(package=pkg, path="", ref="", name=name,
+        # `name` here is the KEY -- the uploaded package is already
+        # filed under it (artifact_store above), and for a permit it was
+        # fixed before the instance existed. The tenant-local name comes
+        # from the permit, which is the only record that knows it that
+        # early (RFC-0025 8.1).
+        ns = argparse.Namespace(package=pkg, path="", ref="",
+                                key=name,
+                                name=(permit or {}).get("name", "") or name,
                                 channel=channel, store_source="",
                                 tenant=(permit or {}).get("tenant", ""))
         try:
@@ -4819,6 +5013,21 @@ def cmd_process_deploys(_args):
         actor = str(req.get("by") or "")
         act_tenant, act_role, _act_err = (acting_tenant(actor) if actor
                                           else (None, "", ""))
+
+        # The two actions that bring an instance into being name it the
+        # way the CALLER thinks of it -- inside their tenant -- because
+        # there is no key yet to name (RFC-0025 8.1). Everything else
+        # names the key, which is what the portal links and what every
+        # other record on this node is filed under. Resolved once, here,
+        # so no branch below has to remember which kind of name it got.
+        local_name = name
+        if action in ("create", "install") and inst is None:
+            found_key, found = find_instance(reg, act_tenant, name)
+            if found is not None:
+                name, inst = found_key, found
+            else:
+                name = instance_key(act_tenant, name)
+                inst = reg["instances"].get(name)
         audit_tenant_id = None
         cross_tenant = (inst is not None and act_role == "tenant_admin"
                         and resolve_tenant(inst.get("tenant")) != act_tenant)
@@ -4826,7 +5035,11 @@ def cmd_process_deploys(_args):
         def run_install(src, channel):
             ns = _argparse.Namespace(
                 package=source_package_arg(name, src), path=src.get("path", ""),
-                ref=src.get("ref", ""), name=name, channel=channel,
+                ref=src.get("ref", ""),
+                # The tenant-local name, not the key: cmd_install
+                # composes the key itself, from the same tenant, so both
+                # sides cannot drift (RFC-0025 8.1).
+                name=local_name, channel=channel,
                 store_source=src.get("store_source", ""),
                 # Only consulted when the instance is NEW: a redeploy
                 # keeps whatever the instance already says, so this can
@@ -4887,8 +5100,8 @@ def cmd_process_deploys(_args):
                 msg = ("this node has no profile 'dev' — creating instances "
                        "from the portal is a development act (RFC-0011)")
             elif inst:
-                msg = f"an instance named '{name}' already exists"
-            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+                msg = f"an instance named '{local_name}' already exists"
+            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local_name):
                 msg = "instance name: lowercase letters, digits and hyphens"
             elif req.get("from") == "store":
                 # Same resolution as the one-click install: the request
@@ -5119,6 +5332,10 @@ def cmd_process_deploys(_args):
             # here, because the spool is data, not trust.
             op = req.get("op", "create")
             if op == "revoke":
+                # Same key the issue path composed, or a revocation
+                # would quietly find nothing (RFC-0025 8.1).
+                if act_tenant is not None and not inst:
+                    name = instance_key(act_tenant, local_name)
                 before = len(load_grants())
                 grants = {k: v for k, v in _grants_prune(load_grants()).items()
                           if not (v.get("kind") == "create"
@@ -5131,8 +5348,8 @@ def cmd_process_deploys(_args):
                 msg = ("this node has no profile 'dev' — creating instances "
                        "is a development act (RFC-0011)")
             elif inst:
-                msg = f"an instance named '{name}' already exists"
-            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name or ""):
+                msg = f"an instance named '{local_name}' already exists"
+            elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local_name or ""):
                 msg = "instance name: lowercase letters, digits and hyphens"
             elif not re.fullmatch(r"[0-9a-f]{64}", req.get("digest", "")):
                 msg = "malformed grant digest"
@@ -5158,15 +5375,29 @@ def cmd_process_deploys(_args):
                     # this record exists to make impossible.
                     msg = permit_err or "no tenant to issue this permit in"
                 else:
-                    grant_create("create", name, req["digest"],
-                                 {"channel": "test", "by": req.get("by", "?"),
-                                  "tenant": permit_tenant},
-                                 ttl=CREATE_GRANT_TTL)
-                    ok = True
-                    label = tenant_label(permit_tenant)
-                    msg = (f"creation grant issued for '{name}', single use, "
-                           f"{CREATE_GRANT_TTL // 60} minutes"
-                           + ("" if single_tenant() else f", tenant '{label}'"))
+                    # The permit fixes the KEY before the instance
+                    # exists -- that is what makes the deploy address it
+                    # names stable and unambiguous (RFC-0025 8.2). It
+                    # carries the tenant-local name too, because after
+                    # this nothing else knows what the human typed.
+                    key = instance_key(permit_tenant, local_name)
+                    if key in reg["instances"]:
+                        msg = f"an instance named '{local_name}' already exists"
+                    else:
+                        name = key
+                        grant_create("create", key, req["digest"],
+                                     {"channel": "test",
+                                      "by": req.get("by", "?"),
+                                      "tenant": permit_tenant,
+                                      "name": local_name},
+                                     ttl=CREATE_GRANT_TTL)
+                        ok = True
+                        label = tenant_label(permit_tenant)
+                        msg = (f"creation grant issued for '{local_name}', "
+                               f"single use, {CREATE_GRANT_TTL // 60} minutes"
+                               + ("" if single_tenant()
+                                  else f", tenant '{label}', deploy under "
+                                       f"'{key}'"))
         elif action == "envelope":
             # An administrator confirms one specific pending announcement
             # in the portal (RFC-0019 decision 5). Bound to the manifest
@@ -5635,8 +5866,12 @@ def cmd_process_deploys(_args):
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
             with open(res_tmp, "w", encoding="utf-8") as f:
+                # The KEY the request ended up on (RFC-0025 8.1). For a
+                # create the caller only knew the tenant-local name, and
+                # without this the portal could not link to what it just
+                # made.
                 json.dump({"ok": ok, "message": msg, "revision": revision,
-                           "version": version, "id": rid}, f)
+                           "version": version, "id": rid, "key": name}, f)
             os.replace(res_tmp, os.path.join(results, f"{rid}.json"))
         os.remove(req_path)          # the claim: this request is answered
         DEADLINE = None

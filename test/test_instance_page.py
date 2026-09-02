@@ -86,6 +86,10 @@ def render(tab, inst=None, **over):
     inst = dict(inst or TESTINSTANZ)
     label, lines = iv.source_view(inst)
     i = {
+        # `key` ist die Kennung des Knotens (steht in jeder URL),
+        # `name` der Name im Mandanten (steht in der Ueberschrift).
+        # Hier gleich, weil die Instanz im Standard-Mandanten liegt.
+        "key": "bdt-hub-test",
         "name": "bdt-hub-test", "app_name": inst["app_name"],
         "version": inst["version"], "app_id": inst["app_id"],
         "description": "Zentrale fuer die Aussendienst-App",
@@ -304,6 +308,20 @@ ok("und traegt die Angabe aus dem Manifest weiter", '"multiline": multiline' in 
 # und erneut klickt, loest etwas anderes aus, als er gewaehlt hat. Die
 # sichere Richtung, aber die falsche Antwort: eine Wahl, die sich hinter
 # dem Ruecken des Bedieners aendert, ist ein Fehler, kein Schutz.
+print("")
+print("Kennung und Name (RFC-0025)")
+
+# Die URL fuehrt den Schluessel, die Ueberschrift den Namen. In einem
+# Mandanten sind das verschiedene Zeichenketten -- `cls-viewer` gegen
+# `viewer` -- und wer beides vertauscht, verlinkt ins Leere oder laesst
+# den Kunden eine Kennung lesen, die er nie eingetippt hat.
+gemischt = render("deployment", key="cls-viewer", name="viewer")
+ok("jede Aktion zeigt auf den Schluessel",
+   "/instances/cls-viewer/" in gemischt and "/instances/viewer/" not in gemischt,
+   "sonst 404, sobald Name und Schluessel auseinandergehen")
+ok("die Ueberschrift nennt den Namen des Kunden",
+   "<h1>viewer</h1>" in gemischt, gemischt[:300])
+
 print("")
 print("Der Entfernen-Abschnitt")
 
