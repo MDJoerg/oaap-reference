@@ -296,5 +296,64 @@ ok("und die Antwort sagt, dass er abgelaufen ist",
    "expired" in r.get_data(as_text=True), r.get_data(as_text=True)[:200])
 
 print("")
+print("Aus einem Schluessel wird ein Terminal (RFC-0028)")
+
+# Der Grund fuer diesen ganzen Umweg: Ein Browser setzt bei einer
+# normalen Navigation keine Authorization-Kopfzeile. Ein Kiosk kann
+# einen Schluessel also nicht so vorzeigen wie ein Skript -- er braucht
+# ein Cookie. Die Einrichtung tauscht den Schluessel einmal dagegen,
+# und das Cookie nennt weiterhin den Schluessel.
+put_users(m, [user("terminal-3", ["user"], kind="machine", tenant="t-cls"),
+              user("joerg", ["server_admin", "user"], tenant="t-default")])
+t = m.app.test_client()
+term, term_secret = m.issue_key(m.load_users(), "terminal-3", ["user"], "",
+                                "Packstation 3", 365, "joerg", terminal=True)
+r = t.post("/auth/terminal", data={"key": term_secret})
+ok("die Einrichtung nimmt den Schluessel an", r.status_code == 200,
+   f"HTTP {r.status_code}")
+ok("und sagt, dass sich das Geraet ab jetzt selbst anmeldet",
+   "Neustart" in r.get_data(as_text=True))
+
+r = t.get("/verify", query_string={"roles": "user"})
+ok("danach kommt der Browser OHNE Kopfzeile durch", r.status_code == 204,
+   f"HTTP {r.status_code}")
+ok("und ist der Maschinen-Prinzipal, nicht der Einrichter",
+   r.headers.get("X-OAAP-User") == "terminal-3", dict(r.headers))
+
+r = t.post("/auth/logout")
+ok("ein Terminal kann sich nicht abmelden", r.status_code == 403,
+   "ein Fehltipp in der Halle darf keinen toten Bildschirm hinterlassen")
+ok("und die Antwort sagt, wo es stattdessen beendet wird",
+   "Zug" in r.get_data(as_text=True))
+ok("es laeuft danach weiter",
+   t.get("/verify", query_string={"roles": "user"}).status_code == 204)
+
+m.revoke_key(term["id"])
+ok("den Schluessel zu entziehen beendet das Terminal sofort",
+   t.get("/verify", query_string={"roles": "user"}).status_code == 303,
+   "sonst ueberlebte das Cookie den Nachweis, aus dem es entstand -- und "
+   "Entziehen waere dasselbe wie Nichtstun, bis jemand neu startet")
+
+t2 = m.app.test_client()
+ok("ein entzogener Schluessel richtet auch kein neues Terminal mehr ein",
+   t2.post("/auth/terminal", data={"key": term_secret}).status_code == 401)
+
+mensch, mensch_secret = m.issue_key(m.load_users(), "joerg", ["user"], "",
+                                    "", 30, "joerg")
+r = t2.post("/auth/terminal", data={"key": mensch_secret})
+ok("ein Schluessel eines MENSCHEN wird als Terminal abgelehnt",
+   r.status_code == 403,
+   "sonst haenge die Anmeldung einer Person dauerhaft an einem Bildschirm")
+
+zweit, zweit_secret = m.issue_key(m.load_users(), "terminal-3", ["user"], "",
+                                  "Packstation 4", 365, "joerg", terminal=True)
+t3 = m.app.test_client()
+t3.post("/auth/terminal", data={"key": zweit_secret})
+ok("ein zweites Geraet am selben Prinzipal laeuft eigenstaendig",
+   t3.get("/verify", query_string={"roles": "user"}).status_code == 204,
+   "geteilt wird der Prinzipal, nie das Geheimnis -- deshalb hat das "
+   "Entziehen des ersten Geraets dieses hier nicht beruehrt")
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

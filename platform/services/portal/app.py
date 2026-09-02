@@ -407,7 +407,8 @@ was sie darf, darf jeder, der an ihr steht oder ihren Schlüssel hat.</p>
 KEYS_LIST_BODY = """
 <div class="pagehead">
   <h1>Zugänge</h1>
-  <a class="btn" href="/keys/new">Schlüssel ausstellen</a>
+  <span><a class="btn" href="/keys/new">Schlüssel ausstellen</a>
+        <a class="btn" href="/terminal/new">Dieses Gerät zum Terminal machen</a></span>
 </div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
@@ -424,7 +425,8 @@ KEYS_LIST_BODY = """
     <td>{{ k.principal }}</td>
     <td class="muted">{{ k.label or "–" }}</td>
     <td>{{ k.roles|join(", ") }}</td>
-    <td class="muted">{{ k.instance or "alle Instanzen" }}</td>
+    <td class="muted">{{ k.instance or "alle Instanzen" }}{% if k.terminal %}
+        <span class="badge">Terminal</span>{% endif %}</td>
     <td>{% if k.revoked %}<span class="badge off">entzogen</span>
         {% elif k.expired %}<span class="badge off">abgelaufen</span>
         {% else %}{{ k.expires[:10] }}{% endif %}</td>
@@ -552,6 +554,100 @@ KEY_DETAIL_BODY = """
   </form>
 </div>
 {% endif %}
+"""
+
+# Floorplan "Dialogseite" (design guidelines 6.2).
+TERMINAL_NEW_BODY = """
+<a class="back" href="/keys">← Zurück zu den Zugängen</a>
+<h1>Dieses Gerät zum Terminal machen</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<p class="muted">Danach meldet sich <strong>dieser Browser</strong> selbst an —
+auch nach einem Neustart — und niemand muss mehr ein Administratorpasswort in
+eine Halle tragen. Wer davorsteht, arbeitet mit den Rechten des Terminals; es
+gibt an dieser Stelle keine zweite Anmeldung. <strong>Gib ihm deshalb so wenig
+wie möglich.</strong></p>
+<form method="post" action="/terminal/create">
+  <div class="card">
+    <h2>Das Gerät</h2>
+    <label>Wo steht es <input type="text" name="label" required
+           value="{{ form.label }}" placeholder="z. B. Packstation 3"></label>
+    <p class="muted">Dieser Text steht später in der Liste der Zugänge. Er ist
+       das, woran Du das richtige Gerät erkennst, wenn Du eines entziehen
+       musst.</p>
+  </div>
+  <div class="card">
+    <h2>Als wer meldet es sich an</h2>
+    <label>Prinzipal
+      <select name="principal">
+        <option value="">— einen neuen anlegen (empfohlen) —</option>
+        {% for u in machines %}
+        <option value="{{ u.username }}" {{ 'selected' if u.username == form.principal }}>{{ u.username }} — {{ u.roles|join(", ") }}</option>
+        {% endfor %}
+      </select></label>
+    <p class="muted">Jedes Gerät bekommt <strong>immer seinen eigenen
+       Schlüssel</strong> — ein verlorenes Gerät wird also allein entzogen,
+       auch wenn mehrere sich einen Prinzipal teilen. Geteilt wird nur, was
+       das Terminal <em>darf</em>: Rollen und Sichtbarkeit hängen am
+       Prinzipal. Sollen zwei Orte Unterschiedliches sehen, brauchen sie
+       zwei.</p>
+    <label>Name des neuen Prinzipals
+      <input type="text" name="new_principal" value="{{ form.new_principal }}"
+             pattern="[a-z0-9][a-z0-9._-]{1,39}" placeholder="z. B. terminal-3">
+    </label>
+    <p class="roles">
+      {% for r in all_roles %}
+      <label><input type="checkbox" name="roles" value="{{ r }}"
+             {{ 'checked' if r in form.roles }}>{{ r }}</label>
+      {% endfor %}
+    </p>
+    <label>Sichtbarkeits-Gruppen (kommagetrennt)
+      <input type="text" name="groups" value="{{ form.groups }}"
+             placeholder="z. B. packstation"></label>
+    <p class="muted">Rollen und Gruppen gelten nur beim Anlegen eines neuen
+       Prinzipals. Wählst Du oben einen vorhandenen, bleibt dessen
+       Ausstattung, wie sie ist.</p>
+  </div>
+  <div class="card">
+    <h2>Reichweite</h2>
+    <label>Auf eine Instanz begrenzen
+      <select name="instance">
+        <option value="">— keine Begrenzung —</option>
+        {% for i in instances %}
+        <option value="{{ i.key }}" {{ 'selected' if i.key == form.instance }}>{{ i.name }}</option>
+        {% endfor %}
+      </select></label>
+    <label>Gültig für (Tage, 1–365)
+      <input type="number" name="days" min="1" max="365" value="{{ form.days }}"></label>
+    <p class="muted">Auch ein Terminal läuft ab. Vor dem Ablauf richtest Du es
+       einmal neu ein — das ist der Preis dafür, dass ein vergessenes Gerät
+       nicht jahrelang offen steht.</p>
+    <button>Weiter</button>
+  </div>
+</form>
+"""
+
+TERMINAL_HANDOFF_BODY = """
+<div class="pagehead"><h1>Letzter Schritt</h1></div>
+<div class="card warn">
+  <h2>Jetzt wird dieser Browser zum Terminal</h2>
+  <p>Der Schlüssel für <strong>{{ k.label }}</strong> ist ausgestellt und wird
+     mit dem Knopf unten direkt an dieses Gerät übergeben. Er wird
+     <strong>nicht angezeigt</strong> und lässt sich später nicht abrufen — er
+     muss auch nirgends notiert werden, er bleibt in diesem Browser.</p>
+  <p>Mit dem Klick endet Deine eigene Anmeldung auf diesem Gerät. Danach ist es
+     <strong>{{ k.principal }}</strong>, dauerhaft, auch nach einem Neustart.</p>
+  <form method="post" action="/auth/terminal">
+    <input type="hidden" name="key" value="{{ secret }}">
+    <button>Dieses Gerät jetzt zum Terminal machen</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Wenn Du es Dir anders überlegst</h2>
+  <p>Klickst Du nicht, bleibt der Schlüssel <code>{{ k.id }}</code> ausgestellt,
+     ohne dass ihn jemand benutzt. Entziehe ihn dann unter
+     <a href="/keys">Zugänge</a> — ein ungenutzter Schlüssel ist der, an den
+     sich später niemand erinnert.</p>
+</div>
 """
 
 KEY_SHOWN_BODY = """
@@ -2627,6 +2723,96 @@ def keys_revoke(kid):
     return redirect("/keys?err=" + quote(
         (resp.json() or {}).get("error", "Entziehen fehlgeschlagen.")),
         code=303)
+
+
+def _terminal_form(**over):
+    form = {"label": "", "principal": "", "new_principal": "",
+            "roles": ["user"], "groups": "", "instance": "", "days": 365}
+    form.update(over)
+    return form
+
+
+def _machine_principals():
+    return [u for u in identity_users() if u.get("kind") == "machine"]
+
+
+@app.get("/terminal/new")
+def terminal_new():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    return page(TERMINAL_NEW_BODY, "Terminal einrichten", "keys",
+                machines=_machine_principals(), all_roles=_key_role_choices(),
+                instances=_instance_choices(), form=_terminal_form(),
+                error=None)
+
+
+@app.post("/terminal/create")
+def terminal_create():
+    """Create (or reuse) the principal, issue this device its own key,
+    and hand it to the browser (RFC-0028 4.2).
+
+    The key never travels in a URL and is never displayed: it goes into
+    a hidden field on a page rendered once, for the administrator
+    standing at this machine, and from there straight into identity.
+    """
+    denied = require_user_admin()
+    if denied:
+        return denied
+    form = _terminal_form(
+        label=request.form.get("label", "").strip(),
+        principal=request.form.get("principal", "").strip(),
+        new_principal=request.form.get("new_principal", "").strip().lower(),
+        roles=request.form.getlist("roles") or ["user"],
+        groups=request.form.get("groups", ""),
+        instance=request.form.get("instance", "").strip(),
+        days=request.form.get("days", "365"))
+
+    def again(err):
+        return page(TERMINAL_NEW_BODY, "Terminal einrichten", "keys",
+                    status=400, machines=_machine_principals(),
+                    all_roles=_key_role_choices(),
+                    instances=_instance_choices(), form=form, error=err)
+
+    if not form["label"]:
+        return again("Sag bitte, wo das Gerät steht — daran erkennst Du es "
+                     "später in der Liste.")
+    principal = form["principal"]
+    if not principal:
+        if not form["new_principal"]:
+            return again("Wähle einen vorhandenen Prinzipal oder gib dem "
+                         "neuen einen Namen.")
+        r = INTERNAL.post(f"{IDENTITY}/internal/users", json={
+            "username": form["new_principal"], "display_name": form["label"],
+            "kind": "machine", "roles": form["roles"],
+            "groups": _parse_groups(form["groups"]),
+            "actor": caller_name()}, timeout=5)
+        if r.status_code != 201:
+            return again((r.json() or {}).get(
+                "error", "Der Prinzipal ließ sich nicht anlegen."))
+        principal = form["new_principal"]
+        roles = form["roles"]
+    else:
+        # A shared principal keeps the roles it has. Taking them from
+        # this form would let the second terminal quietly widen or
+        # narrow what the first one may do -- the page says roles apply
+        # only when creating, and the code has to mean it.
+        chosen = next((u for u in _machine_principals()
+                       if u["username"] == principal), None)
+        if chosen is None:
+            return again("Diesen Prinzipal gibt es hier nicht.")
+        roles = chosen["roles"]
+    resp = INTERNAL.post(f"{IDENTITY}/internal/keys", json={
+        "principal": principal, "roles": roles,
+        "instance": form["instance"], "label": form["label"],
+        "days": form["days"], "terminal": True,
+        "actor": caller_name()}, timeout=5)
+    if resp.status_code != 201:
+        return again((resp.json() or {}).get(
+            "error", "Der Schlüssel ließ sich nicht ausstellen."))
+    body = resp.json()
+    return page(TERMINAL_HANDOFF_BODY, "Terminal einrichten", "keys",
+                k=body["key"], secret=body["secret"])
 
 
 @app.get("/users")

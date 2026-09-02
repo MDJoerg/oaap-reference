@@ -208,5 +208,57 @@ html_h = anlegen.render(form={"username": "", "display_name": "", "roles": [],
 ok("beim Menschen bleibt das Passwortfeld", 'name="password"' in html_h)
 
 print("")
+print("Das Terminal einrichten (RFC-0028)")
+
+tneu = ENV.from_string(template("TERMINAL_NEW_BODY"))
+html = tneu.render(machines=[{"username": "terminal-3", "roles": ["user"]}],
+                   all_roles=["keyuser", "user"],
+                   instances=[{"key": "cls-viewer", "name": "viewer"}],
+                   form={"label": "", "principal": "", "new_principal": "",
+                         "roles": ["user"], "groups": "", "instance": "",
+                         "days": 365},
+                   error=None)
+ok("die Vorgabe ist ein eigener Prinzipal je Terminal",
+   html.index("neuen anlegen") < html.index("terminal-3"),
+   "Teilen ist die bewusste Wahl, nicht der Weg des geringsten Widerstands")
+ok("die Seite sagt, dass jedes Geraet seinen EIGENEN Schluessel bekommt",
+   "eigenen" in html and "Schl" in html)
+ok("und was Teilen wirklich kostet: die Sichtbarkeit",
+   "Sichtbarkeit" in html and "zwei" in html)
+ok("sie warnt, dem Terminal so wenig wie moeglich zu geben",
+   "Gib ihm deshalb so wenig" in html)
+ok("sie sagt, dass es keine zweite Anmeldung davor gibt",
+   "keine zweite Anmeldung" in html,
+   "wer davorsteht, arbeitet mit den Rechten des Terminals -- das ist die "
+   "Obergrenze aus RFC-0028")
+ok("auch ein Terminal laeuft ab", "l" in html and "ab" in html
+   and "365" in html)
+
+hand = ENV.from_string(template("TERMINAL_HANDOFF_BODY"))
+html = hand.render(k={"id": "k7f3a91c", "label": "Packstation 3",
+                      "principal": "terminal-3"},
+                   secret="oaapk_k7f3a91c_" + "S" * 40)
+ok("das Geheimnis steht im Formular, aber nicht als Text auf der Seite",
+   'type="hidden"' in html
+   and html.count("oaapk_k7f3a91c_" + "S" * 40) == 1,
+   "es muss nirgends notiert werden -- es bleibt in diesem Browser")
+ok("die Seite sagt, dass die eigene Anmeldung dabei endet",
+   "endet Deine eigene Anmeldung" in html)
+ok("und was passiert, wenn niemand klickt",
+   "k7f3a91c" in html and "Entziehe" in html,
+   "ein ausgestellter, nie benutzter Schluessel ist der, an den sich "
+   "spaeter niemand erinnert")
+
+create = SRC[SRC.index("def terminal_create("):]
+create = create[:create.index("@app.", 1)]
+ok("beim Mitbenutzen eines Prinzipals gelten DESSEN Rollen",
+   "chosen[" in create and 'roles = chosen["roles"]' in create,
+   "sonst koennte das zweite Terminal still veraendern, was das erste darf")
+ok("der Schluessel geht nie in eine Adresse",
+   "redirect(" not in create)
+ok("und jedes Geraet bekommt seinen eigenen",
+   "/internal/keys" in create)
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

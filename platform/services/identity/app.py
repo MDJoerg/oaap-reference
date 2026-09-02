@@ -16,6 +16,7 @@ import re
 import secrets
 import tempfile
 import time
+from datetime import timedelta
 
 from flask import Flask, redirect, render_template_string, request, session
 from flask.sessions import SecureCookieSessionInterface
@@ -66,9 +67,18 @@ KEY_DEFAULT_DAYS, KEY_MAX_DAYS = 90, 365
 # at issue, and filtered again at use, because a role can be added to a
 # principal after its key was written.
 KEY_FORBIDDEN_ROLES = frozenset({"server_admin"})
+# RFC-0028: a terminal session. A browser cannot put an Authorization
+# header on an ordinary navigation, so a kiosk cannot present a key the
+# way a script does -- it needs a cookie. Enrolment exchanges the key
+# for one, ONCE, and the session keeps naming the key: every request
+# re-checks it, so `oaap key revoke` kills the terminal within seconds
+# and deactivating the principal does the same. The cookie is the
+# carrier; the key remains the credential.
+TERMINAL_SESSION_DAYS = 365
 
 app = Flask(__name__)
 app.secret_key = os.environ["SESSION_SECRET"]
+app.permanent_session_lifetime = timedelta(days=TERMINAL_SESSION_DAYS)
 app.config.update(
     SESSION_COOKIE_NAME="oaap_session",
     SESSION_COOKIE_HTTPONLY=True,
@@ -426,6 +436,7 @@ def load_keys():
         k.setdefault("label", "")
         k.setdefault("revoked", False)
         k.setdefault("last_used", "")
+        k.setdefault("terminal", False)
     return keys
 
 
@@ -441,10 +452,12 @@ def public_key(k):
             "created": k.get("created", ""), "expires": k.get("expires", ""),
             "last_used": k.get("last_used", ""),
             "created_by": k.get("created_by", ""),
+            "terminal": bool(k.get("terminal")),
             "revoked": bool(k.get("revoked"))}
 
 
-def issue_key(users, principal, roles, instance, label, days, created_by):
+def issue_key(users, principal, roles, instance, label, days, created_by,
+              terminal=False):
     """Mint one key. Returns (record, secret) -- the secret is the only
     time the caller ever sees it.
 
@@ -489,7 +502,11 @@ def issue_key(users, principal, roles, instance, label, days, created_by):
            "label": (label or "").strip(),
            "hash": generate_password_hash(secret),
            "created": _now_iso(), "expires": _in_days_iso(days),
-           "last_used": "", "created_by": created_by, "revoked": False}
+           "last_used": "", "created_by": created_by, "revoked": False,
+           # Only a label for the list -- a terminal key is an ordinary
+           # key in every way that matters, which is why enrolling one
+           # needed no new store (RFC-0028 4.1: the device IS the key).
+           "terminal": bool(terminal)}
     keys.append(rec)
     _save(KEYS_FILE, keys)
     return rec, f"oaapk_{kid}_{secret}"
@@ -587,12 +604,29 @@ def _by_key(token, instance):
     return dict(user, roles=effective), "key", None
 
 
+def _terminal_key_ok(kid):
+    """Is the key behind a terminal session still good?
+
+    Checked on EVERY request, not once at enrolment. Without this the
+    cookie would outlive the credential it came from, and revoking a
+    key would leave the screen it was issued for running until somebody
+    rebooted it -- which is the same as not revoking it.
+    """
+    rec = next((k for k in load_keys() if k["id"] == kid), None)
+    return bool(rec and not rec["revoked"]
+                and (not rec.get("expires") or rec["expires"] > _now_iso()))
+
+
 def _by_session():
-    """Method `session` (RFC-0027 3.2): the browser cookie, unchanged."""
+    """Method `session` (RFC-0027 3.2): the browser cookie."""
     username = session_username()
     user = find_user(load_users(), username) if username else None
     if (not user or not user["active"]
             or session.get("epoch") != user.get("session_epoch", 0)):
+        session.clear()
+        return None, "session", redirect("/auth/login", code=303)
+    kid = session.get("terminal_key")
+    if kid and not _terminal_key_ok(kid):
         session.clear()
         return None, "session", redirect("/auth/login", code=303)
     return user, "session", None
@@ -794,8 +828,62 @@ def _revoke_sessions(username):
         _save(USERS_FILE, users)
 
 
+TERMINAL_DONE = """
+<!doctype html><meta charset="utf-8"><title>Terminal eingerichtet</title>
+<body style="font-family:system-ui;max-width:40rem;margin:4rem auto;padding:1rem">
+<h1>Dieses Gerät ist jetzt ein Terminal</h1>
+<p>Es meldet sich ab sofort selbst an, auch nach einem Neustart, als
+   <strong>{{ who }}</strong>.</p>
+<p>Es meldet sich <em>nicht</em> mehr ab. Beendet wird das im Portal unter
+   Zugänge, indem der Schlüssel dieses Geräts entzogen wird — das wirkt
+   sofort, auch wenn niemand am Gerät ist.</p>
+<p><a href="/">Weiter</a></p>
+</body>"""
+
+
+@app.post("/auth/terminal")
+def terminal_enrol():
+    """Exchange a key for a long-lived session (RFC-0028 4.2).
+
+    Why this exists at all: a browser puts no Authorization header on an
+    ordinary navigation, so a kiosk cannot present a key the way a
+    script does. It gets a cookie instead -- and the cookie keeps naming
+    the key, so nothing about revocation changes.
+
+    The key arrives as a form field because the page that carries it was
+    rendered exactly once, by the portal, for the administrator standing
+    at the machine. It must never travel in a URL.
+    """
+    token = (request.form.get("key") or "").strip()
+    user, _method, refusal = _by_key(token, "")
+    if refusal is not None:
+        return refusal
+    if user.get("kind") != "machine":
+        return ("Nur ein Maschinen-Prinzipal kann ein Terminal sein "
+                "(RFC-0028 4.1)."), 403
+    session.clear()
+    session.permanent = True
+    session["user"] = user["username"]
+    session["epoch"] = user.get("session_epoch", 0)
+    session["terminal_key"] = KEY_TOKEN_RE.fullmatch(token).group(1)
+    audit("terminal.enrol", user.get("tenant", ""), user["username"],
+          who=user["username"], role="-",
+          detail="key " + session["terminal_key"])
+    print(f"terminal enrolled: {user['username']} from {_client_ip()}",
+          flush=True)
+    return render_template_string(TERMINAL_DONE, who=user["username"])
+
+
 @app.post("/auth/logout")
 def logout():
+    # A terminal has no one to log out. Offering it the button anyway
+    # would mean one stray tap in a warehouse leaves a dead screen until
+    # somebody with an administrator password walks over -- and the
+    # person who tapped it has no way to know that is what happened.
+    if session.get("terminal_key"):
+        return ("Ein Terminal meldet sich nicht ab. Beendet wird das im "
+                "Portal unter Zugänge, indem der Schlüssel dieses Geräts "
+                "entzogen wird."), 403
     username = session_username()
     if username:
         _revoke_sessions(username)
@@ -1160,7 +1248,8 @@ def keys_create():
     try:
         rec, secret = issue_key(
             users, principal, sorted(wanted), body.get("instance") or "",
-            body.get("label") or "", body.get("days"), actor_name)
+            body.get("label") or "", body.get("days"), actor_name,
+            terminal=bool(body.get("terminal")))
     except ValueError as e:
         return {"error": str(e)}, 400
     audit("key.issue", rec["tenant"], principal, who=actor_name, role=role,
