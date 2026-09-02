@@ -594,6 +594,33 @@ else:
 
 
 print("")
+print("=== ein Port am Gateway vorbei bleibt Sache des Knotens ===")
+
+# Gefunden am 2026-09-02: Die Portal-Route trug im eigenen Kommentar
+# "server_admin only" und rief `require_instance_admin` -- und das laesst
+# seit dem zweiten Mandanten auch einen tenant_admin durch. Auf einem
+# `exposed`-Knoten haette der Kunde seiner App damit einen Port auf dem
+# Wirt geben koennen, an dem Gateway vorbei, das die Grenze durchsetzt.
+import ast                                                    # noqa: E402
+
+PORTAL = os.path.join(HERE, "..", "platform", "services", "portal", "app.py")
+with open(PORTAL, encoding="utf-8") as f:
+    portal_src = f.read()
+fn = next(n for n in ast.parse(portal_src).body
+          if isinstance(n, ast.FunctionDef) and n.name == "instance_endpoint")
+seg = ast.get_source_segment(portal_src, fn) or ""
+check("das Portal verlangt fuer einen Endpunkt ausdruecklich server_admin",
+      'if "server_admin" not in caller_roles():' in seg and "403" in seg, seg[:300])
+
+with open(os.path.join(HERE, "..", "platform", "appctl.py"),
+          encoding="utf-8") as f:
+    cli_src = f.read()
+check("und der Knoten prueft es noch einmal, nicht nur der Knopf",
+      'msg = ("a gateway-bypassing port is a node decision and "' in cli_src)
+check("die Ablehnung nennt den Grund, nicht nur ein Nein",
+      "requires server_admin" in cli_src)
+
+print("")
 print("=== was eine Anfrage ueber die Grenze zu hoeren bekommt ===")
 
 # Zwei Antworten, und der Unterschied ist die ganze Regel. Der Anlass

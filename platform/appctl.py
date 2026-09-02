@@ -5147,6 +5147,14 @@ def cmd_process_deploys(_args):
             decl = next((d for d in declared if d["name"] == ep_name), None)
             if not inst:
                 msg = "unknown instance"
+            elif actor and act_role != "server_admin":
+                # Re-checked here, not only at the button: a port on the
+                # host bypasses the gateway, and with it the tenant
+                # boundary the gateway enforces. That makes it a node
+                # decision (RFC-0011/RFC-0015), so a tenant_admin is
+                # refused even on their own instance.
+                msg = ("a gateway-bypassing port is a node decision and "
+                       "requires server_admin")
             elif not decl:
                 msg = f"no declared endpoint '{ep_name}'"
             elif op == "allow" and not has_profile("exposed"):

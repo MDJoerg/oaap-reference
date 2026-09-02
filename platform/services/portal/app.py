@@ -4174,12 +4174,22 @@ def _endpoint_view(inst):
 
 @app.post("/instances/<name>/endpoint")
 def instance_endpoint(name):
-    """Grant or revoke a non-HTTP endpoint (RFC-0015). server_admin only;
-    queued through the spool worker, which re-checks the 'exposed' node
-    profile — the button is not the boundary."""
+    """Grant or revoke a non-HTTP endpoint (RFC-0015). server_admin only,
+    including for a tenant's own instance: a port on the host that
+    bypasses the gateway is a NODE resource, not a tenant one — it is
+    why the `exposed` profile stayed on the machine (RFC-0011). A
+    tenant_admin administers what happens inside their tenant, and this
+    happens outside it.
+
+    Queued through the spool worker, which re-checks both the role and
+    the 'exposed' node profile — the button is not the boundary."""
     denied = require_instance_admin(name)
     if denied:
         return denied
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: ein Port am Gateway vorbei ist eine "
+                "Entscheidung über den Knoten und erfordert die Rolle "
+                "server_admin."), 403
     if not load_instances().get(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     op = request.form.get("op", "allow")
