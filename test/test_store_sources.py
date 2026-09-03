@@ -363,6 +363,42 @@ res = queue({"id": "r3", "instance": "studio", "action": "install",
 ok("a request cannot introduce a source of its own",
    not res["ok"] and "not listed in any configured" in res["message"], str(res))
 
+print("\n=== a tenant admin installs from the store (RFC-0025 §8.1) ===")
+# Found on the real node oaapx01 on 2026-09-03: `cls-admin` clicked
+# "install" on studio and got "app is not listed in any configured store
+# source" — from a source the portal had just LISTED the app from.
+#
+# Since 0.1.58 the worker turns the requested name into the node-wide
+# key before it resolves anything: outside the default tenant that is
+# `<slug>-<app>`. The store was then asked for an app called
+# `cls-studio`, which no list has ever heard of. Nothing was wrong with
+# the sources; the question was.
+import argparse as _ap  # noqa: E402
+
+appctl.save_sources([
+    {"id": "oaap.platform", "name": "Plattform", "url": BASE + "/platform.json",
+     "trust": "platform", "enabled": True},
+], [])
+with contextlib.redirect_stdout(io.StringIO()):
+    appctl.cmd_tenant(_ap.Namespace(
+        action="create", name="cls", target=None, title="Kunde CLS",
+        account="", account_name="", grace_days=30, yes=True, count=50))
+CLS = appctl.tenant_by_label("cls")[0]
+ident = os.path.join(DATA, "data", "identity")
+os.makedirs(ident, exist_ok=True)
+with open(os.path.join(ident, "users.json"), "w", encoding="utf-8") as f:
+    json.dump([{"username": "cls-admin", "roles": ["tenant_admin"],
+                "tenant": CLS, "groups": [], "active": True}], f)
+ok("the tenant has a slug, so its keys differ from its names",
+   appctl.tenant_slug(CLS) == "cls")
+
+installed.clear()
+res = queue({"id": "t1", "instance": "studio", "action": "install",
+             "by": "cls-admin"})
+ok("a tenant admin can install an app the store lists", res["ok"], str(res))
+ok("resolved by app id, never by the key the node files it under",
+   installed.get("path") == "apps/studio", str(installed))
+
 print("\n=== sources from the portal go through the same rules (§7) ===")
 # The portal's /apps-registry mount is read-only, so a change is queued
 # for the host worker — which re-checks everything the CLI checks,

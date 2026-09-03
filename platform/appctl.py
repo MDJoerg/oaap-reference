@@ -5753,8 +5753,14 @@ def cmd_process_deploys(_args):
             # decided by resolving it against the CONFIGURED store
             # sources, here on the host. A request may pick among the
             # sources the server_admin chose; it can never add one.
+            #
+            # Resolved against `local_name`, never `name`: since 0.1.58
+            # `name` is the node-wide KEY (`<slug>-<app>` outside the
+            # default tenant), and no store list has ever heard of a
+            # key. The app id is what the caller asked for, which is
+            # exactly what `local_name` still holds (RFC-0025 §8.1).
             src, _listed_version, store_src = _store_lookup(
-                name, req.get("source_id", ""),
+                local_name, req.get("source_id", ""),
                 prefer=((inst or {}).get("source") or {}).get("store_source", ""))
             if not src:
                 msg = "app is not listed in any configured store source"
