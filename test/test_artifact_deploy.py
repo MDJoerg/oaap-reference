@@ -553,5 +553,75 @@ check("but the instance belongs to the tenant its creator acts in",
 check("and is called what the human typed, not what the node files it under",
       seen["permit"].get("name") == "viewer", seen)
 
+print("\n-- promoting out of a tenant stays in that tenant")
+# Reported by Joerg on oaapx01, 2026-09-03: he promoted the test
+# instance `cls-gliss-viewer-test` of tenant `cls` to production. The
+# dialogue suggested `cls-gliss-viewer` -- the KEY, prefix and all --
+# and the instance it created then appeared in the DEFAULT tenant
+# instead of in `cls`, invisible to the admin who had just made it.
+#
+# Two faults of the shape fixed one commit earlier for uploads: the
+# target was taken for a node-wide key instead of a name inside a
+# tenant, and nothing told install_artifact whose instance it was
+# creating.
+#
+# The tenant of a promotion is the tenant of the TEST instance -- never
+# the actor's, or a server_admin promoting a customer's test instance
+# would pull it into their own.
+reg = m.load_registry()
+reg["instances"]["kunde-shop-test"] = {
+    "channel": "test", "app_id": "shop", "version": "1.0.0",
+    "name": "shop-test", "tenant": KUNDE,
+    "source": {"kind": "artifact", "version": "1.0.0", "path": ""},
+}
+m.save_registry(reg)
+
+seen.clear()
+m.install_artifact = _capture
+_real_review = m.promotion_review
+m.promotion_review = lambda r, src, tgt: ("/tmp/x.zip", {"app": {"id": "shop"}}, [])
+with open(os.path.join(QUEUE, "pr1.json"), "w", encoding="utf-8") as f:
+    json.dump({"id": "pr1", "instance": "shop", "action": "promote",
+               "from": "kunde-shop-test", "by": "kunde-chef"}, f)
+with _cl.redirect_stdout(_io.StringIO()):
+    m.cmd_process_deploys(None)
+with open(os.path.join(m.SPOOL_DIR, "results", "pr1.json"), encoding="utf-8") as f:
+    res = json.load(f)
+m.install_artifact = _real_install_artifact
+
+check("the promotion is accepted", res.get("ok"), res)
+check("production is filed under the tenant's key",
+      seen.get("key") == "kunde-shop", seen)
+check("and belongs to the tenant of the TEST instance",
+      seen["permit"].get("tenant") == KUNDE, seen)
+check("and is called what the human typed, without the prefix",
+      seen["permit"].get("name") == "shop", seen)
+check("the portal is told the key it may link to",
+      res.get("key") == "kunde-shop", res)
+
+print("\n-- a tenant_admin cannot promote another tenant's test instance")
+reg = m.load_registry()
+reg["instances"]["fremd-test"] = {
+    "channel": "test", "app_id": "shop", "version": "1.0.0",
+    "name": "fremd-test", "tenant": m.ensure_default_tenant(),
+    "source": {"kind": "artifact", "version": "1.0.0", "path": ""},
+}
+m.save_registry(reg)
+seen.clear()
+m.install_artifact = _capture
+with open(os.path.join(QUEUE, "pr2.json"), "w", encoding="utf-8") as f:
+    json.dump({"id": "pr2", "instance": "beute", "action": "promote",
+               "from": "fremd-test", "by": "kunde-chef"}, f)
+with _cl.redirect_stdout(_io.StringIO()):
+    m.cmd_process_deploys(None)
+with open(os.path.join(m.SPOOL_DIR, "results", "pr2.json"), encoding="utf-8") as f:
+    res2 = json.load(f)
+m.install_artifact = _real_install_artifact
+m.promotion_review = _real_review
+check("it is refused", not res2.get("ok"), res2)
+check("as an instance that does not exist for them",
+      res2.get("message") == "unknown instance", res2)
+check("and nothing was installed", not seen, seen)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

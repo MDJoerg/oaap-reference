@@ -3046,7 +3046,27 @@ def cmd_install(args):
                     else "the archive has no usable oaap-app.yaml")
             finally:
                 shutil.rmtree(probe, ignore_errors=True)
+        # Which tenant a NEW instance belongs to, and what it is called
+        # inside it (RFC-0025 8.1). The Git and store paths get this
+        # from the resolution below; this path returns early and so has
+        # to do it itself -- without it `--tenant` was accepted on the
+        # command line and then quietly ignored, and the instance landed
+        # in the default tenant keyed by whatever was typed.
+        local, permit = name, None
         inst = reg["instances"].get(name)
+        if inst is None:
+            owner = tenant_for_new_instance(
+                None, permit={"tenant": resolve_tenant_arg(
+                    getattr(args, "tenant", ""))})
+            found_key, found = find_instance(reg, owner, local)
+            if found is not None:
+                name, inst = found_key, found
+            else:
+                name = instance_key(owner, local)
+                if name in reg["instances"]:
+                    # the name is taken, never by whom (spec 2.4)
+                    die(f"an instance named '{local}' already exists")
+                permit = {"tenant": owner, "name": local}
         if inst and args.channel == "test" and inst.get("channel") == "test":
             # the envelope rule applies to the CLI too — the difference is
             # that here a person is standing at the machine, so a widening
@@ -3069,7 +3089,7 @@ def cmd_install(args):
                 print(f"NOTE: {line}")
         try:
             install_artifact(name, args.package, None, channel=args.channel,
-                             path=args.path)
+                             path=args.path, permit=permit)
         except ArtifactRejected as e:
             die(str(e))
         return
@@ -5064,6 +5084,33 @@ class PromotionRefused(Exception):
     """A refusal a person can act on — same contract as ArtifactRejected."""
 
 
+def promotion_target(reg, source, target_name):
+    """(key, tenant, record) of the production instance a promotion aims at.
+
+    A promotion stays inside ONE tenant: what goes live belongs to
+    whoever owns the test instance it was tested in, and it is called
+    what that tenant calls it -- never the node-wide key (RFC-0025 8.1,
+    RFC-0022 D1). The record is None when the target does not exist yet,
+    which is the ordinary case: promoting is how a production instance
+    usually comes into being.
+
+    One function, because three callers need the same answer and a
+    second derivation would drift: the worker needs the KEY for the log
+    and the registry, install_artifact needs the TENANT and the NAME,
+    and the CLI needs to say which of the two it is about to create.
+    """
+    tenant = resolve_tenant((reg["instances"].get(source) or {}).get("tenant"))
+    key, existing = find_instance(reg, tenant, target_name)
+    if existing is not None:
+        return key, tenant, existing
+    key = instance_key(tenant, target_name)
+    # A key that is taken belongs to somebody -- possibly another
+    # tenant, if their slug and name happen to compose the same word.
+    # Returning that record lets the caller refuse instead of writing
+    # into it.
+    return key, tenant, reg["instances"].get(key)
+
+
 def promotion_review(reg, source, target_name):
     """Everything that must hold before a promotion may run.
 
@@ -5108,7 +5155,7 @@ def promotion_review(reg, source, target_name):
     finally:
         shutil.rmtree(unpacked, ignore_errors=True)
 
-    target = reg["instances"].get(target_name)
+    _key, _tenant, target = promotion_target(reg, source, target_name)
     notes = []
     if target:
         if target.get("channel") != "production":
@@ -5141,7 +5188,8 @@ def promotion_review(reg, source, target_name):
 
 def promote_artifact(source, target_name, confirmed=False):
     """Install the tested artifact of `source` into the production
-    instance `target_name` (RFC-0020).
+    instance called `target_name` inside the test instance's tenant
+    (RFC-0020). Returns (version, sha, notes, key).
 
     Nothing is fetched and nothing is uploaded: the file that installs
     is the one this node already accepted. `confirmed` is the human's
@@ -5156,28 +5204,46 @@ def promote_artifact(source, target_name, confirmed=False):
             "reach or who may reach it (" + "; ".join(notes)
             + ") — read it and confirm it explicitly")
     src_path = (reg["instances"][source].get("source") or {}).get("path", "")
-    version, sha = install_artifact(target_name, path, None,
+    key, tenant, _existing = promotion_target(reg, source, target_name)
+    version, sha = install_artifact(key, path, None,
                                     channel="production", path=src_path,
-                                    origin=source)
-    return version, sha, notes
+                                    origin=source,
+                                    # The two facts nothing else knows
+                                    # once the key is composed: whose
+                                    # instance this is, and what the
+                                    # human typed. Without them a
+                                    # promotion out of a tenant landed
+                                    # in the DEFAULT one and took the
+                                    # key for its name -- invisible to
+                                    # the very admin who had just
+                                    # promoted it (oaapx01, 2026-09-03).
+                                    permit={"tenant": tenant,
+                                            "name": target_name})
+    return version, sha, notes, key
 
 
 def cmd_promote(args):
     """`oaap app promote <test-instance> [--to <name>] [--confirm]`."""
-    target = args.to or (args.name[:-5] if args.name.endswith("-test")
-                         else "")
+    reg = load_registry()
+    # `--to` names the production instance the way its TENANT reads it,
+    # like every other name a person types since RFC-0025 8.1 -- the
+    # slug is the node's business, not theirs. So the default is derived
+    # from the test instance's own name, never from its key: for
+    # `cls-gliss-viewer-test` that is `gliss-viewer`, not
+    # `cls-gliss-viewer`.
+    local = instance_name(args.name, reg["instances"].get(args.name))
+    target = args.to or (local[:-5] if local.endswith("-test") else "")
     if not target:
         die("name the production instance with --to "
             f"(a name ending in '-test' is shortened automatically, "
-            f"'{args.name}' is not)")
-    reg = load_registry()
+            f"'{local}' is not)")
     try:
         _path, m, notes = promotion_review(reg, args.name, target)
     except PromotionRefused as e:
         die(str(e))
-    exists = target in reg["instances"]
-    print(f"Promoting {args.name} -> {target} "
-          f"({'update' if exists else 'new production instance'}), "
+    key, _tenant, existing = promotion_target(reg, args.name, target)
+    print(f"Promoting {args.name} -> {key} "
+          f"({'update' if existing is not None else 'new production instance'}), "
           f"app {m['app']['id']} {m['app']['version']}")
     for n in notes:
         print(f"NOTE: {n}")
@@ -5185,13 +5251,13 @@ def cmd_promote(args):
         die("this promotion widens the envelope (see NOTE above) — "
             "repeat with --confirm if that is intended")
     try:
-        version, sha, _ = promote_artifact(args.name, target,
-                                           confirmed=bool(args.confirm))
+        version, sha, _, key = promote_artifact(args.name, target,
+                                                confirmed=bool(args.confirm))
     except (PromotionRefused, ArtifactRejected) as e:
         die(str(e))
-    print(f"Promoted {version} to '{target}' (sha {sha[:12]}).")
+    print(f"Promoted {version} to '{key}' (sha {sha[:12]}).")
     print("The previous package is retained — 'oaap app artifact rollback "
-          f"{target}' is the way back.")
+          f"{key}' is the way back.")
 
 
 def _version_gt(new, old):
@@ -5719,9 +5785,33 @@ def cmd_process_deploys(_args):
             else:
                 name = instance_key(act_tenant, name)
                 inst = reg["instances"].get(name)
+        elif action == "promote":
+            # A promotion names its target the way the tenant reads it,
+            # ALWAYS -- there is no key to name, because the production
+            # instance usually does not exist yet, and the tenant is the
+            # one the test instance belongs to (never the actor's, so a
+            # server_admin promoting a customer's test instance does not
+            # move it into their own tenant).
+            #
+            # Without this the target was taken for a key: the record
+            # fell back to the DEFAULT tenant and took the key for its
+            # name, so the production instance was invisible to the
+            # admin who had just made it (oaapx01, 2026-09-03 -- the
+            # same shape as the artifact path fixed in 0.1.66).
+            name, _prom_tenant, inst = promotion_target(
+                reg, str(req.get("from") or ""), name)
         audit_tenant_id = None
         cross_tenant = (inst is not None and act_role == "tenant_admin"
                         and resolve_tenant(inst.get("tenant")) != act_tenant)
+        if action == "promote" and act_role == "tenant_admin":
+            # The SOURCE is re-checked here too, because the spool is
+            # data and not trust: it decides which tenant the production
+            # instance is created in, so a request naming somebody
+            # else's test instance must not get that far.
+            src_tenant = resolve_tenant(
+                (reg["instances"].get(str(req.get("from") or "")) or {})
+                .get("tenant"))
+            cross_tenant = cross_tenant or src_tenant != act_tenant
 
         def run_install(src, channel):
             ns = _argparse.Namespace(
@@ -6005,17 +6095,20 @@ def cmd_process_deploys(_args):
                     msg = str(e)
         elif action == "promote":
             # Ship the tested artifact to production (RFC-0020). The
-            # request names the SOURCE instance; `name` is the target,
-            # because everything downstream (log, result, registry)
-            # is keyed on the instance that changes.
+            # request names the SOURCE instance; `name` is by now the
+            # target's KEY, because everything downstream (log, result,
+            # registry) is keyed on the instance that changes -- while
+            # promote_artifact gets the tenant-local name the request
+            # carried, so it composes the same key from the same tenant
+            # and the two sides cannot drift.
             #
             # Every rule is re-checked here even though the portal
             # already showed them: the spool is data, not trust — and
             # between showing and clicking, a deployment may have
             # changed what the test instance runs.
             try:
-                version, sha, notes = promote_artifact(
-                    str(req.get("from") or ""), name,
+                version, sha, notes, _key = promote_artifact(
+                    str(req.get("from") or ""), local_name,
                     confirmed=bool(req.get("confirmed")))
                 revision = sha[:12]
                 ok = True
@@ -7170,7 +7263,10 @@ def main():
                         help="ship the tested artifact to production (RFC-0020)")
     pp.add_argument("name", help="test instance to promote FROM")
     pp.add_argument("--to", default="",
-                    help="production instance (default: the name without '-test')")
+                    help="production instance, named inside the test "
+                         "instance's tenant and without its short name "
+                         "(default: the test instance's name without "
+                         "'-test')")
     pp.add_argument("--confirm", action="store_true",
                     help="accept an envelope widening reported as NOTE")
     pp.set_defaults(fn=cmd_promote)

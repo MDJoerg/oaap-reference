@@ -1865,6 +1865,17 @@ INSTANCE_EDIT_BODY = """
     <label>Oder neuer Name für die Produktiv-Instanz
       <input type="text" name="new_target" placeholder="{{ i.promote.suggestion }}"
              autocomplete="off"></label>
+    {% if i.promote.tenant %}
+    <p class="muted">Der Name gilt <strong>innerhalb des Mandanten
+       {{ i.promote.tenant }}</strong> — genau wie beim Anlegen. Das
+       Mandanten-Kürzel <strong>gehört nicht in das Feld</strong>: der Knoten
+       setzt es selbst davor, damit sich Namen verschiedener Mandanten nicht in
+       die Quere kommen. Aus <code>{{ i.promote.suggestion }}</code> wird also
+       <code>{{ i.promote.tenant }}-{{ i.promote.suggestion }}</code> als
+       interne Kennung, während Du überall <code>{{ i.promote.suggestion }}</code>
+       liest. Die Produktiv-Instanz gehört demselben Mandanten wie diese
+       Test-Instanz.</p>
+    {% endif %}
     <label class="checkline"><input type="checkbox" name="confirm" value="1">
       Rahmenerweiterung bestätigen — nur ankreuzen, wenn der erste Versuch
       eine gemeldet hat</label>
@@ -5126,19 +5137,35 @@ def _promote_view(name, inst):
     Only for an instance that runs from a retained artifact — that is
     the only case where "the same bytes" is provable, which is the whole
     promise. The candidate list is deliberately narrow: production
-    instances of the SAME app, because promoting into a different app is
-    the mistake this page must not make easy.
+    instances of the SAME app IN THE SAME TENANT, because promoting into
+    a different app is the mistake this page must not make easy, and
+    promoting across the tenant boundary is one it must not make
+    possible — nor may it show what another tenant has named its
+    instances (oaap.core.tenant 2.3 rule 2).
+
+    Everything here is the tenant-local name, never the key: what the
+    customer types is the word they read everywhere else, and the node
+    composes `<slug>-<name>` itself (RFC-0025 8.1).
     """
     if inst.get("channel") != "test":
         return None
     if (inst.get("source") or {}).get("kind") != "artifact":
         return None
     app_id = inst.get("app_id", "")
-    targets = [{"name": n, "version": i.get("version", "?")}
-               for n, i in sorted(load_instances().items())
-               if i.get("channel") == "production" and i.get("app_id") == app_id]
-    suggestion = name[:-5] if name.endswith("-test") else f"{app_id}-prod"
-    return {"targets": targets, "suggestion": suggestion}
+    mine = resolve_tenant(inst.get("tenant")) or ""
+    targets = [{"name": local_name(n, i), "version": i.get("version", "?")}
+               for n, i in sorted(visible_instances().items())
+               if i.get("channel") == "production" and i.get("app_id") == app_id
+               and (resolve_tenant(i.get("tenant")) or "") == mine]
+    base = local_name(name, inst)
+    suggestion = base[:-5] if base.endswith("-test") else f"{app_id}-prod"
+    # The label only where it is TRUE: the default tenant has no short
+    # name -- its instances are keyed by the bare word -- and a node
+    # with one tenant must not read a single tenant sentence anywhere.
+    label = ("" if (not multi_tenant() or mine == default_tenant_id())
+             else tenant_label(mine))
+    return {"targets": targets, "suggestion": suggestion,
+            "tenant": label, "local": base}
 
 
 PROMOTE_WAIT_SECONDS = 180  # builds an image, like any other installation
@@ -5170,11 +5197,15 @@ def instance_promote(name):
         return _inst_back(name, err="Ziel fehlt oder ist kein gültiger "
                                     "Instanzname (Kleinbuchstaben, Ziffern, "
                                     "Bindestriche).")
-    if target == name:
+    if target == local_name(name, inst):
         return _inst_back(name, err="Eine Instanz kann nicht in sich selbst "
                                     "übernommen werden.")
-    # queued on the TARGET: that is the instance that changes, and the
-    # log, the result and the registry are all keyed on it
+    # The target is named the way its TENANT reads it, exactly like the
+    # create form: the host composes the key from the tenant of the test
+    # instance and answers with it (RFC-0025 8.1). Sending the key here
+    # would be wrong twice over — it would file the production instance
+    # under no tenant, and it would ask the customer to type a prefix
+    # that is the node's business.
     res = _queue_and_wait(target, {"action": "promote", "from": name,
                                    "confirmed": bool(request.form.get("confirm"))},
                           PROMOTE_WAIT_SECONDS)
@@ -5183,7 +5214,7 @@ def instance_promote(name):
                                     "der Instanzliste nach, ob sie durch ist.")
     if not res.get("ok"):
         return _inst_back(name, err=res.get("message", "Übernahme fehlgeschlagen."))
-    return redirect(f"/instances/{target}?msg="
+    return redirect(f"/instances/{res.get('key') or target}?msg="
                     + quote(res.get("message", "Übernommen.")), code=303)
 
 

@@ -240,6 +240,23 @@ ok("die Bestätigung kommt NACH der Meldung, nicht davor",
 ok("ohne Paketquelle gibt es die Karte nicht",
    "Nach Produktiv übernehmen" not in render("deployment", promote=None))
 
+# Joerg auf oaapx01, 03.09.2026: "Der zu vergebene Name der neuen Instanz hat
+# mich verwundert und es sollte erklaert werden, ob man den Tenant-Prefix
+# vergeben muss oder nicht." Die Karte schlug den SCHLUESSEL vor
+# (`cls-gliss-viewer`) und schwieg dazu, wessen Name das ist.
+h = render("deployment", promote={"targets": [], "suggestion": "gliss-viewer",
+                                  "tenant": "cls", "local": "gliss-viewer-test"})
+ok("der Vorschlag traegt kein Mandanten-Kuerzel",
+   'placeholder="gliss-viewer"' in h)
+ok("die Karte nennt den Mandanten, in dem der Name gilt",
+   "innerhalb des Mandanten" in h and "cls" in h)
+ok("und sagt ausdruecklich, dass das Kuerzel nicht ins Feld gehoert",
+   "gehört nicht in das Feld" in h)
+ok("auf einem Knoten ohne Mandanten steht der Absatz nicht da",
+   "innerhalb des Mandanten" not in render(
+       "deployment", promote={"targets": [], "suggestion": "bdt-hub",
+                              "tenant": "", "local": "bdt-hub-test"}))
+
 print("\n=== Produktiv bekommt kein Token, sagt aber warum ===")
 prod = dict(TESTINSTANZ, channel="production")
 h = render("deployment", prod, is_test=False, channel_label="Produktiv",
