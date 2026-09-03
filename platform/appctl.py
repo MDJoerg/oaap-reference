@@ -3402,6 +3402,13 @@ def remove_instance(reg, name, purge):
     # generated sites are derived from the registry — regenerate them,
     # or the node keeps proxying its external name to a dead container
     refresh_generated_sites()
+    # So are the readable paths (RFC-0026 3.2). Without this the
+    # `by-name` link outlives the instance and points into nothing: the
+    # tree still claims a name that is free, which is the one lie a
+    # directory listing must not tell at two in the morning. Passing the
+    # registry we already hold, so the answer does not depend on whether
+    # the second save below has happened yet.
+    refresh_name_links(reg)
     reload_gateway()
     drop_token(name, "instance removed")
     grants_drop_for(name, "instance removed")

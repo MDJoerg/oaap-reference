@@ -142,8 +142,28 @@ print("Entfernen merkt sich, was es liegen laesst")
 reg = m.load_registry()
 os.makedirs(os.path.join(vorher, "storage", "data"), exist_ok=True)
 m.save_env("cls-viewer", {"API_KEY": "geheim"}, inst)
+# Am echten Knoten gefunden (2026-09-03): Nach `app remove --purge`
+# stand `by-name/cls-gliss-test` noch da und zeigte ins Leere. Die
+# lesbaren Pfade werden bei Migration, Mandanten- und
+# Instanz-Umbenennung nachgezogen -- beim Entfernen nicht.
+#
+# Geprueft wird der Aufruf, nicht das Ergebnis: Symlinks gibt es unter
+# Windows nicht ohne Extrarechte, und genau deshalb ist `name_links`
+# ueberhaupt eine reine Funktion. Was hier gefehlt hat, war die
+# Verdrahtung.
+nachgezogen = []
+_echt = m.refresh_name_links
+m.refresh_name_links = lambda reg=None, tenants=None: nachgezogen.append(reg)
 with contextlib.redirect_stdout(_io.StringIO()):
     meldung = m.remove_instance(reg, "cls-viewer", purge=False)
+m.refresh_name_links = _echt
+ok("das Entfernen zieht die lesbaren Pfade nach", len(nachgezogen) == 1)
+ok("und der Name steht in diesem Mandanten in keinem lesbaren Pfad mehr",
+   by_name not in m.name_links(),
+   "sonst behauptet der Baum einen Namen, den es nicht mehr gibt -- "
+   "der gleichnamige `viewer` des Mandanten meier bleibt davon unberuehrt")
+ok("der gleichnamige des anderen Mandanten bleibt",
+   os.path.join(m.tenant_dir(meier_id), "by-name", "viewer") in m.name_links())
 ok("die Meldung nennt den Namen des Kunden, nicht den Schluessel",
    "viewer" in meldung and "cls-viewer" not in meldung, meldung)
 kept = m.load_registry().get("retained") or {}
