@@ -488,5 +488,70 @@ kept = m.artifact_list("demo-test")
 check("four artifacts kept", len(kept) == 4, kept)
 check("the newest survive", kept[0] == "0.5.0-aaaaaaaaaaaa.zip", kept)
 
+print("\n-- an uploaded package creates the instance in its OWN tenant")
+# Found on oaapx01 on 2026-09-03, minutes after the store fix: a
+# tenant_admin uploaded a ZIP, the portal said "Test-Instanz angelegt"
+# and the page it linked to answered "Instanz nicht gefunden".
+#
+# The instance was real -- it just belonged to nobody's tenant. The
+# worker composes the KEY from the acting tenant (`cls-gliss-viewer`)
+# and then handed only that key to install_artifact. The two facts a
+# permit carries -- whose instance this is, and what the human typed --
+# were dropped on the way, so the record fell back to the DEFAULT
+# tenant and took the key for its name. Invisible to the admin who had
+# just created it, because an instance of another tenant does not exist.
+#
+# Driven through the real worker with the build stubbed: the bug is in
+# what the worker PASSES, so that is what this reads.
+import argparse as _ap  # noqa: E402
+import contextlib as _cl  # noqa: E402
+import io as _io  # noqa: E402
+
+m.save_profiles(["dev"])
+m.ensure_default_tenant()
+with _cl.redirect_stdout(_io.StringIO()):
+    m.cmd_tenant(_ap.Namespace(
+        action="create", name="kunde", target=None, title="Kunde",
+        account="", account_name="", grace_days=30, yes=True, count=50))
+KUNDE = m.tenant_by_label("kunde")[0]
+ident_dir = os.path.join(DATA, "data", "identity")
+os.makedirs(ident_dir, exist_ok=True)
+with open(os.path.join(ident_dir, "users.json"), "w", encoding="utf-8") as f:
+    json.dump([{"username": "kunde-chef", "roles": ["tenant_admin"],
+                "tenant": KUNDE, "groups": [], "active": True}], f)
+
+seen = {}
+_real_install_artifact = m.install_artifact
+
+
+def _capture(name, zip_path, grant, channel="test", path="", origin="",
+             permit=None):
+    seen.update(key=name, permit=permit or {})
+    return "0.1.0", "ab" * 32
+
+
+m.install_artifact = _capture
+QUEUE = os.path.join(m.SPOOL_DIR, "queue")
+os.makedirs(QUEUE, exist_ok=True)
+os.makedirs(os.path.join(m.SPOOL_DIR, "uploads"), exist_ok=True)
+with open(os.path.join(m.SPOOL_DIR, "uploads", "up1.zip"), "wb") as f:
+    f.write(b"nicht echt -- der Bau ist gestubbt")
+with open(os.path.join(QUEUE, "up1.json"), "w", encoding="utf-8") as f:
+    json.dump({"id": "up1", "instance": "viewer", "action": "create",
+               "from": "artifact", "by": "kunde-chef"}, f)
+with _cl.redirect_stdout(_io.StringIO()):
+    m.cmd_process_deploys(None)
+with open(os.path.join(m.SPOOL_DIR, "results", "up1.json"), encoding="utf-8") as f:
+    res = json.load(f)
+m.install_artifact = _real_install_artifact
+
+check("the upload is accepted", res.get("ok"), res)
+check("the node files it under the tenant's key",
+      seen.get("key") == "kunde-viewer", seen)
+check("but the instance belongs to the tenant its creator acts in",
+      seen["permit"].get("tenant") == KUNDE, seen)
+check("and is called what the human typed, not what the node files it under",
+      seen["permit"].get("name") == "viewer", seen)
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

@@ -5819,7 +5819,22 @@ def cmd_process_deploys(_args):
                     else:
                         version, sha = install_artifact(
                             name, up, None, channel="test",
-                            path=(req.get("path") or "").strip())
+                            path=(req.get("path") or "").strip(),
+                            # There is no stored permit on this path --
+                            # the operator IS the permit (RFC-0011):
+                            # they are creating the instance right now,
+                            # in the tenant their own record names. The
+                            # two facts install_artifact takes from a
+                            # permit are exactly the two nothing else
+                            # knows once the key is composed: whose
+                            # instance this is, and what the human
+                            # typed. Without them a package uploaded
+                            # inside a tenant landed in the DEFAULT one,
+                            # keyed `<slug>-<name>` but owned by
+                            # nobody's tenant -- invisible to the very
+                            # admin who had just created it.
+                            permit={"tenant": act_tenant,
+                                    "name": local_name})
                         revision = sha[:12]
                         ok, msg = True, f"test instance created from artifact ({version})"
                 except ArtifactRejected as e:
