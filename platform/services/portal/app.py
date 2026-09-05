@@ -825,6 +825,65 @@ HEALTH_BODY = """
   {% endif %}
 </div>
 {% endif %}
+<div class="card">
+  <h2>Sicherung</h2>
+  {% if bk.running %}
+  <p><span class="dot warn"></span><strong>Läuft seit {{ bk.running.since }}</strong>
+     <span class="muted">— währenddessen stehen die Apps dieses Knotens für
+     die Dauer des Kopierens still.</span></p>
+  {% elif bk.last and bk.last.ok %}
+  <p><span class="dot ok"></span>Zuletzt <strong>{{ bk.last.when }}</strong>
+     <span class="muted">— {{ bk.last.size }}, {{ bk.last.instances }} Instanz(en),
+     Apps standen <strong>{{ bk.last.downtime }}</strong> still
+     (Lauf insgesamt {{ bk.last.total }}).</span></p>
+  {% elif bk.last %}
+  <p><span class="dot err"></span><strong>Fehlgeschlagen</strong>
+     {{ bk.last.when }} <span class="muted">— {{ bk.last.message }}</span></p>
+  <p class="muted">Ein fehlgeschlagener Lauf hinterlässt kein Archiv — es gibt
+     also nichts, was fälschlich nach einer Sicherung aussieht. Die vorige
+     Sicherung liegt unverändert da.</p>
+  {% else %}
+  <p><span class="dot unknown"></span><strong>Auf diesem Knoten wurde noch nie
+     gesichert.</strong></p>
+  {% endif %}
+
+  {% if bk.schedule %}
+  <p><span class="dot {{ 'ok' if bk.schedule.next else 'warn' }}"></span>Geplant:
+     täglich <strong>{{ bk.schedule.at }}</strong>
+     {% if bk.schedule.next %}<span class="muted">— nächster Lauf
+     {{ bk.schedule.next }}</span>{% else %}<span class="muted">— aber der
+     Zeitgeber meldet keinen nächsten Lauf; bitte nachsehen</span>{% endif %}</p>
+  <p class="muted">Ziel <code>{{ bk.schedule.target }}</code>, die
+     {{ bk.schedule.keep }} neuesten Archive bleiben hier liegen.</p>
+  {% else %}
+  <p><span class="dot unknown"></span><span class="muted">Kein Zeitplan
+     eingerichtet — es läuft nichts von allein. Eingerichtet wird er an der
+     Maschine mit <code>sudo bash ops/install-backup-timer.sh</code>.</span></p>
+  {% endif %}
+
+  {% if bk.pulls %}
+  <h3 style="margin:1.2rem 0 .4rem;font-size:1rem">Von hier abgeholt</h3>
+  <p class="muted" style="margin:0 0 .6rem">Was dieser Knoten von anderen
+     geholt hat. Ob eine Kopie ankam und ob die Prüfsumme stimmte, weiß nur
+     die abholende Seite — deshalb steht es hier und nicht dort.</p>
+  <table>
+    <tr><th>Knoten</th><th>Zuletzt</th><th>Prüfsumme</th><th>Generationen</th></tr>
+    {% for p in bk.pulls %}
+    <tr><td><strong>{{ p.node }}</strong></td>
+        <td><span class="dot {{ 'ok' if p.ok else 'err' }}"></span>{{ p.when }}
+            <span class="muted">— {{ p.message }}</span></td>
+        <td>{{ p.checksum }}</td>
+        <td class="muted">{{ p.generations }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if bk.elsewhere %}
+  <p class="muted" style="margin-top:1rem">Ob die Sicherungen dieses Knotens
+     woanders angekommen sind, steht auf dem Knoten, der sie abholt — dieser
+     hier kann es nicht wissen und behauptet es deshalb nicht.</p>
+  {% endif %}
+</div>
 <p class="muted">Geprüft wird aus Sicht des Portals über das interne
 Netz. Landschafts-Gesundheit (Worker-Knoten) folgt mit RFC-0003.</p>
 """
@@ -3548,7 +3607,7 @@ def health():
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
                 core=core, apps=apps, ext=external_access(),
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
-                deploys=recent_deploys())
+                deploys=recent_deploys(), bk=backup_state())
 
 
 # --------------------------------------------- fleet status (RFC-0021)
@@ -3828,6 +3887,94 @@ def _entry_url(name, inst):
     # and no address to name, and saying so beats a 500
     port = (inst or {}).get("port")
     return (f"http://{request.host.split(':')[0]}:{port}/" if port else "")
+
+
+# --------------------------------------------- backups (RFC-0029 D2)
+# Read from three files beside the registry, which this container
+# already mounts read-only. The rule they follow is the one D2 decided:
+# each truth appears once, on the side that can verify it.
+BACKUP_LAST = "/apps-registry/backup-last.json"
+BACKUP_SCHEDULE = "/apps-registry/backup-schedule.json"
+BACKUP_PULLS = "/apps-registry/backup-pulls"
+
+
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _bytes_h(n):
+    n = int(n or 0)
+    return f"{n / 1048576:.0f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB"
+
+
+def _secs_h(n):
+    n = int(n or 0)
+    return f"{n} Sekunden" if n < 90 else f"{n // 60} Minuten {n % 60} Sekunden"
+
+
+def backup_state():
+    """What this node's backups are doing, for the health page.
+
+    Deliberately says four different things, because they need four
+    different answers: it is running, it worked, it failed, or nobody
+    ever set this up. A page that only reports success cannot tell the
+    last two apart -- and those are the two where somebody has to act.
+    """
+    last = _read_json(BACKUP_LAST) or {}
+    sched = _read_json(BACKUP_SCHEDULE) or {}
+    out = {"running": None, "last": None, "schedule": None, "pulls": [],
+           "elsewhere": bool(sched)}
+
+    if last.get("state") == "running":
+        started = last.get("started", "")
+        try:
+            began = datetime.fromisoformat(started)
+            secs = (datetime.now(began.tzinfo) - began).total_seconds()
+            out["running"] = {"since": _ago(secs)}
+        except (TypeError, ValueError):
+            out["running"] = {"since": "unbekannt"}
+    elif last:
+        out["last"] = {
+            "ok": last.get("state") == "ok",
+            "when": (last.get("finished") or "")[:19].replace("T", " "),
+            "size": _bytes_h(last.get("bytes")),
+            "instances": last.get("instances", "?"),
+            "downtime": _secs_h(last.get("downtime_seconds")),
+            "total": _secs_h(last.get("total_seconds")),
+            "message": last.get("message", "kein Grund vermerkt"),
+        }
+
+    if sched.get("enabled"):
+        out["schedule"] = {
+            "at": sched.get("at", "?"),
+            "next": (sched.get("next") or "").replace("T", " ")[:19],
+            "target": sched.get("target", "?"),
+            "keep": sched.get("keep", "?"),
+        }
+
+    try:
+        names = sorted(os.listdir(BACKUP_PULLS))
+    except OSError:
+        names = []
+    for fn in names:
+        p = _read_json(os.path.join(BACKUP_PULLS, fn)) or {}
+        if not p:
+            continue
+        gens = p.get("generations") or {}
+        out["pulls"].append({
+            "node": p.get("source_node", fn[:-5]),
+            "ok": p.get("result") == "ok",
+            "when": (p.get("finished") or "")[:19].replace("T", " "),
+            "message": p.get("message", ""),
+            "checksum": {"yes": "bestätigt", "already here": "unverändert"}.get(
+                p.get("checksum_verified"), p.get("checksum_verified") or "–"),
+            "generations": ", ".join(f"{k}: {v}" for k, v in gens.items()),
+        })
+    return out
 
 
 def recent_deploys(limit=5):

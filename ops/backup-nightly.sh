@@ -136,6 +136,28 @@ if [ "$KEEP" -gt 0 ]; then
     done
 fi
 
+# Keep the planned next run current, so the health page never shows a
+# date that has already passed (RFC-0029 D2). Asked of the timer, not
+# computed -- a page must not claim a schedule that is not armed.
+SCHED=/var/lib/oaap/apps/backup-schedule.json
+if [ -f "$SCHED" ] && command -v python3 >/dev/null 2>&1; then
+  NEXT="$(systemctl show -p NextElapseUSecRealtime --value oaap-backup.timer 2>/dev/null)"     python3 - "$SCHED" <<'PY' || true
+import json, os, sys
+p = sys.argv[1]
+try:
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+except (OSError, ValueError):
+    raise SystemExit(0)
+d["next"] = os.environ.get("NEXT", "")
+tmp = p + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
+os.chmod(p, 0o644)
+PY
+fi
+
 RESULT="ok"
 MESSAGE="$(basename "$ARCHIVE"), $((BYTES / 1024 / 1024)) MB, ${SECONDS_TAKEN}s"
 echo "OK: $MESSAGE"

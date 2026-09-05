@@ -72,6 +72,18 @@ write_state() {
 EOF
   mv "$tmp" "$STATE" 2>/dev/null || true
   chmod 600 "$STATE" 2>/dev/null || true
+  # A second copy beside THIS node's registry, where its own portal can
+  # read it (RFC-0029 D2). Whether the copy arrived and whether the
+  # checksum matched is known only here, on the fetching side -- so it
+  # is shown here, and the node that gave the archive away never claims
+  # it. The file on the backup target stays the authoritative one; this
+  # is the same record, put where a page can reach it without mounting
+  # the backup share into a web container.
+  local reg=/var/lib/oaap/apps/backup-pulls
+  if [ -d /var/lib/oaap/apps ]; then
+    mkdir -p "$reg" && chmod 755 "$reg"
+    cp "$STATE" "$reg/$NODE.json" 2>/dev/null && chmod 644 "$reg/$NODE.json"
+  fi
 }
 trap write_state EXIT
 

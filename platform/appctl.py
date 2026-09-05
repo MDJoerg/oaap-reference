@@ -6901,7 +6901,28 @@ def _backup_missing_instances(archive, reg):
     return missing
 
 
+# Three files, one reader (RFC-0029 D2).
+#
+# The portal already mounts the registry directory read-only, so
+# everything a backup page needs is put HERE rather than behind a new
+# mount or an API. Three files, because there are three writers and
+# each one knows something the others cannot:
+#
+#   backup-last.json      what THIS node's own backup did -- written by
+#                         `oaap backup create`, which is the only thing
+#                         that can measure it
+#   backup-schedule.json  what is planned here -- written by whoever
+#                         installs a schedule; absent means "nobody has
+#                         set this up", which is a different answer from
+#                         "it failed"
+#   backup-pulls/<node>.json   what THIS node fetched from another one
+#                         -- written by the puller, because only the
+#                         puller knows whether the copy arrived and
+#                         whether the checksum matched. The node that
+#                         gave the archive away must never claim this.
 BACKUP_RUN_FILE = os.path.join(APPS_DIR, "backup-last.json")
+BACKUP_SCHEDULE_FILE = os.path.join(APPS_DIR, "backup-schedule.json")
+BACKUP_PULLS_DIR = os.path.join(APPS_DIR, "backup-pulls")
 
 
 def _dir_kbytes(path):
@@ -6919,31 +6940,43 @@ def _dir_kbytes(path):
         return 0
 
 
-def _record_backup_run(path, size, downtime, total, instances):
-    """Write down what the last backup cost this node.
+def _record_backup_run(state, **fields):
+    """Write down what this node's backup is doing, or last did.
 
     Lives beside the registry, which the portal already mounts
     read-only, so a page can read it without a new mount or an API
-    (RFC-0029 D1/D2). It records a MEASUREMENT, never a promise: the
-    sentence the portal owes its operator -- "your apps will stop for
-    about this long" -- has to be this node's own last figure. A number
-    taken from a manual or from another machine is a guess wearing the
-    clothes of a measurement.
+    (RFC-0029 D1/D2).
+
+    Written on EVERY outcome, not only on success. A record that
+    appears only when things went well cannot tell "last night failed"
+    apart from "nobody ever set this up" -- and those two need
+    different answers from whoever is reading the page. `running` is
+    written before the apps are stopped, so the page can say "seit N
+    Minuten" while it is happening, which is exactly when somebody is
+    looking for the reason their app is unreachable (the RFC-0024
+    vocabulary, deliberately reused).
+
+    What it records are MEASUREMENTS, never promises: the sentence the
+    portal owes its operator -- "your apps will stop for about this
+    long" -- has to be this node's own last figure. A number from a
+    manual is always somebody else's machine.
     """
     try:
+        prev = last_backup_run() or {}
+        rec = {"schema": "0.2", "state": state,
+               "started": prev.get("started") if state != "running" else _iso_now()}
+        rec.update(fields)
+        if state != "running":
+            rec["finished"] = _iso_now()
         with open(BACKUP_RUN_FILE, "w", encoding="utf-8") as f:
-            json.dump({"schema": "0.1", "archive": path, "bytes": size,
-                       "instances": instances,
-                       "downtime_seconds": round(downtime),
-                       "total_seconds": round(total),
-                       "finished": _iso_now()}, f, indent=2)
+            json.dump(rec, f, indent=2)
         os.chmod(BACKUP_RUN_FILE, 0o644)   # names no secret, only sizes
     except OSError as e:
-        print(f"NOTE: could not record the backup timing ({e}).")
+        print(f"NOTE: could not record the backup state ({e}).")
 
 
 def last_backup_run():
-    """What the last backup cost, or None. Read by the portal."""
+    """What the last backup did, or None. Read by the portal."""
     try:
         with open(BACKUP_RUN_FILE, encoding="utf-8") as f:
             return json.load(f)
@@ -7074,6 +7107,11 @@ def cmd_backup(args):
             shutil.rmtree(stage, ignore_errors=True)
 
     written = False
+    # Said before anything stops, so the page can answer the question
+    # somebody is about to ask -- "why is my app not answering?" --
+    # while it is still true (RFC-0029 D2).
+    _record_backup_run("running", target=out_path,
+                       instances=len(manifest["instances"]))
     try:
         copy_phase()
         downtime = time.monotonic() - t0
@@ -7097,9 +7135,13 @@ def cmd_backup(args):
         if os.path.isfile(TENANT_LOG) and not missing:
             listing = subprocess.run(["tar", "-tzf", tmp_out], check=True,
                                      text=True, capture_output=True).stdout
-            if os.path.relpath(TENANT_LOG, DATA_DIR).replace(os.sep, "/")                     not in listing.split():
+            rel = os.path.relpath(TENANT_LOG, DATA_DIR).replace(os.sep, "/")
+            if rel not in listing.split():
                 missing = ["the tenant audit log"]
         if missing:
+            reason = ("incomplete -- missing the data of: "
+                      + ", ".join(missing))
+            _record_backup_run("failed", message=reason, target=out_path)
             die("the archive does not contain the data of: "
                 + ", ".join(missing)
                 + ". Nothing was written -- an incomplete backup that "
@@ -7107,10 +7149,14 @@ def cmd_backup(args):
                   "report this with the platform version.")
         os.replace(tmp_out, out_path)
         written = True
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or "").strip().splitlines()
-        die(f"backup failed while running {e.cmd[0]}: "
-            + (err[-1] if err else f"exit {e.returncode}"))
+    except (subprocess.CalledProcessError, OSError, DeployTimeout) as e:
+        # Recorded before the process ends, so the page shows a failure
+        # rather than a run that started last night and never finished.
+        err = (getattr(e, "stderr", "") or "").strip().splitlines()
+        reason = (f"{e.cmd[0]}: " + (err[-1] if err else f"exit {e.returncode}")
+                  if isinstance(e, subprocess.CalledProcessError) else str(e))
+        _record_backup_run("failed", message=reason, target=out_path)
+        die(f"backup failed: {reason}")
     finally:
         # Neither temporary may outlive a failure: one is the size of the
         # whole platform, and a directory holding an 8 GB remnant of a
@@ -7132,7 +7178,10 @@ def cmd_backup(args):
     # it. RFC-0029 D1 asks the portal to say how long the apps will be
     # stopped -- with THIS node's last measured figure, not a general
     # one, because the general one is always somebody else's machine.
-    _record_backup_run(out_path, size, downtime, total, len(manifest["instances"]))
+    _record_backup_run("ok", archive=out_path, bytes=size,
+                       instances=len(manifest["instances"]),
+                       downtime_seconds=round(downtime),
+                       total_seconds=round(total))
     print("SECURITY: this file contains ALL platform secrets, password hashes")
     print("and app data — guard it like a master key (permissions are 0600).")
     print("Restore on a prepared machine with: sudo ./install.sh restore <file>")
