@@ -186,7 +186,7 @@ print("\n=== und ein unvollstaendiges Archiv wird nicht geschrieben ===")
 # harmlosen Fall (es gibt nichts zu sichern) statt den gefaehrlichen
 # (es gibt etwas, und niemand merkt, dass es fehlt).
 def vergesslicher_tar(cmd, **kw):
-    if cmd and cmd[0] == "tar" and "-czpf" in cmd:
+    if cmd and cmd[0] == "tar" and any(a.startswith("-c") for a in cmd):
         cmd = [c for c in cmd if c != "tenants"]
     return fake_run(cmd, **kw)
 
@@ -230,7 +230,7 @@ print("\n=== und ein Archiv ohne Protokoll wird nicht geschrieben ===")
 
 
 def vergesslicher_tar2(cmd, **kw):
-    if cmd and cmd[0] == "tar" and "-czpf" in cmd:
+    if cmd and cmd[0] == "tar" and any(a.startswith("-c") for a in cmd):
         cmd = [c for c in cmd if c != "data/audit"]
     return fake_run(cmd, **kw)
 

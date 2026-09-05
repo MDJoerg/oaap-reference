@@ -6901,6 +6901,56 @@ def _backup_missing_instances(archive, reg):
     return missing
 
 
+BACKUP_RUN_FILE = os.path.join(APPS_DIR, "backup-last.json")
+
+
+def _dir_kbytes(path):
+    """Size of a directory in KiB, or 0 when it cannot be measured.
+
+    `du` rather than walking in Python: it is one process instead of
+    tens of thousands of stat calls, and a backup preflight must not
+    take longer than the thing it checks.
+    """
+    try:
+        out = subprocess.run(["du", "-sk", path], check=True, text=True,
+                             capture_output=True).stdout
+        return int(out.split()[0])
+    except (OSError, ValueError, IndexError, subprocess.CalledProcessError):
+        return 0
+
+
+def _record_backup_run(path, size, downtime, total, instances):
+    """Write down what the last backup cost this node.
+
+    Lives beside the registry, which the portal already mounts
+    read-only, so a page can read it without a new mount or an API
+    (RFC-0029 D1/D2). It records a MEASUREMENT, never a promise: the
+    sentence the portal owes its operator -- "your apps will stop for
+    about this long" -- has to be this node's own last figure. A number
+    taken from a manual or from another machine is a guess wearing the
+    clothes of a measurement.
+    """
+    try:
+        with open(BACKUP_RUN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "archive": path, "bytes": size,
+                       "instances": instances,
+                       "downtime_seconds": round(downtime),
+                       "total_seconds": round(total),
+                       "finished": _iso_now()}, f, indent=2)
+        os.chmod(BACKUP_RUN_FILE, 0o644)   # names no secret, only sizes
+    except OSError as e:
+        print(f"NOTE: could not record the backup timing ({e}).")
+
+
+def last_backup_run():
+    """What the last backup cost, or None. Read by the portal."""
+    try:
+        with open(BACKUP_RUN_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def cmd_backup(args):
     """Offline-consistent platform backup: one self-contained archive."""
     import datetime
@@ -6945,81 +6995,144 @@ def cmd_backup(args):
                       for n, i in sorted(reg["instances"].items())},
     }
 
-    print("Offline-consistent backup: app containers are stopped for the copy")
-    print("and restarted right after (core services keep running).")
+    # RFC-0029 D3: the apps stop for the COPY, not for the compression.
+    #
+    # Measured on oaapx01 before this change: 487 seconds of downtime
+    # for 8.0 GB, of which almost everything was gzip. Copying is
+    # disk-bound and quick; compressing is CPU-bound and slow, and it
+    # does not need the data to hold still -- so it happens afterwards,
+    # with every app running again.
+    #
+    # The price is holding the data twice for a few minutes. On the
+    # machine this was built for that costs nothing (913 GB free), but
+    # it is not free everywhere, so it is checked below and refused
+    # loudly rather than discovered as a full disk at 03:30.
+    print("Offline-consistent backup (RFC-0029 D3): app containers are stopped")
+    print("for the COPY only. Compression runs afterwards, with the apps back up.")
+    need = _dir_kbytes(DATA_DIR)
+    free = shutil.disk_usage(out_dir).free // 1024
+    if need and free < need * 12 // 10:
+        die(f"not enough room in {out_dir}: about {need // 1024} MB is copied "
+            f"there before it is compressed, and {free // 1024} MB is free. "
+            "Free some space, or choose another target with --to.")
     running = run(["docker", "ps", "-q", "--filter", "name=^oaap-app-"]).stdout.split()
     stage = tempfile.mkdtemp(prefix="oaap-backup-")
+    # `<name>.part.tar` rather than something ending in .tar.gz: a
+    # half-written file must not be mistakable for an archive, least of
+    # all by the tired eye at two in the morning.
+    tmp_tar = out_path[:-len(".tar.gz")] + ".part.tar"
+    tmp_out = out_path + ".tmp"
+    downtime = 0.0
     t0 = time.monotonic()
+    # `tenants` carries every instance's data and its instance.env
+    # since RFC-0026 (0.1.59). Before that the same things lay flat
+    # under `apps/<key>/`, which is why this list used to be complete
+    # without it -- and why leaving it out was invisible: the command
+    # still succeeded, the archive still restored, and what came back
+    # had no app data in it. Both are named here, so an archive from a
+    # node mid-migration is complete either way.
+    paths = ["app/.env", "apps", "data/identity"]
+    if os.path.isdir(TENANTS_DIR):
+        paths.append("tenants")
+    # The tenant audit log (oaap.core.tenant 1.7). Found missing by the
+    # first real restore drill, 2026-09-05: the restored node came back
+    # complete and said "No entries yet". It is the counterweight to "a
+    # server_admin may do everything on this node" (RFC-0022 D5) -- the
+    # customer's own record of what the operator did in their tenant. A
+    # restore that drops it silently hands the operator a clean slate.
+    if os.path.isdir(AUDIT_DIR):
+        paths.append("data/audit")
+
+    def copy_phase():
+        """The only part the apps have to stand still for."""
+        try:
+            if running:
+                run(["docker", "stop", *running])
+            with open(os.path.join(stage, "backup-manifest.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            # No -z. Compression is CPU-bound and does not need the data
+            # to hold still, so it happens after the apps are back.
+            run(["tar", "--numeric-owner", "-cpf", tmp_tar,
+                 "--exclude=data/identity/login-throttle.json",
+                 # node profiles stay with the machine (RFC-0011
+                 # decision 4): a 'dev' backup restored onto a
+                 # production box must not bring developer powers along.
+                 # The manifest still records them so the operator can
+                 # set them again deliberately.
+                 "--exclude=apps/node.json",
+                 "-C", stage, "backup-manifest.json",
+                 "-C", DATA_DIR, *paths])
+            os.chmod(tmp_tar, 0o600)
+        finally:
+            # The apps come back HERE -- before compression, and also
+            # when the copy failed. A backup that leaves the node
+            # stopped has done more damage than the one it prevented.
+            if running:
+                subprocess.run(["docker", "start", *running],
+                               capture_output=True, text=True)
+            shutil.rmtree(stage, ignore_errors=True)
+
+    written = False
     try:
-        if running:
-            run(["docker", "stop", *running])
-        with open(os.path.join(stage, "backup-manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-        tmp_out = out_path + ".tmp"
-        # `tenants` carries every instance's data and its instance.env
-        # since RFC-0026 (0.1.59). Before that the same things lay flat
-        # under `apps/<key>/`, which is why this list used to be
-        # complete without it -- and why leaving it out was invisible:
-        # the command still succeeded, the archive still restored, and
-        # what came back had no app data in it. Both are named here, so
-        # an archive from a node mid-migration is complete either way.
-        paths = ["app/.env", "apps", "data/identity"]
-        if os.path.isdir(TENANTS_DIR):
-            paths.append("tenants")
-        # The tenant audit log (oaap.core.tenant 1.7). Found missing by
-        # the first real restore drill, 2026-09-05: the restored node
-        # came back complete and said "No entries yet".
-        #
-        # It is the counterweight to "a server_admin may do everything
-        # on this node" (RFC-0022 D5) -- the customer's own record of
-        # what the operator did in their tenant. A restore that drops it
-        # silently hands the operator a clean slate, which is the one
-        # thing this log exists to make impossible.
-        if os.path.isdir(AUDIT_DIR):
-            paths.append("data/audit")
-        run(["tar", "--numeric-owner", "-czpf", tmp_out,
-             "--exclude=data/identity/login-throttle.json",
-             # node profiles stay with the machine (RFC-0011 decision 4):
-             # a 'dev' backup restored onto a production box must not
-             # bring developer powers along. The manifest still records
-             # them so the operator can set them again deliberately.
-             "--exclude=apps/node.json",
-             "-C", stage, "backup-manifest.json",
-             "-C", DATA_DIR, *paths])
+        copy_phase()
+        downtime = time.monotonic() - t0
+        print(f"Apps are running again after {downtime:.0f}s. Compressing ...")
+        # pigz is gzip that uses every core, and writes an ordinary .gz.
+        # It shortens the total run, never the downtime -- that is over.
+        comp = "pigz" if shutil.which("pigz") else "gzip"
+        run([comp, "-f", tmp_tar])
+        os.replace(tmp_tar + ".gz", tmp_out)
         os.chmod(tmp_out, 0o600)
 
         # Does the archive actually hold what the registry says exists?
         #
-        # This is the check whose absence let the gap above live: the
-        # list of paths was written once, an identifier moved underneath
-        # it, and nothing ever compared the two. Asking the ARCHIVE
-        # rather than the code is what makes the question survive the
-        # next move -- it cannot be satisfied by a path that is merely
-        # spelled correctly.
+        # This is the check whose absence let the 2026-09-05 gap live:
+        # the list of paths was written once, an identifier moved
+        # underneath it, and nothing ever compared the two. Asking the
+        # ARCHIVE rather than the code is what makes the question
+        # survive the next move -- it cannot be satisfied by a path that
+        # is merely spelled correctly.
         missing = _backup_missing_instances(tmp_out, reg)
         if os.path.isfile(TENANT_LOG) and not missing:
             listing = subprocess.run(["tar", "-tzf", tmp_out], check=True,
                                      text=True, capture_output=True).stdout
-            if os.path.relpath(TENANT_LOG, DATA_DIR).replace(os.sep, "/") \
-                    not in listing.split():
+            if os.path.relpath(TENANT_LOG, DATA_DIR).replace(os.sep, "/")                     not in listing.split():
                 missing = ["the tenant audit log"]
         if missing:
-            os.remove(tmp_out)
             die("the archive does not contain the data of: "
                 + ", ".join(missing)
                 + ". Nothing was written -- an incomplete backup that "
                   "calls itself complete is worse than none. Please "
                   "report this with the platform version.")
         os.replace(tmp_out, out_path)
+        written = True
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or "").strip().splitlines()
+        die(f"backup failed while running {e.cmd[0]}: "
+            + (err[-1] if err else f"exit {e.returncode}"))
     finally:
-        if running:
-            subprocess.run(["docker", "start", *running], capture_output=True, text=True)
-        shutil.rmtree(stage, ignore_errors=True)
-    downtime = time.monotonic() - t0
+        # Neither temporary may outlive a failure: one is the size of the
+        # whole platform, and a directory holding an 8 GB remnant of a
+        # run nobody remembers is how a backup target fills up.
+        if not written:
+            for leftover in (tmp_tar, tmp_tar + ".gz", tmp_out):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+
+    total = time.monotonic() - t0
     size = os.path.getsize(out_path)
     size_h = f"{size / 1048576:.1f} MB" if size >= 1048576 else f"{size / 1024:.0f} KB"
     print(f"Backup written: {out_path} ({size_h}, "
-          f"{len(manifest['instances'])} app instance(s), app downtime {downtime:.0f}s)")
+          f"{len(manifest['instances'])} app instance(s), "
+          f"app downtime {downtime:.0f}s of {total:.0f}s total)")
+    # What the downtime actually was, written down where a page can read
+    # it. RFC-0029 D1 asks the portal to say how long the apps will be
+    # stopped -- with THIS node's last measured figure, not a general
+    # one, because the general one is always somebody else's machine.
+    _record_backup_run(out_path, size, downtime, total, len(manifest["instances"]))
     print("SECURITY: this file contains ALL platform secrets, password hashes")
     print("and app data — guard it like a master key (permissions are 0600).")
     print("Restore on a prepared machine with: sudo ./install.sh restore <file>")
