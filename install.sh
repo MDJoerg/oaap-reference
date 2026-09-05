@@ -565,7 +565,14 @@ if [ "$MODE" = "restore" ]; then
   RESTORE_PATHS="app/.env apps data/identity"
   if tar -tzf "$RESTORE_FILE" tenants >/dev/null 2>&1; then
     RESTORE_PATHS="$RESTORE_PATHS tenants"
-  else
+  fi
+  # The tenant audit log — the customer's record of what the operator
+  # did in their tenant (oaap.core.tenant 1.7). Restored where the
+  # archive has it; archives from before 0.1.72 do not.
+  if tar -tzf "$RESTORE_FILE" data/audit >/dev/null 2>&1; then
+    RESTORE_PATHS="$RESTORE_PATHS data/audit"
+  fi
+  if ! tar -tzf "$RESTORE_FILE" tenants >/dev/null 2>&1; then
     say "NOTE: this archive carries no tenants/ directory — it was taken"
     say "      before the instance tree moved there, or by a version with"
     say "      the 2026-09-05 gap. Check that your app data came back."

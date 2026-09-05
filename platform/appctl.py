@@ -6966,6 +6966,17 @@ def cmd_backup(args):
         paths = ["app/.env", "apps", "data/identity"]
         if os.path.isdir(TENANTS_DIR):
             paths.append("tenants")
+        # The tenant audit log (oaap.core.tenant 1.7). Found missing by
+        # the first real restore drill, 2026-09-05: the restored node
+        # came back complete and said "No entries yet".
+        #
+        # It is the counterweight to "a server_admin may do everything
+        # on this node" (RFC-0022 D5) -- the customer's own record of
+        # what the operator did in their tenant. A restore that drops it
+        # silently hands the operator a clean slate, which is the one
+        # thing this log exists to make impossible.
+        if os.path.isdir(AUDIT_DIR):
+            paths.append("data/audit")
         run(["tar", "--numeric-owner", "-czpf", tmp_out,
              "--exclude=data/identity/login-throttle.json",
              # node profiles stay with the machine (RFC-0011 decision 4):
@@ -6986,6 +6997,12 @@ def cmd_backup(args):
         # next move -- it cannot be satisfied by a path that is merely
         # spelled correctly.
         missing = _backup_missing_instances(tmp_out, reg)
+        if os.path.isfile(TENANT_LOG) and not missing:
+            listing = subprocess.run(["tar", "-tzf", tmp_out], check=True,
+                                     text=True, capture_output=True).stdout
+            if os.path.relpath(TENANT_LOG, DATA_DIR).replace(os.sep, "/") \
+                    not in listing.split():
+                missing = ["the tenant audit log"]
         if missing:
             os.remove(tmp_out)
             die("the archive does not contain the data of: "

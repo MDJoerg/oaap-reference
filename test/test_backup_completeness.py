@@ -206,6 +206,44 @@ ok("und kein zweites Archiv",
    len([f for f in os.listdir(OUT) if f.startswith("oaap-backup-")]) == 1,
    str(os.listdir(OUT)))
 
+print("\n=== das Mandanten-Protokoll faehrt mit ===")
+# Gefunden vom ersten echten Wiederherstellungsversuch (05.09.): Der
+# Knoten kam vollstaendig zurueck und sagte "No entries yet". Das
+# Protokoll ist das Gegengewicht zu "ein server_admin darf hier alles"
+# -- eine Wiederherstellung, die es still fallen laesst, schenkt dem
+# Betreiber ein weisses Blatt.
+m.audit_tenant("tenant.create", kunde, "kunde", who="joerg",
+               role="server_admin")
+out, code = capture(m.cmd_backup, Args(OUT))
+neu = sorted(f for f in os.listdir(OUT) if f.startswith("oaap-backup-"))[-1]
+with tarfile.open(os.path.join(OUT, neu)) as t:
+    namen = t.getnames()
+    log = next((t.extractfile(n).read().decode() for n in namen
+                if n.endswith("tenant-log.jsonl")), "")
+ok("das Protokoll ist im Archiv",
+   any(n.endswith("tenant-log.jsonl") for n in namen),
+   str([n for n in namen if "audit" in n]))
+ok("mit dem Eintrag, wer was getan hat",
+   "tenant.create" in log and "joerg" in log, log[:200])
+
+print("\n=== und ein Archiv ohne Protokoll wird nicht geschrieben ===")
+
+
+def vergesslicher_tar2(cmd, **kw):
+    if cmd and cmd[0] == "tar" and "-czpf" in cmd:
+        cmd = [c for c in cmd if c != "data/audit"]
+    return fake_run(cmd, **kw)
+
+
+m.run = vergesslicher_tar2
+try:
+    out, code = capture(m.cmd_backup, Args(OUT))
+finally:
+    m.run = fake_run
+ok("der Lauf schlaegt fehl", code != 0, f"code={code}")
+ok("und nennt das Protokoll beim Namen",
+   "tenant audit log" in out, out[-300:])
+
 print(f"\n{ok_n} bestanden, {fail_n} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail_n else "FEHLGESCHLAGEN")
 sys.exit(1 if fail_n else 0)
