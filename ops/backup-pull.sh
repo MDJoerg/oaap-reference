@@ -62,9 +62,9 @@ write_state() {
   "bytes": $BYTES,
   "checksum_verified": "$VERIFIED",
   "generations": {
-    "daily": $(ls -1 "$DEST/daily" 2>/dev/null | grep -c '\.tar\.gz$' || echo 0),
-    "weekly": $(ls -1 "$DEST/weekly" 2>/dev/null | grep -c '\.tar\.gz$' || echo 0),
-    "monthly": $(ls -1 "$DEST/monthly" 2>/dev/null | grep -c '\.tar\.gz$' || echo 0)
+    "daily": $(ls -1 "$DEST/daily"/*.tar.gz 2>/dev/null | wc -l),
+    "weekly": $(ls -1 "$DEST/weekly"/*.tar.gz 2>/dev/null | wc -l),
+    "monthly": $(ls -1 "$DEST/monthly"/*.tar.gz 2>/dev/null | wc -l)
   },
   "keep": {"daily": $DAILY, "weekly": $WEEKLY, "monthly": $MONTHLY},
   "free_bytes": $(df -PB1 "$TO" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
@@ -100,6 +100,22 @@ if [ -z "$newest" ]; then
 fi
 base="$(basename "$newest")"
 echo "-- newest on $NODE: $base"
+
+# rsync has to exist on BOTH sides. Without this the failure arrives as
+# "rsync error: protocol data stream (code 12)", which sends the reader
+# looking at the network and the key rather than at `apt install rsync`
+# (found on oaap-test, 2026-09-05).
+if ! command -v rsync >/dev/null 2>&1; then
+  MESSAGE="rsync is not installed on $(hostname) -- apt install rsync"
+  echo "ERROR: $MESSAGE" >&2; exit 1
+fi
+if ! "${SSH[@]}" "rsync --version" >/dev/null 2>&1; then
+  # The forced command refuses this, which is correct and also tells us
+  # nothing -- so ask for it only as a hint, never as a verdict.
+  echo "-- note: could not confirm rsync on $NODE (the forced command may"
+  echo "   be refusing the question). If the transfer fails next, check"
+  echo "   that rsync is installed there."
+fi
 
 if [ -f "$DEST/daily/$base" ]; then
   RESULT="ok"; FETCHED=""; VERIFIED="already here"
