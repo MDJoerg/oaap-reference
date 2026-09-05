@@ -3916,6 +3916,21 @@ def _secs_h(n):
     return f"{n} Sekunden" if n < 90 else f"{n // 60} Minuten {n % 60} Sekunden"
 
 
+def _when(value):
+    """A timestamp as a human reads it -- without mangling one that is
+    not ISO.
+
+    systemd reports its next run as "Sun 2026-09-06 03:36:00 UTC", and
+    slicing that to 19 characters produced "Sun 2026-09-06 03:3" on the
+    health page: a time cut off mid-minute, which is worse than no time
+    at all because it looks like one.
+    """
+    s = str(value or "")
+    if len(s) >= 19 and s[4] == "-" and s[7] == "-" and s[10] in "T ":
+        return s[:19].replace("T", " ")
+    return s
+
+
 def backup_state():
     """What this node's backups are doing, for the health page.
 
@@ -3938,9 +3953,17 @@ def backup_state():
         except (TypeError, ValueError):
             out["running"] = {"since": "unbekannt"}
     elif last:
+        # A record written before 0.1.74 has no `state` -- and it only
+        # ever existed on success, because the old code recorded
+        # nothing else. Defaulting to "ok" therefore reads such a file
+        # correctly; defaulting to "failed" would have the page assert
+        # a failure that never happened, which is precisely the kind of
+        # claim D2 exists to prevent. (Seen on oaap-test the same day:
+        # the card called a run "Fehlgeschlagen — kein Grund vermerkt"
+        # that had in fact written an 1.6 GB archive.)
         out["last"] = {
-            "ok": last.get("state") == "ok",
-            "when": (last.get("finished") or "")[:19].replace("T", " "),
+            "ok": last.get("state", "ok") == "ok",
+            "when": _when(last.get("finished")),
             "size": _bytes_h(last.get("bytes")),
             "instances": last.get("instances", "?"),
             "downtime": _secs_h(last.get("downtime_seconds")),
@@ -3951,7 +3974,7 @@ def backup_state():
     if sched.get("enabled"):
         out["schedule"] = {
             "at": sched.get("at", "?"),
-            "next": (sched.get("next") or "").replace("T", " ")[:19],
+            "next": _when(sched.get("next")),
             "target": sched.get("target", "?"),
             "keep": sched.get("keep", "?"),
         }
@@ -3968,7 +3991,7 @@ def backup_state():
         out["pulls"].append({
             "node": p.get("source_node", fn[:-5]),
             "ok": p.get("result") == "ok",
-            "when": (p.get("finished") or "")[:19].replace("T", " "),
+            "when": _when(p.get("finished")),
             "message": p.get("message", ""),
             "checksum": {"yes": "bestätigt", "already here": "unverändert"}.get(
                 p.get("checksum_verified"), p.get("checksum_verified") or "–"),

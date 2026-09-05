@@ -181,6 +181,37 @@ ok("mit den Generationen", "daily: 1" in html)
 ok("und sagt, warum das hier steht und nicht drueben",
    "weiß nur" in html and "abholende Seite" in html, html[-900:])
 
+print("\n=== ein Datensatz aus der Zeit vor 0.1.74 ===")
+# Am echten Knoten aufgefallen: Die alte Fassung schrieb den Datensatz
+# NUR bei Erfolg und kannte kein `state`-Feld. Wer ein fehlendes
+# `state` als Fehlschlag liest, laesst die Seite einen Fehlschlag
+# behaupten, den es nie gab -- genau die Art Behauptung, die D2
+# verhindern soll.
+clear()
+write("backup-last.json", {"schema": "0.1",
+                           "archive": "/var/backups/oaap/alt.tar.gz",
+                           "bytes": 1688066125, "instances": 9,
+                           "downtime_seconds": 14, "total_seconds": 82,
+                           "finished": "2026-09-05T11:04:32+00:00"})
+html = render()
+ok("wird als gelungen gelesen, nicht als Fehlschlag",
+   "Fehlgeschlagen" not in html, html[:300])
+ok("und zeigt die Zahlen, die er enthaelt",
+   "14 Sekunden" in html and "9 Instanz" in html, html[:400])
+
+print("\n=== ein Zeitpunkt, der nicht ISO ist, wird nicht abgeschnitten ===")
+# systemd meldet "Sun 2026-09-06 03:36:00 UTC". Auf 19 Zeichen
+# geschnitten wurde daraus "Sun 2026-09-06 03:3" -- eine Uhrzeit, die
+# mitten in der Minute endet und trotzdem wie eine Uhrzeit aussieht.
+clear()
+write("backup-schedule.json", {"schema": "0.1", "enabled": True, "at": "03:30",
+                               "keep": 2, "target": "/var/backups/oaap",
+                               "next": "Sun 2026-09-06 03:36:00 UTC"})
+html = render()
+ok("die Angabe bleibt vollstaendig",
+   "Sun 2026-09-06 03:36:00 UTC" in html, html[:500])
+ok("und endet nicht mitten in der Minute", "03:3 " not in html, html[:500])
+
 print("\n=== eine kaputte Datei legt die Seite nicht lahm ===")
 clear()
 with open(os.path.join(REG, "backup-last.json"), "w", encoding="utf-8") as f:
