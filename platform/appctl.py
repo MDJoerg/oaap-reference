@@ -1350,16 +1350,55 @@ def zone_probe(label):
             f"tenant can be published as <instance>.{label}.{host}.")
 
 
-def _tenant_write_common(label, action):
+def tenant_label_error(label, action):
+    """Why this label may not be written, or "" when it may.
+
+    Returns a sentence instead of exiting, because there are two callers
+    now: the CLI, which turns it into `die()`, and the deploy worker,
+    which has to answer a portal request rather than end the process
+    (RFC-0025 8.1 lesson -- one rule, every reader, one place).
+    """
     if not TENANT_LABEL_RE.fullmatch(label or ""):
-        die("tenant label: lowercase letters, digits and hyphens, starting "
-            "with a letter or digit, at most 31 characters")
+        return ("tenant label: lowercase letters, digits and hyphens, "
+                "starting with a letter or digit, at most 31 characters")
     if label == DEFAULT_TENANT_LABEL:
-        die(f"'{DEFAULT_TENANT_LABEL}' is this node's own tenant and is not "
-            f"available to {action}")
+        return (f"'{DEFAULT_TENANT_LABEL}' is this node's own tenant and is "
+                f"not available to {action}")
     if not label_is_free(label):
-        die(f"the label '{label}' is already taken on this node (a former "
-            "label still inside its grace period counts as taken)")
+        return (f"the label '{label}' is already taken on this node (a former "
+                "label still inside its grace period counts as taken)")
+    return ""
+
+
+def _tenant_write_common(label, action):
+    err = tenant_label_error(label, action)
+    if err:
+        die(err)
+
+
+def tenant_create(label, name="", account="", account_name=""):
+    """Write one new tenant and log it. The label is already checked.
+
+    Shared by `oaap tenant create` and the portal's create request, so
+    the record cannot come out differently depending on which door it
+    came through.
+    """
+    tenants = load_tenants()
+    tid = str(uuid.uuid4())
+    tenants[tid] = {
+        "label": label,
+        "name": name or "",
+        # The account lives on the central management node (RFC-0022
+        # Q1). Without one given, this tenant is its own account --
+        # honest about what it is rather than pretending to a
+        # registry that does not exist here.
+        "account": account or str(uuid.uuid4()),
+        "account_name": account_name or "",
+        "created": _iso_now(),
+        "former_labels": [],
+    }
+    save_tenants(tenants)
+    return tid, tenants
 
 
 def cmd_migrate_tenant_routes(_args):
@@ -1439,20 +1478,8 @@ def cmd_tenant(args):
     if args.action == "create":
         label = (args.name or "").strip().lower()
         _tenant_write_common(label, "create")
-        tid = str(uuid.uuid4())
-        tenants[tid] = {
-            "label": label,
-            "name": args.title or "",
-            # The account lives on the central management node (RFC-0022
-            # Q1). Without one given, this tenant is its own account --
-            # honest about what it is rather than pretending to a
-            # registry that does not exist here.
-            "account": args.account or str(uuid.uuid4()),
-            "account_name": args.account_name or "",
-            "created": _iso_now(),
-            "former_labels": [],
-        }
-        save_tenants(tenants)
+        tid, tenants = tenant_create(label, args.title, args.account,
+                                     args.account_name)
         audit_tenant("tenant.create", tid, label)
         print(f"Tenant '{label}' created.")
         print("")
@@ -5653,6 +5680,10 @@ TENANT_AUDITED = {
     "endpoint": "instance.endpoint",
     "address": "instance.address",
     "config": "instance.config",
+    # Filed in the tenant that was just born, not in the operator's --
+    # the first line of its log is the record of its own creation, and
+    # its administrator has to be able to read it (RFC-0022 §6).
+    "tenant": "tenant.create",
 }
 
 
@@ -6277,6 +6308,48 @@ def cmd_process_deploys(_args):
                 ok = True
                 msg = ("node profiles set: " + ", ".join(wanted)) if wanted \
                     else "node profiles cleared"
+        elif action == "tenant":
+            # Creating a tenant from the portal (oaap.core.tenant 2.2).
+            #
+            # Why this may leave the machine at all, in the same terms
+            # the store-source branch below uses: a new tenant is empty.
+            # It has no user, no instance, no permit and no address; it
+            # is a reserved word plus a place to put things. What it is
+            # NOT is reversible -- there is no `tenant remove`, by
+            # decision -- so this stays server_admin's alone, and the
+            # label rules are re-checked here because the spool is data,
+            # not trust.
+            #
+            # `server_admin` and not `tenant_admin`: a tenant admin who
+            # could make a tenant could make one and appoint themselves
+            # in it, which is a two-step path out of their own boundary
+            # (spec 2.3 rule 1).
+            label = str(req.get("label") or "").strip().lower()
+            # Named before the checks, so a REFUSAL says which label was
+            # refused instead of filing an empty subject.
+            name = label
+            if act_role != "server_admin":
+                msg = ("creating a tenant requires server_admin "
+                       "(oaap.core.tenant 2.3)")
+            elif err := tenant_label_error(label, "create"):
+                msg = err
+            else:
+                had = len(load_tenants())
+                tid, _t = tenant_create(label, str(req.get("title") or "").strip())
+                audit_tenant_id = tid
+                name = label          # what the log and the result name
+                ok = True
+                # The two sentences the CLI says at this moment, said
+                # here too (spec 3.4): the label is public, and the
+                # second tenant switches the whole capability on. A
+                # portal that creates the record silently would be a
+                # different act wearing the same name.
+                msg = f"tenant '{label}' created. " + zone_probe(label)
+                if had == 1:
+                    msg += (" This node now has more than one tenant, so "
+                            "tenants become visible: every caller sees their "
+                            "own and no other. Nothing about the existing "
+                            "tenant changes.")
         elif action == "source":
             # Store sources from the portal (RFC-0012 §7). Same reason as
             # visibility below: the portal's /apps-registry mount is
@@ -6705,6 +6778,35 @@ def cmd_process_deploys(_args):
 
 # --------------------------------------------- backup & restore (oaap.data.backup)
 
+def _backup_missing_instances(archive, reg):
+    """Which instances of `reg` have no data in `archive`.
+
+    Found on oaap-test 2026-09-05: since the instance tree moved under
+    `tenants/` (RFC-0026), `oaap backup create` archived the registry
+    and the users and NOT one byte of app data or of any instance.env
+    -- and said "Backup written" either way. The restore would have
+    succeeded too, onto an empty platform.
+
+    So completeness is measured against the archive itself. An instance
+    counts as present when the archive holds at least one entry inside
+    its data directory; an instance that genuinely has no directory yet
+    (installed, never started) counts as present, because there is
+    nothing of it to lose.
+    """
+    listing = subprocess.run(["tar", "-tzf", archive], check=True, text=True,
+                             capture_output=True).stdout.splitlines()
+    entries = {e.rstrip("/") for e in listing}
+    missing = []
+    for name, inst in sorted(reg.get("instances", {}).items()):
+        d = instance_dir(name, inst)
+        if not os.path.isdir(d):
+            continue
+        rel = os.path.relpath(d, DATA_DIR).replace(os.sep, "/")
+        if not any(e == rel or e.startswith(rel + "/") for e in entries):
+            missing.append(name)
+    return missing
+
+
 def cmd_backup(args):
     """Offline-consistent platform backup: one self-contained archive."""
     import datetime
@@ -6760,6 +6862,16 @@ def cmd_backup(args):
         with open(os.path.join(stage, "backup-manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         tmp_out = out_path + ".tmp"
+        # `tenants` carries every instance's data and its instance.env
+        # since RFC-0026 (0.1.59). Before that the same things lay flat
+        # under `apps/<key>/`, which is why this list used to be
+        # complete without it -- and why leaving it out was invisible:
+        # the command still succeeded, the archive still restored, and
+        # what came back had no app data in it. Both are named here, so
+        # an archive from a node mid-migration is complete either way.
+        paths = ["app/.env", "apps", "data/identity"]
+        if os.path.isdir(TENANTS_DIR):
+            paths.append("tenants")
         run(["tar", "--numeric-owner", "-czpf", tmp_out,
              "--exclude=data/identity/login-throttle.json",
              # node profiles stay with the machine (RFC-0011 decision 4):
@@ -6768,8 +6880,25 @@ def cmd_backup(args):
              # them so the operator can set them again deliberately.
              "--exclude=apps/node.json",
              "-C", stage, "backup-manifest.json",
-             "-C", DATA_DIR, "app/.env", "apps", "data/identity"])
+             "-C", DATA_DIR, *paths])
         os.chmod(tmp_out, 0o600)
+
+        # Does the archive actually hold what the registry says exists?
+        #
+        # This is the check whose absence let the gap above live: the
+        # list of paths was written once, an identifier moved underneath
+        # it, and nothing ever compared the two. Asking the ARCHIVE
+        # rather than the code is what makes the question survive the
+        # next move -- it cannot be satisfied by a path that is merely
+        # spelled correctly.
+        missing = _backup_missing_instances(tmp_out, reg)
+        if missing:
+            os.remove(tmp_out)
+            die("the archive does not contain the data of: "
+                + ", ".join(missing)
+                + ". Nothing was written -- an incomplete backup that "
+                  "calls itself complete is worse than none. Please "
+                  "report this with the platform version.")
         os.replace(tmp_out, out_path)
     finally:
         if running:

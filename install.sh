@@ -557,7 +557,21 @@ INTERNAL_API_KEY="$(gen_secret)"
 
 if [ "$MODE" = "restore" ]; then
   say "Restoring platform state from $RESTORE_FILE ..."
-  tar --numeric-owner -xzpf "$RESTORE_FILE" -C "$OAAP_DATA_DIR" app/.env apps data/identity
+  # `tenants/` holds every instance's data and instance.env since
+  # RFC-0026; archives from before it have only the flat `apps/<key>/`.
+  # Asked of the ARCHIVE rather than assumed, so both kinds restore --
+  # and so this list cannot drift away from the one in `oaap backup
+  # create` unnoticed a second time (found 2026-09-05: it had).
+  RESTORE_PATHS="app/.env apps data/identity"
+  if tar -tzf "$RESTORE_FILE" tenants >/dev/null 2>&1; then
+    RESTORE_PATHS="$RESTORE_PATHS tenants"
+  else
+    say "NOTE: this archive carries no tenants/ directory — it was taken"
+    say "      before the instance tree moved there, or by a version with"
+    say "      the 2026-09-05 gap. Check that your app data came back."
+  fi
+  # shellcheck disable=SC2086 -- a deliberate word split of the path list
+  tar --numeric-owner -xzpf "$RESTORE_FILE" -C "$OAAP_DATA_DIR" $RESTORE_PATHS
   tar -xzOf "$RESTORE_FILE" backup-manifest.json > "$OAAP_DATA_DIR/last-restore-manifest.json"
   # No silent secret regeneration (oaap.data.backup §4): carry the old
   # ones over — sessions and the identity store stay consistent.

@@ -1205,6 +1205,9 @@ STORE_APP_BODY = """
 # route says the same thing again for anyone who typed the address.
 TENANT_BODY = """
 <h1>{{ "Mandanten" if is_server_admin else "Mandant" }}</h1>
+{% if msg %}
+<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
+{% endif %}
 {% if not is_server_admin %}
 <div class="card">
   <h2>{{ me.name }}</h2>
@@ -1226,10 +1229,38 @@ TENANT_BODY = """
   {% endfor %}
 </table>
 </div>
-<p class="muted">Angelegt und umbenannt werden Mandanten an der Maschine:
-   <code>sudo oaap tenant create &lt;kürzel&gt;</code>. Das Kürzel steht im
-   Hostnamen und damit im öffentlichen Certificate-Transparency-Log — für
-   einen vertraulichen Kunden also eines wählen, das nichts verrät.</p>
+<div class="card">
+  <h2>Mandant anlegen</h2>
+  <p class="muted">Ein neuer Mandant ist leer: kein Benutzer, keine Instanz,
+     keine Adresse. Er bekommt seinen ersten Verwalter danach unter
+     <a href="/users">Benutzer</a> — ein Benutzer mit diesem Mandanten und der
+     Rolle <code>tenant_admin</code>. Ab dort verwaltet sich der Mandant
+     selbst.</p>
+  <p class="err" style="font-weight:600">Das Kürzel wird öffentlich.</p>
+  <p class="muted">Es steht in den Hostnamen dieses Mandanten
+     (<code>&lt;instanz&gt;.&lt;kürzel&gt;.{{ host or "&lt;knoten&gt;" }}</code>)
+     und erscheint damit im Certificate-Transparency-Log, das jeder lesen
+     kann. Für einen vertraulichen Kunden also ein Kürzel wählen, das nichts
+     über ihn verrät — der Klarname daneben bleibt im Haus.</p>
+  <p class="muted"><strong>Rückgängig gibt es nicht.</strong> Ein Mandant kann
+     umbenannt werden (<code>sudo oaap tenant rename</code>, der alte Name
+     antwortet noch eine Weile), gelöscht wird er nicht: Er hält Benutzer,
+     Instanzen und deren Daten, und das wäre Exportieren-dann-Vernichten.</p>
+  <form method="post" action="/tenant/create">
+    <label>Kürzel
+      <input type="text" name="label" required pattern="[a-z0-9][a-z0-9-]{0,30}"
+             placeholder="z. B. kunde-meier" autocomplete="off"></label>
+    <p class="muted" style="margin:.2rem 0 .8rem">Kleinbuchstaben, Ziffern und
+       Bindestriche, höchstens 31 Zeichen.</p>
+    <label>Klarname <input type="text" name="title"
+             placeholder="z. B. Kunde Meier GmbH" autocomplete="off"></label>
+    <p class="muted" style="margin:.2rem 0 .8rem">Frei wählbar, nur für
+       Menschen im Portal — steht in keinem Hostnamen.</p>
+    <button>Mandant anlegen</button>
+  </form>
+  <p class="muted" style="margin-bottom:0">An der Maschine geht dasselbe mit
+     <code>sudo oaap tenant create &lt;kürzel&gt;</code>; umbenannt wird dort.</p>
+</div>
 {% endif %}
 
 <h2>Protokoll</h2>
@@ -2957,12 +2988,22 @@ def tenant_page():
     denied = require_user_admin()
     if denied:
         return denied
-    if not multi_tenant():
-        # Typed by hand on a node that has no tenants in use. Saying
-        # "there is nothing here" is the honest answer and keeps the
-        # invisibility rule intact.
-        return redirect("/", code=303)
     role, mine = caller_scope()
+    if not multi_tenant():
+        # The invisibility rule (spec: on a node with one tenant nothing
+        # about tenants may be visible) and "create the second one in the
+        # portal" pull against each other -- the page that would carry
+        # the button does not exist until the button has been pressed.
+        #
+        # Resolved by keeping the rule where it protects somebody and
+        # dropping it where it protects nobody: the MENU entry stays
+        # hidden (nav asks show_tenant, which is still false), so Bernd's
+        # workshop and a home lab never meet the word. A server_admin who
+        # types this address is the operator, deciding to have a second
+        # tenant; the concept is not news to them. Everyone else, here as
+        # before: there is nothing to see.
+        if role != "server_admin":
+            return redirect("/", code=303)
     tenants = load_tenants()
     users = identity_users()
     instances = load_instances()
@@ -2983,7 +3024,9 @@ def tenant_page():
                          "users": n_users, "instances": n_inst})
         return page(TENANT_BODY, "Mandanten", "tenant", tenants=rows, me=None,
                     is_server_admin=True, host=external_host(),
-                    entries=read_audit())
+                    entries=read_audit(),
+                    msg=request.args.get("msg"),
+                    msg_ok=request.args.get("err") is None)
     t = tenants.get(mine) or {}
     n_users, n_inst = counts(mine)
     me = {"label": t.get("label", "?"), "name": t.get("name") or t.get("label", "?"),
@@ -2993,7 +3036,44 @@ def tenant_page():
     # with and therefore no other tenant's log to ask for.
     return page(TENANT_BODY, "Mandant", "tenant", tenants=[], me=me,
                 is_server_admin=False, host=external_host(),
-                entries=read_audit(mine))
+                entries=read_audit(mine),
+                msg=request.args.get("msg"),
+                msg_ok=request.args.get("err") is None)
+
+
+TENANT_WAIT_SECONDS = 20   # a small JSON file plus one DNS lookup
+
+
+@app.post("/tenant/create")
+def tenant_create_post():
+    """Create a tenant (oaap.core.tenant 2.2), server_admin only.
+
+    The portal's registry mount is read-only, so — like a store source
+    — the host-side worker applies it. Every rule is re-checked there;
+    what happens here is the gate that keeps a tenant_admin out, so the
+    refusal is a page and not a spool round trip.
+    """
+    denied = require_user_admin()
+    if denied:
+        return denied
+    role, _mine = caller_scope()
+    if role != "server_admin":
+        return redirect("/tenant?err=1&msg="
+                        + quote("Mandanten anlegen darf nur ein "
+                                "server_admin."), code=303)
+    label = request.form.get("label", "").strip().lower()
+    res = _queue_and_wait("", {"action": "tenant", "op": "create",
+                               "label": label,
+                               "title": request.form.get("title", "").strip()},
+                          TENANT_WAIT_SECONDS)
+    if res is None:
+        return redirect("/tenant?err=1&msg="
+                        + quote("Der Server hat nicht rechtzeitig geantwortet "
+                                "— die Liste oben zeigt den tatsächlichen "
+                                "Stand."), code=303)
+    text = res.get("message", "unbekanntes Ergebnis")
+    return redirect(f"/tenant?msg={quote(text[0].upper() + text[1:])}"
+                    + ("" if res.get("ok") else "&err=1"), code=303)
 
 
 # ---------------------------------------------------------------------------
