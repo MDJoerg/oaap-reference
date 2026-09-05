@@ -22,6 +22,7 @@ installed, the test reports SKIP rather than a false PASS.
 import importlib
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 IDENTITY_DIR = os.path.join(HERE, "..", "platform", "services", "identity")
@@ -45,6 +46,13 @@ def load_identity(internal_key):
     """
     os.environ["SESSION_SECRET"] = "test-session-secret"
     os.environ["SETUP_TOKEN"] = "test-setup-token"
+    # Ein eigenes Datenverzeichnis, VOR dem Import: DATA_DIR ist im
+    # Dienst eine Modulkonstante ('/data', der Mount im Container), und
+    # eine Migration beim Import schreibt schon hinein. Ohne das lief
+    # der Test gegen den echten Pfad -- auf Windows C:\data, das es
+    # nicht gibt.
+    os.environ["OAAP_IDENTITY_DATA_DIR"] = tempfile.mkdtemp(
+        prefix="oaap-guard-test-")
     if internal_key is None:
         os.environ.pop("INTERNAL_API_KEY", None)
     else:

@@ -464,6 +464,7 @@ def save_registry(reg):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=2)
     os.replace(tmp, REGISTRY)
+    artifact_index_write(reg)
 
 
 # ------------------------------------------- tenancy (oaap.core.tenant 0.1)
@@ -4757,7 +4758,11 @@ def artifact_list(name, inst=None):
         files = [f for f in os.listdir(d) if f.endswith(".zip")]
     except OSError:
         return []
-    return sorted(files, key=lambda f: os.path.getmtime(os.path.join(d, f)),
+    # The name is the tiebreaker, so two packages received in the same
+    # second still have ONE order -- the pruning below deletes by this
+    # list, and "which one goes" must not depend on how the filesystem
+    # felt about listing the directory.
+    return sorted(files, key=lambda f: (os.path.getmtime(os.path.join(d, f)), f),
                   reverse=True)
 
 
@@ -4784,6 +4789,61 @@ def artifact_prune(name, keep=ARTIFACT_KEEP, inst=None):
             os.remove(os.path.join(d, old))
         except OSError:
             pass
+    artifact_index_write()
+
+
+# The portal cannot see a retained package. Since RFC-0026 an instance's
+# data lives under `tenants/<tid>/instances/<iid>/`, and the portal's
+# only registry mount is `apps/` -- deliberately, because the tenant
+# tree holds every instance.env of every customer and the portal has no
+# business reading that.
+#
+# So the host writes down what it found. This file is an INDEX, never
+# the truth: the portal renders it, and the download re-asks the host,
+# which checks the real directory again. A stale line therefore costs a
+# refused download, never a wrong file.
+#
+# Written from save_registry() and from the two functions that change
+# the stored packages without necessarily saving the registry. That it
+# is one function called from three places is the point -- three
+# listings would be three chances to drift.
+ARTIFACT_INDEX = os.path.join(APPS_DIR, "artifacts.json")
+
+
+def artifact_index_write(reg=None):
+    """List every instance's retained packages where the portal can read."""
+    try:
+        reg = reg if reg is not None else load_registry()
+        out = {}
+        for name, inst in (reg.get("instances") or {}).items():
+            if (inst.get("source") or {}).get("kind") != "artifact":
+                continue
+            d = artifact_dir(name, inst)
+            files = []
+            for fn in artifact_list(name, inst):
+                try:
+                    st = os.stat(os.path.join(d, fn))
+                except OSError:
+                    continue
+                files.append({"file": fn, "bytes": st.st_size,
+                              "received": _iso(st.st_mtime)})
+            if files:
+                out[name] = files
+        tmp = ARTIFACT_INDEX + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "instances": out}, f, indent=2)
+        os.replace(tmp, ARTIFACT_INDEX)
+        os.chmod(ARTIFACT_INDEX, 0o644)
+    except OSError as e:
+        # A listing that cannot be written must not fail the operation
+        # that was actually asked for -- it is a view, not a record.
+        print(f"WARNING: could not write {ARTIFACT_INDEX}: {e}", flush=True)
+
+
+def _iso(epoch):
+    import datetime
+    return (datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+            .isoformat(timespec="seconds"))
 
 
 def artifact_remove(inst, name, want):
@@ -4805,7 +4865,54 @@ def artifact_remove(inst, name, want):
             "leave an instance nobody can rebuild. Deploy another version "
             "first, then this one can go.")
     os.remove(os.path.join(artifact_dir(name), want))
+    artifact_index_write()
     return f"deleted retained package {want}"
+
+
+# How long an authorised export may lie in the spool before the host
+# takes it back. The portal fetches it within one request; anything
+# older is a portal that died mid-download.
+EXPORT_TTL_SECONDS = 900
+
+
+def artifact_export(inst, name, want, rid):
+    """Hand ONE retained package to the portal, for ONE download.
+
+    The portal cannot read the tenant tree (see ARTIFACT_INDEX), and it
+    must not start being able to just because a download exists: the
+    tree holds every customer's instance.env. So the host puts the one
+    authorised file where the portal already reads -- the spool it
+    already uses in the other direction for uploads -- and the portal
+    removes it when it has sent it.
+
+    A hard link where the filesystem allows one: the two live under the
+    same data directory, so this costs no second copy of a package that
+    may be a quarter of a gigabyte, and removing the link in the spool
+    leaves the retained package untouched.
+    """
+    if want not in artifact_list(name, inst):
+        # Not a path. Never joined onto a directory, never stat'ed --
+        # the name is checked against what is actually retained.
+        raise ValueError(f"'{want}' is not a package this instance retains")
+    d = os.path.join(SPOOL_DIR, "exports")
+    os.makedirs(d, exist_ok=True)
+    # Sweep first: a portal that died between authorisation and download
+    # would otherwise leave the package lying in the spool forever.
+    cutoff = time.time() - EXPORT_TTL_SECONDS
+    for stale in os.listdir(d):
+        p = os.path.join(d, stale)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+        except OSError:
+            pass
+    src = os.path.join(artifact_dir(name, inst), want)
+    dst = os.path.join(d, f"{rid}.zip")
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+    return want
 
 
 def source_package_arg(name, src):
@@ -5765,6 +5872,13 @@ TENANT_AUDITED = {
     "artifact": "instance.deploy",
     "rollback": "instance.rollback",
     "artifact-remove": "instance.artifact",
+    # A read, not a change -- and in the log for exactly that reason:
+    # the operator may reach everything (RFC-0022 D5), so the tenant
+    # has to be able to see when a copy of their app package left the
+    # node. That the same operator could also take it by ssh is a
+    # reason this log cannot be complete, not a reason to leave out the
+    # line that can be written.
+    "artifact-export": "instance.export",
     "promote": "instance.promote",
     "remove": "instance.remove",
     "rename": "instance.rename",
@@ -6215,6 +6329,36 @@ def cmd_process_deploys(_args):
             else:
                 try:
                     msg = artifact_remove(inst, name, str(req.get("artifact") or ""))
+                    ok = True
+                except (ValueError, OSError) as e:
+                    msg = str(e)
+        elif action == "artifact-export":
+            # Authorising a DOWNLOAD -- the portal streams the file, but
+            # only after this answer (spec oaap.apps.runtime 2.14).
+            #
+            # A read that crosses the tenant boundary is decided where
+            # the registry is authoritative, and the audit line is
+            # written by the same pass that says yes. Deciding it in the
+            # portal would put the record and the decision in two
+            # places, and the spool is data, not trust.
+            if not inst:
+                msg = "unknown instance"
+            elif actor and act_role != "server_admin":
+                # The one rule that is a decision rather than a
+                # mechanism: for a server_admin this button grants
+                # nothing new -- the same file is one scp away -- while
+                # for a tenant_admin it would be a new power, taking
+                # away software a supplier put into their tenant. That
+                # is a question about ownership, and it is left open
+                # rather than answered by a button.
+                msg = ("downloading a package requires server_admin — "
+                       "whether a customer may take away software that "
+                       "was installed into their tenant is a question of "
+                       "ownership, not one this node decides with a button")
+            else:
+                try:
+                    msg = artifact_export(inst, name,
+                                          str(req.get("artifact") or ""), rid)
                     ok = True
                 except (ValueError, OSError) as e:
                     msg = str(e)
@@ -7543,6 +7687,10 @@ def main():
     pmi = sub.add_parser("migrate-instance-dirs",
                          help="move instance data under its tenant (RFC-0026)")
     pmi.set_defaults(fn=cmd_migrate_instance_dirs)
+    pmx = sub.add_parser("artifact-index",
+                         help="internal: list retained packages where the "
+                              "portal can read them (oaap.apps.runtime 2.14)")
+    pmx.set_defaults(fn=lambda _a: artifact_index_write())
     pmt = sub.add_parser("migrate-tenants",
                          help="internal: create the default tenant and stamp "
                               "what belongs to it (RFC-0022 stage 2)")

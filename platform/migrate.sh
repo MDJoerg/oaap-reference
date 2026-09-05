@@ -147,6 +147,15 @@ mkdir -p "$OAAP_DATA_DIR/data/audit"
 # Silent after the first run, like every step in here.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-instance-dirs   2>&1 | sed 's/^/  /' || say "  WARNING: instance data could not be moved — check 'oaap app list'."
 
+# --- the portal's view of the retained packages (oaap.apps.runtime 2.14) ---
+# The packages moved into the tenant tree with RFC-0026, where the
+# portal has no mount and must not get one. Since 0.1.76 the host lists
+# them into apps/artifacts.json instead. Written here once, because a
+# node that changes nothing after the update would otherwise keep an
+# empty card until its next deployment -- which is exactly the state
+# this fixes.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" artifact-index   2>&1 | sed 's/^/  /' || say "  WARNING: the package index could not be written."
+
 # --- the tenant boundary in the generated gateway sites (0.2, spec 3.1) ---
 # The boundary is enforced at the gateway: every authenticated route
 # carries its instance's tenant. Sites generated before 0.2 do not, so

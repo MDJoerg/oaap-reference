@@ -20,7 +20,8 @@ from datetime import date, datetime, timezone
 from urllib.parse import quote
 
 import requests
-from flask import Flask, g, redirect, render_template_string, request
+from flask import (Flask, g, redirect, render_template_string, request,
+                   send_file)
 from markupsafe import Markup
 
 import fleet_view
@@ -1993,11 +1994,12 @@ INSTANCE_EDIT_BODY = """
      hier liegen — deshalb kann sie neu ausgerollt und zurückgesetzt werden,
      und deshalb ist ihr Backup vollständig.</p>
   <table>
-    <tr><th>Paket</th><th>Empfangen</th><th></th></tr>
+    <tr><th>Paket</th><th>Größe</th><th>Empfangen</th><th></th></tr>
     {% for a in i.artifacts %}
     <tr>
       <td><code>{{ a.file }}</code>{% if a.running %}
           <span class="badge">in Betrieb</span>{% endif %}</td>
+      <td class="muted">{{ a.size }}</td>
       <td>{{ a.received }}</td>
       <td>
         <form method="post" action="/instances/{{ i.key }}/rollback"
@@ -2007,6 +2009,11 @@ INSTANCE_EDIT_BODY = """
           <button class="secondary">{{ "Erneut ausrollen" if a.running
                                        else "Hierauf zurück" }}</button>
         </form>
+        {% if i.can_export %}
+        <a class="btn secondary"
+           href="/instances/{{ i.key }}/artifact-download?artifact={{ a.file }}"
+           >Herunterladen</a>
+        {% endif %}
         {% if not a.running %}
         <form method="post" action="/instances/{{ i.key }}/artifact-delete"
               style="display:inline"
@@ -2025,6 +2032,14 @@ INSTANCE_EDIT_BODY = """
      einmal — kein neues Paket, keine neue Übertragung. Gelöscht werden kann
      jedes Paket außer dem in Betrieb: Backup, Rückschritt und die Übernahme
      nach Produktiv lesen genau diese Datei.</p>
+  {% if i.can_export %}
+  <p class="muted">„Herunterladen" gibt Dir <strong>genau diese Bytes</strong>
+     heraus — das ist der Weg, ein hier getestetes Paket auf einem
+     <em>anderen</em> Knoten produktiv zu setzen. Innerhalb dieses Knotens
+     brauchst Du ihn nicht: dafür gibt es die Übernahme. Der Download ist
+     <code>server_admin</code> vorbehalten und wird im Mandantenprotokoll
+     vermerkt.</p>
+  {% endif %}
 </div>
 {% endif %}
 </section>
@@ -5060,6 +5075,11 @@ def instance_detail(name):
          # granted, and whether this node is even allowed to grant them
          "endpoints": _endpoint_view(inst),
          "node_exposed": "exposed" in node_profiles(),
+         # Downloading a package is server_admin's alone (spec
+         # oaap.apps.runtime 2.14). The host refuses it anyway -- this
+         # only decides whether a button is offered that would be
+         # refused.
+         "can_export": "server_admin" in caller_roles(),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
@@ -5188,25 +5208,57 @@ def _token_created(name):
     return stamp.replace("T", " ").rstrip("Z")
 
 
+# The host's listing of retained packages (appctl.ARTIFACT_INDEX).
+#
+# Until 0.1.76 this page listed `/apps-registry/<key>/artifacts` --
+# where packages lived until RFC-0026 moved instance data into
+# `tenants/<tid>/instances/<iid>/`. The portal has no mount there and
+# must not get one (that tree holds every customer's instance.env), so
+# the directory silently listed nothing: on every migrated node the
+# card disappeared, and with it "erneut ausrollen", "hierauf zurück"
+# and "löschen". Found on oaapx01, 2026-09-05 -- the same shape as the
+# stale instance mounts fixed in 0.1.71 and the audit log missing from
+# the archive in 0.1.72. Whoever moves an identifier has to enumerate
+# its readers.
+ARTIFACT_INDEX = "/apps-registry/artifacts.json"
+
+
 def _artifacts(name, inst):
-    """Retained packages of an artifact-deployed instance, newest first."""
+    """Retained packages of an artifact-deployed instance, newest first.
+
+    A view, never the truth: the host wrote this file, and the download
+    re-asks the host, which looks at the real directory again. A stale
+    line therefore costs a refused download, not a wrong file.
+    """
     src = inst.get("source") or {}
     if src.get("kind") != "artifact":
         return []
-    d = os.path.join("/apps-registry", name, "artifacts")
-    running = src.get("stored", "")
     try:
-        files = [f for f in os.listdir(d) if f.endswith(".zip")]
-    except OSError:
+        with open(ARTIFACT_INDEX, encoding="utf-8") as f:
+            files = (json.load(f).get("instances") or {}).get(name) or []
+    except (OSError, ValueError):
         return []
-    files.sort(key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True)
-    out = []
-    for f in files:
-        stamp = datetime.fromtimestamp(os.path.getmtime(os.path.join(d, f)),
-                                       timezone.utc)
-        out.append({"file": f, "running": f == running,
-                    "received": stamp.strftime("%Y-%m-%d %H:%M")})
-    return out
+    running = src.get("stored", "")
+    return [{"file": a.get("file", ""),
+             "running": a.get("file") == running,
+             "size": _mb(a.get("bytes")),
+             "received": _when_short(a.get("received"))}
+            for a in files if a.get("file")]
+
+
+def _mb(n):
+    try:
+        return f"{int(n) / (1024 * 1024):.1f} MB"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _when_short(value):
+    """An ISO stamp as a human reads it -- and anything else unchanged."""
+    s = str(value or "")
+    if len(s) >= 16 and s[4] == "-" and s[7] == "-" and s[10] in "T ":
+        return s[:16].replace("T", " ")
+    return s
 
 
 def _pending_envelope(name):
@@ -5481,6 +5533,62 @@ def instance_rollback(name):
         return _inst_back(name, err="Unbekanntes Paket.")
     return _queue_and_redirect(name, {"action": "rollback", "artifact": artifact},
                                CREATE_WAIT_SECONDS)
+
+
+# A package may be a quarter of a gigabyte, but the wait here is only
+# for the host's YES -- the file itself is then streamed straight from
+# the spool.
+EXPORT_WAIT_SECONDS = 60
+SPOOL_EXPORTS = os.path.join(SPOOL_DIR, "exports")
+
+
+@app.get("/instances/<name>/artifact-download")
+def instance_artifact_download(name):
+    """Download one retained package (spec oaap.apps.runtime 2.14).
+
+    The portal does not decide this and cannot serve it on its own: it
+    has no mount on the tenant tree where the packages live, and it must
+    not get one -- that tree holds every customer's instance.env. So the
+    host authorises the download, hard-links the one file into the spool
+    it already shares with this process, and the answer is streamed from
+    there and the link removed.
+
+    Consequence worth stating: an authorisation is spent by exactly one
+    download. Reloading the browser's download list asks again, and the
+    audit log gains a second line — which is the honest record.
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    artifact = request.args.get("artifact", "").strip()
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
+        return _inst_back(name, err="Unbekanntes Paket.")
+    rid = _uuid.uuid4().hex
+    res = _queue_with_id(rid, name, {"action": "artifact-export",
+                                     "artifact": artifact},
+                         EXPORT_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Die Freigabe läuft noch — bitte gleich "
+                                    "noch einmal versuchen.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message", "Download abgelehnt."))
+    path = os.path.join(SPOOL_EXPORTS, f"{rid}.zip")
+    if not os.path.isfile(path):
+        return _inst_back(name, err="Der Knoten hat das Paket freigegeben, "
+                                    "aber es liegt nicht bereit — bitte noch "
+                                    "einmal versuchen.")
+    try:
+        return send_file(path, as_attachment=True, download_name=artifact,
+                         mimetype="application/zip")
+    finally:
+        # The copy in the spool is for THIS response. Removing the link
+        # leaves the retained package where it is.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 @app.post("/instances/<name>/artifact-delete")

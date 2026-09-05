@@ -925,6 +925,58 @@ def password_change():
     return render_template_string(PASSWORD_PAGE, error=None, done=True)
 
 
+@app.get("/auth/whoami")
+def whoami():
+    """What an app may know about the person in front of it (spec 2.7).
+
+    The same question /verify answers, in a form a page can read. Three
+    rules make it safe to expose on every instance entry point:
+
+    1. It answers about THE CALLER and nobody else. There is no
+       parameter, so there is no request in which a caller can ask
+       about someone else.
+    2. `roles` is the SAME list /verify puts in X-OAAP-Roles -- read
+       from the same resolve_principal() result, not computed again.
+       whoami is a second reading of one truth, never a second truth.
+    3. No tenant and no groups. The tenant boundary is enforced at the
+       gateway before the app is reached (oaap.core.tenant 3.1);
+       handing the app its caller's tenant would invite it to filter by
+       that itself -- a weaker second enforcement, one bug away from a
+       leak between customers -- and on a single-tenant node it would
+       make tenants visible where nothing may be. Groups are absent for
+       the same reason no X-OAAP-Groups header exists (spec 2.6).
+
+    An unauthenticated caller gets 401, never the 303 to the login form
+    that a browser route would give: whoever calls this is a script
+    inside a page, and a script following a redirect would receive an
+    HTML login page with status 200 and call it success.
+    """
+    user, method, refusal = resolve_principal(request.args.get("instance", ""))
+    if refusal is not None:
+        # A key refusal is already a proper machine answer; a failed
+        # session is a redirect, which has to be turned into one.
+        return refusal if method == "key" else (
+            {"error": "not signed in"}, 401,
+            {"WWW-Authenticate": 'Bearer error="invalid_token", '
+                                 'error_description="not signed in"'})
+    # A machine principal has no password, so it is not offered the
+    # page for changing one -- an app rendering this menu would show a
+    # link that leads to a form the caller can never fill in.
+    links = {"logout": "/auth/logout"}
+    if user.get("kind", "human") != "machine":
+        links["password"] = "/auth/password"
+    return ({"username": user["username"],
+             "display_name": user.get("display_name") or "",
+             "roles": list(user["roles"]),
+             "kind": user.get("kind", "human"),
+             "method": method,
+             "links": links},
+            200,
+            # Describes THIS session. A shared cache holding it would
+            # hand one person's name to the next.
+            {"Cache-Control": "no-store"})
+
+
 # ---------------------------------------------------------------------------
 # Request throttling for public routes (RFC-0010).
 #
