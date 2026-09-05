@@ -1197,7 +1197,18 @@ def cmd_migrate_instance_dirs(_args):
         # whereupon Docker re-resolves the OLD path, creates it empty,
         # and the app looks wiped. Leaving that window open would be the
         # worst kind of bug: silent, delayed, and data-shaped.
-        if os.path.isdir(new) and inst.get("services"):
+        #
+        # It was. Until 0.1.71 this asked for `inst["services"]`, which
+        # only instances installed since 0.1.31 have -- so every OLDER
+        # instance kept its old mount, and precisely the oldest and
+        # most-loved data was the data left one restart from looking
+        # wiped (found 2026-09-05 on four nodes at once, Bernd's CRM
+        # among them). `instance_services()` exists to make that
+        # distinction disappear, and its own docstring says "so every
+        # caller (recreate, migrate, config) treats old and new the
+        # same" -- this caller then asked the question it was written
+        # to remove.
+        if os.path.isdir(new):
             try:
                 recreate_instance_containers(key, instance_services(inst),
                                              inst.get("storage") or [],
@@ -1225,6 +1236,89 @@ def cmd_migrate_instance_dirs(_args):
         if moved:
             refresh_generated_sites()
             reload_gateway()
+    _repair_stale_mounts(reg)
+
+
+def _repair_stale_mounts(reg):
+    """Put containers back on the tenant tree that were left on the old
+    path -- the damage the guard above used to cause (0.1.71).
+
+    Runs on every update, like every step in migrate.sh, and is silent
+    when there is nothing to repair. It has to exist separately from
+    the fix: four nodes already carried the fault when it was found,
+    and a node cannot heal from a condition that is only removed for
+    the next migration.
+
+    Two things are repaired, in this order:
+
+    1. The container is recreated on the instance's real directory.
+    2. Whatever appeared at the OLD path is moved aside, never deleted.
+       On a node whose container was never restarted there is nothing
+       there; on one that was, there is a freshly initialised state the
+       app wrote after Docker re-created the path empty. That is young
+       data and almost certainly worthless -- and "almost certainly" is
+       not a licence to delete somebody's directory.
+
+    Deliberately conservative: it acts only when the instance HAS a
+    directory in the tenant tree. Where the move itself failed, the old
+    path may hold the only copy, and moving it aside would be the very
+    accident this function exists to undo.
+    """
+    if not shutil.which("docker"):
+        return
+    repaired, aside = [], []
+    for key, inst in sorted(reg.get("instances", {}).items()):
+        new = instance_dir(key, inst)
+        old = os.path.join(APPS_DIR, key)
+        if not inst.get("id") or not os.path.isdir(new) or old == new:
+            continue
+        # Ask DOCKER where the container reads from, not the registry:
+        # the registry has said the right thing all along, and it was
+        # the container that disagreed.
+        stale = False
+        for svc in instance_services(inst):
+            out = subprocess.run(
+                ["docker", "inspect", "-f",
+                 "{{range .Mounts}}{{.Source}}\n{{end}}", svc["container"]],
+                capture_output=True, text=True)
+            if out.returncode != 0:
+                continue
+            if any(line.startswith(old + os.sep)
+                   for line in out.stdout.splitlines()):
+                stale = True
+        if not stale:
+            continue
+        try:
+            recreate_instance_containers(key, instance_services(inst),
+                                         inst.get("storage") or [],
+                                         inst.get("endpoints") or [],
+                                         inst=inst)
+            repaired.append(key)
+        except Exception as e:            # noqa: BLE001 - reported, not fatal
+            print(f"  WARNING: {key} still reads from the old path and could "
+                  f"not be recreated ({e}).")
+            continue
+        if os.path.isdir(old):
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                os.rename(old, f"{old}.abgeloest-{stamp}")
+                aside.append(f"{key} -> apps/{key}.abgeloest-{stamp}")
+            except OSError as e:
+                print(f"  WARNING: could not set aside {old} ({e}).")
+    if not repaired:
+        return
+    print("")
+    print("Repairing instances left on the old data path (0.1.71) ...")
+    for k in repaired:
+        print(f"  {k}: now reads tenants/<tenant>/instances/<id>/.")
+    for line in aside:
+        print(f"  set aside, nothing deleted: {line}")
+    print("  Their data was never lost -- it moved with the tenant tree,")
+    print("  and it is what these containers read from now. What was set")
+    print("  aside is what the app wrote after a restart re-created the")
+    print("  old path empty; look at it, then remove it.")
+    refresh_generated_sites()
+    reload_gateway()
 
 
 def cmd_migrate_tenants(_args):
