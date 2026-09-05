@@ -85,10 +85,11 @@ fi
 
 t0=$(date +%s)
 before="$(ls -1 "$TARGET"/oaap-backup-*.tar.gz 2>/dev/null || true)"
-# App containers are stopped for the copy and restarted right after --
-# said here too, because whoever reads this log at 02:00 is looking for
-# exactly that explanation of a gap in some app's connections.
-echo "-- app containers pause for the copy (oaap.data.backup 0.1) --"
+# App containers pause for the COPY only (RFC-0029 D3); compression
+# runs with them back up. Said here too, because whoever reads this log
+# at 02:00 is looking for exactly that explanation of a gap in some
+# app's connections -- and needs to know it was seconds, not minutes.
+echo "-- app containers pause for the copy (oaap.data.backup 0.2) --"
 if ! oaap backup create --to "$TARGET"; then
   SECONDS_TAKEN=$(( $(date +%s) - t0 ))
   MESSAGE="oaap backup create failed -- see $LOG"

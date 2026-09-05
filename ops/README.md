@@ -3,14 +3,18 @@
 Hier liegt, was **noch keine Plattform-Fähigkeit ist**: Werkzeuge, mit
 denen wir unsere eigenen Knoten betreiben, bevor die Form bewiesen ist.
 
-Die Reihenfolge ist Absicht. `oaap.data.backup` 0.1 kann genau eine
-Sache — ein vollständiges Archiv auf Zuruf. Zeitplan, Aufbewahrung,
-Auslagerung und Sichtbarkeit stehen dort ausdrücklich als „spätere
-Version". Diese Skripte sind der **Probelauf** dafür: Sie machen die
-Sache jetzt, an echten Knoten, mit echten Daten — und was sich dabei
-als richtig erweist, wandert danach in die Spezifikation und in die
-Plattform, statt vorher geraten zu werden. Genauso ist die
-Instanz-Konfiguration entstanden.
+Die Reihenfolge ist Absicht. Die Plattform macht ein vollständiges
+Archiv auf Zuruf; **Zeitplan, Aufbewahrung, Auslagerung und
+Sichtbarkeit** macht bis auf Weiteres dieses Verzeichnis. Die Skripte
+sind der **Probelauf**: Sie tun die Sache jetzt, an echten Knoten, mit
+echten Daten — und was sich dabei als richtig erweist, wandert danach
+in die Spezifikation und in die Plattform, statt vorher geraten zu
+werden. Genauso ist die Instanz-Konfiguration entstanden.
+
+Der erste Umzug in diese Richtung hat schon stattgefunden: Die
+Ausfallzeit (RFC-0029 D3) gehörte in die Plattform und nicht in ein
+Skript, weil sie beschreibt, *wie* gesichert wird und nicht *wann* —
+seit `oaap.data.backup` 0.2 stehen die Apps nur noch für das Kopieren.
 
 *English summary:* operator scripts for our own fleet — a nightly full
 platform backup on a node, and a pull of those archives to a second
@@ -59,6 +63,25 @@ ssh-keygen -t ed25519 -N "" -C "backup-pull@oaap-demo" -f ~/.ssh/oaap_backup_pul
 sudo bash ops/install-backup-pull.sh --node oaapx01 --host oaap.joomp.de \
      --user oaap-admin --key ~/.ssh/oaap_backup_pull --to /mnt/backup
 ```
+
+## Was der Lauf kostet
+
+Die App-Container stehen **nur für das Kopieren** still; komprimiert
+wird danach, mit laufenden Apps (RFC-0029 D3). Gemessen am 05.09.2026:
+
+| Knoten | Daten | Ausfall vorher | Ausfall jetzt | Gesamtlauf |
+| ------ | ----- | -------------- | ------------- | ---------- |
+| oaapx01 | 8,0 GB | 487 s | **32 s** | 245 s |
+| oaap-test | 899 MB | 127 s | **14 s** | 82 s |
+
+Der Preis: Die Daten liegen für die Dauer des Komprimierens doppelt da.
+Der Befehl prüft das vorher und lehnt laut ab, statt es nachts als
+volle Platte zu entdecken.
+
+**Für die eigene Zahl nicht diese Tabelle lesen**, sondern
+`/var/lib/oaap/apps/backup-last.json` — dort steht, was der letzte Lauf
+*auf diesem Knoten* gekostet hat. Jede andere Zahl ist die Maschine von
+jemand anderem.
 
 ## Aufbewahrung
 
@@ -112,9 +135,15 @@ gebaut wird.
 
 ## Wiederherstellen
 
-Der Weg zurück ist unverändert `oaap.data.backup` 0.1: eine vorbereitete
-Maschine plus Archiv, Installer im Modus `restore`. Er baut **alle**
-Instanzen neu — einzeln geht heute nicht.
+Der Weg zurück ist eine vorbereitete Maschine plus Archiv, Installer im
+Modus `restore`. Er baut **alle** Instanzen neu — einzeln geht heute
+nicht (RFC-0029 D5: das Archiv je Mandant kommt, das Zurückspielen
+eines einzelnen Mandanten in einen laufenden Knoten bekommt eine eigene
+Runde).
 
-**Eine ungeprüfte Sicherung ist keine.** Der Probelauf gehört in den
-Kalender, nicht in die Absicht.
+**Eine ungeprüfte Sicherung ist keine.** Am 05.09.2026 einmal wirklich
+gegangen: oaap-test gelöscht und aus dem Archiv aufgebaut — 9 von 9
+Instanzen, alte Passwörter, byte-gleiche Nutzdaten. Dabei kam heraus,
+dass das Mandanten-Protokoll nie im Archiv war. Genau dafür macht man
+das; kein Test, der nur das Archiv anschaut, hätte es gefunden. Der
+nächste Probelauf gehört in den Kalender, nicht in die Absicht.
