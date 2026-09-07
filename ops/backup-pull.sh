@@ -17,6 +17,7 @@ set -uo pipefail
 
 NODE=""; HOST=""; USER_="oaap-admin"; KEY=""; TO="/mnt/backup"
 DAILY=7; WEEKLY=4; MONTHLY=6; REMOTE_DIR="/var/backups/oaap"
+LOCAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -28,11 +29,19 @@ while [ $# -gt 0 ]; do
     --daily) DAILY="$2"; shift 2 ;;
     --weekly) WEEKLY="$2"; shift 2 ;;
     --monthly) MONTHLY="$2"; shift 2 ;;
-    *) echo "Usage: backup-pull.sh --node NAME --host H --key K [--to DIR] [--user U] [--daily 7] [--weekly 4] [--monthly 6]" >&2; exit 2 ;;
+    # THIS machine is the source. For the node that does the fetching
+    # and has nobody to fetch it: it already has the off-site share
+    # mounted, so it needs no second node, only the same generations.
+    --local) LOCAL=1; shift ;;
+    *) echo "Usage: backup-pull.sh --node NAME (--host H --key K | --local) [--to DIR] [--user U] [--daily 7] [--weekly 4] [--monthly 6]" >&2; exit 2 ;;
   esac
 done
-[ -n "$NODE" ] && [ -n "$HOST" ] && [ -n "$KEY" ] || {
-  echo "ERROR: --node, --host and --key are required." >&2; exit 2; }
+if [ "$LOCAL" -eq 1 ]; then
+  NODE="${NODE:-$(hostname)}"; HOST="${HOST:-$(hostname)}"
+else
+  [ -n "$NODE" ] && [ -n "$HOST" ] && [ -n "$KEY" ] || {
+    echo "ERROR: --node, --host and --key are required (or --local)." >&2; exit 2; }
+fi
 
 DEST="$TO/$NODE"
 STATE="$DEST/status.json"
@@ -88,9 +97,36 @@ EOF
 trap write_state EXIT
 
 echo "== oaap-backup-pull $STARTED  $NODE -> $(hostname):$DEST"
+[ "$LOCAL" -eq 1 ] && echo "-- local source: this machine backs itself up off-site"
 
 SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=20
      -o StrictHostKeyChecking=accept-new "$USER_@$HOST")
+
+# The three -- and only three -- things this script asks of the source.
+# Branching HERE rather than at each use is the point: a local pull and
+# a remote one then walk the same path afterwards, including the
+# checksum check and the generations. Two code paths would be two
+# retention policies within a month.
+src_list() {
+  if [ "$LOCAL" -eq 1 ]; then ls -1t "$REMOTE_DIR"/oaap-backup-*.tar.gz 2>/dev/null
+  else "${SSH[@]}" "ls -1t $REMOTE_DIR/oaap-backup-*.tar.gz 2>/dev/null"; fi
+}
+src_checksum() {   # $1 = the archive's path at the source
+  if [ "$LOCAL" -eq 1 ]; then cat "$1.sha256" 2>/dev/null
+  else "${SSH[@]}" "cat $1.sha256 2>/dev/null"; fi
+}
+src_fetch() {      # $1 = source path, $2 = destination
+  if [ "$LOCAL" -eq 1 ]; then
+    # A copy, never a hard link: the archive at the source is pruned to
+    # the two newest (RFC-0029 D4), and a link would let that pruning
+    # reach into the off-site generations.
+    cp -- "$1" "$2"
+  else
+    rsync -a --partial --inplace --timeout=1800 \
+      -e "ssh -i $KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+      "$USER_@$HOST:$1" "$2"
+  fi
+}
 
 # The target has to be MOUNTED, not merely present. A network share that
 # failed to mount leaves an empty directory on the local disk, and a
@@ -104,7 +140,7 @@ mkdir -p "$DEST"/{daily,weekly,monthly}
 chmod 700 "$DEST" "$DEST"/{daily,weekly,monthly} 2>/dev/null || true
 
 # What does the source have? Newest first.
-remote_list="$("${SSH[@]}" "ls -1t $REMOTE_DIR/oaap-backup-*.tar.gz 2>/dev/null" || true)"
+remote_list="$(src_list || true)"
 newest="$(printf '%s\n' "$remote_list" | head -1)"
 if [ -z "$newest" ]; then
   MESSAGE="the source node has no archive in $REMOTE_DIR -- did its nightly run fail?"
@@ -117,11 +153,11 @@ echo "-- newest on $NODE: $base"
 # "rsync error: protocol data stream (code 12)", which sends the reader
 # looking at the network and the key rather than at `apt install rsync`
 # (found on oaap-test, 2026-09-05).
-if ! command -v rsync >/dev/null 2>&1; then
+if [ "$LOCAL" -eq 0 ] && ! command -v rsync >/dev/null 2>&1; then
   MESSAGE="rsync is not installed on $(hostname) -- apt install rsync"
   echo "ERROR: $MESSAGE" >&2; exit 1
 fi
-if ! "${SSH[@]}" "rsync --version" >/dev/null 2>&1; then
+if [ "$LOCAL" -eq 0 ] && ! "${SSH[@]}" "rsync --version" >/dev/null 2>&1; then
   # The forced command refuses this, which is correct and also tells us
   # nothing -- so ask for it only as a hint, never as a verdict.
   echo "-- note: could not confirm rsync on $NODE (the forced command may"
@@ -138,9 +174,7 @@ else
   # --partial + a temporary name: an interrupted transfer must never
   # leave something under the final name that looks like a backup.
   echo "-- fetching --"
-  if ! rsync -a --partial --inplace --timeout=1800 \
-        -e "ssh -i $KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
-        "$USER_@$HOST:$newest" "$DEST/daily/.$base.part"; then
+  if ! src_fetch "$newest" "$DEST/daily/.$base.part"; then
     MESSAGE="transfer failed"
     echo "ERROR: $MESSAGE" >&2; rm -f "$DEST/daily/.$base.part"; exit 1
   fi
@@ -148,7 +182,7 @@ else
   # Verified against the checksum the SOURCE recorded, not one computed
   # here from the file we just received -- that would only prove the
   # file is a copy of itself.
-  want="$("${SSH[@]}" "cat $newest.sha256 2>/dev/null" | cut -d' ' -f1 || true)"
+  want="$(src_checksum "$newest" | cut -d' ' -f1 || true)"
   got="$(sha256sum "$DEST/daily/.$base.part" | cut -d' ' -f1)"
   if [ -z "$want" ]; then
     VERIFIED="no checksum at the source"

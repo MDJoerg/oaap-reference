@@ -7,7 +7,7 @@
 set -euo pipefail
 
 NODE=""; HOST=""; USER_="oaap-admin"; KEY=""; TO="/mnt/backup"; AT="04:30"
-DAILY=7; WEEKLY=4; MONTHLY=6; REMOVE=0
+DAILY=7; WEEKLY=4; MONTHLY=6; REMOVE=0; LOCAL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -20,7 +20,10 @@ while [ $# -gt 0 ]; do
     --weekly) WEEKLY="$2"; shift 2 ;;
     --monthly) MONTHLY="$2"; shift 2 ;;
     --remove) REMOVE=1; shift ;;
-    *) echo "Usage: install-backup-pull.sh --node N --host H --key K [--to DIR] [--at HH:MM] [--remove]" >&2; exit 2 ;;
+    # This machine is its own source (see backup-pull.sh --local). For
+    # the node that fetches for everyone and has nobody to fetch it.
+    --local) LOCAL=1; shift ;;
+    *) echo "Usage: install-backup-pull.sh --node N (--host H --key K | --local) [--to DIR] [--at HH:MM] [--remove]" >&2; exit 2 ;;
   esac
 done
 
@@ -38,11 +41,15 @@ if [ "$REMOVE" -eq 1 ]; then
   exit 0
 fi
 
-[ -n "$NODE" ] && [ -n "$HOST" ] && [ -n "$KEY" ] || {
-  echo "ERROR: --node, --host and --key are required." >&2; exit 2; }
-[ -r "$KEY" ] || { echo "ERROR: cannot read the key $KEY." >&2; exit 1; }
+if [ "$LOCAL" -eq 1 ]; then
+  NODE="${NODE:-$(hostname)}"; HOST="$(hostname)"; KEY="-"
+else
+  [ -n "$NODE" ] && [ -n "$HOST" ] && [ -n "$KEY" ] || {
+    echo "ERROR: --node, --host and --key are required (or --local)." >&2; exit 2; }
+  [ -r "$KEY" ] || { echo "ERROR: cannot read the key $KEY." >&2; exit 1; }
+  command -v rsync >/dev/null 2>&1 || { echo "ERROR: rsync is not installed (apt install rsync)." >&2; exit 1; }
+fi
 case "$AT" in [0-9][0-9]:[0-9][0-9]) ;; *) echo "ERROR: --at wants HH:MM." >&2; exit 1 ;; esac
-command -v rsync >/dev/null 2>&1 || { echo "ERROR: rsync is not installed (apt install rsync)." >&2; exit 1; }
 
 # The target must be a mount point NOW, or the very first run would
 # write onto the local disk -- checked here so the mistake is caught
@@ -60,6 +67,7 @@ HOST=$HOST
 USER=$USER_
 KEY=$KEY
 TO=$TO
+LOCAL=$LOCAL
 DAILY=$DAILY
 WEEKLY=$WEEKLY
 MONTHLY=$MONTHLY
@@ -80,7 +88,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/oaap-backup-pull/%i.conf
-ExecStart=/bin/sh -c '/usr/local/bin/oaap-backup-pull --node "\$NODE" --host "\$HOST" --user "\$USER" --key "\$KEY" --to "\$TO" --daily "\$DAILY" --weekly "\$WEEKLY" --monthly "\$MONTHLY"'
+ExecStart=/bin/sh -c 'set -- --node "\$NODE" --to "\$TO" --daily "\$DAILY" --weekly "\$WEEKLY" --monthly "\$MONTHLY"; [ "\$LOCAL" = 1 ] && set -- "\$@" --local || set -- "\$@" --host "\$HOST" --user "\$USER" --key "\$KEY"; exec /usr/local/bin/oaap-backup-pull "\$@"'
 TimeoutStartSec=3h
 EOF
 
@@ -109,7 +117,11 @@ systemctl enable --now "oaap-backup-pull@$NODE.timer"
 
 echo ""
 echo "Pull installed on $(hostname):"
-echo "  source: $NODE ($USER_@$HOST:/var/backups/oaap)"
+if [ "$LOCAL" -eq 1 ]; then
+  echo "  source: this machine itself (/var/backups/oaap) -- no key, no network"
+else
+  echo "  source: $NODE ($USER_@$HOST:/var/backups/oaap)"
+fi
 echo "  when:   every day at $AT, missed runs are caught up"
 echo "  target: $TO/$NODE/{daily,weekly,monthly}  (keep $DAILY/$WEEKLY/$MONTHLY)"
 echo "  state:  $TO/$NODE/status.json, transcript /var/log/oaap-backup-pull.log"
