@@ -7299,6 +7299,8 @@ def backup_schedule_set(at="", keep=None, enabled=None):
 
 def cmd_backup(args):
     """Offline-consistent platform backup: one self-contained archive."""
+    if args.action == "schedule":
+        return cmd_backup_schedule(args)
     import datetime
     import socket
     import time
@@ -8030,8 +8032,15 @@ def main():
     pd = sub.add_parser("process-deploys")
     pd.set_defaults(fn=cmd_process_deploys)
     pb = sub.add_parser("backup")
-    pb.add_argument("action", choices=["create"])
+    pb.add_argument("action", choices=["create", "schedule"])
     pb.add_argument("--to", default="", help="target directory or .tar.gz file (outside the data dir)")
+    pb.add_argument("--at", default="", help="schedule: hour HH:MM (24h)")
+    pb.add_argument("--keep", type=int, default=None,
+                    help="schedule: how many archives stay on this node")
+    pb.add_argument("--on", action="store_true", help="schedule: arm the timer")
+    pb.add_argument("--off", action="store_true", help="schedule: disarm it")
+    pb.add_argument("--refresh", action="store_true",
+                    help="schedule: only rewrite what the timer says")
     pb.set_defaults(fn=cmd_backup)
     pri = sub.add_parser("restore-instances")
     pri.set_defaults(fn=cmd_restore_instances)

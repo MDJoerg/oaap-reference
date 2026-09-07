@@ -222,6 +222,14 @@ ok("systemd ist die Wahrheit, die Datei nur die Ansicht",
    "sonst behauptet die Seite einen Zeitplan, der nicht scharf ist")
 ok("und der Zeitplan wird per drop-in gesetzt, nicht in der ops-Unit",
    "portal.conf" in APPCTL, "zwei Schreiber einer Datei waeren der Fehler")
+# Am laufenden Knoten aufgefallen: Der Code stand da, die Kommandozeile
+# kannte ihn nicht -- `oaap backup schedule` antwortete "invalid choice".
+# Eine Faehigkeit, die man nicht aufrufen kann, ist keine.
+ok("'schedule' ist eine gueltige Aktion von 'oaap backup'",
+   'choices=["create", "schedule"]' in APPCTL,
+   "sonst steht die Funktion da und niemand kommt an sie heran")
+ok("und cmd_backup reicht sie weiter",
+   'if args.action == "schedule"' in APPCTL)
 ok("mit dem leeren OnCalendar davor",
    '"OnCalendar=",' in APPCTL,
    "systemd sammelt OnCalendar -- sonst sichert der Knoten zu zwei Uhrzeiten")
