@@ -6340,6 +6340,29 @@ def cmd_process_deploys(_args):
                     ok = True
                 except (ValueError, OSError) as e:
                     msg = str(e)
+        elif action == "backup-schedule":
+            # The nightly schedule from the portal (RFC-0029 D1).
+            # server_admin's alone: this stops EVERY app on the node at
+            # the chosen hour, including the apps of tenants who did not
+            # choose it. Re-checked here, not only at the button -- the
+            # spool is data, not trust.
+            #
+            # Note what is NOT here: the target directory. Where a copy
+            # of every secret on this machine is written stays a
+            # decision made at the machine (RFC-0029 D1).
+            if actor and act_role != "server_admin":
+                msg = ("changing the backup schedule stops every app on this "
+                       "node and therefore requires server_admin")
+            else:
+                try:
+                    op = req.get("op", "set")
+                    msg = backup_schedule_set(
+                        str(req.get("at") or ""),
+                        req.get("keep"),
+                        True if op == "on" else False if op == "off" else None)
+                    ok = True
+                except (ValueError, OSError) as e:
+                    msg = str(e)
         elif action == "artifact-export":
             # Authorising a DOWNLOAD -- the portal streams the file, but
             # only after this answer (spec oaap.apps.runtime 2.14).
@@ -7136,6 +7159,144 @@ def last_backup_run():
         return None
 
 
+# ----------------------------------------------- the schedule (RFC-0029 D1)
+#
+# WHO OWNS WHAT. The timer UNIT belongs to ops/install-backup-timer.sh --
+# setting a node up for nightly backups is still the trial run, not a
+# platform capability. What lives here is the SCHEDULE INSIDE it: the
+# hour, how many archives stay, and whether it is armed at all. That is
+# the half Jörg decided to have in the portal.
+#
+# The split is kept honest by a drop-in: ops writes the unit, the
+# platform writes `portal.conf` beside it and never touches the unit.
+# Two writers of one file would have been the same mistake this
+# codebase keeps finding.
+#
+# And systemd is the TRUTH, not backup-schedule.json. The file is a
+# view, written from what the timer actually reports -- a page must not
+# claim a schedule that is not armed. Same shape as apps/artifacts.json.
+BACKUP_UNIT = "oaap-backup.timer"
+BACKUP_SERVICE = "oaap-backup.service"
+SYSTEMD_DIR = "/etc/systemd/system"
+
+
+def _systemctl(*args, check=False):
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True,
+                          check=check)
+
+
+def _unit_prop(unit, prop):
+    r = _systemctl("show", "-p", prop, "--value", unit)
+    return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+
+def backup_timer_installed():
+    return os.path.isfile(os.path.join(SYSTEMD_DIR, BACKUP_UNIT))
+
+
+def backup_schedule_write():
+    """Write down what the timer ACTUALLY says. Returns the record.
+
+    Absent file means "nobody set this up", which the health page has to
+    be able to say -- a different answer from "it failed", needing a
+    different action (RFC-0029 D2).
+    """
+    if not backup_timer_installed():
+        try:
+            os.remove(BACKUP_SCHEDULE_FILE)
+        except OSError:
+            pass
+        return None
+    enabled = _unit_prop(BACKUP_UNIT, "ActiveState") == "active"
+    # The hour as systemd holds it, not as we last wrote it: a hand-made
+    # edit on the machine has to show up in the portal, not be papered
+    # over by our own memory of what we set.
+    cal = _unit_prop(BACKUP_UNIT, "TimersCalendar")
+    at = ""
+    m = re.search(r"(\d{2}):(\d{2}):\d{2}", cal or "")
+    if m:
+        at = f"{m.group(1)}:{m.group(2)}"
+    env = _unit_prop(BACKUP_SERVICE, "Environment")
+    keep, target = 2, "/var/backups/oaap"
+    for part in (env or "").split():
+        if part.startswith("OAAP_BACKUP_KEEP="):
+            try:
+                keep = int(part.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif part.startswith("OAAP_BACKUP_TARGET="):
+            target = part.split("=", 1)[1]
+    rec = {"schema": "0.1", "enabled": enabled, "at": at, "keep": keep,
+           "target": target, "unit": BACKUP_UNIT,
+           "next": _unit_prop(BACKUP_UNIT, "NextElapseUSecRealtime")}
+    try:
+        tmp = BACKUP_SCHEDULE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, indent=2)
+        os.replace(tmp, BACKUP_SCHEDULE_FILE)
+        os.chmod(BACKUP_SCHEDULE_FILE, 0o644)
+    except OSError as e:
+        print(f"WARNING: could not write {BACKUP_SCHEDULE_FILE}: {e}", flush=True)
+    return rec
+
+
+def backup_schedule_set(at="", keep=None, enabled=None):
+    """Change the hour, the retention, or whether it runs at all.
+
+    Never creates the unit -- that is ops/install-backup-timer.sh's job,
+    and a node without one is told so rather than silently given a
+    schedule the operator never asked for.
+    """
+    if not backup_timer_installed():
+        raise ValueError(
+            "this node has no nightly backup yet. Setting one up is done on "
+            "the machine (sudo bash ops/install-backup-timer.sh) — it decides "
+            "WHERE the archives go, and that is deliberately not a portal "
+            "setting")
+    if at:
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at):
+            raise ValueError("the time wants HH:MM in 24-hour form, e.g. 03:30")
+        d = os.path.join(SYSTEMD_DIR, BACKUP_UNIT + ".d")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "portal.conf"), "w", encoding="utf-8") as f:
+            # The empty assignment first: systemd ACCUMULATES OnCalendar,
+            # so without it the node would back up at both hours.
+            f.write("\n".join([
+                "# Written by OAAP (RFC-0029 D1). The unit itself belongs",
+                "# to ops/install-backup-timer.sh; only this file is ours.",
+                "[Timer]",
+                "OnCalendar=",
+                f"OnCalendar=*-*-* {at}:00",
+                ""]))
+    if keep is not None:
+        keep = int(keep)
+        if keep < 1 or keep > 30:
+            raise ValueError("keep: between 1 and 30 archives stay on this node")
+        d = os.path.join(SYSTEMD_DIR, BACKUP_SERVICE + ".d")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "portal.conf"), "w", encoding="utf-8") as f:
+            f.write("\n".join([
+                "# Written by OAAP (RFC-0029 D1).",
+                "[Service]",
+                f"Environment=OAAP_BACKUP_KEEP={keep}",
+                ""]))
+    _systemctl("daemon-reload")
+    if enabled is not None:
+        _systemctl("enable" if enabled else "disable",
+                   "--now" if enabled else "--now", BACKUP_UNIT)
+    elif _unit_prop(BACKUP_UNIT, "ActiveState") == "active":
+        # A running timer has to be restarted to pick up a new hour.
+        _systemctl("restart", BACKUP_UNIT)
+    rec = backup_schedule_write()
+    if rec is None:
+        return "the nightly backup is gone"
+    if not rec["enabled"]:
+        return "the nightly backup is switched off — nothing runs on its own"
+    nxt = rec["next"] or "unknown"
+    return (f"nightly backup at {rec['at']}, keeping {rec['keep']} archive(s) "
+            f"on this node — next run {nxt}")
+
+
 def cmd_backup(args):
     """Offline-consistent platform backup: one self-contained archive."""
     import datetime
@@ -7445,6 +7606,36 @@ def _report_dropped_profiles():
           f"{', '.join(profiles)}. Profiles describe the machine, not the "
           f"service, so they are NOT restored. Set them again deliberately "
           f"with: sudo oaap node add-profile {profiles[0]}")
+
+
+def cmd_backup_schedule(args):
+    """Show or change the nightly schedule (RFC-0029 D1)."""
+    if args.refresh:
+        backup_schedule_write()
+        return
+    if not (args.at or args.keep is not None or args.on or args.off):
+        rec = backup_schedule_write()
+        if rec is None:
+            print("No nightly backup on this node — nothing runs on its own.")
+            print("Set one up on the machine: sudo bash ops/install-backup-timer.sh")
+            return
+        print(f"nightly backup: {'on' if rec['enabled'] else 'OFF'}")
+        print(f"  at:     {rec['at'] or '?'}")
+        print(f"  keep:   {rec['keep']} archive(s) on this node")
+        print(f"  target: {rec['target']}")
+        print(f"  next:   {rec['next'] or '—'}")
+        last = last_backup_run() or {}
+        if last.get("downtime_seconds") is not None:
+            print(f"  the last run stopped this node's apps for "
+                  f"{last['downtime_seconds']}s")
+        return
+    if args.on and args.off:
+        die("--on and --off at the same time")
+    try:
+        print(backup_schedule_set(args.at, args.keep,
+                                  True if args.on else False if args.off else None))
+    except ValueError as e:
+        die(str(e))
 
 
 def cmd_restore_instances(_args):

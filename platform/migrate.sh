@@ -156,6 +156,13 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-instance-dir
 # this fixes.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" artifact-index   2>&1 | sed 's/^/  /' || say "  WARNING: the package index could not be written."
 
+# --- the schedule as systemd actually holds it (RFC-0029 D1) ---
+# Since 0.1.78 backup-schedule.json is a VIEW derived from the timer,
+# not a note the installer left behind. Written once here so a node that
+# changes nothing after the update still shows the truth -- and so a
+# schedule someone edited by hand on the machine appears in the portal.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" backup schedule --refresh   2>&1 | sed 's/^/  /' || say "  WARNING: the backup schedule could not be read."
+
 # --- the tenant boundary in the generated gateway sites (0.2, spec 3.1) ---
 # The boundary is enforced at the gateway: every authenticated route
 # carries its instance's tenant. Sites generated before 0.2 do not, so

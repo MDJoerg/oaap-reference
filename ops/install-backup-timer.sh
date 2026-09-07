@@ -29,9 +29,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "$REMOVE" -eq 1 ]; then
   systemctl disable --now oaap-backup.timer 2>/dev/null || true
   rm -f /etc/systemd/system/oaap-backup.{service,timer} /usr/local/bin/oaap-backup-nightly
-  # The page must stop claiming a schedule that no longer exists.
-  rm -f /var/lib/oaap/apps/backup-schedule.json
+  # Anything the portal wrote into the unit goes with it (RFC-0029 D1).
+  rm -rf /etc/systemd/system/oaap-backup.timer.d          /etc/systemd/system/oaap-backup.service.d
   systemctl daemon-reload
+  # The page must stop claiming a schedule that no longer exists. Asked
+  # of the platform, which removes the file when the unit is gone.
+  oaap backup schedule --refresh 2>/dev/null     || rm -f /var/lib/oaap/apps/backup-schedule.json
   echo "Nightly backup removed. Existing archives in $TO were kept."
   exit 0
 fi
@@ -90,30 +93,15 @@ systemctl daemon-reload
 systemctl enable --now oaap-backup.timer
 
 # What is PLANNED here, written where the portal can read it (RFC-0029
-# D2). Absent means "nobody set this up", which the health page has to
-# be able to say -- it is a different answer from "it failed", and it
-# needs a different action. The next run is asked of the timer itself
-# rather than derived from --at: a page must not claim a schedule that
-# is not actually armed.
-write_schedule() {
-  local dir=/var/lib/oaap/apps
-  [ -d "$dir" ] || return 0
-  local next
-  next="$(systemctl show -p NextElapseUSecRealtime --value oaap-backup.timer 2>/dev/null)"
-  cat > "$dir/backup-schedule.json" <<JSON
-{
-  "schema": "0.1",
-  "enabled": true,
-  "at": "$AT",
-  "keep": $KEEP,
-  "target": "$TO",
-  "unit": "oaap-backup.timer",
-  "next": "$next"
+# D2) -- but written by the PLATFORM, not here. Since 0.1.78 the portal
+# can change the schedule (RFC-0029 D1), and systemd is the truth:
+# backup-schedule.json is a view derived from what the timer actually
+# reports. Two writers of that file would have been two answers to one
+# question within a month.
+refresh_schedule() {
+  oaap backup schedule --refresh 2>/dev/null     || python3 /var/lib/oaap/app/appctl.py backup schedule --refresh 2>/dev/null     || echo "  NOTE: this platform is older than 0.1.78 and cannot write"             "backup-schedule.json itself — update it, then the health page"             "will show the schedule."
 }
-JSON
-  chmod 644 "$dir/backup-schedule.json"
-}
-write_schedule
+refresh_schedule
 
 echo ""
 echo "Nightly backup installed on $(hostname):"

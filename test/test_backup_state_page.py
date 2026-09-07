@@ -71,6 +71,11 @@ block = block.replace('"/apps-registry/backup-schedule.json"',
 block = block.replace('"/apps-registry/backup-pulls"',
                       repr(os.path.join(REG, "backup-pulls")))
 ns["_ago"] = lambda s: f"{int(s // 60)} Minuten" if s >= 90 else f"{int(s)} Sekunden"
+# Seit RFC-0029 D1 fragt backup_state, ob der Aufrufer den Zeitplan
+# aendern darf. Diese Datei prueft nur die ANZEIGE, also antwortet hier
+# "darf nicht" -- die Formularseite hat ihre eigene Datei
+# (test_backup_schedule.py).
+ns["caller_roles"] = lambda: {"partner"}
 exec(compile(block, "portal-backup-block", "exec"), ns)  # noqa: S102
 backup_state = ns["backup_state"]
 

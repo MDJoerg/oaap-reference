@@ -679,6 +679,8 @@ KEY_SHOWN_BODY = """
 
 HEALTH_BODY = """
 <h1>Gesundheit</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
 <div class="card">
   <h2>Knoten</h2>
   <table>
@@ -856,10 +858,42 @@ HEALTH_BODY = """
      Zeitgeber meldet keinen nächsten Lauf; bitte nachsehen</span>{% endif %}</p>
   <p class="muted">Ziel <code>{{ bk.schedule.target }}</code>, die
      {{ bk.schedule.keep }} neuesten Archive bleiben hier liegen.</p>
+  {% elif bk.off %}
+  <p><span class="dot warn"></span><strong>Zeitplan ist ausgeschaltet</strong>
+     <span class="muted">— es läuft nichts von allein.</span></p>
   {% else %}
   <p><span class="dot unknown"></span><span class="muted">Kein Zeitplan
      eingerichtet — es läuft nichts von allein. Eingerichtet wird er an der
      Maschine mit <code>sudo bash ops/install-backup-timer.sh</code>.</span></p>
+  {% endif %}
+
+  {% if bk.can_edit %}
+  <form method="post" action="/backup/schedule" style="margin-top:1rem">
+    <label>Uhrzeit (24 h)
+      <input type="text" name="at" value="{{ bk.at }}" pattern="[0-2][0-9]:[0-5][0-9]"
+             placeholder="03:30" style="max-width:8rem"></label>
+    <p class="muted"><strong>Zu dieser Uhrzeit stehen alle Apps dieses
+       Knotens still.</strong>
+       {% if bk.downtime %}Beim letzten Lauf <em>auf dieser Maschine</em>
+       waren das <strong>{{ bk.downtime }}</strong>{% if bk.instances %} für
+       {{ bk.instances }} Instanz(en){% endif %} — mit wachsenden Daten wird
+       es mehr.{% else %}Wie lange, weiß dieser Knoten noch nicht: Er hat
+       noch nie gesichert. Die Zahl steht nach dem ersten Lauf hier, und nur
+       seine eigene zählt.{% endif %}</p>
+    <label>Archive, die auf diesem Knoten liegen bleiben
+      <input type="number" name="keep" value="{{ bk.keep }}" min="1" max="30"
+             style="max-width:6rem"></label>
+    <p class="muted">Nicht null: Ein Archiv, das sofort nach der Übertragung
+       verschwindet, lässt bei einer stillen Beschädigung der Kopie nichts
+       übrig.</p>
+    <button>Zeitplan speichern</button>
+    <button name="op" value="{{ 'on' if bk.off else 'off' }}" class="secondary"
+            >{{ 'Wieder einschalten' if bk.off else 'Ausschalten' }}</button>
+  </form>
+  <p class="muted"><strong>Nicht einstellbar, und das mit Absicht:</strong>
+     wohin gesichert wird. Ein Archiv enthält jedes Geheimnis dieser
+     Maschine — wo es landet, wird an der Maschine entschieden, nicht in
+     einem Formular im Netz.</p>
   {% endif %}
 
   {% if bk.pulls %}
@@ -3635,7 +3669,46 @@ def health():
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
                 core=core, apps=apps, ext=external_access(),
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
-                deploys=recent_deploys(), bk=backup_state())
+                deploys=recent_deploys(), bk=backup_state(),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+BACKUP_SCHEDULE_WAIT = 30
+
+
+@app.post("/backup/schedule")
+def backup_schedule_post():
+    """Change the nightly schedule (RFC-0029 D1).
+
+    `server_admin` only: this stops EVERY app on the node at the chosen
+    hour, including the apps of tenants who did not choose it. The host
+    re-checks it anyway -- this only decides whether the form is even
+    offered a chance.
+
+    The target directory is deliberately not a field. An archive holds
+    every secret on this machine; where it is written is decided at the
+    machine.
+    """
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: den Sicherungs-Zeitplan zu ändern "
+                "erfordert die Rolle server_admin."), 403
+    op = request.form.get("op", "set")
+    payload = {"action": "backup-schedule", "op": op}
+    if op == "set":
+        payload["at"] = request.form.get("at", "").strip()
+        keep = request.form.get("keep", "").strip()
+        if keep:
+            try:
+                payload["keep"] = int(keep)
+            except ValueError:
+                return redirect("/health?err=" + quote(
+                    "Anzahl der Archive: bitte eine Zahl."), code=303)
+    res = _queue_and_wait("", payload, BACKUP_SCHEDULE_WAIT)
+    if res is None:
+        return redirect("/health?err=" + quote(
+            "Die Änderung läuft noch — bitte gleich neu laden."), code=303)
+    key = "msg" if res.get("ok") else "err"
+    return redirect(f"/health?{key}=" + quote(res.get("message", "")), code=303)
 
 
 # --------------------------------------------- fleet status (RFC-0021)
@@ -3970,7 +4043,22 @@ def backup_state():
     last = _read_json(BACKUP_LAST) or {}
     sched = _read_json(BACKUP_SCHEDULE) or {}
     out = {"running": None, "last": None, "schedule": None, "pulls": [],
-           "elsewhere": bool(sched)}
+           "elsewhere": bool(sched),
+           # RFC-0029 D1. The form appears only where there is a timer to
+           # change: setting one up decides WHERE a copy of every secret
+           # on this machine is written, and that stays a decision made
+           # at the machine.
+           "can_edit": bool(sched) and "server_admin" in caller_roles(),
+           "at": sched.get("at", ""),
+           "keep": sched.get("keep", 2),
+           "off": bool(sched) and not sched.get("enabled"),
+           # The sentence the schedule form owes its operator, and it
+           # must carry THIS node's measured number -- never a general
+           # one, which is always somebody else's machine (RFC-0029 D1,
+           # Jörg's condition when he chose the fuller variant).
+           "downtime": _secs_h(last.get("downtime_seconds"))
+                       if last.get("downtime_seconds") is not None else "",
+           "instances": last.get("instances")}
 
     if last.get("state") == "running":
         started = last.get("started", "")
