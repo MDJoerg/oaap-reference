@@ -64,6 +64,32 @@ sudo bash ops/install-backup-pull.sh --node oaapx01 --host oaap.joomp.de \
      --user oaap-admin --key ~/.ssh/oaap_backup_pull --to /mnt/backup
 ```
 
+## Wer holt wen — und wer holt den Abholer
+
+```text
+  oaapx01  ──ssh──►  oaap-demo ──►  /mnt/backup/oaapx01/{daily,weekly,monthly}
+  oaap-test ─ssh──►  oaap-demo ──►  /mnt/backup/oaap-test/…
+  oaap-demo ──────►  sich selbst ►  /mnt/backup/oaap-demo/…     (--local)
+```
+
+**Der Abholer hatte lange niemanden, der ihn abholt** — und auf ihm
+laufen Forgejo mit 28 Repos, der Store-Editor und FleetView. Er braucht
+dafür aber keinen zweiten Knoten: Die Synology hängt ohnehin an ihm.
+`--local` ersetzt genau die drei Dinge, die das Skript von der Quelle
+will (auflisten, Prüfsumme lesen, holen); alles danach — Prüfsumme,
+Generationen, Aufbewahrung, `status.json` — ist derselbe Weg.
+
+**Was dabei fehlt, gehört ausgesprochen:** In diesem einen Fall gibt es
+keine zweite Maschine im Weg. Die Auslagerung ist nur so getrennt wie
+die Freigabe, auf die geschrieben wird — wer `oaap-demo` übernimmt,
+erreicht `/mnt/backup`. Für die beiden anderen Knoten gilt das nicht:
+Deren Archive liegen dort, ohne dass sie selbst dorthin kämen.
+
+```sh
+sudo bash ops/install-backup-timer.sh --at 02:30 --keep 2
+sudo bash ops/install-backup-pull.sh --local --node oaap-demo --to /mnt/backup --at 03:15
+```
+
 ## Was der Lauf kostet
 
 Die App-Container stehen **nur für das Kopieren** still; komprimiert
@@ -73,6 +99,7 @@ wird danach, mit laufenden Apps (RFC-0029 D3). Gemessen am 05.09.2026:
 | ------ | ----- | -------------- | ------------- | ---------- |
 | oaapx01 | 8,0 GB | 487 s | **32 s** | 245 s |
 | oaap-test | 899 MB | 127 s | **14 s** | 82 s |
+| oaap-demo | 844 MB | — | **21 s** | 47 s |
 
 Der Preis: Die Daten liegen für die Dauer des Komprimierens doppelt da.
 Der Befehl prüft das vorher und lehnt laut ab, statt es nachts als

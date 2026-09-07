@@ -126,11 +126,18 @@ echo "  when:   every day at $AT, missed runs are caught up"
 echo "  target: $TO/$NODE/{daily,weekly,monthly}  (keep $DAILY/$WEEKLY/$MONTHLY)"
 echo "  state:  $TO/$NODE/status.json, transcript /var/log/oaap-backup-pull.log"
 echo ""
-echo "On $NODE, this key should be able to do nothing else. Install"
-echo "ops/backup-serve.sh there as /usr/local/bin/oaap-backup-serve and"
-echo "put the public key in ~/.ssh/authorized_keys as:"
-echo ""
-echo "  command=\"/usr/local/bin/oaap-backup-serve\",restrict ssh-ed25519 AAAA... backup-pull@$(hostname)"
+if [ "$LOCAL" -eq 1 ]; then
+  echo "No key and no forced command here: there is no second machine in"
+  echo "this path. Note what that means -- this node's off-site copy is"
+  echo "only as separate as the share it writes to. Whoever takes over"
+  echo "this machine can reach $TO."
+else
+  echo "On $NODE, this key should be able to do nothing else. Install"
+  echo "ops/backup-serve.sh there as /usr/local/bin/oaap-backup-serve and"
+  echo "put the public key in ~/.ssh/authorized_keys as:"
+  echo ""
+  echo "  command=\"/usr/local/bin/oaap-backup-serve\",restrict ssh-ed25519 AAAA... backup-pull@$(hostname)"
+fi
 echo ""
 systemctl list-timers "oaap-backup-pull@$NODE.timer" --no-pager || true
 echo ""
