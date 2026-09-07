@@ -2806,6 +2806,7 @@ def config_entries(name, inst):
             "label": c.get("label") or key,
             "secret": bool(c.get("secret")),
             "multiline": bool(c.get("multiline")),
+            "generate": c.get("generate", ""),
             "default": c.get("default", ""),
             "value": env.get(key, ""),
         })
@@ -3445,6 +3446,13 @@ def _install_from_dir(pkg, args, source):
         "config": [{"key": c["key"], "label": c.get("label", ""),
                     "secret": bool(c.get("secret")),
                     "multiline": bool(c.get("multiline")),
+                    # spec 2.8: only a key whose value THIS app defines
+                    # may ask the portal to produce it. Anything else is
+                    # recorded as "no" -- a value we generate into a
+                    # field meant for somebody else's credential is not
+                    # a convenience, it is a wrong answer.
+                    "generate": ("token" if c.get("generate") == "token"
+                                 else ""),
                     "default": c.get("default", "")}
                    for c in (m.get("config") or [])
                    if c["key"] not in RESERVED_ENV],

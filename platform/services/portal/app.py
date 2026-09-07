@@ -2056,16 +2056,29 @@ INSTANCE_EDIT_BODY = """
       <textarea name="cfg-{{ c.key }}" rows="4" spellcheck="false"
                 style="width:100%;font-family:ui-monospace,monospace;font-size:.9rem"
                 placeholder="{{ ('gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt') if c.secret else 'eine Angabe je Zeile' }}">{{ c.value }}</textarea>
-      {% elif c.secret %}
+      {% elif c.secret and not c.fresh %}
       <input type="password" name="cfg-{{ c.key }}" value="" autocomplete="new-password"
              placeholder="{{ 'gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt' }}">
       {% else %}
-      <input type="text" name="cfg-{{ c.key }}" value="{{ c.value }}">
+      {# Ein frisch erzeugter Wert steht LESBAR da: ein Geheimnis, das
+         direkt in schreibgeschuetzten Speicher wandert, ist fuer den
+         verloren, der es der Gegenseite geben muss. #}
+      <input type="text" name="cfg-{{ c.key }}" value="{{ c.value }}"
+             autocomplete="off" spellcheck="false"
+             {% if c.fresh %}style="font-family:ui-monospace,monospace"{% endif %}>
       {% endif %}
     </label>
+    {% if c.generate %}
+    <p><button name="generate" value="{{ c.key }}" class="secondary"
+       >Wert erzeugen</button>
+       {% if c.fresh %}<span class="muted"><strong>Jetzt kopieren</strong> —
+       gespeichert ist er noch nicht, und nach dem Speichern wird er
+       <strong>nicht mehr angezeigt</strong>.</span>{% endif %}</p>
+    {% endif %}
     <p class="muted"><code>{{ c.key }}</code>{% if c.multiline %} — eine Angabe
        je Zeile{% endif %}{% if c.secret %} — vertraulich,
-       wird nie angezeigt{% endif %}</p>
+       wird nie angezeigt{% endif %}{% if c.generate %} — diesen Wert
+       bestimmt die App selbst, der Knoten kann ihn erzeugen{% endif %}</p>
     {% endfor %}
     <p class="muted">Diese Werte deklariert die App in ihrem Manifest; andere
        lassen sich hier nicht setzen. Beim Speichern wird der Container mit
@@ -4668,13 +4681,35 @@ def _instance_env(name):
         return {}
 
 
-def _instance_config(name, inst):
+# What the platform's own storage can carry (spec oaap.apps.runtime 2.8).
+#
+# The alphabet is the whole point. A value typed by a person comes from
+# wherever they got it, and a password generator's output routinely
+# carries ';' (which a list-valued key refuses), '=' or whitespace
+# (which the line-based env file cannot hold safely). 32 bytes of
+# randomness in url-safe base64 has none of those: it is safe in an env
+# file, in a ';'-list, in a URL and on a command line.
+GENERATED_BYTES = 32
+
+
+def generated_value():
+    return secrets.token_urlsafe(GENERATED_BYTES)
+
+
+def _instance_config(name, inst, fresh=None, typed=None):
     """Declared config keys with their current values (spec 2.4.3).
 
     Mirrors appctl.config_entries: instances installed before config
     recording fall back to the keys in instance.env and are treated as
     secret, so an unclassified value is never rendered into a page.
+
+    `fresh` is (key, value) for a value the node has just produced. That
+    ONE key is rendered readable, because a generated secret nobody can
+    read is lost to whoever has to hand it to the other side; every
+    other secret stays write-only. `typed` keeps the operator's other
+    entries across the round trip.
     """
+    fresh_key, fresh_value = fresh or ("", "")
     env = _instance_env(name)
     declared = inst.get("config")
     if declared is None:
@@ -4688,13 +4723,21 @@ def _instance_config(name, inst):
         secret = bool(c.get("secret"))
         multiline = bool(c.get("multiline"))
         stored = env.get(key, "")
+        shown = ("" if secret else
+                 (iv.value_to_lines(stored) if multiline else stored))
+        if typed is not None and key in typed and key != fresh_key:
+            shown = typed[key]
         rows.append({
             "key": key, "label": c.get("label") or key, "secret": secret,
             "multiline": multiline,
+            # Only where the app said its value is its own to define
+            # (spec 2.8) -- never on a field holding somebody else's
+            # credential, where a generated value is a wrong answer.
+            "generate": c.get("generate") == "token",
+            "fresh": key == fresh_key,
             "is_set": bool(env.get(key)),
             # a secret value never leaves the server, not even prefilled
-            "value": "" if secret else
-                     (iv.value_to_lines(stored) if multiline else stored),
+            "value": fresh_value if key == fresh_key else shown,
         })
     return rows
 
@@ -5022,6 +5065,18 @@ def instance_detail(name):
     inst = load_instances().get(name)
     if not inst:
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    return _instance_page(name, inst)
+
+
+def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
+    """The instance object page.
+
+    `fresh` is (key, value) for a config value the node has just
+    produced (spec oaap.apps.runtime 2.8): it is rendered READABLE and
+    is not stored -- only saving the form stores it. `typed` carries the
+    other fields the operator had already filled in, so producing one
+    value does not throw away the rest of their work.
+    """
     groups = _instance_groups(inst)
     address = inst.get("address", "")
     auto = instance_auto_host(name, inst)
@@ -5049,7 +5104,7 @@ def instance_detail(name):
          "storage": inst.get("storage") or [],
          "services": inst.get("services") or [],
          "groups": groups, "roles": inst.get("roles") or [],
-         "config": _instance_config(name, inst),
+         "config": _instance_config(name, inst, fresh, typed),
          "is_test": inst.get("channel") == "test",
          "token_created": _token_created(name),
          "artifacts": _artifacts(name, inst),
@@ -5088,7 +5143,8 @@ def instance_detail(name):
                 # safe default while the operator fixes another field.
                 purge_wanted=bool(request.args.get("purge")),
                 rename_wanted=request.args.get("new", ""),
-                msg=request.args.get("msg"), error=request.args.get("err"))
+                msg=msg if msg is not None else request.args.get("msg"),
+                error=error if error is not None else request.args.get("err"))
 
 
 def _endpoint_view(inst):
@@ -5675,8 +5731,31 @@ def instance_config(name):
     inst = load_instances().get(name)
     if not inst:
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    rows = _instance_config(name, inst)
+    # "Wert erzeugen" (spec oaap.apps.runtime 2.8). A plain submit
+    # button, deliberately: this page carries no JavaScript, and the
+    # value must not travel in a URL, where the gateway's access log and
+    # the browser's history would both keep it.
+    #
+    # ERZEUGEN IST NICHT SPEICHERN. Nothing is written here, no audit
+    # entry is made, and an abandoned page leaves no trace. What the
+    # operator had already typed into the OTHER fields comes back with
+    # the page, so producing one value does not cost them the rest.
+    wanted = (request.form.get("generate") or "").strip()
+    if wanted:
+        row = next((c for c in rows if c["key"] == wanted), None)
+        if not row or not row["generate"]:
+            return _inst_back(name, err="Für diesen Wert kann der Knoten "
+                                        "nichts erzeugen — er gehört einem "
+                                        "anderen System.")
+        typed = {c["key"]: request.form.get(f"cfg-{c['key']}", "")
+                 for c in rows if request.form.get(f"cfg-{c['key']}") is not None}
+        return _instance_page(name, inst, fresh=(wanted, generated_value()),
+                              typed=typed,
+                              msg=f"Ein Wert für {row['label']} ist erzeugt — "
+                                  "gespeichert wird er erst mit „Speichern\".")
     values = {}
-    for c in _instance_config(name, inst):
+    for c in rows:
         submitted = request.form.get(f"cfg-{c['key']}")
         if submitted is None:
             continue
