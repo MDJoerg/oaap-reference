@@ -499,6 +499,46 @@ ok("und die Begruendung steht dabei",
 ok("gewoehnliche Instanzen kommen zurueck", "crm" in started, started)
 
 print("")
+print("Ein abgelehntes Paket laesst kein Verzeichnis zurueck")
+
+# Am laufenden oaap-test gefunden (2026-09-08), waehrend die
+# Generalprobe geprueft wurde: zwei abgelehnte Manifeste hatten
+# `tenants/<tid>/instances/<iid>/artifacts/` liegen lassen -- leer, von
+# nichts referenziert, und nicht mehr zuzuordnen, weil die Kennung
+# absichtlich erst am Ende in die Registry kommt. Aelter als RFC-0030,
+# aber hier entstanden.
+tenant_root = os.path.join(m.tenant_dir(tid), "instances")
+vorher = set(os.listdir(tenant_root))
+bad = os.path.join(DATA, "kaputt.zip")
+import zipfile                                                # noqa: E402
+# Das Manifest muss WEIT GENUG kommen, um den Befund ueberhaupt zu
+# erzeugen: bis hinter `artifact_store()`, das die Kennung praegt und
+# das Verzeichnis anlegt. Ein Manifest ohne `app.version` scheitert
+# vorher und laesst nichts liegen -- die erste Fassung dieser Pruefung
+# bestand deshalb auch OHNE die Korrektur, und genau das ist der Fehler,
+# den dieses Projekt schon einmal gemacht hat. Das hier ist der echte
+# Fall von oaap-test: gueltig genug zum Ablegen, abgelehnt von
+# validate_manifest, weil `health.path` fehlt.
+with zipfile.ZipFile(bad, "w") as z:
+    z.writestr("oaap-app.yaml", "\n".join([
+        "oaap_manifest: '0.2'",
+        "app: {id: neuling, name: Neuling, version: 1.0.0, type: image}",
+        "services: {web: {image: nginx:alpine, port: 80}}",
+        "routes: [{path: /, roles: [admin]}]",
+        ""]))
+try:
+    with contextlib.redirect_stdout(_io.StringIO()):
+        m.install_artifact("neuling", bad, None, channel="test",
+                           permit={"tenant": tid, "name": "neuling"})
+    boom = ""
+except BaseException as e:                                    # noqa: BLE001
+    boom = str(e) or e.__class__.__name__
+ok("das kaputte Paket wird abgelehnt", bool(boom), boom)
+ok("und hinterlaesst kein Verzeichnis",
+   set(os.listdir(tenant_root)) == vorher,
+   sorted(set(os.listdir(tenant_root)) - vorher))
+
+print("")
 print("Und die Faehigkeit ist auch aufrufbar")
 
 # 0.1.78: 'backup schedule' stand im Code und fehlte in den choices des

@@ -5496,6 +5496,23 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                 os.remove(os.path.join(artifact_dir(name, ident), stored))
             except OSError:
                 pass
+            # ... and the directory the identity was minted for, when
+            # the instance never came into being. Found on oaap-test
+            # 2026-09-08: two rejected manifests left
+            # `tenants/<tid>/instances/<iid>/artifacts/` behind, empty
+            # and referenced by nothing -- the identity is deliberately
+            # not persisted until the install finishes, so the next
+            # attempt mints a new one and the old directory is litter
+            # that nobody can ever attribute. `rmdir` is the guard: it
+            # refuses on anything that is not empty, so a redeploy that
+            # failed keeps every byte it had.
+            if _existing is None:
+                for d in (os.path.join(instance_dir(name, ident), "artifacts"),
+                          instance_dir(name, ident)):
+                    try:
+                        os.rmdir(d)
+                    except OSError:
+                        break
             raise
         artifact_prune(name, inst=ident)
         return version, sha
