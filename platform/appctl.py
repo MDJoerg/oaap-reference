@@ -11,6 +11,8 @@ Host-side app manager invoked via `oaap app ...`:
     oaap app config list|set|unset <name> [key] [value]   (spec 2.3/2.4)
     oaap app address show|set|remove <name> [hostname]    (RFC-0009)
     oaap app throttle show|set|off <name> [reqs/seconds]  (RFC-0010)
+    oaap app rehearse <prod> --name <new> [--code-from T]  (RFC-0030)
+    oaap app rehearsal list|extend|sweep [<name>]          (RFC-0030)
 
 Node-level, not per app:
 
@@ -1547,7 +1549,8 @@ def cmd_migrate_tenant_routes(_args):
                                (inst.get("visibility") or {}).get("groups"),
                                name, throttle_of(inst),
                                services=route_targets(inst),
-                               tenant=instance_tenant_ref(inst)))
+                               tenant=instance_tenant_ref(inst),
+                               login_only=is_rehearsal(inst)))
     refresh_generated_sites()
     reload_gateway()
     print(f"  {len(stale)} instance site(s) rewritten.")
@@ -2071,8 +2074,96 @@ def _throttle_block(scope, throttle, edge):
 _AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
 
 
+# ------------------------------------------------- rehearsals (RFC-0030)
+#
+# A rehearsal instance carries the CODE of a test instance and a COPY of
+# a production instance's data (spec 2.15). It is an ordinary instance
+# on the production channel; the `rehearsal` block is the only thing
+# that makes it one, and its presence is what every refusal below asks
+# about.
+#
+# Default lifetime and the step every extension moves it by (D4). Seven
+# days is long enough to look at a migration and short enough that a
+# forgotten copy of live customer data does not become the weakest point
+# on the node.
+REHEARSAL_DAYS = 7
+REHEARSAL_STEP = 7
+
+
+def is_rehearsal(inst):
+    """Is this instance a rehearsal? One reader for one question."""
+    return bool((inst or {}).get("rehearsal"))
+
+
+# Which registry keys are rehearsals, cached against the registry file's
+# own mtime and size.
+#
+# Why a cache and not a parameter everywhere: the `public` refusal
+# (2.15.2) has to hold at EVERY place a gateway site is written, and
+# there are nine of them. A parameter threaded through nine call sites
+# fails SILENTLY at the one that was forgotten -- and it fails towards
+# "serve this route without a login on a copy of production data". So
+# site_body() asks this instead, from the instance scope it already
+# receives, and a caller that knows better (an install, where the
+# registry entry does not exist yet) says so explicitly.
+_REHEARSAL_CACHE = {"stamp": None, "keys": frozenset()}
+
+
+def rehearsal_keys():
+    try:
+        st = os.stat(REGISTRY)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return frozenset()
+    if _REHEARSAL_CACHE["stamp"] != stamp:
+        try:
+            with open(REGISTRY, encoding="utf-8") as f:
+                reg = json.load(f)
+        except (OSError, ValueError):
+            return _REHEARSAL_CACHE["keys"]
+        _REHEARSAL_CACHE["keys"] = frozenset(
+            k for k, i in (reg.get("instances") or {}).items() if is_rehearsal(i))
+        _REHEARSAL_CACHE["stamp"] = stamp
+    return _REHEARSAL_CACHE["keys"]
+
+
+def rehearsal_refusal(reg, name, what):
+    """The refusal a rehearsal owes for an outward-facing change, or "".
+
+    One sentence, and it names WHY -- an operator who meets it is doing
+    something reasonable on the wrong instance, and needs to be told
+    which instance that is rather than that the command is unavailable.
+    """
+    if not is_rehearsal((reg.get("instances") or {}).get(name)):
+        return ""
+    return (f"'{name}' is a rehearsal (RFC-0030) — {what} is not carried "
+            f"over and cannot be added. A rehearsal holds a copy of "
+            f"production data and reaches nothing outward; it is reachable "
+            f"through the portal and this node's automatic name, and it "
+            f"disappears on its own. Do this on the production instance "
+            f"instead.")
+
+
+def rehearsal_days_left(inst, now=None):
+    """Whole days until this rehearsal expires; negative once it has.
+
+    None for anything that is not a rehearsal, and None when the record
+    carries no readable date -- a page that has to say "expired" must
+    not say it because it failed to parse a string.
+    """
+    import datetime
+    stamp = ((inst or {}).get("rehearsal") or {}).get("expires") or ""
+    try:
+        when = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return (when - now).days if when >= now else -((now - when).days + 1)
+
+
 def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
-              edge="", services=None, tenant=""):
+              edge="", services=None, tenant="", login_only=None):
     """Shared handler block for one app instance (LAN and external sites).
 
     /auth/* is reserved on every entry point, not only the portal apex
@@ -2107,7 +2198,22 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     (container, port); each route is proxied to the container of its
     declared `service`. None (single service) proxies every route to the
     given container:svc_port, exactly as before.
+
+    login_only: a rehearsal serves NO public route (spec 2.15.2) — every
+    route asks identity, including one the manifest declares `public`.
+    Enforced HERE, where the site is written, and never by rewriting the
+    stored routes: a manifest copy that no longer says what the manifest
+    says is a second, untrue record of the app.
+
+    Left to None it is looked up from `scope`, which every caller
+    already passes. That is deliberate: a caller who forgets then still
+    gets the safe answer, instead of the one call site nobody updated
+    serving a public route off a copy of production data. Pass it
+    explicitly where the registry cannot answer yet — the install that
+    creates the instance.
     """
+    if login_only is None:
+        login_only = bool(scope) and scope in rehearsal_keys()
     lines = []
     lines.append("\thandle /auth/* {")
     lines.append("\t\trequest_header -X-OAAP-User")
@@ -2120,7 +2226,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
         matcher = "" if r["path"] == "/" else f" {r['path']}*"
         lines.append(f"\thandle{matcher} {{")
         roles = [x for x in r["roles"] if x != "public"]
-        if roles or "public" not in r["roles"]:
+        if roles or "public" not in r["roles"] or login_only:
             # No explicit strip here: Caddy's directive order runs
             # request_header AFTER forward_auth, which would wipe the
             # verified headers again. forward_auth's copy_headers
@@ -2162,7 +2268,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
 
 
 def caddy_site(port, routes, container, svc_port, groups=None, scope="",
-               throttle=None, services=None, tenant=""):
+               throttle=None, services=None, tenant="", login_only=None):
     """Generate a LAN gateway listener for one app instance.
 
     The throttle scope is the instance name on every entry point, so a
@@ -2171,9 +2277,31 @@ def caddy_site(port, routes, container, svc_port, groups=None, scope="",
     """
     lines = ([f":{port} {{"]
              + site_body(routes, container, svc_port, groups, scope, throttle,
-                         services=services, tenant=tenant)
+                         services=services, tenant=tenant,
+                         login_only=login_only)
              + ["}"])
     return "\n".join(lines) + "\n"
+
+
+def write_app_caddy(name, inst):
+    """(Re)write the LAN gateway site of one instance, from its record.
+
+    Seven places used to spell this out, each repeating the same six
+    arguments; a rule that has to hold on all of them -- a rehearsal
+    serves no public route (2.15.2) -- would have had to be added seven
+    times, and the one that was missed would have failed silently and in
+    the unsafe direction. One reader now, and every caller says WHICH
+    instance instead of HOW to describe it.
+    """
+    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w",
+              encoding="utf-8") as f:
+        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
+                           inst["svc_port"],
+                           (inst.get("visibility") or {}).get("groups"), name,
+                           throttle_of(inst), services=route_targets(inst),
+                           tenant=instance_tenant_ref(inst),
+                           login_only=is_rehearsal(inst)))
+
 
 
 # --- registered external hostname (RFC-0005 level 3, hardening) -----------
@@ -2311,7 +2439,8 @@ def write_external_caddy():
             lines += site_body(routes, inst["container"], inst["svc_port"],
                                groups, name, throttle_of(inst), edge,
                                services=route_targets(inst),
-                               tenant=instance_tenant_ref(inst))
+                               tenant=instance_tenant_ref(inst),
+                               login_only=is_rehearsal(inst))
             lines.append("}")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -2365,7 +2494,8 @@ def write_instance_address_caddy():
                                (inst.get("visibility") or {}).get("groups"),
                                name, throttle_of(inst), edge,
                                services=route_targets(inst),
-                               tenant=instance_tenant_ref(inst))
+                               tenant=instance_tenant_ref(inst),
+                               login_only=is_rehearsal(inst))
             lines.append("}")
             if not edge:
                 lines.append(f"http://{host} {{")
@@ -2943,12 +3073,7 @@ def cmd_throttle(args):
               "floods, not a substitute for the app's own key lockout "
               "(RFC-0010).")
     save_registry(reg)
-    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
-                           inst["svc_port"],
-                           (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst), services=route_targets(inst),
-                           tenant=instance_tenant_ref(inst)))
+    write_app_caddy(name, inst)
     refresh_generated_sites()
     reload_gateway()
 
@@ -3022,6 +3147,14 @@ def cmd_address(args):
         die(f"no instance named '{name}'")
     ext_host, edge = load_external_conf()
     aliases = list(inst.get("aliases") or [])
+    # A rehearsal gets no name of its own (spec 2.15.2). Refused for the
+    # WRITING actions only: `show` on a rehearsal is a fair question,
+    # and its answer -- the automatic node address and nothing else --
+    # is exactly what the rule says.
+    if args.action in ("set", "alias-add"):
+        refusal = rehearsal_refusal(reg, name, "an address of its own")
+        if refusal:
+            die(refusal)
 
     if args.action == "show":
         addr = inst.get("address")
@@ -3295,6 +3428,23 @@ def _install_from_dir(pkg, args, source):
     if inst and inst["channel"] == "production" and inst["version"] == app["version"]:
         die(f"production instance '{name}' already runs version {app['version']} — bump the version (spec: redeploy semantics)")
 
+    # A rehearsal is NOT redeployable (spec 2.15.1, RFC-0030 D2). Wrong
+    # package means delete it and build another: it takes as long as the
+    # copy did, and it is honest. A rehearsal that was patched until it
+    # worked is no longer a rehearsal of anything -- and the thing it
+    # would have been patched on is a copy of live customer data.
+    if inst and is_rehearsal(inst) and not getattr(args, "rehearsal", None):
+        die(f"'{name}' is a rehearsal (RFC-0030) and cannot be redeployed. "
+            f"Delete it ('oaap app remove {name} --purge') and build a new "
+            f"one from the test instance that has the package you want.")
+
+    # The two recorded facts that make an instance a rehearsal (2.15.1).
+    # Handed in by `oaap app rehearse` when it creates one, and kept from
+    # the existing record otherwise -- a rehearsal must not lose what it
+    # is, least of all its expiry date.
+    rehearsal = (getattr(args, "rehearsal", None)
+                 or ((inst or {}).get("rehearsal") if inst else None))
+
     # RFC-0016: an app may have several services, each its own container.
     # The PRIMARY service is the one serving "/" (or the first route, or
     # the first service) — it carries the health check and the flat
@@ -3356,6 +3506,19 @@ def _install_from_dir(pkg, args, source):
     # values win over manifest defaults: a redeploy must not undo what
     # the operator configured ('oaap app config').
     env = load_env(name, ident)
+    # A rehearsal carries no secret (spec 2.15.2), and the rule is asked
+    # HERE as well as before the copy -- because here it is asked against
+    # the manifest that is actually being installed. The pre-copy scrub
+    # only knows what the PRODUCTION instance declared secret, and a key
+    # the new version has just started calling secret would otherwise
+    # come up filled. `OAAP_APP_SECRET` is deliberately not touched here:
+    # the creation removed it, the setdefault below mints a fresh one,
+    # and rotating it on any later install would silently make the
+    # instance's own stored data unreadable.
+    if rehearsal:
+        for c in m.get("config") or []:
+            if c.get("secret"):
+                env.pop(c["key"], None)
     env.setdefault("OAAP_APP_SECRET", secrets.token_hex(32))
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
@@ -3383,7 +3546,11 @@ def _install_from_dir(pkg, args, source):
                            services=(route_targets({"services": services})
                                      if multi else None),
                            tenant=tenant_for_new_instance(
-                               inst, permit={"tenant": chosen_tenant})))
+                               inst, permit={"tenant": chosen_tenant}),
+                           # said explicitly: the registry entry below
+                           # does not exist yet, so site_body cannot look
+                           # this up for a rehearsal being created
+                           login_only=bool(rehearsal)))
     reload_gateway()
 
     reg["instances"][name] = {
@@ -3485,6 +3652,12 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["endpoints"] = inst["endpoints"]
     if inst and inst.get("links"):
         reg["instances"][name]["links"] = inst["links"]
+    # What this instance is a rehearsal OF, and when it goes away
+    # (spec 2.15.1). Written LAST and unconditionally when present, so a
+    # record cannot end up a rehearsal by data and an ordinary instance
+    # by gateway config.
+    if rehearsal:
+        reg["instances"][name]["rehearsal"] = rehearsal
     save_registry(reg)
     if channel == "production":
         # moving to production invalidates any deploy token (spec 2.5)
@@ -3565,6 +3738,16 @@ def remove_instance(reg, name, purge):
     tid = resolve_tenant(inst.get("tenant")) or ""
     local = instance_name(name, inst)
     kept = reg.setdefault("retained", {})
+    # A rehearsal ALWAYS takes its data with it (spec 2.15.4). Keeping it
+    # is the safe default everywhere else -- here it is the opposite: what
+    # would be left behind is a copy of live customer data in a directory
+    # nobody looks at, and the retained record would even hand it to the
+    # next instance of the same name. The expiry deletes for exactly this
+    # reason; a manual removal must not be the way around it.
+    if is_rehearsal(inst) and not purge:
+        purge = True
+        print(f"'{local}' is a rehearsal — its copy of production data is "
+              "deleted with it (RFC-0030 D4).")
     if purge:
         shutil.rmtree(data_dir, ignore_errors=True)
         kept.pop(retained_key(tid, local), None)
@@ -3855,6 +4038,16 @@ def cmd_link(args):
             die(f"no instance named '{who}'")
     if a == b:
         die("an instance cannot link to itself")
+    # Neither end (spec 2.15.2). A rehearsal that still reaches
+    # production B is not a copy, it is a second writer on live data --
+    # and production wired to a rehearsal is wired to something that
+    # deletes itself in a few days. `remove` stays open: taking a link
+    # away is never the dangerous direction.
+    if args.action == "add":
+        for who in (a, b):
+            refusal = rehearsal_refusal(reg, who, "an app-to-app link")
+            if refusal:
+                die(refusal)
     inst = reg["instances"][a]
     links = set(inst.get("links") or [])
 
@@ -4005,11 +4198,7 @@ def cmd_visibility(args):
                 die(f"invalid group tag '{g}' (lowercase [a-z0-9._-], max 40 chars)")
     inst["visibility"] = {"groups": groups} if groups else {}
     save_registry(reg)
-    with open(os.path.join(CADDY_APPS_DIR, f"{args.name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
-                           inst["svc_port"], groups, args.name,
-                           throttle_of(inst), services=route_targets(inst),
-                           tenant=instance_tenant_ref(inst)))
+    write_app_caddy(args.name, inst)
     refresh_generated_sites()
     reload_gateway()
     if groups:
@@ -5215,7 +5404,7 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
 
 
 def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
-                     permit=None):
+                     permit=None, ident=None, rehearsal=None):
     """Phase 3: verify the upload against its grant, then install.
 
     `grant` is positional and mandatory on purpose. It was optional
@@ -5233,8 +5422,12 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
     _existing = _reg["instances"].get(name)
     _tenant = (tenant_for_new_instance(_existing, permit=permit)
                if _existing is None else _existing.get("tenant"))
-    ident = instance_identity(_reg, name, _tenant,
-                              (permit or {}).get("name", "") or name)
+    # A caller may hand the identity in: `oaap app rehearse` has already
+    # laid the copied data down under it, and minting a second one here
+    # would file the package in one directory and start the container on
+    # another (the mistake this whole block exists to prevent).
+    ident = ident or instance_identity(_reg, name, _tenant,
+                                       (permit or {}).get("name", "") or name)
     size = os.path.getsize(zip_path)
     if grant is not None:
         if size != grant.get("bytes"):
@@ -5289,7 +5482,13 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                                 ident=ident, key=name,
                                 name=(permit or {}).get("name", "") or name,
                                 channel=channel, store_source="",
-                                tenant=(permit or {}).get("tenant", ""))
+                                tenant=(permit or {}).get("tenant", ""),
+                                # what makes this instance a rehearsal
+                                # (spec 2.15.1) -- passed through so the
+                                # gateway site is written login-only from
+                                # the first second, not from the second
+                                # write after the record exists
+                                rehearsal=rehearsal)
         try:
             _install_from_dir(pkg, ns, source)
         except BaseException:
@@ -5362,10 +5561,27 @@ def promotion_review(reg, source, target_name):
     src = reg["instances"].get(source)
     if not src:
         raise PromotionRefused(f"no instance named '{source}'")
+    if is_rehearsal(src):
+        # Said in its own words rather than left to the channel check
+        # below, which would answer "not a test instance" and hide the
+        # actual rule (spec 2.15.3).
+        raise PromotionRefused(
+            f"'{source}' is a rehearsal (RFC-0030) — a verdict, not a "
+            "source. What goes live are the bytes of the TEST instance the "
+            "rehearsal took its code from; promote that one.")
     if src.get("channel") != "test":
         raise PromotionRefused(
             f"'{source}' is not a test instance — promotion goes from test "
             "to production, never the other way")
+    # Asked BEFORE the package is looked for: refusing a rehearsal target
+    # needs no bytes, and a node whose retained package is gone would
+    # otherwise answer the wrong question first.
+    _k, _t, _target = promotion_target(reg, source, target_name)
+    if _target is not None and is_rehearsal(_target):
+        raise PromotionRefused(
+            f"'{target_name}' is a rehearsal (RFC-0030) and is not "
+            "redeployable. Promote into the production instance it was "
+            "copied from, or delete the rehearsal and build a new one.")
     stored = (src.get("source") or {})
     if stored.get("kind") != "artifact":
         raise PromotionRefused(
@@ -5494,6 +5710,608 @@ def cmd_promote(args):
     print(f"Promoted {version} to '{key}' (sha {sha[:12]}).")
     print("The previous package is retained — 'oaap app artifact rollback "
           f"{key}' is the way back.")
+
+
+# --- building a rehearsal (RFC-0030 D1) --------------------------------
+# The only genuinely new mechanism in RFC-0030: lift ONE instance's
+# subtree out of a backup archive into a NEW, empty instance, and run
+# the TEST instance's package on it.
+#
+# Deliberately not the restore that RFC-0029 D5 deferred. That one merges
+# a tenant back INTO a running node and has to decide what happens to
+# rows that changed since. Here the target is new and empty: nothing to
+# merge, nothing to overwrite, no conflict to resolve. The hard half is
+# absent, which is the whole reason this can exist today.
+
+
+class RehearsalRefused(Exception):
+    """A refusal a person can act on — same contract as PromotionRefused."""
+
+
+BACKUP_DIR_DEFAULT = "/var/backups/oaap"
+
+
+def backup_archive_dir():
+    """Where this node's archives actually lie.
+
+    Asked in the order of who knows best: the last run wrote one and
+    knows its path; failing that the timer says where it sends them; and
+    only then the built-in default. A node that backs up somewhere else
+    entirely must not be told "no archive" because we looked in the
+    wrong place.
+    """
+    last = (last_backup_run() or {}).get("archive") or ""
+    if last:
+        return os.path.dirname(last)
+    try:
+        with open(BACKUP_SCHEDULE_FILE, encoding="utf-8") as f:
+            target = (json.load(f) or {}).get("target") or ""
+        if target:
+            return target
+    except (OSError, ValueError):
+        pass
+    return BACKUP_DIR_DEFAULT
+
+
+def newest_archive(where=""):
+    """The newest complete archive in `where`, or "".
+
+    `.part.tar` and `.tmp` are skipped by construction: they do not end
+    in `.tar.gz`, which is exactly why `oaap backup create` names them
+    that way. A half-written archive must not be mistakable for one, and
+    least of all by this.
+    """
+    where = where or backup_archive_dir()
+    try:
+        files = [os.path.join(where, f) for f in os.listdir(where)
+                 if f.startswith("oaap-backup-") and f.endswith(".tar.gz")]
+    except OSError:
+        return ""
+    files = [f for f in files if os.path.isfile(f)]
+    return max(files, key=os.path.getmtime) if files else ""
+
+
+def archive_member(reg, key):
+    """Where one instance's data sits INSIDE an archive.
+
+    Derived from `instance_dir`, never spelled out a second time. The
+    archive is written relative to DATA_DIR, so this is that path minus
+    the data directory — and an instance from before RFC-0026 answers
+    `apps/<key>` here for the same reason it does on disk.
+    """
+    inst = (reg.get("instances") or {}).get(key) or {}
+    return os.path.relpath(instance_dir(key, inst), DATA_DIR).replace(os.sep, "/")
+
+
+def archive_holds(archive, member):
+    """Does the archive carry anything under `member`?
+
+    The proof the RFC promises in passing: every rehearsal checks a
+    backup, because a backup that turns out not to contain the instance
+    is found HERE instead of on the night somebody actually needs it.
+    """
+    try:
+        out = subprocess.run(["tar", "-tzf", archive], check=True, text=True,
+                             capture_output=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return any(e.rstrip("/") == member or e.startswith(member + "/")
+               for e in out.splitlines())
+
+
+def archive_age_days(archive):
+    return max(0, int((time.time() - os.path.getmtime(archive)) // 86400))
+
+
+def rehearsal_code_default(local):
+    """The test instance a rehearsal takes its code from, by default.
+
+    The mirror image of `oaap app promote`, which turns `crm-test` into
+    `crm`. Guessing is fine here because it is only the DEFAULT: when
+    the guess is wrong the refusal names it, and `--code-from` is one
+    word away.
+    """
+    return f"{local}-test"
+
+
+def rehearsal_review(reg, source, new_name, code_from="", archive="", days=0):
+    """Everything that must hold before a rehearsal is built.
+
+    A pure check: it reads, it computes, it writes nothing. The CLI
+    calls it to print the plan, the host calls it again before it acts,
+    and both get the same answer -- the same contract as
+    `promotion_review`.
+
+    Returns the plan as a dict: which archive, how old, which package,
+    where the data goes, what it costs in disk space.
+    """
+    src = (reg.get("instances") or {}).get(source)
+    if not src:
+        raise RehearsalRefused(f"no instance named '{source}'")
+    if is_rehearsal(src):
+        raise RehearsalRefused(
+            f"'{source}' is itself a rehearsal. A rehearsal is built from "
+            "the PRODUCTION instance whose data is at stake.")
+    if src.get("channel") != "production":
+        raise RehearsalRefused(
+            f"'{source}' is not a production instance. A rehearsal of test "
+            "data is a test instance, and there already is one (RFC-0030).")
+
+    tenant = resolve_tenant(src.get("tenant"))
+    local_src = instance_name(source, src)
+    new_name = (new_name or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", new_name):
+        raise RehearsalRefused("instance name: lowercase letters, digits and "
+                               "hyphens")
+    key = instance_key(tenant, new_name)
+    found_key, found = find_instance(reg, tenant, new_name)
+    if found is not None or key in (reg.get("instances") or {}):
+        raise RehearsalRefused(f"an instance named '{new_name}' already exists")
+    refusal = retained_data_refusal(key, tenant)
+    if refusal:
+        raise RehearsalRefused(refusal)
+
+    # --- the code -------------------------------------------------------
+    want = code_from or rehearsal_code_default(local_src)
+    code_key, code = find_instance(reg, tenant, want)
+    if code is None:
+        code_key, code = want, (reg.get("instances") or {}).get(want)
+    if code is None:
+        raise RehearsalRefused(
+            f"no test instance '{want}' in this tenant — name it with "
+            f"--code-from. A rehearsal runs the code that is about to go "
+            f"live, and that code lives in a test instance.")
+    if code.get("channel") != "test":
+        raise RehearsalRefused(
+            f"'{code_key}' is not a test instance. The rehearsal runs the "
+            "package that is about to be promoted, which is the one a test "
+            "instance holds.")
+    if code.get("app_id") != src.get("app_id"):
+        raise RehearsalRefused(
+            f"'{code_key}' runs app '{code.get('app_id')}' and '{source}' "
+            f"runs '{src.get('app_id')}' — a rehearsal never turns one app "
+            "into another.")
+    stored = code.get("source") or {}
+    if stored.get("kind") != "artifact":
+        raise RehearsalRefused(
+            f"'{code_key}' does not run from an uploaded package. A rehearsal "
+            "carries the SAME BYTES that promotion would ship, and only a "
+            "retained artifact can prove that (RFC-0020).")
+    pkg = source_package_arg(code_key, stored)
+    if not pkg or not os.path.isfile(pkg):
+        raise RehearsalRefused(
+            f"the retained package of '{code_key}' is gone — deploy it once "
+            "more, then build the rehearsal")
+
+    # --- the data -------------------------------------------------------
+    archive = archive or newest_archive()
+    if not archive:
+        raise RehearsalRefused(
+            "this node has no backup archive. Without a backup there is no "
+            "rehearsal — the data comes from the last archive, and there is "
+            "none. Run 'sudo oaap backup create' first (RFC-0029).")
+    if not os.path.isfile(archive):
+        raise RehearsalRefused(f"no archive at {archive}")
+    member = archive_member(reg, source)
+    if not archive_holds(archive, member):
+        raise RehearsalRefused(
+            f"the archive {os.path.basename(archive)} holds no data for "
+            f"'{source}' ({member} is not in it). That is a finding about the "
+            "BACKUP, not about this command — a rehearsal is also the drill "
+            "that proves it. Take a fresh archive and look at why.")
+
+    need = _dir_kbytes(instance_dir(source, src))
+    free = shutil.disk_usage(DATA_DIR).free // 1024
+    if need and free < need * 12 // 10:
+        raise RehearsalRefused(
+            f"not enough room: '{source}' holds about {need // 1024} MB and a "
+            f"rehearsal is a second copy of it, while {free // 1024} MB is "
+            "free on this node. Free some space first — discovering this at "
+            "90 % full is discovering it too late.")
+
+    days = int(days or REHEARSAL_DAYS)
+    if days < 1 or days > 90:
+        raise RehearsalRefused("a rehearsal lives between 1 and 90 days")
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "source": source, "source_local": local_src, "tenant": tenant,
+        "key": key, "name": new_name,
+        "code_key": code_key, "package": pkg,
+        "package_path": stored.get("path", ""),
+        "version": code.get("version", ""),
+        "archive": archive, "archive_age_days": archive_age_days(archive),
+        "archive_created": datetime.datetime.fromtimestamp(
+            os.path.getmtime(archive),
+            datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "member": member, "kbytes": need, "free_kbytes": free,
+        "days": days,
+        "created": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires": (now + datetime.timedelta(days=days)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _extract_instance_subtree(archive, member, dest):
+    """Lift one instance's subtree out of the archive into `dest`.
+
+    Two things here have cost real money elsewhere and are not
+    negotiable:
+
+    * `--numeric-owner`, because that is how the archive was WRITTEN. An
+      extraction that maps names instead hands the container a mount it
+      can no longer write (contract guarantee 7), and nothing says so
+      until the app fails to start.
+    * `--strip-components`, because the paths in the archive carry the
+      OLD instance's identity. Extracting them as they lie would put the
+      copy where the original's data belongs -- which is the one
+      outcome this whole feature must never produce.
+    """
+    depth = len([p for p in member.split("/") if p])
+    os.makedirs(dest, exist_ok=True)
+    run(["tar", "--numeric-owner", "-xpzf", archive, "-C", dest,
+         f"--strip-components={depth}", member])
+
+
+def _scrub_rehearsal_env(key, ident, secret_keys):
+    """Take the secrets out of the copied `instance.env` (D3, spec 2.15.2).
+
+    AFTER the extraction, never before and never by hoping: the archive
+    carries the instance.env of the production instance, so the
+    credentials arrive on this node whatever anyone intended. They are
+    removed here, before a single container is created.
+
+    `OAAP_APP_SECRET` goes too. The install mints a fresh one, which is
+    the platform's ordinary behaviour and the safer one: an app that
+    encrypted its stored data with the old value finds it unreadable in
+    the rehearsal, and that is a real restore problem found early rather
+    than a rehearsal failing.
+
+    Returns the keys that were actually dropped, so the operator is told
+    what to fill in rather than left to discover it from a crash loop.
+    """
+    env = load_env(key, ident)
+    dropped = sorted(k for k in list(env)
+                     if k == "OAAP_APP_SECRET" or k in secret_keys)
+    for k in dropped:
+        env.pop(k, None)
+    save_env(key, env, ident)
+    return [k for k in dropped if k != "OAAP_APP_SECRET"]
+
+
+def create_rehearsal(plan, who="root", role="root"):
+    """Build the rehearsal described by `plan`. Returns (key, dropped).
+
+    Order matters and is the reverse of convenient: the data is in place
+    and scrubbed BEFORE any container exists. An app that came up on the
+    copied data with the original's credentials -- even for a second --
+    would have been able to act on the world with them.
+    """
+    reg = load_registry()
+    src = reg["instances"][plan["source"]]
+    secret_keys = {c["key"] for c in (src.get("config") or [])
+                   if c.get("secret")}
+    ident = instance_identity(reg, plan["key"], plan["tenant"], plan["name"])
+    dest = instance_dir(plan["key"], ident)
+    if os.path.exists(dest) and os.listdir(dest):
+        raise RehearsalRefused(
+            f"{dest} already holds data — refusing to write a copy of "
+            "production data over it")
+    block = {"of": plan["source"], "code_from": plan["code_key"],
+             "archive": plan["archive"],
+             "archive_created": plan["archive_created"],
+             "created": plan["created"], "expires": plan["expires"],
+             "extensions": 0}
+    try:
+        _extract_instance_subtree(plan["archive"], plan["member"], dest)
+        dropped = _scrub_rehearsal_env(plan["key"], ident, secret_keys)
+        install_artifact(plan["key"], plan["package"], None,
+                         channel="production", path=plan["package_path"],
+                         permit={"tenant": plan["tenant"],
+                                 "name": plan["name"]},
+                         ident=ident, rehearsal=block)
+    except BaseException:
+        # A half-built rehearsal is a copy of live customer data lying on
+        # the node under an instance nobody can see. Whatever went wrong,
+        # that must not be what is left behind.
+        shutil.rmtree(dest, ignore_errors=True)
+        r = load_registry()
+        if plan["key"] in r["instances"]:
+            remove_instance(r, plan["key"], purge=True)
+        raise
+    rehearsal_view_write()
+    audit_tenant("rehearsal.create", plan["tenant"], subject=plan["key"],
+                 who=who, role=role,
+                 detail=(f"copy of '{plan['source']}' from "
+                         f"{os.path.basename(plan['archive'])} "
+                         f"({plan['archive_age_days']} d old), code from "
+                         f"'{plan['code_key']}' {plan['version']}, "
+                         f"expires {plan['expires']}"))
+    return plan["key"], dropped
+
+
+def cmd_rehearse(args):
+    """`oaap app rehearse <production-instance> --name <new> [...]`."""
+    reg = load_registry()
+    try:
+        plan = rehearsal_review(reg, args.name, args.to,
+                                code_from=getattr(args, "code_from", ""),
+                                archive=getattr(args, "from_archive", ""),
+                                days=getattr(args, "days", 0))
+    except RehearsalRefused as e:
+        die(str(e))
+    print(f"Rehearsal '{plan['key']}' — the code of '{plan['code_key']}' "
+          f"({plan['version']}) on a copy of '{plan['source']}'s data.")
+    print(f"  data from  {plan['archive']}")
+    # Said out loud, always. A rehearsal on a two-week-old archive is a
+    # rehearsal on two-week-old data, and whoever reads the result has
+    # to know which data it was.
+    age = plan["archive_age_days"]
+    print(f"             written {plan['archive_created']} — "
+          + ("today" if age == 0 else f"{age} day(s) old"))
+    if age >= 7:
+        print("             NOTE: that is not recent. Anything entered since "
+              "is not in this rehearsal.")
+    print(f"  disk       about {plan['kbytes'] // 1024} MB is copied; "
+          f"{plan['free_kbytes'] // 1024} MB free, "
+          f"{(plan['free_kbytes'] - plan['kbytes']) // 1024} MB after")
+    print(f"  expires    {plan['expires']} ({plan['days']} days) — the "
+          "instance and its data are then deleted")
+    print("  refuses    no own address, no public route, no app links, "
+          "no copied secrets (RFC-0030 D3)")
+    if not getattr(args, "yes", False):
+        die("this creates a second copy of live customer data — repeat with "
+            "--yes when that is what you want")
+    try:
+        key, dropped = create_rehearsal(plan)
+    except (RehearsalRefused, ArtifactRejected) as e:
+        die(str(e))
+    print("")
+    print(f"Rehearsal '{key}' is up.")
+    if dropped:
+        print("These configuration values were NOT copied and are empty — "
+              "fill in what the rehearsal really needs:")
+        for k in dropped:
+            print(f"  {k}")
+        print("An app that will not start without one is saying so on "
+              "purpose (RFC-0030 D3).")
+    print(f"It disappears on {plan['expires']} unless somebody extends it.")
+
+
+# --- what the portal may know about rehearsals (RFC-0030 D5) -----------
+#
+# The portal must NOT read the tenant tree. Every customer's
+# instance.env lives there, and its registry mount is `apps/` for
+# exactly that reason. But the page owes an operator two numbers before
+# it copies live customer data — how big the copy is and what is left
+# afterwards — and both can only be measured where the data is.
+#
+# So the host writes a VIEW beside the registry, the same shape as
+# `apps/artifacts.json` (0.1.76) and `apps/backup-schedule.json`
+# (0.1.79): a file the portal reads, and an action the host checks
+# again for itself, because the spool is data and not trust.
+#
+# It carries `written`, and the page says so. A measurement without a
+# date is a number somebody will still believe next month.
+REHEARSAL_VIEW = os.path.join(APPS_DIR, "rehearsal-options.json")
+
+
+def rehearsal_view_write(reg=None):
+    """Measure what a rehearsal would cost, where the portal can read it."""
+    try:
+        reg = reg if reg is not None else load_registry()
+        instances = {}
+        for name, inst in (reg.get("instances") or {}).items():
+            if inst.get("channel") != "production" or is_rehearsal(inst):
+                continue
+            tenant = resolve_tenant(inst.get("tenant"))
+            code = []
+            for other, oi in sorted((reg.get("instances") or {}).items()):
+                if (oi.get("channel") != "test"
+                        or oi.get("app_id") != inst.get("app_id")
+                        or resolve_tenant(oi.get("tenant")) != tenant):
+                    continue
+                src = oi.get("source") or {}
+                pkg = source_package_arg(other, src) if src.get("kind") == "artifact" else ""
+                code.append({"key": other, "name": instance_name(other, oi),
+                             "version": oi.get("version", "?"),
+                             # Offered but marked: a test instance without
+                             # a retained package cannot prove "the same
+                             # bytes", and saying why beats hiding it and
+                             # letting somebody hunt for the missing entry.
+                             "ready": bool(pkg and os.path.isfile(pkg))})
+            instances[name] = {"kbytes": _dir_kbytes(instance_dir(name, inst)),
+                               "code": code}
+        archives = []
+        where = backup_archive_dir()
+        try:
+            for fn in sorted(os.listdir(where)):
+                if not (fn.startswith("oaap-backup-") and fn.endswith(".tar.gz")):
+                    continue
+                p = os.path.join(where, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                archives.append({"file": fn, "path": p, "bytes": st.st_size,
+                                 "created": _iso(st.st_mtime)})
+        except OSError:
+            pass
+        archives.sort(key=lambda a: a["created"], reverse=True)
+        rec = {"schema": "0.1", "written": _iso_now(),
+               "free_kbytes": shutil.disk_usage(DATA_DIR).free // 1024,
+               "default_days": REHEARSAL_DAYS, "step_days": REHEARSAL_STEP,
+               "archives": archives, "instances": instances}
+        tmp = REHEARSAL_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, indent=2)
+        os.replace(tmp, REHEARSAL_VIEW)
+        # Sizes and file names, no secret -- the same class of fact as
+        # apps/artifacts.json, and the portal reads this mount read-only.
+        os.chmod(REHEARSAL_VIEW, 0o644)
+        return rec
+    except OSError as e:
+        print(f"WARNING: could not write {REHEARSAL_VIEW}: {e}", flush=True)
+        return None
+
+
+# --- the expiry (RFC-0030 D4) ------------------------------------------
+# A copy of production data that expires into a directory nobody looks
+# at is the worst of both worlds: not used, and still everything a
+# customer has. So the expiry deletes, and the deletion is automatic.
+#
+# Which is exactly why the lock below is not decoration. An automatic
+# deletion that can reach an ordinary instance is a foot-gun with a
+# timer, and this one runs every night on a machine nobody is watching.
+
+
+def rehearsals(reg=None):
+    """Every rehearsal on this node, keyed as the registry keys them."""
+    reg = reg if reg is not None else load_registry()
+    return {k: i for k, i in (reg.get("instances") or {}).items()
+            if is_rehearsal(i)}
+
+
+def rehearsal_expired(inst, now=None):
+    """Is this rehearsal's time up?
+
+    False for anything that is not a rehearsal -- the lock, stated once,
+    where the sweep reads it. And False for a rehearsal whose date
+    cannot be read: an unreadable field is a reason to look, never a
+    reason to delete somebody's data.
+    """
+    if not is_rehearsal(inst):
+        return False
+    import datetime
+    stamp = (inst.get("rehearsal") or {}).get("expires") or ""
+    try:
+        due = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return False
+    return due <= (now or datetime.datetime.now(datetime.timezone.utc))
+
+
+def rehearsal_extend(key, days=REHEARSAL_STEP, who="root", role="root"):
+    """Move a rehearsal's date out. Returns the new date.
+
+    Counted and logged, both on purpose: a rehearsal extended six times
+    has stopped being temporary, and the tenant's log is what makes that
+    visible instead of a matter of somebody's memory.
+    """
+    import datetime
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(key)
+    if not inst:
+        raise RehearsalRefused(f"no instance named '{key}'")
+    if not is_rehearsal(inst):
+        raise RehearsalRefused(
+            f"'{key}' is not a rehearsal. An expiry date exists ONLY on a "
+            "rehearsal (RFC-0030 D4) — an automatic deletion that can reach "
+            "an ordinary instance is a trap with a timer.")
+    if days < 1 or days > 90:
+        raise RehearsalRefused("extend by between 1 and 90 days")
+    block = inst["rehearsal"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        due = datetime.datetime.strptime(block.get("expires", ""),
+                                         "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        due = now
+    # From today when it has already lapsed: extending an expired
+    # rehearsal from its old date would hand back something that is
+    # still expired, and the next sweep would delete what somebody just
+    # asked to keep.
+    base = due if due > now else now
+    new = (base + datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    block["expires"] = new
+    block["extensions"] = int(block.get("extensions") or 0) + 1
+    save_registry(reg)
+    audit_tenant("rehearsal.extend", resolve_tenant(inst.get("tenant")),
+                 subject=key, who=who, role=role,
+                 detail=f"+{days} d, now {new}, extension "
+                        f"#{block['extensions']}")
+    return new
+
+
+def rehearsal_sweep(who="root", role="root"):
+    """Remove every rehearsal whose time is up, with its data.
+
+    Returns the list of (key, outcome). Reads the registry once per
+    removal because `remove_instance` writes it -- the same shape the
+    other host-side loops use.
+
+    THE LOCK: `rehearsals()` is the only source of candidates, and
+    `rehearsal_expired()` refuses anything without the block a second
+    time. Two readers of the same rule, deliberately, because this
+    function deletes data unattended.
+    """
+    out = []
+    for key in sorted(rehearsals()):
+        reg = load_registry()
+        inst = (reg.get("instances") or {}).get(key)
+        if not inst or not is_rehearsal(inst) or not rehearsal_expired(inst):
+            continue
+        tid = resolve_tenant(inst.get("tenant"))
+        block = inst.get("rehearsal") or {}
+        try:
+            msg = remove_instance(reg, key, purge=True)
+            result = "ok"
+        except Exception as e:                       # noqa: BLE001
+            msg, result = f"could not remove '{key}': {e}", "failed"
+        audit_tenant("rehearsal.expire", tid, subject=key, result=result,
+                     who=who, role=role,
+                     detail=(f"expired {block.get('expires', '?')}, copy of "
+                             f"'{block.get('of', '?')}', removed with its "
+                             f"data"))
+        out.append((key, msg))
+    if out:
+        rehearsal_view_write()
+    return out
+
+
+def cmd_rehearsal(args):
+    """`oaap app rehearsal list|extend|sweep`."""
+    if args.action == "sweep":
+        done = rehearsal_sweep()
+        if not done:
+            print("No rehearsal has expired.")
+            return
+        for key, msg in done:
+            print(f"{key}: {msg}")
+        return
+
+    if args.action == "extend":
+        if not args.name:
+            die("'oaap app rehearsal extend' needs the rehearsal's name")
+        try:
+            new = rehearsal_extend(args.name, days=args.days)
+        except RehearsalRefused as e:
+            die(str(e))
+        print(f"'{args.name}' now expires {new}.")
+        print("Recorded in the tenant's log — a rehearsal that keeps being "
+              "extended is no longer temporary, and that has to be visible.")
+        return
+
+    found = rehearsals()
+    if not found:
+        print("No rehearsals on this node.")
+        return
+    print("Rehearsals (RFC-0030) — each holds a COPY OF PRODUCTION DATA:")
+    for key, inst in sorted(found.items()):
+        b = inst["rehearsal"]
+        left = rehearsal_days_left(inst)
+        when = ("expired" if left is not None and left < 0
+                else f"{left} day(s) left" if left is not None
+                else "expiry unreadable")
+        print(f"  {key}  ({when}, expires {b.get('expires', '?')})")
+        print(f"      data of '{b.get('of', '?')}' from "
+              f"{os.path.basename(b.get('archive', '') or '?')} "
+              f"(written {b.get('archive_created', '?')})")
+        print(f"      code of '{b.get('code_from', '?')}' "
+              f"{inst.get('version', '?')}"
+              + (f", extended {b['extensions']}x" if b.get("extensions") else ""))
 
 
 def _version_gt(new, old):
@@ -5971,6 +6789,7 @@ def cmd_process_deploys(_args):
             os.remove(p)
     reap_stale_claims(results)
 
+    handled = 0
     for req_file in sorted(os.listdir(queue)):
         req_path = os.path.join(queue, req_file)
         # Claim it FIRST, by moving it out of the queue in one atomic
@@ -6667,11 +7486,7 @@ def cmd_process_deploys(_args):
                 groups = req.get("groups") or []
                 inst["visibility"] = {"groups": groups} if groups else {}
                 save_registry(reg)
-                with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-                    f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
-                                       inst["svc_port"], groups, name,
-                                       throttle_of(inst), services=route_targets(inst),
-                                       tenant=instance_tenant_ref(inst)))
+                write_app_caddy(name, inst)
                 refresh_generated_sites()
                 reload_gateway()
                 ok = True
@@ -6925,14 +7740,7 @@ def cmd_process_deploys(_args):
                     else:
                         inst["throttle"] = value
                     save_registry(reg)
-                    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w",
-                              encoding="utf-8") as f:
-                        f.write(caddy_site(inst["port"], inst["routes"],
-                                           inst["container"], inst["svc_port"],
-                                           (inst.get("visibility") or {}).get("groups"),
-                                           name, throttle_of(inst),
-                                           services=route_targets(inst),
-                                           tenant=instance_tenant_ref(inst)))
+                    write_app_caddy(name, inst)
                     refresh_generated_sites()
                     reload_gateway()
                     t = throttle_of(inst)
@@ -6955,6 +7763,60 @@ def cmd_process_deploys(_args):
                     msg = str(e)
                 except subprocess.CalledProcessError as e:
                     msg = (e.stderr or str(e)).strip().splitlines()[-1]
+        elif action == "rehearse":
+            # Build a rehearsal of THIS production instance (RFC-0030 D5).
+            # The request names the production instance, so the ordinary
+            # cross-tenant check above already covers who may ask -- and
+            # the new instance lands in the PRODUCTION instance's tenant,
+            # never the actor's, so a server_admin building a customer's
+            # rehearsal does not pull their data into their own tenant.
+            #
+            # Every rule is re-checked here, in full, by the same
+            # rehearsal_review() the portal used to draw the form: the
+            # spool is data, not trust, and between showing and clicking
+            # the archive may have rotated away.
+            try:
+                plan = rehearsal_review(
+                    reg, name, str(req.get("to") or ""),
+                    code_from=str(req.get("code_from") or ""),
+                    days=int(req.get("days") or REHEARSAL_DAYS))
+                key, dropped = create_rehearsal(
+                    plan, who=actor or "portal", role=act_role or "-")
+                ok = True
+                msg = (f"rehearsal '{key}' built from "
+                       f"{os.path.basename(plan['archive'])} "
+                       f"({plan['archive_age_days']} d old), expires "
+                       f"{plan['expires']}")
+                if dropped:
+                    msg += ("; these values were NOT copied and are empty: "
+                            + ", ".join(dropped))
+                name = key
+            except (RehearsalRefused, ArtifactRejected, ValueError) as e:
+                msg = str(e)
+            except SystemExit as e:
+                msg = f"install refused: {e}"
+            except Exception as e:  # a failed rehearsal must not kill the worker
+                msg = str(e)
+            if not ok:
+                # One entry per outcome, under the action it belongs to.
+                # create_rehearsal writes the successful one itself --
+                # with the archive in it, which is what D5 asks for and
+                # what only the host knows.
+                audit_tenant("rehearsal.create",
+                             resolve_tenant((inst or {}).get("tenant"))
+                             or ensure_default_tenant(),
+                             subject=str(req.get("to") or ""), result="denied",
+                             who=actor or "portal", role=act_role or "-",
+                             detail=msg)
+        elif action == "rehearsal-extend":
+            try:
+                new_date = rehearsal_extend(
+                    name, days=int(req.get("days") or REHEARSAL_STEP),
+                    who=actor or "portal", role=act_role or "-")
+                ok = True
+                msg = f"rehearsal extended, now expires {new_date}"
+            except (RehearsalRefused, ValueError) as e:
+                msg = str(e)
         elif not inst or name not in tokens:
             msg = "unknown instance or no deploy token"
         elif inst["channel"] != "test":
@@ -6974,7 +7836,8 @@ def cmd_process_deploys(_args):
             ok, msg = run_install(src, "test")
         version = (load_registry()["instances"].get(name) or {}).get("version", "")
         via = {"install": "store", "visibility": "portal",
-               "tile": "portal",
+               "tile": "portal", "rehearse": "portal",
+               "rehearsal-extend": "portal",
                "config": "portal", "token": "portal",
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
@@ -7043,6 +7906,14 @@ def cmd_process_deploys(_args):
         os.remove(req_path)          # the claim: this request is answered
         DEADLINE = None
         print(f"deploy {name}: {'OK' if ok else 'FAILED'} — {msg}")
+        handled += 1
+    if handled:
+        # What a rehearsal would cost, re-measured where the portal can
+        # read it (spec 2.15.3). Here rather than in every branch: an
+        # install, a removal and a config change all move these numbers,
+        # and a view refreshed only by the action that thought of it is
+        # the kind of drift this codebase keeps finding.
+        rehearsal_view_write()
 
 
 # --------------------------------------------- backup & restore (oaap.data.backup)
@@ -7363,6 +8234,17 @@ def cmd_backup(args):
         die(f"not enough room in {out_dir}: about {need // 1024} MB is copied "
             f"there before it is compressed, and {free // 1024} MB is free. "
             "Free some space, or choose another target with --to.")
+    # Said out loud, because it is a real consequence of RFC-0030 and not
+    # a detail: while a rehearsal exists, every archive carries a SECOND
+    # copy of that production instance's data, and carries it for as long
+    # as the archive is kept -- which outlives the rehearsal itself. The
+    # archive stays complete either way; a node that restores one gets
+    # the rehearsal back and the daily sweep removes it if its time is up.
+    _reh = rehearsals(reg)
+    if _reh:
+        print(f"NOTE: {len(_reh)} rehearsal instance(s) on this node "
+              f"({', '.join(sorted(_reh))}) — this archive therefore holds a "
+              "second copy of their production data (RFC-0030).")
     running = run(["docker", "ps", "-q", "--filter", "name=^oaap-app-"]).stdout.split()
     stage = tempfile.mkdtemp(prefix="oaap-backup-")
     # `<name>.part.tar` rather than something ending in .tar.gz: a
@@ -7571,12 +8453,7 @@ def _deploy_from_registry(name, inst):
         if name in r["instances"]:
             r["instances"][name].pop("endpoints", None)
             save_registry(r)
-    with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
-        f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
-                           inst["svc_port"],
-                           (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst), services=route_targets(inst),
-                           tenant=instance_tenant_ref(inst)))
+    write_app_caddy(name, inst)
     print(f"Restored '{name}' ({inst['app_name']} {inst['version']}, "
           f"channel {inst['channel']}, port {inst['port']})")
     # The instance's own public names travel with it (RFC-0009/0018): they
@@ -7649,6 +8526,19 @@ def cmd_restore_instances(_args):
         return
     ok = skipped = 0
     for name, inst in sorted(reg["instances"].items()):
+        if is_rehearsal(inst):
+            # A rehearsal is temporary by construction and it holds a
+            # copy of customer data. Starting one on a machine that has
+            # just been rebuilt would put unreleased code back on that
+            # data at the worst possible moment -- while somebody is
+            # still finding out what else came back. Its record and its
+            # data are here; the daily sweep removes them when its date
+            # passes, and until then it can be started deliberately.
+            print(f"SKIPPED {name}: a rehearsal is not started by a restore "
+                  "(RFC-0030) — it carries a copy of production data and "
+                  "expires on its own.")
+            skipped += 1
+            continue
         if not inst.get("routes") or not inst.get("svc_port"):
             print(f"SKIPPED {name}: registry entry predates route capture — "
                   "reinstall it from its package.")
@@ -7892,6 +8782,10 @@ def main():
                          help="internal: list retained packages where the "
                               "portal can read them (oaap.apps.runtime 2.14)")
     pmx.set_defaults(fn=lambda _a: artifact_index_write())
+    pmv = sub.add_parser("rehearsal-index",
+                         help="internal: measure what a rehearsal would cost, "
+                              "where the portal can read it (spec 2.15)")
+    pmv.set_defaults(fn=lambda _a: rehearsal_view_write())
     pmt = sub.add_parser("migrate-tenants",
                          help="internal: create the default tenant and stamp "
                               "what belongs to it (RFC-0022 stage 2)")
@@ -8021,6 +8915,31 @@ def main():
     pp.add_argument("--confirm", action="store_true",
                     help="accept an envelope widening reported as NOTE")
     pp.set_defaults(fn=cmd_promote)
+    prh = sub.add_parser("rehearse",
+                         help="build a rehearsal: the test instance's code on "
+                              "a copy of production data (RFC-0030)")
+    prh.add_argument("name", help="the PRODUCTION instance whose data is copied")
+    prh.add_argument("--name", dest="to", default="",
+                     help="name of the new rehearsal instance, inside the "
+                          "same tenant")
+    prh.add_argument("--code-from", dest="code_from", default="",
+                     help="test instance whose retained package it runs "
+                          "(default: <instance>-test)")
+    prh.add_argument("--from", dest="from_archive", default="",
+                     help="backup archive to take the data from "
+                          "(default: the newest one on this node)")
+    prh.add_argument("--days", type=int, default=REHEARSAL_DAYS,
+                     help=f"how long it lives (default {REHEARSAL_DAYS})")
+    prh.add_argument("--yes", action="store_true",
+                     help="carry it out after reading what it copies")
+    prh.set_defaults(fn=cmd_rehearse)
+    prs = sub.add_parser("rehearsal",
+                         help="list, extend or end rehearsals (RFC-0030)")
+    prs.add_argument("action", choices=["list", "extend", "sweep"])
+    prs.add_argument("name", nargs="?", help="rehearsal instance")
+    prs.add_argument("--days", type=int, default=REHEARSAL_STEP,
+                     help=f"extend by this many days (default {REHEARSAL_STEP})")
+    prs.set_defaults(fn=cmd_rehearsal)
     pt.set_defaults(fn=cmd_token)
     pf = sub.add_parser("fleet",
                         help="fleet keys: read-only /fleet/status access (RFC-0021)")

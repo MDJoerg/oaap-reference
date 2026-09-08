@@ -303,3 +303,161 @@ def lines_to_value(text):
         return "", (f"Ein Eintrag darf kein '{LIST_SEPARATOR}' enthalten — "
                     f"damit werden die Einträge getrennt. Betroffen: {bad[0]!r}")
     return LIST_SEPARATOR.join(lines), ""
+
+
+# ------------------------------------------------- Generalprobe (RFC-0030)
+#
+# Eine Generalprobe traegt den Code der Testinstanz auf einer **Kopie der
+# Produktivdaten** (Runtime-Spec 2.15). Ein Mensch darf sie nie mit der
+# Produktion verwechseln — deshalb ein eigenes Abzeichen und die
+# Restlaufzeit daneben, in der Liste wie im Objektkopf.
+#
+# Die Rechnung steht hier und nicht im Host, weil sie eine ANZEIGE ist:
+# der Host loescht nach `expires`, das Portal sagt, wie lange es noch
+# hin ist. Beide lesen dasselbe Feld, keiner das Ergebnis des anderen.
+
+def is_rehearsal(inst):
+    return bool((inst or {}).get("rehearsal"))
+
+
+def rehearsal_view(inst, now=None):
+    """Was ueber eine Generalprobe zu sehen sein muss, oder None.
+
+    Gibt Abzeichen-Text, Restlaufzeit in Worten und die beiden Instanzen
+    zurueck, aus denen sie zusammengesetzt ist. Ein unlesbares Datum
+    sagt „unbekannt" statt „abgelaufen": Eine Seite, die faelschlich
+    „abgelaufen" behauptet, laesst jemanden eine Generalprobe wegwerfen,
+    die noch laeuft.
+    """
+    if not is_rehearsal(inst):
+        return None
+    import datetime
+    r = inst["rehearsal"]
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    try:
+        due = datetime.datetime.strptime(r.get("expires", ""),
+                                         "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        due = None
+    if due is None:
+        left, short = "Restlaufzeit unbekannt", "?"
+    elif due <= now:
+        left, short = "abgelaufen — wird beim naechsten Lauf entfernt", "abgelaufen"
+    else:
+        days = (due - now).days
+        hours = int((due - now).total_seconds() // 3600)
+        if days >= 1:
+            left = f"noch {days} Tag{'e' if days != 1 else ''}"
+            short = f"{days} d"
+        else:
+            left = f"noch {hours} Stunde{'n' if hours != 1 else ''}"
+            short = f"{hours} h"
+    return {
+        "badge": "Generalprobe",
+        "left": left,
+        "left_short": short,
+        "expires": (r.get("expires") or "").replace("T", " ").rstrip("Z"),
+        "of": r.get("of", ""),
+        "code_from": r.get("code_from", ""),
+        "archive": r.get("archive", ""),
+        "archive_created": (r.get("archive_created") or "").replace("T", " ").rstrip("Z"),
+        "extensions": int(r.get("extensions") or 0),
+        "expired": bool(due is not None and due <= now),
+    }
+
+
+def rehearsal_note(view):
+    """Der Satz, den die Seite einer Generalprobe schuldet.
+
+    Nicht „das ist eine Testkopie" — das waere beruhigend und falsch.
+    Was hier liegt, sind echte Kundendaten.
+    """
+    if not view:
+        return ""
+    return ("Diese Instanz traegt eine Kopie der Produktivdaten von "
+            + "„" + view["of"] + "“ mit dem Code aus "
+            + "„" + view["code_from"] + "“. Sie erreicht nach "
+            "aussen nichts: keine eigene Adresse, keine oeffentliche Route, "
+            "keine App-Verknuepfungen und keine uebernommenen Geheimnisse. "
+            "Sie wird mitsamt ihren Daten geloescht, wenn ihre Zeit um ist.")
+
+
+def _mb(n):
+    try:
+        return f"{int(n) / (1024 * 1024):.1f} MB"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _short(value):
+    """Ein ISO-Stempel, wie ein Mensch ihn liest — alles andere unveraendert."""
+    s = str(value or "")
+    if len(s) >= 16 and s[4] == "-" and s[7] == "-" and s[10] in "T ":
+        return s[:16].replace("T", " ")
+    return s
+
+
+def age_phrase(stamp, now=None):
+    """„heute" / „3 Tage alt" — das Alter eines Archivs, ausgesprochen.
+
+    Eine Generalprobe auf einem zwei Wochen alten Archiv ist eine
+    Generalprobe auf zwei Wochen alten Daten. Wer ihr Ergebnis liest,
+    muss wissen, welche Daten es waren. Ein unlesbarer Stempel sagt
+    nichts, statt ein Alter zu erfinden.
+    """
+    import datetime
+    s = str(stamp or "")
+    try:
+        when = datetime.datetime.strptime(
+            s[:19].replace(" ", "T"), "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return ""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    days = (now - when).days
+    if days <= 0:
+        return "heute"
+    return f"{days} Tag{'e' if days != 1 else ''} alt"
+
+
+def rehearsal_offer(name, inst, view, local=""):
+    """Das Angebot „Generalprobe anlegen", oder None (RFC-0030 D5).
+
+    None fuer alles, was keine Produktiv-Instanz ist: Eine Test-Instanz
+    hat schon Testdaten, und eine Generalprobe einer Generalprobe waere
+    eine Kopie einer Kopie.
+
+    `view` ist die Ansicht, die der HOST neben die Registry schreibt —
+    das Portal darf den Mandantenbaum nicht lesen, dort liegt jede
+    `instance.env` jedes Kunden. Fehlt die Ansicht, sagt die Seite das:
+    Ein Knoten, der noch nie gemessen hat, **leiht sich keine Zahl** —
+    eine Zahl aus einem Handbuch ist immer die Maschine von jemand
+    anderem (dieselbe Regel wie beim Sicherungs-Zeitplan, RFC-0029 D1).
+    """
+    if inst.get("channel") != "production" or is_rehearsal(inst):
+        return None
+    view = view or {}
+    mine = (view.get("instances") or {}).get(name) or {}
+    archives = view.get("archives") or []
+    kb, free = mine.get("kbytes"), view.get("free_kbytes")
+    base = local or name
+    return {
+        "candidates": mine.get("code") or [],
+        "archives": [{"file": a.get("file", ""),
+                      "created": _short(a.get("created")),
+                      "size": _mb(a.get("bytes"))} for a in archives[:5]],
+        "newest": _short(archives[0].get("created")) if archives else "",
+        "newest_age": age_phrase(archives[0].get("created")) if archives else "",
+        "measured": _short(view.get("written")),
+        "size": _mb(kb * 1024) if kb else "",
+        "free": _mb(free * 1024) if free else "",
+        "after": (_mb(max(0, free - kb) * 1024)
+                  if (kb is not None and free is not None) else ""),
+        # Dieselbe Schwelle wie im Host (rehearsal_review): 20 % Luft.
+        # Die Seite sagt es vorher, der Knoten lehnt es ab — beide reden
+        # ueber dieselbe Zahl, statt dass eine Seite hofft.
+        "tight": bool(kb and free is not None and free < kb * 12 // 10),
+        "days": view.get("default_days") or 7,
+        "suggestion": f"{base}-probe",
+    }

@@ -689,10 +689,42 @@ DirectoryNotEmpty=$OAAP_DATA_DIR/data/deploy-spool/queue
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Rehearsal sweep (RFC-0030 D4): a rehearsal holds a COPY OF LIVE
+  # CUSTOMER DATA and disappears on a date. That deletion is the whole
+  # reason the expiry exists, so it is not an optional ops step and not
+  # a decision about this machine -- unlike the backup timer, which
+  # decides WHERE archives go. It is installed with the platform.
+  #
+  # The sweep touches only instances carrying a `rehearsal` block; the
+  # command refuses everything else, twice (see rehearsal_sweep).
+  cat > /etc/systemd/system/oaap-rehearsal-sweep.service <<EOF
+[Unit]
+Description=OAAP rehearsal sweep (removes expired rehearsal instances and their data)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py rehearsal sweep
+EOF
+  cat > /etc/systemd/system/oaap-rehearsal-sweep.timer <<'EOF'
+[Unit]
+Description=OAAP rehearsal sweep, daily
+
+[Timer]
+OnCalendar=*-*-* 04:20:00
+# A node that was off at 04:20 still sweeps: an expired copy of
+# production data must not survive because the machine slept.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   systemctl daemon-reload
   systemctl enable --now oaap-deployd.path >/dev/null 2>&1 || true
+  systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 || true
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."
+  say "WARNING: and an expired rehearsal (RFC-0030) will not be removed by itself — 'sudo oaap app rehearsal sweep' does it by hand."
 fi
 
 # Login greeting, console + SSH. The console banner uses agetty's \4

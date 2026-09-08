@@ -173,3 +173,50 @@ say ""
 say "Checking the tenant boundary in the gateway sites ..."
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-routes \
   2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
+
+# --- the rehearsal sweep timer (RFC-0030 D4) ---
+# A rehearsal holds a COPY OF LIVE CUSTOMER DATA and disappears on a
+# date. On a node updated rather than freshly installed there is no
+# timer to make that happen, and an expiry nothing enforces is a
+# promise, not a mechanism. Written here so every node in the fleet
+# gets it -- idempotent: the units are rewritten from the same text
+# and enabling an enabled timer changes nothing.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+  if [ ! -f /etc/systemd/system/oaap-rehearsal-sweep.timer ]; then
+    say ""
+    say "Installing the rehearsal sweep (expired copies of production data) ..."
+  fi
+  cat > /etc/systemd/system/oaap-rehearsal-sweep.service <<EOF
+[Unit]
+Description=OAAP rehearsal sweep (removes expired rehearsal instances and their data)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py rehearsal sweep
+EOF
+  cat > /etc/systemd/system/oaap-rehearsal-sweep.timer <<'EOF'
+[Unit]
+Description=OAAP rehearsal sweep, daily
+
+[Timer]
+OnCalendar=*-*-* 04:20:00
+# A node that was off at 04:20 still sweeps: an expired copy of
+# production data must not survive because the machine slept.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 \
+    || say "  WARNING: the rehearsal sweep timer could not be enabled."
+fi
+
+# --- what a rehearsal would cost, where the portal can read it (2.15.3) ---
+# The portal has no view of the tenant tree, so the sizes and the list of
+# archives are written beside the registry. Written once here so a node
+# that changes nothing after the update can still draw the form -- same
+# reason as apps/artifacts.json above.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" rehearsal-index   2>&1 | sed 's/^/  /' || say "  WARNING: the rehearsal view could not be written."

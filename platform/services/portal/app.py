@@ -236,6 +236,11 @@ DASHBOARD_BODY = """
                    stroke="#2563eb" stroke-width="8" stroke-linejoin="round"/></svg>
         <h3>{{ t.name }}</h3>
         <span class="badge {{ t.channel }}">{{ t.channel_label }}</span>
+        {# RFC-0030: Hier klickt der Mensch. Eine Generalprobe darf an
+           dieser Stelle nie wie die Produktion aussehen — sie traegt
+           eine Kopie echter Kundendaten und verschwindet wieder. #}
+        {% if t.rehearsal %}<span class="badge todo">{{ t.rehearsal.badge }} ·
+           {{ t.rehearsal.left_short }}</span>{% endif %}
       </div>
       {% if t.description %}<p>{{ t.description }}</p>{% endif %}
       <span class="meta">Version {{ t.version }}</span>
@@ -1406,7 +1411,10 @@ INSTANCES_LIST_BODY = """
     <td><a class="rowaction" href="/instances/{{ i.key }}">{{ i.name }}</a></td>
     <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
     {% if show_tenant %}<td class="muted">{{ i.tenant or "?" }}</td>{% endif %}
-    <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span></td>
+    <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span>
+        {% if i.rehearsal %}<span class="badge todo"
+           title="{{ i.rehearsal.left }}">{{ i.rehearsal.badge }} ·
+           {{ i.rehearsal.left_short }}</span>{% endif %}</td>
     <td>{{ i.visibility_label }}</td>
     <td>{{ "ja" if i.tile_visible else "nein" }}{% if i.tile_mode != "auto" %}
         <span class="muted">(fest)</span>{% endif %}</td>
@@ -1574,8 +1582,11 @@ INSTANCE_EDIT_BODY = """
   <div class="titleline">
     <h1>{{ i.name }}</h1>
     <span class="badge {{ 'test' if i.is_test else 'off' }}">{{ i.channel_label }}</span>
+    {% if i.rehearsal %}<span class="badge todo">{{ i.rehearsal.badge }} ·
+       {{ i.rehearsal.left }}</span>{% endif %}
     {% if i.pending %}<span class="badge todo">Bestätigung offen</span>{% endif %}
   </div>
+  {% if i.rehearsal %}<p class="sub">{{ i.rehearsal_note }}</p>{% endif %}
   <p class="sub">{{ i.app_name }} {{ i.version }} · Kennung <code>{{ i.app_id }}</code></p>
   <div class="facts">
     <div><span class="k">Adresse</span><span class="v">
@@ -2019,6 +2030,111 @@ INSTANCE_EDIT_BODY = """
      und eine Erweiterung des Rahmens (neue öffentliche Route, neuer Speicher,
      neuer Port) wird oben angezeigt und muss ausdrücklich bestätigt werden.
      Ein Deploy-Token bekommt die Produktiv-Instanz dadurch nicht.</p>
+</div>
+{% endif %}
+{% if i.rehearse %}
+<div class="card">
+  <h2>Generalprobe anlegen</h2>
+  <p class="muted">Eine <strong>Generalprobe</strong> trägt den Code einer
+     Test-Instanz auf einer <strong>Kopie der Daten dieser Produktiv-Instanz</strong>
+     aus der letzten Sicherung. Sie beantwortet die eine Frage, die keine
+     Test-Instanz beantworten kann: <em>Kommt diese Version auf DIESEN Daten
+     hoch?</em> Zehn selbst angelegte Zeilen sagen nichts über vierzigtausend
+     gewachsene (RFC-0030).</p>
+  {% if not i.rehearse.candidates %}
+  <p class="muted">Für diese App gibt es in diesem Mandanten <strong>keine
+     Test-Instanz</strong> mit einem hochgeladenen Paket. Eine Generalprobe
+     läuft mit <em>denselben Bytes</em>, die auch übernommen würden — und die
+     hält nur eine Test-Instanz.</p>
+  {% elif not i.rehearse.newest %}
+  <p class="err">Dieser Knoten hat <strong>keine Sicherung</strong>. Ohne
+     Sicherung keine Generalprobe — die Daten kommen aus dem letzten Archiv,
+     und es gibt keines.</p>
+  {% else %}
+  <form method="post" action="/instances/{{ i.key }}/rehearse">
+    <input type="hidden" name="tab" value="deployment">
+    <label>Name der Generalprobe
+      <input type="text" name="to" placeholder="{{ i.rehearse.suggestion }}"
+             autocomplete="off" required></label>
+    <label>Code aus
+      <select name="code_from">
+        {% for c in i.rehearse.candidates %}
+        <option value="{{ c.key }}"{{ ' disabled' if not c.ready }}>{{ c.name }}
+          ({{ c.version }}){{ ' — kein Paket aufgehoben' if not c.ready }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Laufzeit
+      <select name="days">
+        <option value="7" selected>7 Tage</option>
+        <option value="14">14 Tage</option>
+        <option value="21">21 Tage</option>
+      </select>
+    </label>
+    <button>Generalprobe anlegen</button>
+  </form>
+  {# Der Satz, den die Seite schuldet: die Zahlen DIESES Knotens, nicht
+     die aus einem Handbuch. Ein Knoten, der noch nie gemessen hat, sagt
+     das und leiht sich keine Zahl. #}
+  <p class="{{ 'err' if i.rehearse.tight else 'muted' }}">
+    {% if i.rehearse.size %}
+    Die Kopie belegt etwa <strong>{{ i.rehearse.size }}</strong>; frei sind
+    <strong>{{ i.rehearse.free }}</strong>, danach noch
+    <strong>{{ i.rehearse.after }}</strong>.
+    {% if i.rehearse.tight %}Das reicht nicht — der Knoten wird ablehnen.{% endif %}
+    <span class="muted">(gemessen {{ i.rehearse.measured }})</span>
+    {% else %}
+    Wie groß die Kopie wird, hat dieser Knoten noch nicht gemessen — die Zahl
+    steht nach der nächsten Änderung hier. Geliehen wird keine: eine Zahl aus
+    einem Handbuch ist immer die Maschine von jemand anderem.
+    {% endif %}
+  </p>
+  <p class="muted">Die Daten kommen aus der <strong>neuesten Sicherung</strong>
+     ({{ i.rehearse.newest }}, {{ i.rehearse.newest_age }}). Alles, was seitdem
+     eingegeben wurde, ist <strong>nicht</strong> in der Generalprobe. Die
+     Produktion wird dafür nicht angehalten.</p>
+  <p class="muted">Was die Generalprobe <strong>nicht</strong> bekommt: keine
+     eigene Adresse, keine öffentliche Route (auch eine als öffentlich erklärte
+     verlangt Anmeldung), keine App-Verknüpfungen und
+     <strong>keine Geheimnisse</strong> — die Felder kommen leer hoch. Eine
+     App, die ohne ihr Geheimnis nicht startet, sagt das laut; das ist das
+     richtige Ergebnis, nicht der Fehler. Nach Ablauf wird sie
+     <strong>mitsamt ihren Daten gelöscht</strong>.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% if i.rehearsal %}
+<div class="card">
+  <h2>Diese Generalprobe</h2>
+  <p>{{ i.rehearsal_note }}</p>
+  <table class="mini">
+    <tr><td>Daten von</td><td><code>{{ i.rehearsal.of }}</code></td></tr>
+    <tr><td>aus der Sicherung</td><td>{{ i.rehearsal.archive }}<br>
+        <span class="muted">geschrieben {{ i.rehearsal.archive_created }}</span></td></tr>
+    <tr><td>Code von</td><td><code>{{ i.rehearsal.code_from }}</code></td></tr>
+    <tr><td>Läuft ab</td><td>{{ i.rehearsal.expires }}
+        <strong>({{ i.rehearsal.left }})</strong></td></tr>
+    {% if i.rehearsal.extensions %}
+    <tr><td>Verlängert</td><td>{{ i.rehearsal.extensions }}×
+        <span class="muted">— eine oft verlängerte Generalprobe ist keine
+        mehr</span></td></tr>
+    {% endif %}
+  </table>
+  <form method="post" action="/instances/{{ i.key }}/rehearsal-extend">
+    <input type="hidden" name="tab" value="deployment">
+    <label>Verlängern um
+      <select name="days">
+        <option value="7" selected>7 Tage</option>
+        <option value="14">14 Tage</option>
+      </select>
+    </label>
+    <button class="secondary">Verlängern</button>
+  </form>
+  <p class="muted">Jede Verlängerung steht im Mandantenprotokoll. Erneut
+     ausrollen lässt sich eine Generalprobe nicht und übernehmen aus ihr auch
+     nicht: Die getesteten Bytes kommen aus der Test-Instanz — eine
+     Generalprobe ist ein <strong>Urteil, keine Quelle</strong>. Falsches
+     Paket heißt löschen und neu bauen.</p>
 </div>
 {% endif %}
 {% if i.artifacts %}
@@ -2590,6 +2706,7 @@ def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
             "channel_label": CHANNEL_LABELS.get(channel, channel),
             "description": inst.get("description", ""),
             "url": _tile_url(name, inst, host, ext, on_lan),
+            "rehearsal": iv.rehearsal_view(inst),
         })
     return tiles, hidden
 
@@ -4849,6 +4966,9 @@ def instances_list():
             "tile_visible": iv.tile_visible(inst),
             "tile_mode": iv.tile_mode(inst),
             "tenant": tenant_label(resolve_tenant(inst.get("tenant"))),
+            # RFC-0030: eine Generalprobe darf in einer Liste nie wie
+            # eine gewoehnliche Produktiv-Instanz aussehen.
+            "rehearsal": iv.rehearsal_view(inst),
         })
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
                 can_create="dev" in node_profiles(),
@@ -5194,6 +5314,13 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "groups": groups, "roles": inst.get("roles") or [],
          "config": _instance_config(name, inst, fresh, typed),
          "is_test": inst.get("channel") == "test",
+         # Generalprobe (Runtime-Spec 2.15): Abzeichen und Restlaufzeit
+         # im Objektkopf, und der Satz, der sagt, was hier wirklich liegt.
+         "rehearsal": iv.rehearsal_view(inst),
+         "rehearsal_note": iv.rehearsal_note(iv.rehearsal_view(inst)),
+         # ... und auf der PRODUKTIV-Instanz das Angebot, eine zu bauen
+         # (RFC-0030 D5) — dort, weil dort die Daten herkommen.
+         "rehearse": _rehearsal_offer(name, inst),
          "token_created": _token_created(name),
          "artifacts": _artifacts(name, inst),
          "deploy_now": _deploy_now(name),
@@ -5862,6 +5989,102 @@ def instance_config(name):
     if not values:
         return _inst_back(name, msg="Keine Änderung.")
     return _queue_and_redirect(name, {"action": "config", "values": values},
+                               CONFIG_WAIT_SECONDS)
+
+
+# --------------------------------------------------------------- Generalprobe
+#
+# RFC-0030 D5: Anlegen darf `server_admin` UND der `tenant_admin` des
+# Mandanten der Produktiv-Instanz — es sind seine Daten und sein
+# Go-Live. Der Knopf steht auf der Objektseite der PRODUKTIV-Instanz,
+# weil dort die Daten herkommen.
+#
+# Diese Seite misst nichts selbst. Sie darf den Mandantenbaum nicht
+# lesen (dort liegt jede `instance.env` jedes Kunden), also schreibt der
+# Host die Zahlen daneben — dasselbe Muster wie `apps/artifacts.json`.
+# Und der Host prüft beim Ausführen alles noch einmal: Der Spool ist
+# Daten, kein Vertrauen.
+REHEARSAL_VIEW = "/apps-registry/rehearsal-options.json"
+
+
+def _rehearsal_options():
+    try:
+        with open(REHEARSAL_VIEW, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _rehearsal_offer(name, inst):
+    """Das Angebot „Generalprobe anlegen" fuer eine Produktiv-Instanz.
+
+    Die Regeln stehen in `instance_view` — ohne Flask, ohne Datei, damit
+    sie sich pruefen lassen. Hier wird nur die Ansicht des Hosts gelesen
+    und der Name uebergeben, den der Mandant liest.
+    """
+    return iv.rehearsal_offer(name, inst, _rehearsal_options(),
+                              local_name(name, inst))
+
+
+REHEARSE_WAIT_SECONDS = 300   # entpackt Daten und installiert ein Paket
+
+
+@app.post("/instances/<name>/rehearse")
+def instance_rehearse(name):
+    """Eine Generalprobe dieser Produktiv-Instanz bauen (RFC-0030).
+
+    `require_instance_admin` ist genau D5: der `server_admin` des
+    Knotens oder der `tenant_admin` DIESER Instanz. Der Host prüft es
+    erneut — hier wird nur weitergereicht.
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    to = (request.form.get("to") or "").strip().lower()
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", to):
+        return _inst_back(name, err="Name der Generalprobe fehlt oder ist "
+                                    "keiner (Kleinbuchstaben, Ziffern, "
+                                    "Bindestriche).")
+    code_from = (request.form.get("code_from") or "").strip()
+    try:
+        days = int(request.form.get("days") or 7)
+    except ValueError:
+        days = 7
+    res = _queue_and_wait(name, {"action": "rehearse", "to": to,
+                                 "code_from": code_from, "days": days},
+                          REHEARSE_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Die Generalprobe wird noch gebaut — sieh "
+                                    "gleich in der Instanzliste nach.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message",
+                                            "Generalprobe fehlgeschlagen."))
+    return redirect(f"/instances/{res.get('key') or to}?msg="
+                    + quote(res.get("message", "Generalprobe gebaut.")),
+                    code=303)
+
+
+@app.post("/instances/<name>/rehearsal-extend")
+def instance_rehearsal_extend(name):
+    """Die Restlaufzeit einer Generalprobe verlängern (RFC-0030 D4).
+
+    Jede Verlängerung steht im Mandantenprotokoll — eine sechsmal
+    verlängerte Generalprobe ist keine mehr, und das darf keine
+    Gedächtnisfrage sein.
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    try:
+        days = int(request.form.get("days") or 7)
+    except ValueError:
+        days = 7
+    return _queue_and_redirect(name, {"action": "rehearsal-extend",
+                                      "days": days},
                                CONFIG_WAIT_SECONDS)
 
 

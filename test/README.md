@@ -25,6 +25,9 @@ python3 test/test_artifact_deploy.py
 python3 test/test_deploy_state.py
 python3 test/test_tenant.py
 python3 test/test_tenant_boundary.py
+python3 test/test_rehearsal_shape.py
+python3 test/test_rehearsal_data.py
+python3 test/test_rehearsal_page.py  # braucht jinja2
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -70,3 +73,34 @@ Was `test_tile.py` **nicht** prüfen kann, weil es Docker bräuchte: dass
 die Übersteuerung ein erneutes Deployment übersteht, während die Klasse
 selbst aus dem neuen Manifest neu gelesen wird. Das gehört auf eine
 echte Maschine.
+
+`test_rehearsal_shape.py`, `test_rehearsal_data.py` und
+`test_rehearsal_page.py` halten die **Generalprobe** fest (RFC-0030,
+Runtime-Spec 2.15) — in genau der Reihenfolge, in der sie gebaut wurde,
+und die ist keine Geschmacksfrage:
+
+- **Form zuerst.** `test_rehearsal_shape.py` prüft die vier
+  Verweigerungen gegen ein Original, das **all das hat**: eigene
+  Adresse, Alias, öffentliche Route, App-Verknüpfung und einen
+  gesetzten `secret: true`-Wert. Gegen ein Original ohne diese Dinge
+  würde man nur prüfen, dass aus nichts nichts wird. Wer die Kopie vor
+  den Verweigerungen baut, hat die gefährliche Fassung gebaut.
+  Besonders: Die `public`-Regel greift dort, wo die Gateway-Site
+  geschrieben wird, und `site_body()` sucht die Antwort **selbst**,
+  wenn ein Aufrufer sie nicht mitgibt — der eine vergessene Aufrufer
+  fällt so in die sichere Richtung.
+- **Dann die Daten.** `test_rehearsal_data.py` prüft die drei
+  Fallstricke, die dieses Projekt schon einmal Geld gekostet haben: die
+  alte Kennung in den Archivpfaden, `--numeric-owner` beim Entpacken,
+  und die `instance.env`, die **mitkommt** und danach entleert werden
+  muss. Dazu der Ablauf und die Sperre, die nicht fehlen darf: Der
+  Sweep fasst **nur** Instanzen mit `rehearsal`-Block an — eine
+  gewöhnliche Instanz mit einem `expires` im Datensatz überlebt ihn.
+  Und er geht durch den **echten Parser** (0.1.78: eine Fähigkeit, die
+  in den `choices` fehlt, ist keine), mit Gegenprobe.
+- **Zuletzt die Seite.** `test_rehearsal_page.py` prüft den Satz, den
+  die Seite schuldet — wie groß die Kopie wird und wie viel danach frei
+  ist, mit den Zahlen **dieses** Knotens —, dass ein Knoten ohne Messung
+  das sagt statt sich eine Zahl zu leihen, und dass das Portal die
+  Ansicht neben der Registry liest und **keinen Mount in den
+  Mandantenbaum** hat.
