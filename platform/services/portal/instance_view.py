@@ -384,10 +384,23 @@ def rehearsal_note(view):
 
 
 def _mb(n):
+    """Eine Groesse, wie ein Mensch sie liest — und nie als „0.0 MB".
+
+    Am laufenden Knoten aufgefallen (0.1.80): eine kleine Instanz stand
+    mit „Die Kopie belegt etwa 0.0 MB" auf der Seite. Das ist eine
+    kleine Unwahrheit ueber etwas, das nicht leer ist — und kleine
+    Unwahrheiten auf einer Admin-Seite kosten spaeter jemandem eine
+    Stunde.
+    """
     try:
-        return f"{int(n) / (1024 * 1024):.1f} MB"
+        n = int(n)
     except (TypeError, ValueError):
         return ""
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} Byte"
 
 
 def _short(value):

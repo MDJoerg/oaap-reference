@@ -5814,6 +5814,21 @@ def rehearsal_code_default(local):
     return f"{local}-test"
 
 
+def _size_phrase(kbytes):
+    """A size in KiB as a person reads it -- and never as "0 MB".
+
+    Found on the running node: a small instance was announced as
+    "about 0 MB is copied". That is a small untruth about something
+    that is not empty, and the whole point of this line is that the
+    operator can trust the number in it.
+    """
+    try:
+        kbytes = int(kbytes)
+    except (TypeError, ValueError):
+        return "an unknown amount"
+    return f"{kbytes // 1024} MB" if kbytes >= 1024 else f"{kbytes} KB"
+
+
 def rehearsal_review(reg, source, new_name, code_from="", archive="", days=0):
     """Everything that must hold before a rehearsal is built.
 
@@ -6052,9 +6067,9 @@ def cmd_rehearse(args):
     if age >= 7:
         print("             NOTE: that is not recent. Anything entered since "
               "is not in this rehearsal.")
-    print(f"  disk       about {plan['kbytes'] // 1024} MB is copied; "
-          f"{plan['free_kbytes'] // 1024} MB free, "
-          f"{(plan['free_kbytes'] - plan['kbytes']) // 1024} MB after")
+    print(f"  disk       about {_size_phrase(plan['kbytes'])} is copied; "
+          f"{_size_phrase(plan['free_kbytes'])} free, "
+          f"{_size_phrase(plan['free_kbytes'] - plan['kbytes'])} after")
     print(f"  expires    {plan['expires']} ({plan['days']} days) — the "
           "instance and its data are then deleted")
     print("  refuses    no own address, no public route, no app links, "

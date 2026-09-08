@@ -120,6 +120,17 @@ ok("und was danach frei ist",
 ok("mit dem Datum der Messung", offer["measured"][:10] == stamp(0)[:10], offer)
 ok("bei genug Platz ist es kein Alarm", not offer["tight"])
 
+# Am laufenden Knoten aufgefallen: eine kleine Instanz stand mit
+# „belegt etwa 0.0 MB" auf der Seite. Eine kleine Unwahrheit ueber
+# etwas, das nicht leer ist -- und genau diese Zahl soll der Betreiber
+# glauben koennen.
+klein = dict(VIEW, instances={"crm": {"kbytes": 24, "code": []}})
+ok("etwas Kleines heisst nicht '0.0 MB'",
+   iv.rehearsal_offer("crm", PROD, klein, "crm")["size"] == "24 KB",
+   iv.rehearsal_offer("crm", PROD, klein, "crm")["size"])
+ok("und etwas sehr Kleines nennt Bytes", iv._mb(400) == "400 Byte", iv._mb(400))
+ok("ab einem Megabyte wieder MB", iv._mb(2 * 1024 * 1024) == "2.0 MB")
+
 eng = dict(VIEW, free_kbytes=1000 * 1024)     # 1000 MB frei, 900 MB noetig
 tight = iv.rehearsal_offer("crm", PROD, eng, "crm")
 ok("bei zu wenig Platz sagt die Seite es vorher", tight["tight"],
