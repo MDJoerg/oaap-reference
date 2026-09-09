@@ -2222,10 +2222,40 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     lines.append("\t}")
     # longest prefix first; catch-all "/" last
     ordered = sorted(routes, key=lambda r: len(r["path"]), reverse=True)
-    for r in ordered:
+    for idx, r in enumerate(ordered):
         matcher = "" if r["path"] == "/" else f" {r['path']}*"
-        lines.append(f"\thandle{matcher} {{")
         roles = [x for x in r["roles"] if x != "public"]
+        if roles and not login_only:
+            # CORS preflight bypass, ahead of the role-gated handle below
+            # (RFC-0027 follow-up, 2026-09-09 letter from aipc-service: a
+            # browser calling a role-gated route with an API key sends an
+            # unauthenticated OPTIONS preflight first. forward_auth's
+            # session fallback answers that with 303 -> /auth/login, which
+            # is not a 2xx -- the browser aborts before the real request
+            # with the key is ever sent. An OPTIONS carries no credentials
+            # and has no effect, so it is safe to hand straight to the app
+            # (same header strip as a public route); every OTHER method on
+            # this path still goes through /verify, unchanged below.
+            #
+            # NEVER on a rehearsal (login_only, RFC-0030 2.15.2): its rule
+            # is that EVERY block on EVERY route asks /verify, no
+            # exceptions -- a copy of production data does not get a
+            # carve-out because the carved-out method happens to be
+            # harmless today. test_rehearsal_shape.py holds this line.
+            target_c, target_p = container, svc_port
+            if services and r.get("service") in services:
+                target_c, target_p = services[r["service"]]
+            lines.append(f"\t@preflight{idx} {{")
+            lines.append("\t\tmethod OPTIONS")
+            if r["path"] != "/":
+                lines.append(f"\t\tpath {r['path']}*")
+            lines.append("\t}")
+            lines.append(f"\thandle @preflight{idx} {{")
+            lines.append("\t\trequest_header -X-OAAP-User")
+            lines.append("\t\trequest_header -X-OAAP-Roles")
+            lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
+            lines.append("\t}")
+        lines.append(f"\thandle{matcher} {{")
         if roles or "public" not in r["roles"] or login_only:
             # No explicit strip here: Caddy's directive order runs
             # request_header AFTER forward_auth, which would wipe the

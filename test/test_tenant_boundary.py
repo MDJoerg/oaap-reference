@@ -194,6 +194,29 @@ check("ohne Instanzangabe wird der Parameter weggelassen",
       "ein begrenzter Schluessel scheitert dann geschlossen -- das ist die "
       "richtige Richtung fuer eine Datei von vor dieser Fassung")
 
+print("\n=== ein OPTIONS-Preflight kommt an der angemeldeten Route vorbei ===")
+# Brief 2026-09-09, aipc-service an bdt-hub, cc oaap-platform (Postkasten
+# ce_rapotheke/bdt-hub/collab): ein Browser schickt vor einem Cross-Origin-
+# Aufruf mit Authorization-Header einen Preflight OHNE Zugangsdaten.
+# forward_auth's Sitzungs-Zweig beantwortet den mit 303 -> /auth/login,
+# der Browser bricht ab, bevor die eigentliche Anfrage mit dem API-
+# Schluessel je gesendet wird. Ein OPTIONS traegt nie Zugangsdaten und
+# hat keine Wirkung, darf also direkt zur App durchgereicht werden.
+check("die angemeldete Route bekommt einen eigenen Preflight-Durchlass",
+      "@preflight" in body and "method OPTIONS" in body)
+check("der Durchlass haengt VOR dem verify-Aufruf im selben Block",
+      body.index("method OPTIONS") < body.index("/verify?"))
+preflight_handle = next(l for l in body.split("\n") if l.startswith("\thandle @preflight"))
+preflight_block = body.split(preflight_handle)[1].split("\n\t}")[0]
+check("der Durchlass selbst fragt identity nie",
+      "forward_auth" not in preflight_block and "/verify" not in preflight_block)
+check("jede andere Methode auf derselben Route bleibt hinter /verify",
+      "forward_auth identity:8000" in body and "/verify?roles=" in body)
+public_block = body.split('handle /status*')[1].split("\n\t}")[0]
+check("die oeffentliche Route bekommt keinen zusaetzlichen Preflight-Durchlass",
+      "@preflight" not in public_block,
+      "sie braucht keinen -- sie haengt ohnehin nie hinter /verify")
+
 check("was gespeichert ist, wird durchgereicht — nicht was aufloest",
       m.instance_tenant_ref(reg["instances"]["verwaist"])
       == "00000000-0000-4000-8000-000000000000",
