@@ -130,6 +130,38 @@ try:
 except m.ArtifactRejected as e:
     check("missing manifest reported", "oaap-app.yaml" in str(e), e)
 
+print("\n-- build context permissions (found on oaap-test, 2026-09-09:")
+print("   fleetview and studio crash-looped with 'Permission denied' on")
+print("   /srv/app.py because COPY had baked in a restrictive mode)")
+d = tempfile.mkdtemp()
+os.makedirs(os.path.join(d, "sub"))
+restricted_file = os.path.join(d, "app.py")
+restricted_dir = os.path.join(d, "sub")
+with open(restricted_file, "w", encoding="utf-8") as f:
+    f.write("print(1)\n")
+os.chmod(restricted_file, 0o600)
+os.chmod(restricted_dir, 0o700)
+m.ensure_build_context_readable(d)
+check("a 0600 file becomes world-readable",
+      os.stat(restricted_file).st_mode & 0o644 == 0o644,
+      oct(os.stat(restricted_file).st_mode))
+check("a 0700 directory becomes world-traversable",
+      os.stat(restricted_dir).st_mode & 0o755 == 0o755,
+      oct(os.stat(restricted_dir).st_mode))
+
+if os.name == "posix":
+    # Windows' os.chmod cannot represent a POSIX execute bit at all (a
+    # regular file always reports 0o666), so this check only means
+    # anything on the platform the node actually runs on.
+    executable_file = os.path.join(d, "run.sh")
+    with open(executable_file, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n")
+    os.chmod(executable_file, 0o700)
+    m.ensure_build_context_readable(d)
+    check("an already-executable file keeps its owner bits (only bits are ADDED)",
+          os.stat(executable_file).st_mode & 0o700 == 0o700,
+          oct(os.stat(executable_file).st_mode))
+
 print("\n-- envelope rule (RFC-0019 §3)")
 base = yaml.safe_load(MANIFEST)
 inst = {"app_id": "demo", "version": "0.1.0",

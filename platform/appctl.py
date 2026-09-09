@@ -2044,6 +2044,30 @@ def image_uid(image):
         return None
 
 
+def ensure_build_context_readable(pkg):
+    """`docker build` COPYs a file with the mode it already has on this
+    node -- verified on oaap-test, 2026-09-09 -- so a package that
+    arrived here with restrictive permissions (a private-repo checkout
+    made under a strict umask, a manual scp/rsync that preserved mode
+    0600) silently bakes an image its own non-root USER cannot read
+    ("python3: can't open file '/srv/app.py': Permission denied", a
+    crash loop from the first start). This bit the node's two
+    build-from-source apps (fleetview, studio) at once, while every
+    pulled prebuilt image stayed unaffected -- because `pkg` here is the
+    one step every native app's build shares, whichever of the three
+    ways it got there (git clone, ZIP artifact, or a local path).
+    Bits are only ever ADDED, never removed -- an executable script
+    stays executable, and nothing about ownership changes.
+    """
+    for root, dirs, files in os.walk(pkg):
+        for d in dirs:
+            p = os.path.join(root, d)
+            os.chmod(p, os.stat(p).st_mode | 0o755)
+        for f in files:
+            p = os.path.join(root, f)
+            os.chmod(p, os.stat(p).st_mode | 0o644)
+
+
 DEFAULT_THROTTLE = {"limit": 300, "window": 60}
 # identity runs several gunicorn workers and each counts on its own
 # (RFC-0010) — kept here so the CLI can state the real ceiling
@@ -3508,6 +3532,12 @@ def _install_from_dir(pkg, args, source):
                     else route_service_name(m["routes"][0]) if m["routes"]
                     else service_names[0])
     ordered = sorted(svc_items, key=lambda kv: kv[0] != primary_name)
+
+    # Whatever brought `pkg` here (git clone, ZIP artifact, or a local
+    # path) may have left it with permissions `docker build` would
+    # faithfully bake into the image — see ensure_build_context_readable.
+    if pkg and any(app["type"] == "native" or svc.get("build") for _, svc in ordered):
+        ensure_build_context_readable(pkg)
 
     services = []
     for sname, svc in ordered:
@@ -8506,6 +8536,7 @@ def _deploy_from_registry(name, inst):
                       f"({src.get('url') or 'no source recorded'}). Data is restored — "
                       f"copy the package here or reinstall it under the same name.")
                 return False
+            ensure_build_context_readable(pkg)
         for s in services:
             if s["image"].startswith("oaap-app/"):
                 print(f"Building {s['image']} ...")
