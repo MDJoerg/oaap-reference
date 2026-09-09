@@ -167,6 +167,19 @@ ok("migrate.sh reicht STORE_SUPERUSER_PASSWORD auch aktualisierten "
    "installierten) Knoten crash-loopte ohne diesen Schritt, weil "
    "install.sh das Secret nur bei einer Neuinstallation erzeugt",
    "STORE_SUPERUSER_PASSWORD=" in migrate)
+ok("migrate.sh entscheidet mit pg_isready, nicht mit einer "
+   "'.State.Running'-Abfrage -- ebenfalls auf oaap-test gefunden: ein "
+   "Crash-Loop-Container flackert zwischen Running=true und "
+   "Running=false, eine darauf gebaute Prüfung kann die Reparatur im "
+   "falschen Moment verpassen",
+   "docker exec oaap-store-1 pg_isready" in migrate
+   and "docker inspect -f '{{.State.Running}}'" not in migrate)
+
+print("\n=== _store_running() fragt pg_isready, nicht .State.Running ===")
+_appctl_src = read("appctl.py")
+ok("appctl.py hat dieselbe Race NICHT (derselbe Fund, dieselbe Lehre)",
+   "pg_isready" in _appctl_src.split("def _store_running")[1].split(
+       "def _store_psql")[0])
 
 print("\n=== 'status'/'schemas' lesen ohne root, wie 'store list'/'node show' ===")
 appctl_src = read("appctl.py")

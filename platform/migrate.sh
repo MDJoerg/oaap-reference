@@ -244,10 +244,17 @@ fi
 # that does not pass --profile (services without one are simply left
 # alone, per Compose's own semantics, so this step supplies it), or a
 # future migration bug. Quiet when the profile is absent or the
-# container already runs.
+# service already answers.
+#
+# Checked with `pg_isready`, NOT `docker inspect .State.Running` — found
+# on oaap-test, 2026-09-09: a container stuck in a restart loop flickers
+# between Running=true (the instant the process starts) and
+# Running=false (waiting to retry), so a Running-based check can catch
+# it in the wrong instant and skip the very repair it exists for.
+# `pg_isready` asks the one question that actually matters here.
 if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
    && grep -q '"store"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
-  if ! docker inspect -f '{{.State.Running}}' oaap-store-1 2>/dev/null | grep -q true; then
+  if ! docker exec oaap-store-1 pg_isready -U postgres >/dev/null 2>&1; then
     say ""
     say "Ensuring the managed Postgres (profile 'store') is up ..."
     if docker compose --project-directory "$APP_DIR" --project-name oaap \

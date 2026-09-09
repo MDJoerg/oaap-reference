@@ -1948,11 +1948,19 @@ def _compose(*compose_args):
 
 
 def _store_running():
+    """Whether the store actually answers -- not whether the container
+    happens to be in 'Running' at this instant. Found on oaap-test,
+    2026-09-09: a container stuck in a restart loop flickers between
+    Running=true (the moment the process starts) and Running=false
+    (waiting to retry); '.State.Running' can catch it in the wrong
+    instant. 'pg_isready' asks the question every caller here actually
+    means."""
     if not shutil.which("docker"):
         return False
-    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}",
-                        STORE_CONTAINER], capture_output=True, text=True)
-    return r.returncode == 0 and r.stdout.strip() == "true"
+    r = subprocess.run(["docker", "exec", STORE_CONTAINER,
+                        "pg_isready", "-U", "postgres"],
+                       capture_output=True, text=True)
+    return r.returncode == 0
 
 
 def _store_psql(sql, database="postgres"):
