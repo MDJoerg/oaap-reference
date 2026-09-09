@@ -1689,6 +1689,15 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'zugang' }}">
+<div class="card">
+  <h2>API-Schlüssel</h2>
+  <p class="muted">Ein Schlüssel für ein Skript, ein Terminal oder eine
+     andere App, die <strong>{{ i.name }}</strong> automatisiert
+     anspricht — mit <code>Authorization: Bearer …</code> statt Anmeldung
+     im Browser (RFC-0027). Auf diese Instanz begrenzt, sieht er nichts
+     anderes auf diesem Knoten.</p>
+  <a class="btn" href="/keys/new?instance={{ i.key }}">Schlüssel für diese Instanz ausstellen</a>
+</div>
 <form method="post" action="/instances/{{ i.key }}/visibility">
   <input type="hidden" name="tab" value="zugang">
   <div class="card">
@@ -2919,9 +2928,15 @@ def keys_new():
     denied = require_user_admin()
     if denied:
         return denied
+    # ?instance= lets an instance's own page ("Zugang" tab) link straight
+    # here with its scope already chosen -- an unknown or invisible key
+    # simply matches no <option> and the field falls back to "keine
+    # Begrenzung", so nothing needs validating on the way in; identity
+    # decides for real at creation time regardless.
     return page(KEY_NEW_BODY, "Schlüssel ausstellen", "keys",
                 principals=identity_users(), all_roles=_key_role_choices(),
-                instances=_instance_choices(), form=_key_form(),
+                instances=_instance_choices(),
+                form=_key_form(instance=request.args.get("instance", "")),
                 msg=request.args.get("msg"), error=None)
 
 

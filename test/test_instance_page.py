@@ -167,11 +167,23 @@ print("\n=== Nichts geht durch die Gruppierung verloren ===")
 KARTEN = ["Sichtbarkeit", "Kachel im Launchpad", "Eigene Adresse",
           "Drosselung öffentlicher Routen", "Verbindungen zu anderen Apps",
           "Deploy-Token", "Hochgeladene Pakete", "Konfiguration",
-          "Instanz entfernen", "Was die App mitbringt", "Herkunft"]
+          "Instanz entfernen", "Was die App mitbringt", "Herkunft",
+          "API-Schlüssel"]
 for tab_key in (iv.DEFAULT_TAB, "verwaltung"):
     h = render(tab_key)
     fehlt = [k for k in KARTEN if k not in h]
     ok(f"in „{tab_key}“ steht jede Karte im Dokument", not fehlt, str(fehlt))
+
+print("\n=== Ein Schlüssel fuer diese Instanz laesst sich direkt ausstellen ===")
+# RFC-0027 D5 draengt zur Instanz-Begrenzung -- der Weg dorthin sollte
+# von der Instanz selbst aus fuehren, nicht ueber eine Liste, in der man
+# die Instanz erst wiederfinden muss.
+zugang = render("zugang")
+ok("die Instanz-Seite verlinkt direkt auf 'Schluessel ausstellen', "
+   "mit dieser Instanz schon als Ziel",
+   'href="/keys/new?instance=bdt-hub-test"' in zugang)
+ok("und sagt, wofuer das gut ist",
+   "Authorization: Bearer" in zugang and "RFC-0027" in zugang)
 
 print("\n=== Der Kopfbereich beantwortet das Wichtigste ===")
 h = render(iv.DEFAULT_TAB)

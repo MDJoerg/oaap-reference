@@ -168,6 +168,26 @@ ok("ohne Prinzipal fuehrt die Seite zum naechsten Schritt statt in ein "
    "leeres Formular", "Maschine" in ohne and "/users" in ohne)
 
 print("")
+print("Von der Instanz-Seite aus kommt die Reichweite schon vorausgewaehlt")
+
+vorbelegt = neu.render(
+    principals=[{"username": "terminal-3", "kind": "machine", "roles": ["user"]}],
+    all_roles=["admin", "keyuser", "user"],
+    instances=[{"key": "cls-viewer", "name": "viewer"},
+               {"key": "aipc-test", "name": "aipc-test"}],
+    form={"principal": "", "roles": ["user"], "instance": "aipc-test",
+          "label": "", "days": 90},
+    msg=None, error=None)
+ok("die verlinkte Instanz steht als ausgewaehlt da",
+   '<option value="aipc-test" selected>' in vorbelegt)
+ok("und keine andere",
+   '<option value="cls-viewer" selected>' not in vorbelegt)
+keys_new_src = SRC[SRC.index("def keys_new("):]
+keys_new_src = keys_new_src[:keys_new_src.index("@app.", 1)]
+ok("die Route liest die Instanz aus der Adresse, nicht aus einer Sitzung",
+   'request.args.get("instance"' in keys_new_src)
+
+print("")
 print("Die Bestaetigung wird auch im Code geprueft, nicht nur im Browser")
 
 revoke = SRC[SRC.index("def keys_revoke("):]
