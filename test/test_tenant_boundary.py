@@ -23,6 +23,7 @@ Run: python3 test/test_tenant_boundary.py
 """
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -239,6 +240,58 @@ check("eine Datei ohne Mandanten wird einmal neu geschrieben",
 out2, _ = capture(m.cmd_migrate_tenant_routes, None)
 check("und beim zweiten Lauf passiert nichts und wird nichts gesagt",
       out2 == "")
+
+# Eine Datei, die Mandant und Instanz schon nennt, aber vor dem
+# Preflight-Durchlass geschrieben wurde (2026-09-09) -- der Durchlass
+# haengt an der Rolle, nicht am Mandanten, also braucht es einen
+# eigenen, kuenstlich veralteten Fall statt sich auf den obigen zu
+# verlassen.
+missing_preflight = os.path.join(m.CADDY_APPS_DIR, "viewer.caddy")
+with open(missing_preflight, encoding="utf-8") as f:
+    with_boundary = f.read()
+without_preflight = re.sub(
+    r"\t@preflight\d+ \{\n(?:\t\t.*\n)*?\t\}\n"
+    r"\thandle @preflight\d+ \{\n(?:\t\t.*\n)*?\t\}\n",
+    "", with_boundary)
+check("die Testdatei hat den Durchlass tatsaechlich verloren (Testaufbau)",
+      "@preflight" in with_boundary and "@preflight" not in without_preflight)
+with open(missing_preflight, "w", encoding="utf-8") as f:
+    f.write(without_preflight)
+out, _ = capture(m.cmd_migrate_tenant_routes, None)
+with open(missing_preflight, encoding="utf-8") as f:
+    rewritten = f.read()
+check("eine Datei ohne Preflight-Durchlass wird ebenfalls einmal neu geschrieben",
+      "@preflight" in rewritten and "rewritten" in out)
+out2, _ = capture(m.cmd_migrate_tenant_routes, None)
+check("und bleibt danach ebenfalls still", out2 == "")
+
+# Eine Generalprobe (RFC-0030) hat NIE einen Preflight-Durchlass -- das
+# darf die Migration nicht fuer "veraltet" halten, sonst schreibt sie
+# dieselbe Datei bei jedem Update unveraendert neu (die Forgejo-Falle,
+# nur fuer den neuen Fall statt den alten).
+reg = m.load_registry()
+reg["instances"]["probe"] = {
+    "app_id": "demo", "app_name": "Demo", "version": "1.0",
+    "channel": "production", "container": "oaap-probe", "port": 8111,
+    "svc_port": 8080, "tenant": DEFAULT,
+    "rehearsal": {"of": "viewer", "expires": "2099-01-01T00:00:00Z"},
+    "routes": [{"path": "/", "roles": ["user"]}],
+}
+m.save_registry(reg)
+probe_site = os.path.join(m.CADDY_APPS_DIR, "probe.caddy")
+with open(probe_site, "w", encoding="utf-8") as f:
+    f.write(m.caddy_site(8111, reg["instances"]["probe"]["routes"],
+                         "oaap-probe", 8080, scope="probe", tenant=DEFAULT,
+                         login_only=True))
+check("die Generalprobe hat tatsaechlich keinen Preflight-Durchlass",
+      "@preflight" not in open(probe_site, encoding="utf-8").read())
+before = open(probe_site, encoding="utf-8").read()
+out, _ = capture(m.cmd_migrate_tenant_routes, None)
+check("die Migration haelt das nicht fuer veraltet",
+      open(probe_site, encoding="utf-8").read() == before
+      and "probe" not in out,
+      "sonst wuerde jedes Update dieselbe Generalprobe-Datei unveraendert "
+      "neu schreiben und nie fertig werden")
 
 
 print("\n=== eine oeffentliche App mit Bremse ist nicht 'veraltet' ===")

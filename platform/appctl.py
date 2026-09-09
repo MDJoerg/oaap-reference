@@ -1508,6 +1508,14 @@ def cmd_migrate_tenant_routes(_args):
     reach -- there must be no window in which the boundary is merely
     intended.
 
+    Also carries the OPTIONS preflight bypass (2026-09-09, aipc-service
+    letter) to every existing role-gated route: that fix lives in the
+    site GENERATOR, so an instance installed before it keeps the old
+    file until something rewrites it. Same reasoning as the paragraph
+    above applies word for word -- there must be no window in which a
+    browser-direct API-key call is silently broken on an app that
+    already shipped its own CORS handling.
+
     Idempotent and silent afterwards, like every step in migrate.sh:
     it looks at what is on disk and does nothing when the answer is
     already there.
@@ -1528,20 +1536,26 @@ def cmd_migrate_tenant_routes(_args):
         # forgejo was rewritten by every run.)
         if "/verify?" not in body:
             continue
-        # Two parameters are generated into every authentication call
-        # now: the tenant (0.2) and the instance (RFC-0027 D5, so a key
-        # can be limited to one app). A site missing either is rewritten
-        # once. Both are carried by the same step rather than a second
-        # near-identical one -- a migration that only ever regenerates
-        # sites should stay one migration.
-        if "&tenant=" in body and "&instance=" in body:
+        # Three things are generated into an authenticated site now: the
+        # tenant (0.2), the instance (RFC-0027 D5), and -- on a route
+        # that actually carries roles -- a preflight bypass (2026-09-09).
+        # A rehearsal (login_only, RFC-0030 2.15.2) never gets the last
+        # one by design (every block of a rehearsal asks /verify, no
+        # exceptions), so its absence there must NOT count as stale --
+        # that would rewrite the same file, unchanged, on every update,
+        # exactly the forgejo/throttle trap the comment above warns
+        # about. All generated together rather than as separate
+        # near-identical migrations -- one migration should stay one.
+        gated = any(x for r in inst["routes"] for x in r["roles"] if x != "public")
+        needs_preflight = gated and not is_rehearsal(inst) and "@preflight" not in body
+        if "&tenant=" in body and "&instance=" in body and not needs_preflight:
             continue
         stale.append((name, inst, path))
     if not stale:
         return
     print("")
     print("Bringing the gateway sites up to date (tenant boundary, "
-          "instance scope) ...")
+          "instance scope, preflight bypass) ...")
     for name, inst, path in stale:
         with open(path, "w", encoding="utf-8") as f:
             f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
@@ -1560,6 +1574,9 @@ def cmd_migrate_tenant_routes(_args):
     else:
         print("  Every authenticated route now names the tenant of its")
         print("  instance, and is refused to sessions from another one.")
+    print("  A route with roles also gets its own OPTIONS preflight "
+          "bypass now -- a browser-direct API-key call no longer dies "
+          "on the unauthenticated preflight that precedes it.")
 
 
 def cmd_tenant(args):
