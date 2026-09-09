@@ -28,6 +28,7 @@ python3 test/test_tenant_boundary.py
 python3 test/test_rehearsal_shape.py
 python3 test/test_rehearsal_data.py
 python3 test/test_rehearsal_page.py  # braucht jinja2
+python3 test/test_data_store.py
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -104,3 +105,18 @@ und die ist keine Geschmacksfrage:
   das sagt statt sich eine Zahl zu leihen, und dass das Portal die
   Ansicht neben der Registry liest und **keinen Mount in den
   Mandantenbaum** hat.
+
+`test_data_store.py` hält den **Store** fest (`oaap.data.store` 0.1,
+RFC-0031 Schritt 1) — ohne Docker, also ohne das echte Postgres: dass
+ohne das Knotenprofil `store` jede Aktion "nicht getragen" statt eines
+Fehlers meldet, dass mit Profil, aber ohne laufenden Dienst, jede
+Aktion verweigert wird statt ein `docker exec` gegen nichts zu
+versuchen, dass `remove-profile store` den Code kennt, der bestehende
+Schemas schützt, und dass der Compose-Dienst wirklich hinter
+`profiles: [store]` gattert und keinen Port veröffentlicht. Dazu die
+Kollisionsprüfung, die beim Bauen den Anlass gab: `oaap store` (Paket-
+Store, RFC-0012) und `oaap data store` (dieser Dienst) sind zwei
+Befehle, nicht einer. Was diese Datei **nicht** prüfen kann, weil es
+ein echtes Postgres bräuchte — dass `create`/`copy`/`drop`/`restore`
+tatsächlich ein Schema anlegen, kopieren, löschen oder wiederherstellen
+— gehört auf `oaap-test`, wie bei `klicktest.py`.

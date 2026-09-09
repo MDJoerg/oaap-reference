@@ -529,7 +529,7 @@ say "Preflight OK."
 APP_DIR="$OAAP_DATA_DIR/app"
 mkdir -p "$APP_DIR" "$OAAP_DATA_DIR/data/identity" "$OAAP_DATA_DIR/apps" \
          "$OAAP_DATA_DIR/data/gateway/logs" "$OAAP_DATA_DIR/data/gateway/caddy-data" \
-         "$OAAP_DATA_DIR/data/audit"
+         "$OAAP_DATA_DIR/data/audit" "$OAAP_DATA_DIR/data/store"
 cp -r "$SCRIPT_DIR/platform/." "$APP_DIR/"
 cp "$SCRIPT_DIR/VERSION" "$APP_DIR/VERSION"
 
@@ -554,6 +554,14 @@ SESSION_SECRET="$(gen_secret)"
 # (RFC-0015 addendum A4). Unlike the two above it carries no state, so a
 # fresh one is always fine — including on restore.
 INTERNAL_API_KEY="$(gen_secret)"
+# Postgres superuser for the 'store' service (oaap.data.store 0.1,
+# RFC-0031 Schritt 1). Generated on every install, whether or not this
+# node ever carries the 'store' profile — cheap, and it means the
+# secret is already in place the moment 'oaap node add-profile store'
+# starts the container for the first time. Never used over the
+# network (no published port); it only matters the one time Postgres
+# initialises its own data directory.
+STORE_SUPERUSER_PASSWORD="$(gen_secret)"
 
 if [ "$MODE" = "restore" ]; then
   say "Restoring platform state from $RESTORE_FILE ..."
@@ -585,9 +593,30 @@ if [ "$MODE" = "restore" ]; then
   SESSION_SECRET="$(grep '^SESSION_SECRET=' "$APP_DIR/.env" | cut -d= -f2- || true)"
   SETUP_TOKEN="$(grep '^SETUP_TOKEN=' "$APP_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$SESSION_SECRET" ] && [ -n "$SETUP_TOKEN" ] || fail "The backup's app/.env is incomplete — cannot restore."
+  # Carry the old superuser secret over too, where the archive's .env
+  # has one (oaap.data.store 0.1) — a fresh one would still work (it
+  # only matters at first container start), but there is no reason to
+  # regenerate what already exists.
+  OLD_STORE_PW="$(grep '^STORE_SUPERUSER_PASSWORD=' "$APP_DIR/.env" | cut -d= -f2- || true)"
+  [ -n "$OLD_STORE_PW" ] && STORE_SUPERUSER_PASSWORD="$OLD_STORE_PW"
   BACKUP_VERSION="$(grep -o '"platform_version": *"[^"]*"' "$OAAP_DATA_DIR/last-restore-manifest.json" | cut -d'"' -f4 || true)"
   [ -z "$BACKUP_VERSION" ] || [ "$BACKUP_VERSION" = "$VERSION" ] \
     || say "NOTE: the backup was taken on platform version $BACKUP_VERSION; this installer is $VERSION."
+  # The managed-Postgres dump (oaap.data.store 2.5): the node profile
+  # 'store' is deliberately NOT restored (RFC-0011 D4 — profiles are
+  # never inherited, only the DATA a profile would have used is), so
+  # the dump would otherwise sit inside the archive with nothing ever
+  # pointing at it. Extracted, never replayed automatically.
+  if tar -tzf "$RESTORE_FILE" store-dump.sql >/dev/null 2>&1; then
+    tar -xzOf "$RESTORE_FILE" store-dump.sql > "$OAAP_DATA_DIR/last-restore-store-dump.sql"
+    chmod 600 "$OAAP_DATA_DIR/last-restore-store-dump.sql"
+    say "NOTE: this backup carries a managed-Postgres dump"
+    say "      ($OAAP_DATA_DIR/last-restore-store-dump.sql). The 'store'"
+    say "      profile is not restored automatically (RFC-0011 D4) --"
+    say "      to bring the data back:"
+    say "        sudo oaap node add-profile store"
+    say "        oaap data store restore $OAAP_DATA_DIR/last-restore-store-dump.sql"
+  fi
 fi
 
 umask 077
@@ -606,6 +635,7 @@ OAAP_PLATFORM_SOURCE=$SCRIPT_DIR
 SESSION_SECRET=$SESSION_SECRET
 SETUP_TOKEN=$SETUP_TOKEN
 INTERNAL_API_KEY=$INTERNAL_API_KEY
+STORE_SUPERUSER_PASSWORD=$STORE_SUPERUSER_PASSWORD
 EOF
 # Baseline for `oaap update`: which revision is installed right now.
 git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse --short HEAD > "$APP_DIR/REVISION" 2>/dev/null \

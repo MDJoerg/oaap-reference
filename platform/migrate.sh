@@ -214,6 +214,29 @@ EOF
     || say "  WARNING: the rehearsal sweep timer could not be enabled."
 fi
 
+# --- managed Postgres for a profiled node (RFC-0031 Schritt 1, oaap.data.store 0.1) ---
+# 'oaap node add-profile store' already starts the service immediately
+# (appctl.py cmd_node) -- this is the idempotent safety net for what
+# that command cannot cover by itself: a node that gained the profile
+# while appctl or docker was unavailable, a Compose recreate on update
+# that does not pass --profile (services without one are simply left
+# alone, per Compose's own semantics, so this step supplies it), or a
+# future migration bug. Quiet when the profile is absent or the
+# container already runs.
+if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
+   && grep -q '"store"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+  if ! docker inspect -f '{{.State.Running}}' oaap-store-1 2>/dev/null | grep -q true; then
+    say ""
+    say "Ensuring the managed Postgres (profile 'store') is up ..."
+    if docker compose --project-directory "$APP_DIR" --project-name oaap \
+         --profile store up -d store >/dev/null 2>&1; then
+      say "  Done."
+    else
+      say "  WARNING: 'store' service could not be started — check 'docker compose ps'."
+    fi
+  fi
+fi
+
 # --- what a rehearsal would cost, where the portal can read it (2.15.3) ---
 # The portal has no view of the tenant tree, so the sizes and the list of
 # archives are written beside the registry. Written once here so a node

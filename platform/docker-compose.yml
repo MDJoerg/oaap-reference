@@ -64,3 +64,30 @@ services:
       # deploy hook (runtime spec 2.5): the portal queues requests here,
       # the host-side worker (oaap-deployd path unit) executes them
       - "${OAAP_DATA_DIR}/data/deploy-spool:/deploy-spool"
+
+  # Managed Postgres (oaap.data.store 0.1, RFC-0031 Schritt 1). Gated by
+  # the node profile 'store' (RFC-0011, oaap.core.host 2.5) through
+  # Compose's own 'profiles:' key -- 'docker compose up -d' without
+  # --profile store never starts this, exactly like a node that was
+  # never asked to carry it. appctl.py passes --profile store itself,
+  # right after 'oaap node add-profile store' and again on every update
+  # while the profile is held (platform/migrate.sh).
+  store:
+    image: pgvector/pgvector:pg16
+    profiles: ["store"]
+    restart: unless-stopped
+    environment:
+      # Only used to initialise the superuser on first start. Nothing
+      # in this stack connects over the network with it -- every
+      # operation is 'docker exec' into this container (2.1: no
+      # published port, ever), and schema roles are separate secrets
+      # held by the consuming service (oaap.data.twin), never by an app.
+      POSTGRES_PASSWORD: "${STORE_SUPERUSER_PASSWORD:-}"
+    volumes:
+      - "${OAAP_DATA_DIR}/data/store:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No 'ports:' -- deliberate (oaap.data.store 2.1, 4).

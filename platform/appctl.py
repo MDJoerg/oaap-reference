@@ -23,6 +23,11 @@ Node-level, not per app:
     oaap store trust <id> verified|unverified
     oaap store reconcile          (run by `oaap update`, RFC-0012 §4)
 
+    oaap data store status|schemas                    (oaap.data.store 0.1)
+    oaap data store create <purpose> <tenant-id>
+    oaap data store copy <schema> <new-name> | drop <schema> --yes
+    oaap data store restore <dump-file>                (RFC-0031 Schritt 1)
+
 Implements: manifest validation (subset of the published JSON Schema),
 build on device, named instances with channels, per-instance storage/
 secret/port, gateway wiring (generated Caddy site + reload).
@@ -1821,6 +1826,11 @@ PROFILES = {
     "exposed": "exposed node — an operator may grant an app a non-HTTP "
                "port that bypasses the gateway (RFC-0015). Only meaningful "
                "where the node has (or will get) the router port forward.",
+    "store": "data-platform node — carries the managed Postgres of "
+             "oaap.data.store 0.1 (RFC-0031 Schritt 1). Without it, "
+             "data-model and digital-twin capabilities are unavailable "
+             "here. Unlike 'dev'/'exposed' this actually starts and stops "
+             "a platform service (see cmd_node below).",
 }
 
 
@@ -1884,11 +1894,264 @@ def cmd_node(args):
                   "source it is given — not only from the configured store\n"
                   "sources. That is the point of the profile, and it is a bad\n"
                   "trade on a machine holding customer data.")
+        if profile == "store":
+            # Unlike dev/exposed, this profile has nothing to check at
+            # request time -- either the container is up or it is not.
+            # So the effect happens now, not "on the next update".
+            try:
+                _compose("--profile", "store", "up", "-d", "store")
+                print("The managed Postgres is starting "
+                      "('docker compose ... --profile store up -d store').")
+            except (subprocess.CalledProcessError, OSError) as e:
+                err = (getattr(e, "stderr", "") or "").strip().splitlines()
+                print(f"WARNING: could not start the 'store' service"
+                      + (f": {err[-1]}" if err else f": {e}") + ".")
+                print("Check with: docker compose --project-directory "
+                      f"{APP_DIR} --project-name oaap --profile store "
+                      "up -d store")
     else:
         if profile not in profiles:
             die(f"node does not have profile '{profile}'")
+        if profile == "store":
+            existing = store_schemas()
+            if existing:
+                names = ", ".join(r["schema"] for r in existing)
+                die(f"cannot remove profile 'store' — {len(existing)} "
+                    f"schema(s) still exist ({names}). Drop them first: "
+                    "'oaap data store drop <schema> --yes'.")
         save_profiles([p for p in profiles if p != profile])
         print(f"Node profile '{profile}' removed.")
+        if profile == "store":
+            try:
+                _compose("stop", "store")
+                print("The managed Postgres container was stopped "
+                      "(its data volume is kept).")
+            except (subprocess.CalledProcessError, OSError):
+                print("WARNING: could not stop the 'store' container — "
+                      "check 'docker ps'.")
+
+
+# -------------------------------------------- managed Postgres (oaap.data.store 0.1)
+# One Postgres per node, one schema per tenant and purpose, gated by the
+# 'store' node profile above. Apps never talk to this directly — only
+# oaap.data.twin/oaap.data.model will (RFC-0031 §6) — so this CLI is
+# operator/service tooling, nested like 'oaap fleet key ...':
+# 'oaap data store <action>'. Deliberately NOT named 'oaap store' — that
+# verb already means the app/package store (oaap.apps.runtime, RFC-0012).
+
+STORE_CONTAINER = "oaap-store-1"  # compose v2 default: <project>-<service>-1
+
+
+def _compose(*compose_args):
+    return run(["docker", "compose", "--project-directory", APP_DIR,
+                "--project-name", "oaap", *compose_args])
+
+
+def _store_running():
+    if not shutil.which("docker"):
+        return False
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}",
+                        STORE_CONTAINER], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _store_psql(sql, database="postgres"):
+    """Run one statement as the 'postgres' OS/DB user inside the
+    container — local trust auth over its own socket, the same reason
+    'docker exec -u postgres ... psql' needs no password anywhere in
+    this file. STORE_SUPERUSER_PASSWORD in .env is what the image used
+    to initialise that user on first start; nothing here ever types it
+    again (security requirement 1)."""
+    return run(["docker", "exec", "-u", "postgres", STORE_CONTAINER,
+                "psql", "-v", "ON_ERROR_STOP=1", "-tAc", sql, database])
+
+
+def store_schemas():
+    """[{schema, role, purpose, tenant_id}, ...] — read from Postgres
+    itself, never from a side file, so this can never claim a schema
+    exists that does not (the 0.1.4 backup lesson, applied here: ask
+    the database, not a list that can drift away from it)."""
+    if not _store_running():
+        return []
+    out = _store_psql(
+        "SELECT nspname FROM pg_namespace WHERE nspname NOT IN "
+        r"('public','pg_catalog','information_schema') "
+        r"AND nspname NOT LIKE 'pg\_%' ORDER BY 1"
+    ).stdout
+    rows = []
+    for name in (n.strip() for n in out.splitlines()):
+        if not name:
+            continue
+        purpose, _, tenant = name.partition("_")
+        rows.append({"schema": name, "role": name,
+                     "purpose": purpose or name, "tenant_id": tenant})
+    return rows
+
+
+def _schema_size_kb(schema):
+    out = _store_psql(
+        "SELECT COALESCE(SUM(pg_total_relation_size(c.oid)),0)::bigint "
+        "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        f"WHERE n.nspname = '{schema}'"
+    ).stdout.strip()
+    try:
+        return int(out) // 1024
+    except ValueError:
+        return 0
+
+
+def _store_free_kb():
+    return shutil.disk_usage(os.path.join(DATA_DIR, "data", "store")).free // 1024
+
+
+def cmd_data(args):
+    """'oaap data store ...' — the managed Postgres (oaap.data.store 0.1).
+
+    Nested like 'oaap fleet key ...': a top-level verb ('data') meant to
+    carry oaap.data.model and oaap.data.twin too once they exist, an
+    object ('store' today), and an action.
+    """
+    if args.object != "store":
+        die(f"unknown object '{args.object}' — available: store")
+
+    if args.action == "status":
+        if not has_profile("store"):
+            print("store: not carried — this node has no profile 'store'.")
+            print("Data-model and digital-twin capabilities are "
+                  "unavailable here. Add it with:")
+            print("  sudo oaap node add-profile store")
+            return
+        running = _store_running()
+        print(f"store: carried, container "
+              f"{'running' if running else 'NOT running'}")
+        if running:
+            print(f"schemas: {len(store_schemas())}")
+        else:
+            print("Check with: docker compose --project-directory "
+                  f"{APP_DIR} --project-name oaap --profile store "
+                  "up -d store")
+        return
+
+    if not has_profile("store"):
+        die("this node has no profile 'store' — add it first: "
+            "'sudo oaap node add-profile store'.")
+    if not _store_running():
+        die(f"the '{STORE_CONTAINER}' service is not running — see "
+            "'oaap data store status'.")
+
+    if args.action == "schemas":
+        rows = store_schemas()
+        if not rows:
+            print("No schemas.")
+            return
+        for r in rows:
+            print(f"{r['schema']}  purpose={r['purpose']}  "
+                  f"tenant={r['tenant_id'] or '?'}")
+        return
+
+    if args.action == "create":
+        purpose = (args.arg1 or "").strip().lower()
+        tenant_id = (args.arg2 or "").strip()
+        if not purpose or not tenant_id:
+            die("usage: oaap data store create <purpose> <tenant-id>")
+        if not re.fullmatch(r"[a-z][a-z0-9]*", purpose):
+            die("purpose must be lowercase letters/digits, starting with "
+                "a letter (it becomes part of the schema name)")
+        if tenant_id not in load_tenants():
+            die(f"unknown tenant '{tenant_id}' — 'oaap tenant list' shows "
+                "the IDs. The schema name carries the tenant-ID, never "
+                "the Kürzel (RFC-0025/0026).")
+        schema = f"{purpose}_{tenant_id}"
+        if schema in {r["schema"] for r in store_schemas()}:
+            die(f"schema '{schema}' already exists")
+        password = secrets.token_urlsafe(24)
+        _store_psql(f'CREATE ROLE "{schema}" LOGIN PASSWORD \'{password}\';')
+        _store_psql(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{schema}";')
+        print(f"Schema '{schema}' created.")
+        print(f"Role:     {schema}")
+        print(f"Password: {password}")
+        print("Shown once — a platform secret for the consuming service "
+              "(oaap.data.twin), never for an app (security requirement 2).")
+        return
+
+    if args.action == "drop":
+        schema = (args.arg1 or "").strip()
+        if not schema:
+            die("usage: oaap data store drop <schema> --yes")
+        if schema not in {r["schema"] for r in store_schemas()}:
+            die(f"no such schema '{schema}'")
+        if not args.yes:
+            die(f"dropping '{schema}' deletes its data permanently — "
+                "pass --yes to confirm. Nothing was changed.")
+        _store_psql(f'DROP SCHEMA "{schema}" CASCADE;')
+        _store_psql(f'DROP ROLE IF EXISTS "{schema}";')
+        print(f"Schema '{schema}' and its role dropped.")
+        return
+
+    if args.action == "copy":
+        schema = (args.arg1 or "").strip()
+        new_schema = (args.arg2 or "").strip()
+        if not schema or not new_schema:
+            die("usage: oaap data store copy <schema> <new-schema>")
+        # Every schema/role name reaches SQL as a quoted identifier
+        # built by f-string, not a parameter -- safe only because it is
+        # constrained first. 'schema' is checked below against what
+        # Postgres itself already lists (so it can only be a name a
+        # validated 'create' produced); 'new_schema' is fresh input and
+        # gets the same shape rule 'create' enforces.
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", new_schema):
+            die("new schema name must be lowercase letters/digits/"
+                "underscores, starting with a letter")
+        existing = {r["schema"] for r in store_schemas()}
+        if schema not in existing:
+            die(f"no such schema '{schema}'")
+        if new_schema in existing:
+            die(f"schema '{new_schema}' already exists")
+        size_kb = _schema_size_kb(schema)
+        free_kb = _store_free_kb()
+        if size_kb and free_kb < size_kb * 12 // 10:
+            die(f"not enough room to copy '{schema}' (~{size_kb // 1024} MB "
+                f"needed, {free_kb // 1024} MB free). Nothing was copied.")
+        dump = run(["docker", "exec", "-u", "postgres", STORE_CONTAINER,
+                    "pg_dump", "-n", schema, "postgres"]).stdout
+        # Postgres has no "copy this schema" command (spec 2.3): dump,
+        # rewrite the name inside the dump, restore under a NEW role.
+        # A rehearsal never inherits production credentials (RFC-0030
+        # D3 parity) -- so the role is created fresh, never reused.
+        rewritten = dump.replace(f'"{schema}"', f'"{new_schema}"')
+        password = secrets.token_urlsafe(24)
+        _store_psql(f'CREATE ROLE "{new_schema}" LOGIN PASSWORD \'{password}\';')
+        _store_psql(f'CREATE SCHEMA "{new_schema}" AUTHORIZATION "{new_schema}";')
+        run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
+             "psql", "-v", "ON_ERROR_STOP=1", "postgres"], input=rewritten)
+        print(f"Schema '{schema}' copied to '{new_schema}'.")
+        print(f"Role:     {new_schema}  (a DIFFERENT role than '{schema}' — "
+              "RFC-0030 D3 parity)")
+        print(f"Password: {password}")
+        return
+
+    if args.action == "restore":
+        dump_path = (args.arg1 or "").strip()
+        if not dump_path or not os.path.isfile(dump_path):
+            die("usage: oaap data store restore <dump-file> — file not found")
+        before = {r["schema"] for r in store_schemas()}
+        with open(dump_path, encoding="utf-8") as f:
+            text = f.read()
+        # Refuse rather than overwrite (spec 2.5): a restore must never
+        # clobber a schema a fresh install already produced.
+        clashes = sorted(s for s in before if f'"{s}"' in text or f" {s}." in text)
+        if clashes:
+            die("refusing to restore — these schemas already exist on "
+                "this node: " + ", ".join(clashes))
+        run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
+             "psql", "-v", "ON_ERROR_STOP=1", "postgres"], input=text)
+        after = {r["schema"] for r in store_schemas()} - before
+        print(f"Restored {len(after)} schema(s): " + ", ".join(sorted(after))
+              if after else "Restore ran; no new schema appeared — check "
+                            "the dump was for this store.")
+        return
+
+    die(f"unknown action '{args.action}'")
 
 
 def read_manifest_version(value):
@@ -8326,6 +8589,26 @@ def cmd_backup(args):
               "second copy of their production data (RFC-0030).")
     running = run(["docker", "ps", "-q", "--filter", "name=^oaap-app-"]).stdout.split()
     stage = tempfile.mkdtemp(prefix="oaap-backup-")
+    # The managed Postgres (oaap.data.store 0.1, spec 2.4): a DUMP, not
+    # a copy of its data directory -- a dump survives a Postgres
+    # major-version change across a relocation (RFC-0029 "Umzug"), a
+    # directory copy does not. Taken here, BEFORE the app-stop window
+    # below: 'store' is a platform service, not an app container (it is
+    # never in `running`, which only lists 'oaap-app-*'), and pg_dumpall
+    # is transactionally consistent against a live server -- no reason
+    # to make apps wait for it.
+    store_dumped = False
+    if has_profile("store") and _store_running():
+        try:
+            dump = run(["docker", "exec", "-u", "postgres", STORE_CONTAINER,
+                        "pg_dumpall"]).stdout
+            with open(os.path.join(stage, "store-dump.sql"), "w",
+                      encoding="utf-8") as f:
+                f.write(dump)
+            store_dumped = True
+        except subprocess.CalledProcessError:
+            pass  # caught by the completeness check below -- no archive
+                  # is written rather than one that silently lacks it.
     # `<name>.part.tar` rather than something ending in .tar.gz: a
     # half-written file must not be mistakable for an archive, least of
     # all by the tired eye at two in the morning.
@@ -8360,6 +8643,9 @@ def cmd_backup(args):
             with open(os.path.join(stage, "backup-manifest.json"), "w",
                       encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
+            stage_files = ["backup-manifest.json"]
+            if store_dumped:
+                stage_files.append("store-dump.sql")
             # No -z. Compression is CPU-bound and does not need the data
             # to hold still, so it happens after the apps are back.
             run(["tar", "--numeric-owner", "-cpf", tmp_tar,
@@ -8370,7 +8656,7 @@ def cmd_backup(args):
                  # The manifest still records them so the operator can
                  # set them again deliberately.
                  "--exclude=apps/node.json",
-                 "-C", stage, "backup-manifest.json",
+                 "-C", stage, *stage_files,
                  "-C", DATA_DIR, *paths])
             os.chmod(tmp_tar, 0o600)
         finally:
@@ -8408,12 +8694,20 @@ def cmd_backup(args):
         # survive the next move -- it cannot be satisfied by a path that
         # is merely spelled correctly.
         missing = _backup_missing_instances(tmp_out, reg)
-        if os.path.isfile(TENANT_LOG) and not missing:
+        # Same question asked of the managed Postgres (oaap.data.store
+        # 0.1, spec 2.4): a node profiled for it that fails to dump must
+        # not produce an archive that calls itself complete.
+        if has_profile("store") and not missing and not store_dumped:
+            missing = ["the managed Postgres (dump failed or 'store' "
+                       "was not running)"]
+        if not missing and (os.path.isfile(TENANT_LOG) or store_dumped):
             listing = subprocess.run(["tar", "-tzf", tmp_out], check=True,
-                                     text=True, capture_output=True).stdout
+                                     text=True, capture_output=True).stdout.split()
             rel = os.path.relpath(TENANT_LOG, DATA_DIR).replace(os.sep, "/")
-            if rel not in listing.split():
+            if os.path.isfile(TENANT_LOG) and rel not in listing:
                 missing = ["the tenant audit log"]
+            elif store_dumped and "store-dump.sql" not in listing:
+                missing = ["the managed-Postgres dump"]
         if missing:
             reason = ("incomplete -- missing the data of: "
                       + ", ".join(missing))
@@ -9062,6 +9356,20 @@ def main():
     pn.add_argument("profile", nargs="?",
                     help="node profile, e.g. dev (RFC-0011)")
     pn.set_defaults(fn=cmd_node)
+    pdt = sub.add_parser("data",
+                         help="managed Postgres and other data-platform "
+                              "services (oaap.data.store 0.1, RFC-0031)")
+    pdt.add_argument("object", choices=["store"])
+    pdt.add_argument("action", choices=["status", "schemas", "create",
+                                        "copy", "drop", "restore"])
+    pdt.add_argument("arg1", nargs="?",
+                     help="create: purpose; copy/drop: schema; "
+                          "restore: dump file")
+    pdt.add_argument("arg2", nargs="?",
+                     help="create: tenant-id; copy: new schema name")
+    pdt.add_argument("--yes", action="store_true",
+                     help="drop: confirm — deletes the schema permanently")
+    pdt.set_defaults(fn=cmd_data)
     pe = sub.add_parser("external")
     pe.add_argument("action", choices=["show", "set", "remove"])
     pe.add_argument("hostname", nargs="?")

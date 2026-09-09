@@ -2584,6 +2584,9 @@ PROFILE_LABELS = {
     "exposed": "Exponierter Knoten — der Betreiber darf einer App einen "
                "Nicht-HTTP-Port am Gateway vorbei freigeben (RFC-0015). "
                "Sinnvoll nur, wo die Portweiterleitung des Routers steht.",
+    "store": "Datenplattform-Knoten — trägt das verwaltete Postgres von "
+             "oaap.data.store (RFC-0031 Schritt 1). Ohne dieses Profil "
+             "sind Digitaler Zwilling und Typregister hier nicht verfügbar.",
 }
 
 

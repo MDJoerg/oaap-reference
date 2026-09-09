@@ -136,6 +136,7 @@ case "$cmd" in
   app)         exec python3 "$APP_DIR/appctl.py" "$@" ;;
   store)       exec python3 "$APP_DIR/appctl.py" store "$@" ;;
   node)        exec python3 "$APP_DIR/appctl.py" node "$@" ;;
+  data)        exec python3 "$APP_DIR/appctl.py" data "$@" ;;
   external)    exec python3 "$APP_DIR/appctl.py" external "$@" ;;
   edge)        exec python3 "$APP_DIR/appctl.py" edge "$@" ;;
   backup)      exec python3 "$APP_DIR/appctl.py" backup "$@" ;;
@@ -146,5 +147,5 @@ case "$cmd" in
   tenant)      exec python3 "$APP_DIR/appctl.py" tenant "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)      exec bash "$APP_DIR/update.sh" "$@" ;;
-  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|rename|remove|purge|visibility|tile|config|address|throttle|rehearse|rehearsal ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source|enable|disable|trust|rename|reconcile ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|machine add|list ...|key issue|list|revoke ...|fleet key issue|list|revoke <label>|tenant list|show|check|log|create|rename|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|rename|remove|purge|visibility|tile|config|address|throttle|rehearse|rehearsal ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source|enable|disable|trust|rename|reconcile ...|data store status|schemas|create|copy|drop|restore ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|machine add|list ...|key issue|list|revoke ...|fleet key issue|list|revoke <label>|tenant list|show|check|log|create|rename|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac
