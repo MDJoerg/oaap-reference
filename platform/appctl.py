@@ -392,7 +392,9 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 2      # 0.2 adds app.class (runtime spec 2.10)
+MANIFEST_MINOR = 3      # 0.2 adds app.class (runtime spec 2.10);
+                        # 0.3 adds data_model/contributes/consumes
+                        # (RFC-0031 Schritt 2, oaap.data.model 0.1)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -432,6 +434,21 @@ def instance_class(inst):
 # rather than installed half-understood. Empty on purpose: the names
 # reserved in RFC-0012 §8.3 land here as they are actually implemented.
 MANIFEST_FEATURES = set()
+
+# --------------------------------------------- oaap.data.model (RFC-0031 §4/§5)
+#
+# The manifest's 'data_model' section names five kinds of type. A type
+# key is PascalCase-ish like the RFC-0031 §5 examples (Customer, VatId,
+# isContactOf); a GROUP type key is dotted-lowercase instead
+# ('crm.core', 'raci.assignments') so it reads as <namespace>.<name> on
+# the object page (§3.3) -- the one kind with a different shape because
+# it is the one kind an app author is expected to prefix by hand.
+MODEL_KINDS = ("object_types", "attribute_types", "group_types",
+              "relation_types", "activity_types")
+MODEL_VALUE_TYPES = ("text", "int", "decimal", "bool", "date", "datetime",
+                     "enum", "ref")
+_MODEL_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+_MODEL_GROUP_KEY_RE = re.compile(r"[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+")
 
 
 def die(msg):
@@ -2013,14 +2030,16 @@ def _store_free_kb():
 
 
 def cmd_data(args):
-    """'oaap data store ...' — the managed Postgres (oaap.data.store 0.1).
+    """'oaap data store|model ...' — the managed Postgres (oaap.data.store
+    0.1) and the type registry built on it (oaap.data.model 0.1).
 
     Nested like 'oaap fleet key ...': a top-level verb ('data') meant to
-    carry oaap.data.model and oaap.data.twin too once they exist, an
-    object ('store' today), and an action.
+    carry oaap.data.twin too once it exists, an object, and an action.
     """
+    if args.object == "model":
+        return cmd_data_model(args)
     if args.object != "store":
-        die(f"unknown object '{args.object}' — available: store")
+        die(f"unknown object '{args.object}' — available: store, model")
 
     if args.action == "status":
         if not has_profile("store"):
@@ -2190,6 +2209,107 @@ def cmd_data(args):
     die(f"unknown action '{args.action}'")
 
 
+def cmd_data_model(args):
+    """'oaap data model ...' — the type registry (oaap.data.model 0.1).
+
+    Every action needs the store the registry's tables actually live
+    in (spec §2.1): a node without the profile, or with the profile but
+    the service not running, gets the same two-step refusal 'store'
+    itself uses -- never a raw docker/psql error.
+    """
+    if args.action not in ("types", "show", "register", "alias", "bindings"):
+        die(f"unknown action '{args.action}' for 'data model' — available: "
+            "types, show, register, alias, bindings")
+    if not has_profile("store"):
+        die("this node has no profile 'store' — the model registry lives "
+            "in it (oaap.data.model 0.1 §2.1). Add it first: "
+            "'sudo oaap node add-profile store'.")
+    if not _store_running():
+        die(f"the '{STORE_CONTAINER}' service is not running — see "
+            "'oaap data store status'.")
+
+    if args.action == "types":
+        rows = model_types(tenant_id=args.tenant or None)
+        if not rows:
+            print("No types registered."
+                  + (f" (activated for tenant '{args.tenant}')" if args.tenant else ""))
+            return
+        for t in rows:
+            aliases = f"  aliases={','.join(t['aliases'])}" if t["aliases"] else ""
+            print(f"{t['key']}  kind={t['kind']}  origin={t['origin']}  "
+                  f"package={t['package']}  version={t['version']}{aliases}")
+        return
+
+    if args.action == "show":
+        key = (args.arg1 or "").strip()
+        if not key:
+            die("usage: oaap data model show <type-key>")
+        rec = model_show(key)
+        if not rec:
+            die(f"no such type '{key}' — see 'oaap data model types'")
+        print(f"{rec['key']}  kind={rec['kind']}  origin={rec['origin']}  "
+              f"package={rec['package']}  version={rec['version']}")
+        print(f"aliases:           {', '.join(rec['aliases']) or '(none)'}")
+        print(f"activated tenants: {', '.join(rec['activated_tenants']) or '(none)'}")
+        print(f"definition:        {json.dumps(rec['definition'])}")
+        return
+
+    if args.action == "register":
+        # The tenant's own CLI stand-in for the twin browser (Schritt 5,
+        # RFC-0031 §4 third origin) -- one type, one kind, one file, until
+        # the browser exists. 'kind' is read from the file itself so the
+        # same shape used under a manifest's data_model.<kind> works here
+        # unchanged: {"kind": "object_types", "key": ..., ...}.
+        path = (args.arg1 or "").strip()
+        tenant_id = (args.tenant or "").strip()
+        if not path or not tenant_id:
+            die("usage: oaap data model register <definition-file.yaml> "
+                "--tenant <tenant-id>")
+        if tenant_id not in load_tenants():
+            die(f"unknown tenant '{tenant_id}' — 'oaap tenant list' shows the IDs")
+        try:
+            with open(path, encoding="utf-8") as f:
+                entry = yaml.safe_load(f) or {}
+        except OSError as e:
+            die(f"cannot read '{path}': {e}")
+        kind = entry.pop("kind", None)
+        if kind not in MODEL_KINDS:
+            die(f"'{path}': top-level 'kind' must be one of {', '.join(MODEL_KINDS)}")
+        errs = validate_data_model_sections({"data_model": {kind: [entry]}})
+        if errs:
+            die("definition invalid:\n  - " + "\n  - ".join(errs))
+        model_register_data_model("tenant", tenant_id, "1.0.0",
+                                  {kind: [entry]}, tenant_id=tenant_id)
+        print(f"Type '{entry['key']}' registered (origin: tenant, "
+              f"tenant: {tenant_id}) and activated for that tenant.")
+        return
+
+    if args.action == "alias":
+        key = (args.arg1 or "").strip()
+        alias = (args.arg2 or "").strip()
+        if not key or not alias:
+            die("usage: oaap data model alias <type-key> <word>")
+        model_add_alias(key, alias)
+        print(f"Alias '{alias}' added for '{key}'.")
+        return
+
+    if args.action == "bindings":
+        instance = (args.arg1 or "").strip()
+        if not instance:
+            die("usage: oaap data model bindings <instance>")
+        rows = model_bindings_of(instance)
+        if not rows:
+            print(f"No bindings recorded for '{instance}'.")
+            return
+        for b in rows:
+            extra = (f"  group={b['group_key']}" if b["group_key"]
+                     else f"  fields={','.join(b['fields'])}" if b["fields"] else "")
+            print(f"{b['direction']:11}  {b['type_key']}"
+                  f"{'  as=' + b['declared_as'] if b['declared_as'] else ''}"
+                  f"{'  role=' + b['role'] if b['role'] else ''}{extra}")
+        return
+
+
 def read_manifest_version(value):
     """Read 'oaap_manifest' tolerantly. Returns (minor, error).
 
@@ -2331,8 +2451,437 @@ def validate_manifest(m):
                         "app has more than one service")
     if not str((m.get("health") or {}).get("path", "")).startswith("/"):
         errs.append("health.path: required, must start with /")
+    errs.extend(validate_data_model_sections(m))
     if errs:
         die("manifest invalid:\n  - " + "\n  - ".join(errs))
+
+
+def validate_data_model_sections(m):
+    """Structural checks for 'data_model'/'contributes'/'consumes'
+    (manifest 0.3, RFC-0031 §5, oaap.data.model 0.1 §2.2). Pure — no
+    registry lookup here; whether a 'type:' word actually RESOLVES to
+    something is a binding-time question (§2.4), answered only on a
+    node that carries the store, at install.
+
+    Returns a list of error strings (empty = valid); the caller decides
+    what to do with them, same shape as every other manifest.py check
+    in validate_manifest above.
+    """
+    errs = []
+    dm = m.get("data_model") or {}
+    if dm and not isinstance(dm, dict):
+        return ["data_model: mapping expected"]
+    for kind in MODEL_KINDS:
+        for entry in dm.get(kind) or []:
+            if not isinstance(entry, dict):
+                errs.append(f"data_model.{kind}: each entry must be a mapping")
+                continue
+            key = str(entry.get("key", ""))
+            key_re = _MODEL_GROUP_KEY_RE if kind == "group_types" else _MODEL_KEY_RE
+            if not key or not key_re.fullmatch(key):
+                errs.append(f"data_model.{kind}: key '{key}' invalid "
+                            + ("(dotted lowercase, e.g. 'crm.core')" if kind == "group_types"
+                               else "([A-Za-z][A-Za-z0-9]*)"))
+            if kind == "attribute_types" and entry.get("value_type") not in MODEL_VALUE_TYPES:
+                errs.append(f"data_model.attribute_types.{key}: value_type must be one "
+                            f"of {' | '.join(MODEL_VALUE_TYPES)}")
+            if kind == "group_types" and not str(entry.get("on", "")).strip():
+                errs.append(f"data_model.group_types.{key}: 'on' (the object type it "
+                            "belongs to) is required")
+            if kind == "relation_types":
+                if not str(entry.get("from", "")).strip() or not str(entry.get("to", "")).strip():
+                    errs.append(f"data_model.relation_types.{key}: 'from' and 'to' "
+                                "(object type keys) are required")
+    for i, c in enumerate(m.get("contributes") or []):
+        if not str((c or {}).get("type", "")).strip():
+            errs.append(f"contributes[{i}]: 'type' is required")
+        role = (c or {}).get("role", "owner")
+        if role not in ("owner", "contributor"):
+            errs.append(f"contributes[{i}]: role must be owner | contributor")
+        if role == "contributor" and not str((c or {}).get("group", "")).strip():
+            errs.append(f"contributes[{i}]: role 'contributor' requires a 'group'")
+    for i, c in enumerate(m.get("consumes") or []):
+        if not str((c or {}).get("type", "")).strip():
+            errs.append(f"consumes[{i}]: 'type' is required")
+    return errs
+
+
+def declaration_text(contributes, consumes):
+    """The sentence RFC-0031 D7 asks to be shown before an install with
+    data-region declarations proceeds -- built from the manifest ALONE
+    (no registry lookup), so it must be produced even on a node without
+    the store (oaap.data.model 0.1 §2.7). '' when neither section says
+    anything, so the caller can skip printing rather than print silence.
+    """
+    def join_and(words):
+        words = list(words)
+        if not words:
+            return ""
+        if len(words) == 1:
+            return words[0]
+        return ", ".join(words[:-1]) + " and " + words[-1]
+
+    consumes = consumes or []
+    contributes = contributes or []
+    parts = []
+    reads = [str(c.get("type", "?")) for c in consumes]
+    if reads:
+        parts.append(f"reads {join_and(reads)}")
+    writes = []
+    for c in contributes:
+        t = str(c.get("type", "?"))
+        if c.get("role") == "contributor" and c.get("group"):
+            writes.append(f"{t} (contributor: {c['group']})")
+        else:
+            writes.append(t)
+    if writes:
+        parts.append(f"writes into {join_and(writes)}")
+    if not parts:
+        return ""
+    return "this app " + " and ".join(parts) + "."
+
+
+def type_change_kind(old, new):
+    """Compare two versions of the SAME type's definition (RFC-0031 §4,
+    D2; oaap.data.model 0.1 §2.5). Returns 'unchanged' | 'additive' |
+    'destructive'. Pure -- no registry access, so this is testable
+    without a node at all.
+
+    'old'/'new' are the entry mappings as they appear under one
+    data_model.<kind> list (e.g. one object_types entry, one
+    group_types entry). List-valued fields (a group type's own
+    attributes/relations/activities) may only GROW; every other change
+    to a value already present is destructive, on the conservative
+    reading described in the spec (0.1 has no twin yet to ask whether
+    a removed member actually has instances).
+    """
+    if old == new:
+        return "unchanged"
+    list_fields = ("attributes", "relations", "activities")
+    scalar_old = {k: v for k, v in old.items() if k not in list_fields}
+    scalar_new = {k: v for k, v in new.items() if k not in list_fields}
+    for k, v in scalar_old.items():
+        if k in ("title", "title_plural", "description", "tags"):
+            continue  # presentation only -- never destructive
+        if k not in scalar_new or scalar_new[k] != v:
+            return "destructive"
+    for field in list_fields:
+        old_members = set(old.get(field) or [])
+        new_members = set(new.get(field) or [])
+        if not old_members <= new_members:
+            return "destructive"
+    return "additive" if new != old else "unchanged"
+
+
+def bind_candidates(word, type_index):
+    """Which registered type key(s) match a manifest 'type:'/'as:' word
+    (RFC-0031 D4; oaap.data.model 0.1 §2.4). Pure -- 'type_index' is
+    [{"key": ..., "aliases": [...]}, ...], already read from the
+    registry by the caller, so this resolution logic is testable
+    without Postgres.
+
+    An exact (case-insensitive) key match wins outright, even if the
+    same word is ALSO someone's alias elsewhere -- the platform's own
+    name for a type is never ambiguous with a nickname. Otherwise every
+    case-insensitive alias match is a candidate; zero or more than one
+    is what the caller turns into a refusal.
+    """
+    word_l = word.strip().lower()
+    for t in type_index:
+        if t["key"].lower() == word_l:
+            return [t["key"]]
+    return sorted({t["key"] for t in type_index
+                   for a in t.get("aliases", []) if a.lower() == word_l})
+
+
+# ------------------------------------------------ oaap.data.model (Postgres)
+#
+# Four tables in schema 'oaap_model' of the SAME store oaap.data.store
+# already manages -- this capability has no infrastructure of its own
+# (spec §2.1). Every function below is a thin, single-purpose wrapper
+# around _store_psql; the actual decisions (does this change conflict,
+# does this word resolve) are the pure functions above, so they can be
+# tested without Docker at all -- only these need a running store.
+MODEL_SCHEMA = "oaap_model"
+
+
+def _sql_lit(value):
+    """A single-quoted SQL string literal. Safe under
+    'standard_conforming_strings = on', Postgres's default since 9.1
+    and unchanged by the pgvector image -- the only escaping this
+    file's f-string SQL needs anywhere (see _store_psql call sites)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _model_ensure_schema():
+    """Idempotent -- called before every read or write below, same
+    posture as CREATE SCHEMA/TABLE IF NOT EXISTS everywhere else in
+    this file. No migration framework needed for four tables that only
+    ever gain columns one at a time, by hand, like the rest of appctl."""
+    _store_psql("""
+        CREATE SCHEMA IF NOT EXISTS oaap_model;
+        CREATE TABLE IF NOT EXISTS oaap_model.type_definitions (
+            key text PRIMARY KEY,
+            kind text NOT NULL,
+            origin text NOT NULL,
+            package text NOT NULL,
+            version text NOT NULL,
+            definition text NOT NULL,
+            registered_at timestamptz NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS oaap_model.type_aliases (
+            type_key text NOT NULL REFERENCES oaap_model.type_definitions(key)
+                ON DELETE CASCADE,
+            alias text NOT NULL,
+            PRIMARY KEY (type_key, alias)
+        );
+        CREATE TABLE IF NOT EXISTS oaap_model.activations (
+            tenant_id text NOT NULL,
+            type_key text NOT NULL REFERENCES oaap_model.type_definitions(key)
+                ON DELETE CASCADE,
+            activated_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (tenant_id, type_key)
+        );
+        CREATE TABLE IF NOT EXISTS oaap_model.bindings (
+            instance text NOT NULL,
+            type_key text NOT NULL REFERENCES oaap_model.type_definitions(key)
+                ON DELETE CASCADE,
+            direction text NOT NULL,
+            declared_as text NOT NULL DEFAULT '',
+            role text NOT NULL DEFAULT '',
+            group_key text NOT NULL DEFAULT '',
+            fields text NOT NULL DEFAULT '',
+            bound_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (instance, type_key, direction)
+        );
+    """)
+
+
+def model_types(tenant_id=None):
+    """[{key, kind, origin, package, version, aliases: [...]}, ...] --
+    all registered types, or only those activated for one tenant."""
+    _model_ensure_schema()
+    if tenant_id:
+        rows = _store_psql(
+            "SELECT d.key, d.kind, d.origin, d.package, d.version "
+            "FROM oaap_model.type_definitions d "
+            "JOIN oaap_model.activations a ON a.type_key = d.key "
+            f"WHERE a.tenant_id = {_sql_lit(tenant_id)} ORDER BY d.key"
+        ).stdout
+    else:
+        rows = _store_psql(
+            "SELECT key, kind, origin, package, version "
+            "FROM oaap_model.type_definitions ORDER BY key"
+        ).stdout
+    out = []
+    for line in rows.splitlines():
+        if not line.strip():
+            continue
+        key, kind, origin, package, version = line.split("|")
+        out.append({"key": key, "kind": kind, "origin": origin,
+                    "package": package, "version": version,
+                    "aliases": _model_aliases_of(key)})
+    return out
+
+
+def _model_aliases_of(type_key):
+    out = _store_psql(
+        "SELECT alias FROM oaap_model.type_aliases WHERE type_key = "
+        f"{_sql_lit(type_key)} ORDER BY alias"
+    ).stdout
+    return [a for a in (l.strip() for l in out.splitlines()) if a]
+
+
+def model_type_index():
+    """[{"key":, "aliases": [...]}, ...] for bind_candidates() -- one
+    query pass, not one alias lookup per candidate."""
+    _model_ensure_schema()
+    keys = _store_psql("SELECT key FROM oaap_model.type_definitions ORDER BY key").stdout
+    return [{"key": k, "aliases": _model_aliases_of(k)}
+            for k in (l.strip() for l in keys.splitlines()) if k]
+
+
+def model_show(type_key):
+    """One type's full record, or None -- kind/origin/package/version/
+    definition (parsed back to a dict)/aliases/activated tenants."""
+    _model_ensure_schema()
+    out = _store_psql(
+        "SELECT kind, origin, package, version, definition FROM "
+        f"oaap_model.type_definitions WHERE key = {_sql_lit(type_key)}"
+    ).stdout.strip()
+    if not out:
+        return None
+    kind, origin, package, version, definition = out.split("|", 4)
+    tenants = _store_psql(
+        "SELECT tenant_id FROM oaap_model.activations WHERE type_key = "
+        f"{_sql_lit(type_key)} ORDER BY tenant_id"
+    ).stdout
+    return {"key": type_key, "kind": kind, "origin": origin, "package": package,
+            "version": version, "definition": json.loads(definition),
+            "aliases": _model_aliases_of(type_key),
+            "activated_tenants": [t for t in (l.strip() for l in tenants.splitlines()) if t]}
+
+
+def model_add_alias(type_key, alias):
+    _model_ensure_schema()
+    if not _store_psql(f"SELECT 1 FROM oaap_model.type_definitions "
+                       f"WHERE key = {_sql_lit(type_key)}").stdout.strip():
+        die(f"no such type '{type_key}' — see 'oaap data model types'")
+    _store_psql(
+        f"INSERT INTO oaap_model.type_aliases (type_key, alias) "
+        f"VALUES ({_sql_lit(type_key)}, {_sql_lit(alias)}) "
+        "ON CONFLICT (type_key, alias) DO NOTHING;")
+
+
+def model_register_data_model(origin, package, version, data_model, tenant_id=None):
+    """Register every entry of a 'data_model' section (spec §2.3).
+    All-or-nothing: every entry is checked against the registry BEFORE
+    any is written, so a conflict on entry five of six never leaves
+    the first four registered on their own. Dies (via die()) naming the
+    offending entry on any ownership violation or destructive change.
+
+    tenant_id is set only for the CLI 'register' action (§2.3's
+    tenant-origin case, where 'package' is the tenant-id itself); an
+    app install passes None -- app-origin types are node-wide from the
+    start (D2), never scoped to one tenant at registration time.
+    """
+    _model_ensure_schema()
+    plan = []  # [(kind, key, action, entry)]
+    for kind in MODEL_KINDS:
+        for entry in data_model.get(kind) or []:
+            key = entry["key"]
+            existing = _store_psql(
+                "SELECT origin, definition FROM oaap_model.type_definitions "
+                f"WHERE key = {_sql_lit(key)}"
+            ).stdout.strip()
+            if not existing:
+                plan.append((kind, key, "create", entry))
+                continue
+            ex_origin, ex_def = existing.split("|", 1)
+            if ex_origin != origin:
+                die(f"data_model.{kind}.{key}: already registered by "
+                    f"'{ex_origin}' — an app cannot alter a type it does "
+                    "not own (RFC-0031 D1)")
+            change = type_change_kind(json.loads(ex_def), entry)
+            if change == "destructive":
+                die(f"data_model.{kind}.{key}: this change removes or "
+                    "redefines part of a type already registered "
+                    "(oaap.data.model 0.1 §2.5) — refused. 0.1 has no "
+                    "twin yet to ask whether the removed part has "
+                    "instances, so every destructive change is refused "
+                    "unconditionally; add the new shape under a "
+                    "different key instead.")
+            plan.append((kind, key, change, entry))
+    for kind, key, action, entry in plan:
+        if action == "create":
+            _store_psql(
+                "INSERT INTO oaap_model.type_definitions "
+                "(key, kind, origin, package, version, definition) VALUES ("
+                f"{_sql_lit(key)}, {_sql_lit(kind)}, {_sql_lit(origin)}, "
+                f"{_sql_lit(package)}, {_sql_lit(version)}, "
+                f"{_sql_lit(json.dumps(entry))});")
+        elif action == "additive":
+            _store_psql(
+                "UPDATE oaap_model.type_definitions SET version = "
+                f"{_sql_lit(version)}, definition = {_sql_lit(json.dumps(entry))} "
+                f"WHERE key = {_sql_lit(key)};")
+        # 'unchanged' -- nothing to write
+    if tenant_id:
+        for _, key, _, _ in plan:
+            _store_psql(
+                "INSERT INTO oaap_model.activations (tenant_id, type_key) "
+                f"VALUES ({_sql_lit(tenant_id)}, {_sql_lit(key)}) "
+                "ON CONFLICT DO NOTHING;")
+    return plan
+
+
+def model_bind_declarations(instance, tenant_id, contributes, consumes, explicit=None):
+    """Bind every contributes/consumes entry to a registered type,
+    activate it for tenant_id, record the binding (spec §2.4).
+
+    'explicit' is {manifest-word: platform-key} from '--bind' -- checked
+    first, so an operator's answer to an earlier refusal always wins
+    over automatic matching. Dies listing every entry that still has
+    zero or more than one candidate, so ALL problems are shown at once
+    rather than one refusal per re-run.
+    """
+    explicit = explicit or {}
+    index = model_type_index()
+    known = {t["key"] for t in index}
+    resolved = []   # (direction, entry, type_key)
+    problems = []
+    for entry in contributes or []:
+        word = entry["type"]
+        key = explicit.get(word)
+        if key and key not in known:
+            problems.append(f"contributes '{word}': --bind names unknown type '{key}'")
+            continue
+        if not key:
+            cands = bind_candidates(word, index)
+            if len(cands) == 1:
+                key = cands[0]
+            else:
+                problems.append(f"contributes '{word}': "
+                                 + (f"{len(cands)} candidates ({', '.join(cands)})"
+                                    if cands else "no matching registered type")
+                                 + f" — resolve with --bind {word}=<type-key>")
+                continue
+        resolved.append(("contributes", entry, key))
+    for entry in consumes or []:
+        word = entry.get("as") or entry["type"]
+        match_word = entry["type"]
+        key = explicit.get(word) or explicit.get(match_word)
+        if key and key not in known:
+            problems.append(f"consumes '{match_word}': --bind names unknown type '{key}'")
+            continue
+        if not key:
+            cands = bind_candidates(match_word, index)
+            if len(cands) == 1:
+                key = cands[0]
+            else:
+                problems.append(f"consumes '{match_word}': "
+                                 + (f"{len(cands)} candidates ({', '.join(cands)})"
+                                    if cands else "no matching registered type")
+                                 + f" — resolve with --bind {match_word}=<type-key>")
+                continue
+        resolved.append(("consumes", entry, key))
+    if problems:
+        die("data-model binding failed:\n  - " + "\n  - ".join(problems))
+    for direction, entry, key in resolved:
+        _store_psql(
+            "INSERT INTO oaap_model.activations (tenant_id, type_key) VALUES "
+            f"({_sql_lit(tenant_id)}, {_sql_lit(key)}) ON CONFLICT DO NOTHING;")
+        _store_psql(
+            "INSERT INTO oaap_model.bindings "
+            "(instance, type_key, direction, declared_as, role, group_key, fields) "
+            f"VALUES ({_sql_lit(instance)}, {_sql_lit(key)}, {_sql_lit(direction)}, "
+            f"{_sql_lit(entry.get('as', ''))}, {_sql_lit(entry.get('role', ''))}, "
+            f"{_sql_lit(entry.get('group', ''))}, "
+            f"{_sql_lit(','.join(entry.get('fields') or []))}) "
+            "ON CONFLICT (instance, type_key, direction) DO UPDATE SET "
+            "declared_as = EXCLUDED.declared_as, role = EXCLUDED.role, "
+            "group_key = EXCLUDED.group_key, fields = EXCLUDED.fields, "
+            "bound_at = now();")
+    return resolved
+
+
+def model_bindings_of(instance):
+    _model_ensure_schema()
+    out = _store_psql(
+        "SELECT type_key, direction, declared_as, role, group_key, fields "
+        f"FROM oaap_model.bindings WHERE instance = {_sql_lit(instance)} "
+        "ORDER BY direction, type_key"
+    ).stdout
+    rows = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        type_key, direction, declared_as, role, group_key, fields = line.split("|")
+        rows.append({"type_key": type_key, "direction": direction,
+                    "declared_as": declared_as, "role": role,
+                    "group_key": group_key,
+                    "fields": fields.split(",") if fields else []})
+    return rows
 
 
 def image_uid(image):
@@ -3790,6 +4339,38 @@ def _install_from_dir(pkg, args, source):
     # is, least of all its expiry date.
     rehearsal = (getattr(args, "rehearsal", None)
                  or ((inst or {}).get("rehearsal") if inst else None))
+
+    # ---------------------------------------------- oaap.data.model (RFC-0031
+    # Schritt 2, manifest 0.3): registration and binding happen HERE, before
+    # any image is built or pulled, so a refusal (an ownership conflict, a
+    # destructive change, an unresolved binding) leaves nothing built. This
+    # is the ONE place every install path (local dir, Git, uploaded ZIP,
+    # remote deploy hook) passes through -- see _install_from_dir's callers.
+    dm_section = m.get("data_model")
+    contributes = m.get("contributes") or []
+    consumes = m.get("consumes") or []
+    if dm_section or contributes or consumes:
+        text = declaration_text(contributes, consumes)
+        if text:
+            print(f"NOTE (RFC-0031 D7): {text}")
+        if has_profile("store") and _store_running():
+            model_tenant = tenant_for_new_instance(inst, permit={"tenant": chosen_tenant})
+            if dm_section:
+                model_register_data_model(f"app:{app['id']}", app["id"],
+                                          app["version"], dm_section)
+            if contributes or consumes:
+                explicit_bind = {}
+                for pair in (getattr(args, "bind", None) or []):
+                    word, _, key = pair.partition("=")
+                    if word and key:
+                        explicit_bind[word] = key
+                model_bind_declarations(name, model_tenant, contributes, consumes,
+                                        explicit=explicit_bind)
+        else:
+            print("NOTE: this node has no working 'store' (RFC-0011 profile, "
+                  "or the service is not running) -- installing anyway, but "
+                  "this app's data-model declarations were NOT registered or "
+                  "bound (oaap.data.model 0.1 §2.1).")
 
     # RFC-0016: an app may have several services, each its own container.
     # The PRIMARY service is the one serving "/" (or the first route, or
@@ -9146,6 +9727,10 @@ def main():
                     help="tenant label for a NEW instance (default: this "
                          "node's own). Ignored on a redeploy — an instance "
                          "never changes tenant")
+    pi.add_argument("--bind", action="append", default=[], metavar="WORD=TYPE",
+                    help="resolve a 'contributes'/'consumes' entry the "
+                         "registry could not match on its own (oaap.data."
+                         "model 0.1 §2.4) — repeatable")
     pi.set_defaults(fn=cmd_install)
     pl = sub.add_parser("list")
     pl.set_defaults(fn=cmd_list)
@@ -9393,18 +9978,26 @@ def main():
                     help="node profile, e.g. dev (RFC-0011)")
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
-                         help="managed Postgres and other data-platform "
-                              "services (oaap.data.store 0.1, RFC-0031)")
-    pdt.add_argument("object", choices=["store"])
+                         help="managed Postgres, type registry and other "
+                              "data-platform services (oaap.data.store 0.1, "
+                              "oaap.data.model 0.1, RFC-0031)")
+    pdt.add_argument("object", choices=["store", "model"])
     pdt.add_argument("action", choices=["status", "schemas", "create",
-                                        "copy", "drop", "restore"])
+                                        "copy", "drop", "restore",
+                                        "types", "show", "register",
+                                        "alias", "bindings"])
     pdt.add_argument("arg1", nargs="?",
-                     help="create: purpose; copy/drop: schema; "
-                          "restore: dump file")
+                     help="create: purpose; copy/drop: schema; restore: "
+                          "dump file; model show/register/alias: type key "
+                          "or definition file; model bindings: instance")
     pdt.add_argument("arg2", nargs="?",
-                     help="create: tenant-id; copy: new schema name")
+                     help="create: tenant-id; copy: new schema name; "
+                          "model alias: the alias word")
     pdt.add_argument("--yes", action="store_true",
                      help="drop: confirm — deletes the schema permanently")
+    pdt.add_argument("--tenant", default="",
+                     help="model types/register: tenant-id (RFC-0031 §4 "
+                          "third origin — the twin browser's CLI stand-in)")
     pdt.set_defaults(fn=cmd_data)
     pe = sub.add_parser("external")
     pe.add_argument("action", choices=["show", "set", "remove"])
@@ -9427,8 +10020,11 @@ def main():
                  or (args.cmd == "store" and args.action == "list")
                  # `data store status`/`schemas` only read (oaap.data.store
                  # 0.1) -- create/copy/drop/restore change the node and
-                 # need root like everything else that does.
-                 or (args.cmd == "data" and args.action in ("status", "schemas"))
+                 # need root like everything else that does. `data model
+                 # types`/`show`/`bindings` are the same shape one level up
+                 # (oaap.data.model 0.1) -- register/alias change the node.
+                 or (args.cmd == "data" and args.action in
+                     ("status", "schemas", "types", "show", "bindings"))
                  # `tenant` reads without root — including `check`, which
                  # reports and deliberately repairs nothing. Creating and
                  # renaming change the node and need root like everything

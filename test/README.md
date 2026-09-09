@@ -29,6 +29,7 @@ python3 test/test_rehearsal_shape.py
 python3 test/test_rehearsal_data.py
 python3 test/test_rehearsal_page.py  # braucht jinja2
 python3 test/test_data_store.py
+python3 test/test_data_model.py
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -120,3 +121,18 @@ Befehle, nicht einer. Was diese Datei **nicht** prüfen kann, weil es
 ein echtes Postgres bräuchte — dass `create`/`copy`/`drop`/`restore`
 tatsächlich ein Schema anlegen, kopieren, löschen oder wiederherstellen
 — gehört auf `oaap-test`, wie bei `klicktest.py`.
+
+`test_data_model.py` hält das **Typregister** fest (`oaap.data.model`
+0.1, RFC-0031 Schritt 2) — ebenfalls ohne Docker: die additiv/
+destruktiv-Unterscheidung zweier Versionen desselben Typs (rein in
+Python, ohne Registry), die Bindungslogik (ein Wort trifft genau einen
+Schlüssel oder eine Mehrdeutigkeit wird gezeigt, nie erraten — ein
+exakter Schlüsseltreffer gewinnt dabei immer, auch wenn dasselbe Wort
+anderswo ein Alias ist), der Klartext-Satz (RFC-0031 D7, allein aus dem
+Manifest gebaut, ohne Store), die Toleranz von Manifest 0.3 (kein
+`must_understand`) und dass die Installation an **genau einer** Stelle
+(`_install_from_dir`) in das Register greift, vor jedem `docker
+build`/`pull`. Was diese Datei **nicht** prüfen kann — dass
+`register`/`alias`/`types`/`show`/`bindings` wirklich Zeilen in
+Postgres lesen und schreiben, und dass eine echte Installation
+tatsächlich registriert und bindet — gehört auf `oaap-test`.

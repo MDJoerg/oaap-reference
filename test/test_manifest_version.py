@@ -66,13 +66,21 @@ def with_class(value, version="0.2"):
     return doc
 
 
+# Read from the platform's own constants, not hardcoded -- a hardcoded
+# "0.3 is newer" broke the moment MANIFEST_MINOR itself reached 3
+# (oaap.data.model 0.1, RFC-0031 Schritt 2). This is the same class of
+# drift the PROFILE_LABELS parity test was fixed for on 2026-08-24.
+OWN = f"{appctl.MANIFEST_MAJOR}.{appctl.MANIFEST_MINOR}"
+NEWER = f"{appctl.MANIFEST_MAJOR}.{appctl.MANIFEST_MINOR + 1}"
+MUCH_NEWER = f"{appctl.MANIFEST_MAJOR}.{appctl.MANIFEST_MINOR + 7}"
+
 case("today's 0.1 manifest installs", manifest(), True)
-case("0.2 is this platform's own version, so no note",
-     manifest(oaap_manifest="0.2"), True,
+case(f"{OWN} is this platform's own version, so no note",
+     manifest(oaap_manifest=OWN), True,
      unwanted_text="newer than this platform")
-case("a newer MINOR is read, with a note", manifest(oaap_manifest="0.3"),
+case("a newer MINOR is read, with a note", manifest(oaap_manifest=NEWER),
      True, "newer than this platform")
-case("a much newer MINOR is still read", manifest(oaap_manifest="0.9"),
+case("a much newer MINOR is still read", manifest(oaap_manifest=MUCH_NEWER),
      True, "newer than this platform")
 case("an unknown field is ignored, not refused",
      manifest(depends=["some-data-model"]), True)
