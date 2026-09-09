@@ -2029,7 +2029,27 @@ def cmd_data(args):
                   "unavailable here. Add it with:")
             print("  sudo oaap node add-profile store")
             return
-        running = _store_running()
+        # Not just _store_running() here: that function treats ANY
+        # failure -- Postgres actually down, or Docker unreachable at
+        # all -- as "not running", which is the right conservative
+        # default for a gate before a destructive action, but the
+        # wrong answer to show a human. Found running this by hand on
+        # oaap-test without sudo: it said "NOT running" for a container
+        # that was in fact healthy, because 'docker exec' itself needs
+        # root/the 'docker' group here (same limitation 'oaap status'
+        # already names) -- a permission error, reported as a crash.
+        if shutil.which("docker"):
+            r = subprocess.run(["docker", "exec", STORE_CONTAINER,
+                                "pg_isready", "-U", "postgres"],
+                               capture_output=True, text=True)
+        else:
+            r = None
+        if r is not None and "permission denied" in (r.stderr or "").lower():
+            print("store: carried, cannot tell from here -- no permission "
+                  "to reach Docker (run with sudo, or add yourself to the "
+                  "'docker' group).")
+            return
+        running = r is not None and r.returncode == 0
         print(f"store: carried, container "
               f"{'running' if running else 'NOT running'}")
         if running:

@@ -181,6 +181,15 @@ ok("appctl.py hat dieselbe Race NICHT (derselbe Fund, dieselbe Lehre)",
    "pg_isready" in _appctl_src.split("def _store_running")[1].split(
        "def _store_psql")[0])
 
+print("\n=== 'status' unterscheidet 'nicht erreichbar' von 'nicht laufend' ===")
+_cmd_data_body = read("appctl.py").split("def cmd_data")[1].split("\ndef ")[0]
+ok("cmd_data prüft auf 'permission denied' getrennt von einem echten "
+   "pg_isready-Fehlschlag -- gefunden auf oaap-test: ohne sudo/'docker'-"
+   "Gruppe meldete status faelschlich 'NOT running' fuer einen "
+   "kerngesunden Container, weil 'docker exec' selbst schon an der "
+   "Berechtigung scheiterte, nicht an Postgres",
+   "permission denied" in _cmd_data_body)
+
 print("\n=== 'status'/'schemas' lesen ohne root, wie 'store list'/'node show' ===")
 appctl_src = read("appctl.py")
 main_body = appctl_src[appctl_src.index("read_only = ("):]
