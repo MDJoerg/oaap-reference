@@ -181,6 +181,19 @@ ok("appctl.py hat dieselbe Race NICHT (derselbe Fund, dieselbe Lehre)",
    "pg_isready" in _appctl_src.split("def _store_running")[1].split(
        "def _store_psql")[0])
 
+print("\n=== 'copy' legt das Schema nicht doppelt an ===")
+# Gefunden auf oaap-test, 09.09.: der Dump von 'pg_dump -n <schema>'
+# traegt sein eigenes 'CREATE SCHEMA "..."' (plus 'ALTER SCHEMA ...
+# OWNER TO ...') schon mit -- eine zusaetzliche, selbst geschriebene
+# CREATE SCHEMA-Zeile VOR dem Wiedereinspielen kollidiert damit, jedes
+# Mal. Nur die ROLLE darf vorher angelegt werden.
+_cmd_data_body = read("appctl.py").split("def cmd_data")[1].split("\ndef ")[0]
+_copy_body = _cmd_data_body.split('args.action == "copy"')[1].split(
+    'args.action == "restore"')[0]
+ok("'copy' legt vorher nur die ROLLE an, nicht das Schema",
+   "_store_psql(f'CREATE ROLE " in _copy_body
+   and "_store_psql(f'CREATE SCHEMA " not in _copy_body)
+
 print("\n=== 'status' unterscheidet 'nicht erreichbar' von 'nicht laufend' ===")
 _cmd_data_body = read("appctl.py").split("def cmd_data")[1].split("\ndef ")[0]
 ok("cmd_data prüft auf 'permission denied' getrennt von einem echten "

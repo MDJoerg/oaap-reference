@@ -2146,10 +2146,18 @@ def cmd_data(args):
         # rewrite the name inside the dump, restore under a NEW role.
         # A rehearsal never inherits production credentials (RFC-0030
         # D3 parity) -- so the role is created fresh, never reused.
+        #
+        # 'CREATE SCHEMA' is NOT run separately here -- the dump already
+        # carries its own 'CREATE SCHEMA "..."' plus an
+        # 'ALTER SCHEMA "..." OWNER TO "...";' (role name == schema name
+        # in this design, so replacing the one string rewrites both).
+        # Found on oaap-test, 2026-09-09: creating the schema twice made
+        # the dump's own CREATE SCHEMA collide with mine, every time.
+        # Only the ROLE has to exist beforehand -- the dump's OWNER TO
+        # and GRANTs need it to already be there.
         rewritten = dump.replace(f'"{schema}"', f'"{new_schema}"')
         password = secrets.token_urlsafe(24)
         _store_psql(f'CREATE ROLE "{new_schema}" LOGIN PASSWORD \'{password}\';')
-        _store_psql(f'CREATE SCHEMA "{new_schema}" AUTHORIZATION "{new_schema}";')
         run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
              "psql", "-v", "ON_ERROR_STOP=1", "postgres"], input=rewritten)
         print(f"Schema '{schema}' copied to '{new_schema}'.")
