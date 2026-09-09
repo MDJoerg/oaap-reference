@@ -79,6 +79,28 @@ if [ -f "$ENVF" ] && ! grep -q '^INTERNAL_API_KEY=' "$ENVF"; then
   fi
 fi
 
+# --- superuser secret for the managed Postgres (oaap.data.store 0.1) ---
+# install.sh generates STORE_SUPERUSER_PASSWORD on every fresh install,
+# whether or not the node carries the 'store' profile -- but a node that
+# reaches 0.1.86 by UPDATING, not installing, has no such line in its
+# .env at all. Found on oaap-test, 2026-09-09: the very first
+# 'add-profile store' recreated the store service with an EMPTY
+# password, which the official Postgres image refuses outright
+# ("Database is uninitialized and superuser password is not
+# specified") -- a clean crash loop, not a silent one, but a crash
+# loop all the same, and on the first node that ever tried this step.
+# Generated here unconditionally, exactly like install.sh, so the
+# secret exists before anyone runs 'add-profile store' for the first
+# time on an updated node.
+if [ -f "$ENVF" ] && ! grep -q '^STORE_SUPERUSER_PASSWORD=' "$ENVF"; then
+  say ""
+  say "Adding the managed-Postgres superuser secret (oaap.data.store 0.1) ..."
+  umask 077
+  printf 'STORE_SUPERUSER_PASSWORD=%s\n' \
+    "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$ENVF"
+  say "  Done."
+fi
+
 # --- per-app networks + gateway links (RFC-0016) ---
 # Two jobs, both idempotent: isolate any app still on the flat platform
 # network onto its own (one-time for apps installed before 0.1.30), and

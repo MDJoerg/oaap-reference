@@ -9389,6 +9389,10 @@ def main():
     read_only = (args.cmd == "convert"
                  or (args.cmd == "node" and args.action == "show")
                  or (args.cmd == "store" and args.action == "list")
+                 # `data store status`/`schemas` only read (oaap.data.store
+                 # 0.1) -- create/copy/drop/restore change the node and
+                 # need root like everything else that does.
+                 or (args.cmd == "data" and args.action in ("status", "schemas"))
                  # `tenant` reads without root — including `check`, which
                  # reports and deliberately repairs nothing. Creating and
                  # renaming change the node and need root like everything

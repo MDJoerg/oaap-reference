@@ -161,6 +161,21 @@ print("\n=== migrate.sh: idempotenter Sicherheitsnetz-Schritt ===")
 migrate = read("migrate.sh")
 ok("migrate.sh prüft das Profil, bevor es den Dienst hochfährt",
    '"store"' in migrate and "--profile store up -d store" in migrate)
+ok("migrate.sh reicht STORE_SUPERUSER_PASSWORD auch aktualisierten "
+   "Knoten nach -- gefunden auf oaap-test, 09.09.: der erste "
+   "'add-profile store' auf einem AKTUALISIERTEN (nicht frisch "
+   "installierten) Knoten crash-loopte ohne diesen Schritt, weil "
+   "install.sh das Secret nur bei einer Neuinstallation erzeugt",
+   "STORE_SUPERUSER_PASSWORD=" in migrate)
+
+print("\n=== 'status'/'schemas' lesen ohne root, wie 'store list'/'node show' ===")
+appctl_src = read("appctl.py")
+main_body = appctl_src[appctl_src.index("read_only = ("):]
+main_body = main_body[:main_body.index("if not read_only")]
+ok("die read_only-Liste in main() kennt 'data status/schemas' -- ohne "
+   "diesen Eintrag verlangt jeder Lesebefehl root, entgegen 'store "
+   "list' und 'node show' (gefunden beim Prüfen auf oaap-test)",
+   '"data"' in main_body and '"status", "schemas"' in main_body)
 
 print(f"\n{ok_n} bestanden, {fail_n} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail_n else "FEHLGESCHLAGEN")
