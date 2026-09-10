@@ -262,6 +262,21 @@ ok("viewing/merging duplicates needs role tenant_admin (§3.6) -- checked "
    sum('"tenant_admin" not in roles' in (_twin_fn_body(n) or "")
        or '"tenant_admin" in roles' in (_twin_fn_body(n) or "")
        for n in ("twin_candidates", "twin_merges", "twin_merge", "twin_unmerge")) == 4)
+
+candidates_fn = _twin_fn_body("twin_candidates")
+ok("candidate buckets are keyed by TITLE ALONE, not (type, title) -- a "
+   "same-type restriction would hide the very duplicate this step exists "
+   "to resolve (Anna as Kontaktperson AND, independently, as Mitarbeiter "
+   "-- two DIFFERENT types), found live on oaap-test 2026-09-10",
+   candidates_fn is not None
+   and "buckets.setdefault(norm, [])" in candidates_fn
+   and "buckets.setdefault((r[\"type_key\"], norm)" not in candidates_fn)
+merge_fn = _twin_fn_body("twin_merge")
+ok("merge itself carries no same-type refusal any more -- the reference "
+   "duplicate is cross-type by construction",
+   merge_fn is not None
+   and "cannot merge objects of different types" not in merge_fn
+   and 'found[keep_id] != found[drop_id]' not in merge_fn)
 write_fn = _twin_fn_body("twin_write_group_person")
 ok("a person writing a tenant group needs role admin, keyuser or "
    "tenant_admin -- never plain 'user'",

@@ -800,11 +800,21 @@ def twin_tree(obj_id):
 
 @app.get("/internal/twin/candidates")
 def twin_candidates():
-    """Duplicate candidates for this tenant (§3.6): two objects of the
-    SAME type, the SAME normalised title, created by DIFFERENT origins,
-    neither already merged. A platform-computed hint, nothing more --
-    §3.6: "A detection produces a candidate pair, visible in the twin
-    browser ... nothing else.\""""
+    """Duplicate candidates for this tenant (§3.6): the SAME normalised
+    title, created by DIFFERENT origins, neither already merged. A
+    platform-computed hint, nothing more -- §3.6: "A detection produces
+    a candidate pair, visible in the twin browser ... nothing else."
+
+    Deliberately NOT scoped to one type: the reference scenario this
+    step exists to resolve (Bauplan Schritt 4, Mitarbeiterverwaltung
+    2026-09-10) is exactly "Anna Müller" as a `Kontaktperson` (owner
+    `app:partnerverwaltung`) and, independently, as a `Mitarbeiter`
+    (owner `app:mitarbeiterverwaltung`) -- two DIFFERENT types, the same
+    real person. Restricting detection to one type (an earlier reading
+    of the RFC's own illustrative wording) would have made this service
+    unable to surface the very duplicate it was built to resolve --
+    found live on oaap-test while verifying this step, before the
+    candidate list had ever been shown to a person."""
     person, err, code = require_person()
     if err:
         return err, code
@@ -820,24 +830,25 @@ def twin_candidates():
                 cur.execute(
                     "SELECT id, type_key, title, owner_origin FROM objects "
                     "WHERE id NOT IN (SELECT alias_id FROM aliases WHERE "
-                    "unmerged_at IS NULL) ORDER BY type_key, title")
+                    "unmerged_at IS NULL) ORDER BY title")
                 rows = cur.fetchall()
     finally:
         conn.close()
     buckets = {}
     for r in rows:
         norm = re.sub(r"\s+", " ", (r["title"] or "").strip().lower())
-        buckets.setdefault((r["type_key"], norm), []).append(r)
+        buckets.setdefault(norm, []).append(r)
     candidates = []
-    for (type_key, _norm), members in buckets.items():
+    for _norm, members in buckets.items():
         if len(members) < 2 or len({m["owner_origin"] for m in members}) < 2:
             # the SAME origin naming a thing twice is that app's own
             # bug, not a twin duplicate -- not shown here
             continue
         candidates.append({
-            "type": type_key,
+            "title": members[0]["title"],
             "objects": [{"id": f"urn:oaap:obj:{m['id']}", "title": m["title"],
-                        "owner": m["owner_origin"]} for m in members]})
+                        "type": m["type_key"], "owner": m["owner_origin"]}
+                       for m in members]})
     return jsonify({"candidates": candidates})
 
 
@@ -880,9 +891,15 @@ def twin_merges():
 @app.post("/internal/twin/merge")
 def twin_merge():
     """A human act (§3.6), audited: 'keep' stays the canonical id,
-    'drop' becomes an alias that answers forever (D3). Both must be the
-    SAME type -- merging across types is not a duplicate, it is a
-    mistake this refuses rather than half-executes."""
+    'drop' becomes an alias that answers forever (D3). Deliberately
+    allowed ACROSS different object types -- §3.6 never restricts merge
+    to one type, only the automatic DETECTION heuristic's illustrative
+    wording did, and the reference duplicate this step exists to
+    resolve (Anna as `Kontaktperson` AND, independently, as
+    `Mitarbeiter`) is exactly a cross-type case. The canonical object's
+    OWN type is what every future read reports; the dropped object's
+    groups are kept and shown alongside it regardless (§2.9's loader
+    already unions by object id, never by type)."""
     person, err, code = require_person()
     if err:
         return err, code
@@ -908,9 +925,6 @@ def twin_merge():
                 found = {str(r["id"]): r["type_key"] for r in cur.fetchall()}
             if keep_id not in found or drop_id not in found:
                 return "no such object", 404
-            if found[keep_id] != found[drop_id]:
-                return ("cannot merge objects of different types "
-                        f"('{found[keep_id]}' vs '{found[drop_id]}')"), 400
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 FROM aliases WHERE alias_id = %s AND "
                            "unmerged_at IS NULL", (drop_id,))

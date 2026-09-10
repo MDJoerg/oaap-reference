@@ -6421,22 +6421,26 @@ Zusammenführen ist ein menschlicher Schritt und lässt sich auflösen.</p>
 {% if candidates %}
 {% for c in candidates %}
 <div class="card">
-  <h2>{{ c.type }}</h2>
+  <h2>{{ c.title }}</h2>
   <table>
-  <tr><th>Titel</th><th>Herkunft</th><th></th></tr>
+  <tr><th>Titel</th><th>Typ</th><th>Herkunft</th><th></th></tr>
   {% for o in c.objects %}
-  <tr><td>{{ o.title }}</td><td class="muted">{{ o.owner_label }}</td>
+  <tr><td>{{ o.title }}</td><td class="muted">{{ o.type }}</td><td class="muted">{{ o.owner_label }}</td>
       <td><a class="rowaction" href="/zwilling/object/{{ o.bare_id }}">Ansehen</a></td></tr>
   {% endfor %}
   </table>
+  <p class="muted">Verschiedene Typen sind kein Hindernis (§3.6) — genau
+     der Fall, für den diese Seite gebaut wurde: derselbe Mensch als
+     zwei verschiedene Objekttypen, je eine App, die vom anderen nichts
+     weiß.</p>
   <form method="post" action="/zwilling/duplicates/merge">
     <label>Behalten
       <select name="keep">
-      {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.owner_label }})</option>{% endfor %}
+      {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.type }}, {{ o.owner_label }})</option>{% endfor %}
       </select></label>
     <label>Verschwindet als eigenes Objekt
       <select name="drop">
-      {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.owner_label }})</option>{% endfor %}
+      {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.type }}, {{ o.owner_label }})</option>{% endfor %}
       </select></label>
     <button>Zusammenführen</button>
   </form>
