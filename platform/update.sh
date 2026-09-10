@@ -159,13 +159,39 @@ cp "$SRC/VERSION" "$APP_DIR/VERSION"
 set_env OAAP_VERSION "$new_ver"
 install -m 0755 "$SRC/bin/oaap" /usr/local/bin/oaap
 
+# A service with a 'profiles:' key (store, twin — RFC-0011) is invisible
+# to a plain 'docker compose build'/'up' call: WITHOUT '--profile', compose
+# only touches services that carry no profile at all, even if the profiled
+# one is already running. Found live on oaap-test, 2026-09-10, while
+# verifying Schritt 5: 'twin' kept running its OLD image update after
+# update after update, because nothing here ever named its profile —
+# migrate.sh's own twin-container check only starts it if the container is
+# MISSING, never rebuilds one that is already up. Every profile this node
+# actually carries is passed here, so a future profile needs no line added.
+PROFILE_ARGS=()
+if [ -f "$OAAP_DATA_DIR/apps/node.json" ]; then
+  while IFS= read -r p; do
+    [ -n "$p" ] && PROFILE_ARGS+=(--profile "$p")
+  done < <(python3 -c "
+import json
+try:
+    with open('$OAAP_DATA_DIR/apps/node.json', encoding='utf-8') as f:
+        for p in (json.load(f).get('profiles') or []):
+            print(p)
+except Exception:
+    pass
+" 2>/dev/null)
+fi
+
 say "Building core service images (the running services stay up) ..."
-if ! docker compose --project-directory "$APP_DIR" --project-name oaap build --quiet; then
+if ! docker compose --project-directory "$APP_DIR" --project-name oaap \
+       "${PROFILE_ARGS[@]}" build --quiet; then
   fail "Image build failed — the platform keeps running on $cur_ver. Nothing was restarted."
 fi
 
 say "Restarting core services ..."
-docker compose --project-directory "$APP_DIR" --project-name oaap up -d
+docker compose --project-directory "$APP_DIR" --project-name oaap \
+  "${PROFILE_ARGS[@]}" up -d
 
 caddy_after="$(md5sum "$APP_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1)"
 if [ "$caddy_before" != "$caddy_after" ]; then
