@@ -16,6 +16,9 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./apps-caddy:/etc/caddy/apps:ro
+      # RFC-0035: shared platform assets served directly by the
+      # gateway, e.g. /platform/theme.css -- no app-facing service.
+      - ./static:/etc/caddy/static:ro
       # ACME account/certificates must survive container recreation
       - "${OAAP_DATA_DIR}/data/gateway/caddy-data:/data"
       # access log of the external sites (portal shows the last hit)

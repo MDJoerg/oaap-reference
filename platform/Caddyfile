@@ -11,8 +11,10 @@
 }
 #
 # Public routes (the only ones, per spec):
-#   /auth/*  — login/logout, served by identity
-#   /setup*  — first-run wizard, protected by the one-time setup token
+#   /auth/*      — login/logout, served by identity
+#   /setup*      — first-run wizard, protected by the one-time setup token
+#   /platform/*  — static platform assets (RFC-0035): today just the
+#                  shared theme stylesheet, no session needed to read it
 # Everything else requires an authenticated session, verified by the
 # identity service via forward_auth; the verified user and roles are
 # passed to apps as trusted headers.
@@ -32,6 +34,18 @@
 		request_header -X-OAAP-User
 		request_header -X-OAAP-Roles
 		reverse_proxy portal:8000
+	}
+
+	# RFC-0035 (App Design Contract): shared platform assets, static,
+	# served by the gateway itself -- no app-facing service needed for
+	# a stylesheet. 0.1 is one file (theme.css); a per-tenant theme
+	# (D3, a later phase) changes what is served here, never this route.
+	handle /platform/* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		uri strip_prefix /platform
+		root * /etc/caddy/static
+		file_server
 	}
 
 	# Deploy hook (oaap.apps.runtime 2.5): authorized by a per-instance

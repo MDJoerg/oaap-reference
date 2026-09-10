@@ -2363,8 +2363,6 @@ def validate_manifest(m):
         errs.append("app.id: lowercase [a-z0-9-], 3-40 chars")
     if not re.fullmatch(r"\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?", str(app.get("version", ""))):
         errs.append("app.version: semver required")
-    if app.get("type") not in ("native", "image", "wrapped"):
-        errs.append("app.type: native | image | wrapped")
     if not app.get("name"):
         errs.append("app.name: required")
     # Not an error: an unrecognised class is ignored like any other
@@ -2375,87 +2373,103 @@ def validate_manifest(m):
         print(f"Note: app.class '{app['class']}' is not a class this "
               f"platform knows ({' | '.join(APP_CLASSES)}). Treating it as "
               f"'{DEFAULT_APP_CLASS}'.")
-    # RFC-0016: more than one service is allowed. Each runs as its own
-    # container on the instance's network; routes and storage may name a
-    # target service, defaulting to the single one when there is only one.
-    services = m.get("services") or {}
-    if not services:
-        errs.append("services: at least one service")
-    for sname, svc in services.items():
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(sname)):
-            errs.append(f"service name invalid: '{sname}' (lowercase [a-z0-9-])")
-        if not isinstance(svc.get("port"), int):
-            errs.append(f"services.{sname}.port: integer required")
-        if bool(svc.get("build")) == bool(svc.get("image")):
-            errs.append(f"services.{sname}: exactly one of build/image")
-    multi = len(services) > 1
-    routes = m.get("routes") or []
-    if not routes:
-        errs.append("routes: at least one route")
-    for r in routes:
-        if not str(r.get("path", "")).startswith("/"):
-            errs.append(f"routes: path must start with / ({r.get('path')})")
-        roles = set(r.get("roles") or [])
-        if not roles or not roles <= ROLES:
-            errs.append(f"routes {r.get('path')}: roles must be non-empty subset of {sorted(ROLES)}")
-        # a route's target service must exist; it may be omitted only when
-        # there is exactly one service to mean (RFC-0016)
-        rsvc = r.get("service")
-        if rsvc is not None and rsvc not in services:
-            errs.append(f"routes {r.get('path')}: unknown service '{rsvc}'")
-        elif rsvc is None and multi:
-            errs.append(f"routes {r.get('path')}: 'service' is required when the "
-                        "app has more than one service")
-    for s in m.get("storage") or []:
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(s.get("name", ""))) or not str(s.get("mount", "")).startswith("/"):
-            errs.append(f"storage entry invalid: {s}")
-        ssvc = s.get("service")
-        if ssvc is not None and ssvc not in services:
-            errs.append(f"storage {s.get('name')}: unknown service '{ssvc}'")
-        elif ssvc is None and multi:
-            errs.append(f"storage {s.get('name')}: 'service' is required when the "
-                        "app has more than one service")
-    # RFC-0015: at most one non-HTTP endpoint, declared but not published
-    # until an operator grants it on an 'exposed' node.
-    endpoints = m.get("endpoints") or []
-    if len(endpoints) > 1:
-        errs.append("endpoints: at most one endpoint per app (RFC-0015)")
-    for e in endpoints:
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(e.get("name", ""))):
-            errs.append(f"endpoint name invalid: '{e.get('name')}'")
-        if e.get("protocol") not in ("udp", "tcp", "both"):
-            errs.append(f"endpoint {e.get('name')}: protocol must be udp | tcp | both")
-        if not isinstance(e.get("container_port"), int):
-            errs.append(f"endpoint {e.get('name')}: container_port (integer) required")
-        if e.get("wish") is not None and not isinstance(e.get("wish"), int):
-            errs.append(f"endpoint {e.get('name')}: wish must be an integer port")
-        # RFC-0015 §fixed (RFC-0017 §5.1): a server that advertises its own
-        # port to clients (a media server: ICE candidates carry the exact
-        # port) cannot accept a silently-reassigned one. `fixed: true` makes
-        # the port a requirement — published unchanged on the host, grant
-        # fails loudly if taken. Because host_port then equals container_port,
-        # the number must live in the endpoint range so it cannot collide
-        # with a platform port (80/443, gateway 8100-8199, internals).
-        if e.get("fixed") is not None and not isinstance(e.get("fixed"), bool):
-            errs.append(f"endpoint {e.get('name')}: fixed must be true or false")
-        if e.get("fixed") and isinstance(e.get("container_port"), int) \
-                and e["container_port"] not in ENDPOINT_PORT_RANGE:
-            errs.append(f"endpoint {e.get('name')}: a fixed endpoint's "
-                        f"container_port must be in {ENDPOINT_PORT_RANGE.start}–"
-                        f"{ENDPOINT_PORT_RANGE.stop - 1} (it is published "
-                        "unchanged on the host, so it must not clash with a "
-                        "platform port)")
-        if not str(e.get("reason") or "").strip():
-            errs.append(f"endpoint {e.get('name')}: a 'reason' is required — it is "
-                        "shown to the operator verbatim at grant time")
-        esvc = e.get("service")
-        if esvc is not None and esvc not in services:
-            errs.append(f"endpoint {e.get('name')}: unknown service '{esvc}'")
-        elif esvc is None and multi:
-            errs.append(f"endpoint {e.get('name')}: 'service' is required when the "
-                        "app has more than one service")
-    if not str((m.get("health") or {}).get("path", "")).startswith("/"):
-        errs.append("health.path: required, must start with /")
+    # oaap.data.model 0.1 §2.8 / RFC-0012 §8.5: a 'data_models' artefact
+    # is a package with data_model only -- no service, no route, no
+    # health check, and (RFC-0031 §4) no app.type either, because it
+    # never builds or runs a container. Recognised structurally (no
+    # 'services' key at all), not by a declared class, because
+    # app.class (2.10) is a launchpad-tile question, orthogonal to
+    # whether a package has a container to begin with.
+    is_artefact = bool(m.get("data_model")) and not m.get("services")
+    if is_artefact:
+        if m.get("routes") or m.get("endpoints") or m.get("storage"):
+            errs.append("a data_models artefact (data_model, no services) must "
+                        "not declare routes/endpoints/storage — it has no "
+                        "service to attach them to (oaap.data.model 0.1 §2.8)")
+    else:
+        if app.get("type") not in ("native", "image", "wrapped"):
+            errs.append("app.type: native | image | wrapped")
+        # RFC-0016: more than one service is allowed. Each runs as its own
+        # container on the instance's network; routes and storage may name a
+        # target service, defaulting to the single one when there is only one.
+        services = m.get("services") or {}
+        if not services:
+            errs.append("services: at least one service")
+        for sname, svc in services.items():
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(sname)):
+                errs.append(f"service name invalid: '{sname}' (lowercase [a-z0-9-])")
+            if not isinstance(svc.get("port"), int):
+                errs.append(f"services.{sname}.port: integer required")
+            if bool(svc.get("build")) == bool(svc.get("image")):
+                errs.append(f"services.{sname}: exactly one of build/image")
+        multi = len(services) > 1
+        routes = m.get("routes") or []
+        if not routes:
+            errs.append("routes: at least one route")
+        for r in routes:
+            if not str(r.get("path", "")).startswith("/"):
+                errs.append(f"routes: path must start with / ({r.get('path')})")
+            roles = set(r.get("roles") or [])
+            if not roles or not roles <= ROLES:
+                errs.append(f"routes {r.get('path')}: roles must be non-empty subset of {sorted(ROLES)}")
+            # a route's target service must exist; it may be omitted only when
+            # there is exactly one service to mean (RFC-0016)
+            rsvc = r.get("service")
+            if rsvc is not None and rsvc not in services:
+                errs.append(f"routes {r.get('path')}: unknown service '{rsvc}'")
+            elif rsvc is None and multi:
+                errs.append(f"routes {r.get('path')}: 'service' is required when the "
+                            "app has more than one service")
+        for s in m.get("storage") or []:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(s.get("name", ""))) or not str(s.get("mount", "")).startswith("/"):
+                errs.append(f"storage entry invalid: {s}")
+            ssvc = s.get("service")
+            if ssvc is not None and ssvc not in services:
+                errs.append(f"storage {s.get('name')}: unknown service '{ssvc}'")
+            elif ssvc is None and multi:
+                errs.append(f"storage {s.get('name')}: 'service' is required when the "
+                            "app has more than one service")
+        # RFC-0015: at most one non-HTTP endpoint, declared but not published
+        # until an operator grants it on an 'exposed' node.
+        endpoints = m.get("endpoints") or []
+        if len(endpoints) > 1:
+            errs.append("endpoints: at most one endpoint per app (RFC-0015)")
+        for e in endpoints:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", str(e.get("name", ""))):
+                errs.append(f"endpoint name invalid: '{e.get('name')}'")
+            if e.get("protocol") not in ("udp", "tcp", "both"):
+                errs.append(f"endpoint {e.get('name')}: protocol must be udp | tcp | both")
+            if not isinstance(e.get("container_port"), int):
+                errs.append(f"endpoint {e.get('name')}: container_port (integer) required")
+            if e.get("wish") is not None and not isinstance(e.get("wish"), int):
+                errs.append(f"endpoint {e.get('name')}: wish must be an integer port")
+            # RFC-0015 §fixed (RFC-0017 §5.1): a server that advertises its own
+            # port to clients (a media server: ICE candidates carry the exact
+            # port) cannot accept a silently-reassigned one. `fixed: true` makes
+            # the port a requirement — published unchanged on the host, grant
+            # fails loudly if taken. Because host_port then equals container_port,
+            # the number must live in the endpoint range so it cannot collide
+            # with a platform port (80/443, gateway 8100-8199, internals).
+            if e.get("fixed") is not None and not isinstance(e.get("fixed"), bool):
+                errs.append(f"endpoint {e.get('name')}: fixed must be true or false")
+            if e.get("fixed") and isinstance(e.get("container_port"), int) \
+                    and e["container_port"] not in ENDPOINT_PORT_RANGE:
+                errs.append(f"endpoint {e.get('name')}: a fixed endpoint's "
+                            f"container_port must be in {ENDPOINT_PORT_RANGE.start}–"
+                            f"{ENDPOINT_PORT_RANGE.stop - 1} (it is published "
+                            "unchanged on the host, so it must not clash with a "
+                            "platform port)")
+            if not str(e.get("reason") or "").strip():
+                errs.append(f"endpoint {e.get('name')}: a 'reason' is required — it is "
+                            "shown to the operator verbatim at grant time")
+            esvc = e.get("service")
+            if esvc is not None and esvc not in services:
+                errs.append(f"endpoint {e.get('name')}: unknown service '{esvc}'")
+            elif esvc is None and multi:
+                errs.append(f"endpoint {e.get('name')}: 'service' is required when the "
+                            "app has more than one service")
+        if not str((m.get("health") or {}).get("path", "")).startswith("/"):
+            errs.append("health.path: required, must start with /")
     errs.extend(validate_data_model_sections(m))
     if errs:
         die("manifest invalid:\n  - " + "\n  - ".join(errs))
@@ -4563,6 +4577,13 @@ def _install_from_dir(pkg, args, source):
     dm_section = m.get("data_model")
     contributes = m.get("contributes") or []
     consumes = m.get("consumes") or []
+    # RFC-0031 §4: a data_models artefact (no 'services') registers its
+    # types under origin 'model:<id>', never 'app:<id>' -- it is not an
+    # app, it never runs a container. Found while building the first
+    # real one (Kundenzufriedenheit, RFC-0031 Schritt 4 second wave,
+    # 2026-09-10): this call used 'app:' unconditionally before.
+    is_artefact = not m.get("services")
+    dm_origin = f"model:{app['id']}" if is_artefact else f"app:{app['id']}"
     # Needed below for oaap.data.model AND oaap.data.twin (E1) alike --
     # computed once, regardless of whether either section is present,
     # so it is ready the moment either block below needs it.
@@ -4573,7 +4594,7 @@ def _install_from_dir(pkg, args, source):
             print(f"NOTE (RFC-0031 D7): {text}")
         if has_profile("store") and _store_running():
             if dm_section:
-                model_register_data_model(f"app:{app['id']}", app["id"],
+                model_register_data_model(dm_origin, app["id"],
                                           app["version"], dm_section)
             if contributes or consumes:
                 explicit_bind = {}
@@ -4604,6 +4625,20 @@ def _install_from_dir(pkg, args, source):
                   "this app's data-model declarations were NOT registered or "
                   "bound (oaap.data.model 0.1 §2.1), and its twin schema was "
                   "NOT provisioned (oaap.data.twin 0.1).")
+
+    # oaap.data.model 0.1 §2.8: a data_models artefact has no service, no
+    # route, no health check -- and therefore no instance either. It
+    # leaves no trace in the instance registry ('oaap app list' does not
+    # show it, 'oaap app remove' has nothing to remove); its only
+    # lasting effect is the type registration just above. Nothing below
+    # this point applies (no image, no compose, no port, no registry
+    # write) -- stop here.
+    if is_artefact:
+        print(f"Registered data_models artefact '{app['id']}' {app['version']} "
+              "-- no service, no route, no health check (oaap.data.model "
+              "0.1 §2.8). It carries no instance; see 'oaap data model "
+              "types' for what it registered.")
+        return
 
     # RFC-0016: an app may have several services, each its own container.
     # The PRIMARY service is the one serving "/" (or the first route, or

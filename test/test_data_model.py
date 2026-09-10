@@ -201,6 +201,47 @@ ok("'data_model'/'contributes'/'consumes' are not in MANIFEST_FEATURES -- "
    "an older node ignores them rather than refusing the install",
    not ({"data_model", "contributes", "consumes"} & m.MANIFEST_FEATURES))
 
+print("\n=== validate_manifest: a data_models artefact needs no service (0.1 §2.8) ===")
+
+
+def validates(manifest):
+    """True if validate_manifest(manifest) does not die(), capturing its
+    stdout/stderr so a passing or failing check prints nothing extra."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            m.validate_manifest(manifest)
+            return True
+        except SystemExit:
+            return False
+
+
+ARTEFACT_MANIFEST = {
+    "oaap_manifest": "0.3",
+    "app": {"id": "kundenzufriedenheit", "name": "Kundenzufriedenheit",
+            "version": "0.1.0"},
+    "data_model": {
+        "attribute_types": [{"key": "SatisfactionScore",
+                              "title": "Zufriedenheit", "value_type": "int"}],
+        "group_types": [{"key": "crm.satisfaction", "on": "Customer",
+                          "attributes": ["SatisfactionScore"]}],
+    },
+}
+ok("an artefact (data_model, no services) needs no app.type/services/"
+   "routes/health", validates(ARTEFACT_MANIFEST))
+ok("an artefact must not declare routes -- it has no service to attach them to",
+   not validates(dict(ARTEFACT_MANIFEST,
+                       routes=[{"path": "/", "roles": ["user"]}])))
+ok("an artefact must not declare storage",
+   not validates(dict(ARTEFACT_MANIFEST,
+                       storage=[{"name": "data", "mount": "/data"}])))
+ok("neither services nor data_model -- still refused for missing services, "
+   "not silently accepted as an artefact",
+   not validates({"oaap_manifest": "0.3",
+                  "app": {"id": "x", "name": "X", "version": "0.1.0"}}))
+
 print("\n=== 'oaap data model' is registered as an object of the 'data' verb ===")
 appctl_src = read("appctl.py")
 ok("'model' is a choice alongside 'store'",
@@ -237,6 +278,18 @@ ok("a node without a working store is told plainly, not left to guess",
 ok("--bind overrides are read from the install args, defensively "
    "(the artifact-deploy path builds its own Namespace without one)",
    'getattr(args, "bind", None) or []' in install_body)
+
+print("\n=== _install_from_dir: a data_models artefact registers under "
+      "'model:', creates no instance (§2.8) ===")
+ok("artefact-ness is decided by the manifest shape (no 'services'), not a "
+   "declared class", 'is_artefact = not m.get("services")' in install_body)
+ok("an artefact's types register under origin 'model:<id>', never 'app:<id>' "
+   "(RFC-0031 §4)",
+   'f"model:{app[\'id\']}" if is_artefact else f"app:{app[\'id\']}"' in install_body)
+ok("an artefact install stops before any image/instance work -- no image, "
+   "no port, no registry row",
+   "if is_artefact:" in install_body
+   and 'print(f"Registered data_models artefact' in install_body)
 
 print("\n=== 'oaap app install' carries --bind (§2.4's CLI dialog stand-in) ===")
 ok("'--bind' is a repeatable install flag",
