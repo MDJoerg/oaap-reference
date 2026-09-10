@@ -234,6 +234,7 @@ EXPECTED_GUARD = {
     "/zwilling": "require_twin",
     "/zwilling/<type_key>": "require_twin",
     "/zwilling/object/<obj_id>": "require_twin",
+    "/zwilling/object/<obj_id>/tree": "require_twin",
     "/zwilling/object/<obj_id>/save/<group_key>": "require_twin_write",
     "/zwilling/duplicates": "require_twin_admin",
     "/zwilling/duplicates/merge": "require_twin_admin",

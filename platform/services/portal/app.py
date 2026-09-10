@@ -6350,6 +6350,7 @@ TWIN_OBJECT_BODY = """
     <button>Anzeigen</button>
     {% if at %}<a class="btn" href="/zwilling/object/{{ bare_id }}">Heute</a>{% endif %}
   </form>
+  <a class="btn" href="/zwilling/object/{{ bare_id }}/tree{{ '?at=' + at if at else '' }}">Baum ansehen</a>
 </div>
 {% for gk, g in obj.groups.items() %}
 <div class="card">
@@ -6504,6 +6505,38 @@ Datenmodell-Paket.</p>
 </form>
 """
 
+# RFC-0031 §6's own '/twin/objects/{id}/tree?at=&depth=' -- the
+# navigation tree, not the type-list page above (Bauplan Schritt 5
+# names both: "Baum je Objekttyp" is the type -> object list; this is
+# the RELATION tree from one object outward). A Jinja macro renders it
+# recursively -- no JavaScript, the same posture every other page here
+# already takes.
+TWIN_TREE_BODY = """
+<a class="back" href="/zwilling/object/{{ bare(tree.id) if tree else '' }}">← Zurück zum Objekt</a>
+<h1>Baum{% if tree %}: {{ tree.title }}{% endif %}</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if tree %}
+<div class="card">
+  <form method="get">
+    <label>Stichtag (Gültigkeit, §3.4)
+      <input type="date" name="at" value="{{ at or '' }}"></label>
+    <label>Tiefe
+      <input type="number" name="depth" min="0" max="5" value="{{ depth or 2 }}"></label>
+    <button>Anzeigen</button>
+  </form>
+</div>
+<div class="card">
+{% macro render_node(node) %}
+<li><a href="/zwilling/object/{{ bare(node.id) }}">{{ node.title }}</a>
+  <span class="muted">({{ node.type }}{% if node.via %}, via {{ node.via }}{% endif %})</span>
+  {% if node.children %}<ul>{% for c in node.children %}{{ render_node(c) }}{% endfor %}</ul>{% endif %}
+</li>
+{% endmacro %}
+<ul>{{ render_node(tree) }}</ul>
+</div>
+{% endif %}
+"""
+
 
 @app.get("/zwilling")
 def twin_home():
@@ -6572,6 +6605,29 @@ def twin_object_page(obj_id):
                base_group_key=twin_view.base_group_key,
                msg=request.args.get("msg"), msg_ok=request.args.get("err") is None,
                error=None)
+
+
+@app.get("/zwilling/object/<obj_id>/tree")
+def twin_object_tree(obj_id):
+    """RFC-0031 §6's own '/twin/objects/{id}/tree?at=&depth=' -- the
+    relation tree from one object outward, distinct from the type-list
+    page (which is the OTHER "Baum je Objekttyp" the Bauplan names)."""
+    denied = require_twin()
+    if denied:
+        return denied
+    at = request.args.get("at", "").strip()
+    depth = request.args.get("depth", "").strip()
+    params = {k: v for k, v in (("at", at), ("depth", depth)) if v}
+    try:
+        r = _twin_call("GET", f"/internal/twin/objects/{obj_id}/tree", params=params)
+    except requests.RequestException as e:
+        return page(TWIN_TREE_BODY, "Baum", "twin", tree=None, bare=_bare,
+                   error=f"Der Zwilling antwortet nicht ({type(e).__name__}).")
+    if r.status_code != 200:
+        return page(TWIN_TREE_BODY, "Baum", "twin", status=r.status_code,
+                   tree=None, bare=_bare, error=r.text or f"HTTP {r.status_code}")
+    return page(TWIN_TREE_BODY, "Baum", "twin", tree=r.json(), bare=_bare,
+               at=at, depth=depth, error=None)
 
 
 @app.post("/zwilling/object/<obj_id>/save/<group_key>")
