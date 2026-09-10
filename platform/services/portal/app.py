@@ -25,8 +25,10 @@ from flask import (Flask, g, redirect, render_template_string, request,
 from markupsafe import Markup
 
 import fleet_view
+import twin_view
 
 IDENTITY = "http://identity:8000"
+TWIN = "http://twin:8000"
 GATEWAY = "http://gateway:80"
 # Internal health-probe listener on the gateway (RFC-0016): the portal
 # cannot reach isolated app containers directly, so it asks the gateway
@@ -43,6 +45,30 @@ GATEWAY_HEALTH = "http://gateway:8099"
 INTERNAL = requests.Session()
 INTERNAL.headers[
     "X-OAAP-Internal-Key"] = os.environ.get("INTERNAL_API_KEY", "")
+
+# Same key, a third holder (RFC-0031 Bauplan Schritt 5, the twin
+# browser): 'twin' also refuses '/internal/*' without it. Person
+# headers are per-request (they name THIS caller, not a fixed
+# identity), so they are passed at call time, not set on the session.
+TWIN_INTERNAL = requests.Session()
+TWIN_INTERNAL.headers["X-OAAP-Internal-Key"] = os.environ.get("INTERNAL_API_KEY", "")
+
+
+def _twin_call(method, path, **kw):
+    """One call to the twin service's person-facing API, on behalf of
+    THIS request's already-verified caller (RFC-0031 §6: "the twin
+    browser uses the same API with a person's session instead of an
+    instance credential") — twin never sees the browser directly, the
+    portal relays who is asking, exactly as it already does calling
+    identity's own '/internal/*' (this file's own top comment)."""
+    headers = kw.pop("headers", {})
+    headers["X-OAAP-Person-User"] = caller_name()
+    headers["X-OAAP-Person-Tenant"] = caller_scope()[1]
+    headers["X-OAAP-Person-Roles"] = ",".join(caller_roles())
+    return TWIN_INTERNAL.request(method, f"{TWIN}{path}", headers=headers,
+                                 timeout=kw.pop("timeout", 8), **kw)
+
+
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
 REGISTRY = "/apps-registry/registry.json"
 
@@ -201,6 +227,7 @@ LAYOUT = STYLE + """
     {% if is_user_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
     {% if can_store %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
+    {% if can_twin %}<a href="/twin" class="{{ 'active' if active == 'twin' }}">Zwilling</a>{% endif %}
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
     {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
@@ -2552,6 +2579,13 @@ def page(body_template, title, active, status=200, **ctx):
         can_store=bool(caller & {"server_admin", "tenant_admin"}),
         show_tenant=multi,
         can_health=bool(caller & {"server_admin", "partner"}),
+        # The twin browser (RFC-0031 Bauplan Schritt 5): every tenant
+        # role sees it ("user sieht"); a server_admin with no tenant
+        # role of their own does not, because there is no tenant whose
+        # twin they would be looking at.
+        can_twin=bool(caller & {"user", "keyuser", "admin", "tenant_admin"}),
+        can_twin_write=bool(caller & {"admin", "keyuser", "tenant_admin"}),
+        can_twin_admin="tenant_admin" in caller,
         version=VERSION,
     ), status
 
@@ -6201,3 +6235,463 @@ def setup_submit():
         return redirect("/auth/login", code=303)
     error = resp.json().get("error", f"Einrichtung fehlgeschlagen (HTTP {resp.status_code}).")
     return render_template_string(SETUP_PAGE, done=False, error=error), resp.status_code
+
+
+# ---------------------------------------------------------------------------
+# Digitaler Zwilling (RFC-0031 Bauplan Schritt 5) -- the twin browser.
+# 'twin_view.py' holds the pure rules (what to show); every route here
+# does the I/O: calling twin's own '/internal/*' API via _twin_call()
+# (defined next to TWIN_INTERNAL near the top of this file) and
+# rendering the result. Role gates below are a fast, plain-German
+# refusal before the round trip -- the twin service re-checks the same
+# role itself and is the real authority (its own require_person, and
+# each route's own check), exactly the split identity's '/internal/*'
+# comment already describes for that service.
+
+def require_twin():
+    if not (caller_roles() & {"user", "keyuser", "admin", "tenant_admin"}):
+        return ("Zugriff verweigert: der Zwilling erfordert eine "
+                "Mandantenrolle (user, keyuser, admin oder tenant_admin)."), 403
+    return None
+
+
+def require_twin_write():
+    if not (caller_roles() & {"admin", "keyuser", "tenant_admin"}):
+        return ("Zugriff verweigert: erfordert die Rolle admin, keyuser "
+                "oder tenant_admin."), 403
+    return None
+
+
+def require_twin_admin():
+    if "tenant_admin" not in caller_roles():
+        return "Zugriff verweigert: erfordert die Rolle tenant_admin.", 403
+    return None
+
+
+def _bare(urn):
+    """The plain uuid out of 'urn:oaap:obj:<uuid>' -- portal URLs use
+    this form; twin's own API accepts either (OBJ_ID_RE)."""
+    return (urn or "").rsplit(":", 1)[-1]
+
+
+TWIN_VALUE_TYPES = ("text", "int", "decimal", "bool", "date", "datetime", "enum", "ref")
+
+
+def _twin_types_or_error():
+    try:
+        r = _twin_call("GET", "/internal/twin/types")
+    except requests.RequestException as e:
+        return [], f"Der Zwilling antwortet nicht ({type(e).__name__})."
+    if r.status_code != 200:
+        return [], r.text or f"Zwilling: HTTP {r.status_code}"
+    return r.json().get("types", []), None
+
+
+TWIN_HOME_BODY = """
+<h1>Digitaler Zwilling</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if types %}
+<div class="tiles">
+{% for t in types %}
+<a class="tile" href="/twin/{{ t.key }}">
+  <div class="top"><h3>{{ t.title }}</h3></div>
+  <span class="meta">{{ t.key }}</span>
+</a>
+{% endfor %}
+</div>
+{% else %}
+<div class="card"><p class="muted">Noch keine Typen für diesen Mandanten
+aktiv — sie entstehen, sobald eine App installiert wird, die Daten
+liefert oder liest, oder über "Typ anlegen" unten.</p></div>
+{% endif %}
+{% if can_twin_admin %}
+<p><a class="btn" href="/twin/types/new">+ Typ anlegen</a>
+   <a class="btn" href="/twin/duplicates">Dubletten</a></p>
+{% endif %}
+"""
+
+TWIN_TYPE_LIST_BODY = """
+<a class="back" href="/twin">← Zurück</a>
+<div class="pagehead"><h1>{{ type_title }}</h1></div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+<tr><th>Titel</th><th>Herkunft</th><th></th></tr>
+{% for o in objects %}
+<tr class="rowlink">
+  <td><a class="rowaction" href="/twin/object/{{ o.bare_id }}">{{ o.title }}</a></td>
+  <td class="muted">{{ o.owner_label }}</td>
+  <td><a class="rowaction" href="/twin/object/{{ o.bare_id }}">Ansehen</a></td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% if not objects and not error %}<p class="muted">Noch keine Objekte dieses Typs.</p>{% endif %}
+"""
+
+TWIN_OBJECT_BODY = """
+<a class="back" href="/twin/{{ obj.type }}">← Zurück zur Liste</a>
+<div class="pagehead">
+  <h1>{{ obj.title }}</h1>
+  <span class="badge">{{ type_title }}</span>
+</div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if obj %}
+{% if obj.merged_aliases %}
+<p class="muted">Dieses Objekt hat {{ obj.merged_aliases|length }}
+   zusammengeführte(s) Objekt(e) — Gruppen aus beiden werden hier
+   gemeinsam gezeigt. <a href="/twin/duplicates">Zusammenführungen verwalten</a></p>
+{% endif %}
+<div class="card">
+  <form method="get">
+    <label>Stichtag (Gültigkeit, §3.4)
+      <input type="date" name="at" value="{{ at or '' }}"></label>
+    <button>Anzeigen</button>
+    {% if at %}<a class="btn" href="/twin/object/{{ bare_id }}">Heute</a>{% endif %}
+  </form>
+</div>
+{% for gk, g in obj.groups.items() %}
+<div class="card">
+  <h2>{{ gk }} <span class="badge">{{ origin_label(g.origin) }}</span></h2>
+  {% if g.attributes %}
+  <table>
+  {% for ak, av in g.attributes.items() %}
+    <tr><td class="muted">{{ attr_titles.get(ak, ak) }}</td><td>{{ av.value }}</td></tr>
+  {% endfor %}
+  </table>
+  {% endif %}
+  {% if g.relations %}
+  <p class="muted">Beziehungen:</p>
+  <ul>{% for r in g.relations %}
+    <li>{{ r.key }} → <a href="/twin/object/{{ bare(r.target) }}">{{ r.target }}</a></li>
+  {% endfor %}</ul>
+  {% endif %}
+  {% if not g.attributes and not g.relations and not g.activities %}
+  <p class="muted">Keine Inhalte.</p>
+  {% endif %}
+  {% if can_twin_write and g.origin == 'tenant' %}
+  <form method="post" action="/twin/object/{{ bare_id }}/save/{{ base_group_key(gk) }}">
+    {% for ak, av in g.attributes.items() %}
+    <label>{{ attr_titles.get(ak, ak) }}
+      <input type="text" name="attr_{{ ak }}" value="{{ av.value }}"></label>
+    {% endfor %}
+    <button>Speichern</button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+{% if activities %}
+<div class="card">
+  <h2>Zeitleiste der Aktivitäten</h2>
+  <table>
+  <tr><th>Wann</th><th>Aktivität</th><th>Status</th></tr>
+  {% for a in activities %}
+  <tr><td>{{ a.when or '–' }}</td><td>{{ a.key }} ({{ a.group_key }})</td><td>{{ a.status }}</td></tr>
+  {% endfor %}
+  </table>
+</div>
+{% endif %}
+{% if can_twin_write and addable %}
+<div class="card">
+  <h2>Gruppe hinzufügen</h2>
+  {% for gt in addable %}
+  <h3>{{ gt.title }}</h3>
+  <form method="post" action="/twin/object/{{ bare_id }}/save/{{ gt.key }}">
+    {% for ak in gt.definition.attributes %}
+    <label>{{ attr_titles.get(ak, ak) }}
+      <input type="text" name="attr_{{ ak }}"></label>
+    {% endfor %}
+    <button>Anlegen</button>
+  </form>
+  {% endfor %}
+</div>
+{% endif %}
+{% endif %}
+"""
+
+TWIN_DUPLICATES_BODY = """
+<a class="back" href="/twin">← Zurück</a>
+<h1>Dubletten</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+<p class="muted">Kandidaten: gleicher Typ, gleicher (normalisierter) Titel,
+verschiedene Herkunft (RFC-0031 §3.6) — ein Hinweis, keine Entscheidung.
+Zusammenführen ist ein menschlicher Schritt und lässt sich auflösen.</p>
+{% if candidates %}
+{% for c in candidates %}
+<div class="card">
+  <h2>{{ c.type }}</h2>
+  <table>
+  <tr><th>Titel</th><th>Herkunft</th><th></th></tr>
+  {% for o in c.objects %}
+  <tr><td>{{ o.title }}</td><td class="muted">{{ o.owner_label }}</td>
+      <td><a class="rowaction" href="/twin/object/{{ o.bare_id }}">Ansehen</a></td></tr>
+  {% endfor %}
+  </table>
+  <form method="post" action="/twin/duplicates/merge">
+    <label>Behalten
+      <select name="keep">
+      {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.owner_label }})</option>{% endfor %}
+      </select></label>
+    <label>Verschwindet als eigenes Objekt
+      <select name="drop">
+      {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.owner_label }})</option>{% endfor %}
+      </select></label>
+    <button>Zusammenführen</button>
+  </form>
+</div>
+{% endfor %}
+{% else %}
+<div class="card"><p class="muted">Keine Dubletten-Kandidaten gefunden.</p></div>
+{% endif %}
+{% if merged %}
+<h2>Bereits zusammengeführt</h2>
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+<tr><th>Aufgegangen in</th><th>Verschwunden als</th><th>Wann</th><th></th></tr>
+{% for m in merged %}
+<tr><td><a href="/twin/object/{{ m.canonical_id }}">{{ m.canonical_title }}</a></td>
+    <td class="muted">{{ m.alias_title }}</td><td class="muted">{{ m.merged_at }}</td>
+    <td><form method="post" action="/twin/duplicates/unmerge" style="display:inline">
+      <input type="hidden" name="drop" value="{{ m.alias_id }}">
+      <button>Auflösen</button></form></td></tr>
+{% endfor %}
+</table>
+</div>
+{% endif %}
+"""
+
+TWIN_TYPE_NEW_BODY = """
+<a class="back" href="/twin">← Zurück</a>
+<h1>Typ anlegen</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<p class="muted">Bewusst schmal (RFC-0031 §9 Schritt 5): eine neue Gruppe
+mit ihren Attributen an einem schon vorhandenen, aktiven Objekttyp —
+genau das Beispiel aus dem Zielbild ("Kundenzufriedenheit auf Firma").
+Ein ganz neuer Objekttyp entsteht weiterhin nur über eine App oder ein
+Datenmodell-Paket.</p>
+<form method="post" action="/twin/types/new">
+  <div class="card">
+    <h2>Woran hängt die Gruppe?</h2>
+    <label>Objekttyp
+      <select name="on">
+        {% for t in object_types %}<option value="{{ t.key }}">{{ t.title }}</option>{% endfor %}
+      </select></label>
+    <label>Gruppen-Schlüssel (namespace.name, klein)
+      <input type="text" name="group_key" placeholder="z. B. crm.notiz" required></label>
+    <label>Titel der Gruppe
+      <input type="text" name="group_title" placeholder="z. B. Notizen"></label>
+  </div>
+  <div class="card">
+    <h2>Attribute</h2>
+    {% for i in range(3) %}
+    <p>
+      <input type="text" name="attr_key" placeholder="Schlüssel, z. B. Kommentar">
+      <input type="text" name="attr_title" placeholder="Titel, z. B. Kommentar">
+      <select name="attr_value_type">
+        {% for v in value_types %}<option value="{{ v }}">{{ v }}</option>{% endfor %}
+      </select>
+    </p>
+    {% endfor %}
+    <p class="muted">Leere Zeilen werden übersprungen.</p>
+    <button>Anlegen</button>
+  </div>
+</form>
+"""
+
+
+@app.get("/twin")
+def twin_home():
+    denied = require_twin()
+    if denied:
+        return denied
+    types, error = _twin_types_or_error()
+    return page(TWIN_HOME_BODY, "Zwilling", "twin",
+               types=twin_view.object_types(types), error=error)
+
+
+@app.get("/twin/<type_key>")
+def twin_type_list(type_key):
+    denied = require_twin()
+    if denied:
+        return denied
+    types, terr = _twin_types_or_error()
+    type_row = next((t for t in types if t["key"] == type_key
+                     and t["kind"] == "object_types"), None)
+    type_title = (type_row or {}).get("title", type_key)
+    if terr:
+        return page(TWIN_TYPE_LIST_BODY, type_title, "twin",
+                   objects=[], type_title=type_title, error=terr)
+    try:
+        r = _twin_call("GET", "/internal/twin/objects", params={"type": type_key})
+    except requests.RequestException as e:
+        return page(TWIN_TYPE_LIST_BODY, type_title, "twin", objects=[],
+                   type_title=type_title,
+                   error=f"Der Zwilling antwortet nicht ({type(e).__name__}).")
+    objects = r.json().get("objects", []) if r.status_code == 200 else []
+    for o in objects:
+        o["owner_label"] = twin_view.origin_label(o["owner"])
+        o["bare_id"] = _bare(o["id"])
+    return page(TWIN_TYPE_LIST_BODY, type_title, "twin", objects=objects,
+               type_title=type_title,
+               error=None if r.status_code == 200 else (r.text or f"HTTP {r.status_code}"))
+
+
+@app.get("/twin/object/<obj_id>")
+def twin_object_page(obj_id):
+    denied = require_twin()
+    if denied:
+        return denied
+    at = request.args.get("at", "").strip()
+    types, _terr = _twin_types_or_error()
+    try:
+        r = _twin_call("GET", f"/internal/twin/objects/{obj_id}",
+                       params={"at": at} if at else {})
+    except requests.RequestException as e:
+        return page(TWIN_OBJECT_BODY, "Zwilling", "twin", obj=None,
+                   error=f"Der Zwilling antwortet nicht ({type(e).__name__}).")
+    if r.status_code != 200:
+        return page(TWIN_OBJECT_BODY, "Zwilling", "twin", status=r.status_code,
+                   obj=None, error=r.text or f"HTTP {r.status_code}")
+    obj = r.json()
+    type_row = next((t for t in types if t["key"] == obj["type"]), None)
+    attr_titles = {k: (v.get("title") or k) for k, v in
+                   twin_view.attribute_defs(types).items()}
+    addable = twin_view.addable_group_types(types, obj["type"], obj["groups"].keys())
+    activities = twin_view.timeline(obj["groups"])
+    return page(TWIN_OBJECT_BODY, obj["title"], "twin",
+               obj=obj, type_title=(type_row or {}).get("title", obj["type"]),
+               bare_id=_bare(obj["id"]), at=at, attr_titles=attr_titles,
+               addable=addable, activities=activities,
+               origin_label=twin_view.origin_label, bare=_bare,
+               base_group_key=twin_view.base_group_key,
+               msg=request.args.get("msg"), msg_ok=request.args.get("err") is None,
+               error=None)
+
+
+@app.post("/twin/object/<obj_id>/save/<group_key>")
+def twin_object_save(obj_id, group_key):
+    denied = require_twin_write()
+    if denied:
+        return denied
+    attrs = {}
+    for name, value in request.form.items():
+        if name.startswith("attr_") and value.strip():
+            attrs[name[len("attr_"):]] = value.strip()
+    try:
+        r = _twin_call("PUT", f"/internal/twin/objects/{obj_id}/groups/{group_key}",
+                       json={"attributes": attrs})
+    except requests.RequestException as e:
+        return redirect(f"/twin/object/{obj_id}?err=1&msg="
+                        + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
+                        code=303)
+    if r.status_code != 204:
+        return redirect(f"/twin/object/{obj_id}?err=1&msg="
+                        + quote(r.text or f"HTTP {r.status_code}"), code=303)
+    return redirect(f"/twin/object/{obj_id}?msg=" + quote("Gespeichert."), code=303)
+
+
+@app.get("/twin/duplicates")
+def twin_duplicates():
+    denied = require_twin_admin()
+    if denied:
+        return denied
+    try:
+        rc = _twin_call("GET", "/internal/twin/candidates")
+        rm = _twin_call("GET", "/internal/twin/merges")
+    except requests.RequestException as e:
+        return page(TWIN_DUPLICATES_BODY, "Dubletten", "twin",
+                   candidates=[], merged=[],
+                   error=f"Der Zwilling antwortet nicht ({type(e).__name__}).")
+    candidates = rc.json().get("candidates", []) if rc.status_code == 200 else []
+    merged = rm.json().get("merges", []) if rm.status_code == 200 else []
+    for c in candidates:
+        for o in c["objects"]:
+            o["bare_id"] = _bare(o["id"])
+            o["owner_label"] = twin_view.origin_label(o["owner"])
+    for m in merged:
+        m["alias_id"] = _bare(m["alias"])
+        m["canonical_id"] = _bare(m["canonical"])
+    return page(TWIN_DUPLICATES_BODY, "Dubletten", "twin",
+               candidates=candidates, merged=merged,
+               error=None if rc.status_code == 200 else rc.text,
+               msg=request.args.get("msg"), msg_ok=request.args.get("err") is None)
+
+
+@app.post("/twin/duplicates/merge")
+def twin_duplicates_merge():
+    denied = require_twin_admin()
+    if denied:
+        return denied
+    keep = request.form.get("keep", "").strip()
+    drop = request.form.get("drop", "").strip()
+    if not keep or not drop or keep == drop:
+        return redirect("/twin/duplicates?err=1&msg="
+                        + quote("Bitte zwei unterschiedliche Objekte wählen."), code=303)
+    try:
+        r = _twin_call("POST", "/internal/twin/merge", json={"keep": keep, "drop": drop})
+    except requests.RequestException as e:
+        return redirect("/twin/duplicates?err=1&msg="
+                        + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
+                        code=303)
+    if r.status_code != 204:
+        return redirect("/twin/duplicates?err=1&msg="
+                        + quote(r.text or f"HTTP {r.status_code}"), code=303)
+    return redirect("/twin/duplicates?msg=" + quote("Zusammengeführt."), code=303)
+
+
+@app.post("/twin/duplicates/unmerge")
+def twin_duplicates_unmerge():
+    denied = require_twin_admin()
+    if denied:
+        return denied
+    drop = request.form.get("drop", "").strip()
+    try:
+        r = _twin_call("POST", "/internal/twin/unmerge", json={"drop": drop})
+    except requests.RequestException as e:
+        return redirect("/twin/duplicates?err=1&msg="
+                        + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
+                        code=303)
+    if r.status_code != 204:
+        return redirect("/twin/duplicates?err=1&msg="
+                        + quote(r.text or f"HTTP {r.status_code}"), code=303)
+    return redirect("/twin/duplicates?msg=" + quote("Zusammenführung aufgelöst."), code=303)
+
+
+@app.get("/twin/types/new")
+def twin_type_new_form():
+    denied = require_twin_admin()
+    if denied:
+        return denied
+    types, error = _twin_types_or_error()
+    return page(TWIN_TYPE_NEW_BODY, "Typ anlegen", "twin",
+               object_types=twin_view.object_types(types),
+               value_types=TWIN_VALUE_TYPES, error=error)
+
+
+@app.post("/twin/types/new")
+def twin_type_new_create():
+    denied = require_twin_admin()
+    if denied:
+        return denied
+    body, error = twin_view.parse_new_type_form(request.form)
+    if error:
+        types, _terr = _twin_types_or_error()
+        return page(TWIN_TYPE_NEW_BODY, "Typ anlegen", "twin", status=400,
+                   object_types=twin_view.object_types(types),
+                   value_types=TWIN_VALUE_TYPES, error=error)
+    try:
+        r = _twin_call("POST", "/internal/twin/types", json=body)
+    except requests.RequestException as e:
+        types, _terr = _twin_types_or_error()
+        return page(TWIN_TYPE_NEW_BODY, "Typ anlegen", "twin", status=502,
+                   object_types=twin_view.object_types(types),
+                   value_types=TWIN_VALUE_TYPES,
+                   error=f"Der Zwilling antwortet nicht ({type(e).__name__}).")
+    if r.status_code != 201:
+        types, _terr = _twin_types_or_error()
+        return page(TWIN_TYPE_NEW_BODY, "Typ anlegen", "twin", status=r.status_code,
+                   object_types=twin_view.object_types(types),
+                   value_types=TWIN_VALUE_TYPES, error=r.text or f"HTTP {r.status_code}")
+    return redirect("/twin?msg=" + quote(f"Typ '{body['group_key']}' angelegt."), code=303)

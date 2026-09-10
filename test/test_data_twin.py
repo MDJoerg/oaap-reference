@@ -204,6 +204,107 @@ ok("every write records an event -- the outbox RFC-0032 will read (0.1 "
    "writes it; nothing reads it yet, by design)",
    twin_src.count("_record_event(") >= 2)
 
+print("\n=== 0.2 (Bauplan Schritt 5): '?at=' and merge, additive to the "
+      "app-facing API, never narrowing it ===")
+ok("read_object still starts with require_caller -- an instance's own "
+   "route is unchanged", "def read_object(obj_id):\n    caller, err, code = "
+   "require_caller()" in twin_src)
+ok("'?at=' is parsed from the query string, not trusted as a body field",
+   'request.args.get("at")' in twin_src and "def _parse_at(" in twin_src)
+ok("a merged-away id still resolves ('an app that stored the alias never "
+   "breaks', D3) -- _load_object/_canonical_of is on the read AND write path",
+   twin_src.count("_canonical_of(conn,") >= 3)
+ok("_write_group_content resolves a relation's TARGET through a merge too, "
+   "not just the object being written", "_canonical_of(conn, m.group(1))" in twin_src)
+
+print("\n=== 0.2: a second authentication path for the portal ONLY, never "
+      "through the gateway, never with an RFC-0027 key ===")
+ok("INTERNAL_API_KEY is read from the environment, same variable name as "
+   "identity's own guard", 'INTERNAL_KEY = os.environ.get("INTERNAL_API_KEY", "")'
+   in twin_src)
+ok("the guard is a before_request hook scoped to '/internal/' by PREFIX -- "
+   "a future route under it is covered the day it exists, not by a per-route "
+   "decorator someone can forget (identity's own A4 finding, repeated here)",
+   "def _guard_internal_api():" in twin_src
+   and 'request.path.startswith("/internal/")' in twin_src)
+ok("missing key -> 503, wrong key -> 401, both fail CLOSED",
+   "return jsonify(error=" in twin_src and "503" in twin_src
+   and "secrets.compare_digest" in twin_src and "401" in twin_src)
+ok("require_person() is a SEPARATE function from require_caller() -- a "
+   "person is never mistaken for a machine principal",
+   "def require_person():" in twin_src
+   and "X-OAAP-Person-User" in twin_src and "X-OAAP-Person-Tenant" in twin_src
+   and "X-OAAP-Person-Roles" in twin_src)
+
+print("\n=== 0.2: every person-facing route, and at the right role ===")
+
+
+def _twin_fn_body(name):
+    """One function's own source, by name -- split on '\\ndef ' the same
+    way this file already reads appctl.py's functions (e.g.
+    '_twin_issue_instance_key' above), just applied to twin_src too."""
+    if f"\ndef {name}(" not in twin_src:
+        return None
+    return ("def " + twin_src.split(f"\ndef {name}(", 1)[1]
+            .split("\n@app.", 1)[0])
+
+
+for path, fn_name in (
+        ("/internal/twin/types", "twin_types_for_person"),
+        ("/internal/twin/objects", "twin_objects_by_type"),
+        ("/internal/twin/candidates", "twin_candidates"),
+        ("/internal/twin/merges", "twin_merges")):
+    fn = _twin_fn_body(fn_name)
+    ok(f"{path} ({fn_name}) calls require_person(), not require_caller()",
+       fn is not None and "require_person()" in fn and "require_caller()" not in fn)
+ok("viewing/merging duplicates needs role tenant_admin (§3.6) -- checked "
+   "for candidates, merges, merge AND unmerge",
+   sum('"tenant_admin" not in roles' in (_twin_fn_body(n) or "")
+       or '"tenant_admin" in roles' in (_twin_fn_body(n) or "")
+       for n in ("twin_candidates", "twin_merges", "twin_merge", "twin_unmerge")) == 4)
+write_fn = _twin_fn_body("twin_write_group_person")
+ok("a person writing a tenant group needs role admin, keyuser or "
+   "tenant_admin -- never plain 'user'",
+   write_fn is not None
+   and 'roles & {"admin", "keyuser", "tenant_admin"}' in write_fn)
+create_type_fn = _twin_fn_body("twin_create_type")
+ok("creating a type needs role tenant_admin",
+   create_type_fn is not None and '"tenant_admin" not in roles' in create_type_fn)
+ok("type creation is scoped to an EXISTING, active object type -- never a "
+   "brand new object type from the browser (documented narrowing, not a gap)",
+   create_type_fn is not None and "d.kind = 'object_types'" in create_type_fn
+   and "'group_types'," in create_type_fn)
+ok("a brand-new tenant type is qualified 'tenant:<tenant-id>', not the "
+   "bare word 'tenant' -- avoids two tenants on one node silently sharing "
+   "one type_definitions row (D2's node-wide registry)",
+   'origin = f"tenant:{tenant_id}"' in twin_src)
+
+print("\n=== 0.2: appctl.py provisions what the browser needs -- the "
+      "aliases table, and the one new grant, nothing wider ===")
+ok("the tenant schema gets an 'aliases' table (merge/unmerge, §3.6)",
+   'CREATE TABLE IF NOT EXISTS "{schema}".aliases (' in appctl_src)
+ok("...with alias_id as its own primary key -- one object merged away "
+   "at most once AT A TIME, enforced by Postgres, not just by app code",
+   "alias_id uuid PRIMARY KEY REFERENCES" in appctl_src)
+ok("a tenant schema role may INSERT into the shared type registry -- "
+   "INSERT only, never UPDATE or DELETE (the service's own code is where "
+   "the ownership/collision check actually lives)",
+   'GRANT INSERT ON oaap_model.type_definitions, oaap_model.activations' in appctl_src)
+ok("the CLI's own tenant-type registration no longer writes the bare "
+   "word 'tenant' as origin (the cross-tenant collision this closes, "
+   "found while building the browser, 2026-09-10)",
+   'model_register_data_model("tenant", tenant_id' not in appctl_src
+   and 'origin = f"tenant:{tenant_id}"' in appctl_src)
+
+print("\n=== 0.2: docker-compose.yml -- 'twin' holds the SAME internal "
+      "key as identity and portal, nothing else changed about its gate ===")
+twin_block2 = compose_src.split("\n  twin:")[1].split("\n\n")[0]
+ok("'twin' carries INTERNAL_API_KEY now, the third holder",
+   'INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"' in twin_block2)
+ok("...but its profile gate, port and mount are UNCHANGED",
+   'profiles: ["store"]' in twin_block2 and "ports:" not in twin_block2
+   and "- store" in twin_block2)
+
 print(f"\n{ok_n} bestanden, {fail_n} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail_n else "FEHLGESCHLAGEN")
 sys.exit(1 if fail_n else 0)

@@ -107,6 +107,14 @@ services:
     restart: unless-stopped
     depends_on:
       - store
+    environment:
+      # The third holder of this key, after identity and portal (RFC-0015
+      # addendum A4's posture, applied here for Schritt 5, the twin
+      # browser): proves a caller of '/internal/*' IS the portal, since
+      # the platform network by itself no longer proves anything.
+      # '/twin/*' (the gateway route, RFC-0027 keys) needs no part of
+      # this and is unaffected.
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
     volumes:
       # registry.json (whose tenant/app owns which instance) and
       # twin-secrets.json (the per-tenant schema role/password, written

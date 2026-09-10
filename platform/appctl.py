@@ -2283,10 +2283,23 @@ def cmd_data_model(args):
         errs = validate_data_model_sections({"data_model": {kind: [entry]}})
         if errs:
             die("definition invalid:\n  - " + "\n  - ".join(errs))
-        model_register_data_model("tenant", tenant_id, "1.0.0",
+        # Origin is 'tenant:<id>', not the bare word 'tenant' this used to
+        # write (found while building Schritt 5's twin browser, which
+        # calls the same registration through the twin service --
+        # 2026-09-10): oaap_model.type_definitions is a single, NODE-WIDE
+        # table (D2), keyed only by 'key'. A bare 'tenant' origin made the
+        # ownership check at model_register_data_model's 'ex_origin !=
+        # origin' pass for ANY tenant registering the SAME key -- two
+        # unrelated tenants on one node calling their own group 'notiz'
+        # would have silently shared one type definition, each also able
+        # to "additively" change the other's. Never exercised live (no
+        # tenant had used this action before the browser existed), so
+        # fixed here rather than migrated.
+        origin = f"tenant:{tenant_id}"
+        model_register_data_model(origin, tenant_id, "1.0.0",
                                   {kind: [entry]}, tenant_id=tenant_id)
-        print(f"Type '{entry['key']}' registered (origin: tenant, "
-              f"tenant: {tenant_id}) and activated for that tenant.")
+        print(f"Type '{entry['key']}' registered (origin: {origin}) "
+              "and activated for that tenant.")
         return
 
     if args.action == "alias":
@@ -2968,6 +2981,22 @@ def _twin_ensure_schema(tenant_id):
         f'GRANT SELECT ON ALL TABLES IN SCHEMA oaap_model TO "{schema}"; '
         "ALTER DEFAULT PRIVILEGES IN SCHEMA oaap_model "
         f'GRANT SELECT ON TABLES TO "{schema}";')
+    # Schritt 5 (the twin browser): a tenant_admin may register a brand
+    # new tenant-origin type through the twin service itself
+    # (twin/app.py's 'twin_create_type'), which connects as exactly this
+    # role. INSERT only, never UPDATE/DELETE -- the service's own code
+    # refuses to touch a key that already exists (create-only, §4 "the
+    # service only ever does DML"; the ownership/version-diff logic
+    # model_register_data_model has stays exclusive to appctl, run by a
+    # human on the host). Granting this to a per-tenant role on a table
+    # shared by every tenant on the node is a deliberate trade, not an
+    # oversight: the alternative -- a second, more privileged Postgres
+    # role just for this one write -- was rejected as more moving parts
+    # for the same trust boundary this file already relies on everywhere
+    # else (its own Python enforces the invariants a grant alone cannot).
+    _store_psql(
+        f'GRANT INSERT ON oaap_model.type_definitions, oaap_model.activations '
+        f'TO "{schema}";')
     _twin_ensure_tables(schema)
 
 
@@ -3053,6 +3082,21 @@ def _twin_ensure_tables(schema):
             object_id uuid,
             group_key text NOT NULL DEFAULT '',
             origin text NOT NULL
+        );
+        -- Merge (§3.6, Schritt 5): 'alias_id' stops being its own object
+        -- and answers as 'canonical_id' from then on -- forever
+        -- resolvable (D3), never deleted. A row's own primary key
+        -- (alias_id) means one object can be merged away only once AT A
+        -- TIME; unmerge clears 'unmerged_at' back to NULL only by
+        -- setting it, never by deleting the row, so the merge itself
+        -- stays in the history even after being undone.
+        CREATE TABLE IF NOT EXISTS "{schema}".aliases (
+            alias_id uuid PRIMARY KEY REFERENCES "{schema}".objects(id),
+            canonical_id uuid NOT NULL REFERENCES "{schema}".objects(id),
+            merged_at timestamptz NOT NULL DEFAULT now(),
+            merged_by text NOT NULL,
+            unmerged_at timestamptz,
+            unmerged_by text
         );
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
