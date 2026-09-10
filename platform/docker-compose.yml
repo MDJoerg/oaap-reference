@@ -77,11 +77,10 @@ services:
     profiles: ["store"]
     restart: unless-stopped
     environment:
-      # Only used to initialise the superuser on first start. Nothing
-      # in this stack connects over the network with it -- every
-      # operation is 'docker exec' into this container (2.1: no
-      # published port, ever), and schema roles are separate secrets
-      # held by the consuming service (oaap.data.twin), never by an app.
+      # Only used to initialise the superuser on first start. appctl
+      # (host-side, 'docker exec') still does every schema/role DDL --
+      # the one network client is 'twin' below, and only with a
+      # per-tenant schema role, never the superuser (RFC-0031 §7/§8).
       POSTGRES_PASSWORD: "${STORE_SUPERUSER_PASSWORD:-}"
     volumes:
       - "${OAAP_DATA_DIR}/data/store:/var/lib/postgresql/data"
@@ -90,4 +89,24 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    # No 'ports:' -- deliberate (oaap.data.store 2.1, 4).
+    # No 'ports:' -- deliberate (oaap.data.store 2.1, 4). Still reachable
+    # from 'twin' over the compose network by service name; 'ports:'
+    # only controls HOST exposure, which stays off.
+
+  # The digital twin (oaap.data.twin 0.1, RFC-0031 Schritt 3) -- the only
+  # service an app instance talks to for shared tenant data. Same gate
+  # as 'store', because it is nothing without it: no 'store' profile,
+  # no twin. Reached through the gateway's '/twin/*' route (Caddyfile),
+  # never directly -- an app's own network (RFC-0016) cannot see it.
+  twin:
+    build: ./services/twin
+    profiles: ["store"]
+    restart: unless-stopped
+    depends_on:
+      - store
+    volumes:
+      # registry.json (whose tenant/app owns which instance) and
+      # twin-secrets.json (the per-tenant schema role/password, written
+      # by appctl, read by nobody else) -- both read-only, same posture
+      # as identity's own '/platform-apps' mount.
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"

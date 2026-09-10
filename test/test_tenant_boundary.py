@@ -570,9 +570,17 @@ check("das Portal schreibt das Protokoll nicht, es zeigt es nur",
       "/data/audit:/audit:ro" in compose)
 check("identity darf es schreiben — Benutzerverwaltung laeuft nie ueber den Host",
       "/data/audit:/audit\"" in compose)
-check("der Mandantenspeicher bleibt fuer beide nur lesbar",
-      compose.count("/apps:/platform-apps:ro") == 1
-      and compose.count("/apps:/apps-registry:ro") == 1)
+check("der Mandantenspeicher bleibt fuer jeden Leser nur lesbar",
+      # Seit oaap.data.twin 0.1 (RFC-0031 Schritt 3) liest 'twin' die
+      # gleiche apps/-Ablage wie 'identity' (Registry + sein eigenes
+      # twin-secrets.json) -- ein zweiter Leser desselben Mount-Strings
+      # ist der Punkt, keine Regression. Was diese Zeile wirklich
+      # verteidigt, bleibt: KEIN Dienst darf ihn beschreibbar mounten.
+      compose.count("/apps:/platform-apps:ro") == 2  # identity, twin
+      and compose.count("/apps:/apps-registry:ro") == 1  # portal
+      and all(line.rstrip().endswith(':ro"')
+              for line in compose.splitlines()
+              if "OAAP_DATA_DIR}/apps:" in line))
 
 migrate = read("platform/migrate.sh")
 check("das Update reicht die Grenze in alte Gateway-Dateien nach",

@@ -1916,16 +1916,21 @@ def cmd_node(args):
             # request time -- either the container is up or it is not.
             # So the effect happens now, not "on the next update".
             try:
-                _compose("--profile", "store", "up", "-d", "store")
-                print("The managed Postgres is starting "
-                      "('docker compose ... --profile store up -d store').")
+                # 'twin' alongside 'store' (RFC-0031 Schritt 3): it is
+                # nothing without Postgres and gated by the same profile
+                # (docker-compose.yml), so the one command that starts
+                # the capability starts both halves of it.
+                _compose("--profile", "store", "up", "-d", "store", "twin")
+                print("The managed Postgres and the digital twin service "
+                      "are starting ('docker compose ... --profile store "
+                      "up -d store twin').")
             except (subprocess.CalledProcessError, OSError) as e:
                 err = (getattr(e, "stderr", "") or "").strip().splitlines()
-                print(f"WARNING: could not start the 'store' service"
+                print(f"WARNING: could not start the 'store'/'twin' services"
                       + (f": {err[-1]}" if err else f": {e}") + ".")
                 print("Check with: docker compose --project-directory "
                       f"{APP_DIR} --project-name oaap --profile store "
-                      "up -d store")
+                      "up -d store twin")
     else:
         if profile not in profiles:
             die(f"node does not have profile '{profile}'")
@@ -1940,12 +1945,12 @@ def cmd_node(args):
         print(f"Node profile '{profile}' removed.")
         if profile == "store":
             try:
-                _compose("stop", "store")
-                print("The managed Postgres container was stopped "
-                      "(its data volume is kept).")
+                _compose("stop", "store", "twin")
+                print("The managed Postgres and digital-twin containers "
+                      "were stopped (Postgres's data volume is kept).")
             except (subprocess.CalledProcessError, OSError):
-                print("WARNING: could not stop the 'store' container — "
-                      "check 'docker ps'.")
+                print("WARNING: could not stop the 'store'/'twin' "
+                      "containers — check 'docker ps'.")
 
 
 # -------------------------------------------- managed Postgres (oaap.data.store 0.1)
@@ -2884,6 +2889,201 @@ def model_bindings_of(instance):
     return rows
 
 
+# ------------------------------------------ oaap.data.twin (RFC-0031 Schritt 3)
+# The digital twin has its own service (platform/services/twin) reached
+# through the gateway's '/twin/*' route -- appctl's job here stops at
+# what only the host can do: mint the machine-principal credential an
+# instance presents (E1), and provision the tenant's twin_<id> schema,
+# role and tables the twin service will connect to (D8/oaap.data.store
+# 0.1 §2: the schema role is shown once, to no app, only to this).
+TWIN_SECRETS_FILE = os.path.join(APPS_DIR, "twin-secrets.json")
+
+
+def _twin_secrets_load():
+    try:
+        with open(TWIN_SECRETS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _twin_secrets_save(secrets_map):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = TWIN_SECRETS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(secrets_map, f, indent=2)
+    os.replace(tmp, TWIN_SECRETS_FILE)
+    # oaap.data.twin's own secret -- the twin container's read-only
+    # mount is the only reader besides this host; never an app's.
+    os.chmod(TWIN_SECRETS_FILE, 0o600)
+
+
+def _twin_ensure_schema(tenant_id):
+    """Idempotent: the tenant's twin_<id> schema, its own Postgres role,
+    and the append-only tables/views this build's twin service reads
+    and writes (RFC-0031 §3.4 -- recorded time always; validity carried,
+    not yet filtered; no tree, no references, no merge in 0.1 -- see
+    the capability spec's §2 for what that means).
+
+    Called from _install_from_dir once an instance contributes or
+    consumes a type, same gate as oaap.data.model's own registration
+    (has_profile('store') and _store_running(), checked by the caller)."""
+    schema = f"twin_{tenant_id}"
+    existing = {r["schema"] for r in store_schemas()}
+    secrets_map = _twin_secrets_load()
+    if schema not in existing:
+        password = secrets.token_urlsafe(24)
+        _store_psql(f'CREATE ROLE "{schema}" LOGIN PASSWORD \'{password}\';')
+        _store_psql(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{schema}";')
+        secrets_map[schema] = {"role": schema, "password": password}
+        _twin_secrets_save(secrets_map)
+    elif schema not in secrets_map:
+        # Self-healing, same posture as migrate.sh's OAAP_INTERNAL_KEY
+        # repair: the schema survived (e.g. a restore) but the secret
+        # file did not -- reset the role's password rather than guess
+        # a lost one.
+        password = secrets.token_urlsafe(24)
+        _store_psql(f'ALTER ROLE "{schema}" PASSWORD \'{password}\';')
+        secrets_map[schema] = {"role": schema, "password": password}
+        _twin_secrets_save(secrets_map)
+    # The registry the twin reads (oaap.data.model 0.1 §2 calls it
+    # exactly that). Granted every time -- harmless once already
+    # granted, and repairs a schema a human created by hand.
+    _store_psql(
+        f'GRANT USAGE ON SCHEMA oaap_model TO "{schema}"; '
+        f'GRANT SELECT ON ALL TABLES IN SCHEMA oaap_model TO "{schema}"; '
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA oaap_model "
+        f'GRANT SELECT ON TABLES TO "{schema}";')
+    _twin_ensure_tables(schema)
+
+
+def _twin_ensure_tables(schema):
+    """objects/source_keys/groups/attributes/relations/activities/events,
+    plus the current_* views the service actually queries -- append-only
+    everywhere a row can change (D5), 'current' meaning 'superseded_by
+    IS NULL', never a DELETE or UPDATE of the value itself."""
+    _store_psql(f"""
+        CREATE TABLE IF NOT EXISTS "{schema}".objects (
+            id uuid PRIMARY KEY,
+            type_key text NOT NULL,
+            title text NOT NULL,
+            owner_origin text NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".source_keys (
+            object_id uuid NOT NULL REFERENCES "{schema}".objects(id) ON DELETE CASCADE,
+            origin text NOT NULL,
+            source_key text NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL,
+            PRIMARY KEY (object_id, origin)
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".groups (
+            object_id uuid NOT NULL REFERENCES "{schema}".objects(id) ON DELETE CASCADE,
+            group_key text NOT NULL,
+            origin text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            created_by text NOT NULL,
+            PRIMARY KEY (object_id, group_key)
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".attributes (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL,
+            group_key text NOT NULL,
+            attr_key text NOT NULL,
+            value jsonb NOT NULL,
+            valid_from date,
+            valid_to date,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL,
+            superseded_by bigint,
+            FOREIGN KEY (object_id, group_key)
+                REFERENCES "{schema}".groups(object_id, group_key)
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".relations (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL,
+            group_key text NOT NULL,
+            rel_key text NOT NULL,
+            target_id uuid NOT NULL,
+            valid_from date,
+            valid_to date,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL,
+            superseded_by bigint,
+            FOREIGN KEY (object_id, group_key)
+                REFERENCES "{schema}".groups(object_id, group_key)
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".activities (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL,
+            group_key text NOT NULL,
+            activity_key text NOT NULL,
+            target_id uuid,
+            status text NOT NULL DEFAULT 'open',
+            planned_start timestamptz,
+            planned_end timestamptz,
+            started_at timestamptz,
+            finished_at timestamptz,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL,
+            superseded_by bigint,
+            FOREIGN KEY (object_id, group_key)
+                REFERENCES "{schema}".groups(object_id, group_key)
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".events (
+            id bigserial PRIMARY KEY,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            kind text NOT NULL,
+            object_id uuid,
+            group_key text NOT NULL DEFAULT '',
+            origin text NOT NULL
+        );
+        CREATE OR REPLACE VIEW "{schema}".current_attributes AS
+            SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
+        CREATE OR REPLACE VIEW "{schema}".current_relations AS
+            SELECT * FROM "{schema}".relations WHERE superseded_by IS NULL;
+        CREATE OR REPLACE VIEW "{schema}".current_activities AS
+            SELECT * FROM "{schema}".activities WHERE superseded_by IS NULL;
+        GRANT ALL ON ALL TABLES IN SCHEMA "{schema}" TO "{schema}";
+        GRANT ALL ON ALL SEQUENCES IN SCHEMA "{schema}" TO "{schema}";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT ALL ON TABLES TO "{schema}";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA "{schema}" GRANT ALL ON SEQUENCES TO "{schema}";
+    """)
+
+
+def _twin_issue_instance_key(name, tenant_id):
+    """Mint the machine principal 'instance:<name>' (RFC-0027 3.1) and an
+    API key for it -- the credential this instance presents to
+    oaap.data.twin so origin and tenant come from the credential, never
+    the request (RFC-0031 §8, E1). Returns the full bearer token.
+
+    Deliberately issued WITHOUT --instance scoping: '/twin/*' is ONE
+    route shared by every instance on the node (unlike an app's own
+    site, which names itself), so a key limited to one instance would
+    be refused there for lacking the OTHER instances' names. What
+    actually limits this key is the principal itself -- nothing else
+    was ever issued one, and it holds only role 'user'."""
+    principal = f"instance:{name}"
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "users = m.load_users()\n"
+        "name = os.environ['OAAP_T_NAME']\n"
+        "if not m.find_user(users, name):\n"
+        "    users.append({'username': name,\n"
+        "                  'display_name': os.environ['OAAP_T_INST'],\n"
+        "                  'password_hash': '', 'kind': 'machine',\n"
+        "                  'roles': ['user'], 'groups': [],\n"
+        "                  'tenant': os.environ['OAAP_T_TENANT'], 'active': True})\n"
+        "    m._save(m.USERS_FILE, users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], '',\n"
+        "    'oaap.data.twin (RFC-0031 E1)', m.KEY_MAX_DAYS, 'root')\n"
+        "print(json.dumps(secret))\n",
+        {"OAAP_T_NAME": principal, "OAAP_T_INST": name, "OAAP_T_TENANT": tenant_id})
+    return json.loads(out)
+
+
 def image_uid(image):
     try:
         out = run(["docker", "run", "--rm", "--entrypoint", "id", image, "-u"]).stdout.strip()
@@ -3626,7 +3826,7 @@ def reload_gateway():
 # the old values. install, restore and 'app config set' all go through
 # start_instance_container so the container shape stays identical.
 
-RESERVED_ENV = {"OAAP_APP_SECRET"}  # platform-owned, never operator-editable
+RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL"}  # platform-owned, never operator-editable
 
 
 def tenant_dir(tid):
@@ -4349,12 +4549,15 @@ def _install_from_dir(pkg, args, source):
     dm_section = m.get("data_model")
     contributes = m.get("contributes") or []
     consumes = m.get("consumes") or []
+    # Needed below for oaap.data.model AND oaap.data.twin (E1) alike --
+    # computed once, regardless of whether either section is present,
+    # so it is ready the moment either block below needs it.
+    twin_tenant = tenant_for_new_instance(inst, permit={"tenant": chosen_tenant})
     if dm_section or contributes or consumes:
         text = declaration_text(contributes, consumes)
         if text:
             print(f"NOTE (RFC-0031 D7): {text}")
         if has_profile("store") and _store_running():
-            model_tenant = tenant_for_new_instance(inst, permit={"tenant": chosen_tenant})
             if dm_section:
                 model_register_data_model(f"app:{app['id']}", app["id"],
                                           app["version"], dm_section)
@@ -4364,13 +4567,29 @@ def _install_from_dir(pkg, args, source):
                     word, _, key = pair.partition("=")
                     if word and key:
                         explicit_bind[word] = key
-                model_bind_declarations(name, model_tenant, contributes, consumes,
+                model_bind_declarations(name, twin_tenant, contributes, consumes,
                                         explicit=explicit_bind)
+                # oaap.data.twin (RFC-0031 Schritt 3): the tenant's
+                # twin_<id> schema must exist before the app ever calls
+                # '/twin/*' -- provisioned here, the one place a binding
+                # is created, not lazily inside the twin service itself
+                # (which never holds the superuser credential this needs).
+                #
+                # NOT for a rehearsal: D8 (a rehearsal's OWN copy of the
+                # tenant's twin schema) is not built yet, and this
+                # tenant's schema is the PRODUCTION one -- a rehearsal
+                # that could reach it would read and write live customer
+                # data, which is the one thing RFC-0030 exists to
+                # prevent. Bound above for the audit trail; refused the
+                # working credential below instead.
+                if not rehearsal:
+                    _twin_ensure_schema(twin_tenant)
         else:
             print("NOTE: this node has no working 'store' (RFC-0011 profile, "
                   "or the service is not running) -- installing anyway, but "
                   "this app's data-model declarations were NOT registered or "
-                  "bound (oaap.data.model 0.1 §2.1).")
+                  "bound (oaap.data.model 0.1 §2.1), and its twin schema was "
+                  "NOT provisioned (oaap.data.twin 0.1).")
 
     # RFC-0016: an app may have several services, each its own container.
     # The PRIMARY service is the one serving "/" (or the first route, or
@@ -4447,6 +4666,18 @@ def _install_from_dir(pkg, args, source):
             if c.get("secret"):
                 env.pop(c["key"], None)
     env.setdefault("OAAP_APP_SECRET", secrets.token_hex(32))
+    # oaap.data.twin (RFC-0031 Schritt 3, E1): the machine-principal key
+    # this instance presents to '/twin/*'. Minted ONCE, like the secret
+    # above -- a redeploy must not silently rotate a credential the app
+    # may have stored, and reissuing it on every install would make
+    # every earlier key an orphan nobody revoked. NOT for a rehearsal,
+    # for the same reason its schema is not provisioned above: RFC-0030
+    # rehearsal.
+    if (contributes or consumes) and not rehearsal and "OAAP_PLATFORM_KEY" not in env:
+        env["OAAP_PLATFORM_KEY"] = _twin_issue_instance_key(name, twin_tenant)
+        env["OAAP_TWIN_URL"] = f"http://{GATEWAY_CONTAINER}/twin"
+        print(f"Issued a machine-principal API key for '{name}' (RFC-0031 "
+              "E1) -- OAAP_PLATFORM_KEY/OAAP_TWIN_URL are in its environment.")
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     save_env(name, env, ident)
@@ -6926,16 +7157,27 @@ def _scrub_rehearsal_env(key, ident, secret_keys):
     the rehearsal, and that is a real restore problem found early rather
     than a rehearsal failing.
 
+    `OAAP_PLATFORM_KEY`/`OAAP_TWIN_URL` (oaap.data.twin 0.1, RFC-0031
+    E1) go for a sharper reason than tidiness: the copied value is a
+    live credential for the PRODUCTION tenant's twin schema, and D8 (a
+    rehearsal's own copy of that schema) is not built yet. Left in
+    place, a rehearsal of this app could read and write live customer
+    data through the twin -- exactly what RFC-0030 exists to prevent.
+    The install that follows does not reissue it for a rehearsal
+    either (`_install_from_dir`), so the app simply cannot reach
+    oaap.data.twin from here, honestly, until D8 exists.
+
     Returns the keys that were actually dropped, so the operator is told
     what to fill in rather than left to discover it from a crash loop.
     """
+    platform_owned = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL"}
     env = load_env(key, ident)
     dropped = sorted(k for k in list(env)
-                     if k == "OAAP_APP_SECRET" or k in secret_keys)
+                     if k in platform_owned or k in secret_keys)
     for k in dropped:
         env.pop(k, None)
     save_env(key, env, ident)
-    return [k for k in dropped if k != "OAAP_APP_SECRET"]
+    return [k for k in dropped if k not in platform_owned]
 
 
 def create_rehearsal(plan, who="root", role="root"):

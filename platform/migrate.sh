@@ -266,6 +266,28 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
   fi
 fi
 
+# --- the digital twin service for a profiled node (RFC-0031 Schritt 3, oaap.data.twin 0.1) ---
+# 'twin' is a new service in this version's compose file. A node that
+# already carries 'store' AND already has Postgres running skips the
+# check above entirely (pg_isready succeeds) -- without a check of its
+# own, 'twin' would never be created on such a node's update. Checked
+# by container presence, not a health endpoint: unlike Postgres, 'twin'
+# has no data of its own to be healthy or not about; it either runs or
+# it does not.
+if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
+   && grep -q '"store"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+  if [ -z "$(docker ps -q -f name=^oaap-twin-1$ -f status=running)" ]; then
+    say ""
+    say "Ensuring the digital twin service (oaap.data.twin 0.1) is up ..."
+    if docker compose --project-directory "$APP_DIR" --project-name oaap \
+         --profile store up -d twin >/dev/null 2>&1; then
+      say "  Done."
+    else
+      say "  WARNING: 'twin' service could not be started — check 'docker compose ps'."
+    fi
+  fi
+fi
+
 # --- what a rehearsal would cost, where the portal can read it (2.15.3) ---
 # The portal has no view of the tenant tree, so the sizes and the list of
 # archives are written beside the registry. Written once here so a node

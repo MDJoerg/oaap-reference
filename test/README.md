@@ -30,6 +30,7 @@ python3 test/test_rehearsal_data.py
 python3 test/test_rehearsal_page.py  # braucht jinja2
 python3 test/test_data_store.py
 python3 test/test_data_model.py
+python3 test/test_data_twin.py
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -136,3 +137,19 @@ build`/`pull`. Was diese Datei **nicht** prüfen kann — dass
 `register`/`alias`/`types`/`show`/`bindings` wirklich Zeilen in
 Postgres lesen und schreiben, und dass eine echte Installation
 tatsächlich registriert und bindet — gehört auf `oaap-test`.
+
+`test_data_twin.py` hält den **digitalen Zwilling** fest (`oaap.data.
+twin` 0.1, RFC-0031 Schritt 3) — wieder ohne Docker und ohne den
+`twin`-Container selbst: dass eine Generalprobe niemals den
+Zwilling-Schlüssel der Produktion mitbekommt (weder beim Kopieren der
+`instance.env` noch bei der folgenden Installation — die eine echte
+Lücke war, bis dieser Test sie fasste), dass der Installations-Haken
+das Mandantenschema und den Maschinen-Prinzipal-Schlüssel an derselben
+Stelle anlegt wie `oaap.data.model`s Bindung, dass das Knotenprofil
+`store` `twin` genauso trägt und entlässt wie den Store selbst, dass
+die Compose-Datei, die Caddyfile-Route und `migrate.sh` je ihre eigene
+Absicherung haben, und dass der Dienst selbst gültiges Python ist und
+Herkunft/Mandant nur aus dem geprüften Aufrufer liest, nie aus der
+Anfrage. Was diese Datei **nicht** prüfen kann — dass ein echtes
+Anlegen/Lesen/Schreiben eines Objekts gegen ein echtes Postgres tut,
+was RFC-0031 §9 Schritt 1–3 verlangt — gehört auf `oaap-test`.
