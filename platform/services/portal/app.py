@@ -227,7 +227,7 @@ LAYOUT = STYLE + """
     {% if is_user_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
     {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
     {% if can_store %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
-    {% if can_twin %}<a href="/twin" class="{{ 'active' if active == 'twin' }}">Zwilling</a>{% endif %}
+    {% if can_twin %}<a href="/zwilling" class="{{ 'active' if active == 'twin' }}">Zwilling</a>{% endif %}
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
     {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
@@ -6293,7 +6293,7 @@ TWIN_HOME_BODY = """
 {% if types %}
 <div class="tiles">
 {% for t in types %}
-<a class="tile" href="/twin/{{ t.key }}">
+<a class="tile" href="/zwilling/{{ t.key }}">
   <div class="top"><h3>{{ t.title }}</h3></div>
   <span class="meta">{{ t.key }}</span>
 </a>
@@ -6305,13 +6305,13 @@ aktiv — sie entstehen, sobald eine App installiert wird, die Daten
 liefert oder liest, oder über "Typ anlegen" unten.</p></div>
 {% endif %}
 {% if can_twin_admin %}
-<p><a class="btn" href="/twin/types/new">+ Typ anlegen</a>
-   <a class="btn" href="/twin/duplicates">Dubletten</a></p>
+<p><a class="btn" href="/zwilling/types/new">+ Typ anlegen</a>
+   <a class="btn" href="/zwilling/duplicates">Dubletten</a></p>
 {% endif %}
 """
 
 TWIN_TYPE_LIST_BODY = """
-<a class="back" href="/twin">← Zurück</a>
+<a class="back" href="/zwilling">← Zurück</a>
 <div class="pagehead"><h1>{{ type_title }}</h1></div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
@@ -6319,9 +6319,9 @@ TWIN_TYPE_LIST_BODY = """
 <tr><th>Titel</th><th>Herkunft</th><th></th></tr>
 {% for o in objects %}
 <tr class="rowlink">
-  <td><a class="rowaction" href="/twin/object/{{ o.bare_id }}">{{ o.title }}</a></td>
+  <td><a class="rowaction" href="/zwilling/object/{{ o.bare_id }}">{{ o.title }}</a></td>
   <td class="muted">{{ o.owner_label }}</td>
-  <td><a class="rowaction" href="/twin/object/{{ o.bare_id }}">Ansehen</a></td>
+  <td><a class="rowaction" href="/zwilling/object/{{ o.bare_id }}">Ansehen</a></td>
 </tr>
 {% endfor %}
 </table>
@@ -6330,7 +6330,7 @@ TWIN_TYPE_LIST_BODY = """
 """
 
 TWIN_OBJECT_BODY = """
-<a class="back" href="/twin/{{ obj.type }}">← Zurück zur Liste</a>
+<a class="back" href="/zwilling/{{ obj.type }}">← Zurück zur Liste</a>
 <div class="pagehead">
   <h1>{{ obj.title }}</h1>
   <span class="badge">{{ type_title }}</span>
@@ -6341,14 +6341,14 @@ TWIN_OBJECT_BODY = """
 {% if obj.merged_aliases %}
 <p class="muted">Dieses Objekt hat {{ obj.merged_aliases|length }}
    zusammengeführte(s) Objekt(e) — Gruppen aus beiden werden hier
-   gemeinsam gezeigt. <a href="/twin/duplicates">Zusammenführungen verwalten</a></p>
+   gemeinsam gezeigt. <a href="/zwilling/duplicates">Zusammenführungen verwalten</a></p>
 {% endif %}
 <div class="card">
   <form method="get">
     <label>Stichtag (Gültigkeit, §3.4)
       <input type="date" name="at" value="{{ at or '' }}"></label>
     <button>Anzeigen</button>
-    {% if at %}<a class="btn" href="/twin/object/{{ bare_id }}">Heute</a>{% endif %}
+    {% if at %}<a class="btn" href="/zwilling/object/{{ bare_id }}">Heute</a>{% endif %}
   </form>
 </div>
 {% for gk, g in obj.groups.items() %}
@@ -6364,14 +6364,14 @@ TWIN_OBJECT_BODY = """
   {% if g.relations %}
   <p class="muted">Beziehungen:</p>
   <ul>{% for r in g.relations %}
-    <li>{{ r.key }} → <a href="/twin/object/{{ bare(r.target) }}">{{ r.target }}</a></li>
+    <li>{{ r.key }} → <a href="/zwilling/object/{{ bare(r.target) }}">{{ r.target }}</a></li>
   {% endfor %}</ul>
   {% endif %}
   {% if not g.attributes and not g.relations and not g.activities %}
   <p class="muted">Keine Inhalte.</p>
   {% endif %}
   {% if can_twin_write and g.origin == 'tenant' %}
-  <form method="post" action="/twin/object/{{ bare_id }}/save/{{ base_group_key(gk) }}">
+  <form method="post" action="/zwilling/object/{{ bare_id }}/save/{{ base_group_key(gk) }}">
     {% for ak, av in g.attributes.items() %}
     <label>{{ attr_titles.get(ak, ak) }}
       <input type="text" name="attr_{{ ak }}" value="{{ av.value }}"></label>
@@ -6397,7 +6397,7 @@ TWIN_OBJECT_BODY = """
   <h2>Gruppe hinzufügen</h2>
   {% for gt in addable %}
   <h3>{{ gt.title }}</h3>
-  <form method="post" action="/twin/object/{{ bare_id }}/save/{{ gt.key }}">
+  <form method="post" action="/zwilling/object/{{ bare_id }}/save/{{ gt.key }}">
     {% for ak in gt.definition.attributes %}
     <label>{{ attr_titles.get(ak, ak) }}
       <input type="text" name="attr_{{ ak }}"></label>
@@ -6411,7 +6411,7 @@ TWIN_OBJECT_BODY = """
 """
 
 TWIN_DUPLICATES_BODY = """
-<a class="back" href="/twin">← Zurück</a>
+<a class="back" href="/zwilling">← Zurück</a>
 <h1>Dubletten</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
@@ -6426,10 +6426,10 @@ Zusammenführen ist ein menschlicher Schritt und lässt sich auflösen.</p>
   <tr><th>Titel</th><th>Herkunft</th><th></th></tr>
   {% for o in c.objects %}
   <tr><td>{{ o.title }}</td><td class="muted">{{ o.owner_label }}</td>
-      <td><a class="rowaction" href="/twin/object/{{ o.bare_id }}">Ansehen</a></td></tr>
+      <td><a class="rowaction" href="/zwilling/object/{{ o.bare_id }}">Ansehen</a></td></tr>
   {% endfor %}
   </table>
-  <form method="post" action="/twin/duplicates/merge">
+  <form method="post" action="/zwilling/duplicates/merge">
     <label>Behalten
       <select name="keep">
       {% for o in c.objects %}<option value="{{ o.bare_id }}">{{ o.title }} ({{ o.owner_label }})</option>{% endfor %}
@@ -6451,9 +6451,9 @@ Zusammenführen ist ein menschlicher Schritt und lässt sich auflösen.</p>
 <table>
 <tr><th>Aufgegangen in</th><th>Verschwunden als</th><th>Wann</th><th></th></tr>
 {% for m in merged %}
-<tr><td><a href="/twin/object/{{ m.canonical_id }}">{{ m.canonical_title }}</a></td>
+<tr><td><a href="/zwilling/object/{{ m.canonical_id }}">{{ m.canonical_title }}</a></td>
     <td class="muted">{{ m.alias_title }}</td><td class="muted">{{ m.merged_at }}</td>
-    <td><form method="post" action="/twin/duplicates/unmerge" style="display:inline">
+    <td><form method="post" action="/zwilling/duplicates/unmerge" style="display:inline">
       <input type="hidden" name="drop" value="{{ m.alias_id }}">
       <button>Auflösen</button></form></td></tr>
 {% endfor %}
@@ -6463,7 +6463,7 @@ Zusammenführen ist ein menschlicher Schritt und lässt sich auflösen.</p>
 """
 
 TWIN_TYPE_NEW_BODY = """
-<a class="back" href="/twin">← Zurück</a>
+<a class="back" href="/zwilling">← Zurück</a>
 <h1>Typ anlegen</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 <p class="muted">Bewusst schmal (RFC-0031 §9 Schritt 5): eine neue Gruppe
@@ -6471,7 +6471,7 @@ mit ihren Attributen an einem schon vorhandenen, aktiven Objekttyp —
 genau das Beispiel aus dem Zielbild ("Kundenzufriedenheit auf Firma").
 Ein ganz neuer Objekttyp entsteht weiterhin nur über eine App oder ein
 Datenmodell-Paket.</p>
-<form method="post" action="/twin/types/new">
+<form method="post" action="/zwilling/types/new">
   <div class="card">
     <h2>Woran hängt die Gruppe?</h2>
     <label>Objekttyp
@@ -6501,7 +6501,7 @@ Datenmodell-Paket.</p>
 """
 
 
-@app.get("/twin")
+@app.get("/zwilling")
 def twin_home():
     denied = require_twin()
     if denied:
@@ -6511,7 +6511,7 @@ def twin_home():
                types=twin_view.object_types(types), error=error)
 
 
-@app.get("/twin/<type_key>")
+@app.get("/zwilling/<type_key>")
 def twin_type_list(type_key):
     denied = require_twin()
     if denied:
@@ -6538,7 +6538,7 @@ def twin_type_list(type_key):
                error=None if r.status_code == 200 else (r.text or f"HTTP {r.status_code}"))
 
 
-@app.get("/twin/object/<obj_id>")
+@app.get("/zwilling/object/<obj_id>")
 def twin_object_page(obj_id):
     denied = require_twin()
     if denied:
@@ -6570,7 +6570,7 @@ def twin_object_page(obj_id):
                error=None)
 
 
-@app.post("/twin/object/<obj_id>/save/<group_key>")
+@app.post("/zwilling/object/<obj_id>/save/<group_key>")
 def twin_object_save(obj_id, group_key):
     denied = require_twin_write()
     if denied:
@@ -6583,16 +6583,16 @@ def twin_object_save(obj_id, group_key):
         r = _twin_call("PUT", f"/internal/twin/objects/{obj_id}/groups/{group_key}",
                        json={"attributes": attrs})
     except requests.RequestException as e:
-        return redirect(f"/twin/object/{obj_id}?err=1&msg="
+        return redirect(f"/zwilling/object/{obj_id}?err=1&msg="
                         + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
                         code=303)
     if r.status_code != 204:
-        return redirect(f"/twin/object/{obj_id}?err=1&msg="
+        return redirect(f"/zwilling/object/{obj_id}?err=1&msg="
                         + quote(r.text or f"HTTP {r.status_code}"), code=303)
-    return redirect(f"/twin/object/{obj_id}?msg=" + quote("Gespeichert."), code=303)
+    return redirect(f"/zwilling/object/{obj_id}?msg=" + quote("Gespeichert."), code=303)
 
 
-@app.get("/twin/duplicates")
+@app.get("/zwilling/duplicates")
 def twin_duplicates():
     denied = require_twin_admin()
     if denied:
@@ -6619,7 +6619,7 @@ def twin_duplicates():
                msg=request.args.get("msg"), msg_ok=request.args.get("err") is None)
 
 
-@app.post("/twin/duplicates/merge")
+@app.post("/zwilling/duplicates/merge")
 def twin_duplicates_merge():
     denied = require_twin_admin()
     if denied:
@@ -6627,21 +6627,21 @@ def twin_duplicates_merge():
     keep = request.form.get("keep", "").strip()
     drop = request.form.get("drop", "").strip()
     if not keep or not drop or keep == drop:
-        return redirect("/twin/duplicates?err=1&msg="
+        return redirect("/zwilling/duplicates?err=1&msg="
                         + quote("Bitte zwei unterschiedliche Objekte wählen."), code=303)
     try:
         r = _twin_call("POST", "/internal/twin/merge", json={"keep": keep, "drop": drop})
     except requests.RequestException as e:
-        return redirect("/twin/duplicates?err=1&msg="
+        return redirect("/zwilling/duplicates?err=1&msg="
                         + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
                         code=303)
     if r.status_code != 204:
-        return redirect("/twin/duplicates?err=1&msg="
+        return redirect("/zwilling/duplicates?err=1&msg="
                         + quote(r.text or f"HTTP {r.status_code}"), code=303)
-    return redirect("/twin/duplicates?msg=" + quote("Zusammengeführt."), code=303)
+    return redirect("/zwilling/duplicates?msg=" + quote("Zusammengeführt."), code=303)
 
 
-@app.post("/twin/duplicates/unmerge")
+@app.post("/zwilling/duplicates/unmerge")
 def twin_duplicates_unmerge():
     denied = require_twin_admin()
     if denied:
@@ -6650,16 +6650,16 @@ def twin_duplicates_unmerge():
     try:
         r = _twin_call("POST", "/internal/twin/unmerge", json={"drop": drop})
     except requests.RequestException as e:
-        return redirect("/twin/duplicates?err=1&msg="
+        return redirect("/zwilling/duplicates?err=1&msg="
                         + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
                         code=303)
     if r.status_code != 204:
-        return redirect("/twin/duplicates?err=1&msg="
+        return redirect("/zwilling/duplicates?err=1&msg="
                         + quote(r.text or f"HTTP {r.status_code}"), code=303)
-    return redirect("/twin/duplicates?msg=" + quote("Zusammenführung aufgelöst."), code=303)
+    return redirect("/zwilling/duplicates?msg=" + quote("Zusammenführung aufgelöst."), code=303)
 
 
-@app.get("/twin/types/new")
+@app.get("/zwilling/types/new")
 def twin_type_new_form():
     denied = require_twin_admin()
     if denied:
@@ -6670,7 +6670,7 @@ def twin_type_new_form():
                value_types=TWIN_VALUE_TYPES, error=error)
 
 
-@app.post("/twin/types/new")
+@app.post("/zwilling/types/new")
 def twin_type_new_create():
     denied = require_twin_admin()
     if denied:
@@ -6694,4 +6694,4 @@ def twin_type_new_create():
         return page(TWIN_TYPE_NEW_BODY, "Typ anlegen", "twin", status=r.status_code,
                    object_types=twin_view.object_types(types),
                    value_types=TWIN_VALUE_TYPES, error=r.text or f"HTTP {r.status_code}")
-    return redirect("/twin?msg=" + quote(f"Typ '{body['group_key']}' angelegt."), code=303)
+    return redirect("/zwilling?msg=" + quote(f"Typ '{body['group_key']}' angelegt."), code=303)

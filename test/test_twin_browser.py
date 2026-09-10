@@ -7,12 +7,15 @@ und Store-Zugriff (`test_store_access.py`):
     `twin_view.py` ist reine Logik -- Regeln, keine Anfrage, kein
     Flask, kein Netzwerk -- und direkt testbar, importiert.
 
-    `platform/services/portal/app.py`s eigene '/twin*'-Routen werden an
-    der QUELLE gelesen (kein Flask-Client, kein laufender Knoten -- die
+    `platform/services/portal/app.py`s eigene '/zwilling*'-Routen werden
+    an der QUELLE gelesen (kein Flask-Client, kein laufender Knoten -- die
     Routen rufen den 'twin'-Dienst über das Netz, das hier nicht
-    existiert): jede Route ruft den richtigen Wächter, und keine Route
-    unter '/twin' fällt zwischen sie durch, genau das Muster
-    `test_store_access.py` schon für '/store' durchsetzt.
+    existiert): jede Route ruft den richtigen Wächter, keine Route unter
+    '/zwilling' fällt zwischen sie durch (genau das Muster
+    `test_store_access.py` schon für '/store' durchsetzt), und keine
+    liegt unter '/twin' -- das gehört bereits dem Gateway (Caddyfile
+    `handle /twin/*`, maschinen-only), live auf oaap-test gefunden
+    (2026-09-10), nachdem der erste Bau genau dort lag.
 
 Aufruf: python3 test/test_twin_browser.py
 """
@@ -223,18 +226,19 @@ ok("require_twin_write: user fehlt -- nur admin/keyuser/tenant_admin "
 ok("require_twin_admin: ausschließlich tenant_admin (Typen, Merge)",
    '"tenant_admin"' in g3 and '"admin"' not in g3 and '"keyuser"' not in g3)
 
-print("\n=== Jede /twin-Route ruft einen der drei Wächter, keine fällt "
-      "durch (dasselbe Muster wie test_store_access.py für /store) ===")
+print("\n=== Jede /zwilling-Route ruft einen der drei Wächter, keine "
+      "fällt durch (dasselbe Muster wie test_store_access.py für /store) "
+      "===")
 R = routes()
 EXPECTED_GUARD = {
-    "/twin": "require_twin",
-    "/twin/<type_key>": "require_twin",
-    "/twin/object/<obj_id>": "require_twin",
-    "/twin/object/<obj_id>/save/<group_key>": "require_twin_write",
-    "/twin/duplicates": "require_twin_admin",
-    "/twin/duplicates/merge": "require_twin_admin",
-    "/twin/duplicates/unmerge": "require_twin_admin",
-    "/twin/types/new": "require_twin_admin",
+    "/zwilling": "require_twin",
+    "/zwilling/<type_key>": "require_twin",
+    "/zwilling/object/<obj_id>": "require_twin",
+    "/zwilling/object/<obj_id>/save/<group_key>": "require_twin_write",
+    "/zwilling/duplicates": "require_twin_admin",
+    "/zwilling/duplicates/merge": "require_twin_admin",
+    "/zwilling/duplicates/unmerge": "require_twin_admin",
+    "/zwilling/types/new": "require_twin_admin",
 }
 for path, guard in EXPECTED_GUARD.items():
     fn = R.get(path)
@@ -242,30 +246,41 @@ for path, guard in EXPECTED_GUARD.items():
 
 unguarded = []
 for path, fn in R.items():
-    if not path.startswith("/twin"):
+    if not path.startswith("/zwilling"):
         continue
     text = body_of(fn)
     if "require_twin" not in text:
         unguarded.append(f"{path} -> {fn}")
-ok("jede /twin-Route ruft einen 'require_twin*'-Wächter", not unguarded, unguarded)
+ok("jede /zwilling-Route ruft einen 'require_twin*'-Wächter", not unguarded, unguarded)
 
-# /twin/types/new existiert zweimal (GET und POST) -- beide müssen halten.
+# /zwilling/types/new existiert zweimal (GET und POST) -- beide müssen halten.
 new_type_fns = [n.name for n in TREE.body
                if isinstance(n, ast.FunctionDef)
                and any(isinstance(d, ast.Call) and d.args
                        and isinstance(d.args[0], ast.Constant)
-                       and d.args[0].value == "/twin/types/new"
+                       and d.args[0].value == "/zwilling/types/new"
                        for d in n.decorator_list)]
-ok("GET und POST auf /twin/types/new sind beide gesichert",
+ok("GET und POST auf /zwilling/types/new sind beide gesichert",
    len(new_type_fns) == 2
    and all("require_twin_admin" in body_of(fn) for fn in new_type_fns),
    new_type_fns)
+
+print("\n=== Keine Portal-Route lebt unter '/twin' -- das gehört bereits "
+      "dem Gateway (Caddyfile 'handle /twin/*', maschinen-only), live auf "
+      "oaap-test gefunden (2026-09-10): jede Anfrage unter '/twin*' wäre "
+      "an den Zwilling-DIENST selbst gegangen, nie ans Portal, und der "
+      "kennt z. B. '/twin/Firma' gar nicht -- Flasks eigenes 404, nicht "
+      "einmal eine Meldung des Portals ===")
+ok("keine @app.get/@app.post-Route beginnt mit '/twin'",
+   not [p for p in R if p == "/twin" or p.startswith("/twin/")], list(R))
+ok("die neuen Routen leben stattdessen unter '/zwilling'",
+   any(p.startswith("/zwilling") for p in R))
 
 print("\n=== Die Navigation zeigt 'Zwilling' nur mit einer Mandantenrolle "
       "-- ein server_admin ohne eigenen Mandanten sieht keinen Zwilling "
       "eines Mandanten, den er nicht hat ===")
 ok("can_twin in der Navigation verdrahtet",
-   '{% if can_twin %}<a href="/twin"' in SRC)
+   '{% if can_twin %}<a href="/zwilling"' in SRC)
 page_fn = body_of("page")
 ok("page() setzt can_twin/can_twin_write/can_twin_admin aus denselben "
    "Rollen wie die drei Wächter oben, nicht aus einer eigenen Liste",
