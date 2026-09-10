@@ -6274,6 +6274,23 @@ def _bare(urn):
     return (urn or "").rsplit(":", 1)[-1]
 
 
+def _twin_flags():
+    """can_twin_write/can_twin_admin, for the BODY templates that use
+    them -- page() computes the same two flags too, but only for its
+    OWN wrapping LAYOUT render; render_template_string(body_template,
+    **ctx) never sees them unless a route passes them itself (the same
+    thing store_page already does explicitly with 'can_sources'). Their
+    absence here is not an error Jinja raises -- an undefined variable
+    in an '{% if %}' is simply falsy -- so every button gated by either
+    flag was invisible to EVERY role, tenant_admin included, until this
+    was added. Found live on oaap-test, 2026-09-10, testing tenant type
+    creation: the type registered correctly (confirmed via the API
+    directly) and never appeared as an offer on the object page."""
+    caller = caller_roles()
+    return {"can_twin_write": bool(caller & {"admin", "keyuser", "tenant_admin"}),
+           "can_twin_admin": "tenant_admin" in caller}
+
+
 TWIN_VALUE_TYPES = ("text", "int", "decimal", "bool", "date", "datetime", "enum", "ref")
 
 
@@ -6544,7 +6561,7 @@ def twin_home():
     if denied:
         return denied
     types, error = _twin_types_or_error()
-    return page(TWIN_HOME_BODY, "Zwilling", "twin",
+    return page(TWIN_HOME_BODY, "Zwilling", "twin", **_twin_flags(),
                types=twin_view.object_types(types), error=error)
 
 
@@ -6597,7 +6614,7 @@ def twin_object_page(obj_id):
                    twin_view.attribute_defs(types).items()}
     addable = twin_view.addable_group_types(types, obj["type"], obj["groups"].keys())
     activities = twin_view.timeline(obj["groups"])
-    return page(TWIN_OBJECT_BODY, obj["title"], "twin",
+    return page(TWIN_OBJECT_BODY, obj["title"], "twin", **_twin_flags(),
                obj=obj, type_title=(type_row or {}).get("title", obj["type"]),
                bare_id=_bare(obj["id"]), at=at, attr_titles=attr_titles,
                addable=addable, activities=activities,

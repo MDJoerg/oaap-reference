@@ -277,6 +277,32 @@ ok("keine @app.get/@app.post-Route beginnt mit '/twin'",
 ok("die neuen Routen leben stattdessen unter '/zwilling'",
    any(p.startswith("/zwilling") for p in R))
 
+print("\n=== can_twin_write/can_twin_admin erreichen auch die BODY-"
+      "Vorlage, nicht nur die aeussere LAYOUT-Hülle -- page()s eigenes "
+      "render_template_string(body_template, **ctx) sieht nur, was die "
+      "RUFENDE Route in ctx mitgibt; ein Flag, das dort fehlt, ist in "
+      "Jinja einfach 'falsy', kein Fehler. Live auf oaap-test gefunden "
+      "(2026-09-10): ein neu angelegter Mandanten-Typ registrierte "
+      "korrekt, erschien aber nie als Angebot auf der Objektseite, weil "
+      "can_twin_write dort nie ankam -- fuer JEDE Rolle, auch "
+      "tenant_admin ===")
+FLAG_USING_BODIES = {
+    # anchored to the SUCCESS render of each -- the error-path renders
+    # of TWIN_OBJECT_BODY (obj=None, nothing to offer) legitimately
+    # skip the flags, so a plain first-occurrence search would check
+    # the wrong call site entirely.
+    'page(TWIN_HOME_BODY, "Zwilling", "twin"': "can_twin_admin",
+    'page(TWIN_OBJECT_BODY, obj["title"], "twin"': "can_twin_write",
+}
+for anchor, flag in FLAG_USING_BODIES.items():
+    body_name = anchor.split(",", 1)[0][len("page("):]
+    body_const = SRC.split(f"\n{body_name} = \"\"\"", 1)[1].split('"""', 1)[0]
+    ok(f"{body_name} really uses {flag} (guards this test itself)",
+       flag in body_const)
+    call_site = SRC[SRC.find(anchor):][:400]
+    ok(f"the route rendering {body_name} passes {flag} into it "
+       "(via _twin_flags())", "**_twin_flags()" in call_site, call_site)
+
 print("\n=== Die Navigation zeigt 'Zwilling' nur mit einer Mandantenrolle "
       "-- ein server_admin ohne eigenen Mandanten sieht keinen Zwilling "
       "eines Mandanten, den er nicht hat ===")
