@@ -272,6 +272,24 @@ ok("page() setzt can_twin/can_twin_write/can_twin_admin aus denselben "
    "can_twin=" in page_fn and "can_twin_write=" in page_fn
    and "can_twin_admin=" in page_fn)
 
+print("\n=== Dockerfile: jedes 'import <lokales Modul>' in app.py hat "
+      "eine eigene COPY-Zeile -- live auf oaap-test gefunden (2026-09-10): "
+      "twin_view.py fehlte im Image, ModuleNotFoundError, Portal fiel in "
+      "eine Neustart-Schleife, obwohl der lokale Test dasselbe app.py schon "
+      "erfolgreich importiert hatte (dort liegt twin_view.py ja daneben) ===")
+with open(os.path.join(PORTAL_DIR, "Dockerfile"), encoding="utf-8") as f:
+    DOCKERFILE = f.read()
+copy_line = next((l for l in DOCKERFILE.splitlines() if l.startswith("COPY app.py")), "")
+local_modules = []
+for node in ast.walk(TREE):
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if os.path.isfile(os.path.join(PORTAL_DIR, f"{alias.name}.py")):
+                local_modules.append(alias.name)
+missing = [m for m in local_modules if f"{m}.py" not in copy_line]
+ok("jedes lokal importierte Modul steht auch in der COPY-Zeile "
+   f"({', '.join(local_modules)})", not missing, missing)
+
 print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)
