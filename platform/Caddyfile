@@ -58,14 +58,20 @@
 	# Verified the same way every other protected route is -- the caller
 	# presents its own machine-principal key (RFC-0027, minted at install
 	# for an app that contributes/consumes); 'twin' itself refuses
-	# anything whose X-OAAP-User is not 'instance:<name>'. No ?instance=
-	# scoping here on purpose: this route serves every instance on the
-	# node, so the key issued for it is deliberately NOT instance-scoped
-	# (see appctl.py's _twin_issue_instance_key) — the principal itself
-	# is already 1:1 with one instance, which is what actually limits it.
+	# anything whose X-OAAP-User is not 'instance:<name>'.
+	#
+	# ?instance=oaap.twin (RFC-0027 D5) on purpose, and it MUST stay in
+	# sync with appctl.py's TWIN_KEY_SCOPE: an app's own site always
+	# names itself here, so a key WITHOUT this parameter would have been
+	# refused nowhere but by role and tenant -- it would authenticate
+	# against every OTHER app's own route asking only role 'user' in the
+	# same tenant, not only this one. Found live on oaap-test 2026-09-10
+	# (CURRENT_STATE 125), by testing the very thing the comment here
+	# used to claim was safe. 'oaap.twin' can never collide with a real
+	# app name (app.id is '[a-z0-9][a-z0-9-]{1,38}[a-z0-9]', never a dot).
 	handle /twin/* {
 		forward_auth identity:8000 {
-			uri /verify?roles=user
+			uri /verify?roles=user&instance=oaap.twin
 			copy_headers X-OAAP-User X-OAAP-Roles
 			header_up -Connection
 			header_up -Upgrade

@@ -3053,18 +3053,31 @@ def _twin_ensure_tables(schema):
     """)
 
 
+
+# RFC-0027 D5's --instance scoping limits a key to one app's own site,
+# named by that app (app.id: '[a-z0-9][a-z0-9-]{1,38}[a-z0-9]', never a
+# dot). 'oaap.twin' therefore names a scope no real app instance can
+# EVER hold -- not a reservation this platform has to remember and
+# enforce elsewhere, a syntactic impossibility. Used only here and in
+# the Caddyfile's '/twin/*' block; the two must always agree.
+TWIN_KEY_SCOPE = "oaap.twin"
+
+
 def _twin_issue_instance_key(name, tenant_id):
     """Mint the machine principal 'instance:<name>' (RFC-0027 3.1) and an
     API key for it -- the credential this instance presents to
     oaap.data.twin so origin and tenant come from the credential, never
     the request (RFC-0031 §8, E1). Returns the full bearer token.
 
-    Deliberately issued WITHOUT --instance scoping: '/twin/*' is ONE
-    route shared by every instance on the node (unlike an app's own
-    site, which names itself), so a key limited to one instance would
-    be refused there for lacking the OTHER instances' names. What
-    actually limits this key is the principal itself -- nothing else
-    was ever issued one, and it holds only role 'user'."""
+    Issued WITH --instance scoping, to the reserved value TWIN_KEY_SCOPE
+    (RFC-0027 D5) -- not left unscoped. An unscoped key is refused
+    nowhere except by role and tenant (that is what D5 is for: an app's
+    own site always names itself in the forward_auth call), so an
+    unscoped twin key would authenticate against every OTHER app's own
+    route requiring only role 'user' in the same tenant, not only
+    '/twin/*' -- found live on oaap-test 2026-09-10 (CURRENT_STATE 125)
+    by testing the very thing this docstring used to claim was safe.
+    """
     principal = f"instance:{name}"
     out = _identity_exec(
         "import json, os, app as m\n"
@@ -3077,10 +3090,11 @@ def _twin_issue_instance_key(name, tenant_id):
         "                  'roles': ['user'], 'groups': [],\n"
         "                  'tenant': os.environ['OAAP_T_TENANT'], 'active': True})\n"
         "    m._save(m.USERS_FILE, users)\n"
-        "rec, secret = m.issue_key(users, name, ['user'], '',\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
         "    'oaap.data.twin (RFC-0031 E1)', m.KEY_MAX_DAYS, 'root')\n"
         "print(json.dumps(secret))\n",
-        {"OAAP_T_NAME": principal, "OAAP_T_INST": name, "OAAP_T_TENANT": tenant_id})
+        {"OAAP_T_NAME": principal, "OAAP_T_INST": name, "OAAP_T_TENANT": tenant_id,
+         "OAAP_T_SCOPE": TWIN_KEY_SCOPE})
     return json.loads(out)
 
 

@@ -33,6 +33,7 @@ Run: python3 test/test_data_twin.py
 """
 import ast
 import os
+import re
 import sys
 import tempfile
 
@@ -120,11 +121,26 @@ ok("OAAP_TWIN_URL points through the gateway, never straight at 'twin' -- "
    "an app's own network (RFC-0016) cannot reach 'twin' directly",
    'f"http://{GATEWAY_CONTAINER}/twin"' in install_body)
 
-print("\n=== _twin_issue_instance_key: unscoped by design (the shared route "
-      "cannot name every instance in advance) ===")
+print("\n=== _twin_issue_instance_key: scoped to the reserved instance "
+      "'oaap.twin' (RFC-0027 D5) -- NOT left unscoped ===")
+# Found live on oaap-test 2026-09-10 (CURRENT_STATE 125): an unscoped key
+# is refused nowhere but by role and tenant, so it authenticated against
+# every OTHER app's own route asking only role 'user' in the same
+# tenant, not only '/twin/*'. TWIN_KEY_SCOPE names a value app.id's own
+# pattern can never produce (it contains a '.'), so nothing this
+# platform ever installs can collide with it.
+ok("TWIN_KEY_SCOPE is reserved and can never be a real app.id "
+   "([a-z0-9][a-z0-9-]{1,38}[a-z0-9] never contains a dot)",
+   re.fullmatch(r"[a-z0-9][a-z0-9-]{1,38}[a-z0-9]", m.TWIN_KEY_SCOPE) is None
+   and "." in m.TWIN_KEY_SCOPE)
 key_fn = appctl_src.split("def _twin_issue_instance_key")[1].split("\ndef ")[0]
-ok("the key is issued WITHOUT --instance scoping (empty string, not 'name')",
-   "issue_key(users, name, ['user'], ''," in key_fn)
+ok("the key is issued WITH --instance scoping, to TWIN_KEY_SCOPE -- "
+   "not an empty string",
+   "issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE']," in key_fn
+   and "OAAP_T_SCOPE" in key_fn)
+ok("the scope value handed into the exec environment IS TWIN_KEY_SCOPE, "
+   "not some other string",
+   '"OAAP_T_SCOPE": TWIN_KEY_SCOPE' in key_fn)
 ok("the machine principal is named 'instance:<name>', never the bare name",
    'principal = f"instance:{name}"' in key_fn)
 
@@ -146,15 +162,18 @@ ok("'twin' mounts the registry+secrets directory read-only",
    '/platform-apps:ro' in twin_block)
 
 print("\n=== Caddyfile: '/twin/*' is verified like every other protected "
-      "route, scoped to no single instance ===")
+      "route, scoped to the SAME reserved instance appctl.py issues the "
+      "key for ===")
 twin_route = caddy_src.split("handle /twin/*")[1].split("\n\thandle")[0]
 ok("the route goes through identity's real /verify, not a bespoke check",
    "forward_auth identity:8000" in twin_route and "uri /verify" in twin_route)
 ok("the verified principal and roles are handed to the twin service",
    "copy_headers X-OAAP-User X-OAAP-Roles" in twin_route)
-ok("no '?instance=' restriction -- this route serves every instance, "
-   "not one (see _twin_issue_instance_key's own reasoning)",
-   "instance=" not in twin_route)
+ok("the route carries '?instance=' scoped to TWIN_KEY_SCOPE -- an "
+   "unscoped key here would authenticate against every other app's "
+   "own route asking only role 'user' in the same tenant, not only "
+   "this one (found live on oaap-test 2026-09-10, CURRENT_STATE 125)",
+   f"instance={m.TWIN_KEY_SCOPE}" in twin_route)
 ok("proxies to the 'twin' service, not 'portal' or 'identity'",
    "reverse_proxy twin:8000" in twin_route)
 

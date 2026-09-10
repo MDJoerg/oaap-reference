@@ -150,6 +150,12 @@ Stelle anlegt wie `oaap.data.model`s Bindung, dass das Knotenprofil
 die Compose-Datei, die Caddyfile-Route und `migrate.sh` je ihre eigene
 Absicherung haben, und dass der Dienst selbst gültiges Python ist und
 Herkunft/Mandant nur aus dem geprüften Aufrufer liest, nie aus der
-Anfrage. Was diese Datei **nicht** prüfen kann — dass ein echtes
-Anlegen/Lesen/Schreiben eines Objekts gegen ein echtes Postgres tut,
-was RFC-0031 §9 Schritt 1–3 verlangt — gehört auf `oaap-test`.
+Anfrage. Seit der ersten Live-Prüfung auch: dass der Maschinen-
+Schlüssel wirklich mit RFC-0027s `--instance`-Bindung auf den
+reservierten Wert `oaap.twin` ausgestellt wird und dass Caddyfile und
+`appctl.py` denselben Wert nennen — ein ungebundener Schlüssel wäre auf
+`oaap-test` selbst gegen andere Apps im selben Mandanten gegangen, nicht
+nur gegen `/twin/*` (CURRENT_STATE 125). Was diese Datei **nicht**
+prüfen kann — dass ein echtes Anlegen/Lesen/Schreiben eines Objekts
+gegen ein echtes Postgres tut, was RFC-0031 §9 Schritt 1–3 verlangt —
+gehört auf `oaap-test`.
