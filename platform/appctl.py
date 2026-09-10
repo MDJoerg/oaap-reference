@@ -2101,6 +2101,28 @@ def cmd_data(args):
                   f"tenant={r['tenant_id'] or '?'}")
         return
 
+    if args.action == "migrate-twin":
+        # _twin_ensure_schema is idempotent by design ("same posture as
+        # migrate.sh's OAAP_INTERNAL_KEY repair", its own docstring) --
+        # but until now, nothing ever called it AGAIN for a tenant whose
+        # twin schema already existed; the only call site is the install
+        # hook, which an already-installed app only re-enters on a
+        # version bump. A reference upgrade that adds a table or a grant
+        # to every tenant's schema (0.2's 'aliases' table and its
+        # GRANT INSERT, Schritt 5) had no way to reach an
+        # ALREADY-PROVISIONED tenant without one -- found live on
+        # oaap-test while verifying Schritt 5, 2026-09-10, not by design.
+        healed = []
+        for r in store_schemas():
+            if r["purpose"] == "twin" and r["tenant_id"]:
+                _twin_ensure_schema(r["tenant_id"])
+                healed.append(r["tenant_id"])
+        if not healed:
+            print("No twin schemas to migrate.")
+        else:
+            print(f"Migrated {len(healed)} twin schema(s): {', '.join(healed)}.")
+        return
+
     if args.action == "create":
         purpose = (args.arg1 or "").strip().lower()
         tenant_id = (args.arg2 or "").strip()
@@ -10319,6 +10341,7 @@ def main():
     pdt.add_argument("object", choices=["store", "model"])
     pdt.add_argument("action", choices=["status", "schemas", "create",
                                         "copy", "drop", "restore",
+                                        "migrate-twin",
                                         "types", "show", "register",
                                         "alias", "bindings"])
     pdt.add_argument("arg1", nargs="?",

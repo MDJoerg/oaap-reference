@@ -70,7 +70,8 @@ ok("aber nicht bei --check, das nichts ändern darf",
 print("\n=== die Schritte stehen nur noch an einer Stelle ===")
 # Ein Schritt, der wieder in update.sh wandert, ist der Rückfall.
 for step, marker in (("Ratengrenze des Deploy-Workers", "StartLimitIntervalSec"),
-                     ("Abgleich der Store-Quellen", "store reconcile")):
+                     ("Abgleich der Store-Quellen", "store reconcile"),
+                     ("Migration bestehender Zwillings-Schemata", "migrate-twin")):
     ok(f"{step}: in migrate.sh", marker in migrate)
     ok(f"{step}: NICHT mehr in update.sh", marker not in update,
        "ein Schritt in update.sh wird von dem Update übersprungen, "

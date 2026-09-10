@@ -305,6 +305,35 @@ ok("...but its profile gate, port and mount are UNCHANGED",
    'profiles: ["store"]' in twin_block2 and "ports:" not in twin_block2
    and "- store" in twin_block2)
 
+print("\n=== 'oaap data store migrate-twin': heals an ALREADY-provisioned "
+      "tenant, found missing live on oaap-test (2026-09-10) while "
+      "verifying Schritt 5 -- _twin_ensure_schema's own 'idempotent' "
+      "claim was true only the first time it ran ===")
+ok("'migrate-twin' is a valid action of the 'data' verb",
+   '"migrate-twin"' in appctl_src
+   and re.search(r'choices=\["status", "schemas", "create",\s*\n\s*'
+                 r'"copy", "drop", "restore",\s*\n\s*"migrate-twin"', appctl_src))
+migrate_twin_body = appctl_src.split('if args.action == "migrate-twin":', 1)[1].split("\n\n    if ", 1)[0]
+ok("it re-runs _twin_ensure_schema for every EXISTING twin_<tenant> "
+   "schema -- not just at install time",
+   "_twin_ensure_schema(r[\"tenant_id\"])" in migrate_twin_body)
+ok("only schemas with purpose 'twin' are touched -- never a store_<x> "
+   "or app_<x> schema some other capability owns",
+   'r["purpose"] == "twin"' in migrate_twin_body)
+ok("a node with no twin schema at all is told plainly, not silently",
+   "No twin schemas to migrate." in migrate_twin_body)
+
+print("\n=== migrate.sh runs it on every 'oaap update', not just once "
+      "(test_migrate.py's own rule: a repair step lives in migrate.sh, "
+      "called from the NEW version, or a node that jumps versions "
+      "skips it forever) ===")
+ok("wired into migrate.sh, beside the existing twin-container check",
+   "data store migrate-twin" in migrate_src)
+ok("gated the same way the rest of this block already is -- only when "
+   "the store profile is carried and Postgres actually answers",
+   "pg_isready -U postgres" in migrate_src.split("data store migrate-twin")[0]
+   .rsplit('if [ -f "$OAAP_DATA_DIR/apps/node.json" ]', 1)[-1])
+
 print(f"\n{ok_n} bestanden, {fail_n} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail_n else "FEHLGESCHLAGEN")
 sys.exit(1 if fail_n else 0)

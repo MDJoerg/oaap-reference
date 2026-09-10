@@ -286,6 +286,19 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
       say "  WARNING: 'twin' service could not be started — check 'docker compose ps'."
     fi
   fi
+  # Every EXISTING tenant's twin_<id> schema gets whatever table or
+  # grant this version's _twin_ensure_schema now adds (0.2's 'aliases'
+  # table and its GRANT INSERT, Schritt 5) -- an already-provisioned
+  # tenant otherwise has no way to reach that function again short of
+  # an app redeploy that bumps its version. Found missing on oaap-test
+  # while live-verifying Schritt 5, 2026-09-10; harmless to run on a
+  # node with no twin schema yet (prints "No twin schemas to migrate.").
+  if docker exec oaap-store-1 pg_isready -U postgres >/dev/null 2>&1; then
+    say "Migrating existing twin schemas (oaap.data.twin 0.2) ..."
+    OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" \
+      data store migrate-twin 2>&1 | sed 's/^/  /' \
+      || say "  WARNING: twin schemas could not be migrated."
+  fi
 fi
 
 # --- what a rehearsal would cost, where the portal can read it (2.15.3) ---
