@@ -931,8 +931,24 @@ def twin_merge():
                 if cur.fetchone():
                     return f"'{drop_id}' is already merged into another object", 409
                 cur.execute(
+                    # 'alias_id' is the table's PRIMARY KEY (appctl.py's
+                    # own comment: "one object merged away at most once
+                    # AT A TIME") -- but an id that was unmerged and is
+                    # now merging again is the SAME alias_id with an
+                    # OLD, historical row already sitting there
+                    # (unmerge sets unmerged_at, never deletes, on
+                    # purpose). A plain INSERT hits that row's PK and
+                    # fails with a 500 -- found live on oaap-test,
+                    # 2026-09-10, re-merging the very Anna duplicate
+                    # this step exists to resolve, right after proving
+                    # unmerge works. ON CONFLICT turns the history back
+                    # into an active merge instead of colliding with it.
                     "INSERT INTO aliases (alias_id, canonical_id, merged_at, "
-                    "merged_by) VALUES (%s, %s, now(), %s)",
+                    "merged_by) VALUES (%s, %s, now(), %s) "
+                    "ON CONFLICT (alias_id) DO UPDATE SET "
+                    "canonical_id = EXCLUDED.canonical_id, merged_at = now(), "
+                    "merged_by = EXCLUDED.merged_by, unmerged_at = NULL, "
+                    "unmerged_by = NULL",
                     (drop_id, keep_id, username))
             _record_event(conn, "object.merged", keep_id, "", f"tenant:{username}")
     finally:

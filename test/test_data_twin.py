@@ -277,6 +277,13 @@ ok("merge itself carries no same-type refusal any more -- the reference "
    merge_fn is not None
    and "cannot merge objects of different types" not in merge_fn
    and 'found[keep_id] != found[drop_id]' not in merge_fn)
+ok("re-merging an id that was unmerged does not 500 on the alias table's "
+   "own primary key -- unmerge sets unmerged_at rather than deleting the "
+   "row (appctl.py), so a plain INSERT collides with that historical row; "
+   "found live on oaap-test 2026-09-10 re-merging the very Anna duplicate "
+   "right after proving unmerge works",
+   merge_fn is not None and "ON CONFLICT (alias_id) DO UPDATE SET" in merge_fn
+   and "unmerged_at = NULL" in merge_fn)
 write_fn = _twin_fn_body("twin_write_group_person")
 ok("a person writing a tenant group needs role admin, keyuser or "
    "tenant_admin -- never plain 'user'",
