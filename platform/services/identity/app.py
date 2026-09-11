@@ -728,6 +728,61 @@ PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE
 </div></body></html>"""])
 
 
+PROFILE_PAGE = _HEAD + "<title>Profil — OAAP</title>" + _CARD_STYLE + _MARK_SVG.join([
+    "<body><div class='card'>",
+    """<h1>Profil</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if done %}
+  <p class="ok">Der Anzeigename wurde geändert.</p>
+{% endif %}
+<form method="post" action="/auth/profile">
+  <label>Anzeigename (max. 80 Zeichen)
+    <input name="display_name" maxlength="80" value="{{ display_name }}"></label>
+  <button>Speichern</button>
+</form>
+<p><a href="/">Zurück zum Portal</a></p>
+</div></body></html>"""])
+
+
+@app.get("/auth/profile")
+def profile_form():
+    if not session_username():
+        return redirect("/auth/login", code=303)
+    users = load_users()
+    u = find_user(users, session_username() or "")
+    if not u or not u["active"]:
+        return redirect("/auth/login", code=303)
+    return render_template_string(
+        PROFILE_PAGE, error=None, done=False,
+        display_name=u.get("display_name") or "")
+
+
+@app.post("/auth/profile")
+def profile_change():
+    """Self-service display-name change (RFC-0036 Teil B).
+
+    Deliberately the only field this route touches. Roles, groups,
+    tenant, active status and the username itself stay admin-only
+    (spec 2.2/2.3) -- this is the one thing about themselves that was
+    previously stuck behind "ask an admin" for no security reason: a
+    misspelled or outdated display name carries no privilege.
+    """
+    users = load_users()
+    u = find_user(users, session_username() or "")
+    if not u or not u["active"]:
+        return redirect("/auth/login", code=303)
+    name = (request.form.get("display_name") or "").strip()
+    if len(name) > 80:
+        return render_template_string(
+            PROFILE_PAGE, error="Der Anzeigename darf höchstens 80 Zeichen haben.",
+            done=False, display_name=name[:80]), 400
+    u["display_name"] = name
+    _save(USERS_FILE, users)
+    print(f"profile changed: {u['username']} (display_name)", flush=True)
+    return render_template_string(PROFILE_PAGE, error=None, done=True,
+                                  display_name=name)
+
+
 @app.get("/verify")
 def verify():
     """Forward-auth endpoint for the gateway (RFC-0002 default deny).

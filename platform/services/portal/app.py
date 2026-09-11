@@ -168,6 +168,8 @@ STYLE = """
   .tabs a.danger.active{color:var(--err);border-bottom-color:var(--err)}
   .panel{display:none}
   .panel.active{display:block}
+  h2.section{font-size:.95rem;font-weight:600;color:var(--oaap-muted);
+       margin:1.6rem 0 .3rem;text-transform:uppercase;letter-spacing:.04em}
   .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(15rem,1fr));gap:1rem;margin:1rem 0}
   .tile{display:block;background:var(--oaap-surface);border:1px solid var(--oaap-border);
        border-radius:.6rem;padding:1rem 1.1rem;text-decoration:none;color:inherit;
@@ -234,6 +236,7 @@ LAYOUT = STYLE + """
   </nav>
   <div class="userbox">
     <span class="who">{{ user }}<br><small>{{ roles }}</small></span>
+    <a href="/auth/profile" title="Anzeigenamen ändern">Profil</a>
     <a href="/auth/password" title="Passwort ändern">Passwort</a>
     <form method="post" action="/auth/logout"><button>Abmelden</button></form>
   </div>
@@ -249,7 +252,12 @@ LAYOUT = STYLE + """
 
 DASHBOARD_BODY = """
 <h1>Apps</h1>
-{% if tiles %}
+{% if sections %}
+  {% for label, tiles in sections %}
+  {# RFC-0036 D2: the label a developer's manifest suggested
+     (launchpad.group). "" is the pre-existing, unlabelled bucket —
+     no heading, so an app that never sets it looks unchanged. #}
+  {% if label %}<h2 class="section">{{ label }}</h2>{% endif %}
   <div class="tiles">
     {% for t in tiles %}
     {# Apps öffnen im neuen Tab (Jörg, 2026-08-23): das Portal bleibt
@@ -274,6 +282,7 @@ DASHBOARD_BODY = """
     </a>
     {% endfor %}
   </div>
+  {% endfor %}
 {% else %}
   <div class="card"><p class="muted">Noch keine Apps installiert — oder für
   Ihre Rollen ist keine sichtbar. Apps installiert die Administration mit
@@ -2753,6 +2762,12 @@ def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
             "description": inst.get("description", ""),
             "url": _tile_url(name, inst, host, ext, on_lan),
             "rehearsal": iv.rehearsal_view(inst),
+            # RFC-0036 D2: a developer-suggested section label, re-read
+            # from the manifest at install time like app_class — never
+            # from a foreign list, for the same offline-answer reason.
+            # Blank means "no section", the status quo before this field
+            # existed.
+            "group": (inst.get("launchpad") or {}).get("group") or "",
         })
     return tiles, hidden
 
@@ -2808,7 +2823,7 @@ def dashboard():
     # Only a server_admin is told about tileless instances: they are the
     # only ones who can do anything about it, and everybody else would
     # be told to miss something they were never meant to operate.
-    return page(DASHBOARD_BODY, "Apps", "apps", tiles=tiles,
+    return page(DASHBOARD_BODY, "Apps", "apps", sections=iv.grouped_tiles(tiles),
                 hidden_count=hidden if "server_admin" in roles else 0)
 
 

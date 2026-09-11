@@ -263,6 +263,27 @@ def hidden_instances(instances):
                   if not tile_visible(inst))
 
 
+def grouped_tiles(tiles):
+    """Tiles bucketed by their 'group' label (RFC-0036 D2), for display.
+
+    Each tile dict is expected to carry a 'group' key (launchpad_tiles
+    in app.py sets it from the instance's manifest-derived launchpad
+    hint). Ungrouped tiles (label "") come first, in their OWN section
+    with no heading — the exact rendering every tile had before this
+    field existed, so an app that never sets launchpad.group looks
+    unchanged. Labelled sections follow, sorted by label. Order WITHIN
+    a section is whatever `tiles` already has (launchpad_tiles sorts by
+    instance name) — grouping only buckets, it never reorders.
+    """
+    sections = {}
+    for t in tiles:
+        sections.setdefault(t.get("group") or "", []).append(t)
+    ungrouped = sections.pop("", [])
+    ordered = ([("", ungrouped)] if ungrouped else [])
+    ordered += sorted(sections.items())
+    return ordered
+
+
 # --------------------------------------------------- mehrzeilige Konfiguration
 #
 # Manche Konfigurationswerte sind Listen: die Knoten von FleetView, die

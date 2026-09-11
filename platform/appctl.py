@@ -392,9 +392,11 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 3      # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 4      # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
-                        # (RFC-0031 Schritt 2, oaap.data.model 0.1)
+                        # (RFC-0031 Schritt 2, oaap.data.model 0.1);
+                        # 0.4 adds launchpad.group/embeddable
+                        # (RFC-0036 Teil B)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -2408,6 +2410,23 @@ def validate_manifest(m):
         print(f"Note: app.class '{app['class']}' is not a class this "
               f"platform knows ({' | '.join(APP_CLASSES)}). Treating it as "
               f"'{DEFAULT_APP_CLASS}'.")
+    # Manifest 0.4, RFC-0036 D2/D1: a developer hint about the launchpad
+    # tile, not an operator decision (that stays 'visibility', set by
+    # 'oaap app visibility', RFC-0007). Optional and additive like
+    # app.class above — a node that ignores it shows the tile without a
+    # section heading, which is untidy, not broken. Still worth catching
+    # a malformed value here (real validation, not a must_understand
+    # refusal), the same way app.class's TYPE is never checked but its
+    # own fields would be if it had any.
+    launchpad = m.get("launchpad") or {}
+    if not isinstance(launchpad, dict):
+        errs.append("launchpad: object expected")
+    else:
+        group = launchpad.get("group")
+        if group is not None and (not isinstance(group, str) or len(group) > 40):
+            errs.append("launchpad.group: string, max 40 chars")
+        if "embeddable" in launchpad and not isinstance(launchpad["embeddable"], bool):
+            errs.append("launchpad.embeddable: boolean expected")
     # oaap.data.model 0.1 §2.8 / RFC-0012 §8.5: a 'data_models' artefact
     # is a package with data_model only -- no service, no route, no
     # health check, and (RFC-0031 §4) no app.type either, because it
@@ -4903,6 +4922,15 @@ def _install_from_dir(pkg, args, source):
         # additional visibility restriction on top of roles (RFC-0007);
         # {} means "all" (no restriction) — set with 'oaap app visibility'
         "visibility": visibility,
+        # launchpad hints (RFC-0036 D1/D2) — re-read from the manifest on
+        # every install, like app_class above: this describes the app,
+        # it is not an operator's decision about this instance.
+        # 'group': optional section label the portal renders as a
+        # heading. 'embeddable': reserved, has no effect yet (RFC-0036
+        # D1) — a future embedded shell mode would read it, so the name
+        # exists now and no manifest needs a breaking change later.
+        "launchpad": {"group": str((m.get("launchpad") or {}).get("group") or "").strip(),
+                     "embeddable": bool((m.get("launchpad") or {}).get("embeddable"))},
     }
     # an own public hostname (RFC-0009) survives redeploy like port and
     # visibility — clients must not lose their address to a deployment
