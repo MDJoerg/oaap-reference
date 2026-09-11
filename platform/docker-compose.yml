@@ -143,7 +143,7 @@ services:
   # (docker-compose.broker-exposed.yml, appctl.py's
   # _broker_compose_files()) -- no 'ports:' here on purpose.
   broker:
-    image: iegomez/mosquitto-go-auth:2.0.18
+    image: iegomez/mosquitto-go-auth:3.0.0-mosquitto_2.0.18
     profiles: ["broker"]
     restart: unless-stopped
     depends_on:
