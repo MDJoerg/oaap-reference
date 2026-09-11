@@ -1,0 +1,49 @@
+# oaap.events.broker 0.1 (RFC-0032 D2) -- Mosquitto config, generated at
+# container start by the 'broker' service's own command (docker-
+# compose.yml): '__INTERNAL_API_KEY__' is substituted with the real
+# INTERNAL_API_KEY, unknown at image-build time, and the result is
+# written to /tmp/mosquitto.conf.
+#
+# Nothing here grants access on its own -- no local password file, no
+# local ACL file. Every CONNECT and every topic action (publish AND
+# subscribe) is checked live against identity's two new routes
+# (platform/services/identity/app.py, '/mqtt-auth/getuser',
+# '/mqtt-auth/aclcheck'): the RFC-0027 machine-principal key a client
+# presents as its MQTT password decides who it is, and its tenant
+# decides which 'oaap/<tenant>/...' topics it may touch (RFC-0032 §1.1).
+
+# Raw TCP, for devices that cannot speak HTTP and carry no identity
+# (RFC-0015 Stage 1) -- published to the host only when this node also
+# carries 'exposed' (docker-compose.broker-exposed.yml). Reachable on
+# the compose network regardless, for a future in-platform publisher
+# (RFC-0032 §3 step 3's simulated-machine reference app) that needs no
+# host port at all.
+listener 1883
+
+# MQTT over WebSocket, for browsers -- reached ONLY through the
+# gateway's '/broker/*' route (Caddyfile), never published to the host
+# directly, exactly like the digital twin's own '/twin/*'. The gateway's
+# forward_auth gates establishing the tunnel (a logged-in session); the
+# CONNECT inside it still needs a real RFC-0027 key, checked the same
+# way as on the raw port -- two gates, not one, for this transport only.
+listener 9001
+protocol websockets
+
+# No anonymous MQTT client, ever -- the platform-wide default-deny
+# posture (RFC-0002), applied here the same way the gateway applies it
+# to every HTTP route.
+allow_anonymous false
+
+persistence true
+persistence_location /mosquitto/data/
+log_dest stdout
+
+auth_plugin /mosquitto/go-auth.so
+auth_opt_backends http
+auth_opt_http_host identity
+auth_opt_http_port 8000
+auth_opt_http_getuser_uri /mqtt-auth/getuser?k=__INTERNAL_API_KEY__
+auth_opt_http_aclcheck_uri /mqtt-auth/aclcheck?k=__INTERNAL_API_KEY__
+auth_opt_http_params_mode json
+auth_opt_http_response_mode json
+auth_opt_http_method POST

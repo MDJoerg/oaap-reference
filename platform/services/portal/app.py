@@ -2630,6 +2630,10 @@ PROFILE_LABELS = {
     "store": "Datenplattform-Knoten — trägt das verwaltete Postgres von "
              "oaap.data.store (RFC-0031 Schritt 1). Ohne dieses Profil "
              "sind Digitaler Zwilling und Typregister hier nicht verfügbar.",
+    "broker": "Echtzeit-Knoten — trägt den MQTT-Broker von "
+              "oaap.events.broker (RFC-0032 D2), unabhängig von 'store'. "
+              "Der rohe Geräte-Port wird nur zusätzlich mit 'exposed' "
+              "veröffentlicht.",
 }
 
 

@@ -1850,6 +1850,13 @@ PROFILES = {
              "data-model and digital-twin capabilities are unavailable "
              "here. Unlike 'dev'/'exposed' this actually starts and stops "
              "a platform service (see cmd_node below).",
+    "broker": "real-time messaging node — carries the MQTT broker of "
+              "oaap.events.broker 0.1 (RFC-0032 D2), independent of "
+              "'store': a back-office tenant has a twin but no reason to "
+              "run a broker. Like 'store' this actually starts and stops "
+              "a platform service. The raw device port (no identity, RFC-"
+              "0015) is only published when the node ALSO carries "
+              "'exposed' — see _broker_compose_files below.",
 }
 
 
@@ -1878,6 +1885,23 @@ def save_profiles(profiles):
 
 def has_profile(name):
     return name in load_profiles()
+
+
+def _broker_compose_files():
+    """Which compose file(s) 'docker compose ... broker' should use.
+
+    The raw MQTT port (1883, no identity — RFC-0015) is only published
+    to the host when this node ALSO carries 'exposed'. Compose's own
+    'profiles:' key ORs profiles together (any one of a service's
+    profiles being active is enough to start it) and cannot express
+    "start with 'broker', but only publish a port with 'exposed' too" —
+    so the port lives in a second file, layered on top with '-f',
+    applied only when both profiles are held.
+    """
+    files = ["-f", os.path.join(APP_DIR, "docker-compose.yml")]
+    if has_profile("exposed"):
+        files += ["-f", os.path.join(APP_DIR, "docker-compose.broker-exposed.yml")]
+    return files
 
 
 def cmd_node(args):
@@ -1933,6 +1957,33 @@ def cmd_node(args):
                 print("Check with: docker compose --project-directory "
                       f"{APP_DIR} --project-name oaap --profile store "
                       "up -d store twin")
+        if profile == "broker":
+            # Same reasoning as 'store' above: nothing to check at
+            # request time, so the effect happens now.
+            try:
+                _compose(*_broker_compose_files(), "--profile", "broker",
+                          "up", "-d", "broker")
+                print("The MQTT broker is starting ('docker compose ... "
+                      "--profile broker up -d broker')."
+                      + (" The raw device port (1883) is published — this "
+                         "node also carries 'exposed'."
+                         if has_profile("exposed") else
+                         " The raw device port stays closed until this "
+                         "node also carries 'exposed'."))
+            except (subprocess.CalledProcessError, OSError) as e:
+                err = (getattr(e, "stderr", "") or "").strip().splitlines()
+                print("WARNING: could not start the 'broker' service"
+                      + (f": {err[-1]}" if err else f": {e}") + ".")
+        if profile == "exposed" and has_profile("broker"):
+            # The broker is already running without the raw port; bring
+            # it back up with the overlay so the port gets published.
+            try:
+                _compose(*_broker_compose_files(), "--profile", "broker",
+                          "up", "-d", "broker")
+                print("The broker's raw device port (1883) is now published.")
+            except (subprocess.CalledProcessError, OSError):
+                print("WARNING: could not republish the broker's raw port "
+                      "— check 'docker ps' / 'docker compose ... up -d broker'.")
     else:
         if profile not in profiles:
             die(f"node does not have profile '{profile}'")
@@ -1953,6 +2004,26 @@ def cmd_node(args):
             except (subprocess.CalledProcessError, OSError):
                 print("WARNING: could not stop the 'store'/'twin' "
                       "containers — check 'docker ps'.")
+        if profile == "broker":
+            try:
+                _compose("stop", "broker")
+                print("The MQTT broker container was stopped "
+                      "(its data volume is kept).")
+            except (subprocess.CalledProcessError, OSError):
+                print("WARNING: could not stop the 'broker' container "
+                      "— check 'docker ps'.")
+        if profile == "exposed" and has_profile("broker"):
+            # 'exposed' is already gone from the saved profiles above, so
+            # _broker_compose_files() now resolves to the base file only
+            # -- re-up recreates the container without the published port.
+            try:
+                _compose(*_broker_compose_files(), "--profile", "broker",
+                          "up", "-d", "broker")
+                print("The broker's raw device port (1883) is no longer "
+                      "published.")
+            except (subprocess.CalledProcessError, OSError):
+                print("WARNING: could not unpublish the broker's raw port "
+                      "— check 'docker ps' / 'docker compose ... up -d broker'.")
 
 
 # -------------------------------------------- managed Postgres (oaap.data.store 0.1)

@@ -301,6 +301,36 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
   fi
 fi
 
+# --- the MQTT broker for a profiled node (RFC-0032 D2, oaap.events.broker 0.1) ---
+# Same safety net as 'store'/'twin' above, and for the same reasons:
+# 'oaap node add-profile broker' already starts it immediately
+# (appctl.py cmd_node) -- this covers a Compose recreate that skips a
+# profiled service on update, or a profile gained while docker was
+# unavailable. Checked by container presence, like 'twin' -- the broker
+# has no data of its own to be healthy or not about.
+#
+# Must pass the SAME file set as appctl.py's _broker_compose_files(),
+# or a node holding both 'broker' and 'exposed' would silently lose the
+# raw device port on every update -- Compose recreates the container
+# from whatever '-f' files this call names, nothing more.
+if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
+   && grep -q '"broker"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+  if [ -z "$(docker ps -q -f name=^oaap-broker-1$ -f status=running)" ]; then
+    say ""
+    say "Ensuring the MQTT broker (profile 'broker') is up ..."
+    BROKER_FILES=(-f "$APP_DIR/docker-compose.yml")
+    if grep -q '"exposed"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+      BROKER_FILES+=(-f "$APP_DIR/docker-compose.broker-exposed.yml")
+    fi
+    if docker compose --project-directory "$APP_DIR" --project-name oaap \
+         "${BROKER_FILES[@]}" --profile broker up -d broker >/dev/null 2>&1; then
+      say "  Done."
+    else
+      say "  WARNING: 'broker' service could not be started — check 'docker compose ps'."
+    fi
+  fi
+fi
+
 # --- what a rehearsal would cost, where the portal can read it (2.15.3) ---
 # The portal has no view of the tenant tree, so the sizes and the list of
 # archives are written beside the registry. Written once here so a node

@@ -93,6 +93,24 @@
 		reverse_proxy twin:8000
 	}
 
+	# The MQTT broker's WebSocket listener (oaap.events.broker 0.1,
+	# RFC-0032 D2) -- browsers only, reached through the gateway, never
+	# published directly (docker-compose.yml). Gates establishing the
+	# tunnel to a logged-in session; the MQTT CONNECT inside it still
+	# needs its own RFC-0027 key, checked by the broker itself
+	# (mosquitto-go-auth against identity) -- two gates for this
+	# transport, same posture as the raw device port having none at the
+	# gateway layer and one at the MQTT layer (RFC-0015).
+	handle /broker/* {
+		forward_auth identity:8000 {
+			uri /verify?roles=user
+			copy_headers X-OAAP-User X-OAAP-Roles
+			header_up -Connection
+			header_up -Upgrade
+		}
+		reverse_proxy broker:9001
+	}
+
 	handle {
 		forward_auth identity:8000 {
 			uri /verify

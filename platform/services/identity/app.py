@@ -1196,6 +1196,93 @@ def _guard_internal_api():
     return None
 
 
+# ------------------------------------------------- MQTT broker auth (RFC-0032 D2)
+# oaap.events.broker 0.1: mosquitto-go-auth's http backend calls these
+# two routes for every CONNECT (getuser) and every publish or subscribe
+# (aclcheck) on the broker gated by the 'broker' node profile
+# (services/broker/mosquitto.conf.template). Deliberately NOT under
+# '/internal/' -- that prefix's guard above checks a HEADER
+# (X-OAAP-Internal-Key), and the plugin has no configuration option to
+# set one (checked against its own documentation while building this).
+# The one exception to that convention: the same shared secret travels
+# in the query string instead. Safe here because this call never leaves
+# the compose network -- mosquitto.conf.template's auth_opt_http_host is
+# the container name 'identity', never something a browser or a device
+# can reach or observe.
+MQTT_AUTH_PARAM = "k"
+
+
+def _mqtt_auth_ok():
+    if not INTERNAL_KEY:
+        return False
+    return secrets.compare_digest(
+        request.args.get(MQTT_AUTH_PARAM, ""), INTERNAL_KEY)
+
+
+def _topic_allowed(topic, tenant):
+    """Is `topic` inside this principal's own 'oaap/<tenant>/...' tree?
+
+    RFC-0032 §1.1: tenant first, so one rule scopes a client to
+    everything it owns and nothing else -- the same boundary-at-the-edge
+    principle RFC-0022 uses at the gateway. Applies identically to a
+    literal publish topic and a subscription filter (mosquitto passes
+    both through aclcheck the same way, wildcards included): a filter
+    like 'oaap/<tenant>/#' still starts with 'oaap/<tenant>/', and one
+    reaching outside it (a bare '#', or another tenant's prefix) does
+    not.
+    """
+    if not tenant:
+        return False
+    prefix = f"oaap/{tenant}"
+    return topic == prefix or topic.startswith(prefix + "/")
+
+
+@app.post("/mqtt-auth/getuser")
+def mqtt_auth_getuser():
+    """Which principal is this MQTT client? RFC-0027 method 'key', reused:
+
+    the client's MQTT password carries the full token
+    ('oaapk_<id>_<secret>'); its username must be that same id, in the
+    clear -- a copy-paste/ordering mistake refuses rather than silently
+    authenticating as the wrong half of the pair. Only an UNSCOPED key
+    is accepted (instance=None): an instance-scoped key like the twin's
+    own is for one app's HTTP calls through '/twin/*', not for this.
+    """
+    if not _mqtt_auth_ok():
+        return {"Ok": False, "Error": "denied"}, 200
+    body = request.get_json(force=True, silent=True) or {}
+    token = body.get("password", "")
+    m = KEY_TOKEN_RE.fullmatch(token)
+    if not m or body.get("username", "") != m.group(1):
+        return {"Ok": False, "Error": "invalid credentials"}, 200
+    user, _method, err = _by_key(token, instance=None)
+    if err or not user:
+        return {"Ok": False, "Error": "invalid credentials"}, 200
+    return {"Ok": True, "Error": ""}, 200
+
+
+@app.post("/mqtt-auth/aclcheck")
+def mqtt_auth_aclcheck():
+    """May this already-authenticated client touch this topic?
+
+    Runs after getuser already accepted the CONNECT, so this only looks
+    the key back up by id (the MQTT username) for its tenant -- no
+    secret to check again, the same way a session is trusted for the
+    rest of its lifetime once /verify has accepted it once.
+    """
+    if not _mqtt_auth_ok():
+        return {"Ok": False, "Error": "denied"}, 200
+    body = request.get_json(force=True, silent=True) or {}
+    kid = body.get("username", "")
+    rec = next((k for k in load_keys()
+                if k["id"] == kid and not k["revoked"]), None)
+    if not rec:
+        return {"Ok": False, "Error": "unknown key"}, 200
+    if _topic_allowed(body.get("topic", ""), rec.get("tenant", "")):
+        return {"Ok": True, "Error": ""}, 200
+    return {"Ok": False, "Error": "topic outside this principal's tenant"}, 200
+
+
 @app.get("/internal/status")
 def internal_status():
     state = _load(STATE_FILE, {})

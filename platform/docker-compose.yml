@@ -121,3 +121,39 @@ services:
       # by appctl, read by nobody else) -- both read-only, same posture
       # as identity's own '/platform-apps' mount.
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+
+  # The MQTT broker (oaap.events.broker 0.1, RFC-0032 D2) -- gated by the
+  # node profile 'broker' (RFC-0011), INDEPENDENT of 'store': a
+  # back-office tenant has a twin but no reason to run real-time
+  # messaging. Every CONNECT and every topic action is checked live
+  # against identity (mosquitto-go-auth's http backend, see
+  # services/broker/mosquitto.conf.template) -- no local password file,
+  # no local ACL file. INTERNAL_API_KEY cannot travel as a header here
+  # (the plugin sets none), so it travels in the auth URLs' query string
+  # instead -- traffic that never leaves this compose network. The
+  # config is generated at container start (the key is unknown at image
+  # build time) and written to /tmp, which every user this image runs
+  # as can write.
+  #
+  # Only the internal WebSocket listener (9001) is meant to be reached
+  # this way, through the gateway's '/broker/*' route (Caddyfile) --
+  # like 'twin', an app's own network (RFC-0016) cannot see it directly.
+  # The raw device port (1883, no identity by design -- RFC-0015) is
+  # published to the host only when this node ALSO carries 'exposed'
+  # (docker-compose.broker-exposed.yml, appctl.py's
+  # _broker_compose_files()) -- no 'ports:' here on purpose.
+  broker:
+    image: iegomez/mosquitto-go-auth:2.0.18
+    profiles: ["broker"]
+    restart: unless-stopped
+    depends_on:
+      - identity
+    environment:
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
+    volumes:
+      - ./services/broker/mosquitto.conf.template:/mosquitto-template/mosquitto.conf.template:ro
+      - "${OAAP_DATA_DIR}/data/broker:/mosquitto/data"
+    command:
+      - /bin/sh
+      - -c
+      - sed "s/__INTERNAL_API_KEY__/$$INTERNAL_API_KEY/g" /mosquitto-template/mosquitto.conf.template > /tmp/mosquitto.conf && exec /usr/sbin/mosquitto -c /tmp/mosquitto.conf

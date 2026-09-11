@@ -1,0 +1,19 @@
+# Overlay for the 'broker' service (oaap.events.broker 0.1, RFC-0032 D2),
+# applied ONLY when the node carries BOTH the 'broker' AND 'exposed'
+# node profiles (RFC-0011). Compose's own 'profiles:' key cannot express
+# an AND of two profiles for one service, so appctl.py's
+# _broker_compose_files() layers this file on top with '-f' instead of
+# adding a second entry to docker-compose.yml's own 'profiles:' list.
+#
+# Publishes the raw MQTT port (1883) to the host, for devices that
+# cannot speak HTTP and carry no identity (RFC-0015 Stage 1) -- gated
+# the same way any other non-HTTP endpoint that bypasses the gateway is
+# gated, reusing 'exposed' rather than inventing a second grant
+# mechanism for this one platform service. The WebSocket listener
+# (9001, browsers through the gateway) is never published here or
+# anywhere else -- it stays reachable only from the gateway container,
+# over the compose network, exactly like 'twin'.
+services:
+  broker:
+    ports:
+      - "1883:1883"
