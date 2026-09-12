@@ -31,6 +31,8 @@ python3 test/test_rehearsal_page.py  # braucht jinja2
 python3 test/test_data_store.py
 python3 test/test_data_model.py
 python3 test/test_data_twin.py
+python3 test/test_broker_profile.py  # Identity-Teil braucht flask
+python3 test/test_event_relay.py     # Identity-Teil braucht flask
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
@@ -159,3 +161,19 @@ nur gegen `/twin/*` (CURRENT_STATE 125). Was diese Datei **nicht**
 prüfen kann — dass ein echtes Anlegen/Lesen/Schreiben eines Objekts
 gegen ein echtes Postgres tut, was RFC-0031 §9 Schritt 1–3 verlangt —
 gehört auf `oaap-test`.
+
+`test_event_relay.py` hält das **Ereignis-Relais** fest (`oaap.data.twin`
+0.3, RFC-0032 Bauplan Schritt 2): Themenbaum und dünne Nachricht, wer
+einen `states`-Eintrag bekommt, und vor allem die Reihenfolge, an der
+die Verlustfreiheit hängt — erst bestätigt der Broker (MQTT v5, damit
+eine Verweigerung als Fehlercode zurückkommt), dann schreiben
+Schnappschuss und Wasserstand in einer Transaktion. Dazu: beide neuen
+Tabellen in jedem Mandantenschema, der Dienst `relay` am Profil
+`broker` ohne Port und ohne Abhängigkeit von `store`, das Geheimnis
+`BROKER_RELAY_KEY` bei Installation und Update, kein `up -d`, das den
+Broker ohne sein Port-Overlay neu erzeugt, der Plattform-Prinzipal
+`oaap.relay` in identity (nur veröffentlichen, nur bekannte Mandanten,
+ohne Geheimnis gar nicht — mit Flasks Testclient) und jede Zeile, die
+die Gesundheitsseite dazu zeigen kann. Ob Mosquitto eine Verweigerung
+wirklich so quittiert und ein Ereignis wirklich bis `states` durchläuft,
+prüft erst `oaap-test`.

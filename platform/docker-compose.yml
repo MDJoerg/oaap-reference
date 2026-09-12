@@ -37,6 +37,10 @@ services:
       # network no longer proves anything — every app instance is on it
       # too (RFC-0015 addendum A4). Held by these two services only.
       INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
+      # Checks the outbox relay's broker login (oaap.data.twin 0.3,
+      # principal 'oaap.relay'). Held by identity and 'relay' only --
+      # never by the broker, which only asks identity, nor by 'twin'.
+      BROKER_RELAY_KEY: "${BROKER_RELAY_KEY:-}"
     volumes:
       - "${OAAP_DATA_DIR}/data/identity:/data"
       # read-only: external.json — the session cookie must span the
@@ -157,3 +161,28 @@ services:
       - /bin/sh
       - -c
       - sed "s/__INTERNAL_API_KEY__/$$INTERNAL_API_KEY/g" /mosquitto-template/mosquitto.conf.template > /tmp/mosquitto.conf && exec /usr/sbin/mosquitto -c /tmp/mosquitto.conf
+
+  # The outbox relay (oaap.data.twin 0.3, RFC-0032 build order step 2) --
+  # the 'twin' image with a different command (services/twin/relay.py).
+  # Carries the 'broker' profile, NOT 'store' (Jörg, 2026-09-12): no broker,
+  # no relay -- the outbox grows, nothing is lost, the portal says so. On a
+  # node with 'broker' but without 'store' it finds no twin schema and idles.
+  # Deliberately no 'depends_on: store': a dependency on a service whose
+  # profile is not active refuses to start at all. No port, no gateway
+  # route -- it only ever calls out, to 'store' and to 'broker'.
+  relay:
+    build: ./services/twin
+    profiles: ["broker"]
+    restart: unless-stopped
+    command: ["python", "-u", "relay.py"]
+    depends_on:
+      - broker
+    environment:
+      # Its broker login as the platform principal 'oaap.relay', checked
+      # by identity -- the one secret this container holds besides the
+      # per-tenant database credentials below.
+      BROKER_RELAY_KEY: "${BROKER_RELAY_KEY:-}"
+    volumes:
+      # twin-secrets.json (every tenant schema's role/password), read-only,
+      # the same mount 'twin' already has.
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"

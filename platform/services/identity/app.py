@@ -1211,6 +1211,42 @@ def _guard_internal_api():
 # can reach or observe.
 MQTT_AUTH_PARAM = "k"
 
+# The platform's own outbox relay (oaap.data.twin 0.3, RFC-0032 build
+# order step 2) -- Jörg's decision of 2026-09-12: a node secret of its
+# own, not one RFC-0027 key per tenant. A key is confined to its own
+# tenant's tree (_topic_allowed below); the relay publishes for EVERY
+# tenant on the node. The dot makes RELAY_USER a name no key id
+# ([0-9a-f]{8}, KEY_TOKEN_RE) can ever be, so the two paths can never be
+# mistaken for each other. Must match services/twin/relay.py exactly.
+RELAY_USER = "oaap.relay"
+RELAY_KEY = os.environ.get("BROKER_RELAY_KEY", "")
+# mosquitto-go-auth's 'acc': 1 read, 2 write (publish), 3 read+write,
+# 4 subscribe. The relay only ever publishes.
+MQTT_ACC_WRITE = 2
+# Exactly the shape relay.topic_for() builds -- tenant, type, object,
+# optionally group; literal levels only, never a wildcard.
+_RELAY_TOPIC_RE = re.compile(
+    r"^oaap/([0-9a-f-]{36})/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+"
+    r"(?:/[A-Za-z0-9._-]+)?$")
+
+
+def _relay_login_ok(password):
+    """Fail closed: a node whose relay secret was never generated has no
+    relay principal at all -- not even for an empty password."""
+    return bool(RELAY_KEY) and secrets.compare_digest(
+        (password or "").encode("utf-8"), RELAY_KEY.encode("utf-8"))
+
+
+def _relay_topic_ok(topic, acc):
+    """Publish only, and only into the tree of a tenant this node knows."""
+    try:
+        acc = int(acc)
+    except (TypeError, ValueError):
+        return False
+    m = _RELAY_TOPIC_RE.fullmatch(topic or "")
+    return (bool(RELAY_KEY) and acc == MQTT_ACC_WRITE and m is not None
+            and m.group(1) in known_tenants())
+
 
 def _mqtt_auth_ok():
     if not INTERNAL_KEY:
@@ -1251,6 +1287,10 @@ def mqtt_auth_getuser():
     if not _mqtt_auth_ok():
         return {"Ok": False, "Error": "denied"}, 200
     body = request.get_json(force=True, silent=True) or {}
+    if body.get("username", "") == RELAY_USER:
+        if _relay_login_ok(body.get("password", "")):
+            return {"Ok": True, "Error": ""}, 200
+        return {"Ok": False, "Error": "invalid credentials"}, 200
     token = body.get("password", "")
     m = KEY_TOKEN_RE.fullmatch(token)
     if not m or body.get("username", "") != m.group(1):
@@ -1274,6 +1314,13 @@ def mqtt_auth_aclcheck():
         return {"Ok": False, "Error": "denied"}, 200
     body = request.get_json(force=True, silent=True) or {}
     kid = body.get("username", "")
+    if kid == RELAY_USER:
+        # Publish only, never subscribe or read, and only into a known
+        # tenant's tree -- the relay has no reason to hear anything.
+        if _relay_topic_ok(body.get("topic", ""), body.get("acc")):
+            return {"Ok": True, "Error": ""}, 200
+        return {"Ok": False,
+                "Error": "the relay may only publish into a known tenant's tree"}, 200
     rec = next((k for k in load_keys()
                 if k["id"] == kid and not k["revoked"]), None)
     if not rec:

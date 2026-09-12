@@ -93,7 +93,7 @@ ok("adding 'exposed' republishes the port when 'broker' is already held",
    'if profile == "exposed" and has_profile("broker"):' in add_half)
 ok("remove-profile 'broker' stops the service",
    'if profile == "broker":' in remove_half
-   and '_compose("stop", "broker")' in remove_half)
+   and '_compose("stop", "broker"' in remove_half)
 ok("removing 'exposed' republishes broker WITHOUT the port",
    'if profile == "exposed" and has_profile("broker"):' in remove_half)
 

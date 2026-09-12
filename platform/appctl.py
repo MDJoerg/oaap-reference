@@ -1961,10 +1961,15 @@ def cmd_node(args):
             # Same reasoning as 'store' above: nothing to check at
             # request time, so the effect happens now.
             try:
+                # 'relay' alongside 'broker' (oaap.data.twin 0.3): the
+                # outbox relay is nothing without a broker to publish to
+                # and carries the same profile (docker-compose.yml) -- the
+                # same pairing 'store' already makes with 'twin' above.
                 _compose(*_broker_compose_files(), "--profile", "broker",
-                          "up", "-d", "broker")
-                print("The MQTT broker is starting ('docker compose ... "
-                      "--profile broker up -d broker')."
+                          "up", "-d", "broker", "relay")
+                print("The MQTT broker and the event relay are starting "
+                      "('docker compose ... --profile broker up -d broker "
+                      "relay')."
                       + (" The raw device port (1883) is published — this "
                          "node also carries 'exposed'."
                          if has_profile("exposed") else
@@ -2006,12 +2011,16 @@ def cmd_node(args):
                       "containers — check 'docker ps'.")
         if profile == "broker":
             try:
-                _compose("stop", "broker")
-                print("The MQTT broker container was stopped "
-                      "(its data volume is kept).")
+                # The relay goes with it (oaap.data.twin 0.3). Its
+                # watermark stays in each tenant schema, so events written
+                # meanwhile are published when the profile comes back.
+                _compose("stop", "broker", "relay")
+                print("The MQTT broker and event relay containers were "
+                      "stopped (the broker's data volume is kept; events "
+                      "keep collecting in the outbox).")
             except (subprocess.CalledProcessError, OSError):
-                print("WARNING: could not stop the 'broker' container "
-                      "— check 'docker ps'.")
+                print("WARNING: could not stop the 'broker'/'relay' "
+                      "containers — check 'docker ps'.")
         if profile == "exposed" and has_profile("broker"):
             # 'exposed' is already gone from the saved profiles above, so
             # _broker_compose_files() now resolves to the base file only
@@ -3210,6 +3219,35 @@ def _twin_ensure_tables(schema):
             unmerged_at timestamptz,
             unmerged_by text
         );
+        -- The outbox relay (oaap.data.twin 0.3, RFC-0032 §1.4/§1.5).
+        -- 'states': one row per published group change, the group's
+        -- attribute snapshot at the moment the relay read it -- written
+        -- ONLY by the relay (services/twin/relay.py), append-only like
+        -- every table above. 'event_id' is additive to RFC-0032 §1.4's
+        -- own sketch: it ties a snapshot to the event it answers, and its
+        -- UNIQUE constraint is what makes a re-published row harmless.
+        CREATE TABLE IF NOT EXISTS "{schema}".states (
+            id bigserial PRIMARY KEY,
+            event_id bigint NOT NULL UNIQUE,
+            object_id uuid NOT NULL,
+            group_key text NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            payload jsonb NOT NULL
+        );
+        -- The relay's own bookkeeping, not twin data, and therefore the one
+        -- table here that is UPDATEd: exactly one row per tenant (the CHECK
+        -- makes a second one impossible), the last event id published, and
+        -- when/why the relay last reported -- what the portal's health page
+        -- reads (twin/app.py '/internal/twin/outbox').
+        CREATE TABLE IF NOT EXISTS "{schema}".relay_watermark (
+            id smallint PRIMARY KEY CHECK (id = 1),
+            last_event_id bigint NOT NULL DEFAULT 0,
+            updated_at timestamptz,
+            checked_at timestamptz,
+            last_error text
+        );
+        INSERT INTO "{schema}".relay_watermark (id) VALUES (1)
+            ON CONFLICT (id) DO NOTHING;
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS

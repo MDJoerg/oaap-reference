@@ -25,6 +25,7 @@ from flask import (Flask, g, redirect, render_template_string, request,
 from markupsafe import Markup
 
 import fleet_view
+import relay_view
 import twin_view
 
 IDENTITY = "http://identity:8000"
@@ -67,6 +68,17 @@ def _twin_call(method, path, **kw):
     headers["X-OAAP-Person-Roles"] = ",".join(caller_roles())
     return TWIN_INTERNAL.request(method, f"{TWIN}{path}", headers=headers,
                                  timeout=kw.pop("timeout", 8), **kw)
+
+
+def _relay_report():
+    """The outbox relay's progress per tenant (twin '/internal/twin/outbox',
+    oaap.data.twin 0.3), or None when the twin does not answer. No person
+    headers: a node-wide count for the health page, not a tenant's read."""
+    try:
+        r = TWIN_INTERNAL.get(f"{TWIN}/internal/twin/outbox", timeout=4)
+        return r.json() if r.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
 
 
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
@@ -3843,6 +3855,14 @@ def health():
         return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder partner.", 403
 
     core = _core_states()
+    # The event relay (RFC-0032 §1.5, relay_view.py) -- health page only,
+    # not in _core_states(): /fleet/status shares that list, and a fleet
+    # document is not the place to grow a new row without its own spec.
+    profiles = node_profiles()
+    relay = relay_view.relay_state(
+        profiles, _relay_report() if "store" in profiles else None)
+    if relay:
+        core.append(relay)
 
     apps = []
     for name, inst in sorted(load_instances().items()):

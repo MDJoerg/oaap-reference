@@ -562,6 +562,11 @@ INTERNAL_API_KEY="$(gen_secret)"
 # network (no published port); it only matters the one time Postgres
 # initialises its own data directory.
 STORE_SUPERUSER_PASSWORD="$(gen_secret)"
+# The outbox relay's broker login (oaap.data.twin 0.3, principal
+# 'oaap.relay'). Stateless like INTERNAL_API_KEY -- identity and the relay
+# read the same line -- so a fresh one is fine on restore, too. Generated
+# whether or not this node ever carries 'broker', same reasoning as above.
+BROKER_RELAY_KEY="$(gen_secret)"
 
 if [ "$MODE" = "restore" ]; then
   say "Restoring platform state from $RESTORE_FILE ..."
@@ -636,6 +641,7 @@ SESSION_SECRET=$SESSION_SECRET
 SETUP_TOKEN=$SETUP_TOKEN
 INTERNAL_API_KEY=$INTERNAL_API_KEY
 STORE_SUPERUSER_PASSWORD=$STORE_SUPERUSER_PASSWORD
+BROKER_RELAY_KEY=$BROKER_RELAY_KEY
 EOF
 # Baseline for `oaap update`: which revision is installed right now.
 git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse --short HEAD > "$APP_DIR/REVISION" 2>/dev/null \

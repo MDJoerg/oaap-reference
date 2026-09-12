@@ -1,4 +1,5 @@
-"""oaap.data.twin 0.2 — the digital twin (RFC-0031 Schritt 3 + Schritt 5).
+"""oaap.data.twin 0.3 — the digital twin (RFC-0031 Schritt 3 + Schritt 5,
+RFC-0032 build order step 2).
 
 The only service an app talks to for shared tenant data. It never
 learns a tenant or an origin from a request -- both come from the
@@ -62,10 +63,17 @@ Concretely NOT built yet, named here rather than silently missing:
 - **`/twin/references`** (fuzzy search, D6) -- still nothing to search.
 - **The rehearsal's own schema copy** (D8) -- unchanged from 0.1: a
   rehearsal gets no twin credential at all, deliberately.
-- **The outbox reader** (RFC-0032) -- every write still appends one
-  `events` row; nothing reads it yet.
+**0.3 (RFC-0032 build order step 2) adds the outbox's other end:**
 
-Every write still appends one row to `events`.
+- `relay.py`, the SAME image run by the compose service `relay` (node
+  profile `broker`): publishes every `events` row to the broker and
+  writes a group's snapshot into `states` -- see that file.
+- `GET /internal/twin/outbox` (end of this file): per tenant, how many
+  events wait and when the relay last reported -- what the portal's
+  health page reads.
+
+Every write still appends one row to `events`; this service itself
+never publishes anything.
 """
 import datetime
 import json
@@ -1161,3 +1169,62 @@ def twin_create_type():
     finally:
         conn.close()
     return jsonify({"key": group_key}), 201
+
+
+# ============================================================ outbox (0.3)
+@app.get("/internal/twin/outbox")
+def twin_outbox():
+    """How far the outbox relay (relay.py, RFC-0032 §1.5) has come, per
+    tenant -- the portal's health page turns this into "the outbox grows
+    and nobody collects it" (oaap.core.portal 2.5).
+
+    The one '/internal/twin/*' route WITHOUT require_person(): it answers
+    a node-wide operator question, not a person's question about their
+    own tenant, and it returns counts and ages only -- never an object,
+    a group or a value. The prefix guard above still demands
+    INTERNAL_API_KEY; the portal additionally shows the result only to
+    'server_admin'/'partner', the same audience as the rest of that page.
+
+    Ages come from Postgres's own clock (now() - checked_at), so a clock
+    difference between containers cannot make a live relay look silent.
+    """
+    out = []
+    for schema in sorted(load_secrets()):
+        if not schema.startswith("twin_"):
+            continue
+        tenant_id = schema[len("twin_"):]
+        entry = {"tenant": tenant_id}
+        try:
+            conn = get_conn(tenant_id)
+        except psycopg2.Error:
+            entry["error"] = "store not reachable"
+            out.append(entry)
+            continue
+        if conn is None:
+            continue
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT w.last_event_id, w.last_error, "
+                        "EXTRACT(EPOCH FROM now() - w.checked_at) AS checked_age, "
+                        "(SELECT count(*) FROM events e WHERE e.id > w.last_event_id) "
+                        "AS pending FROM relay_watermark w WHERE w.id = 1")
+                    row = cur.fetchone()
+            if row is None:
+                entry["error"] = "relay watermark row missing"
+            else:
+                entry.update(
+                    pending=int(row["pending"]),
+                    watermark=int(row["last_event_id"]),
+                    checked_age=(float(row["checked_age"])
+                                 if row["checked_age"] is not None else None),
+                    last_error=row["last_error"])
+        except psycopg2.Error:
+            # A tenant schema provisioned before 0.3 and not yet migrated
+            # ('oaap data store migrate-twin', run by every update).
+            entry["error"] = "relay tables missing"
+        finally:
+            conn.close()
+        out.append(entry)
+    return jsonify({"tenants": out})

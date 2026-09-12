@@ -101,6 +101,36 @@ if [ -f "$ENVF" ] && ! grep -q '^STORE_SUPERUSER_PASSWORD=' "$ENVF"; then
   say "  Done."
 fi
 
+# --- the event relay's broker secret (oaap.data.twin 0.3, RFC-0032 step 2) ---
+# The outbox relay logs in to the broker as the platform principal
+# 'oaap.relay' with this node secret (Jörg, 2026-09-12); identity checks
+# it, the relay presents it, both read it from this .env. Generated
+# unconditionally, like the store secret above, so it is in place the day
+# a node gains 'broker'.
+#
+# The update's own 'up -d' ran BEFORE this file, with the line still
+# missing: identity (and a relay, if running) came up with an EMPTY key
+# and refuse the relay -- fail closed, but a relay that never publishes.
+# Recreate exactly those two. '--no-deps' is not decoration: without it
+# 'up -d relay' would also recreate 'broker' from docker-compose.yml
+# alone and drop the raw device port of a node that carries 'exposed'.
+if [ -f "$ENVF" ] && ! grep -q '^BROKER_RELAY_KEY=' "$ENVF"; then
+  say ""
+  say "Adding the event relay's broker secret (oaap.data.twin 0.3) ..."
+  umask 077
+  printf 'BROKER_RELAY_KEY=%s\n' \
+    "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$ENVF"
+  docker compose --project-directory "$APP_DIR" --project-name oaap \
+    up -d --no-deps identity >/dev/null 2>&1 \
+    || say "  WARNING: identity could not be recreated — run 'docker compose --project-directory $APP_DIR --project-name oaap up -d identity'."
+  if grep -q '"broker"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+    docker compose --project-directory "$APP_DIR" --project-name oaap \
+      --profile broker up -d --no-deps relay >/dev/null 2>&1 \
+      || say "  WARNING: the relay could not be recreated — see 'docker compose ps'."
+  fi
+  say "  Done."
+fi
+
 # --- per-app networks + gateway links (RFC-0016) ---
 # Two jobs, both idempotent: isolate any app still on the flat platform
 # network onto its own (one-time for apps installed before 0.1.30), and
@@ -315,18 +345,39 @@ fi
 # from whatever '-f' files this call names, nothing more.
 if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
    && grep -q '"broker"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+  BROKER_FILES=(-f "$APP_DIR/docker-compose.yml")
+  if grep -q '"exposed"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+    BROKER_FILES+=(-f "$APP_DIR/docker-compose.broker-exposed.yml")
+  fi
   if [ -z "$(docker ps -q -f name=^oaap-broker-1$ -f status=running)" ]; then
     say ""
     say "Ensuring the MQTT broker (profile 'broker') is up ..."
-    BROKER_FILES=(-f "$APP_DIR/docker-compose.yml")
-    if grep -q '"exposed"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
-      BROKER_FILES+=(-f "$APP_DIR/docker-compose.broker-exposed.yml")
-    fi
     if docker compose --project-directory "$APP_DIR" --project-name oaap \
          "${BROKER_FILES[@]}" --profile broker up -d broker >/dev/null 2>&1; then
       say "  Done."
     else
       say "  WARNING: 'broker' service could not be started — check 'docker compose ps'."
+    fi
+  elif [ "${#BROKER_FILES[@]}" -gt 2 ]; then
+    # Running, but maybe WITHOUT its raw port: an update.sh older than
+    # 0.1.98 recreated the broker from docker-compose.yml alone (that
+    # update.sh is the one running this very update -- see this file's
+    # header). With the same file set this is a no-op when the port is
+    # already published, and puts it back when it is not.
+    docker compose --project-directory "$APP_DIR" --project-name oaap \
+      "${BROKER_FILES[@]}" --profile broker up -d --no-deps broker >/dev/null 2>&1 \
+      || say "  WARNING: could not re-apply the broker's raw device port — check 'docker ps'."
+  fi
+  # The outbox relay rides on the same profile (oaap.data.twin 0.3). Same
+  # safety net as the broker's, '--no-deps' so it never touches 'broker'.
+  if [ -z "$(docker ps -q -f name=^oaap-relay-1$ -f status=running)" ]; then
+    say ""
+    say "Ensuring the event relay (profile 'broker') is up ..."
+    if docker compose --project-directory "$APP_DIR" --project-name oaap \
+         --profile broker up -d --no-deps relay >/dev/null 2>&1; then
+      say "  Done."
+    else
+      say "  WARNING: 'relay' service could not be started — check 'docker compose ps'."
     fi
   fi
 fi

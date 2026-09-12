@@ -183,15 +183,28 @@ except Exception:
 " 2>/dev/null)
 fi
 
+# The broker's raw device port lives in an overlay file, applied only when
+# the node carries BOTH 'broker' and 'exposed' (appctl.py
+# _broker_compose_files(), migrate.sh's broker block). A plain 'up -d' names
+# docker-compose.yml alone, so on such a node every update recreated the
+# broker WITHOUT port 1883 -- devices cut off by an update that changed
+# nothing about them. Found while building the event relay, 2026-09-12,
+# before any node held both profiles. Same file set, here too.
+COMPOSE_FILES=()
+if [[ " ${PROFILE_ARGS[*]-} " == *" broker "* && " ${PROFILE_ARGS[*]-} " == *" exposed "* ]]; then
+  COMPOSE_FILES=(-f "$APP_DIR/docker-compose.yml"
+                 -f "$APP_DIR/docker-compose.broker-exposed.yml")
+fi
+
 say "Building core service images (the running services stay up) ..."
 if ! docker compose --project-directory "$APP_DIR" --project-name oaap \
-       "${PROFILE_ARGS[@]}" build --quiet; then
+       "${COMPOSE_FILES[@]}" "${PROFILE_ARGS[@]}" build --quiet; then
   fail "Image build failed — the platform keeps running on $cur_ver. Nothing was restarted."
 fi
 
 say "Restarting core services ..."
 docker compose --project-directory "$APP_DIR" --project-name oaap \
-  "${PROFILE_ARGS[@]}" up -d
+  "${COMPOSE_FILES[@]}" "${PROFILE_ARGS[@]}" up -d
 
 caddy_after="$(md5sum "$APP_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1)"
 if [ "$caddy_before" != "$caddy_after" ]; then
