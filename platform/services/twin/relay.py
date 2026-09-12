@@ -293,7 +293,12 @@ def main():
     else:
         log("BROKER_RELAY_KEY is not configured -- not connecting (fail closed); "
             "'sudo oaap update' generates it")
-    conns, beats, written = {}, {}, {}
+    # 'logged': the last exception text per schema. An update recreates
+    # this container BEFORE migrate.sh adds a new table to existing tenant
+    # schemas, so for a few seconds every poll raised the same
+    # UndefinedTable -- seen live on oaap-test, 2026-09-12, as a wall of
+    # identical lines. Say it once, and again only when it changes.
+    conns, beats, written, logged = {}, {}, {}, {}
     while True:
         now = time.time()
         if not RELAY_KEY:
@@ -318,8 +323,12 @@ def main():
                     written[schema], beats[schema] = result, now
                     if result:
                         log(f"{tenant_id}: {result}")
+                logged.pop(schema, None)
             except Exception as e:  # one tenant's trouble never stops the rest
-                log(f"{tenant_id}: {type(e).__name__}: {e}")
+                msg = (f"{type(e).__name__}: {e}".strip().splitlines() or ["?"])[0]
+                if logged.get(schema) != msg:
+                    log(f"{tenant_id}: {msg}")
+                    logged[schema] = msg
                 old = conns.pop(schema, None)
                 if old is not None:
                     try:

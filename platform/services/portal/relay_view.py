@@ -26,8 +26,13 @@ def _row(state, label, detail):
     return {"name": NAME, "state": state, "label": label, "detail": detail}
 
 
-def _n(count):
-    return f"{count} Ereignis" if count == 1 else f"{count} Ereignisse"
+def _n(count, singular, plural):
+    """„1 Ereignis wartet" / „3 Ereignisse warten" — Substantiv UND Verb.
+    Live auf oaap-test stand zuerst „1 Ereignis warten" da (12.09.): nur
+    das Substantiv folgte der Zahl."""
+    if count == 1:
+        return f"1 Ereignis {singular}"
+    return f"{count} Ereignisse {plural}"
 
 
 def relay_state(profiles, report):
@@ -61,10 +66,11 @@ def relay_state(profiles, report):
     if "broker" not in profiles:
         if pending:
             return _row("warn", "Kein Broker",
-                        f"{_n(pending)} warten auf Veröffentlichung, aber "
-                        "dieser Knoten trägt das Profil 'broker' nicht — "
-                        "niemand holt sie ab. Verloren geht nichts. "
-                        "Einschalten: 'sudo oaap node add-profile broker'")
+                        f"{_n(pending, 'wartet', 'warten')} auf "
+                        "Veröffentlichung, aber dieser Knoten trägt das "
+                        "Profil 'broker' nicht — niemand holt sie ab. "
+                        "Verloren geht nichts. Einschalten: "
+                        "'sudo oaap node add-profile broker'")
         return _row("ok", "Nichts offen",
                     "Kein Broker auf diesem Knoten (Profil 'broker' fehlt); "
                     "es wartet kein Ereignis.")
@@ -79,9 +85,9 @@ def relay_state(profiles, report):
                  f"hat sich seit {int(newest // 60)} Minuten nicht gemeldet")
         if pending:
             return _row("error", "Steht",
-                        f"{_n(pending)} warten, und das Relais {since} — "
-                        "prüfen mit 'docker logs oaap-relay-1', wieder "
-                        "starten mit 'sudo oaap update'")
+                        f"{_n(pending, 'wartet', 'warten')}, und das Relais "
+                        f"{since} — prüfen mit 'docker logs oaap-relay-1', "
+                        "wieder starten mit 'sudo oaap update'")
         return _row("warn", "Schweigt",
                     f"Es wartet kein Ereignis, aber das Relais {since} — "
                     "läuft der Container 'oaap-relay-1'? ('docker ps')")
@@ -89,11 +95,12 @@ def relay_state(profiles, report):
     if errors:
         if pending:
             return _row("error", "Steht",
-                        f"{_n(pending)} warten; letzter Fehler: {errors[0]}")
+                        f"{_n(pending, 'wartet', 'warten')}; letzter Fehler: "
+                        f"{errors[0]}")
         return _row("warn", "Keine Verbindung",
                     f"Es wartet kein Ereignis, aber: {errors[0]}")
 
     if pending:
         return _row("ok", "Arbeitet",
-                    f"{_n(pending)} werden gerade veröffentlicht")
+                    f"{_n(pending, 'wird', 'werden')} gerade veröffentlicht")
     return _row("ok", "Gesund", "Alle Ereignisse veröffentlicht")

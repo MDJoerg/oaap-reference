@@ -155,6 +155,11 @@ ok("ohne BROKER_RELAY_KEY wird gar nicht erst verbunden (fail closed)",
    "if RELAY_KEY:" in main_src and "make_client" in main_src.split("if RELAY_KEY:", 1)[1][:80])
 ok("ein Mandant mit Problemen haelt die anderen nicht auf",
    "except Exception" in main_src)
+exc = main_src.split("except Exception", 1)[1]
+ok("dieselbe Ausnahme wird je Mandant nur einmal geloggt (Update-Fenster "
+   "vor migrate-twin, live gesehen 12.09.)",
+   "logged.get(schema) != msg" in exc and "logged[schema] = msg" in exc
+   and "logged.pop(schema, None)" in main_src)
 
 # ----------------------------------------------------------------- appctl
 print("\n=== appctl.py: states und relay_watermark in jedem Mandantenschema ===")
@@ -375,6 +380,14 @@ ok("frische Meldung mit Fehler, 5 warten -> Steht mit dem Fehlertext",
    r["state"] == "error" and "Broker nicht erreichbar" in r["detail"], r)
 r = rv.relay_state(["store", "broker"], {"tenants": [t(pending=0, err="Broker nicht erreichbar")]})
 ok("Fehler, aber nichts wartet -> Warnung", r["state"] == "warn", r)
+# Live auf oaap-test stand hier zuerst "1 Ereignis warten" (12.09.).
+r = rv.relay_state(["store", "broker"], {"tenants": [t(pending=1, err="x")]})
+ok("Einzahl: '1 Ereignis wartet', nicht '1 Ereignis warten'",
+   r["detail"].startswith("1 Ereignis wartet;"), r["detail"])
+r = rv.relay_state(["store"], {"tenants": [t(pending=1, age=None)]})
+ok("Einzahl auch ohne Broker", r["detail"].startswith("1 Ereignis wartet auf"), r["detail"])
+r = rv.relay_state(["store", "broker"], {"tenants": [t(pending=2, age=None)]})
+ok("Mehrzahl bleibt Mehrzahl", r["detail"].startswith("2 Ereignisse warten,"), r["detail"])
 r = rv.relay_state(["store", "broker"], {"tenants": [t(pending=1)]})
 ok("frisch, 1 wartet -> Arbeitet (Einzahl richtig)",
    r["state"] == "ok" and r["label"] == "Arbeitet" and "1 Ereignis " in r["detail"], r)
