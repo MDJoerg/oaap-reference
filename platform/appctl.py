@@ -491,6 +491,7 @@ def save_registry(reg):
         json.dump(reg, f, indent=2)
     os.replace(tmp, REGISTRY)
     artifact_index_write(reg)
+    config_view_write(reg)
 
 
 # ------------------------------------------- tenancy (oaap.core.tenant 0.1)
@@ -4107,6 +4108,9 @@ def save_env(name, env, inst=None):
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.writelines(f"{k}={v}\n" for k, v in env.items())
     os.replace(tmp, path)
+    # The portal cannot read this file (tenant tree); what its card shows
+    # must follow every write, or the next save compares against old values.
+    config_view_write()
 
 
 def instance_services(inst):
@@ -4238,7 +4242,9 @@ def config_entries(name, inst):
     instance.env and treated as SECRET -- a key we cannot classify might
     well be one, and masking a harmless value is the cheaper mistake.
     """
-    env = load_env(name)
+    # With the record at hand: config_view_write() asks this for every
+    # instance, and without it each call would re-read the registry.
+    env = load_env(name, inst)
     declared = inst.get("config")
     if declared is None:
         declared = [{"key": k, "label": k, "secret": True}
@@ -6445,6 +6451,54 @@ def artifact_index_write(reg=None):
         # A listing that cannot be written must not fail the operation
         # that was actually asked for -- it is a view, not a record.
         print(f"WARNING: could not write {ARTIFACT_INDEX}: {e}", flush=True)
+
+
+# --- the portal's view of configuration values (portal 2.4, 0.1.100) -----
+# The FOURTH reader RFC-0026 left behind (ARTIFACT_INDEX above was the
+# third). The portal's configuration card read
+# /apps-registry/<key>/instance.env, which no longer exists once instance
+# data lives in the tenant tree. Every non-secret value therefore showed
+# EMPTY -- and saving sent those empty fields back, so every value the
+# operator did not retype was wiped. Found 2026-09-15 on oaap-test, after
+# it had already emptied values of a customer's instance on oaapx01.
+#
+# So the host writes what the card may show: the values of declared
+# NON-secret keys, and for every key only WHETHER it is set. Never a secret
+# value. Written from save_registry() and save_env() -- together the only
+# writers of a record or an instance.env besides a restore, which saves
+# the registry -- and once from migrate.sh.
+CONFIG_VIEW = os.path.join(APPS_DIR, "config-values.json")
+
+
+def config_view_write(reg=None):
+    """Write what the configuration card may show, where the portal reads."""
+    try:
+        reg = reg if reg is not None else load_registry()
+        out = {}
+        for name, inst in (reg.get("instances") or {}).items():
+            try:
+                entries = config_entries(name, inst)
+            except (KeyError, TypeError, ValueError):
+                # One odd record must not blank the card of every other
+                # instance. Its own card then says the values are unknown
+                # and offers no save -- the safe direction.
+                continue
+            out[name] = {
+                "values": {e["key"]: e["value"] for e in entries
+                           if not e["secret"]},
+                "set": sorted(e["key"] for e in entries if e["value"]),
+                "keys": [e["key"] for e in entries],
+            }
+        tmp = CONFIG_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "written": _iso_now(),
+                       "instances": out}, f, indent=2)
+        os.replace(tmp, CONFIG_VIEW)
+        # Non-secret values only, which the card has always shown to the
+        # instance's administrators -- the same class as artifacts.json.
+        os.chmod(CONFIG_VIEW, 0o644)
+    except OSError as e:
+        print(f"WARNING: could not write {CONFIG_VIEW}: {e}", flush=True)
 
 
 def _iso(epoch):
@@ -10274,6 +10328,10 @@ def main():
                          help="internal: measure what a rehearsal would cost, "
                               "where the portal can read it (spec 2.15)")
     pmv.set_defaults(fn=lambda _a: rehearsal_view_write())
+    pmc = sub.add_parser("config-index",
+                         help="internal: write non-secret config values where "
+                              "the portal can read them (portal 2.4)")
+    pmc.set_defaults(fn=lambda _a: config_view_write())
     pmt = sub.add_parser("migrate-tenants",
                          help="internal: create the default tenant and stamp "
                               "what belongs to it (RFC-0022 stage 2)")

@@ -218,6 +218,17 @@ STYLE = """
   .roles label{display:inline-block;margin-right:.8rem;font-size:.95rem;white-space:nowrap}
   .roles input,.checkline input{width:auto;margin:0 .3rem 0 0}
   .checkline{display:block;margin:.3rem 0 1rem}
+  /* Konfiguration (portal 2.4, 0.3.15): ein umrandeter Block je Wert, damit
+     Name, Erklaerung und Feld sichtbar zusammengehoeren */
+  .cfgfield{border:1px solid var(--oaap-border);border-radius:.5rem;
+       padding:.8rem 1rem;margin:0 0 .9rem}
+  .cfgfield label{display:block;font-weight:600}
+  .cfgfield .hint{margin:.1rem 0 .45rem;font-size:.82rem}
+  .cfgfield input,.cfgfield textarea{margin:0;box-sizing:border-box}
+  .cfgfield p.gen{margin:.6rem 0 0}
+  .cfgsave{border-top:1px solid var(--oaap-border);margin-top:1.2rem;padding-top:1rem}
+  .cfgsave p{margin:0 0 .8rem}
+  .cfgdefault{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
   footer.oaap{max-width:62rem;margin:2rem auto 1.2rem;padding:0 1.2rem;
        color:var(--oaap-muted);font-size:.8rem;display:flex;gap:.5rem;align-items:center}
   @media (max-width:640px){
@@ -2252,46 +2263,80 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'konfiguration' }}">
-{% if i.config %}
+{% if not i.config_known %}
+{# Unbekannt ist nicht leer (0.1.100). Bis dahin zeigte diese Karte leere
+   Felder, wenn sie die Werte nicht lesen konnte -- und Speichern schrieb
+   sie leer zurueck. Ohne Ansicht des Knotens gibt es deshalb kein
+   Formular. #}
+<div class="card warn">
+  <h2>Konfiguration</h2>
+  <p>Die aktuellen Werte dieser Instanz liegen dem Portal gerade nicht vor.
+     Damit kein Wert versehentlich überschrieben wird, lässt sich hier im
+     Moment nichts speichern.</p>
+  <p class="muted">Der Knoten schreibt die Übersicht bei jeder Änderung und
+     bei <code>sudo oaap update</code> neu. Bis dahin ändert man Werte an der
+     Maschine: <code>sudo oaap app config list {{ i.key }}</code> und
+     <code>sudo oaap app config set {{ i.key }} SCHLÜSSEL WERT</code>.</p>
+</div>
+{% elif i.config %}
 <form method="post" action="/instances/{{ i.key }}/config">
   <input type="hidden" name="tab" value="konfiguration">
+  {# Enter in einem Feld loest den ERSTEN Absendeknopf des Formulars aus.
+     Stuende dort „Wert erzeugen", erzeugte Enter einen Wert, statt zu
+     speichern. Deshalb steht dieser unsichtbare Speichern-Knopf vorn —
+     aus dem Bild geschoben, nicht display:none, das nicht jeder Browser
+     als Standardknopf nimmt. #}
+  <button class="cfgdefault" tabindex="-1" aria-hidden="true">Speichern</button>
   <div class="card">
     <h2>Konfiguration</h2>
+    <p class="muted">Diese Werte deklariert die App in ihrem Manifest; andere
+       lassen sich hier nicht setzen.</p>
     {% for c in i.config %}
-    <label>{{ c.label }}
+    {# Ein Block je Wert: Name, Erklaerung, Feld. Die Erklaerung stand
+       frueher UNTER dem Feld und damit direkt ueber dem Namen des
+       naechsten — sie las sich wie dessen Ueberschrift (Joergs Befund,
+       2026-09-15). #}
+    <div class="cfgfield">
+      <label for="cfg-{{ c.key }}">{{ c.label }}</label>
+      <p class="muted hint"><code>{{ c.key }}</code>{% if c.multiline %} — eine Angabe
+         je Zeile{% endif %}{% if c.secret %} — vertraulich,
+         wird nie angezeigt{% endif %}{% if c.generate %} — diesen Wert
+         bestimmt die App selbst, der Knoten kann ihn erzeugen{% endif %}</p>
       {% if c.multiline %}
-      <textarea name="cfg-{{ c.key }}" rows="4" spellcheck="false"
+      <textarea name="cfg-{{ c.key }}" id="cfg-{{ c.key }}" rows="4" spellcheck="false"
                 style="width:100%;font-family:ui-monospace,monospace;font-size:.9rem"
                 placeholder="{{ ('gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt') if c.secret else 'eine Angabe je Zeile' }}">{{ c.value }}</textarea>
       {% elif c.secret and not c.fresh %}
-      <input type="password" name="cfg-{{ c.key }}" value="" autocomplete="new-password"
+      <input type="password" name="cfg-{{ c.key }}" value="" id="cfg-{{ c.key }}"
+             autocomplete="new-password"
              placeholder="{{ 'gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt' }}">
       {% else %}
       {# Ein frisch erzeugter Wert steht LESBAR da: ein Geheimnis, das
          direkt in schreibgeschuetzten Speicher wandert, ist fuer den
          verloren, der es der Gegenseite geben muss. #}
-      <input type="text" name="cfg-{{ c.key }}" value="{{ c.value }}"
+      <input type="text" name="cfg-{{ c.key }}" value="{{ c.value }}" id="cfg-{{ c.key }}"
              autocomplete="off" spellcheck="false"
              {% if c.fresh %}style="font-family:ui-monospace,monospace"{% endif %}>
       {% endif %}
-    </label>
-    {% if c.generate %}
-    <p><button name="generate" value="{{ c.key }}" class="secondary"
-       >Wert erzeugen</button>
-       {% if c.fresh %}<span class="muted"><strong>Jetzt kopieren</strong> —
-       gespeichert ist er noch nicht, und nach dem Speichern wird er
-       <strong>nicht mehr angezeigt</strong>.</span>{% endif %}</p>
-    {% endif %}
-    <p class="muted"><code>{{ c.key }}</code>{% if c.multiline %} — eine Angabe
-       je Zeile{% endif %}{% if c.secret %} — vertraulich,
-       wird nie angezeigt{% endif %}{% if c.generate %} — diesen Wert
-       bestimmt die App selbst, der Knoten kann ihn erzeugen{% endif %}</p>
+      {% if c.generate %}
+      <p class="gen"><button name="generate" value="{{ c.key }}" class="secondary"
+         >Wert erzeugen</button>
+         {% if c.fresh %}<span class="muted"><strong>Jetzt kopieren</strong> —
+         gespeichert ist er noch nicht, und nach dem Speichern wird er
+         <strong>nicht mehr angezeigt</strong>.</span>{% endif %}</p>
+      {% endif %}
+    </div>
     {% endfor %}
-    <p class="muted">Diese Werte deklariert die App in ihrem Manifest; andere
-       lassen sich hier nicht setzen. Beim Speichern wird der Container mit
-       den neuen Werten neu erzeugt — die App ist dabei kurz nicht
-       erreichbar. Daten, Adresse und Version bleiben unverändert.</p>
-    <button>Speichern</button>
+    {# Der Neustart wird dort gesagt, wo entschieden wird: am Knopf. Als
+       grauer Satz unter allen Feldern hat ihn niemand gelesen. #}
+    <div class="cfgsave">
+      <p><strong>Speichern startet die App neu.</strong> Hat sich ein Wert
+         geändert, wird der Container mit den neuen Werten neu erzeugt — die
+         App ist dabei einige Sekunden nicht erreichbar. Daten, Adresse und
+         Version bleiben unverändert. Ändert sich nichts, bleibt die App
+         unberührt.</p>
+      <button>Speichern und App neu starten</button>
+    </div>
   </div>
 </form>
 {% else %}
@@ -4968,13 +5013,30 @@ def _instance_groups(inst):
 RESERVED_ENV = {"OAAP_APP_SECRET"}  # platform-owned, never operator-editable
 
 
-def _instance_env(name):
-    """Current config values of an instance (read-only mount)."""
+# The host's view of configuration values (appctl.CONFIG_VIEW).
+#
+# Until 0.1.100 this read `/apps-registry/<key>/instance.env` -- where the
+# file lived until RFC-0026 moved instance data into the tenant tree. The
+# portal has no mount there and must not get one, so every value read as
+# EMPTY, and saving sent the empty fields back: whatever the operator did
+# not retype was wiped (found 2026-09-15 on oaap-test; it had already
+# emptied values on oaapx01). The fourth reader of a moved identifier --
+# see ARTIFACT_INDEX for the third.
+CONFIG_VIEW = "/apps-registry/config-values.json"
+
+
+def _config_view(name):
+    """What the host reported for this instance, or None if it did not.
+
+    None is not "no values". A missing view must never render as empty
+    fields that a save would then write back -- the card offers no save.
+    """
     try:
-        with open(f"/apps-registry/{name}/instance.env", encoding="utf-8") as f:
-            return dict(l.strip().split("=", 1) for l in f if "=" in l)
-    except OSError:
-        return {}
+        with open(CONFIG_VIEW, encoding="utf-8") as f:
+            mine = (json.load(f).get("instances") or {}).get(name)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return mine if isinstance(mine, dict) else None
 
 
 # What the platform's own storage can carry (spec oaap.apps.runtime 2.8).
@@ -4995,8 +5057,9 @@ def generated_value():
 def _instance_config(name, inst, fresh=None, typed=None):
     """Declared config keys with their current values (spec 2.4.3).
 
-    Mirrors appctl.config_entries: instances installed before config
-    recording fall back to the keys in instance.env and are treated as
+    Values come from the host's view (_config_view), never from a file
+    in the tenant tree. Instances installed before config recording fall
+    back to the keys the host found in instance.env and are treated as
     secret, so an unclassified value is never rendered into a page.
 
     `fresh` is (key, value) for a value the node has just produced. That
@@ -5006,11 +5069,13 @@ def _instance_config(name, inst, fresh=None, typed=None):
     entries across the round trip.
     """
     fresh_key, fresh_value = fresh or ("", "")
-    env = _instance_env(name)
+    view = _config_view(name) or {}
+    values = view.get("values") or {}
+    is_set = set(view.get("set") or [])
     declared = inst.get("config")
     if declared is None:
         declared = [{"key": k, "label": k, "secret": True}
-                    for k in env if k not in RESERVED_ENV]
+                    for k in (view.get("keys") or []) if k not in RESERVED_ENV]
     rows = []
     for c in declared:
         key = c["key"]
@@ -5018,7 +5083,9 @@ def _instance_config(name, inst, fresh=None, typed=None):
             continue
         secret = bool(c.get("secret"))
         multiline = bool(c.get("multiline"))
-        stored = env.get(key, "")
+        # The view carries no secret value at all, so there is nothing to
+        # show for one and nothing to compare a submission against.
+        stored = "" if secret else str(values.get(key, ""))
         shown = ("" if secret else
                  (iv.value_to_lines(stored) if multiline else stored))
         if typed is not None and key in typed and key != fresh_key:
@@ -5031,7 +5098,10 @@ def _instance_config(name, inst, fresh=None, typed=None):
             # credential, where a generated value is a wrong answer.
             "generate": c.get("generate") == "token",
             "fresh": key == fresh_key,
-            "is_set": bool(env.get(key)),
+            "is_set": key in is_set,
+            # What is stored, as the host reported it. Saving sends only a
+            # field whose submission differs from this (_config_changes).
+            "stored": stored,
             # a secret value never leaves the server, not even prefilled
             "value": fresh_value if key == fresh_key else shown,
         })
@@ -5404,6 +5474,9 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "services": inst.get("services") or [],
          "groups": groups, "roles": inst.get("roles") or [],
          "config": _instance_config(name, inst, fresh, typed),
+         # Unknown is not empty (0.1.100): without the host's view the
+         # card offers no form, instead of empty fields a save writes back.
+         "config_known": _config_view(name) is not None,
          "is_test": inst.get("channel") == "test",
          # Generalprobe (Runtime-Spec 2.15): Abzeichen und Restlaufzeit
          # im Objektkopf, und der Satz, der sagt, was hier wirklich liegt.
@@ -6029,6 +6102,55 @@ def instance_token(name):
                 name=name, token=token, hook_url=_hook_url(name))
 
 
+def _config_changes(rows, form):
+    """The values the operator actually changed, as the host stores them.
+
+    Returns (values, err). Only a field whose submission differs from
+    what the page showed is sent. That is the second half of the 0.1.100
+    fix: a view that is stale or wrong can then cost a wrong display,
+    never a value nobody touched. Before, every shown field was sent, and
+    a field shown empty by mistake was written empty.
+    """
+    values = {}
+    for c in rows:
+        submitted = form.get(f"cfg-{c['key']}")
+        if submitted is None:
+            continue
+        # an empty secret field means "keep the stored value" -- there is
+        # nothing to prefill it with, so blank cannot mean "clear it"
+        if c["secret"] and submitted.strip() == "":
+            continue
+        if c.get("multiline"):
+            # Zeilen -> gespeicherte Listenform. Ein Eintrag mit ';' wird
+            # abgelehnt statt zerschnitten (instance_view.lines_to_value).
+            joined, err = iv.lines_to_value(submitted)
+            if err:
+                return {}, f"{c['label']}: {err}"
+            submitted = joined
+        if not c["secret"] and submitted == c.get("stored", ""):
+            continue
+        values[c["key"]] = submitted
+    return values, ""
+
+
+def _config_outcome(res):
+    """The worker's verdict on a config save, in the words of the page.
+
+    Returns (msg, err). A plain "Gespeichert." hid the one thing an
+    operator needs to know after saving: whether the app was just
+    restarted (portal 2.4, 0.3.15). The worker already says which --
+    apply_config answers "changed: ..." or "no change".
+    """
+    if res is None:
+        return "", ("Die Änderung läuft noch — ein Neustart kann einen "
+                    "Moment dauern. Bitte gleich erneut prüfen.")
+    if not res.get("ok"):
+        return "", res.get("message") or "Speichern fehlgeschlagen."
+    if (res.get("message") or "").endswith("no change"):
+        return "Keine Änderung — die App läuft unverändert weiter.", ""
+    return "Gespeichert — die App wurde mit den neuen Werten neu gestartet.", ""
+
+
 @app.post("/instances/<name>/config")
 def instance_config(name):
     denied = require_instance_admin(name)
@@ -6060,27 +6182,23 @@ def instance_config(name):
                               typed=typed,
                               msg=f"Ein Wert für {row['label']} ist erzeugt — "
                                   "gespeichert wird er erst mit „Speichern\".")
-    values = {}
-    for c in rows:
-        submitted = request.form.get(f"cfg-{c['key']}")
-        if submitted is None:
-            continue
-        # an empty secret field means "keep the stored value" -- there is
-        # nothing to prefill it with, so blank cannot mean "clear it"
-        if c["secret"] and submitted.strip() == "":
-            continue
-        if c.get("multiline"):
-            # Zeilen -> gespeicherte Listenform. Ein Eintrag mit ';' wird
-            # abgelehnt statt zerschnitten (instance_view.lines_to_value).
-            joined, err = iv.lines_to_value(submitted)
-            if err:
-                return _inst_back(name, err=f"{c['label']}: {err}")
-            submitted = joined
-        values[c["key"]] = submitted
+    # Without the host's view the rows above carry no values, and saving
+    # them wrote empty fields back -- the bug 0.1.100 fixes. Refuse before
+    # anything reaches the host.
+    if _config_view(name) is None:
+        return _inst_back(name, err="Die aktuellen Werte dieser Instanz "
+                                    "liegen dem Portal gerade nicht vor. "
+                                    "Gespeichert wurde nichts, damit kein "
+                                    "Wert versehentlich überschrieben wird.")
+    values, err = _config_changes(rows, request.form)
+    if err:
+        return _inst_back(name, err=err)
     if not values:
-        return _inst_back(name, msg="Keine Änderung.")
-    return _queue_and_redirect(name, {"action": "config", "values": values},
-                               CONFIG_WAIT_SECONDS)
+        msg, err = _config_outcome({"ok": True, "message": "config no change"})
+        return _inst_back(name, msg=msg, err=err)
+    msg, err = _config_outcome(_queue_and_wait(
+        name, {"action": "config", "values": values}, CONFIG_WAIT_SECONDS))
+    return _inst_back(name, msg=msg, err=err)
 
 
 # --------------------------------------------------------------- Generalprobe

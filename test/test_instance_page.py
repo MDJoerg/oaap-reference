@@ -107,6 +107,7 @@ def render(tab, inst=None, **over):
         "groups": (inst.get("visibility") or {}).get("groups") or [],
         "roles": inst.get("roles") or [],
         "config": [dict(c, value="", is_set=False) for c in inst.get("config") or []],
+        "config_known": True,
         "token_created": "2026-08-16 07:00",
         "artifacts": [{"file": "0.4.1-ab12.zip", "running": True,
                        "received": "2026-08-16 09:12"},
@@ -234,6 +235,13 @@ h = render("konfiguration", config=[], endpoints=[], artifacts=[])
 ok("ohne Konfigurationsschluessel steht da eine Begruendung",
    "erklärt in ihrem Manifest keine Konfigurationswerte" in h)
 ok("und kein Eingabefeld", 'name="cfg-' not in h)
+# 0.1.100: ohne die Ansicht des Hosts sind die Werte unbekannt. Leere
+# Felder anzubieten hiesse, sie beim Speichern leer zurueckzuschreiben.
+h = render("konfiguration", config_known=False)
+ok("ohne bekannte Werte sagt die Karte das",
+   "liegen dem Portal gerade nicht vor" in h)
+ok("und bietet kein Formular an", 'action="/instances/bdt-hub/config"' not in h
+   and 'name="cfg-' not in h)
 ok("ohne Direktport steht da eine Begruendung",
    "keinen Port am Gateway vorbei" in h)
 

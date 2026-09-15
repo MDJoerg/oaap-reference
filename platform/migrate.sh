@@ -208,6 +208,14 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-instance-dir
 # this fixes.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" artifact-index   2>&1 | sed 's/^/  /' || say "  WARNING: the package index could not be written."
 
+# --- the portal's view of configuration values (portal 2.4) ---
+# Same move, same reason: until 0.1.100 the configuration card read
+# instance.env from the old path, showed every non-secret value empty, and
+# a save wrote the empty fields back. The view is written here once so a
+# node that changes nothing after the update gets a correct card at once
+# -- until it exists, the card offers no save at all.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" config-index   2>&1 | sed 's/^/  /' || say "  WARNING: the configuration view could not be written."
+
 # --- the schedule as systemd actually holds it (RFC-0029 D1) ---
 # Since 0.1.78 backup-schedule.json is a VIEW derived from the timer,
 # not a note the installer left behind. Written once here so a node that
