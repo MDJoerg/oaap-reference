@@ -162,6 +162,11 @@ TABS = (
     ("netz", "Netz & Adressen"),
     ("deployment", "Deployment"),
     ("konfiguration", "Konfiguration"),
+    # RFC-0038: eigener Reiter, nicht eine Karte im Überblick. Der
+    # Zustand gehört nach vorn, weil er immer sichtbar ist; das Log und
+    # die Gateway-Sicht hinter eine ausdrückliche Handlung, weil sie
+    # Inhalte zeigen, die die App geschrieben hat.
+    ("diagnose", "Diagnose"),
     ("verwaltung", "Verwaltung"),
 )
 DEFAULT_TAB = TABS[0][0]

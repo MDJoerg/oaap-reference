@@ -755,9 +755,47 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  # Instance watch (RFC-0038 D1/D2): two small jobs, one minute apart.
+  #
+  # The first writes the container facts the instance page shows --
+  # running or not, since when, how often restarted. The portal cannot
+  # ask the container runtime (it has no socket, deliberately), so the
+  # host writes them beside the registry. Tied to a timer rather than to
+  # a registry save, because container state changes on its own: a view
+  # refreshed only when somebody saves something would be fresh exactly
+  # when nothing had happened.
+  #
+  # The second closes diagnosis windows whose time is up. That is not
+  # housekeeping -- the time limit IS the promise the window makes, and
+  # a window that expires on the page while the gateway keeps collecting
+  # would break it silently.
+  cat > /etc/systemd/system/oaap-instance-watch.service <<EOF
+[Unit]
+Description=OAAP instance watch (container state for the portal, expiry of diagnosis windows)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py state-index
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py diagnose sweep
+EOF
+  cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
+[Unit]
+Description=OAAP instance watch, every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=15s
+# Nothing to catch up on: both jobs answer "what is true NOW".
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
   systemctl daemon-reload
   systemctl enable --now oaap-deployd.path >/dev/null 2>&1 || true
   systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 || true
+  systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."
   say "WARNING: and an expired rehearsal (RFC-0030) will not be removed by itself — 'sudo oaap app rehearsal sweep' does it by hand."

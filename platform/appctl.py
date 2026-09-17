@@ -3502,7 +3502,14 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     """
     if login_only is None:
         login_only = bool(scope) and scope in rehearsal_keys()
-    lines = []
+    # While a diagnosis window is open, THIS instance's requests are
+    # logged to a file of its own (RFC-0038 D3). Here, in the one body
+    # every entry point shares, so the window covers the LAN port, the
+    # automatic name, the instance's own names and its aliases -- an
+    # entry point left out would be a blind spot exactly where somebody
+    # is looking for one. Nothing at all while no window is open: this
+    # RFC does not turn on permanent per-instance logging.
+    lines = list(diagnose_site_lines(scope))
     lines.append("\thandle /auth/* {")
     lines.append("\t\trequest_header -X-OAAP-User")
     lines.append("\t\trequest_header -X-OAAP-Roles")
@@ -4145,6 +4152,26 @@ def _endpoint_publish(endpoints, svc_name, primary):
     return args
 
 
+# How much log one container may keep (RFC-0038 D5).
+#
+# Docker's json-file driver keeps logs WITHOUT ANY LIMIT unless told
+# otherwise, and no OAAP node configures one: there is no
+# /etc/docker/daemon.json on any of them. So a chatty app fills the disk
+# slowly, invisibly, and a diagnosis window that points a person at "the
+# log" would be pointing at a file that can be gigabytes.
+#
+# Set PER CONTAINER, not host-wide in daemon.json: a node may run
+# containers that are not OAAP's, and their owner decides for them.
+# About 30 MB at most per container, which is far more than any
+# diagnosis window reads and far less than a disk.
+#
+# An existing container gets this at its next recreate -- a deploy, a
+# configuration save, a restart. Deliberately no forced recreate on
+# update: that would make an update an outage of every app on the node
+# for a benefit that can wait (D5).
+CONTAINER_LOG_OPTS = ["--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
+
+
 def recreate_instance_containers(name, services, storage, endpoints=None,
                                  inst=None):
     """(Re)create ALL of an instance's service containers on its own
@@ -4181,6 +4208,7 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
                        capture_output=True, text=True)
         run(["docker", "run", "-d", "--name", s["container"],
              "--restart", "unless-stopped", "--network", net, *alias,
+             *CONTAINER_LOG_OPTS,
              "--env-file", env_path(name, inst), *mounts, *publish, s["image"]])
     # Erklärte App-zu-App-Verbindungen zurückholen: `docker run` kennt nur
     # EIN Netz, also hat der neue Container seine Link-Netze verloren
@@ -4291,6 +4319,632 @@ def apply_config(name, inst, values):
     recreate_instance_containers(name, instance_services(inst),
                                  inst.get("storage") or [])
     return "changed: " + ", ".join(sorted(changed))
+
+
+# ------------------------------------------- instance diagnostics (RFC-0038)
+#
+# Three things in rising order of sensitivity, and the order matters --
+# it is the whole design:
+#
+#   D1  STATE, always visible. Facts about a container (running, since
+#       when, how often restarted, last exit code, killed for memory),
+#       never content the app produced. No window, no audit entry.
+#   D2  A DIAGNOSIS WINDOW, opened on purpose for 15/30/60 minutes and
+#       recorded in the tenant's log. While it is open the portal may
+#       show the app's own log.
+#   D3  THE GATEWAY'S VIEW, collected only while that window is open --
+#       and never the query string, the Authorization header, cookies or
+#       the identity headers.
+#   D4  RESTART = RECREATE, the same operation a configuration save
+#       already runs. One path, so install/restore/config/restart cannot
+#       drift apart.
+#
+# WHY A WINDOW AT ALL (and not a log page that is simply there): logs are
+# written by the APP, not by the platform. An app may print request
+# bodies, e-mail addresses, a token it received -- the platform cannot
+# know and cannot filter it. A permanently visible log would quietly
+# make every administrator of an instance a permanent reader of whatever
+# the app chooses to print. Jörgs own framing is the rule this follows:
+# reading is an ACT -- on purpose, for a while, and on record.
+
+# The portal's view of container state (D1). Written by the host, read
+# read-only by the portal, exactly like apps/artifacts.json and
+# apps/config-values.json -- the portal never talks to the container
+# runtime.
+STATE_VIEW = os.path.join(APPS_DIR, "instance-state.json")
+
+# Snapshots of an app's log, one file per instance with an open window
+# (D2). Deleted when the window closes.
+DIAGNOSE_DIR = os.path.join(APPS_DIR, "diagnose")
+
+# What the gateway may be asked to collect for one instance (D3). Lives
+# next to the external access log, which the portal already mounts.
+GATEWAY_LOG_DIR = os.path.join(DATA_DIR, "data", "gateway", "logs")
+
+# D2: the three durations, and the default. Not extendable by design --
+# opening it again is a new act with its own audit entry, which is the
+# difference between "I looked once" and "it has been open since
+# Tuesday".
+DIAGNOSE_MINUTES = (15, 30, 60)
+DIAGNOSE_DEFAULT_MINUTES = 30
+# How much of a container's log a snapshot may carry.
+DIAGNOSE_TAIL_DEFAULT = 200
+DIAGNOSE_TAIL_MAX = 1000
+
+
+class DiagnoseRefused(Exception):
+    """A diagnosis window or a restart that must not happen, with the
+    sentence that says why -- raised rather than die()d so the CLI and
+    the spool worker can each answer in their own way (as
+    EndpointPortTaken already does)."""
+
+
+# --- D1: what the container runtime knows -------------------------------
+#
+# ONE `docker inspect` for the whole node, not one per container: this
+# runs every minute from a timer, and a node carries a dozen containers.
+# The name is asked for in the output as well, so a container that is
+# GONE simply does not appear -- which is a state of its own ("not
+# present") and must not be confused with "stopped".
+_INSPECT_FIELDS = ("{{.Name}}\t{{.State.Status}}\t{{.State.StartedAt}}\t"
+                   "{{.RestartCount}}\t{{.State.ExitCode}}\t"
+                   "{{.State.OOMKilled}}\t"
+                   "{{if .State.Health}}{{.State.Health.Status}}{{end}}")
+
+
+def container_states(names):
+    """State facts for the named containers, keyed by container name.
+
+    Returns (states, runtime_ok). `runtime_ok` False means the container
+    runtime could not be asked at all -- and then the page must say
+    "unknown" rather than "down". A container that merely does not exist
+    is absent from `states`, which is not the same thing and is why both
+    answers are needed.
+    """
+    names = [n for n in names if n]
+    if not names:
+        return {}, True
+    try:
+        res = subprocess.run(
+            ["docker", "inspect", "--format", _INSPECT_FIELDS, *names],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {}, False
+    out = {}
+    for line in (res.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        name, status, started, restarts, exit_code, oom, health = parts
+        try:
+            restarts = int(restarts)
+            exit_code = int(exit_code)
+        except ValueError:
+            restarts, exit_code = 0, 0
+        out[name.lstrip("/")] = {
+            "state": status, "started": started, "restarts": restarts,
+            "exit_code": exit_code, "oom": oom.strip().lower() == "true",
+            "health": health.strip(),
+        }
+    # A non-zero exit code with output present means "some of these
+    # containers are gone", which is an answer, not a failure. Only a
+    # run that produced nothing at all says the runtime is unreachable.
+    return out, bool(out) or res.returncode == 0
+
+
+def state_view_write(reg=None):
+    """Write the state facts of every instance where the portal reads.
+
+    Deliberately NOT called from save_registry(): container state
+    changes on its own, without anybody saving anything, so it is
+    refreshed by a timer (oaap-instance-state.timer) and after every
+    worker action. Tying it to the registry would have produced a view
+    that is fresh exactly when nothing happened.
+    """
+    try:
+        reg = reg if reg is not None else load_registry()
+        instances = (reg.get("instances") or {})
+
+        def services_of(inst):
+            """The services of one record, or none.
+
+            One odd record must not blank the card of every other
+            instance -- the same rule config_view_write() follows, and
+            for the same reason: a record without a container (a
+            half-written entry, a fixture, a future shape) is a reason
+            for THAT instance to say "unknown", never for the whole
+            view to go missing.
+            """
+            try:
+                return [s for s in instance_services(inst) if s.get("container")]
+            except (KeyError, TypeError, ValueError):
+                return []
+
+        wanted = []
+        for inst in instances.values():
+            wanted += [s["container"] for s in services_of(inst)]
+        states, runtime_ok = container_states(wanted)
+        out = {}
+        for name, inst in instances.items():
+            rows = []
+            for s in services_of(inst):
+                fact = states.get(s["container"])
+                rows.append({"service": s.get("service") or "",
+                             "container": s["container"],
+                             **(fact or {"state": "absent"})})
+            out[name] = {"services": rows}
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = STATE_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "written": _iso_now(),
+                       "runtime_ok": runtime_ok, "instances": out}, f, indent=2)
+        os.replace(tmp, STATE_VIEW)
+        # Container names and statuses -- nothing the app wrote, nothing
+        # anybody's own. Same class as apps/artifacts.json.
+        os.chmod(STATE_VIEW, 0o644)
+        return True
+    except OSError as e:
+        print(f"WARNING: could not write {STATE_VIEW}: {e}", flush=True)
+        return False
+
+
+# --- D2/D3: the window --------------------------------------------------
+
+
+def diagnose_window(inst):
+    """The instance's window record, or None -- expiry included.
+
+    An expired record is answered as None on purpose: every reader then
+    gets the same answer as after a close, even before the sweep has
+    run. The sweep still has work to do (the gateway is still
+    collecting, the snapshot is still on disk), but nothing DISPLAYS an
+    expired window as open in the meantime.
+    """
+    w = (inst or {}).get("diagnose") or None
+    if not w or not w.get("until"):
+        return None
+    return None if _past(w["until"]) else w
+
+
+def _past(stamp):
+    """Is this ISO instant in the past? An unreadable one counts as
+    past -- a window nobody can date must not stay open forever."""
+    import datetime
+    try:
+        when = datetime.datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return when <= datetime.datetime.now(datetime.timezone.utc)
+
+
+def diagnose_seconds_left(inst, now=None):
+    """Seconds this window still has, or 0."""
+    import datetime
+    w = diagnose_window(inst)
+    if not w:
+        return 0
+    try:
+        until = datetime.datetime.fromisoformat(str(w["until"]))
+    except ValueError:
+        return 0
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=datetime.timezone.utc)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return max(0, int((until - now).total_seconds()))
+
+
+# Which instances the GATEWAY is currently collecting for, cached
+# against the registry file's own stamp.
+#
+# Same construction and the same reason as rehearsal_keys(): the rule
+# has to hold at every place a gateway site is written, and there are
+# nine of them. A parameter threaded through nine call sites fails
+# silently at the one that was forgotten -- and here it would fail
+# towards "keeps logging this instance after the window closed", which
+# is precisely what the window is a promise against.
+_DIAGNOSE_CACHE = {"stamp": None, "keys": frozenset()}
+
+
+def diagnose_keys():
+    try:
+        st = os.stat(REGISTRY)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return frozenset()
+    if _DIAGNOSE_CACHE["stamp"] != stamp:
+        try:
+            with open(REGISTRY, encoding="utf-8") as f:
+                reg = json.load(f)
+        except (OSError, ValueError):
+            return _DIAGNOSE_CACHE["keys"]
+        _DIAGNOSE_CACHE["keys"] = frozenset(
+            k for k, i in (reg.get("instances") or {}).items()
+            if diagnose_window(i))
+        _DIAGNOSE_CACHE["stamp"] = stamp
+    return _DIAGNOSE_CACHE["keys"]
+
+
+def diagnose_log_file(name):
+    """The gateway's log for one instance's window (host path)."""
+    return os.path.join(GATEWAY_LOG_DIR, f"diagnose-{name}.log")
+
+
+def diagnose_snapshot_file(name):
+    return os.path.join(DIAGNOSE_DIR, f"{name}.json")
+
+
+# What the gateway writes while a window is open (D3), as Caddyfile
+# lines for one site.
+#
+# THE FILTER IS THE SPEC, NOT A CONVENIENCE. RFC-0038 D3 says these
+# fields MUST NOT be written, so they are removed where the line is
+# produced -- not where it is displayed. The query string goes first:
+# the gateway's own access log keeps full URIs, and tokens have ended up
+# in query strings before (which is why the portal never puts one
+# there either).
+#
+# The reader in the portal is an ALLOW-list on top of this, so a field
+# Caddy starts logging in some future version reaches no page even
+# though nobody thought to delete it here.
+#
+# `replace` rather than `delete` for the two credential headers, and
+# that is the difference between a field and an answer: D3 asks for
+# WHETHER credentials were present (yes/no), never their value. Deleting
+# them would have thrown away the one fact that tells "the caller sent
+# no key" apart from "the key was wrong" -- which is exactly the
+# question that cost Jörg the 15.09.
+#
+# The Location header keeps its path and loses its query for the same
+# reason the URI does: an app may redirect to a URL carrying a token,
+# and this file must not become the place that records it.
+#
+# Size: 2 MiB with one kept predecessor, so an hour of somebody
+# hammering a route cannot turn a diagnosis into a disk problem.
+REDACTED = "REDACTED"
+
+
+def _diagnose_log_block(name):
+    return [
+        f"\tlog diagnose_{re.sub(r'[^a-z0-9_]', '_', name)} {{",
+        f"\t\toutput file /logs/diagnose-{name}.log {{",
+        "\t\t\troll_size 2mib",
+        "\t\t\troll_keep 1",
+        "\t\t}",
+        "\t\tformat filter {",
+        "\t\t\twrap json",
+        "\t\t\tfields {",
+        '\t\t\t\trequest>uri regexp "\\?.*$" ""',
+        f"\t\t\t\trequest>headers>Authorization replace {REDACTED}",
+        f"\t\t\t\trequest>headers>Cookie replace {REDACTED}",
+        "\t\t\t\trequest>headers>X-Oaap-User delete",
+        "\t\t\t\trequest>headers>X-Oaap-Roles delete",
+        "\t\t\t\trequest>headers>Proxy-Authorization delete",
+        "\t\t\t\tresp_headers>Set-Cookie delete",
+        '\t\t\t\tresp_headers>Location regexp "\\?.*$" ""',
+        "\t\t\t}",
+        "\t\t}",
+        "\t}",
+    ]
+
+
+def diagnose_site_lines(scope):
+    """The log block this instance's sites carry right now, or none."""
+    return _diagnose_log_block(scope) if scope and scope in diagnose_keys() else []
+
+
+def _apply_instance_sites(name, inst):
+    """Rewrite every gateway site of one instance and reload.
+
+    All of them, because a window has to cover the LAN port, the
+    automatic name, the instance's own names and its aliases -- an
+    entry point left out would be a blind spot exactly where somebody
+    is looking for one.
+    """
+    write_app_caddy(name, inst)
+    refresh_generated_sites()
+    reload_gateway()
+
+
+def diagnose_open(name, minutes=DIAGNOSE_DEFAULT_MINUTES, who="root",
+                  role="root"):
+    """Open a diagnosis window for one instance (D2/D3).
+
+    Returns the record. Raises DiagnoseRefused for an unknown instance
+    or a duration that was not offered -- the spool is data, not trust,
+    so the duration is checked here and not only in the form.
+    """
+    import datetime
+    if int(minutes) not in DIAGNOSE_MINUTES:
+        raise DiagnoseRefused(
+            f"a diagnosis window lasts "
+            f"{', '.join(str(m) for m in DIAGNOSE_MINUTES)} minutes, "
+            f"not {minutes}")
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(name)
+    if not inst:
+        raise DiagnoseRefused("unknown instance")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rec = {"opened": now.isoformat(timespec="seconds"),
+           "until": (now + datetime.timedelta(minutes=int(minutes)))
+                    .isoformat(timespec="seconds"),
+           "minutes": int(minutes), "by": who}
+    inst["diagnose"] = rec
+    save_registry(reg)
+    try:
+        _apply_instance_sites(name, inst)
+    except (subprocess.CalledProcessError, OSError) as e:
+        # A window the gateway refused is worth nothing, and leaving the
+        # record behind would leave a site file the next reload cannot
+        # load either. So it goes back exactly as it was.
+        inst.pop("diagnose", None)
+        save_registry(reg)
+        try:
+            _apply_instance_sites(name, inst)
+        except (subprocess.CalledProcessError, OSError):
+            pass
+        raise DiagnoseRefused(
+            f"the gateway did not accept the diagnosis log: {e}")
+    audit_tenant("diagnose.opened", resolve_tenant(inst.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail=f"{int(minutes)} minutes")
+    diagnose_logs_write(name, inst)
+    return rec
+
+
+def diagnose_close(name, who="root", role="root", expired=False):
+    """Close a window: stop collecting, and delete what was collected.
+
+    Deleting is the point, not tidiness. What the window gathered is
+    the app's own output and the gateway's view of somebody's requests;
+    keeping it past the window would turn a time-boxed read into a
+    store nobody agreed to.
+    """
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(name)
+    if not inst:
+        raise DiagnoseRefused("unknown instance")
+    had = bool(inst.get("diagnose"))
+    inst.pop("diagnose", None)
+    save_registry(reg)
+    _apply_instance_sites(name, inst)
+    for path in (diagnose_snapshot_file(name), diagnose_log_file(name)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    # Caddy's roller leaves dated predecessors behind; they belong to
+    # the same window and go with it.
+    try:
+        for fn in os.listdir(GATEWAY_LOG_DIR):
+            if fn.startswith(f"diagnose-{name}-") or fn.startswith(
+                    f"diagnose-{name}.log."):
+                os.remove(os.path.join(GATEWAY_LOG_DIR, fn))
+    except OSError:
+        pass
+    if had:
+        audit_tenant("diagnose.expired" if expired else "diagnose.closed",
+                     resolve_tenant(inst.get("tenant"))
+                     or ensure_default_tenant(),
+                     subject=name, who=who, role=role)
+    return had
+
+
+def diagnose_sweep(who="root", role="root"):
+    """Close every window whose time is up (D2).
+
+    Runs from a timer every minute. Without it a window would expire on
+    the page and keep collecting at the gateway -- the one failure this
+    feature must not have, because the promise IS the time limit.
+    """
+    closed = []
+    reg = load_registry()
+    for name, inst in sorted((reg.get("instances") or {}).items()):
+        w = (inst or {}).get("diagnose") or None
+        if w and (not w.get("until") or _past(w["until"])):
+            try:
+                diagnose_close(name, who=who, role=role, expired=True)
+                closed.append(name)
+            except (DiagnoseRefused, subprocess.CalledProcessError) as e:
+                print(f"WARNING: could not close the diagnosis window of "
+                      f"'{name}': {e}", flush=True)
+    return closed
+
+
+def diagnose_logs_write(name, inst=None, tail=DIAGNOSE_TAIL_DEFAULT,
+                        service=""):
+    """Snapshot the app's log where the portal can read it (D2).
+
+    Only while a window is open -- checked HERE and not only by the
+    caller, because this is the one function that moves the app's own
+    output out of the container, and every other guard is somebody
+    else's discipline.
+    """
+    reg = None
+    if inst is None:
+        reg = load_registry()
+        inst = (reg.get("instances") or {}).get(name)
+    if not inst:
+        raise DiagnoseRefused("unknown instance")
+    if not diagnose_window(inst):
+        raise DiagnoseRefused("no diagnosis window is open for this instance")
+    tail = max(1, min(int(tail or DIAGNOSE_TAIL_DEFAULT), DIAGNOSE_TAIL_MAX))
+    out = []
+    for s in instance_services(inst):
+        if service and (s.get("service") or "") != service:
+            continue
+        try:
+            res = subprocess.run(
+                ["docker", "logs", "--timestamps", "--tail", str(tail),
+                 s["container"]], capture_output=True, text=True, timeout=60)
+            # stdout and stderr in one stream, oldest first, exactly as
+            # the container produced them. `docker logs` puts them on
+            # the two streams it received them on; a person reading a
+            # crash wants them interleaved, not sorted by channel.
+            text = (res.stdout or "") + (res.stderr or "")
+        except (OSError, subprocess.SubprocessError) as e:
+            text = f"(the log of this container could not be read: {e})"
+        out.append({"service": s.get("service") or "",
+                    "container": s["container"],
+                    "lines": text.splitlines()[-tail:]})
+    os.makedirs(DIAGNOSE_DIR, exist_ok=True)
+    os.chmod(DIAGNOSE_DIR, 0o700)
+    path = diagnose_snapshot_file(name)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "written": _iso_now(), "tail": tail,
+                   "services": out}, f)
+    os.replace(tmp, path)
+    # 0600, unlike every other view beside the registry: this is the
+    # app's OWN output, which may carry anything the app chose to print.
+    # The portal reads it as root through a read-only mount; nobody else
+    # on the machine has business with it.
+    return path
+
+
+# --- D4: restart = recreate ---------------------------------------------
+#
+# Which spool actions are a deployment. Mirrors deploy_state.py in the
+# portal, which answers the same question for the page; here it decides
+# whether a restart may run at all.
+DEPLOY_SPOOL_ACTIONS = frozenset({"redeploy", "install", "artifact",
+                                  "announce", "rollback", "promote",
+                                  "create"})
+
+
+def deployment_in_flight(name, own_rid=""):
+    """Is a deployment of this instance queued or running?
+
+    `own_rid` is the request this question is being asked from -- a
+    restart arriving through the spool is itself a claim, and without
+    this it would find itself and refuse every time.
+    """
+    for d in (os.path.join(SPOOL_DIR, "queue"), SPOOL_CLAIMS):
+        try:
+            files = os.listdir(d)
+        except OSError:
+            continue
+        for fn in files:
+            if not fn.endswith(".json") or fn[:-5] == own_rid:
+                continue
+            try:
+                with open(os.path.join(d, fn), encoding="utf-8") as f:
+                    req = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if (isinstance(req, dict) and req.get("instance") == name
+                    and req.get("action", "redeploy") in DEPLOY_SPOOL_ACTIONS):
+                return True
+    return False
+
+
+def restart_instance(name, inst, own_rid="", who="root", role="root"):
+    """Recreate every container of one instance (D4). Returns a message.
+
+    RECREATE, not `docker restart`, and that is the decision:
+
+    * ONE PATH. Install, restore, a configuration save and this produce
+      the identical container. A second, lighter path would be the one
+      that drifts.
+    * IT HEALS MORE. A container that is "Up" but lost its network link
+      or its published port (the gateway case of 2026-08-07) comes back
+      whole.
+    * IT IS NOT NEW BEHAVIOUR. Files written inside the container
+      outside declared storage are already lost on every deploy and
+      every configuration save; apps must not rely on them
+      (oaap.apps.runtime storage rule). This makes that no worse.
+
+    Refused while a deployment of the instance is in flight -- a restart
+    queued behind a build would recreate containers the build is in the
+    middle of replacing.
+    """
+    if deployment_in_flight(name, own_rid):
+        raise DiagnoseRefused(
+            "a deployment of this instance is queued or running — a restart "
+            "would collide with it. Wait for it to finish and try again.")
+    recreate_instance_containers(name, instance_services(inst),
+                                 inst.get("storage") or [])
+    state_view_write()
+    audit_tenant("instance.restarted", resolve_tenant(inst.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role)
+    started = ""
+    states, _ok = container_states([instance_services(inst)[0]["container"]])
+    for fact in states.values():
+        started = (fact.get("started") or "")[:19].replace("T", " ")
+    return ("restarted" + (f", running since {started} UTC" if started else ""))
+
+
+def cmd_diagnose(args):
+    """`oaap app diagnose open|close|sweep|status <instance>`."""
+    if args.action == "sweep":
+        closed = diagnose_sweep()
+        print(f"Closed {len(closed)} expired diagnosis window(s)"
+              + (": " + ", ".join(closed) if closed else "") + ".")
+        return
+    reg = load_registry()
+    name = args.name or ""
+    inst = (reg.get("instances") or {}).get(name)
+    if not inst:
+        die(f"unknown instance '{name}'")
+    if args.action == "status":
+        w = diagnose_window(inst)
+        if not w:
+            print(f"{name}: no diagnosis window is open.")
+        else:
+            print(f"{name}: window open until {w['until']} "
+                  f"({diagnose_seconds_left(inst) // 60} min left), opened by "
+                  f"{w.get('by', '?')}.")
+        return
+    try:
+        if args.action == "open":
+            rec = diagnose_open(name, minutes=args.minutes)
+            print(f"Diagnosis window open until {rec['until']} — the gateway "
+                  f"is collecting requests to this instance from now on.")
+        else:
+            had = diagnose_close(name)
+            print("Diagnosis window closed and what it collected deleted."
+                  if had else "No diagnosis window was open.")
+    except DiagnoseRefused as e:
+        die(str(e))
+
+
+def cmd_logs(args):
+    """`oaap app logs <instance>` -- at the machine, without a window.
+
+    No window here, and no audit entry: whoever is at the machine
+    already has Docker, and pretending otherwise would be theatre. The
+    window exists because the PORTAL hands the log to somebody who does
+    not have the machine.
+    """
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"unknown instance '{args.name}'")
+    tail = max(1, min(int(args.tail), DIAGNOSE_TAIL_MAX))
+    for s in instance_services(inst):
+        if args.service and (s.get("service") or "") != args.service:
+            continue
+        label = s.get("service") or "(single service)"
+        print(f"=== {args.name} / {label} — {s['container']} ===")
+        subprocess.run(["docker", "logs", "--timestamps", "--tail", str(tail),
+                        s["container"]])
+
+
+def cmd_restart(args):
+    """`oaap app restart <instance>`."""
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"unknown instance '{args.name}'")
+    try:
+        msg = restart_instance(args.name, inst, who="cli", role="root")
+    except DiagnoseRefused as e:
+        die(str(e))
+    except subprocess.CalledProcessError as e:
+        die((e.stderr or str(e)).strip().splitlines()[-1])
+    print(f"'{args.name}' {msg}.")
 
 
 def cmd_config(args):
@@ -8221,6 +8875,13 @@ TENANT_AUDITED = {
     "endpoint": "instance.endpoint",
     "address": "instance.address",
     "config": "instance.config",
+    # RFC-0038 is deliberately ABSENT from this table. Its four actions
+    # write their own entries where they happen -- restart_instance()
+    # knows the new start time and also serves the CLI, and the window's
+    # open/close entries have to say whether it EXPIRED, which only the
+    # sweep knows and where no spool request exists at all. The same
+    # arrangement create_rehearsal() already uses, with the same
+    # consequence: the refusal path is written in the branch below.
     # Filed in the tenant that was just born, not in the operator's --
     # the first line of its log is the record of its own creation, and
     # its administrator has to be able to read it (RFC-0022 §6).
@@ -9315,6 +9976,64 @@ def cmd_process_deploys(_args):
                              subject=str(req.get("to") or ""), result="denied",
                              who=actor or "portal", role=act_role or "-",
                              detail=msg)
+        elif action in ("diagnose-open", "diagnose-close", "diagnose-logs"):
+            # The diagnosis window (RFC-0038 D2/D3). Who may open it is
+            # re-checked by the ordinary cross-tenant check above -- it
+            # is the same right as every other card on the page -- and
+            # the DURATION is re-checked inside diagnose_open, because
+            # the spool is data, not trust: a request naming 600
+            # minutes must not become a window nobody offered.
+            if not inst:
+                msg = "unknown instance"
+            else:
+                try:
+                    if action == "diagnose-open":
+                        rec = diagnose_open(
+                            name, minutes=int(req.get("minutes")
+                                              or DIAGNOSE_DEFAULT_MINUTES),
+                            who=actor or "portal", role=act_role or "-")
+                        ok, msg = True, f"diagnosis window open until {rec['until']}"
+                    elif action == "diagnose-close":
+                        had = diagnose_close(name, who=actor or "portal",
+                                             role=act_role or "-")
+                        ok = True
+                        msg = ("diagnosis window closed" if had
+                               else "no diagnosis window was open")
+                    else:
+                        diagnose_logs_write(
+                            name, inst,
+                            tail=int(req.get("tail") or DIAGNOSE_TAIL_DEFAULT))
+                        ok, msg = True, "log snapshot written"
+                except (DiagnoseRefused, ValueError) as e:
+                    msg = str(e)
+                except subprocess.CalledProcessError as e:
+                    msg = (e.stderr or str(e)).strip().splitlines()[-1]
+        elif action == "restart":
+            # Restart = recreate (RFC-0038 D4). Exactly the operation a
+            # configuration save runs, on purpose: one path for install,
+            # restore, config and restart, so none of them can drift.
+            if not inst:
+                msg = "unknown instance"
+            else:
+                try:
+                    msg = restart_instance(name, inst, own_rid=rid,
+                                           who=actor or "portal",
+                                           role=act_role or "-")
+                    ok = True
+                except DiagnoseRefused as e:
+                    msg = str(e)
+                except subprocess.CalledProcessError as e:
+                    msg = (e.stderr or str(e)).strip().splitlines()[-1]
+            if not ok:
+                # One entry per outcome: the successful restart is
+                # recorded by restart_instance itself, with its new
+                # start time; a refused one is recorded here, with the
+                # sentence that says why.
+                audit_tenant("instance.restarted",
+                             resolve_tenant((inst or {}).get("tenant"))
+                             or ensure_default_tenant(), subject=name,
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
         elif action == "rehearsal-extend":
             try:
                 new_date = rehearsal_extend(
@@ -9345,6 +10064,8 @@ def cmd_process_deploys(_args):
         via = {"install": "store", "visibility": "portal",
                "tile": "portal", "rehearse": "portal",
                "rehearsal-extend": "portal",
+               "diagnose-open": "portal", "diagnose-close": "portal",
+               "diagnose-logs": "portal", "restart": "portal",
                "config": "portal", "token": "portal",
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
@@ -9421,6 +10142,11 @@ def cmd_process_deploys(_args):
         # and a view refreshed only by the action that thought of it is
         # the kind of drift this codebase keeps finding.
         rehearsal_view_write()
+        # And the container facts the object page shows (RFC-0038 D1).
+        # An install, a removal, a config save and a restart all change
+        # them, and the timer would otherwise leave the page up to a
+        # minute behind the action the operator just took.
+        state_view_write()
 
 
 # --------------------------------------------- backup & restore (oaap.data.backup)
@@ -10328,6 +11054,33 @@ def main():
                          help="internal: measure what a rehearsal would cost, "
                               "where the portal can read it (spec 2.15)")
     pmv.set_defaults(fn=lambda _a: rehearsal_view_write())
+    plg = sub.add_parser("logs",
+                         help="show an instance's container log (RFC-0038)")
+    plg.add_argument("name")
+    plg.add_argument("--tail", type=int, default=DIAGNOSE_TAIL_DEFAULT,
+                     help=f"how many lines per service (default "
+                          f"{DIAGNOSE_TAIL_DEFAULT}, at most "
+                          f"{DIAGNOSE_TAIL_MAX})")
+    plg.add_argument("--service", default="",
+                     help="only this service of a multi-container app")
+    plg.set_defaults(fn=cmd_logs)
+    prs = sub.add_parser("restart",
+                         help="recreate an instance's containers (RFC-0038 D4)")
+    prs.add_argument("name")
+    prs.set_defaults(fn=cmd_restart)
+    pdg = sub.add_parser("diagnose",
+                         help="the portal's diagnosis window, from the "
+                              "machine (RFC-0038 D2)")
+    pdg.add_argument("action", choices=["open", "close", "status", "sweep"])
+    pdg.add_argument("name", nargs="?", default="")
+    pdg.add_argument("--minutes", type=int, default=DIAGNOSE_DEFAULT_MINUTES,
+                     choices=list(DIAGNOSE_MINUTES),
+                     help=f"how long (default {DIAGNOSE_DEFAULT_MINUTES})")
+    pdg.set_defaults(fn=cmd_diagnose)
+    pms = sub.add_parser("state-index",
+                         help="internal: write container state facts where "
+                              "the portal can read them (RFC-0038 D1)")
+    pms.set_defaults(fn=lambda _a: state_view_write())
     pmc = sub.add_parser("config-index",
                          help="internal: write non-secret config values where "
                               "the portal can read them (portal 2.4)")

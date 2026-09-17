@@ -6,6 +6,16 @@ services:
   gateway:
     image: caddy:2
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "${OAAP_HTTP_PORT}:80"
       # TLS for registered external hostnames (RFC-0005 level 3);
@@ -30,6 +40,16 @@ services:
   identity:
     build: ./services/identity
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     environment:
       SESSION_SECRET: "${SESSION_SECRET}"
       SETUP_TOKEN: "${SETUP_TOKEN}"
@@ -57,6 +77,16 @@ services:
   portal:
     build: ./services/portal
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     environment:
       OAAP_VERSION: "${OAAP_VERSION}"
       INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
@@ -83,6 +113,16 @@ services:
     image: pgvector/pgvector:pg16
     profiles: ["store"]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     environment:
       # Only used to initialise the superuser on first start. appctl
       # (host-side, 'docker exec') still does every schema/role DDL --
@@ -109,6 +149,16 @@ services:
     build: ./services/twin
     profiles: ["store"]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - store
     environment:
@@ -150,6 +200,16 @@ services:
     image: iegomez/mosquitto-go-auth:3.0.0-mosquitto_2.0.18
     profiles: ["broker"]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - identity
     environment:
@@ -174,6 +234,16 @@ services:
     build: ./services/twin
     profiles: ["broker"]
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
     command: ["python", "-u", "relay.py"]
     depends_on:
       - broker

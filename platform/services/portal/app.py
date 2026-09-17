@@ -218,6 +218,13 @@ STYLE = """
   .roles label{display:inline-block;margin-right:.8rem;font-size:.95rem;white-space:nowrap}
   .roles input,.checkline input{width:auto;margin:0 .3rem 0 0}
   .checkline{display:block;margin:.3rem 0 1rem}
+  /* Diagnose (RFC-0038 D2): Log-Zeilen. Umbruch statt Abschneiden -- eine
+     abgeschnittene Fehlermeldung ist die falsche Haelfte -- und eine feste
+     Hoehe, damit 200 Zeilen die Seite nicht unlesbar machen. */
+  .logbox{background:#0b1220;color:#e5e7eb;padding:.7rem .8rem;border-radius:.4rem;
+       font-size:.8rem;line-height:1.45;max-height:26rem;overflow:auto;
+       white-space:pre-wrap;word-break:break-word;margin:.3rem 0 1rem}
+  table.mini th,table.mini td{padding:.35rem .5rem;font-size:.9rem;vertical-align:top}
   /* Konfiguration (portal 2.4, 0.3.15): ein umrandeter Block je Wert, damit
      Name, Erklaerung und Feld sichtbar zusammengehoeren */
   .cfgfield{border:1px solid var(--oaap-border);border-radius:.5rem;
@@ -1661,10 +1668,27 @@ INSTANCE_EDIT_BODY = """
     <div><span class="k">Verbindungen</span><span class="v">
       {% if i.links %}{{ i.links|length }} zu {{ i.links|join(", ") }}
       {% else %}<span class="muted">keine — isoliert</span>{% endif %}</span></div>
+    {# RFC-0038 D1: immer sichtbar, ohne Freischaltung — es sind
+       Tatsachen ueber einen Container, nichts, was die App schrieb. #}
+    {% if i.diag %}<div><span class="k">Zustand</span><span class="v">
+      {% if not i.diag.state_known %}<span class="muted">unbekannt</span>
+      {% else %}{% for s in i.diag.state %}{{ "" if loop.first else " · " }}{{
+        s.label }}{% if s.service %} ({{ s.service }}){% endif %}{% endfor %}
+      {% endif %}</span></div>{% endif %}
   </div>
 </div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if i.diag and i.diag.warning %}
+{# Ueber den Reitern, wie die offene Bestaetigung darunter: ein
+   Container, der immer wieder neu startet, darf nicht in einem Reiter
+   verborgen sein, den niemand oeffnet (RFC-0038 D1). #}
+<div class="card warn">
+  <h2>Der Zustand dieser Instanz</h2>
+  <p>{{ i.diag.warning }}</p>
+  <p><a class="btn" href="/instances/{{ i.key }}?tab=diagnose">Zur Diagnose</a></p>
+</div>
+{% endif %}
 {% if i.pending %}
 {# Über den Reitern, nicht in einem: eine anstehende Entscheidung darf
    die Gruppierung nicht verstecken (design guidelines 6.2.2). #}
@@ -2349,6 +2373,159 @@ INSTANCE_EDIT_BODY = """
 {% endif %}
 </section>
 
+<section class="panel {{ 'active' if tab == 'diagnose' }}">
+{% if i.diag %}
+<div class="card">
+  <h2>Zustand</h2>
+  {% if not i.diag.state_known %}
+  <p class="muted">Der Knoten hat dem Portal noch nicht mitgeteilt, wie es
+     den Containern dieser Instanz geht. Das sagt <em>nichts</em> darüber,
+     ob die App läuft — nur, dass diese Seite es nicht weiß. Die Angabe
+     wird jede Minute erneuert.</p>
+  {% else %}
+  <table class="mini">
+    <tr><th>Dienst</th><th>Zustand</th><th>Seit</th><th>Neustarts</th></tr>
+    {% for s in i.diag.state %}
+    <tr>
+      <td><code>{{ s.service or "(einziger)" }}</code></td>
+      <td>{{ s.label }}{% if s.state == 'exited' %} (Exit-Code {{ s.exit_code }}){% endif %}
+          {% if s.oom %} <span class="badge todo">Speichermangel</span>{% endif %}
+          {% if s.health %}<br><span class="muted">{{ s.health }}</span>{% endif %}</td>
+      <td>{{ s.since or "—" }}</td>
+      <td>{{ s.restarts }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Das sind Tatsachen über den Container, nicht Inhalte der
+     App — deshalb brauchen sie keine Freischaltung. Stand:
+     {{ i.diag.state_written or "unbekannt" }} UTC.</p>
+  {% endif %}
+</div>
+
+<form method="post" action="/instances/{{ i.key }}/restart">
+  <input type="hidden" name="tab" value="diagnose">
+  <div class="card">
+    <h2>App neu starten</h2>
+    <p>Die App ist dabei <strong>einige Sekunden nicht erreichbar</strong>.
+       <strong>Daten, Adresse, Version und Konfiguration bleiben</strong> —
+       es ist genau der Vorgang, den das Speichern der Konfiguration
+       ohnehin ausführt: Die Container werden neu erzeugt.</p>
+    <p class="muted">Das holt auch einen Container zurück, der „läuft“,
+       aber seine Netzverbindung oder seinen Port verloren hat. Was die
+       App außerhalb ihrer erklärten Ablage in den Container geschrieben
+       hat, ist danach weg — das gilt bei jedem Deployment genauso.</p>
+    {% if i.diag and i.diag.deploy_running %}
+    <p class="err">Für diese Instanz läuft gerade ein Deployment. Ein
+       Neustart würde damit kollidieren und wird abgelehnt, statt sich
+       einzureihen.</p>
+    {% endif %}
+    <button class="secondary" {{ 'disabled' if i.diag and i.diag.deploy_running }}>Jetzt neu starten</button>
+  </div>
+</form>
+
+{% if i.diag.window %}
+<div class="card">
+  <h2>Diagnose-Fenster offen</h2>
+  <p>Geöffnet von <strong>{{ i.diag.window.by }}</strong> für
+     {{ i.diag.window.minutes }} Minuten, noch
+     <strong>{{ i.diag.window.left }}</strong> (bis
+     {{ i.diag.window.until[11:19] }} UTC). Verlängern gibt es nicht —
+     erneutes Öffnen ist ein neuer Vorgang und steht wieder im
+     Mandantenprotokoll.</p>
+  <p class="muted">{{ i.diag.log_warning }}</p>
+  <form method="post" action="/instances/{{ i.key }}/diagnose" style="display:inline">
+    <input type="hidden" name="tab" value="diagnose">
+    <input type="hidden" name="op" value="refresh">
+    <button>Aktualisieren</button>
+  </form>
+  <form method="post" action="/instances/{{ i.key }}/diagnose" style="display:inline">
+    <input type="hidden" name="tab" value="diagnose">
+    <input type="hidden" name="op" value="close">
+    <button class="secondary">Fenster schließen</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Was das Gateway sieht</h2>
+  {% if i.diag.cors_note %}<p class="err">{{ i.diag.cors_note }}</p>{% endif %}
+  {% if not i.diag.gateway %}
+  <p class="muted">Noch keine Anfrage aufgezeichnet.
+     {{ i.diag.collect_note }}</p>
+  {% else %}
+  <table class="mini">
+    <tr><th>Zeit</th><th>Anfrage</th><th>Status</th><th>Wer hat geantwortet</th>
+        <th>Herkunft / CORS</th></tr>
+    {% for r in i.diag.gateway|reverse %}
+    <tr>
+      <td>{{ r.when }}</td>
+      <td><code>{{ r.method }} {{ r.path }}</code><br>
+          <span class="muted">{{ "mit Nachweis" if r.credentials else "ohne Nachweis" }},
+          {{ r.ms }} ms</span></td>
+      <td>{{ r.status }}</td>
+      <td>{{ r.verdict }}</td>
+      <td>
+        {% if r.origin %}<code>{{ r.origin }}</code>{% else %}<span class="muted">gleiche Herkunft</span>{% endif %}
+        {% for n, v in r.resp_headers %}<br><span class="muted">{{ n }}: {{ v }}</span>{% endfor %}
+        {% if r.origin and not r.acao %}<br><span class="err">keine
+           Access-Control-Allow-Origin in der Antwort</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <p class="muted">Aufgezeichnet werden Zeit, Methode, Pfad <strong>ohne
+     Query</strong>, Status, Dauer und die CORS-Kopfzeilen hin und zurück.
+     <strong>Nie</strong> aufgezeichnet werden Query-Parameter, der Wert
+     von <code>Authorization</code>, Cookies, die Identitäts-Kopfzeilen
+     oder Inhalte — nur, <em>ob</em> ein Nachweis dabei war. Beim
+     Schließen wird die Aufzeichnung gelöscht.</p>
+</div>
+
+<div class="card">
+  <h2>Was die App schreibt</h2>
+  {% if not i.diag.log %}
+  <p class="muted">Noch nichts aufgenommen — „Aktualisieren" holt die
+     letzten Zeilen.</p>
+  {% else %}
+  <p class="muted">Aufgenommen {{ i.diag.log.written[11:19] }} UTC, die
+     letzten {{ i.diag.log.tail }} Zeilen je Dienst, älteste oben.</p>
+  {% for s in i.diag.log.services %}
+  <h3>{{ s.service or "(einziger Dienst)" }}</h3>
+  {% if s.lines %}
+  <pre class="logbox">{% for l in s.lines %}{{ l }}
+{% endfor %}</pre>
+  {% else %}
+  <p class="muted">Dieser Dienst hat nichts geschrieben.</p>
+  {% endif %}
+  {% endfor %}
+  {% endif %}
+</div>
+{% else %}
+<form method="post" action="/instances/{{ i.key }}/diagnose">
+  <input type="hidden" name="tab" value="diagnose">
+  <div class="card">
+    <h2>Diagnose-Fenster öffnen</h2>
+    <p>Solange das Fenster offen ist, zeigt diese Seite zwei Dinge, die es
+       sonst nicht gibt: die <strong>letzten Log-Zeilen</strong> jedes
+       Containers dieser App und die <strong>Sicht des Gateways</strong> auf
+       die Anfragen an sie — Methode, Pfad, Status und die
+       CORS-Kopfzeilen.</p>
+    <p class="muted">{{ i.diag.log_warning }} Das Öffnen, das Schließen und
+       das Ablaufen stehen im Mandantenprotokoll — die Inhalte nie.
+       {{ i.diag.collect_note }}</p>
+    <label>Wie lange
+      <select name="minutes">
+        {% for m in i.diag.durations %}
+        <option value="{{ m }}" {{ 'selected' if m == i.diag.default_minutes }}>{{ m }} Minuten</option>
+        {% endfor %}
+      </select></label>
+    <button>Fenster öffnen</button>
+  </div>
+</form>
+{% endif %}
+{% endif %}
+</section>
+
 <section class="panel {{ 'active' if tab == 'verwaltung' }}">
 <form method="post" action="/instances/{{ i.key }}/rename">
   <input type="hidden" name="tab" value="verwaltung">
@@ -2766,6 +2943,7 @@ def edge_tls_ask():
 # it carries a CLASS_LABEL of its own, about instances rather than store
 # entries.
 import instance_view as iv  # noqa: E402
+import diagnose_view as dv  # noqa: E402
 
 
 def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
@@ -5514,6 +5692,11 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # only decides whether a button is offered that would be
          # refused.
          "can_export": "server_admin" in caller_roles(),
+         # Instanz-Diagnose (RFC-0038): Zustand, Fenster, Gateway-Sicht
+         # und App-Log in einem Stueck, unter einem eigenen Schluessel --
+         # so kann keiner der vier Namen mit einem Feld der Instanz
+         # kollidieren.
+         "diag": _diagnose_page(name, inst),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
@@ -6295,6 +6478,193 @@ def instance_rehearsal_extend(name):
     return _queue_and_redirect(name, {"action": "rehearsal-extend",
                                       "days": days},
                                CONFIG_WAIT_SECONDS)
+
+
+# --------------------------------------------- Instanz-Diagnose (RFC-0038)
+#
+# Drei Ansichten, in steigender Empfindlichkeit, und die Reihenfolge ist
+# die Gestaltung: Zustand immer (D1), das App-Log nur bei ausdrücklich
+# geöffnetem Fenster (D2), die Gateway-Sicht nur solange dieses Fenster
+# offen ist (D3). Dazu der Neustart (D4) im Reiter Verwaltung.
+#
+# Die Regeln stehen in `diagnose_view.py`, ohne Flask — wie store_view
+# und instance_view. Hier stehen nur die PFADE dieses Knotens und die
+# Routen.
+#
+# Warum das Portal den Zustand nicht selbst ermittelt: Es hat keinen
+# Zugang zur Container-Laufzeit und soll keinen bekommen. Also schreibt
+# der Host die Tatsachen daneben (appctl.STATE_VIEW) — dasselbe Muster
+# wie apps/artifacts.json und apps/config-values.json.
+STATE_VIEW = "/apps-registry/instance-state.json"
+DIAGNOSE_DIR = "/apps-registry/diagnose"
+# Was das Gateway aufgezeichnet hat, liegt in demselben Mount, den die
+# Gesundheitsseite für das externe Zugriffsprotokoll schon liest.
+GATEWAY_LOG_DIR = "/gateway-logs"
+# Wieviel der Datei gelesen wird. Ein offenes Fenster kann 2 MiB
+# erzeugen; die Seite zeigt die letzten Anfragen, nicht alle.
+GATEWAY_LOG_TAIL_BYTES = 512 * 1024
+
+DIAGNOSE_WAIT_SECONDS = 60      # schreibt Caddy-Sites und lädt das Gateway neu
+RESTART_WAIT_SECONDS = 120      # erzeugt die Container neu
+
+
+def _state_view(name):
+    """Die Zustandsansicht des Hosts für eine Instanz, oder None.
+
+    None ist nicht „läuft nicht". Ohne Ansicht sagt die Karte
+    „unbekannt" — dieselbe Regel wie bei der Konfigurationskarte seit
+    0.1.100, und aus demselben Grund: Eine Seite darf keine Störung
+    behaupten, nur weil sie nichts gelesen hat.
+    """
+    try:
+        with open(STATE_VIEW, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError, AttributeError):
+        return None, ""
+    mine = (doc.get("instances") or {}).get(name)
+    return (mine if isinstance(mine, dict) else None), doc.get("written", "")
+
+
+def _diagnose_snapshot(name):
+    try:
+        with open(os.path.join(DIAGNOSE_DIR, f"{name}.json"),
+                  encoding="utf-8") as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _gateway_log(name):
+    """Die letzten Zeilen des Instanz-Protokolls des Gateways.
+
+    Nur der Schwanz der Datei, und die erste (möglicherweise
+    angeschnittene) Zeile fliegt weg — `gateway_rows` würde sie
+    ohnehin verwerfen, aber so steht der Grund hier.
+    """
+    path = os.path.join(GATEWAY_LOG_DIR, f"diagnose-{name}.log")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - GATEWAY_LOG_TAIL_BYTES))
+            raw = f.read()
+    except OSError:
+        return ""
+    text = raw.decode("utf-8", "replace")
+    return text.split("\n", 1)[1] if size > GATEWAY_LOG_TAIL_BYTES else text
+
+
+def _diagnose_page(name, inst):
+    """Alles, was der Reiter Diagnose braucht — in einem Stück."""
+    view, written = _state_view(name)
+    rows = dv.state_rows(inst, view)
+    win = dv.window(inst)
+    gw = dv.gateway_rows(_gateway_log(name)) if win else []
+    return {
+        "state": rows,
+        "state_known": view is not None,
+        "state_written": written[:19].replace("T", " "),
+        "warning": dv.state_warning(rows),
+        "window": win,
+        "durations": dv.DURATIONS,
+        "default_minutes": dv.DEFAULT_MINUTES,
+        "log_warning": dv.LOG_WARNING,
+        "collect_note": dv.COLLECT_NOTE,
+        "log": dv.log_sections(_diagnose_snapshot(name)) if win else None,
+        "gateway": gw,
+        "cors_note": dv.cors_note(gw) if gw else "",
+        # Ein Neustart, der hinter einem Deployment in der Schlange
+        # steht, würde Container neu erzeugen, die das Deployment gerade
+        # ersetzt. Die Seite sagt das, statt ihn einzureihen (D4).
+        "deploy_running": bool(_deploy_now(name)),
+    }
+
+
+@app.post("/instances/<name>/diagnose")
+def instance_diagnose(name):
+    """Ein Diagnose-Fenster öffnen oder schließen (RFC-0038 D2).
+
+    `require_instance_admin` ist genau D2: der `server_admin` des
+    Knotens oder der `tenant_admin` DIESER Instanz — es ist seine App
+    und sein Log. Der Host prüft beides erneut und dazu die Dauer: Der
+    Spool ist Daten, kein Vertrauen.
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    op = (request.form.get("op") or "").strip()
+    if op == "close":
+        res = _queue_and_wait(name, {"action": "diagnose-close"},
+                              DIAGNOSE_WAIT_SECONDS)
+        if res is None:
+            return _inst_back(name, err="Das Schließen läuft noch — bitte "
+                                        "gleich erneut prüfen.")
+        if not res.get("ok"):
+            return _inst_back(name, err=res.get("message",
+                                                "Schließen fehlgeschlagen."))
+        return _inst_back(name, msg="Diagnose-Fenster geschlossen — das "
+                                    "Aufgezeichnete ist gelöscht.")
+    if op == "refresh":
+        # Nur eine neue Aufnahme des App-Logs. Die Gateway-Sicht liest
+        # die Seite bei jedem Aufruf frisch aus der Datei, die braucht
+        # dafür nichts.
+        res = _queue_and_wait(name, {"action": "diagnose-logs"},
+                              DIAGNOSE_WAIT_SECONDS)
+        if res is None or not res.get("ok"):
+            return _inst_back(name, err=(res or {}).get(
+                "message", "Das Log konnte nicht gelesen werden."))
+        return _inst_back(name, msg="Log neu aufgenommen.")
+    try:
+        minutes = int(request.form.get("minutes") or dv.DEFAULT_MINUTES)
+    except ValueError:
+        minutes = dv.DEFAULT_MINUTES
+    if minutes not in dv.DURATIONS:
+        return _inst_back(name, err="Diese Dauer gibt es nicht — 15, 30 oder "
+                                    "60 Minuten.")
+    res = _queue_and_wait(name, {"action": "diagnose-open",
+                                 "minutes": minutes}, DIAGNOSE_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Das Öffnen läuft noch — bitte gleich "
+                                    "erneut prüfen.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message", "Öffnen "
+                                            "fehlgeschlagen."))
+    return _inst_back(name, msg=f"Diagnose-Fenster für {minutes} Minuten "
+                                f"geöffnet. {dv.COLLECT_NOTE}")
+
+
+@app.post("/instances/<name>/restart")
+def instance_restart(name):
+    """Die Container dieser Instanz neu erzeugen (RFC-0038 D4).
+
+    Technisch genau, was das Speichern der Konfiguration schon tut —
+    ein einziger Weg für Installation, Wiederherstellung, Konfiguration
+    und Neustart. Ein zweiter, leichterer wäre der, der auseinanderläuft.
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    if _deploy_now(name):
+        return _inst_back(name, err="Für diese Instanz läuft gerade ein "
+                                    "Deployment. Ein Neustart würde damit "
+                                    "kollidieren — warte, bis es fertig ist.")
+    res = _queue_and_wait(name, {"action": "restart"}, RESTART_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Der Neustart läuft noch — der Zustand "
+                                    "im Reiter Diagnose sagt, ob er "
+                                    "durchgekommen ist.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message",
+                                            "Neustart fehlgeschlagen."))
+    return _inst_back(name, msg="Die App wurde neu gestartet — "
+                                + (res.get("message") or ""))
 
 
 def _queue_and_redirect(name, payload, wait_seconds):

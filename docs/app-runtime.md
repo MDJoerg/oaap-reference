@@ -10,6 +10,10 @@ sudo oaap app install <package-dir> [--name NAME] [--channel production|test]
 sudo oaap app list
 sudo oaap app remove <name> [--purge]
 sudo oaap app config list|set|unset <name> [key] [value]
+sudo oaap app logs <name> [--tail N] [--service S]
+sudo oaap app restart <name>
+sudo oaap app diagnose open|close|status <name> [--minutes 15|30|60]
+sudo oaap app diagnose sweep
 ```
 
 A package is a directory with `oaap-app.yaml` (validated against
@@ -51,6 +55,41 @@ object page (`server_admin` only), queued through the host-side worker.
 Instances installed before 0.1.11 have no recorded config declaration;
 their keys are read back from `instance.env` and all treated as secret
 until the next redeploy records the manifest's real labels and flags.
+
+## Diagnosis: state, logs, restart (RFC-0038)
+
+`oaap app logs` and `oaap app restart` need no window: whoever is at the
+machine already has the container runtime. `restart` **recreates** the
+containers — the same operation a configuration save performs, so
+install, restore, config and restart cannot drift apart — and is refused
+while a deployment of that instance is queued or running.
+
+```sh
+sudo oaap app logs studio --tail 50
+sudo oaap app restart studio          # recreates, audited as actor `cli`
+```
+
+`oaap app diagnose` is the machine-side view of what the **portal**
+offers: a window of 15/30/60 minutes during which the gateway writes an
+access log for that one instance and the portal may show the app's log.
+Opening and closing rewrite that instance's gateway sites and reload the
+gateway; closing deletes everything collected.
+
+```sh
+sudo oaap app diagnose open studio --minutes 15
+sudo oaap app diagnose status studio
+sudo oaap app diagnose close studio
+```
+
+Two jobs run every minute from `oaap-instance-watch.timer`:
+`appctl.py state-index` writes the container facts the portal shows
+(it has no access to the container runtime, deliberately), and
+`appctl.py diagnose sweep` closes windows whose time is up. The second
+is not housekeeping: the time limit is the promise the window makes.
+
+Container logs are bounded at 3 × 10 MB per container, set where
+containers are created. An existing container receives the limit at its
+next recreate — no forced restart of every app on update.
 
 ## Instance public address (RFC-0009)
 

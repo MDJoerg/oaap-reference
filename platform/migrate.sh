@@ -216,6 +216,12 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" artifact-index   2>&
 # -- until it exists, the card offers no save at all.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" config-index   2>&1 | sed 's/^/  /' || say "  WARNING: the configuration view could not be written."
 
+# --- the portal's view of container state (RFC-0038 D1) ---
+# Written once here for the same reason as the two views above: a node
+# that changes nothing after the update would otherwise show "Zustand
+# unbekannt" until the watch timer's first run.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" state-index   2>&1 | sed 's/^/  /' || say "  WARNING: the container state view could not be written."
+
 # --- the schedule as systemd actually holds it (RFC-0029 D1) ---
 # Since 0.1.78 backup-schedule.json is a VIEW derived from the timer,
 # not a note the installer left behind. Written once here so a node that
@@ -272,6 +278,47 @@ EOF
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 \
     || say "  WARNING: the rehearsal sweep timer could not be enabled."
+fi
+
+# --- the instance watch timer (RFC-0038 D1/D2) ---
+# Two one-shot jobs a minute: the container facts the instance page
+# shows, and the expiry of diagnosis windows. A node that was UPDATED
+# rather than freshly installed has neither, and without the second one
+# a window would expire on the page while the gateway kept collecting --
+# the one failure this feature must not have, because the time limit IS
+# the promise. Idempotent: the units are rewritten from the same text,
+# and enabling an enabled timer changes nothing.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+  if [ ! -f /etc/systemd/system/oaap-instance-watch.timer ]; then
+    say ""
+    say "Installing the instance watch (container state, diagnosis windows) ..."
+  fi
+  cat > /etc/systemd/system/oaap-instance-watch.service <<EOF
+[Unit]
+Description=OAAP instance watch (container state for the portal, expiry of diagnosis windows)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py state-index
+ExecStart=$PYTHON3 $APP_DIR/appctl.py diagnose sweep
+EOF
+  cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
+[Unit]
+Description=OAAP instance watch, every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=15s
+# Nothing to catch up on: both jobs answer "what is true NOW".
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1     || say "  WARNING: the instance watch timer could not be enabled."
 fi
 
 # --- managed Postgres for a profiled node (RFC-0031 Schritt 1, oaap.data.store 0.1) ---

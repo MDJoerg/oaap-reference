@@ -18,7 +18,8 @@ import tempfile
 import time
 from datetime import timedelta
 
-from flask import Flask, redirect, render_template_string, request, session
+from flask import (Flask, make_response, redirect, render_template_string,
+                   request, session)
 from flask.sessions import SecureCookieSessionInterface
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -781,6 +782,127 @@ def profile_change():
     print(f"profile changed: {u['username']} (display_name)", flush=True)
     return render_template_string(PROFILE_PAGE, error=None, done=True,
                                   display_name=name)
+
+
+# ---------------------------------------------------------------------------
+# CORS ON A REFUSAL (RFC-0038 §"Open for later" follow-up, Jörgs Befund
+# 2026-09-15/17)
+#
+# WHY THIS EXISTS. A page on another origin calls an app on this node.
+# The gateway refuses it -- no session (303 -> /auth/login), no or a
+# wrong API key (401/403), too many requests (429) -- and the refusal
+# carries no CORS header, because nothing ever put one there. So the
+# browser does not report "not authenticated". It reports a CORS error,
+# and the status it actually received is invisible both to the script
+# and to the person debugging it. That is the wrong question, and it
+# cost Jörg the 15.09.: the true answer ("this one call carries no
+# key") sat in the gateway's access log the whole time.
+#
+# ONE PLACE, because there is only one. Every refusal the gateway can
+# produce on an app route comes from this service: /verify answers
+# session, key, role, group and tenant, /throttle answers the brake
+# (appctl.site_body and _throttle_block are the only two forward_auth
+# calls a generated site makes). A rule written here therefore cannot
+# be forgotten at the ninth call site -- the failure mode this codebase
+# keeps finding.
+#
+# WHAT IS DELIBERATELY NOT DONE: no `Access-Control-Allow-Credentials`.
+# A cookie-bearing cross-origin call still cannot read this answer, so
+# no foreign page can use a refusal to probe whether its visitor has a
+# session on this node. The case this serves is the one that is MEANT
+# to work -- an API key in `Authorization` (RFC-0027), which is not a
+# credential in the CORS sense -- and there it replaces a lie with the
+# truth. A caller that insists on cookies across origins keeps the CORS
+# error, and that is the honest answer: cookies are not the way in from
+# another origin.
+CORS_REFUSAL_PATHS = ("/verify", "/throttle")
+
+# Only what a browser needs to READ a refusal, and nothing that would
+# let it act on one. `Vary` is added, never assigned: the answer depends
+# on the caller's Origin, so a cache must not hand one caller's copy to
+# the next.
+CORS_REFUSAL_HINT = ("not authenticated: a call from another origin cannot "
+                     "use the browser login of this platform. Present an "
+                     "OAAP API key as 'Authorization: Bearer <key>' "
+                     "(RFC-0027), issued in the portal under „Zugänge“.")
+
+
+def _forwarded(header, default=""):
+    """The first value of a hop-by-hop list header, or `default`."""
+    return request.headers.get(header, "").split(",")[0].strip() or default
+
+
+def site_origin():
+    """The origin of the site the gateway is protecting, as the browser
+    sees it -- never this container's own host.
+
+    forward_auth calls arrive at identity:8000, so `request.host` is
+    useless here; the gateway's X-Forwarded-* headers carry the name the
+    caller typed. Absent (a direct call to /verify on the container
+    network) yields "", and then every Origin counts as foreign -- the
+    harmless direction: the only thing that follows is a header on a
+    refusal.
+    """
+    host = _forwarded("X-Forwarded-Host")
+    return f'{_forwarded("X-Forwarded-Proto", "https")}://{host}' if host else ""
+
+
+def foreign_origin():
+    """The Origin of a cross-origin browser call, or "".
+
+    "" for a same-origin call (whose refusal needs no CORS header, and
+    whose redirect to the login form is exactly right) and for the
+    literal `null` an opaque document sends, which no reflected origin
+    can help.
+    """
+    origin = request.headers.get("Origin", "").strip()
+    if not origin or origin.lower() == "null":
+        return ""
+    return "" if origin.lower() == site_origin().lower() else origin
+
+
+def is_navigation():
+    """Is the browser NAVIGATING here, rather than a script calling?
+
+    Fetch metadata, which every current browser sends and no script can
+    forge (the Sec- prefix makes it browser-owned). The distinction
+    decides whether a refusal may stay a redirect: for a navigation --
+    a cross-origin form post, a link -- the login form IS the answer,
+    and turning it into a 401 would break a sign-in that works today.
+    For a fetch() it is useless: the browser follows the 303, the login
+    page answers 200 without CORS headers, and the script reports a CORS
+    error on a URL it never called.
+
+    A browser too old to send these headers and posting a form across
+    origins is judged a script call and gets a 401. Accepted knowingly:
+    it is a narrow case, the message says what to do, and the other
+    direction would keep the misleading answer for everybody.
+    """
+    return (request.headers.get("Sec-Fetch-Mode", "").lower() == "navigate"
+            or request.headers.get("Sec-Fetch-Dest", "").lower() == "document")
+
+
+@app.after_request
+def cors_on_refusal(resp):
+    """Let a cross-origin caller READ why the gateway refused it."""
+    if request.path not in CORS_REFUSAL_PATHS or resp.status_code < 300:
+        return resp
+    origin = foreign_origin()
+    if not origin:
+        return resp
+    if resp.status_code in (301, 302, 303, 307, 308) and not is_navigation():
+        # A machine gets an answer, never a redirect to a login form --
+        # the same rule _key_refusal() already holds for a bad key, now
+        # applied where the caller presented NO credential at all.
+        resp = make_response(CORS_REFUSAL_HINT, 401)
+        resp.headers["WWW-Authenticate"] = (
+            'Bearer error="invalid_token", error_description="no session and '
+            'no API key"')
+    resp.headers["Access-Control-Allow-Origin"] = origin
+    resp.vary.add("Origin")
+    resp.headers["Access-Control-Expose-Headers"] = "WWW-Authenticate"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/verify")

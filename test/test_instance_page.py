@@ -27,6 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "platform", "services", "portal"))
+import diagnose_view as dv                                   # noqa: E402
 import instance_view as iv                                   # noqa: E402
 
 try:
@@ -122,6 +123,23 @@ def render(tab, inst=None, **over):
         "endpoints": [], "node_exposed": False, "promote": None,
         "throttle_mode": "default", "throttle_rate": "",
         "throttle_default": "300 Anfragen pro 60 Sekunden",
+        # Instanz-Diagnose (RFC-0038). Kein Platzhalter: der Reiter
+        # gehoert zu den Abschnitten, die diese Datei prueft, und der
+        # Zustand steht im Objektkopf.
+        "diag": {
+            "state": dv.state_rows(
+                inst, {"services": [{"container": inst.get("container", "c"),
+                                     "state": "running",
+                                     "started": "2026-08-16T07:00:00Z",
+                                     "restarts": 0, "exit_code": 0,
+                                     "oom": False, "health": ""}]}),
+            "state_known": True, "state_written": "2026-08-16 09:20",
+            "warning": "", "window": None, "durations": dv.DURATIONS,
+            "default_minutes": dv.DEFAULT_MINUTES,
+            "log_warning": dv.LOG_WARNING, "collect_note": dv.COLLECT_NOTE,
+            "log": None, "gateway": [], "cors_note": "",
+            "deploy_running": False,
+        },
     }
     purge_wanted = over.pop("purge_wanted", False)
     rename_wanted = over.pop("rename_wanted", "")

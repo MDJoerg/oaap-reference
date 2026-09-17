@@ -113,6 +113,14 @@ uninstall() {
 
   systemctl disable --now oaap-deployd.path >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/oaap-deployd.service /etc/systemd/system/oaap-deployd.path
+  # The timers, too. A timer left behind calls an appctl.py that is
+  # about to be deleted, so it fails on every tick from here on --
+  # every minute in the case of the instance watch. Removing the
+  # platform has to remove what keeps calling it.
+  for unit in oaap-rehearsal-sweep oaap-instance-watch; do
+    systemctl disable --now "$unit.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$unit.service" "/etc/systemd/system/$unit.timer"
+  done
   systemctl daemon-reload >/dev/null 2>&1 || true
 
   rm -rf "$APP_DIR"
@@ -147,5 +155,5 @@ case "$cmd" in
   tenant)      exec python3 "$APP_DIR/appctl.py" tenant "$@" ;;
   uninstall)   uninstall "$@" ;;
   update)      exec bash "$APP_DIR/update.sh" "$@" ;;
-  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|rename|remove|purge|visibility|tile|config|address|throttle|rehearse|rehearsal ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source|enable|disable|trust|rename|reconcile ...|data store status|schemas|create|copy|drop|restore ...|data model types|show|register|alias|bindings ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|machine add|list ...|key issue|list|revoke ...|fleet key issue|list|revoke <label>|tenant list|show|check|log|create|rename|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
+  *) echo "Usage: oaap [status|version|setup-token|update [--check]|app install|list|rename|remove|purge|visibility|tile|config|address|throttle|logs|restart|diagnose|rehearse|rehearsal ...|node show|add-profile|remove-profile ...|store list|add-source|remove-source|enable|disable|trust|rename|reconcile ...|data store status|schemas|create|copy|drop|restore ...|data model types|show|register|alias|bindings ...|external show|set|remove ...|edge add|list|remove ...|backup create [--to PATH]|user list|password <username> [password]|machine add|list ...|key issue|list|revoke ...|fleet key issue|list|revoke <label>|tenant list|show|check|log|create|rename|uninstall [--purge] [--yes]]" >&2; exit 2 ;;
 esac

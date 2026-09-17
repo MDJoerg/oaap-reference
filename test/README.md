@@ -23,6 +23,8 @@ python3 test/test_tile.py
 python3 test/test_instance_page.py   # braucht jinja2
 python3 test/test_config_layout.py   # braucht jinja2
 python3 test/test_config_view.py     # braucht PyYAML und jinja2
+python3 test/test_diagnose.py        # braucht PyYAML und jinja2
+python3 test/test_cors_refusal.py    # braucht flask
 python3 test/test_artifact_deploy.py
 python3 test/test_deploy_state.py
 python3 test/test_tenant.py
