@@ -356,6 +356,31 @@ ok("gated the same way the rest of this block already is -- only when "
    "pg_isready -U postgres" in migrate_src.split("data store migrate-twin")[0]
    .rsplit('if [ -f "$OAAP_DATA_DIR/apps/node.json" ]', 1)[-1])
 
+print("\n=== 0.1.104: migrate-twin is quiet when nothing is due -- it said "
+      "'Migrated 1 twin schema(s)' on EVERY update, true of nothing ===")
+ensure_body = appctl_src.split("def _twin_ensure_schema(tenant_id):", 1)[1] \
+    .split("\ndef ", 1)[0]
+ok("a schema is stamped with the build's revision -- and the stamp is "
+   "the LAST statement, so a run that fails halfway is retried",
+   "COMMENT ON SCHEMA" in ensure_body
+   and ensure_body.index("COMMENT ON SCHEMA")
+   > ensure_body.index("_twin_ensure_tables(schema)"))
+rev_body = appctl_src.split("def _twin_schema_rev():", 1)[1].split("\ndef ", 1)[0]
+ok("the revision is derived from the SOURCE of both shaping functions, "
+   "not a hand-kept number somebody forgets to bump",
+   "inspect.getsource(_twin_ensure_schema)" in rev_body
+   and "inspect.getsource(_twin_ensure_tables)" in rev_body)
+ok("migrate-twin skips a schema already carrying this revision",
+   "_twin_schema_stamp(r[\"schema\"]) == rev" in migrate_twin_body
+   and "continue" in migrate_twin_body)
+ok("migrate.sh calls it --quiet, and prints no header of its own",
+   "migrate-twin --quiet" in migrate_src
+   and 'say "Migrating existing twin schemas' not in migrate_src)
+ok("--quiet still reports a migration that did happen",
+   "if healed:" in migrate_twin_body
+   and migrate_twin_body.index("if healed:")
+   < migrate_twin_body.index("elif args.quiet:"))
+
 print(f"\n{ok_n} bestanden, {fail_n} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail_n else "FEHLGESCHLAGEN")
 sys.exit(1 if fail_n else 0)

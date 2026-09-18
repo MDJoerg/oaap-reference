@@ -250,6 +250,14 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-route
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-stream-close \
   2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
 
+# --- access-log lines from before the filter (0.1.104) ---
+# The filter above covers every line written from now on. The lines
+# written before keep full URIs -- query strings with share keys in
+# them. Run through the same rules once per node (marker file in the
+# log directory); nothing is deleted, time/host/address/status stay.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" scrub-access-log \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the old access-log lines could not be filtered."
+
 # --- the rehearsal sweep timer (RFC-0030 D4) ---
 # A rehearsal holds a COPY OF LIVE CUSTOMER DATA and disappears on a
 # date. On a node updated rather than freshly installed there is no
@@ -387,11 +395,14 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
   # tenant otherwise has no way to reach that function again short of
   # an app redeploy that bumps its version. Found missing on oaap-test
   # while live-verifying Schritt 5, 2026-09-10; harmless to run on a
-  # node with no twin schema yet (prints "No twin schemas to migrate.").
+  # node with no twin schema yet, and silent when every schema already
+  # carries this build's revision stamp.
   if docker exec oaap-store-1 pg_isready -U postgres >/dev/null 2>&1; then
-    say "Migrating existing twin schemas (oaap.data.twin) ..."
+    # --quiet (0.1.104): the header and the count only when a schema
+    # was actually behind this build -- it used to report "Migrated 1"
+    # on every single update.
     OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" \
-      data store migrate-twin 2>&1 | sed 's/^/  /' \
+      data store migrate-twin --quiet 2>&1 | sed 's/^/  /' \
       || say "  WARNING: twin schemas could not be migrated."
   fi
 fi

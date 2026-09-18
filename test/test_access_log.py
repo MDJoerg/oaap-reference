@@ -115,6 +115,79 @@ ok("genau ein Neuladen", len(reloads) == 1, reloads)
 m.cmd_migrate_stream_close(None)
 ok("zweiter Lauf tut nichts", len(reloads) == 1, reloads)
 
+print("\n=== alte Zeilen von vor 0.1.103 (0.1.104, einmal je Knoten) ===")
+import gzip  # noqa: E402
+
+os.makedirs(m.GATEWAY_LOG_DIR, exist_ok=True)
+
+
+def line(uri, auth=None, cookie=None, loc=None, extra=None):
+    e = {"level": "info", "ts": 1789700000.5, "logger": "http.log.access",
+         "request": {"remote_ip": "91.1.40.210", "host": "bdt-hub.joomp.de",
+                     "method": "GET", "uri": uri, "headers": {}},
+         "status": 200, "resp_headers": {}}
+    if auth:
+        e["request"]["headers"]["Authorization"] = [auth]
+    if cookie:
+        e["request"]["headers"]["Cookie"] = [cookie]
+    if loc:
+        e["resp_headers"]["Location"] = [loc]
+    if extra:
+        e["request"]["headers"].update(extra)
+    return json.dumps(e)
+
+
+old = "\n".join([
+    line("/xr?key=GEHEIM-QUERY-1"),
+    line("/api/x", auth="Bearer GEHEIM-BEARER-2", cookie="s=GEHEIM-COOKIE-3"),
+    line("/ok"),                                     # nothing to change
+    line("/login", loc="/auth/login?next=/x&t=GEHEIM-LOC-4",
+         extra={"X-Oaap-User": ["gefaelscht"]}),
+    "kein json, bleibt stehen",
+]) + "\n" + '{"unfertig": "zeile'                     # Caddy mid-write
+active = os.path.join(m.GATEWAY_LOG_DIR, "external-access.log")
+rotated = os.path.join(m.GATEWAY_LOG_DIR,
+                       "external-access-2026-09-05T17-30-07.744-size.log.gz")
+with open(active, "w", encoding="utf-8") as f:
+    f.write(old)
+with gzip.open(rotated, "wb") as z:
+    z.write(line("/alt?key=GEHEIM-GZ-5").encode() + b"\n")
+unrelated = os.path.join(m.GATEWAY_LOG_DIR, "diagnose-x.log")
+with open(unrelated, "w", encoding="utf-8") as f:
+    f.write(line("/d?q=bleibt-unberuehrt") + "\n")
+
+m.cmd_scrub_access_log(None)
+now = open(active, encoding="utf-8").read()
+gz = gzip.open(rotated, "rb").read().decode()
+ok("kein Geheimnis mehr in der aktiven Datei",
+   "GEHEIM" not in now, now)
+ok("keines in der rotierten .gz-Datei", "GEHEIM" not in gz, gz)
+ok("Pfade bleiben", "/xr" in now and "/api/x" in now and "/alt" in gz)
+ok("Nachweise als REDACTED, nicht geloescht",
+   now.count('"REDACTED"') == 2, now)
+ok("Location behaelt den Pfad", '"/auth/login"' in now, now)
+ok("gefaelschte X-Oaap-User-Kopfzeile entfernt", "gefaelscht" not in now)
+rows = [json.loads(x) for x in now.splitlines()[:4]]
+ok("Zeit, Host, IP und Status bleiben (was das Portal liest)",
+   all(r["ts"] == 1789700000.5 and r["request"]["host"] == "bdt-hub.joomp.de"
+       and r["request"]["remote_ip"] == "91.1.40.210" and r["status"] == 200
+       for r in rows), rows)
+ok("eine Zeile ohne Aenderungsbedarf bleibt byte-gleich",
+   now.splitlines()[2] == line("/ok"))
+ok("Nicht-JSON und eine unfertige letzte Zeile bleiben byte-gleich",
+   now.splitlines()[4] == "kein json, bleibt stehen"
+   and now.endswith('{"unfertig": "zeile'))
+ok("andere Protokolldateien werden nicht angefasst",
+   "bleibt-unberuehrt" in open(unrelated, encoding="utf-8").read())
+ok("die Merkdatei zaehlt ehrlich (4 Zeilen, 2 Dateien)",
+   json.load(open(os.path.join(m.GATEWAY_LOG_DIR, m.SCRUB_MARKER)))
+   ["lines"] == 4)
+with open(active, "a", encoding="utf-8") as f:
+    f.write("\n" + line("/neu?key=nach-dem-lauf"))
+m.cmd_scrub_access_log(None)
+ok("zweiter Lauf tut nichts (Merkdatei)",
+   "nach-dem-lauf" in open(active, encoding="utf-8").read())
+
 print()
 print("ALLE PRUEFUNGEN BESTANDEN" if not fails else f"{fails} FEHLSCHLAG(E)")
 sys.exit(1 if fails else 0)

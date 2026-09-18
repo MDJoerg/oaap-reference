@@ -2250,15 +2250,31 @@ def cmd_data(args):
         # GRANT INSERT, Schritt 5) had no way to reach an
         # ALREADY-PROVISIONED tenant without one -- found live on
         # oaap-test while verifying Schritt 5, 2026-09-10, not by design.
-        healed = []
+        #
+        # 0.1.104: a schema already stamped with this build's revision
+        # is skipped. Before, every 'oaap update' re-ran the whole DDL
+        # for every tenant and reported "Migrated 1 twin schema(s)" --
+        # true of nothing, and a step that talks on every run hides the
+        # one run where it did something (migrate.sh's first rule).
+        rev = _twin_schema_rev()
+        healed, current = [], 0
         for r in store_schemas():
             if r["purpose"] == "twin" and r["tenant_id"]:
+                if _twin_schema_stamp(r["schema"]) == rev:
+                    current += 1
+                    continue
                 _twin_ensure_schema(r["tenant_id"])
                 healed.append(r["tenant_id"])
-        if not healed:
-            print("No twin schemas to migrate.")
-        else:
+        if healed:
+            if args.quiet:
+                print("Migrating existing twin schemas (oaap.data.twin) ...")
             print(f"Migrated {len(healed)} twin schema(s): {', '.join(healed)}.")
+        elif args.quiet:
+            pass
+        elif current:
+            print(f"All {current} twin schema(s) already current (rev {rev}).")
+        else:
+            print("No twin schemas to migrate.")
         return
 
     if args.action == "create":
@@ -3175,6 +3191,34 @@ def _twin_ensure_schema(tenant_id):
         f'GRANT INSERT ON oaap_model.type_definitions, oaap_model.activations '
         f'TO "{schema}";')
     _twin_ensure_tables(schema)
+    # Stamp LAST: a run that fails halfway leaves the old stamp, so the
+    # next update tries again instead of believing it is done.
+    _store_psql(f"COMMENT ON SCHEMA \"{schema}\" IS "
+                f"'{TWIN_STAMP_PREFIX}{_twin_schema_rev()}';")
+
+
+# What 'migrate-twin' compares against (0.1.104). Derived from the
+# SOURCE of the two functions that shape a twin schema, not from a
+# number somebody has to remember to bump: a changed table, grant or
+# view changes the text, so every existing schema is due again on the
+# next update; a pure comment change costs one harmless re-run. A
+# hand-kept revision would be exactly the reader that stays behind.
+TWIN_STAMP_PREFIX = "oaap-twin-rev:"
+
+
+def _twin_schema_rev():
+    import inspect
+    src = (inspect.getsource(_twin_ensure_schema)
+           + inspect.getsource(_twin_ensure_tables))
+    return hashlib.sha256(src.encode("utf-8")).hexdigest()[:12]
+
+
+def _twin_schema_stamp(schema):
+    """The revision a schema was last brought up to, or '' if none."""
+    out = _store_psql(
+        f"SELECT COALESCE(obj_description('\"{schema}\"'::regnamespace, "
+        "'pg_namespace'), '')").stdout.strip()
+    return out[len(TWIN_STAMP_PREFIX):] if out.startswith(TWIN_STAMP_PREFIX) else ""
 
 
 def _twin_ensure_tables(schema):
@@ -4482,6 +4526,134 @@ DIAGNOSE_DIR = os.path.join(APPS_DIR, "diagnose")
 # What the gateway may be asked to collect for one instance (D3). Lives
 # next to the external access log, which the portal already mounts.
 GATEWAY_LOG_DIR = os.path.join(DATA_DIR, "data", "gateway", "logs")
+
+
+# --- scrubbing access-log lines written before 0.1.103 (Jörg, 18.09.) ---
+#
+# _log_filter keeps query strings and credential values out of every
+# line written since 0.1.103. The lines from before stay as they were:
+# full URIs, so share keys that apps put into query strings (bdt-hub's
+# XR link, 08.08.). They are run through the SAME rules here, once per
+# node -- not deleted, because time, host, address and status are what
+# the portal and any later diagnosis read, and they are harmless.
+#
+# Rotated files (.gz) are rewritten and swapped in; Caddy never writes
+# to them. The ACTIVE file Caddy keeps open and appends to, so it is
+# rewritten in place: read, filter, pick up whatever Caddy appended
+# meanwhile, write, truncate. A line Caddy appends in the milliseconds
+# between the last read and the truncate is lost -- accepted, and said
+# in the output, rather than restarting the gateway (which would cut
+# every open connection on the node, the thing 0.1.102 just fixed).
+SCRUB_MARKER = ".scrubbed-0.1.103"
+
+
+def _scrub_record(e):
+    """Apply _log_filter's rules to one parsed log record, in place."""
+    changed = False
+    req = e.get("request") or {}
+    uri = req.get("uri")
+    if isinstance(uri, str) and "?" in uri:
+        req["uri"] = uri.split("?", 1)[0]
+        changed = True
+    for where, name, action in (("request", "Authorization", "replace"),
+                                ("request", "Cookie", "replace"),
+                                ("request", "Proxy-Authorization", "delete"),
+                                ("request", "X-Oaap-User", "delete"),
+                                ("request", "X-Oaap-Roles", "delete"),
+                                ("resp", "Set-Cookie", "delete"),
+                                ("resp", "Location", "query")):
+        headers = (req.get("headers") if where == "request"
+                   else e.get("resp_headers")) or {}
+        if name not in headers:
+            continue
+        if action == "delete":
+            del headers[name]
+            changed = True
+        elif action == "replace":
+            if headers[name] != [REDACTED]:
+                headers[name] = [REDACTED]
+                changed = True
+        else:
+            vals = headers[name] if isinstance(headers[name], list) else [headers[name]]
+            new = [v.split("?", 1)[0] if isinstance(v, str) else v for v in vals]
+            if new != vals:
+                headers[name] = new
+                changed = True
+    return changed
+
+
+def _scrub_bytes(data):
+    """Filter complete JSON lines; an unparsable or unfinished line is
+    kept byte for byte. Returns (new bytes, number of lines changed)."""
+    out, n = [], 0
+    lines = data.split(b"\n")
+    for i, raw in enumerate(lines):
+        last = i == len(lines) - 1
+        if last or not raw.strip():
+            out.append(raw)
+            continue
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            out.append(raw)
+            continue
+        if isinstance(e, dict) and _scrub_record(e):
+            out.append(json.dumps(e, ensure_ascii=False,
+                                  separators=(",", ":")).encode("utf-8"))
+            n += 1
+        else:
+            out.append(raw)
+    return b"\n".join(out), n
+
+
+def cmd_scrub_access_log(_args):
+    """Run the pre-0.1.103 access-log lines through _log_filter's rules.
+
+    Once per node (marker file); quiet afterwards, like every step in
+    migrate.sh."""
+    import gzip
+    marker = os.path.join(GATEWAY_LOG_DIR, SCRUB_MARKER)
+    if not os.path.isdir(GATEWAY_LOG_DIR) or os.path.exists(marker):
+        return
+    total, files = 0, 0
+    for fn in sorted(os.listdir(GATEWAY_LOG_DIR)):
+        if not fn.startswith("external-access"):
+            continue
+        path = os.path.join(GATEWAY_LOG_DIR, fn)
+        if fn.endswith(".gz"):
+            with gzip.open(path, "rb") as f:
+                data = f.read()
+            new, n = _scrub_bytes(data)
+            if n:
+                fd, tmp = tempfile.mkstemp(dir=GATEWAY_LOG_DIR, prefix=".scrub-")
+                with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as z:
+                    z.write(new)
+                os.replace(tmp, path)
+        elif fn.endswith(".log"):
+            with open(path, "r+b") as f:
+                data = f.read()
+                new, n = _scrub_bytes(data)
+                if n:
+                    tail = f.read()          # appended while we filtered
+                    tnew, tn = _scrub_bytes(tail)
+                    f.seek(0)
+                    f.write(new + tnew)
+                    f.truncate()
+                    n += tn
+        else:
+            continue
+        if n:
+            total += n
+            files += 1
+    with open(marker, "w", encoding="utf-8") as f:
+        json.dump({"at": _iso_now(), "lines": total, "files": files}, f)
+    if total:
+        print("")
+        print("Scrubbing the gateway access log written before 0.1.103 ...")
+        print(f"  {total} line(s) in {files} file(s): query strings and "
+              "credential values removed; time, host, address and status "
+              "kept. A line the gateway wrote in the same instant may be "
+              "missing.")
 
 # D2: the three durations, and the default. Not extendable by design --
 # opening it again is a new act with its own audit entry, which is the
@@ -11184,6 +11356,10 @@ def main():
                          help="internal: keep open streams alive across "
                               "gateway reloads in sites written before 0.1.102")
     pms.set_defaults(fn=cmd_migrate_stream_close)
+    psc = sub.add_parser("scrub-access-log",
+                         help="internal: filter access-log lines written "
+                              "before 0.1.103 (once per node)")
+    psc.set_defaults(fn=cmd_scrub_access_log)
     pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
@@ -11392,6 +11568,9 @@ def main():
                           "model alias: the alias word")
     pdt.add_argument("--yes", action="store_true",
                      help="drop: confirm — deletes the schema permanently")
+    pdt.add_argument("--quiet", action="store_true",
+                     help="migrate-twin: say nothing unless a schema "
+                          "was actually migrated (migrate.sh)")
     pdt.add_argument("--tenant", default="",
                      help="model types/register: tenant-id (RFC-0031 §4 "
                           "third origin — the twin browser's CLI stand-in)")
