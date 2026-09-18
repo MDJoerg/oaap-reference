@@ -240,6 +240,14 @@ say "Checking the tenant boundary in the gateway sites ..."
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-routes \
   2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
 
+# --- open streams survive gateway reloads (0.1.102) ---
+# Every deployment reloads the gateway, and a reload used to cut every
+# open WebSocket/SSE stream of every app on the node. The delay that
+# prevents it is generated into the site files, so files written before
+# 0.1.102 are rewritten once. Quiet and idempotent afterwards.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-stream-close \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
+
 # --- the rehearsal sweep timer (RFC-0030 D4) ---
 # A rehearsal holds a COPY OF LIVE CUSTOMER DATA and disappears on a
 # date. On a node updated rather than freshly installed there is no

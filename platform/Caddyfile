@@ -108,7 +108,11 @@
 			header_up -Connection
 			header_up -Upgrade
 		}
-		reverse_proxy broker:9001
+		# Survive reloads (every deployment reloads the gateway);
+		# same value and reasoning as STREAM_CLOSE_DELAY in appctl.py.
+		reverse_proxy broker:9001 {
+			stream_close_delay 12h
+		}
 	}
 
 	handle {

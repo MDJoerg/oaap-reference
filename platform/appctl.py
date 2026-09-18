@@ -1604,6 +1604,42 @@ def cmd_migrate_tenant_routes(_args):
           "on the unauthenticated preflight that precedes it.")
 
 
+def cmd_migrate_stream_close(_args):
+    """Carry STREAM_CLOSE_DELAY into sites written before it (0.1.102).
+
+    The delay lives in the site GENERATOR, so an instance installed
+    earlier keeps a file whose streams die on every reload until
+    something rewrites it. Public-only sites included -- they are the
+    ones hall displays and signaling clients hold open for hours, and
+    cmd_migrate_tenant_routes deliberately skips them. Idempotent: a
+    file that already carries the delay is left alone.
+    """
+    marker = f"stream_close_delay {STREAM_CLOSE_DELAY}"
+    reg = load_registry()
+    stale = []
+    for name, inst in sorted(reg.get("instances", {}).items()):
+        if not inst.get("routes") or not inst.get("svc_port"):
+            continue
+        body = _read_file(os.path.join(CADDY_APPS_DIR, f"{name}.caddy")) or ""
+        if marker not in body:
+            stale.append((name, inst))
+    edge = _read_file(os.path.join(CADDY_APPS_DIR, "edge.caddy")) or ""
+    edge_stale = bool(edge) and marker not in edge
+    if not stale and not edge_stale:
+        return
+    print("")
+    print("Keeping open WebSocket/SSE streams alive across gateway reloads ...")
+    for name, inst in stale:
+        write_app_caddy(name, inst)
+    if edge_stale:
+        write_edge_caddy()
+    refresh_generated_sites()
+    reload_gateway()
+    print(f"  {len(stale)} instance site(s) rewritten"
+          f"{', edge routes too' if edge_stale else ''}. A deployment no "
+          "longer cuts every other app's open connections.")
+
+
 def cmd_tenant(args):
     """This node's tenants (spec 2.1/2.2).
 
@@ -3361,6 +3397,30 @@ def _throttle_block(scope, throttle, edge):
 # and SSE pass through) does not hold on ANY authenticated route.
 _AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
 
+# Every reload of the gateway -- and every deployment of ANY app on the
+# node reloads it -- used to cut every open WebSocket/SSE stream of
+# EVERY app at once: Caddy closes upgraded connections when the config
+# they were opened under is unloaded. Measured on oaap-test (Caddy
+# 2.11.4, 2026-09-18): a held /broker/ socket died in the same second
+# as a `caddy reload`. Found through the Handball-Infoboard's first
+# letter -- hall displays hold one socket for hours.
+#
+# stream_close_delay keeps such a stream on the old config for this
+# long instead. It does NOT keep a stream to an app that is itself
+# redeployed alive: that container stops, and the socket goes with it,
+# as it should. 12h covers a match day; clients must still reconnect
+# (backup stops containers nightly), just not whenever a neighbour
+# deploys.
+STREAM_CLOSE_DELAY = "12h"
+
+
+def _proxy(target, indent, extra=()):
+    """reverse_proxy block to an app: survives reloads (see above)."""
+    return ([f"{indent}reverse_proxy {target} {{"]
+            + [f"{indent}\t{x}" for x in extra]
+            + [f"{indent}\tstream_close_delay {STREAM_CLOSE_DELAY}",
+               f"{indent}}}"])
+
 
 # ------------------------------------------------- rehearsals (RFC-0030)
 #
@@ -3583,7 +3643,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
         target_c, target_p = container, svc_port
         if services and r.get("service") in services:
             target_c, target_p = services[r["service"]]
-        lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
+        lines += _proxy(f"{target_c}:{target_p}", "\t\t")
         lines.append("\t}")
     if not any(r["path"] == "/" for r in routes):
         lines.append("\thandle {")
@@ -3975,14 +4035,13 @@ def write_edge_caddy():
         lines.append("\t\ton_demand")
         lines.append("\t}")
         lines += _LOG_BLOCK
-        lines.append(f"\treverse_proxy {target} {{")
         # Overwrite instead of append: the edge is the outermost hop, so
         # the only trustworthy entry is the peer it sees itself. Caddy's
         # default would keep a client-supplied prefix, and everything
         # downstream that reads the first entry — access log, the public
         # route throttle (RFC-0010) — would believe the client.
-        lines.append("\t\theader_up X-Forwarded-For {http.request.remote.host}")
-        lines.append("\t}")
+        lines += _proxy(target, "\t",
+                        ["header_up X-Forwarded-For {http.request.remote.host}"])
         lines.append("}")
         lines.append(f"http://{r['host']}, http://*.{r['host']} {{")
         lines.append("\tredir https://{host}{uri} permanent")
@@ -11093,7 +11152,11 @@ def main():
                          help="internal: put the tenant boundary into gateway "
                               "sites written before oaap.core.tenant 0.2")
     pmr.set_defaults(fn=cmd_migrate_tenant_routes)
-    pten = sub.add_parser("tenant", help="accounts and tenants of this node "
+    pms = sub.add_parser("migrate-stream-close",
+                         help="internal: keep open streams alive across "
+                              "gateway reloads in sites written before 0.1.102")
+    pms.set_defaults(fn=cmd_migrate_stream_close)
+    pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create", "rename"])
