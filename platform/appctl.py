@@ -1613,6 +1613,10 @@ def cmd_migrate_stream_close(_args):
     ones hall displays and signaling clients hold open for hours, and
     cmd_migrate_tenant_routes deliberately skips them. Idempotent: a
     file that already carries the delay is left alone.
+
+    Since 0.1.103 it also brings the access-log filter into the sites
+    that write the permanent log -- same kind of step (a generator
+    change carried into files on disk), and one reload instead of two.
     """
     marker = f"stream_close_delay {STREAM_CLOSE_DELAY}"
     reg = load_registry()
@@ -1625,19 +1629,34 @@ def cmd_migrate_stream_close(_args):
             stale.append((name, inst))
     edge = _read_file(os.path.join(CADDY_APPS_DIR, "edge.caddy")) or ""
     edge_stale = bool(edge) and marker not in edge
-    if not stale and not edge_stale:
+    # 0.1.103: the permanent access log drops query strings and
+    # credential values (_log_filter). It is written into the external,
+    # instance-address and edge sites; one written before keeps logging
+    # full URIs until regenerated.
+    unfiltered = [f for f in ("external.caddy", "instance-addresses.caddy",
+                              "edge.caddy")
+                  if "/logs/external-access.log" in
+                  (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")
+                  and "request>uri regexp" not in
+                  (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")]
+    if not stale and not edge_stale and not unfiltered:
         return
     print("")
-    print("Keeping open WebSocket/SSE streams alive across gateway reloads ...")
+    if stale or edge_stale:
+        print("Keeping open WebSocket/SSE streams alive across gateway reloads ...")
     for name, inst in stale:
         write_app_caddy(name, inst)
-    if edge_stale:
+    if edge_stale or "edge.caddy" in unfiltered:
         write_edge_caddy()
     refresh_generated_sites()
     reload_gateway()
-    print(f"  {len(stale)} instance site(s) rewritten"
-          f"{', edge routes too' if edge_stale else ''}. A deployment no "
-          "longer cuts every other app's open connections.")
+    if stale or edge_stale:
+        print(f"  {len(stale)} instance site(s) rewritten"
+              f"{', edge routes too' if edge_stale else ''}. A deployment no "
+              "longer cuts every other app's open connections.")
+    if unfiltered:
+        print("  The gateway access log no longer records query strings or "
+              f"credential values ({', '.join(unfiltered)} rewritten).")
 
 
 def cmd_tenant(args):
@@ -3691,8 +3710,52 @@ def write_app_caddy(name, inst):
 
 # --- registered external hostname (RFC-0005 level 3, hardening) -----------
 
-_LOG_BLOCK = ["\tlog {", "\t\toutput file /logs/external-access.log",
-              "\t\tformat json", "\t}"]
+# What any gateway access log may record -- RFC-0038 D3 for the
+# diagnosis log, and since 0.1.103 for the permanent one as well.
+# THE FILTER IS THE SPEC, NOT A CONVENIENCE: fields are removed where
+# the line is produced, not where it is displayed.
+#
+# The query string goes first. The permanent log used to keep full
+# URIs, and tokens do end up in query strings: the bdt-hub XR share link
+# (08.08.) put one there, and the portal never does for that reason. A
+# key in the PATH stays visible -- that is the app's choice, and apps
+# are told to carry device keys in the URL fragment instead, which never
+# reaches a server (Handball-Infoboard letter, 18.09.).
+#
+# `replace` rather than `delete` for the two credential headers: a log
+# has to answer WHETHER credentials were present, never their value.
+# Deleting them would throw away the one fact that tells "the caller
+# sent no key" apart from "the key was wrong" -- the question that cost
+# Jörg the 15.09. Caddy redacts both by default as well; here it is a
+# MUST of the gateway spec, not a property inherited from a default.
+#
+# The Location header keeps its path and loses its query for the same
+# reason the URI does: an app may redirect to a URL carrying a token.
+REDACTED = "REDACTED"
+
+
+def _log_filter(indent):
+    """The `format filter` block every gateway access log carries."""
+    i = indent
+    return [
+        f"{i}format filter {{",
+        f"{i}\twrap json",
+        f"{i}\tfields {{",
+        f'{i}\t\trequest>uri regexp "\\?.*$" ""',
+        f"{i}\t\trequest>headers>Authorization replace {REDACTED}",
+        f"{i}\t\trequest>headers>Cookie replace {REDACTED}",
+        f"{i}\t\trequest>headers>X-Oaap-User delete",
+        f"{i}\t\trequest>headers>X-Oaap-Roles delete",
+        f"{i}\t\trequest>headers>Proxy-Authorization delete",
+        f"{i}\t\tresp_headers>Set-Cookie delete",
+        f'{i}\t\tresp_headers>Location regexp "\\?.*$" ""',
+        f"{i}\t}}",
+        f"{i}}}",
+    ]
+
+
+_LOG_BLOCK = (["\tlog {", "\t\toutput file /logs/external-access.log"]
+              + _log_filter("\t\t") + ["\t}"])
 
 
 def load_external_conf():
@@ -4635,35 +4698,14 @@ def diagnose_snapshot_file(name):
 
 
 # What the gateway writes while a window is open (D3), as Caddyfile
-# lines for one site.
-#
-# THE FILTER IS THE SPEC, NOT A CONVENIENCE. RFC-0038 D3 says these
-# fields MUST NOT be written, so they are removed where the line is
-# produced -- not where it is displayed. The query string goes first:
-# the gateway's own access log keeps full URIs, and tokens have ended up
-# in query strings before (which is why the portal never puts one
-# there either).
-#
-# The reader in the portal is an ALLOW-list on top of this, so a field
-# Caddy starts logging in some future version reaches no page even
-# though nobody thought to delete it here.
-#
-# `replace` rather than `delete` for the two credential headers, and
-# that is the difference between a field and an answer: D3 asks for
-# WHETHER credentials were present (yes/no), never their value. Deleting
-# them would have thrown away the one fact that tells "the caller sent
-# no key" apart from "the key was wrong" -- which is exactly the
-# question that cost Jörg the 15.09.
-#
-# The Location header keeps its path and loses its query for the same
-# reason the URI does: an app may redirect to a URL carrying a token,
-# and this file must not become the place that records it.
+# lines for one site. The field filter is shared with the permanent
+# access log (_log_filter, where the reasoning lives); the reader in
+# the portal is an ALLOW-list on top of it, so a field Caddy starts
+# logging in some future version reaches no page even though nobody
+# thought to delete it there.
 #
 # Size: 2 MiB with one kept predecessor, so an hour of somebody
 # hammering a route cannot turn a diagnosis into a disk problem.
-REDACTED = "REDACTED"
-
-
 def _diagnose_log_block(name):
     return [
         f"\tlog diagnose_{re.sub(r'[^a-z0-9_]', '_', name)} {{",
@@ -4671,21 +4713,7 @@ def _diagnose_log_block(name):
         "\t\t\troll_size 2mib",
         "\t\t\troll_keep 1",
         "\t\t}",
-        "\t\tformat filter {",
-        "\t\t\twrap json",
-        "\t\t\tfields {",
-        '\t\t\t\trequest>uri regexp "\\?.*$" ""',
-        f"\t\t\t\trequest>headers>Authorization replace {REDACTED}",
-        f"\t\t\t\trequest>headers>Cookie replace {REDACTED}",
-        "\t\t\t\trequest>headers>X-Oaap-User delete",
-        "\t\t\t\trequest>headers>X-Oaap-Roles delete",
-        "\t\t\t\trequest>headers>Proxy-Authorization delete",
-        "\t\t\t\tresp_headers>Set-Cookie delete",
-        '\t\t\t\tresp_headers>Location regexp "\\?.*$" ""',
-        "\t\t\t}",
-        "\t\t}",
-        "\t}",
-    ]
+    ] + _log_filter("\t\t") + ["\t}"]
 
 
 def diagnose_site_lines(scope):

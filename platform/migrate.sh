@@ -244,7 +244,9 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-route
 # Every deployment reloads the gateway, and a reload used to cut every
 # open WebSocket/SSE stream of every app on the node. The delay that
 # prevents it is generated into the site files, so files written before
-# 0.1.102 are rewritten once. Quiet and idempotent afterwards.
+# 0.1.102 are rewritten once. Quiet and idempotent afterwards. Since
+# 0.1.103 the same step carries the access-log filter (no query strings,
+# no credential values) into the sites that write the permanent log.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-stream-close \
   2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
 
