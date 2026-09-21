@@ -40,6 +40,7 @@ The identity half needs flask + werkzeug (as the service does). If they
 are not installed, that section reports SKIP rather than a false PASS.
 """
 import importlib
+import io
 import json
 import os
 import sys
@@ -344,6 +345,55 @@ ok("ein partner kommt an einer support-Route nicht vorbei",
 r = c4.get("/verify?roles=partner")
 ok("an seiner eigenen Rolle aber schon", r.status_code == 204,
    r.status_code)
+
+print("")
+print("Der Aufraeum-Hinweis: meldet sich, bis er nicht mehr noetig ist")
+
+# Die Umstellung oben kann genau eine Sache NICHT: unterscheiden, ob
+# ein bisheriger `partner` der Dienstleister war oder eine echte
+# Fremdfirma. Nur ein Mensch weiss das, also fragt die Plattform bei
+# jedem `oaap update` -- und hoert auf zu fragen, sobald niemand mehr
+# beide Rollen haelt. Ein Hinweis, der nie verstummt, wird ignoriert;
+# einer, der zu frueh verstummt, hinterlaesst falsche Konten.
+sys.path.insert(0, PLATFORM_DIR)
+try:
+    import appctl
+except Exception as e:                                   # pragma: no cover
+    print(f"SKIP  appctl laesst sich nicht laden ({e})")
+else:
+    class _Args:
+        pass
+
+    def note_for(usernames):
+        """Der Hinweis, wie er auf einem Knoten mit diesem Bestand faellt.
+
+        `_identity_exec` laeuft sonst im Container; hier steht an seiner
+        Stelle die Antwort, die er zurueckgaebe.
+        """
+        real = appctl._identity_exec
+        appctl._identity_exec = lambda *a, **k: json.dumps(usernames)
+        buf = io.StringIO()
+        real_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            appctl.cmd_support_cleanup_note(_Args())
+        finally:
+            sys.stdout = real_stdout
+            appctl._identity_exec = real
+        return buf.getvalue()
+
+    ok("still, solange niemand beide Rollen haelt", note_for([]) == "",
+       repr(note_for([])))
+
+    text = note_for(["technikerin", "lieferant-mueller"])
+    ok("meldet sich, sobald jemand beide haelt", text != "")
+    ok("und nennt beide Konten beim Namen",
+       "technikerin" in text and "lieferant-mueller" in text, text)
+    # Ohne diesen Satz weiss der Betreiber zwar, DASS etwas offen ist,
+    # aber nicht, welche der beiden Rollen er wem lassen soll.
+    ok("sagt auch, woran man die beiden unterscheidet",
+       "support" in text and "partner" in text
+       and ("extern" in text.lower() or "external" in text.lower()), text)
 
 print("")
 print(f"{'FAILED' if fails else 'OK'} ({fails} Fehler)")
