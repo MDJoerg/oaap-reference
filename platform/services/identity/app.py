@@ -39,13 +39,23 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 # authority by itself. tenant_admin (oaap.core.tenant 2.3) is the half
 # RFC-0008 left open: platform authority INSIDE ONE TENANT -- the
 # tenant of the holder's own record, never one named in a request.
-ASSIGNABLE_ROLES = ("server_admin", "tenant_admin", "admin", "keyuser",
-                    "user", "guest", "partner")
+# support (RFC-0039) is the read-only counterpart to server_admin: the
+# service provider who looks after this node and reads its node-wide
+# status surfaces, changing nothing.
+ASSIGNABLE_ROLES = ("server_admin", "tenant_admin", "support", "admin",
+                    "keyuser", "user", "guest", "partner")
 # Roles whose authority reaches past a tenant. server_admin administers
-# the node; partner reads the health page, which lists every instance on
+# the node; support reads the health page, which lists every instance on
 # the machine. A tenant_admin may grant neither -- otherwise the role is
 # a two-step path out of its own tenant (oaap.core.tenant 2.3 rule 1).
-NODE_WIDE_ROLES = frozenset({"server_admin", "partner"})
+#
+# RFC-0039: `partner` used to stand here, carrying that node-wide read
+# while RFC-0002 published it as "external partner organization" -- an
+# app-facing classification. One word, two meanings, and the unsafe one
+# was the one nobody wrote down. The privilege moved out to `support`;
+# `partner` stayed and now means only what RFC-0002 always said, which
+# is why a tenant_admin may hand it out like any other app-facing role.
+NODE_WIDE_ROLES = frozenset({"server_admin", "support"})
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
 # Free-form visibility tags (RFC-0007) — no registry, a group exists
 # the moment any user carries it. Kept short and simple like usernames.
@@ -339,7 +349,45 @@ def _migrate_server_admin_once():
     _save(STATE_FILE, state)
 
 
+def _migrate_support_once():
+    """RFC-0039, one-time upgrade step: every existing `partner` holder
+    also becomes `support`, so nobody who looks after this node loses
+    the health page when the node-wide half of `partner` moves out.
+
+    The same shape as the RFC-0008 migration above, and for the same
+    reason: today's `partner` holders ARE service providers -- that is
+    the only meaning the role was usable for, because it was the only
+    one the platform enforced. So this preserves exactly the access
+    they have and grants nobody anything new.
+
+    `partner` is deliberately NOT removed. Taking a role away is the
+    riskier direction (an app route may require it), and the platform
+    cannot tell a service provider from a genuine external company --
+    guessing would either strip a real partner or leave a technician
+    mislabelled. Sorting that out is an operator task, named in the
+    release note.
+    """
+    state = _load(STATE_FILE, {})
+    if state.get("support_migrated"):
+        return
+    users = load_users()
+    changed = False
+    for u in users:
+        if "partner" in u["roles"] and "support" not in u["roles"]:
+            u["roles"] = sorted(set(u["roles"]) | {"support"})
+            changed = True
+    if changed:
+        _save(USERS_FILE, users)
+        print(f"RFC-0039 migration: granted support to "
+              f"{sum(1 for u in users if 'support' in u['roles'])} existing "
+              f"partner(s) -- review who should keep 'partner'",
+              flush=True)
+    state["support_migrated"] = True
+    _save(STATE_FILE, state)
+
+
 _migrate_server_admin_once()
+_migrate_support_once()
 _migrate_tenant_once()
 
 
@@ -1518,7 +1566,12 @@ def internal_setup():
         "tenant": default_tenant_id(),
         "active": True,
     }])
-    _save(STATE_FILE, {"setup_done": True, "server_admin_migrated": True})
+    # Both migrations are marked done on a fresh node: there is nothing
+    # to upgrade, and the first user deliberately gets neither `partner`
+    # nor `support` -- a node's own operator holds server_admin, which
+    # already sees everything (RFC-0039 §3.7).
+    _save(STATE_FILE, {"setup_done": True, "server_admin_migrated": True,
+                       "support_migrated": True})
     return {"ok": True}, 201
 
 
@@ -1704,13 +1757,13 @@ def users_create():
         tenant = actor_tenant
     # Rule 1 of spec 2.3: a tenant_admin may not grant a node-wide role.
     # Without that the role is a two-step path out of its tenant --
-    # create an account, give it server_admin (the node) or partner
+    # create an account, give it server_admin (the node) or support
     # (the health page, which names every instance on the machine),
     # sign in as it. Granting tenant_admin IS allowed, because `tenant`
     # above is already forced to the actor's own: the new administrator
     # cannot land anywhere else.
     if role == "tenant_admin" and NODE_WIDE_ROLES & set(roles):
-        return {"error": "Ein tenant_admin darf server_admin und partner "
+        return {"error": "Ein tenant_admin darf server_admin und support "
                          "nicht vergeben."}, 403
     # server_admin on a machine is refused for the same reason a key
     # may not carry it (RFC-0027 D2): nothing that authenticates from a
@@ -1752,7 +1805,7 @@ def users_update(username):
     if not u or not may_see(role, actor_tenant, u):
         return {"error": "Benutzer nicht gefunden."}, 404
     if role == "tenant_admin" and NODE_WIDE_ROLES & set(body.get("roles") or []):
-        return {"error": "Ein tenant_admin darf server_admin und partner "
+        return {"error": "Ein tenant_admin darf server_admin und support "
                          "nicht vergeben."}, 403
     try:
         roles = _validated_roles(body.get("roles"))

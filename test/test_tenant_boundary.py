@@ -544,9 +544,13 @@ check("jeder schreibende Aufruf der internen Schnittstelle nennt den Handelnden"
       "ohne Handelnden muesste identity die maechtigere Rolle annehmen")
 check("ein tenant_admin darf keine knotenweite Rolle vergeben",
       ident.count("NODE_WIDE_ROLES &") == 2
-      and '"partner"' in ident.split("NODE_WIDE_ROLES = ")[1][:120],
-      "server_admin verwaltet den Knoten, partner sieht auf der "
-      "Gesundheitsseite jede Instanz der Maschine")
+      and '"support"' in ident.split("NODE_WIDE_ROLES = ")[1][:160],
+      "server_admin verwaltet den Knoten, support sieht auf der "
+      "Gesundheitsseite jede Instanz der Maschine (RFC-0039)"),
+check("und partner steht nicht mehr darunter",
+      '"partner"' not in ident.split("NODE_WIDE_ROLES = ")[1][:160],
+      "RFC-0039: partner ist app-seitig und darf deshalb von einem "
+      "tenant_admin vergeben werden")
 check("und keinen Benutzer eines anderen Mandanten anfassen",
       ident.count("may_see(role, actor_tenant, u)") >= 2)
 check("ein fremder Benutzer wird beantwortet, als gaebe es ihn nicht",
@@ -670,7 +674,7 @@ else:
     check("und beim Anlegen wird der Mandant gewaehlt",
           "Mandant" in form and "k7f3" in form)
     check("das Formular bietet einem tenant_admin keine knotenweite Rolle an",
-          "server_admin" not in form and "partner" not in form,
+          "server_admin" not in form and "support" not in form,
           "identity lehnt sie ohnehin ab — hier wird niemand dazu eingeladen")
 
     log = [{"when": "2026-08-29T10:00:00+00:00", "who": "joerg",

@@ -113,7 +113,12 @@ class DeployTimeout(Exception):
 
 
 PORT_RANGE = range(8100, 8200)
-ROLES = {"admin", "keyuser", "user", "guest", "partner", "public"}
+# Roles an app manifest may gate a route on. Neither server_admin nor
+# tenant_admin appears: platform authority is never what an app asks
+# about (RFC-0008). `support` does appear (RFC-0039) — it is forwarded
+# like any other role, and a node-status view is a legitimate thing for
+# an app to gate on. `public` is a route marker, not a role.
+ROLES = {"support", "admin", "keyuser", "user", "guest", "partner", "public"}
 GATEWAY_CONTAINER = "oaap-gateway-1"
 IDENTITY_CONTAINER = "oaap-identity-1"
 # The compose default network, home of the three platform services
@@ -6795,6 +6800,46 @@ def cmd_key(args):
     print("Use it as:  Authorization: Bearer " + "oaapk_" + rec["id"] + "_...")
 
 
+def cmd_support_cleanup_note(args):
+    """RFC-0039: name the one thing the platform may NOT decide itself.
+
+    The migration gave `support` to everyone who held `partner`, because
+    every `partner` holder was in practice a service provider -- that
+    was the only meaning the platform enforced. But `partner` also has
+    a legitimate second use (RFC-0002: an external company taking part
+    in an app's processes), and nothing in a user record says which of
+    the two a person is. Guessing would either strip a real business
+    partner or leave a technician mislabelled, so the platform does
+    neither and asks.
+
+    Printed on every update while anybody still holds BOTH roles, and
+    silent the moment nobody does -- a nag that clears itself when the
+    work is done, rather than a line in a release note that scrolls
+    past once. Holding both is safe, just untidy: `support` is
+    read-only and `partner` grants nothing.
+    """
+    out = _identity_exec(
+        "import json, app as m\n"
+        "print(json.dumps([u['username'] for u in m.load_users()\n"
+        "                  if 'partner' in u['roles']"
+        " and 'support' in u['roles']]))\n")
+    both = json.loads(out or "[]")
+    if not both:
+        return
+    print("RFC-0039: 'partner' no longer sees anything of the platform.")
+    print("  The service provider who looks after this node is now")
+    print("  'support'. Everyone who held 'partner' was given 'support'")
+    print("  as well, so nobody lost the health page. Now please take")
+    print("  one of the two away from each of these accounts:")
+    for name in both:
+        print(f"    {name}")
+    print("  Keep 'support' for a technician or service partner; keep")
+    print("  'partner' for someone of an external company taking part")
+    print("  in an app's processes. Change it in the portal under")
+    print("  'Benutzer', or with 'sudo oaap user list' to look first.")
+    print("  This note disappears once no account holds both.")
+
+
 def cmd_user(args):
     if args.action == "list":
         out = _identity_exec(
@@ -11360,6 +11405,10 @@ def main():
                          help="internal: filter access-log lines written "
                               "before 0.1.103 (once per node)")
     psc.set_defaults(fn=cmd_scrub_access_log)
+    pscn = sub.add_parser("support-cleanup-note",
+                          help="internal: name the accounts still holding "
+                               "both 'partner' and 'support' (RFC-0039)")
+    pscn.set_defaults(fn=cmd_support_cleanup_note)
     pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",

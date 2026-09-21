@@ -5,7 +5,7 @@ token, validated by the identity service), the role-and-group-filtered
 launchpad, user management (server_admin only, list report + object
 page floorplans), app-instance visibility (RFC-0007) and configuration
 (both server_admin only) and the platform health page
-(server_admin/partner).
+(server_admin/support).
 Authentication is entirely the gateway's job: the portal trusts the
 X-OAAP-User / X-OAAP-Roles headers set after forward auth.
 
@@ -84,14 +84,18 @@ def _relay_report():
 VERSION = os.environ.get("OAAP_VERSION", "unknown")
 REGISTRY = "/apps-registry/registry.json"
 
-ALL_ROLES = ("server_admin", "tenant_admin", "admin", "keyuser", "user",
-             "guest", "partner")
+ALL_ROLES = ("server_admin", "tenant_admin", "support", "admin", "keyuser",
+             "user", "guest", "partner")
 # Roles whose authority reaches past a tenant: server_admin administers
-# the node, and partner sees the health page — which lists every
+# the node, and support sees the health page — which lists every
 # instance on the machine. A tenant_admin may hand out neither, or the
 # boundary has a second door (oaap.core.tenant 2.3 rule 1). Kept in
 # step with the same list in identity, which does the refusing.
-NODE_WIDE_ROLES = ("server_admin", "partner")
+#
+# RFC-0039: `partner` stood here until the node-wide read moved to
+# `support`. It is now app-facing only, and therefore appears in the
+# list a tenant_admin may hand out.
+NODE_WIDE_ROLES = ("server_admin", "support")
 CHANNEL_LABELS = {"test": "Test", "production": "Produktiv"}
 
 # Hexagon mark per design guidelines (assets/logo.svg, white for the
@@ -2821,7 +2825,7 @@ def page(body_template, title, active, status=200, **ctx):
         # (oaap.core.portal 2.6). Two rights, therefore two flags.
         can_store=bool(caller & {"server_admin", "tenant_admin"}),
         show_tenant=multi,
-        can_health=bool(caller & {"server_admin", "partner"}),
+        can_health=bool(caller & {"server_admin", "support"}),
         # The twin browser (RFC-0031 Bauplan Schritt 5): every tenant
         # role sees it ("user sieht"); a server_admin with no tenant
         # role of their own does not, because there is no tenant whose
@@ -3621,7 +3625,7 @@ def tenant_create_post():
 
 
 # ---------------------------------------------------------------------------
-# Health (design guidelines: visible for admin and partner) — checked
+# Health (design guidelines: visible for admin and support) — checked
 # live from the portal over the internal container network.
 
 def _gb(n_bytes):
@@ -4074,8 +4078,8 @@ def _instance_probe(name, inst):
 
 @app.get("/health")
 def health():
-    if not caller_roles() & {"server_admin", "partner"}:
-        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder partner.", 403
+    if not caller_roles() & {"server_admin", "support"}:
+        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder support.", 403
 
     core = _core_states()
     # The event relay (RFC-0032 §1.5, relay_view.py) -- health page only,

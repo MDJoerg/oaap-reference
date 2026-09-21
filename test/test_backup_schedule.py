@@ -180,9 +180,9 @@ print("Wer nicht darf, sieht kein Formular")
 clear()
 write("backup-schedule.json", SCHED)
 write("backup-last.json", RUN)
-ROLES["v"] = {"partner"}
+ROLES["v"] = {"support"}
 low = render()
-ok("ein partner sieht den Zustand", "Geplant" in low, low[:300])
+ok("ein support sieht den Zustand", "Geplant" in low, low[:300])
 ok("aber kein Formular", "/backup/schedule" not in low, low[:600])
 ok("und keinen Ausschalter", 'value="off"' not in low)
 ROLES["v"] = {"server_admin"}

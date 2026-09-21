@@ -1183,7 +1183,7 @@ def twin_outbox():
     own tenant, and it returns counts and ages only -- never an object,
     a group or a value. The prefix guard above still demands
     INTERNAL_API_KEY; the portal additionally shows the result only to
-    'server_admin'/'partner', the same audience as the rest of that page.
+    'server_admin'/'support', the same audience as the rest of that page.
 
     Ages come from Postgres's own clock (now() - checked_at), so a clock
     difference between containers cannot make a live relay look silent.
