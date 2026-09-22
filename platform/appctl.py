@@ -2013,6 +2013,13 @@ PROFILES = {
              "data-model and digital-twin capabilities are unavailable "
              "here. Unlike 'dev'/'exposed' this actually starts and stops "
              "a platform service (see cmd_node below).",
+    "sideload": "sideload node — a server_admin may install an UPLOADED "
+                "package straight into a production instance from the "
+                "portal (RFC-0037 D1). Off by default and not offered by "
+                "the first-run wizard: it is switched on when first "
+                "needed. The price, stated plainly: on such a node a "
+                "compromised portal or a stolen admin session can put "
+                "arbitrary code into production. Independent of 'dev'.",
     "broker": "real-time messaging node — carries the MQTT broker of "
               "oaap.events.broker 0.1 (RFC-0032 D2), independent of "
               "'store': a back-office tenant has a twin but no reason to "
@@ -5769,34 +5776,83 @@ def cmd_install(args):
                     die(f"an instance named '{local}' already exists")
                 permit = {"tenant": owner, "name": local}
         # What an existing instance already is decides, not the flag's
-        # default (0.1.110). Resolved before the envelope review below,
-        # because that review only applies on the test channel.
+        # default (0.1.110).
         channel = resolve_channel(inst, args.channel, local)
-        if inst and channel == "test" and inst.get("channel") == "test":
-            # the envelope rule applies to the CLI too — the difference is
-            # that here a person is standing at the machine, so a widening
-            # is reported and then proceeds
+        if inst:
+            # The envelope rule applies to the CLI on BOTH channels
+            # (RFC-0037). Until 0.1.111 this ran only for a test
+            # instance, so updating a PRODUCTION instance from a ZIP at
+            # the machine installed a widening without saying so --
+            # while promotion, the other way into production, had shown
+            # it and required --confirm all along. Found while writing
+            # RFC-0037, and it is the same shape yet again: two paths to
+            # the same place, one of them carrying a rule the other did
+            # not.
             probe = tempfile.mkdtemp(prefix="oaap-probe-")
             try:
                 extract_artifact(args.package, probe)
                 with open(os.path.join(package_root(probe, args.path),
                                        "oaap-app.yaml"), encoding="utf-8") as f:
-                    notes = sum(envelope_review(inst, yaml.safe_load(f)), [])
+                    probed = yaml.safe_load(f)
             except ArtifactRejected as e:
                 shutil.rmtree(probe, ignore_errors=True)
                 die(str(e))
             finally:
                 shutil.rmtree(probe, ignore_errors=True)
-            # reported, not refused: the envelope rule protects the
-            # UNATTENDED path. Here a person is at the machine, and that
-            # person is the confirmation the rule asks for.
-            for line in notes:
-                print(f"NOTE: {line}")
+            hard, confirm = envelope_review(inst, probed)
+            if channel == "production":
+                # "Production takes a higher version only" is a rule
+                # about what PRODUCTION runs. A test instance being
+                # raised to production carries its own version with it
+                # and changes nothing but the channel -- measuring that
+                # against itself would make the move impossible.
+                running, new = inst.get("version", ""), probed["app"]["version"]
+                if inst.get("channel") == "production"                         and not _version_gt(new, running):
+                    die(f"production runs {running}, the package is {new} — "
+                        "production takes a higher version only (RFC-0037 "
+                        "D2). Going back is a rollback ('oaap app artifact "
+                        f"rollback {name}'), which is a different and "
+                        "deliberate act")
+                # The version rule above is production's own, and the
+                # app-id rule is a refusal in any case -- what is left
+                # for a person to weigh is the widening.
+                notes = confirm + [h for h in hard if "version" not in h]
+                for line in notes:
+                    print(f"NOTE: {line}")
+                if notes and not getattr(args, "confirm", False):
+                    die("this package widens the envelope of a PRODUCTION "
+                        "instance (see NOTE above) — repeat with --confirm "
+                        "if that is intended (RFC-0037)")
+            else:
+                # Reported, not refused: the envelope rule protects the
+                # UNATTENDED path. Here a person is at the machine, and
+                # that person is the confirmation the rule asks for.
+                for line in hard + confirm:
+                    print(f"NOTE: {line}")
         try:
-            install_artifact(name, args.package, None, channel=channel,
-                             path=args.path, permit=permit)
+            _v, _sha = install_artifact(
+                name, args.package, None, channel=channel,
+                path=args.path, permit=permit,
+                # RFC-0037: a package that went into production from a
+                # browser or from this terminal answers "where did this
+                # come from?" with a person and a checksum -- there is
+                # no test instance behind it to point at.
+                sideloaded_by=("cli" if channel == "production" else ""))
         except ArtifactRejected as e:
             die(str(e))
+        if channel == "production":
+            # In the CUSTOMER's log, not only in the deploy log: an
+            # operator putting code into a tenant's production instance
+            # is exactly the act RFC-0022 §6 says they must be able to
+            # see (RFC-0037).
+            after = load_registry()["instances"].get(name) or {}
+            audit_tenant("instance.sideload",
+                         resolve_tenant(after.get("tenant"))
+                         or ensure_default_tenant(),
+                         subject=name,
+                         who=os.environ.get("SUDO_USER") or "root",
+                         role="root",
+                         detail=f"from the machine, {_v}, sha {_sha[:12]}")
         return
     else:
         pkg = os.path.abspath(os.path.join(args.package, args.path)
@@ -8063,7 +8119,8 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
 
 
 def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
-                     permit=None, ident=None, rehearsal=None):
+                     permit=None, ident=None, rehearsal=None,
+                     sideloaded_by=""):
     """Phase 3: verify the upload against its grant, then install.
 
     `grant` is positional and mandatory on purpose. It was optional
@@ -8128,6 +8185,13 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
             # where production got it from (RFC-0020) — so "what runs
             # here?" is answerable with a test instance and a checksum
             source["promoted_from"] = origin
+        if sideloaded_by:
+            # RFC-0037: the same question, answered for a package that
+            # arrived from a browser. A sideloaded instance has no test
+            # instance behind it, so the only honest answer is WHO put
+            # it there and WHEN -- next to the checksum, which is what
+            # a person can compare by eye against the node it came from.
+            source["sideloaded_by"] = sideloaded_by
         # The creation permit is the ONE record that names a tenant
         # before the instance exists (oaap.core.tenant 1.4), and this is
         # where that choice finally lands. Empty for a redeploy, which
@@ -8386,6 +8450,275 @@ def cmd_promote(args):
     print(f"Promoted {version} to '{key}' (sha {sha[:12]}).")
     print("The previous package is retained — 'oaap app artifact rollback "
           f"{key}' is the way back.")
+
+
+# --- sideloading (RFC-0037) --------------------------------------------
+# Promotion's sibling. The same act into production, with the bytes
+# coming from a browser upload instead of from a package this node has
+# already accepted -- and therefore without promotion's one guarantee,
+# that these are the tested bytes. Everything that CAN be shared with
+# promotion is shared: the envelope review, the higher-version rule,
+# the target resolved inside one tenant. The difference between the two
+# is where the bytes come from, and nothing else may drift apart.
+#
+# What a `sideload` node gives up is stated in the RFC and belongs here
+# too: on such a node a compromised portal or a stolen server_admin
+# session can put arbitrary code into production. The compensating
+# controls are the design -- off by default and set at the machine,
+# server_admin only, the whole envelope shown, one confirmation bound
+# to one checksum, a visible origin, an audit entry, and the ordinary
+# rollback.
+
+
+class SideloadRefused(Exception):
+    """A refusal a person can act on — same contract as PromotionRefused."""
+
+
+def sideload_target(reg, tenant, target_name):
+    """(key, record) of the production instance an upload aims at.
+
+    The same shape as promotion_target and for the same reason: the
+    portal needs it to show what is about to happen, the host needs it
+    again to act, and a second derivation would drift.
+    """
+    key, existing = find_instance(reg, tenant, target_name)
+    if existing is not None:
+        return key, existing
+    key = instance_key(tenant, target_name)
+    # A composed key that is taken belongs to somebody -- possibly
+    # another tenant whose slug and name happen to compose the same
+    # word. Returning that record lets the caller refuse instead of
+    # installing into it.
+    return key, reg["instances"].get(key)
+
+
+def sideload_envelope(m):
+    """The whole envelope a NEW instance would be given (RFC-0037).
+
+    Not a widening -- there is nothing to widen against -- so all of it
+    is named, and never summarised as a count. An unread confirmation is
+    worse than a refusal, which is the entire reason this returns
+    sentences instead of numbers.
+    """
+    notes = []
+    pub = _public_paths(m.get("routes"))
+    if pub:
+        notes.append("reachable without login: " + ", ".join(sorted(pub)))
+    eps = _endpoint_keys(m.get("endpoints"))
+    if eps:
+        notes.append("declared endpoints (ports past the gateway, needs the "
+                     "node profile 'exposed'): "
+                     + ", ".join(sorted(e[0] for e in eps)))
+    st = _storage_keys(m.get("storage"))
+    if st:
+        notes.append("storage mounts: " + ", ".join(sorted(s[0] for s in st)))
+    return notes
+
+
+def sideload_review(reg, zip_path, tenant, target_name, path=""):
+    """Everything that must hold before an uploaded package may go into
+    production (RFC-0037 D1/D2/D3).
+
+    Returns (manifest, notes, key, existing, sha, size). `notes` is what
+    a person has to read and confirm: the widenings against an existing
+    target, or the WHOLE envelope for a new instance.
+
+    Deliberately pure -- reads no request, writes nothing, installs
+    nothing. The portal calls it to show the review, the host calls it
+    again before it acts, and both must arrive at the same answer. That
+    is promotion_review's contract, kept here because the spool is data
+    and not trust: what was reviewed in one request is re-derived in the
+    next, never carried across in it.
+    """
+    if not has_profile("sideload"):
+        raise SideloadRefused(
+            "this node has no profile 'sideload' — installing an uploaded "
+            "package into production is switched on at the machine with "
+            "'sudo oaap node add-profile sideload' (RFC-0037 D1)")
+    if not os.path.isfile(zip_path):
+        raise SideloadRefused("the upload did not arrive")
+    size = os.path.getsize(zip_path)
+    if size > ARTIFACT_MAX_BYTES:
+        raise SideloadRefused(
+            f"the package is {size} bytes, the limit is "
+            f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB")
+    sha = _sha256_file(zip_path)
+    unpacked = tempfile.mkdtemp(prefix="oaap-sideload-")
+    try:
+        # The untrusted-archive rules of 2.14 (paths, links, entry count,
+        # size while unpacking) run HERE, before anything is read out of
+        # the file -- the review is the first thing that touches it.
+        extract_artifact(zip_path, unpacked)
+        pkg = package_root(unpacked, path)
+        mf = os.path.join(pkg, "oaap-app.yaml")
+        if not os.path.isfile(mf):
+            raise SideloadRefused(
+                f"no oaap-app.yaml in {path or 'the archive'}")
+        with open(mf, encoding="utf-8") as f:
+            m = yaml.safe_load(f)
+    except ArtifactRejected as e:
+        raise SideloadRefused(str(e))
+    finally:
+        shutil.rmtree(unpacked, ignore_errors=True)
+    if not isinstance(m, dict):
+        raise SideloadRefused("the package's manifest is empty or not a mapping")
+    import contextlib
+    import io as _io
+    buf = _io.StringIO()
+    try:
+        # the validator reports to the console and exits; here the report
+        # IS the answer, because a person is waiting for it in a browser
+        with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+            validate_manifest(m)
+    except SystemExit:
+        raise SideloadRefused(
+            "the package's manifest is invalid — "
+            + (buf.getvalue().strip().replace("ERROR: ", "")
+               or "validate it against the published schema"))
+
+    key, existing = sideload_target(reg, tenant, target_name)
+    if existing is None:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", target_name or ""):
+            raise SideloadRefused(
+                "instance name: lowercase letters, digits and hyphens")
+        # Says that the name is taken, never by whom (oaap.core.tenant 2.4)
+        if key in reg["instances"]:
+            raise SideloadRefused(
+                f"an instance named '{target_name}' already exists")
+        refusal = retained_data_refusal(key, tenant)
+        if refusal:
+            raise SideloadRefused(refusal)
+        return m, sideload_envelope(m), key, None, sha, size
+
+    if is_rehearsal(existing):
+        raise SideloadRefused(
+            f"'{target_name}' is a rehearsal (RFC-0030) and is not "
+            "redeployable. Upload into the production instance it was "
+            "copied from, or delete the rehearsal and build a new one.")
+    if existing.get("channel") != "production":
+        raise SideloadRefused(
+            f"'{target_name}' is not a production instance — sideloading "
+            "installs into production. A test instance is deployed to the "
+            "ordinary way (RFC-0019) or from the machine.")
+    if existing.get("app_id") != m["app"]["id"]:
+        raise SideloadRefused(
+            f"'{target_name}' runs app '{existing.get('app_id')}', the "
+            f"package is '{m['app']['id']}' — an instance belongs to one app")
+    # D3: an instance has ONE answer to "where do my updates come from".
+    # Without this rule the store would later offer an "update" that
+    # overwrites the uploaded code, or the other way around, and neither
+    # the portal nor the operator would see the conflict coming. It is
+    # also the closest thing OAAP has to Android's signature rule, which
+    # unsigned packages (RFC-0019 non-goal) cannot give us: an app that
+    # did not come from a package may not be replaced by one from a
+    # browser.
+    stored_kind = ((existing.get("source") or {}).get("kind") or "")
+    if stored_kind != "artifact":
+        where = {"git": "a Git repository", "store": "a store list",
+                 "local": "a directory on this machine"}.get(
+                     stored_kind, stored_kind or "an unknown source")
+        raise SideloadRefused(
+            f"'{target_name}' gets its updates from {where}. Switching it to "
+            "uploaded packages is a structural change and is done on the "
+            f"machine ('sudo oaap app install <zip> --name {target_name}'), "
+            "not in the browser (RFC-0037 D3)")
+    running, new = existing.get("version", ""), m["app"]["version"]
+    if not _version_gt(new, running):
+        raise SideloadRefused(
+            f"production runs {running}, the package is {new} — production "
+            "takes a higher version only. Going back is a rollback "
+            f"('oaap app artifact rollback {target_name}'), which is a "
+            "different and deliberate act")
+    hard, confirm = envelope_review(existing, m)
+    # The hard refusals of RFC-0019 §3 do not apply the way they do to a
+    # token: the app-id change and the version rule are both answered
+    # above, in production's own words. What remains is the widening,
+    # and a person is standing in front of it.
+    notes = confirm + [h for h in hard
+                       if "version" not in h and "belongs to one app" not in h]
+    return m, notes, key, existing, sha, size
+
+
+def _same_package_test_instance(reg, tenant, app_id, sha):
+    """A test instance of this tenant running exactly these bytes.
+
+    RFC-0037: where one exists, promotion (RFC-0020) does the same thing
+    with a proven origin, and the person deserves to be told that before
+    they take the weaker path. Compared by CHECKSUM, never by version
+    number -- the number is precisely what an uploaded package cannot
+    vouch for.
+    """
+    for key, i in sorted(reg.get("instances", {}).items()):
+        if i.get("channel") != "test" or i.get("app_id") != app_id:
+            continue
+        if resolve_tenant(i.get("tenant")) != tenant:
+            continue
+        if ((i.get("source") or {}).get("sha256") or "").lower()                 == (sha or "").lower():
+            return key
+    return ""
+
+
+def _prune_uploads(max_age=900):
+    """Forget uploads nobody came back for (RFC-0037: fifteen minutes).
+
+    A reviewed package has to survive between the review and the
+    confirmation, so it cannot be deleted at the end of the request that
+    wrote it. What must not happen is that it lies there forever: the
+    spool would slowly fill with packages that were looked at once and
+    abandoned, and each of them is somebody's code.
+    """
+    d = os.path.join(SPOOL_DIR, "uploads")
+    cutoff = time.time() - max_age
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for f in names:
+        path = os.path.join(d, f)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def sideload_install(zip_path, tenant, target_name, who, sha="", path="",
+                     confirmed=False):
+    """Install an uploaded package into production (RFC-0037).
+
+    Everything the review checked is checked again here, because the
+    spool between the two is data and not trust. `sha` is the checksum
+    the person confirmed: if the file under the same name is no longer
+    that file, nothing installs.
+
+    Returns (version, sha, notes, key, created).
+    """
+    reg = load_registry()
+    m, notes, key, existing, got, _size = sideload_review(
+        reg, zip_path, tenant, target_name, path)
+    if sha and not hmac.compare_digest(got, (sha or "").lower()):
+        raise SideloadRefused(
+            "the package is not the one that was reviewed — its checksum "
+            "changed. Upload it again and read the review it produces.")
+    if notes and not confirmed:
+        raise SideloadRefused(
+            "this package would widen what the production instance may reach "
+            "or who may reach it (" + "; ".join(notes)
+            + ") — read it and confirm it explicitly")
+    version, stored_sha = install_artifact(
+        key, zip_path, None, channel="production", path=path,
+        sideloaded_by=who or "unknown",
+        # The two facts nothing else knows once the key is composed:
+        # whose instance this is, and what the person typed. The same
+        # pair promotion had to learn the hard way on oaapx01.
+        permit={"tenant": tenant, "name": target_name})
+    audit_tenant("instance.sideload", tenant, subject=key,
+                 who=who or "unknown", role="server_admin",
+                 detail=("new" if existing is None else
+                         f"update from {existing.get('version', '?')}")
+                        + f" to {version}, sha {stored_sha[:12]}"
+                        + ("; confirmed: " + "; ".join(notes) if notes else ""))
+    return version, stored_sha, notes, key, existing is None
 
 
 # --- building a rehearsal (RFC-0030 D1) --------------------------------
@@ -9534,6 +9867,11 @@ def cmd_process_deploys(_args):
         inst = reg["instances"].get(name)
         tokens = load_tokens()
         ok, msg, revision = False, "", ""
+        # A structured answer, for the one action whose result is not a
+        # sentence but a review the portal has to lay out (RFC-0037).
+        # Everything else leaves it None and the result looks as it did.
+        detail = None
+        side_tenant = None
         retry = False        # rollback onto the running package
 
         # Who queued this, and which tenant they may act in (spec 2.3
@@ -9575,6 +9913,22 @@ def cmd_process_deploys(_args):
             # same shape as the artifact path fixed in 0.1.66).
             name, _prom_tenant, inst = promotion_target(
                 reg, str(req.get("from") or ""), name)
+        elif action in ("sideload", "sideload-review"):
+            # RFC-0037. The target may already exist (named by its key,
+            # from the instance page) or not (named the way its tenant
+            # reads it, from the store page). Both resolve to ONE tenant
+            # and ONE tenant-local name here, once -- so the review and
+            # the install that follows it cannot land on two different
+            # instances, which is the failure this two-step shape would
+            # otherwise invite.
+            _prune_uploads()
+            if inst is not None:
+                side_tenant = resolve_tenant(inst.get("tenant"))
+                local_name = instance_name(name, inst)
+            else:
+                side_tenant = act_tenant or ensure_default_tenant()
+                local_name = name
+                name, inst = sideload_target(reg, side_tenant, local_name)
         audit_tenant_id = None
         cross_tenant = (inst is not None and act_role == "tenant_admin"
                         and resolve_tenant(inst.get("tenant")) != act_tenant)
@@ -9952,6 +10306,103 @@ def cmd_process_deploys(_args):
                 msg = err.splitlines()[-1] if err else str(e)
             except Exception as e:
                 msg = str(e)
+        elif action == "sideload-review":
+            # RFC-0037, step one: upload and review. NOTHING installs
+            # here. The answer is what the portal puts in front of the
+            # person before they confirm -- app, version, size, checksum,
+            # which target, and the envelope in full. Named in full and
+            # never summarised as a count: an unread confirmation is
+            # worse than a refusal.
+            up = os.path.join(SPOOL_DIR, "uploads", f"{rid}.zip")
+            try:
+                if act_role != "server_admin":
+                    msg = ("sideloading is server_admin only — putting code "
+                           "into production is operator power (RFC-0037)")
+                else:
+                    m, notes, key, existing, sha, size = sideload_review(
+                        reg, up, side_tenant, local_name,
+                        path=str(req.get("path") or ""))
+                    name = key
+                    revision = sha[:12]
+                    ok = True
+                    detail = {
+                        "app_id": m["app"]["id"], "app_name": m["app"]["name"],
+                        "version": m["app"]["version"], "sha256": sha,
+                        "bytes": size, "key": key, "name": local_name,
+                        "notes": notes, "upload": rid,
+                        "target": ("update" if existing is not None
+                                   else "new"),
+                        "running": (existing or {}).get("version", ""),
+                        # The hint towards promotion (RFC-0037): where a
+                        # test instance on THIS node already holds a
+                        # package with the same checksum, promotion does
+                        # the same thing with a proven origin, and the
+                        # person should be told before they choose the
+                        # weaker path.
+                        "promotable_from": _same_package_test_instance(
+                            reg, side_tenant, m["app"]["id"], sha),
+                    }
+                    msg = (f"{m['app']['name']} {m['app']['version']} "
+                           f"reviewed for "
+                           + (f"'{local_name}' (running "
+                              f"{existing.get('version', '?')})"
+                              if existing is not None
+                              else f"a new instance '{local_name}'"))
+            except SideloadRefused as e:
+                msg = str(e)
+            except Exception as e:
+                msg = str(e)
+            if not ok:
+                # A refused review keeps nothing: the file would
+                # otherwise sit in the spool for its full fifteen
+                # minutes for no reason anybody could act on.
+                try:
+                    os.remove(up)
+                except OSError:
+                    pass
+        elif action == "sideload":
+            # Step two: confirm and install. Every rule the review
+            # applied is applied AGAIN here, because the spool between
+            # the two is data and not trust -- and because between
+            # showing and clicking the target may have changed (another
+            # upload, a promotion, a rollback). The checksum the person
+            # confirmed is carried along, so a file that is no longer
+            # the reviewed one installs nothing.
+            up = os.path.join(SPOOL_DIR, "uploads",
+                              f"{str(req.get('upload') or rid)}.zip")
+            try:
+                if act_role != "server_admin":
+                    msg = ("sideloading is server_admin only — putting code "
+                           "into production is operator power (RFC-0037)")
+                else:
+                    version, sha, notes, key, created = sideload_install(
+                        up, side_tenant, local_name, actor or "portal",
+                        sha=str(req.get("sha256") or ""),
+                        path=str(req.get("path") or ""),
+                        confirmed=bool(req.get("confirmed")))
+                    name = key
+                    revision = sha[:12]
+                    ok = True
+                    msg = (("created production instance from an uploaded "
+                            "package" if created else
+                            "updated from an uploaded package")
+                           + f" ({version})"
+                           + (" (envelope widened: " + "; ".join(notes) + ")"
+                              if notes else ""))
+            except (SideloadRefused, ArtifactRejected) as e:
+                msg = str(e)
+            except SystemExit as e:
+                msg = f"install refused: {e}"
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or "").strip()
+                msg = err.splitlines()[-1] if err else str(e)
+            except Exception as e:
+                msg = str(e)
+            finally:
+                try:
+                    os.remove(up)
+                except OSError:
+                    pass
         elif action == "grant":
             # Instance creation grant (RFC-0019, Studio section): the
             # one privileged thing Studio can do that no deploy token
@@ -10614,7 +11065,9 @@ def cmd_process_deploys(_args):
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
-               "grant": "portal", "promote": "portal"}.get(action, "deploy-hook")
+               "grant": "portal", "promote": "portal",
+               "sideload": "portal", "sideload-review": "portal"}.get(
+                   action, "deploy-hook")
         # The request id travels into the log, not only into the result
         # file (RFC-0024 §1). Result files are pruned after an hour; the
         # log is not — so a client that comes back the next morning can
@@ -10669,8 +11122,11 @@ def cmd_process_deploys(_args):
                 # create the caller only knew the tenant-local name, and
                 # without this the portal could not link to what it just
                 # made.
-                json.dump({"ok": ok, "message": msg, "revision": revision,
-                           "version": version, "id": rid, "key": name}, f)
+                res_body = {"ok": ok, "message": msg, "revision": revision,
+                            "version": version, "id": rid, "key": name}
+                if detail is not None:
+                    res_body["detail"] = detail
+                json.dump(res_body, f)
             os.replace(res_tmp, os.path.join(results, f"{rid}.json"))
         os.remove(req_path)          # the claim: this request is answered
         DEADLINE = None
@@ -11537,6 +11993,9 @@ def main():
     pi.add_argument("--path", default="", help="package path inside the directory/repo")
     pi.add_argument("--ref", default="", help="git branch/tag to install from (git sources)")
     pi.add_argument("--name")
+    pi.add_argument("--confirm", action="store_true",
+                    help="proceed although the package widens the envelope "
+                         "of a PRODUCTION instance (RFC-0037)")
     pi.add_argument("--channel", choices=["production", "test"], default=None,
                     help="channel for a NEW instance (default: production). "
                          "A redeploy keeps the channel the instance has; "

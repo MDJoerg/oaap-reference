@@ -1103,6 +1103,26 @@ STORE_BODY = """
      style="margin-left:.8rem">Zurücksetzen</a>{% endif %}
 </form>
 
+{% if can_sideload %}
+<div class="card">
+  {% if sideload_on %}
+  <p style="margin:0"><strong>Paket hochladen</strong> — eine App als
+    ZIP-Datei direkt in eine Produktiv-Instanz, ohne Store-Liste
+    (RFC-0037).</p>
+  <p class="muted" style="margin:.3rem 0 .6rem">Geprüft wird vor dem
+    Installieren: App, Version, Prüfsumme und der vollständige Rahmen.</p>
+  <a class="btn" href="/sideload">Paket hochladen</a>
+  {% else %}
+  <p class="muted" style="margin:0">Ein eigenes ZIP-Paket ließe sich hier
+    direkt in eine Produktiv-Instanz installieren — dieser Knoten hat das
+    Profil <code>sideload</code> aber nicht. Eingeschaltet wird es an der
+    Maschine mit <code>sudo oaap node add-profile sideload</code>
+    (RFC-0037). Eine abwesende Möglichkeit wird erklärt, nicht
+    versteckt.</p>
+  {% endif %}
+</div>
+{% endif %}
+
 {% if not apps %}
 <div class="card"><p class="muted" style="margin:0">
   {% if total %}Kein Treffer — mit „Zurücksetzen" siehst Du wieder alles.
@@ -2148,6 +2168,32 @@ INSTANCE_EDIT_BODY = """
      Ein Deploy-Token bekommt die Produktiv-Instanz dadurch nicht.</p>
 </div>
 {% endif %}
+{% if i.sideload %}
+<div class="card">
+  <h2>Neues Paket hochladen</h2>
+  {% if i.sideload.on %}
+  <p class="muted">Diese Produktiv-Instanz läuft aus einem hochgeladenen
+     Paket. Ein neues ZIP lässt sich hier direkt einspielen — geprüft wird
+     vorher: App, Version, <strong>Prüfsumme</strong> und jede Erweiterung
+     des Rahmens (RFC-0037).</p>
+  <p class="muted">Liegt dasselbe Paket schon in einer Test-Instanz dieses
+     Knotens, sagt die Prüfseite es — dann ist die
+     <strong>Übernahme</strong> der bessere Weg, weil sie die Herkunft
+     beweist statt sie zu behaupten.</p>
+  <a class="btn" href="/sideload?name={{ i.sideload.name }}">Paket hochladen</a>
+  {% elif i.sideload.why == 'profile' %}
+  <p class="muted">Dieser Knoten hat das Profil <code>sideload</code>
+     nicht. Eingeschaltet wird es an der Maschine mit
+     <code>sudo oaap node add-profile sideload</code> (RFC-0037).</p>
+  {% else %}
+  <p class="muted">Diese Instanz bekommt ihre Aktualisierungen aus
+     {{ i.sideload.source }}. Sie auf hochgeladene Pakete umzustellen ist
+     eine <strong>strukturelle</strong> Änderung und geschieht an der
+     Maschine, nicht im Browser — sonst böte die andere Quelle später ein
+     „Update" an, das den hochgeladenen Code überschreibt (RFC-0037 D3).</p>
+  {% endif %}
+</div>
+{% endif %}
 {% if i.rehearse %}
 <div class="card">
   <h2>Generalprobe anlegen</h2>
@@ -2888,6 +2934,12 @@ PROFILE_LABELS = {
     "store": "Datenplattform-Knoten — trägt das verwaltete Postgres von "
              "oaap.data.store (RFC-0031 Schritt 1). Ohne dieses Profil "
              "sind Digitaler Zwilling und Typregister hier nicht verfügbar.",
+    "sideload": "Sideload-Knoten — ein server_admin darf ein "
+                "HOCHGELADENES Paket direkt in eine Produktiv-Instanz "
+                "installieren (RFC-0037). Ab Werk aus. Der Preis, offen "
+                "gesagt: auf einem solchen Knoten kann ein gekapertes "
+                "Portal oder eine gestohlene Admin-Sitzung beliebigen "
+                "Code in Produktion bringen.",
     "broker": "Echtzeit-Knoten — trägt den MQTT-Broker von "
               "oaap.events.broker (RFC-0032 D2), unabhängig von 'store'. "
               "Der rohe Geräte-Port wird nur zusätzlich mit 'exposed' "
@@ -5071,6 +5123,8 @@ def store_page(msg=None, msg_ok=True, status=200):
                                    for e in entries}.values()],
                 licenses=sorted({e["license"] for e in entries if e["license"]}),
                 profiles=node_profiles(),
+                can_sideload="server_admin" in caller_roles(),
+                sideload_on="sideload" in node_profiles(),
                 msg=msg or request.args.get("msg"),
                 msg_ok=msg_ok and request.args.get("err") is None)
 
@@ -5610,6 +5664,236 @@ def _new_error(text):
                 store_apps=_store_apps(), error=text)
 
 
+# --- sideloading (RFC-0037) --------------------------------------------
+# Two pages, because the act has two steps and the second one must not
+# be reachable without the first: upload and review, then confirm and
+# install. The portal itself decides nothing here -- it streams the file
+# into the spool and shows what the HOST answered. Every rule is the
+# host's, and the host applies them again at install time.
+
+SIDELOAD_BODY = """
+<div class="pagehead"><h1>Paket hochladen</h1>
+  <a class="btn" href="/store">Zurück zum Store</a></div>
+{% if not on %}
+<div class="card">
+  <p class="err" style="margin:0"><strong>Dieser Knoten hat das Profil
+    <code>sideload</code> nicht.</strong></p>
+  <p class="muted">Damit lässt sich ein hochgeladenes Paket nicht direkt
+    in eine Produktiv-Instanz installieren. Eingeschaltet wird das an der
+    Maschine: <code>sudo oaap node add-profile sideload</code>.</p>
+  <p class="muted">Der Preis, offen gesagt: Auf einem solchen Knoten kann
+    ein gekapertes Portal oder eine gestohlene Administrator-Sitzung
+    beliebigen Code in Produktion bringen. Deshalb ist das eine
+    Entscheidung je Knoten — und keine, die ein Assistent für Dich
+    trifft.</p>
+</div>
+{% else %}
+{% if error %}<div class="card"><p class="err" style="margin:0">{{ error }}</p></div>{% endif %}
+<div class="card">
+  <p class="muted" style="margin-top:0">Dieses Paket stammt aus keiner
+    Store-Liste. Prüfe Herkunft und Prüfsumme, bevor Du es in Produktion
+    installierst — OAAP-Pakete sind nicht signiert, die Plattform kann
+    Dir die Herkunft also nicht bestätigen.</p>
+  <form method="post" action="/sideload" enctype="multipart/form-data">
+    <label for="artifact">ZIP-Paket</label>
+    <input id="artifact" name="artifact" type="file" accept=".zip" required>
+    <label for="name">Instanz</label>
+    <input id="name" name="name" value="{{ preset }}" required
+           placeholder="name der produktiv-instanz">
+    <p class="muted" style="margin:.2rem 0 .8rem">Eine bestehende
+      Produktiv-Instanz wird aktualisiert; ein freier Name legt eine neue
+      an.</p>
+    <label for="artifact_path">Pfad im Paket (optional)</label>
+    <input id="artifact_path" name="artifact_path" value="" placeholder="z. B. app/">
+    <button>Prüfen</button>
+  </form>
+</div>
+{% endif %}
+"""
+
+SIDELOAD_REVIEW_BODY = """
+<div class="pagehead"><h1>Prüfen und bestätigen</h1>
+  <a class="btn" href="/sideload">Anderes Paket</a></div>
+<div class="card">
+  <h2 style="margin-top:0">{{ d.app_name }} {{ d.version }}</h2>
+  <style>
+    .sfacts{display:grid;grid-template-columns:auto 1fr;gap:.45rem 1rem;
+         font-size:.92rem;margin:.6rem 0}
+    .sfacts dt{color:var(--oaap-muted)}
+    .sfacts dd{margin:0}
+  </style>
+  <dl class="sfacts">
+    <dt>App-Kennung</dt><dd><code>{{ d.app_id }}</code></dd>
+    <dt>Ziel</dt><dd>{% if d.target == 'update' %}Aktualisierung von
+      <code>{{ d.name }}</code> (läuft {{ d.running }}){% else %}neue
+      Produktiv-Instanz <code>{{ d.name }}</code>{% endif %}</dd>
+    <dt>Größe</dt><dd>{{ (d.bytes / 1024) | round | int }} KB</dd>
+    <dt>Prüfsumme (SHA-256)</dt><dd><code
+      style="word-break:break-all">{{ d.sha256 }}</code></dd>
+  </dl>
+  <p class="muted">Vergleiche die Prüfsumme mit der des Pakets, das Du
+    getestet hast. Sie ist das Einzige, was diesen Weg mit dem Knoten
+    verbindet, auf dem es lief.</p>
+</div>
+
+{% if d.promotable_from %}
+<div class="card">
+  <p style="margin:0"><strong>Dieses Paket liegt schon auf diesem
+    Knoten.</strong> Die Test-Instanz <code>{{ d.promotable_from }}</code>
+    läuft mit derselben Prüfsumme.</p>
+  <p class="muted" style="margin:.3rem 0 0">Die Übernahme (RFC-0020) tut
+    dasselbe mit bewiesener Herkunft — sie nimmt die Bytes, die dieser
+    Knoten bereits angenommen hat, statt einer Datei aus dem Browser.
+    Wenn Du die Wahl hast, ist sie der bessere Weg.</p>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">{% if d.target == 'update' %}Was sich am Rahmen
+    ändert{% else %}Was diese App bekommt{% endif %}</h2>
+  {% if d.notes %}
+  <ul>{% for n in d.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+  <p class="muted">Das ist vollständig aufgezählt, nicht zusammengefasst.
+    Mit dem Bestätigen erlaubst Du genau das.</p>
+  {% else %}
+  <p class="muted" style="margin:0">Keine Erweiterung gegenüber dem, was
+    diese Instanz heute darf.</p>
+  {% endif %}
+</div>
+
+<form class="card" method="post" action="/sideload/install">
+  <input type="hidden" name="upload" value="{{ d.upload }}">
+  <input type="hidden" name="name" value="{{ d.name }}">
+  <input type="hidden" name="sha256" value="{{ d.sha256 }}">
+  <input type="hidden" name="path" value="{{ path }}">
+  <input type="hidden" name="confirmed" value="yes">
+  <p class="muted" style="margin-top:0">Das geprüfte Paket liegt höchstens
+    15 Minuten bereit. Danach lädst Du es neu hoch.</p>
+  <button>In Produktion installieren</button>
+  <a class="rowaction" href="/sideload" style="margin-left:.8rem">Abbrechen</a>
+</form>
+"""
+
+SIDELOAD_WAIT_SECONDS = 40      # unpack, validate, compare — no build
+SIDELOAD_INSTALL_WAIT = CREATE_WAIT_SECONDS
+
+
+def _require_sideload_admin():
+    """Only the node's administrator, and only here.
+
+    Not `tenant_admin`: putting code into production inside a tenant is
+    operator power (RFC-0037, *Who*). The host checks this again from
+    its own user record — this is the door, not the lock.
+    """
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: ein Paket in Produktion zu installieren "
+                "erfordert die Rolle server_admin (RFC-0037)."), 403
+    return None
+
+
+@app.get("/sideload")
+def sideload_form():
+    denied = _require_sideload_admin()
+    if denied:
+        return denied
+    return page(SIDELOAD_BODY, "Paket hochladen", "store",
+                on="sideload" in node_profiles(),
+                preset=request.args.get("name", "").strip().lower(),
+                error=request.args.get("err"))
+
+
+def _sideload_error(text):
+    return page(SIDELOAD_BODY, "Paket hochladen", "store", status=400,
+                on="sideload" in node_profiles(), preset="", error=text)
+
+
+@app.post("/sideload")
+def sideload_review_page():
+    """Step one: the file goes into the spool, the HOST reads it.
+
+    The portal deliberately does not unpack the archive to show a
+    summary of its own. Unpacking an untrusted archive is exactly the
+    job that belongs to the host (2.14), and a second reading would be
+    a second answer — the one the person confirms has to be the one the
+    installer will act on.
+    """
+    denied = _require_sideload_admin()
+    if denied:
+        return denied
+    if "sideload" not in node_profiles():
+        return _sideload_error(
+            "Dieser Knoten hat das Profil 'sideload' nicht.")
+    upload = request.files.get("artifact")
+    name = request.form.get("name", "").strip().lower()
+    path = request.form.get("artifact_path", "").strip()
+    if not upload or not upload.filename:
+        return _sideload_error("Bitte ein ZIP-Paket auswählen.")
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+        return _sideload_error(
+            "Instanzname: Kleinbuchstaben, Ziffern, Bindestriche.")
+    rid = _uuid.uuid4().hex
+    os.makedirs(SPOOL_UPLOADS, exist_ok=True)
+    dest = os.path.join(SPOOL_UPLOADS, f"{rid}.zip")
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = upload.stream.read(1 << 16)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > ARTIFACT_MAX_BYTES:
+                    raise ValueError("too large")
+                out.write(chunk)
+    except (ValueError, OSError):
+        os.remove(dest)
+        return _sideload_error(
+            f"Das Paket ist größer als "
+            f"{ARTIFACT_MAX_BYTES // (1024 * 1024)} MB.")
+    res = _queue_with_id(rid, name, {"action": "sideload-review",
+                                     "path": path}, SIDELOAD_WAIT_SECONDS)
+    if res is None:
+        return _sideload_error(
+            "Die Prüfung dauert ungewöhnlich lange — das Ergebnis steht im "
+            "Deploy-Protokoll auf der Gesundheitsseite.")
+    if not res.get("ok"):
+        return _sideload_error(res.get("message", "unbekannter Fehler"))
+    return page(SIDELOAD_REVIEW_BODY, "Prüfen und bestätigen", "store",
+                d=res.get("detail") or {}, path=path)
+
+
+@app.post("/sideload/install")
+def sideload_install_page():
+    """Step two. Nothing from this form is trusted: the host re-derives
+    the review from the file itself and compares the checksum the person
+    saw against the file that is actually there."""
+    denied = _require_sideload_admin()
+    if denied:
+        return denied
+    name = request.form.get("name", "").strip().lower()
+    res = _queue_with_id(_uuid.uuid4().hex, name, {
+        "action": "sideload",
+        "upload": request.form.get("upload", "").strip(),
+        "sha256": request.form.get("sha256", "").strip().lower(),
+        "path": request.form.get("path", "").strip(),
+        "confirmed": request.form.get("confirmed") == "yes",
+    }, SIDELOAD_INSTALL_WAIT)
+    if res is None:
+        return redirect(
+            "/instances?msg=" + quote(
+                f"Die Installation von {name} läuft noch — das Ergebnis "
+                "steht im Deploy-Protokoll auf der Gesundheitsseite."),
+            code=303)
+    if res.get("ok"):
+        return redirect(f"/instances/{res.get('key') or name}"
+                        f"?msg={quote('Paket in Produktion installiert.')}",
+                        code=303)
+    return _sideload_error(
+        f"Installation abgelehnt: {res.get('message', 'unbekannter Fehler')}")
+
+
+
 def _tab(default=""):
     """Which section the caller is in — from the link (?tab=) or from the
     hidden field a form carried along, so a save comes back where it was
@@ -5709,6 +5993,7 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "deploy_now": _deploy_now(name),
          "deploy_limit": DEPLOY_MAX_MINUTES,
          "promote": _promote_view(name, inst),
+         "sideload": _sideload_offer(name, inst),
          "pending": _pending_envelope(name),
          "hook_url": _hook_url(name),
          "address": address,
@@ -6090,6 +6375,32 @@ def instance_envelope(name):
         name, {"action": "envelope", "op": op,
                "manifest_sha": request.form.get("manifest_sha", "").strip()},
         TOKEN_WAIT_SECONDS)
+
+
+def _sideload_offer(name, inst):
+    """Whether this instance may be updated from an uploaded package.
+
+    Three gates, and all three are the host's -- this only decides what
+    to SHOW, so a person is not offered a button that will refuse them
+    (RFC-0037 D1/D3). Returns a dict with the reason when the answer is
+    "not here", because an absent possibility is explained, not hidden.
+    """
+    if inst.get("channel") != "production" or inst.get("rehearsal"):
+        return None
+    if "server_admin" not in caller_roles():
+        return None
+    if "sideload" not in node_profiles():
+        return {"on": False, "why": "profile"}
+    kind = ((inst.get("source") or {}).get("kind") or "")
+    if kind != "artifact":
+        # D3: an instance has one answer to "where do my updates come
+        # from", and this one's answer is not "a package".
+        return {"on": False, "why": "source",
+                "source": {"git": "einem Git-Repository",
+                           "store": "einer Store-Liste",
+                           "local": "einem Verzeichnis auf der Maschine"}
+                .get(kind, "einer anderen Quelle")}
+    return {"on": True, "name": local_name(name, inst)}
 
 
 def _promote_view(name, inst):
