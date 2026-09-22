@@ -250,6 +250,17 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-route
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-stream-close \
   2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
 
+# --- the identity headers of RFC-0040 (0.1.108) ---
+# Same class as the step above, and the reason it exists: 0.1.107 added
+# three headers to the site GENERATOR, and the update rewrote the main
+# Caddyfile but not the per-app site files — those are written once, at
+# deployment. Measured on oaap-test: 13 of 13 app sites still named two
+# headers. That is not only a missing feature. The anti-spoofing is
+# copy_headers OVERWRITING what the client sent, so a header the site
+# neither strips nor copies passes straight through to the app.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-identity-headers \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the identity headers could not be carried into the gateway sites — run 'oaap status'."
+
 # --- access-log lines from before the filter (0.1.104) ---
 # The filter above covers every line written from now on. The lines
 # written before keep full URIs -- query strings with share keys in

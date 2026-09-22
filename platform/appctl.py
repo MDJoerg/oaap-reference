@@ -1664,6 +1664,61 @@ def cmd_migrate_stream_close(_args):
               f"credential values ({', '.join(unfiltered)} rewritten).")
 
 
+def cmd_migrate_identity_headers(_args):
+    """Carry the identity header list into sites written before it (0.1.108).
+
+    RFC-0040 put three more headers on the verified request, and the
+    list lives in the site GENERATOR -- so every instance deployed
+    before 0.1.107 keeps a file that names two. Same shape as
+    cmd_migrate_stream_close, and found the same way: by measuring the
+    files on oaap-test after the update instead of trusting that a
+    platform update rewrites them. It does not; only a deployment does.
+
+    Two consequences, and the second is the one that matters:
+
+      1. the app never receives X-OAAP-User-Id, so the contract v0.8
+         told app authors to anchor on a header this node does not
+         send;
+      2. a CLIENT-sent X-OAAP-User-Id reaches the app untouched. The
+         anti-spoofing is copy_headers OVERWRITING whatever arrived --
+         a header the site neither strips nor copies has nothing to
+         overwrite it. Latent only for as long as no app reads it,
+         which the contract is busy telling them to do.
+
+    external.caddy and instance-addresses.caddy carry the same bodies
+    and are rewritten wholesale by refresh_generated_sites(). edge.caddy
+    is not in scope: it forwards foreign names and carries no identity
+    lines at all. Idempotent, and silent when there is nothing to carry.
+    """
+    reg = load_registry()
+    stale = []
+    for name, inst in sorted(reg.get("instances", {}).items()):
+        if not inst.get("routes") or not inst.get("svc_port"):
+            continue
+        body = _read_file(os.path.join(CADDY_APPS_DIR, f"{name}.caddy")) or ""
+        if _site_identity_stale(body):
+            stale.append((name, inst))
+    generated = [f for f in ("external.caddy", "instance-addresses.caddy")
+                 if _site_identity_stale(
+                     _read_file(os.path.join(CADDY_APPS_DIR, f)) or "")]
+    if not stale and not generated:
+        return
+    print("")
+    print("Carrying the identity headers into sites written before them "
+          "(RFC-0040) ...")
+    for name, inst in stale:
+        write_app_caddy(name, inst)
+    refresh_generated_sites()
+    reload_gateway()
+    parts = []
+    if stale:
+        parts.append(f"{len(stale)} instance site(s)")
+    parts += generated
+    print(f"  {', '.join(parts)} rewritten. Apps now receive all "
+          f"{len(IDENTITY_HEADERS)} identity headers, and a client-sent one "
+          "is overwritten again instead of passing straight through.")
+
+
 def cmd_tenant(args):
     """This node's tenants (spec 2.1/2.2).
 
@@ -3502,6 +3557,27 @@ _COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
 def strip_identity(indent="\t\t"):
     """Drop every client-sent identity header (contract guarantee 1)."""
     return [f"{indent}request_header -{h}" for h in IDENTITY_HEADERS]
+
+
+def _site_identity_stale(body):
+    """True when this site file was written before the current list.
+
+    Deriving every WRITER from the constant above is not enough: a site
+    file is written once, at deployment, and then kept. Add a header
+    and every app deployed earlier keeps a file naming the old list --
+    the constant cannot reach the past. cmd_migrate_identity_headers
+    can, and this is how it recognises what to rewrite.
+
+    Line-wise on purpose. "request_header -X-OAAP-User" is a prefix of
+    "request_header -X-OAAP-User-Id", so a substring test would call a
+    file complete that names only the longer one.
+    """
+    lines = [ln.strip() for ln in (body or "").splitlines()]
+    strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")}
+    if strips and strips != {f"request_header -{h}" for h in IDENTITY_HEADERS}:
+        return True
+    return any(ln.startswith("copy_headers ") and ln != _COPY_IDENTITY
+               for ln in lines)
 
 
 def _log_header_name(h):
@@ -11450,6 +11526,10 @@ def main():
                          help="internal: keep open streams alive across "
                               "gateway reloads in sites written before 0.1.102")
     pms.set_defaults(fn=cmd_migrate_stream_close)
+    pmi = sub.add_parser("migrate-identity-headers",
+                         help="internal: carry RFC-0040's identity headers "
+                              "into sites written before 0.1.107")
+    pmi.set_defaults(fn=cmd_migrate_identity_headers)
     psc = sub.add_parser("scrub-access-log",
                          help="internal: filter access-log lines written "
                               "before 0.1.103 (once per node)")

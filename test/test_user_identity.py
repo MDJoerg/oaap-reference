@@ -467,6 +467,62 @@ ok("eine nicht uebernommene Behauptung wird gesagt, nicht verschluckt",
    "geprueft")
 
 print("")
+print("Die Dateien, die vor der Liste geschrieben wurden (0.1.108)")
+
+# Jede Stelle aus der Konstante abzuleiten reicht nicht: eine Site-Datei
+# wird EINMAL geschrieben, beim Ausrollen, und dann behalten. Auf
+# oaap-test standen nach dem Update auf 0.1.107 13 von 13 App-Dateien
+# weiter auf zwei Kopfzeilen. Das ist nicht nur eine fehlende Funktion --
+# eine Kopfzeile, die die Datei weder strippt noch kopiert, geht
+# ungeprueft an die App durch.
+current = "\n".join(appctl.site_body(route, "c", 8000, scope="i", tenant="t"))
+ok("eine frisch erzeugte Datei gilt als aktuell",
+   not appctl._site_identity_stale(current),
+   "sonst schreibt der Schritt bei jedem Update alles neu")
+
+old = current
+for h in NEW:
+    old = "\n".join(l for l in old.splitlines()
+                    if l.strip() != f"request_header -{h}")
+old = old.replace(appctl._COPY_IDENTITY, "copy_headers X-OAAP-User X-OAAP-Roles")
+ok("eine Datei im Stand vor 0.1.107 gilt als alt",
+   appctl._site_identity_stale(old), old)
+
+ok("auch wenn nur die copy_headers-Zeile alt ist",
+   appctl._site_identity_stale(
+       current.replace(appctl._COPY_IDENTITY,
+                       "copy_headers X-OAAP-User X-OAAP-Roles")))
+
+# Der Prefix-Fall: "request_header -X-OAAP-User" ist Anfang von
+# "request_header -X-OAAP-User-Id". Ein Teilstring-Test haette eine
+# Datei, die NUR die laengere nennt, fuer vollstaendig gehalten.
+ok("eine Datei, die nur die laengere Kopfzeile nennt, gilt als alt",
+   appctl._site_identity_stale("\trequest_header -X-OAAP-User-Id"),
+   "sonst prueft der Test einen Namen, der sich selbst mitzaehlt")
+
+ok("eine Datei ganz ohne Identitaets-Zeilen ist nicht alt",
+   not appctl._site_identity_stale(
+       "https://x {\n\ttls {\n\t\ton_demand\n\t}\n\treverse_proxy y:80\n}"),
+   "edge.caddy leitet fremde Namen weiter und fuehrt keine")
+
+mig_fn = appctl_src.split("def cmd_migrate_identity_headers")[1].split("\ndef ")[0]
+ok("der Schritt schreibt die App-Dateien neu",
+   "write_app_caddy(name, inst)" in mig_fn)
+ok("und die aus der Registry erzeugten mit",
+   "refresh_generated_sites()" in mig_fn
+   and "external.caddy" in mig_fn and "instance-addresses.caddy" in mig_fn)
+ok("und laedt das Gateway danach neu", "reload_gateway()" in mig_fn)
+ok("er schweigt, wenn es nichts zu tragen gibt",
+   "if not stale and not generated:" in mig_fn and "return" in mig_fn,
+   "ein Schritt, der jedes Mal etwas sagt, wird nicht mehr gelesen")
+
+ok("migrate.sh ruft ihn auf",
+   "migrate-identity-headers" in read(PLATFORM_DIR, "migrate.sh"),
+   "sonst laeuft er auf keinem Knoten")
+ok("und appctl kennt ihn als Unterbefehl",
+   'sub.add_parser("migrate-identity-headers"' in appctl_src)
+
+print("")
 print("Der Vertrag und die Spezifikation sagen es den Apps")
 
 SPEC = os.path.join(HERE, "..", "..", "oaap-spec")
