@@ -225,8 +225,17 @@ ok("und der Zeitplan wird per drop-in gesetzt, nicht in der ops-Unit",
 # Am laufenden Knoten aufgefallen: Der Code stand da, die Kommandozeile
 # kannte ihn nicht -- `oaap backup schedule` antwortete "invalid choice".
 # Eine Faehigkeit, die man nicht aufrufen kann, ist keine.
+# Nach der Liste gefragt, nicht nach ihrer Schreibweise: die Aussage ist
+# "man kommt an die Funktion heran", und die haengt nicht daran, welche
+# anderen Aktionen daneben stehen. Als Textvergleich ging die Pruefung
+# rot, als 0.1.112 'exclude'/'include'/'status' hinzufuegte -- ohne dass
+# irgendetwas an ihrer Aussage falsch geworden waere.
+import re as _re                                              # noqa: E402
+
+_choices = _re.search(r'pb\.add_argument\("action", choices=\[(.*?)\]',
+                      APPCTL, _re.S)
 ok("'schedule' ist eine gueltige Aktion von 'oaap backup'",
-   'choices=["create", "schedule"]' in APPCTL,
+   bool(_choices) and '"schedule"' in _choices.group(1),
    "sonst steht die Funktion da und niemand kommt an sie heran")
 ok("und cmd_backup reicht sie weiter",
    'if args.action == "schedule"' in APPCTL)

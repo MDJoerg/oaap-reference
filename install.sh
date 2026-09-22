@@ -508,7 +508,16 @@ if [ "$MODE" = "restore" ]; then
   elif [ ! -r "$RESTORE_FILE" ]; then
     errors+=("Cannot read backup file '$RESTORE_FILE'.")
   elif ! tar -tzf "$RESTORE_FILE" backup-manifest.json >/dev/null 2>&1; then
-    errors+=("'$RESTORE_FILE' is not an OAAP backup (no backup-manifest.json inside).")
+    if tar -tzf "$RESTORE_FILE" tenant-manifest.json >/dev/null 2>&1; then
+      # A TENANT archive (RFC-0029 D5). It holds real data and it is
+      # not restorable here: a whole-node restore replaces a machine,
+      # a tenant restore merges into a running one that has other
+      # customers on it. Said in its own words -- "not an OAAP backup"
+      # would be both wrong and alarming.
+      errors+=("'$RESTORE_FILE' is a TENANT archive (RFC-0029 D5), not a node backup. Merging one tenant into a running node is a separate problem and is not built yet. Its contents are listed with: tar -tzf '$RESTORE_FILE'")
+    else
+      errors+=("'$RESTORE_FILE' is not an OAAP backup (no backup-manifest.json inside).")
+    fi
   fi
 fi
 

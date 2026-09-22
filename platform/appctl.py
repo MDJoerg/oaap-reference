@@ -11398,14 +11398,344 @@ def backup_schedule_set(at="", keep=None, enabled=None):
             f"on this node — next run {nxt}")
 
 
-def cmd_backup(args):
-    """Offline-consistent platform backup: one self-contained archive."""
-    if args.action == "schedule":
-        return cmd_backup_schedule(args)
+def _platform_env():
+    """The installed platform's .env, or {} — read by both archives."""
+    try:
+        with open(os.path.join(APP_DIR, ".env"), encoding="utf-8") as f:
+            return dict(l.strip().split("=", 1) for l in f if "=" in l)
+    except OSError:
+        return {}
+
+
+# --- whose data an archive holds, and whose it deliberately does not ---
+# RFC-0029 D5 and D5b, and they belong together: exclusion is only
+# bearable once the excluded tenant can be archived by itself, and a
+# per-tenant archive is only useful once somebody may stop carrying that
+# tenant in the node archive. Built in that order for that reason.
+#
+# What changes about the operator's archive is not a detail. Today it is
+# "everything on this machine", which on a node with customers means the
+# operator holds every customer's complete data set wherever the backup
+# target happens to be. With exclusion it becomes "everything I am
+# responsible for" -- a more honest description of the duty, and a
+# smaller blast radius for a stolen archive.
+
+BACKUP_EXCLUSIONS = os.path.join(APPS_DIR, "backup-exclusions.json")
+
+
+def load_backup_exclusions():
+    """{tenant-id: {reason, who, since}} — tenants the node archive omits."""
+    try:
+        with open(BACKUP_EXCLUSIONS, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_backup_exclusions(ex):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = BACKUP_EXCLUSIONS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(ex, f, indent=2)
+    os.replace(tmp, BACKUP_EXCLUSIONS)
+
+
+def excluded_tenants():
+    """The live exclusions: only ids that still name a tenant of this node.
+
+    A stale id is ignored rather than trusted, the same posture as
+    load_profiles(). The difference matters more here: an exclusion that
+    outlived its tenant and then matched a NEW one would silently stop
+    backing up a customer nobody meant.
+    """
+    known = load_tenants()
+    return {t: v for t, v in load_backup_exclusions().items() if t in known}
+
+
+def tenant_instances(reg, tid):
+    return {k: i for k, i in (reg.get("instances") or {}).items()
+            if resolve_tenant(i.get("tenant")) == tid}
+
+
+def cmd_backup_exclude(args):
+    """`oaap backup exclude|include <label> [--reason ...]` (RFC-0029 D5b).
+
+    Three conditions came with this decision and none of them is
+    optional. Two of them live elsewhere -- the archive records what it
+    left out (cmd_backup), and a restore says it instead of discovering
+    it (cmd_restore_instances). The third is here: **the tenant has to
+    be able to see it.** Exclusion moves the risk onto the customer, and
+    that is a contract statement, not a checkbox. So it carries a reason
+    in the operator's own words and it lands in THAT tenant's audit log
+    -- the same counterweight that makes `server_admin` bearable
+    (RFC-0022 §6). A customer who is not backed up by the operator must
+    not learn it from the outage.
+    """
+    label = (args.target or "").strip().lower()
+    if not label:
+        die("name the tenant: oaap backup "
+            f"{args.action} <label> [--reason \"...\"]")
+    tid, t = tenant_by_label(label)
+    if not tid:
+        die(f"no tenant with label '{label}' on this node "
+            "(see: oaap tenant list)")
+    ex = load_backup_exclusions()
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.action == "include":
+        if tid not in ex:
+            print(f"Tenant '{label}' is already part of the node backup.")
+            return
+        ex.pop(tid)
+        save_backup_exclusions(ex)
+        audit_tenant("backup.included", tid, subject=label, who=who,
+                     role="root",
+                     detail="this tenant is part of the node backup again")
+        print(f"Tenant '{label}' is part of the node backup again.")
+        return
+    reason = (getattr(args, "reason", "") or "").strip()
+    if not reason:
+        # Refused rather than defaulted. "Excluded" without a reason is
+        # exactly the arrangement that fails quietly: a year later
+        # nobody knows whether somebody else is handling it or whether
+        # it was a mistake.
+        die("say why, in words the customer can read: "
+            f"oaap backup exclude {label} --reason \"...\". An exclusion "
+            "without a reason is a customer nobody is backing up and "
+            "nobody remembers deciding not to.")
+    reg = load_registry()
+    mine = tenant_instances(reg, tid)
+    ex[tid] = {"reason": reason, "who": who, "since": _iso_now(),
+               "label": (t or {}).get("label", label)}
+    save_backup_exclusions(ex)
+    audit_tenant("backup.excluded", tid, subject=label, who=who, role="root",
+                 detail=f"excluded from the node backup: {reason}")
+    print(f"Tenant '{label}' is excluded from the node backup.")
+    print(f"  Reason recorded: {reason}")
+    if mine:
+        print(f"  {len(mine)} instance(s) — {', '.join(sorted(mine))} — "
+              "keep running; only their DATA leaves the node archive.")
+    print("  This is in that tenant's own audit log, where they can read it.")
+    print(f"  Their own archive: sudo oaap backup create --tenant {label}")
+    print("  A restore of this node brings their instances back DORMANT "
+          "and says so.")
+
+
+def cmd_backup_status(_args):
+    """What the node archive currently holds, and what it does not."""
+    ex = excluded_tenants()
+    tenants = load_tenants()
+    reg = load_registry()
+    print(f"Tenants on this node: {len(tenants)}")
+    for tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
+        label = t.get("label", "?")
+        n = len(tenant_instances(reg, tid))
+        if tid in ex:
+            e = ex[tid]
+            print(f"  {label}: EXCLUDED from the node backup "
+                  f"({n} instance(s))")
+            print(f"    reason: {e.get('reason', '?')}")
+            print(f"    since {str(e.get('since', '?'))[:10]}, "
+                  f"by {e.get('who', '?')}")
+        else:
+            print(f"  {label}: in the node backup ({n} instance(s))")
+    if ex:
+        print("")
+        print("An archive of this node is NOT a complete copy of this "
+              "machine. It records whom it left out, and a restore says "
+              "so before it starts anything.")
+
+
+def _tenant_archive(tid, label, out_dir, out_file):
+    """One tenant's archive (RFC-0029 D5). Returns the path written.
+
+    What it is: everything this node holds that belongs to this tenant —
+    its instance subtree, its registry entries, its users, its audit log
+    and, where the node carries `store`, its twin schema.
+
+    What it is NOT, and the archive says so itself: something the
+    installer can restore. A whole-node restore REPLACES a machine;
+    restoring one tenant MERGES into a running node that has other
+    customers on it, and every question that makes hard is open — an
+    instance that exists now and did not then, a port somebody else has
+    taken, a name another tenant has claimed since, a user who is in
+    both. Answering those badly loses another customer's data while
+    restoring this one's. So the archive is produced and the merge is
+    not promised; that is a separate round (RFC-0029 D5).
+
+    Only this tenant's containers stop, and only for the copy — the
+    other customers on the machine never notice.
+    """
     import datetime
     import socket
     import time
 
+    reg = load_registry()
+    mine = tenant_instances(reg, tid)
+    t0 = time.monotonic()
+    stage = tempfile.mkdtemp(prefix="oaap-tenant-backup-")
+    out_path = os.path.join(out_dir, out_file)
+    tmp_tar = out_path[:-len(".tar.gz")] + ".part.tar"
+    tmp_out = out_path + ".tmp"
+
+    users = _read_identity_users()
+    if users is None:
+        shutil.rmtree(stage, ignore_errors=True)
+        die("cannot read the user store — run this as root "
+            "(sudo oaap backup create --tenant ...). A tenant archive "
+            "without its people is not a tenant archive.")
+    theirs = [u for u in users
+              if resolve_tenant(u.get("tenant")) == tid]
+    manifest = {
+        # A DIFFERENT name from the node archive's `backup-manifest.json`,
+        # deliberately: the installer looks for that one, and an archive
+        # it must not restore must not look restorable.
+        "backup_format": "tenant-0.1",
+        "scope": "tenant",
+        "tenant": tid, "tenant_label": label,
+        "platform_version": _platform_env().get("OAAP_VERSION", "unknown"),
+        "created": datetime.datetime.now(datetime.timezone.utc)
+                   .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hostname": socket.gethostname(),
+        "instances": {n: {"app_name": i.get("app_name", ""),
+                          "version": i.get("version", ""),
+                          "channel": i.get("channel", "")}
+                      for n, i in sorted(mine.items())},
+        "users": len(theirs),
+        "restorable": False,
+        "note": ("This archive holds one tenant. The installer cannot "
+                 "restore it: merging a tenant into a running node that "
+                 "has other customers on it is a separate, undecided "
+                 "problem (RFC-0029 D5). What this archive guarantees is "
+                 "that the data EXISTS outside this machine."),
+    }
+    subtree = os.path.join("tenants", tid)
+    if not os.path.isdir(os.path.join(DATA_DIR, subtree)):
+        subtree = ""
+    with open(os.path.join(stage, "tenant-manifest.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    with open(os.path.join(stage, "tenant-registry.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"instances": mine}, f, indent=2)
+    with open(os.path.join(stage, "tenant-users.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(theirs, f, indent=2)
+    os.chmod(os.path.join(stage, "tenant-users.json"), 0o600)
+    log = [e for e in read_tenant_log(tid, limit=10 ** 9)]
+    with open(os.path.join(stage, "tenant-audit.jsonl"), "w",
+              encoding="utf-8") as f:
+        for e in log:
+            f.write(json.dumps(e) + "\n")
+    files = ["tenant-manifest.json", "tenant-registry.json",
+             "tenant-users.json", "tenant-audit.jsonl"]
+    # The tenant's twin schema, where the node carries one (oaap.data.store
+    # 0.1). One schema, not the whole cluster: the other schemas belong
+    # to other customers and have no business in this file.
+    if has_profile("store") and _store_running():
+        schema = f"twin_{tid}"
+        try:
+            dump = run(["docker", "exec", "-u", "postgres", STORE_CONTAINER,
+                        "pg_dump", "-n", schema, "postgres"]).stdout
+            if dump.strip():
+                with open(os.path.join(stage, "tenant-store-dump.sql"), "w",
+                          encoding="utf-8") as f:
+                    f.write(dump)
+                files.append("tenant-store-dump.sql")
+        except subprocess.CalledProcessError:
+            shutil.rmtree(stage, ignore_errors=True)
+            die(f"the twin schema '{schema}' could not be dumped — nothing "
+                "was written. An archive that silently lacks a tenant's "
+                "twin is the failure this whole section exists to prevent.")
+
+    containers = [s["container"] for i in mine.values()
+                  for s in instance_services(i) if s.get("container")]
+    running = [c for c in run(["docker", "ps", "-q", "--filter",
+                               "name=^oaap-app-"]).stdout.split() if c]
+    stop = []
+    if containers:
+        ids = run(["docker", "ps", "-q", *sum(
+            (["--filter", f"name=^{c}$"] for c in containers), [])]).stdout.split()
+        stop = [c for c in ids if c in running] or ids
+    downtime = 0.0
+    written = False
+    try:
+        d0 = time.monotonic()
+        try:
+            if stop:
+                run(["docker", "stop", *stop])
+            args_tar = ["tar", "--numeric-owner", "-cpf", tmp_tar,
+                        "-C", stage, *files]
+            if subtree:
+                args_tar += ["-C", DATA_DIR, subtree]
+            run(args_tar)
+            os.chmod(tmp_tar, 0o600)
+        finally:
+            if stop:
+                subprocess.run(["docker", "start", *stop],
+                               capture_output=True, text=True)
+            downtime = time.monotonic() - d0
+        comp = "pigz" if shutil.which("pigz") else "gzip"
+        run([comp, "-f", tmp_tar])
+        os.replace(tmp_tar + ".gz", tmp_out)
+        os.chmod(tmp_out, 0o600)
+        # The same question the node archive learned to ask in 0.1.70,
+        # asked of THIS archive: does it hold the data of every instance
+        # this tenant has? A tenant archive that quietly contains none
+        # is the 9 KB archive again, one level down.
+        missing = _backup_missing_instances(tmp_out, {"instances": mine})
+        if missing:
+            die("the tenant archive does not contain the data of: "
+                + ", ".join(missing) + ". Nothing was written.")
+        os.replace(tmp_out, out_path)
+        written = True
+    except (subprocess.CalledProcessError, OSError) as e:
+        die(f"tenant backup failed: {e}")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        if not written:
+            for leftover in (tmp_tar, tmp_tar + ".gz", tmp_out):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+    size = os.path.getsize(out_path)
+    size_h = (f"{size / 1048576:.1f} MB" if size >= 1048576
+              else f"{size / 1024:.0f} KB")
+    print(f"Tenant archive written: {out_path} ({size_h}, "
+          f"{len(mine)} instance(s), {len(theirs)} user(s), "
+          f"app downtime {downtime:.0f}s of "
+          f"{time.monotonic() - t0:.0f}s total)")
+    print("Only this tenant's apps were stopped — the rest of the node "
+          "kept running.")
+    print("This archive CANNOT be restored by the installer. Merging one "
+          "tenant into a running node is a separate problem and is not "
+          "promised here (RFC-0029 D5); what it guarantees is that the "
+          "data exists outside this machine.")
+    return out_path
+
+
+def cmd_backup(args):
+    """Offline-consistent platform backup: one self-contained archive."""
+    if args.action == "schedule":
+        return cmd_backup_schedule(args)
+    if args.action in ("exclude", "include"):
+        return cmd_backup_exclude(args)
+    if args.action == "status":
+        return cmd_backup_status(args)
+    import datetime
+    import socket
+    import time
+
+    # Whose archive this is (RFC-0029 D5). Resolved before anything
+    # else, because it decides the file's NAME as well as its contents:
+    # a tenant archive that looks like a node archive is one an operator
+    # will one day hand to the installer.
+    want_tenant = (getattr(args, "tenant", "") or "").strip().lower()
+    tid, trec = (tenant_by_label(want_tenant) if want_tenant else (None, None))
+    if want_tenant and not tid:
+        die(f"no tenant with label '{want_tenant}' on this node "
+            "(see: oaap tenant list)")
     target = args.to or "/var/backups/oaap"
     if target.endswith(".tar.gz"):
         out_dir = os.path.abspath(os.path.dirname(target) or ".")
@@ -11413,7 +11743,9 @@ def cmd_backup(args):
     else:
         out_dir = os.path.abspath(target)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_file = f"oaap-backup-{socket.gethostname()}-{stamp}.tar.gz"
+        out_file = (f"oaap-tenant-{want_tenant}-{socket.gethostname()}-"
+                    f"{stamp}.tar.gz" if want_tenant else
+                    f"oaap-backup-{socket.gethostname()}-{stamp}.tar.gz")
     data_abs = os.path.abspath(DATA_DIR)
     if os.path.commonpath([out_dir, data_abs]) == data_abs:
         die(f"backup target {out_dir} lies inside the platform data directory "
@@ -11421,6 +11753,9 @@ def cmd_backup(args):
             "Choose an outside path with --to.")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, out_file)
+    if tid:
+        return _tenant_archive(tid, (trec or {}).get("label", want_tenant),
+                               out_dir, out_file)
 
     env = {}
     try:
@@ -11443,6 +11778,22 @@ def cmd_backup(args):
                           "channel": i["channel"]}
                       for n, i in sorted(reg["instances"].items())},
     }
+    # RFC-0029 D5b, condition 1: an archive MUST record what it
+    # deliberately left out. Without this a restore silently produces a
+    # node with a customer missing -- the same class of failure as the
+    # 9 KB archive that started this RFC, and discovered on the same
+    # day: the day the original is gone.
+    _ex = excluded_tenants()
+    _all_tenants = load_tenants()
+    manifest["tenants_included"] = sorted(
+        t.get("label", tid) for tid, t in _all_tenants.items()
+        if tid not in _ex)
+    manifest["tenants_excluded"] = [
+        {"tenant": tid, "label": _all_tenants[tid].get("label", tid),
+         "reason": e.get("reason", ""), "who": e.get("who", ""),
+         "since": e.get("since", ""),
+         "instances": sorted(tenant_instances(reg, tid))}
+        for tid, e in sorted(_ex.items())]
 
     # RFC-0029 D3: the apps stop for the COPY, not for the compression.
     #
@@ -11513,7 +11864,16 @@ def cmd_backup(args):
     # node mid-migration is complete either way.
     paths = ["app/.env", "apps", "data/identity"]
     if os.path.isdir(TENANTS_DIR):
-        paths.append("tenants")
+        if _ex:
+            # Named one by one rather than with an --exclude pattern: a
+            # pattern that matches nothing is indistinguishable from one
+            # that matches everything, and here the difference is a
+            # customer's data.
+            paths += [f"tenants/{t}" for t in sorted(_all_tenants)
+                      if t not in _ex
+                      and os.path.isdir(os.path.join(TENANTS_DIR, t))]
+        else:
+            paths.append("tenants")
     # The tenant audit log (oaap.core.tenant 1.7). Found missing by the
     # first real restore drill, 2026-09-05: the restored node came back
     # complete and said "No entries yet". It is the counterweight to "a
@@ -11581,7 +11941,14 @@ def cmd_backup(args):
         # ARCHIVE rather than the code is what makes the question
         # survive the next move -- it cannot be satisfied by a path that
         # is merely spelled correctly.
-        missing = _backup_missing_instances(tmp_out, reg)
+        # The excluded tenants' instances are absent ON PURPOSE, so
+        # they are not a defect -- but every OTHER instance still has to
+        # be there, and that is the check that caught the 2026-09-05
+        # gap. Narrowed here rather than weakened.
+        missing = _backup_missing_instances(
+            tmp_out, {"instances": {k: i for k, i in reg["instances"].items()
+                                    if resolve_tenant(i.get("tenant"))
+                                    not in _ex}})
         # Same question asked of the managed Postgres (oaap.data.store
         # 0.1, spec 2.4): a node profiled for it that fails to dump must
         # not produce an archive that calls itself complete.
@@ -11632,6 +11999,12 @@ def cmd_backup(args):
     print(f"Backup written: {out_path} ({size_h}, "
           f"{len(manifest['instances'])} app instance(s), "
           f"app downtime {downtime:.0f}s of {total:.0f}s total)")
+    for ent in manifest["tenants_excluded"]:
+        print(f"NOTE: tenant '{ent['label']}' is NOT in this archive "
+              f"({len(ent['instances'])} instance(s)) — {ent['reason']}")
+    if manifest["tenants_excluded"]:
+        print("      This archive is not a complete copy of this machine. "
+              "A restore brings those instances back dormant and says so.")
     # What the downtime actually was, written down where a page can read
     # it. RFC-0029 D1 asks the portal to say how long the apps will be
     # stopped -- with THIS node's last measured figure, not a general
@@ -11778,6 +12151,28 @@ def cmd_backup_schedule(args):
         die(str(e))
 
 
+def restored_exclusions():
+    """Which tenants the archive this node was restored from left out.
+
+    RFC-0029 D5b, condition 2: *the restore must say it, not discover
+    it.* Read from the manifest the installer extracted, not from the
+    node's own exclusion file -- the question here is what that ARCHIVE
+    contained, and the two can differ the moment somebody restores an
+    older archive.
+    """
+    try:
+        with open(os.path.join(DATA_DIR, "last-restore-manifest.json"),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for ent in (data.get("tenants_excluded") or []):
+        if ent.get("tenant"):
+            out[ent["tenant"]] = ent
+    return out
+
+
 def cmd_restore_instances(_args):
     """Used by 'install.sh restore': re-create every registered instance."""
     _report_dropped_profiles()
@@ -11785,8 +12180,35 @@ def cmd_restore_instances(_args):
     if not reg["instances"]:
         print("No app instances in the restored registry.")
         return
+    # Said BEFORE anything starts, because it changes what the operator
+    # should do next -- and because an instance coming up empty is the
+    # one thing that must never look like an instance coming up.
+    left_out = restored_exclusions()
+    if left_out:
+        print("")
+        print("!! This archive deliberately left tenants out (RFC-0029 D5b).")
+        for ent in left_out.values():
+            print(f"   {ent.get('label', '?')}: "
+                  f"{len(ent.get('instances') or [])} instance(s) — "
+                  f"{ent.get('reason', 'no reason recorded')}")
+        print("   Their registry entries came back, their DATA did not.")
+        print("   Those instances are NOT started here: an app that comes "
+              "up on an empty disk looks wiped, and somebody will believe "
+              "it.")
+        print("   Bring their data back from wherever it is kept, then "
+              "start them deliberately.")
+        print("")
     ok = skipped = 0
     for name, inst in sorted(reg["instances"].items()):
+        if resolve_tenant(inst.get("tenant")) in left_out:
+            # Dormant plus a loud sentence, rather than dropping the
+            # registry entry: a customer's instance silently vanishing
+            # from the registry is worse than one that says where its
+            # data is (RFC-0029 D5b, the sub-question).
+            print(f"DORMANT {name}: its tenant was excluded from this "
+                  "archive — the record is here, the data is not.")
+            skipped += 1
+            continue
         if is_rehearsal(inst):
             # A rehearsal is temporary by construction and it holds a
             # copy of customer data. Starting one on a machine that has
@@ -12273,8 +12695,18 @@ def main():
     pd = sub.add_parser("process-deploys")
     pd.set_defaults(fn=cmd_process_deploys)
     pb = sub.add_parser("backup")
-    pb.add_argument("action", choices=["create", "schedule"])
+    pb.add_argument("action", choices=["create", "schedule", "exclude",
+                                       "include", "status"])
+    pb.add_argument("target", nargs="?", help="tenant label for "
+                                              "exclude/include")
     pb.add_argument("--to", default="", help="target directory or .tar.gz file (outside the data dir)")
+    pb.add_argument("--tenant", default="",
+                    help="create: archive ONE tenant instead of the node "
+                         "(RFC-0029 D5). Such an archive is not restorable "
+                         "by the installer — see the note it prints")
+    pb.add_argument("--reason", default="",
+                    help="exclude: why, in words the customer can read — it "
+                         "goes into THEIR audit log")
     pb.add_argument("--at", default="", help="schedule: hour HH:MM (24h)")
     pb.add_argument("--keep", type=int, default=None,
                     help="schedule: how many archives stay on this node")
