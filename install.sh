@@ -594,6 +594,13 @@ if [ "$MODE" = "restore" ]; then
   if tar -tzf "$RESTORE_FILE" data/audit >/dev/null 2>&1; then
     RESTORE_PATHS="$RESTORE_PATHS data/audit"
   fi
+  # The byte store of RFC-0034 (`files/`). Asked of the ARCHIVE, like
+  # everything else here -- an archive from before 0.1.113 has none,
+  # and naming a path that is not inside makes tar fail the whole
+  # restore over a directory that was never meant to be there.
+  if tar -tzf "$RESTORE_FILE" files >/dev/null 2>&1; then
+    RESTORE_PATHS="$RESTORE_PATHS files"
+  fi
   if ! tar -tzf "$RESTORE_FILE" tenants >/dev/null 2>&1; then
     say "NOTE: this archive carries no tenants/ directory — it was taken"
     say "      before the instance tree moved there, or by a version with"

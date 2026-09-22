@@ -5654,6 +5654,211 @@ def cmd_address(args):
           "at their own pace.")
 
 
+# ------------------------------------------- oaap.data.files (RFC-0034 Stufe 1)
+# The bytes half of RFC-0034, and deliberately only that half. This
+# layer never sees a title, a link or an owner: it stores content and
+# returns it by hash. `oaap.data.documents` -- identity, metadata,
+# retention, the twin relation -- is the other half and is not built
+# here. The split is what makes this testable on its own (D1).
+#
+# The `local` backing of D11, and nothing else yet: the node's own
+# content-addressed store under the data directory. That placement is
+# the point. It is in the backup today, in the rehearsal today and in
+# the update path today, without one new component in any of the three.
+# External backings (s3, smb) are Stufe 4 and are where the interesting
+# questions live -- the ones RFC-0029 D5b just answered for tenants and
+# §7 here answers for bytes: a backup that REFERENCES instead of
+# copying has to say what it referenced.
+
+FILES_DIR = os.path.join(DATA_DIR, "files")
+
+
+class FilesRefused(Exception):
+    """A refusal a person can act on — same contract as PromotionRefused."""
+
+
+def files_tenant_dir(tenant):
+    return os.path.join(FILES_DIR, tenant)
+
+
+def files_path(tenant, sha):
+    """Where these bytes lie for this tenant.
+
+    `files/<tenant>/<hh>/<sha256>` -- the two-character fan-out is not
+    decoration. A single directory with a hundred thousand entries is
+    slow to list on every filesystem we target and unreadable on all of
+    them; 256 subdirectories keep both bearable.
+
+    The TENANT is part of the path and not a column, which is the whole
+    isolation story: one tenant's bytes are not addressable from another
+    tenant's repository, whatever they physically contain. The cost is
+    that identical content is stored twice on a node with two customers
+    who happen to hold the same file. That is deliberate (D11): dedup
+    across tenants would make one customer's storage bill and one
+    customer's deletion depend on another's, and would let the presence
+    of a hash answer a question about somebody else's data.
+    """
+    return os.path.join(files_tenant_dir(tenant), sha[:2], sha)
+
+
+def files_put(tenant, src, expect=""):
+    """Take these bytes into the tenant's store. Returns (sha256, stored).
+
+    `stored` is False when the content was already there -- the write is
+    idempotent because the name IS the content. `expect`, when given, is
+    the hash the caller believes it is storing; a mismatch refuses
+    rather than silently filing the bytes under their real hash, which
+    would turn a corrupted transfer into a successful upload.
+
+    Written to a temporary name in the same directory and renamed into
+    place, so a half-written file can never be found by its hash. An
+    interrupted put leaves a temporary the next put overwrites; it never
+    leaves a lie.
+    """
+    if not tenant:
+        raise FilesRefused("a file belongs to a tenant, and none was named")
+    if not os.path.isfile(src):
+        raise FilesRefused(f"no such file: {src}")
+    sha = _sha256_file(src)
+    if expect and not hmac.compare_digest(sha.lower(), expect.lower()):
+        raise FilesRefused(
+            f"the file hashes to {sha[:12]}…, but {expect[:12]}… was "
+            "expected — the transfer is damaged, and storing it would "
+            "record the damage as a fact")
+    dest = files_path(tenant, sha)
+    if os.path.isfile(dest):
+        return sha, False
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+    return sha, True
+
+
+def files_get(tenant, sha):
+    """The path of these bytes for this tenant, or None.
+
+    Asked with the tenant, always. A lookup by hash alone would make the
+    store a place where one customer can ask whether another holds a
+    given file -- and for many kinds of document, knowing that a
+    specific file exists IS the information.
+    """
+    if not tenant or not re.fullmatch(r"[0-9a-f]{64}", (sha or "").lower()):
+        return None
+    p = files_path(tenant, sha.lower())
+    return p if os.path.isfile(p) else None
+
+
+def files_walk(tenant=None):
+    """(tenant, sha, path, size) for everything in the store."""
+    if not os.path.isdir(FILES_DIR):
+        return
+    for t in sorted(os.listdir(FILES_DIR)):
+        if tenant and t != tenant:
+            continue
+        tdir = os.path.join(FILES_DIR, t)
+        if not os.path.isdir(tdir):
+            continue
+        for fan in sorted(os.listdir(tdir)):
+            fdir = os.path.join(tdir, fan)
+            if not os.path.isdir(fdir):
+                continue
+            for name in sorted(os.listdir(fdir)):
+                p = os.path.join(fdir, name)
+                if os.path.isfile(p) and not name.endswith(".part"):
+                    yield t, name, p, os.path.getsize(p)
+
+
+def files_verify(tenant=None):
+    """Re-read every file and check it against its own name.
+
+    Returns (checked, problems) where each problem is a sentence. This
+    is the one operation the content-addressed layout makes possible and
+    an ordinary directory does not: the store can be asked whether it
+    still holds what it says it holds, without any other record to
+    compare against.
+
+    Three kinds of problem, and they are different: a file whose content
+    no longer hashes to its name (silent corruption -- the case backups
+    exist for and the case nobody notices); a name that is not a hash at
+    all (something wrote into the store that is not this code); and a
+    file in the wrong fan-out directory (the same, less obviously).
+    """
+    checked, problems = 0, []
+    for t, name, path, _size in files_walk(tenant):
+        checked += 1
+        if not re.fullmatch(r"[0-9a-f]{64}", name):
+            problems.append(f"{t}: '{name}' is not a content hash — "
+                            "something other than the platform wrote here")
+            continue
+        if os.path.basename(os.path.dirname(path)) != name[:2]:
+            problems.append(f"{t}: {name[:12]}… lies in the wrong fan-out "
+                            "directory — it will not be found by its hash")
+            continue
+        got = _sha256_file(path)
+        if not hmac.compare_digest(got, name):
+            problems.append(
+                f"{t}: {name[:12]}… now hashes to {got[:12]}… — the content "
+                "changed under its own name. This is the corruption a "
+                "checksum exists to find; restore this file from a backup.")
+    return checked, problems
+
+
+def files_usage():
+    """{tenant: (count, bytes)} — what the store costs, per customer."""
+    out = {}
+    for t, _sha, _p, size in files_walk():
+        c, b = out.get(t, (0, 0))
+        out[t] = (c + 1, b + size)
+    return out
+
+
+def cmd_files(args):
+    """`oaap files status|put|get|verify` (RFC-0034 Stufe 1)."""
+    if args.action == "status":
+        usage = files_usage()
+        if not usage:
+            print("The file store is empty "
+                  f"({FILES_DIR} — created on first use).")
+            return
+        total = 0
+        for tid, (count, size) in sorted(usage.items()):
+            total += size
+            print(f"{tenant_label(tid) or tid}: {count} file(s), "
+                  f"{size / 1048576:.1f} MB")
+        print(f"Total: {total / 1048576:.1f} MB in {FILES_DIR}")
+        print("This lies in the data directory, so it is in the backup "
+              "and in the rehearsal already (RFC-0034 §3.3).")
+        return
+    tid = resolve_tenant_arg(getattr(args, "tenant", "")) or ensure_default_tenant()
+    try:
+        if args.action == "put":
+            if not args.target:
+                die("name the file: oaap files put <path> [--tenant <label>]")
+            sha, stored = files_put(tid, args.target,
+                                    expect=getattr(args, "sha256", ""))
+            print(f"{sha}  {'stored' if stored else 'already present'}")
+            if not stored:
+                print("  Identical content is kept once per tenant, never "
+                      "across tenants (RFC-0034 D11).")
+        elif args.action == "get":
+            p = files_get(tid, args.target or "")
+            if not p:
+                die("no such content in this tenant's store")
+            print(p)
+        elif args.action == "verify":
+            checked, problems = files_verify(
+                tid if getattr(args, "tenant", "") else None)
+            for line in problems:
+                print(f"PROBLEM {line}")
+            print(f"{checked} file(s) checked, {len(problems)} problem(s).")
+            if problems:
+                die("the file store does not hold what it says it holds")
+    except FilesRefused as e:
+        die(str(e))
+
+
 def resolve_tenant_arg(label):
     """Turn a --tenant label from the command line into an id.
 
@@ -11609,9 +11814,9 @@ def _tenant_archive(tid, label, out_dir, out_file):
                  "problem (RFC-0029 D5). What this archive guarantees is "
                  "that the data EXISTS outside this machine."),
     }
-    subtree = os.path.join("tenants", tid)
-    if not os.path.isdir(os.path.join(DATA_DIR, subtree)):
-        subtree = ""
+    subtrees = [d for d in (os.path.join("tenants", tid),
+                            os.path.join("files", tid))
+                if os.path.isdir(os.path.join(DATA_DIR, d))]
     with open(os.path.join(stage, "tenant-manifest.json"), "w",
               encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -11627,7 +11832,7 @@ def _tenant_archive(tid, label, out_dir, out_file):
               encoding="utf-8") as f:
         for e in log:
             f.write(json.dumps(e) + "\n")
-    files = ["tenant-manifest.json", "tenant-registry.json",
+    parts = ["tenant-manifest.json", "tenant-registry.json",
              "tenant-users.json", "tenant-audit.jsonl"]
     # The tenant's twin schema, where the node carries one (oaap.data.store
     # 0.1). One schema, not the whole cluster: the other schemas belong
@@ -11641,7 +11846,7 @@ def _tenant_archive(tid, label, out_dir, out_file):
                 with open(os.path.join(stage, "tenant-store-dump.sql"), "w",
                           encoding="utf-8") as f:
                     f.write(dump)
-                files.append("tenant-store-dump.sql")
+                parts.append("tenant-store-dump.sql")
         except subprocess.CalledProcessError:
             shutil.rmtree(stage, ignore_errors=True)
             die(f"the twin schema '{schema}' could not be dumped — nothing "
@@ -11665,9 +11870,9 @@ def _tenant_archive(tid, label, out_dir, out_file):
             if stop:
                 run(["docker", "stop", *stop])
             args_tar = ["tar", "--numeric-owner", "-cpf", tmp_tar,
-                        "-C", stage, *files]
-            if subtree:
-                args_tar += ["-C", DATA_DIR, subtree]
+                        "-C", stage, *parts]
+            if subtrees:
+                args_tar += ["-C", DATA_DIR, *subtrees]
             run(args_tar)
             os.chmod(tmp_tar, 0o600)
         finally:
@@ -11882,6 +12087,23 @@ def cmd_backup(args):
     # restore that drops it silently hands the operator a clean slate.
     if os.path.isdir(AUDIT_DIR):
         paths.append("data/audit")
+    # The byte store of RFC-0034 (`files/`, §3.3). Found while building
+    # it, and it is the 2026-09-05 shape exactly: "it lies in the data
+    # directory, so it is in the backup" is FALSE here, because this
+    # archives a written LIST of paths, not the directory. A new
+    # subdirectory is invisible to a list nobody updated -- and
+    # invisible in the only way that matters, since the command would
+    # still succeed and the archive would still restore.
+    #
+    # Named per tenant where tenants are excluded, for the same reason
+    # as `tenants/` above: an excluded customer's bytes are their bytes.
+    if os.path.isdir(FILES_DIR):
+        if _ex:
+            paths += [f"files/{t}" for t in sorted(_all_tenants)
+                      if t not in _ex
+                      and os.path.isdir(files_tenant_dir(t))]
+        else:
+            paths.append("files")
 
     def copy_phase():
         """The only part the apps have to stand still for."""
@@ -12715,6 +12937,17 @@ def main():
     pb.add_argument("--refresh", action="store_true",
                     help="schedule: only rewrite what the timer says")
     pb.set_defaults(fn=cmd_backup)
+    pf = sub.add_parser("files",
+                        help="the byte store of RFC-0034 (Stufe 1, local)")
+    pf.add_argument("action", choices=["status", "put", "get", "verify"])
+    pf.add_argument("target", nargs="?", help="a path for 'put', a hash "
+                                              "for 'get'")
+    pf.add_argument("--tenant", default="",
+                    help="whose store — default: this node's own")
+    pf.add_argument("--sha256", default="",
+                    help="put: the hash the caller believes it is storing; "
+                         "a mismatch refuses")
+    pf.set_defaults(fn=cmd_files)
     pri = sub.add_parser("restore-instances")
     pri.set_defaults(fn=cmd_restore_instances)
     ps = sub.add_parser("store")
