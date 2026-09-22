@@ -23,16 +23,29 @@
 # clients are never forwarded. On protected routes forward_auth
 # overwrites them from the auth response; on public routes we strip
 # them explicitly here.
+#
+# There are FIVE of them since RFC-0040 — user, roles, user id, display
+# name, e-mail. The list is written out here and derived from
+# appctl.IDENTITY_HEADERS in every generated site; the two must agree,
+# and test_user_identity.py checks that they do. A header forgotten in
+# one of the strip blocks below is not a missing feature, it is an app
+# believing a name a visitor typed.
 :80 {
 	handle /auth/* {
 		request_header -X-OAAP-User
 		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
 		reverse_proxy identity:8000
 	}
 
 	handle /setup* {
 		request_header -X-OAAP-User
 		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
 		reverse_proxy portal:8000
 	}
 
@@ -43,6 +56,9 @@
 	handle /platform/* {
 		request_header -X-OAAP-User
 		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
 		uri strip_prefix /platform
 		root * /etc/caddy/static
 		file_server
@@ -55,6 +71,9 @@
 	handle /deploy/* {
 		request_header -X-OAAP-User
 		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
 		reverse_proxy portal:8000
 	}
 
@@ -64,6 +83,9 @@
 	handle /fleet/* {
 		request_header -X-OAAP-User
 		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
 		reverse_proxy portal:8000
 	}
 
@@ -86,7 +108,7 @@
 	handle /twin/* {
 		forward_auth identity:8000 {
 			uri /verify?roles=user&instance=oaap.twin
-			copy_headers X-OAAP-User X-OAAP-Roles
+			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email
 			header_up -Connection
 			header_up -Upgrade
 		}
@@ -104,7 +126,7 @@
 	handle /broker/* {
 		forward_auth identity:8000 {
 			uri /verify?roles=user
-			copy_headers X-OAAP-User X-OAAP-Roles
+			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email
 			header_up -Connection
 			header_up -Upgrade
 		}
@@ -118,7 +140,7 @@
 	handle {
 		forward_auth identity:8000 {
 			uri /verify
-			copy_headers X-OAAP-User X-OAAP-Roles
+			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email
 			# The auth call is a plain GET — never hand it the
 			# handshake's hop-by-hop headers. The WSGI server answers
 			# those with 400, and forward_auth returns that to the

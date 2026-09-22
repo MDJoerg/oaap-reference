@@ -215,7 +215,10 @@ def identity_fn(name):
 profile_form = identity_fn("profile_form")
 profile_change = identity_fn("profile_change")
 ok("GET /auth/profile requires a session, like /auth/password",
-   "session_username()" in profile_form and "/auth/login" in profile_form,
+   "session_username()" in profile_form
+   # login_redirect() since RFC-0040 -- the same redirect, now carrying
+   # the page the caller wanted so they land back on it after signing in.
+   and ("/auth/login" in profile_form or "login_redirect()" in profile_form),
    profile_form)
 ok("POST /auth/profile writes display_name and nothing else -- no roles, "
    "groups, tenant, active or username field is ASSIGNED in this route "
@@ -227,10 +230,13 @@ ok("POST /auth/profile writes display_name and nothing else -- no roles, "
    and 'u["active"] =' not in profile_change
    and 'u["username"] =' not in profile_change,
    profile_change)
+# The limit is spelled DISPLAY_NAME_MAX since RFC-0040 (one constant,
+# because the internal API now enforces the same 80 characters).
+_limit = next((x for x in ("len(name) > DISPLAY_NAME_MAX", "len(name) > 80")
+               if x in profile_change), "")
 ok("an over-long display name is refused with no change made",
-   "len(name) > 80" in profile_change
-   and profile_change.index("len(name) > 80")
-   < profile_change.index('u["display_name"] ='),
+   bool(_limit)
+   and profile_change.index(_limit) < profile_change.index('u["display_name"] ='),
    profile_change)
 
 

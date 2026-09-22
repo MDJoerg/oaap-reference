@@ -381,6 +381,21 @@ USER_EDIT_BODY = """
   <div class="card">
     <h2>Stammdaten</h2>
     <label>Anzeigename <input type="text" name="display_name" value="{{ u.display_name }}"></label>
+    <label>E-Mail-Adresse <input type="email" name="email" value="{{ u.email }}"
+           placeholder="name@beispiel.de"></label>
+    <label class="checkline"><input type="checkbox" name="email_verified"
+        {{ 'checked' if u.email_verified }}>Diese Adresse ist geprüft</label>
+    <p class="muted">Setz das Häkchen nur, wenn Du <em>weißt</em>, dass die
+       Adresse der Person gehört — Apps bekommen eine Adresse erst dann zu
+       sehen, und was in einer Plattform-Kopfzeile steht, gilt dort als
+       bewiesen. <strong>Änderst Du die Adresse, fällt das Häkchen</strong>:
+       eine geänderte Adresse hat niemand geprüft. Häkchen setzen ist dann
+       ein zweites, bewusstes Speichern.</p>
+    {% if u.id %}
+    <p class="muted">Kennung: <code>{{ u.id }}</code> — daran hängen Apps
+       ihre Berechtigungen (<code>X-OAAP-User-Id</code>). Sie ändert sich
+       nie und wird nie wieder vergeben; der Benutzername ist ein Name.</p>
+    {% endif %}
     {% if tenant_of %}
     <p class="muted">Mandant: <strong>{{ tenant_of }}</strong> — steht beim
        Anlegen fest und ändert sich nicht. Jemanden in einen anderen Mandanten
@@ -446,6 +461,11 @@ was sie darf, darf jeder, der an ihr steht oder ihren Schlüssel hat.</p>
            title="Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)"></label>
     <label>Anzeigename <input type="text" name="display_name" value="{{ form.display_name }}"></label>
     {% if form.kind != 'machine' %}
+    <label>E-Mail-Adresse (optional) <input type="email" name="email"
+           value="{{ form.email }}" placeholder="name@beispiel.de"></label>
+    <p class="muted">Wird als <strong>ungeprüft</strong> gespeichert und
+       Apps deshalb noch nicht gezeigt. Das Häkchen „geprüft" setzt Du
+       danach auf der Benutzerseite — bewusst ein eigener Schritt.</p>
     <label>Startpasswort (mind. 8 Zeichen) <input type="password" name="password"
            minlength="8" required autocomplete="new-password"></label>
     {% endif %}
@@ -3176,7 +3196,7 @@ def _tenant_choices():
 
 def _new_user_form():
     return {"username": "", "display_name": "", "roles": ["user"],
-            "groups": [], "tenant": ""}
+            "groups": [], "tenant": "", "email": ""}
 
 
 def _key_form(**over):
@@ -3445,6 +3465,7 @@ def users_create():
     form = {
         "username": request.form.get("username", "").strip(),
         "display_name": request.form.get("display_name", ""),
+        "email": request.form.get("email", "").strip(),
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
         "tenant": request.form.get("tenant", ""),
@@ -3499,15 +3520,31 @@ def users_update(username):
     denied = require_user_admin()
     if denied:
         return denied
+    email = request.form.get("email", "").strip()
+    asserted = request.form.get("email_verified") == "on"
     resp = INTERNAL.put(f"{IDENTITY}/internal/users/{username}", json={
         "display_name": request.form.get("display_name", ""),
+        "email": email,
+        "email_verified": asserted,
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
         "active": request.form.get("active") == "on",
         "actor": caller_name(),
     }, timeout=5)
     if resp.status_code == 200:
-        return redirect(f"/users/{username}?msg={quote('Gespeichert.')}", code=303)
+        # Identity refuses to carry an assertion across a CHANGED
+        # address (RFC-0040 §3.2). Say so here rather than let the
+        # administrator leave the page believing the tick took: a
+        # silently dropped "this address is proven" is exactly the kind
+        # of quiet no this platform keeps getting caught by.
+        done = next((x for x in identity_users()
+                     if x["username"] == username), None)
+        msg = "Gespeichert."
+        if asserted and done is not None and not done.get("email_verified"):
+            msg = ("Gespeichert. Das Häkchen „geprüft“ wurde NICHT "
+                   "übernommen, weil sich die Adresse geändert hat — "
+                   "setz es jetzt noch einmal.")
+        return redirect(f"/users/{username}?msg={quote(msg)}", code=303)
     return redirect(f"/users/{username}?err={quote(resp.json().get('error', 'Speichern fehlgeschlagen.'))}", code=303)
 
 

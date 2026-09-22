@@ -168,7 +168,12 @@ twin_route = caddy_src.split("handle /twin/*")[1].split("\n\thandle")[0]
 ok("the route goes through identity's real /verify, not a bespoke check",
    "forward_auth identity:8000" in twin_route and "uri /verify" in twin_route)
 ok("the verified principal and roles are handed to the twin service",
-   "copy_headers X-OAAP-User X-OAAP-Roles" in twin_route)
+   # Against appctl.IDENTITY_HEADERS rather than a literal list: the
+   # set grew from two to five with RFC-0040, and a test holding its
+   # own copy would have failed for the change instead of guarding it.
+   all(h in twin_route.split("copy_headers")[1].split("\n")[0]
+       for h in m.IDENTITY_HEADERS),
+   twin_route)
 ok("the route carries '?instance=' scoped to TWIN_KEY_SCOPE -- an "
    "unscoped key here would authenticate against every other app's "
    "own route asking only role 'user' in the same tenant, not only "

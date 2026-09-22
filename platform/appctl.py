@@ -3392,17 +3392,23 @@ def _twin_issue_instance_key(name, tenant_id):
     by testing the very thing this docstring used to claim was safe.
     """
     principal = f"instance:{name}"
+    # Through users_rw()/save_users(), like every other write since
+    # RFC-0040: the lock, and an `id` on the new record. A creation
+    # path that bypassed save_users() would be the one place producing
+    # a principal without an identity -- and an app anchoring on
+    # X-OAAP-User-Id would anchor on an empty string, silently.
     out = _identity_exec(
         "import json, os, app as m\n"
-        "users = m.load_users()\n"
-        "name = os.environ['OAAP_T_NAME']\n"
-        "if not m.find_user(users, name):\n"
-        "    users.append({'username': name,\n"
-        "                  'display_name': os.environ['OAAP_T_INST'],\n"
-        "                  'password_hash': '', 'kind': 'machine',\n"
-        "                  'roles': ['user'], 'groups': [],\n"
-        "                  'tenant': os.environ['OAAP_T_TENANT'], 'active': True})\n"
-        "    m._save(m.USERS_FILE, users)\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_T_INST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
         "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
         "    'oaap.data.twin (RFC-0031 E1)', m.KEY_MAX_DAYS, 'root')\n"
         "print(json.dumps(secret))\n",
@@ -3464,6 +3470,44 @@ def _throttle_block(scope, throttle, edge):
 # in it. Without this, App Deployment Contract guarantee 7 (WebSocket
 # and SSE pass through) does not hold on ANY authenticated route.
 _AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
+
+# ---------------------------------------------------------------------------
+# THE IDENTITY HEADERS, IN ONE PLACE (RFC-0002 guarantee 1, RFC-0040 §3.3)
+#
+# There were two; RFC-0040 makes it five. Each of them has to appear in
+# three different kinds of place, and forgetting one is a different bug
+# every time:
+#
+#   - `copy_headers` on every forward_auth call. A header missing here
+#     never reaches the app: the identity it carries is simply absent,
+#     and an app told to anchor on `X-OAAP-User-Id` anchors on nothing.
+#   - `request_header -<name>` on every route the gateway does NOT
+#     authenticate. A header missing here is the anti-spoofing hole:
+#     whatever the client sent travels on to the app, which is entitled
+#     to believe it.
+#   - the access log's field filter. A header missing there writes a
+#     person's name and e-mail address into a file that is not part of
+#     the backup and belongs to the node operator.
+#
+# So the list is written ONCE and every place derives from it. This is
+# the fifth time in this codebase that an identifier was added or moved
+# and a reader stayed behind; the answer is not to be more careful but
+# to leave nowhere to be careless.
+IDENTITY_HEADERS = ("X-OAAP-User", "X-OAAP-Roles", "X-OAAP-User-Id",
+                    "X-OAAP-Display-Name", "X-OAAP-Email")
+
+_COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
+
+
+def strip_identity(indent="\t\t"):
+    """Drop every client-sent identity header (contract guarantee 1)."""
+    return [f"{indent}request_header -{h}" for h in IDENTITY_HEADERS]
+
+
+def _log_header_name(h):
+    """The same header as Caddy's log writes its key: canonical case."""
+    return h.replace("X-OAAP-", "X-Oaap-")
+
 
 # Every reload of the gateway -- and every deployment of ANY app on the
 # node reloads it -- used to cut every open WebSocket/SSE stream of
@@ -3639,8 +3683,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     # RFC does not turn on permanent per-instance logging.
     lines = list(diagnose_site_lines(scope))
     lines.append("\thandle /auth/* {")
-    lines.append("\t\trequest_header -X-OAAP-User")
-    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines += strip_identity()
     lines.append("\t\treverse_proxy identity:8000")
     lines.append("\t}")
     # longest prefix first; catch-all "/" last
@@ -3674,8 +3717,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
                 lines.append(f"\t\tpath {r['path']}*")
             lines.append("\t}")
             lines.append(f"\thandle @preflight{idx} {{")
-            lines.append("\t\trequest_header -X-OAAP-User")
-            lines.append("\t\trequest_header -X-OAAP-Roles")
+            lines += strip_identity()
             lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
             lines.append("\t}")
         lines.append(f"\thandle{matcher} {{")
@@ -3699,15 +3741,14 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
                 uri += f"&instance={scope}"
             lines.append("\t\tforward_auth identity:8000 {")
             lines.append(f"\t\t\turi {uri}")
-            lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
+            lines.append("\t\t\t" + _COPY_IDENTITY)
             lines += _AUTH_NO_UPGRADE
             lines.append("\t\t}")
         else:
             # Public route: nothing overwrites the headers, so strip
             # client-sent identity headers explicitly (contract guarantee 1).
             lines += _throttle_block(scope, throttle, edge)
-            lines.append("\t\trequest_header -X-OAAP-User")
-            lines.append("\t\trequest_header -X-OAAP-Roles")
+            lines += strip_identity()
         target_c, target_p = container, svc_port
         if services and r.get("service") in services:
             target_c, target_p = services[r["service"]]
@@ -3793,8 +3834,11 @@ def _log_filter(indent):
         f'{i}\t\trequest>uri regexp "\\?.*$" ""',
         f"{i}\t\trequest>headers>Authorization replace {REDACTED}",
         f"{i}\t\trequest>headers>Cookie replace {REDACTED}",
-        f"{i}\t\trequest>headers>X-Oaap-User delete",
-        f"{i}\t\trequest>headers>X-Oaap-Roles delete",
+        # All five, from the one list (RFC-0040): two of the new ones
+        # are a person's name and their e-mail address, and this log is
+        # not part of the backup and is read by the node's operator.
+    ] + [f"{i}\t\trequest>headers>{_log_header_name(h)} delete"
+         for h in IDENTITY_HEADERS] + [
         f"{i}\t\trequest>headers>Proxy-Authorization delete",
         f"{i}\t\tresp_headers>Set-Cookie delete",
         f'{i}\t\tresp_headers>Location regexp "\\?.*$" ""',
@@ -3824,33 +3868,29 @@ def _portal_site_body():
     """Handler block for the platform apex (portal, auth, setup, hook)."""
     lines = []
     lines.append("\thandle /auth/* {")
-    lines.append("\t\trequest_header -X-OAAP-User")
-    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines += strip_identity()
     lines.append("\t\treverse_proxy identity:8000")
     lines.append("\t}")
     lines.append("\thandle /setup* {")
-    lines.append("\t\trequest_header -X-OAAP-User")
-    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines += strip_identity()
     lines.append("\t\treverse_proxy portal:8000")
     lines.append("\t}")
     # deploy hook (runtime spec 2.5): bearer token instead of session —
     # the portal validates the token, so no forward_auth here
     lines.append("\thandle /deploy/* {")
-    lines.append("\t\trequest_header -X-OAAP-User")
-    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines += strip_identity()
     lines.append("\t\treverse_proxy portal:8000")
     lines.append("\t}")
     # fleet status (RFC-0021): read-only, guarded by a fleet key the
     # portal validates — no session, no identity headers
     lines.append("\thandle /fleet/* {")
-    lines.append("\t\trequest_header -X-OAAP-User")
-    lines.append("\t\trequest_header -X-OAAP-Roles")
+    lines += strip_identity()
     lines.append("\t\treverse_proxy portal:8000")
     lines.append("\t}")
     lines.append("\thandle {")
     lines.append("\t\tforward_auth identity:8000 {")
     lines.append("\t\t\turi /verify")
-    lines.append("\t\t\tcopy_headers X-OAAP-User X-OAAP-Roles")
+    lines.append("\t\t\t" + _COPY_IDENTITY)
     lines += _AUTH_NO_UPGRADE
     lines.append("\t\t}")
     lines.append("\t\treverse_proxy portal:8000")
@@ -4560,13 +4600,16 @@ def _scrub_record(e):
     if isinstance(uri, str) and "?" in uri:
         req["uri"] = uri.split("?", 1)[0]
         changed = True
-    for where, name, action in (("request", "Authorization", "replace"),
-                                ("request", "Cookie", "replace"),
-                                ("request", "Proxy-Authorization", "delete"),
-                                ("request", "X-Oaap-User", "delete"),
-                                ("request", "X-Oaap-Roles", "delete"),
-                                ("resp", "Set-Cookie", "delete"),
-                                ("resp", "Location", "query")):
+    rules = [("request", "Authorization", "replace"),
+             ("request", "Cookie", "replace"),
+             ("request", "Proxy-Authorization", "delete")]
+    # Same five as _log_filter, from the same list -- a header the live
+    # filter drops but the scrubber does not would stay in every line
+    # written before this version.
+    rules += [("request", _log_header_name(h), "delete")
+              for h in IDENTITY_HEADERS]
+    rules += [("resp", "Set-Cookie", "delete"), ("resp", "Location", "query")]
+    for where, name, action in rules:
         headers = (req.get("headers") if where == "request"
                    else e.get("resp_headers")) or {}
         if name not in headers:
@@ -6693,16 +6736,22 @@ def cmd_machine(args):
         die(f"this node has no tenant '{args.tenant}'")
     out = _identity_exec(
         "import json, os, sys, app as m\n"
-        "users = m.load_users()\n"
-        "name = os.environ['OAAP_M_NAME']\n"
-        "if m.find_user(users, name):\n"
-        "    print('exists', file=sys.stderr); sys.exit(1)\n"
-        "users.append({'username': name, 'display_name': os.environ['OAAP_M_TITLE'],\n"
-        "              'password_hash': '', 'kind': 'machine',\n"
-        "              'roles': json.loads(os.environ['OAAP_M_ROLES']),\n"
-        "              'groups': json.loads(os.environ['OAAP_M_GROUPS']),\n"
-        "              'tenant': os.environ['OAAP_M_TENANT'], 'active': True})\n"
-        "m._save(m.USERS_FILE, users)\n"
+        # users_rw() holds the lock across the name check and the
+        # append (RFC-0040 D6): two `machine add` runs at once would
+        # otherwise both find the name free and one would be lost.
+        # save_users() gives the new principal its id.
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_M_NAME']\n"
+        "    if m.find_user(users, name):\n"
+        "        print('exists', file=sys.stderr); sys.exit(1)\n"
+        "    users.append({'username': name,\n"
+        "                  'display_name': os.environ['OAAP_M_TITLE'],\n"
+        "                  'password_hash': '', 'kind': 'machine',\n"
+        "                  'roles': json.loads(os.environ['OAAP_M_ROLES']),\n"
+        "                  'groups': json.loads(os.environ['OAAP_M_GROUPS']),\n"
+        "                  'tenant': os.environ['OAAP_M_TENANT'],\n"
+        "                  'active': True})\n"
+        "    m.save_users(users)\n"
         "print('ok')\n",
         {"OAAP_M_NAME": name, "OAAP_M_TITLE": args.title or "",
          "OAAP_M_ROLES": json.dumps(roles), "OAAP_M_GROUPS": json.dumps(groups),
@@ -6865,18 +6914,18 @@ def cmd_user(args):
     out = _identity_exec(
         "import os, sys, app as m\n"
         "from werkzeug.security import generate_password_hash\n"
-        "users = m.load_users()\n"
-        "u = m.find_user(users, os.environ['OAAP_CLI_USERNAME'])\n"
-        "if not u:\n"
-        "    print('no such user: ' + os.environ['OAAP_CLI_USERNAME'], file=sys.stderr)\n"
-        "    sys.exit(1)\n"
-        "u['password_hash'] = generate_password_hash(os.environ['OAAP_CLI_PASSWORD'])\n"
+        "with m.users_rw() as users:\n"
+        " u = m.find_user(users, os.environ['OAAP_CLI_USERNAME'])\n"
+        " if not u:\n"
+        "  print('no such user: ' + os.environ['OAAP_CLI_USERNAME'], file=sys.stderr)\n"
+        "  sys.exit(1)\n"
+        " u['password_hash'] = generate_password_hash(os.environ['OAAP_CLI_PASSWORD'])\n"
         # invalidates every existing session for this user (same
         # mechanism as a self-service password change, spec 2.3) — a
         # rescue reset should not leave an old, possibly-compromised
         # session valid.
-        "u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
-        "m._save(m.USERS_FILE, users)\n"
+        " u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
+        " m.save_users(users)\n"
         "print('password reset for ' + u['username'] + ' -- existing sessions were signed out')\n",
         {"OAAP_CLI_USERNAME": args.username, "OAAP_CLI_PASSWORD": password})
     print(out.strip())

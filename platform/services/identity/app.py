@@ -10,13 +10,16 @@ on every call — sessions carry only the username, never roles — so
 role changes and deactivation act on the user's next request.
 """
 
+import contextlib
 import json
 import os
 import re
 import secrets
 import tempfile
 import time
+import uuid
 from datetime import timedelta
+from urllib.parse import quote
 
 from flask import (Flask, make_response, redirect, render_template_string,
                    request, session)
@@ -57,6 +60,30 @@ ASSIGNABLE_ROLES = ("server_admin", "tenant_admin", "support", "admin",
 # is why a tenant_admin may hand it out like any other app-facing role.
 NODE_WIDE_ROLES = frozenset({"server_admin", "support"})
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
+
+# RFC-0040: the person behind the name.
+#
+# THE IDENTITY. Every user record carries a UUID that is assigned once,
+# never changed and never reused -- not even after deactivation. It is
+# what an app anchors on; `username` goes back to being what it always
+# was, a name. UUID rather than the short hex RFC-0026 gave instances,
+# because this identifier will be mapped one-to-one onto a foreign
+# provider's subject claim (RFC-0040 §6) and it leaves the node.
+#
+# THE ADDRESS. `email` plus `email_verified`. The platform sends no
+# mail in this version, so the flag is set only by an administrator
+# asserting it or, later, by the verification flow a foreign identity
+# provider brings. Setting a DIFFERENT address clears the flag -- an
+# address that changed is an address nobody proved.
+#
+# Deliberately loose validation: one '@', something on either side of
+# it, no spaces, no control characters, 254 characters at most. The
+# platform is not the arbiter of address syntax (RFC 5322 allows more
+# than anyone wants to implement), and the flag, not the regex, is what
+# says whether an address is real.
+EMAIL_MAX = 254
+EMAIL_RE = re.compile(r"^[^\s@,;<>\"]+@[^\s@,;<>\".]+(\.[^\s@,;<>\".]+)+$")
+DISPLAY_NAME_MAX = 80
 # Free-form visibility tags (RFC-0007) — no registry, a group exists
 # the moment any user carries it. Kept short and simple like usernames.
 GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
@@ -64,7 +91,7 @@ GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 # API keys (RFC-0027). A key is the second way to answer the one
 # question /verify asks -- WHICH PRINCIPAL IS THIS -- and nothing after
 # that answer knows the difference: roles, visibility groups, tenant and
-# the two headers are the same code for a cookie and for a key.
+# the identity headers are the same code for a cookie and for a key.
 #
 # Presented as `Authorization: Bearer oaapk_<id>_<secret>`. The id
 # travels in clear so the audit log and the portal can name a key
@@ -264,11 +291,112 @@ def _save(path, data):
     os.replace(tmp, path)
 
 
+# ---------------------------------------------------------------------------
+# THE WRITE LOCK ON THE USER FILE (RFC-0040 §4, D6)
+#
+# Every change to a user goes read -> modify -> write-whole-file. Two of
+# those at the same time lose one of the changes, and lose it silently:
+# the second writer's file is complete and valid, it simply does not
+# contain what the first one did.
+#
+# Today that is nearly unreachable -- an administrator creates accounts
+# one at a time through the portal. It stops being unreachable the
+# moment records are created by INCOMING TRAFFIC, which is exactly what
+# a foreign identity provider brings (RFC-0040 §6) and what
+# self-registration needs. RFC-0040 fixes it now rather than in the RFC
+# that needs it, because by then the bug is live.
+#
+# The service already knew how: _braked_note() takes an exclusive flock
+# for precisely this reason. It was simply never applied to the file
+# that matters most.
+#
+# THE LOCK MUST SPAN THE READ. A lock around the write alone fixes
+# nothing -- the stale copy was read before it was taken. So the unit is
+# `with users_rw() as users:`, which holds the lock across load, change
+# and save. Reads (verify, whoami, authority) stay lock-free: _save()
+# swaps the file in with os.replace(), so a reader sees the old file or
+# the new one, never half of either.
+USERS_LOCK_FILE = os.path.join(DATA_DIR, "users.lock")
+
+
+@contextlib.contextmanager
+def _users_lock():
+    """Exclusive lock for a read-modify-write of the user file.
+
+    A lock FILE of its own, never users.json itself: _save() replaces
+    that file, so a lock held on it would be a lock on an inode nobody
+    writes to any more.
+
+    On a platform without fcntl (a developer's Windows machine running
+    the tests) this is a no-op -- said out loud rather than hidden,
+    because the guarantee it makes is then absent. The service itself
+    only ever runs in a Linux container.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    fd = os.open(USERS_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def users_rw():
+    """The user store, open for change: lock, load, hand over.
+
+    The caller mutates the list and calls save_users() on it INSIDE the
+    block -- or returns without saving, which is a legitimate outcome
+    (a validation error changes nothing). Either way the lock is held
+    from before the read until after the write.
+    """
+    with _users_lock():
+        yield load_users()
+
+
+def save_users(users):
+    """Write the user store back. Only ever called inside users_rw().
+
+    Assigns an `id` to any record that lacks one, so a creation path
+    that forgets cannot produce a record without an identity. That has
+    happened four times in this codebase with other identifiers: a path
+    was rebuilt and one writer stayed on the old one. Here the missing
+    field would not be an error anybody sees -- it would be an app
+    anchoring its permissions on an empty string.
+
+    Takes no lock of its own: flock is per file descriptor, so opening
+    the lock file a second time in the same process would wait for a
+    lock this process already holds. The lock belongs to users_rw().
+    """
+    for u in users:
+        if not u.get("id"):
+            u["id"] = new_user_id()
+    _save(USERS_FILE, users)
+
+
+def new_user_id():
+    """A fresh user identity (RFC-0040 D1): a UUID, never reused."""
+    return str(uuid.uuid4())
+
+
 def load_users():
     users = _load(USERS_FILE, [])
     for u in users:
         u.setdefault("display_name", "")
         u.setdefault("active", True)
+        # RFC-0040 §3.1: the identity, as opposed to the name. Read as
+        # "" when absent so that no reader crashes on a hand-edited
+        # file; _backfill_user_ids() below makes absent a state that
+        # does not survive a restart, and save_users() one that does
+        # not survive a write.
+        u.setdefault("id", "")
+        # RFC-0040 §3.2: the address, and whether anybody proved it.
+        u.setdefault("email", "")
+        u.setdefault("email_verified", False)
         # Sessions are stateless (signed cookie, no server-side store) —
         # logout alone cannot invalidate a copy of the cookie held
         # elsewhere (another tab/window, browser history). This counter,
@@ -312,14 +440,14 @@ def _migrate_tenant_once():
     tid = default_tenant_id()
     if not tid:
         return
-    users = load_users()
-    changed = False
-    for u in users:
-        if not u.get("tenant"):
-            u["tenant"] = tid
-            changed = True
-    if changed:
-        _save(USERS_FILE, users)
+    with users_rw() as users:
+        changed = False
+        for u in users:
+            if not u.get("tenant"):
+                u["tenant"] = tid
+                changed = True
+        if changed:
+            save_users(users)
     state["tenant_migrated"] = True
     _save(STATE_FILE, state)
 
@@ -334,17 +462,17 @@ def _migrate_server_admin_once():
     state = _load(STATE_FILE, {})
     if state.get("server_admin_migrated"):
         return
-    users = load_users()
-    changed = False
-    for u in users:
-        if "admin" in u["roles"] and "server_admin" not in u["roles"]:
-            u["roles"] = sorted(set(u["roles"]) | {"server_admin"})
-            changed = True
-    if changed:
-        _save(USERS_FILE, users)
-        print(f"RFC-0008 migration: granted server_admin to "
-              f"{sum(1 for u in users if 'server_admin' in u['roles'])} existing admin(s)",
-              flush=True)
+    with users_rw() as users:
+        changed = False
+        for u in users:
+            if "admin" in u["roles"] and "server_admin" not in u["roles"]:
+                u["roles"] = sorted(set(u["roles"]) | {"server_admin"})
+                changed = True
+        if changed:
+            save_users(users)
+            print(f"RFC-0008 migration: granted server_admin to "
+                  f"{sum(1 for u in users if 'server_admin' in u['roles'])} existing admin(s)",
+                  flush=True)
     state["server_admin_migrated"] = True
     _save(STATE_FILE, state)
 
@@ -370,25 +498,51 @@ def _migrate_support_once():
     state = _load(STATE_FILE, {})
     if state.get("support_migrated"):
         return
-    users = load_users()
-    changed = False
-    for u in users:
-        if "partner" in u["roles"] and "support" not in u["roles"]:
-            u["roles"] = sorted(set(u["roles"]) | {"support"})
-            changed = True
-    if changed:
-        _save(USERS_FILE, users)
-        print(f"RFC-0039 migration: granted support to "
-              f"{sum(1 for u in users if 'support' in u['roles'])} existing "
-              f"partner(s) -- review who should keep 'partner'",
-              flush=True)
+    with users_rw() as users:
+        changed = False
+        for u in users:
+            if "partner" in u["roles"] and "support" not in u["roles"]:
+                u["roles"] = sorted(set(u["roles"]) | {"support"})
+                changed = True
+        if changed:
+            save_users(users)
+            print(f"RFC-0039 migration: granted support to "
+                  f"{sum(1 for u in users if 'support' in u['roles'])} existing "
+                  f"partner(s) -- review who should keep 'partner'",
+                  flush=True)
     state["support_migrated"] = True
     _save(STATE_FILE, state)
+
+
+def _backfill_user_ids():
+    """RFC-0040 §7: every existing user receives an `id` on the first
+    start after the update, written once.
+
+    DELIBERATELY WITHOUT A STATE FLAG, unlike the three migrations
+    above. Those change what a record MEANS (a role granted, a tenant
+    joined), so repeating them would undo an operator's cleanup -- the
+    flag is what makes them safe. Filling in a missing identity changes
+    no meaning and is idempotent: a record that has one is left alone.
+
+    Without the flag this also heals the cases a flag would miss -- a
+    users.json restored from a backup older than the update, a file
+    edited by hand on the machine, a creation path nobody thought of.
+    Together with save_users() it means a user record without an
+    identity survives neither a write nor a restart.
+    """
+    with users_rw() as users:
+        missing = [u for u in users if not u.get("id")]
+        if not missing:
+            return
+        save_users(users)
+        print(f"RFC-0040: assigned a stable id to {len(missing)} existing "
+              f"user record(s)", flush=True)
 
 
 _migrate_server_admin_once()
 _migrate_support_once()
 _migrate_tenant_once()
+_backfill_user_ids()
 
 
 def find_user(users, username):
@@ -410,10 +564,149 @@ def public_user(u):
     it cannot filter by something it is not told. This record goes to
     the portal over the key-protected internal API and to `oaap user
     list` on the machine — never to an app, and never into a header.
+
+    Carries the RFC-0040 identity and address since 0.4.0. `id` so the
+    portal can show an administrator the thing apps anchor on --
+    otherwise the one field a support question is about would be
+    visible nowhere. `email` WITH its verification flag, always
+    together: an address shown without it invites the reader to believe
+    it, which is the same mistake D2 keeps out of the headers.
     """
     return {"username": u["username"], "display_name": u["display_name"],
             "roles": u["roles"], "groups": u["groups"], "active": u["active"],
-            "tenant": u.get("tenant", ""), "kind": u.get("kind", "human")}
+            "tenant": u.get("tenant", ""), "kind": u.get("kind", "human"),
+            "id": u.get("id", ""), "email": u.get("email", ""),
+            "email_verified": bool(u.get("email_verified"))}
+
+
+def _header_value(value):
+    """A header value an app can always percent-decode (RFC-0040 D4).
+
+    HTTP header values are not a safe place for arbitrary Unicode, and
+    the failure is not a clean error -- it is mojibake in one app and a
+    dropped header in another, found in production. A display name is
+    "Jörg Müller"; an e-mail local part can be worse.
+
+    Plain whenever the value is printable ASCII WITHOUT a percent sign
+    -- the common case, and it stays readable for whoever is looking at
+    it. Otherwise UTF-8 percent-encoded.
+
+    The percent sign is what makes the rule total. An ASCII name
+    containing one ("100% sicher") would be indistinguishable from an
+    escape sequence, so it is encoded as well -- which is why the
+    instruction to apps can be the simple one: ALWAYS percent-decode.
+    A rule with an exception is a rule half the apps will get wrong.
+    """
+    if value and all(32 <= ord(c) < 127 for c in value) and "%" not in value:
+        return value
+    return quote(value, safe="", encoding="utf-8")
+
+
+def identity_headers(user):
+    """The trusted headers the gateway copies onto the app's request.
+
+    ALWAYS all five, empty where there is no value, never a shorter
+    list. The gateway's anti-spoofing guarantee works by OVERWRITING
+    what the client sent (deployment contract guarantee 1); a header
+    this answer leaves out is a header whose client-sent value has
+    nothing to overwrite it. So absent is expressed as empty, not as
+    missing, and apps are told to read the two the same way.
+
+    `X-OAAP-Email` carries a PROVEN address or nothing (RFC-0040 D2).
+    An address in a platform header will be treated as proven whatever
+    flag stands next to it, so an unverified one is not handed over at
+    all. hbsha asked for the address plus a flag; this is the narrower
+    answer, and it can be widened later without breaking anybody.
+    """
+    return {
+        "X-OAAP-User": user["username"],
+        "X-OAAP-Roles": ",".join(user["roles"]),
+        "X-OAAP-User-Id": user.get("id", ""),
+        "X-OAAP-Display-Name": _header_value(user.get("display_name") or ""),
+        "X-OAAP-Email": (_header_value(user.get("email") or "")
+                         if user.get("email_verified") else ""),
+    }
+
+
+# The originally requested address, carried through the login (RFC-0040
+# §5). An invitation link is the ordinary case this fixes: today the
+# path and query are lost and only the instance survives, so a person
+# who follows an invitation lands on the app's start page and the token
+# in the link is gone.
+RETURN_MAX = 512
+
+# Paths that are never a place to send somebody back to.
+#
+# /auth/login and /auth/logout are the obvious ones: the flow that just
+# ran is not the destination.
+#
+# /verify and /throttle are the SAFETY NET for the day the gateway stops
+# telling us the original address. _requested_uri() then falls back to
+# the request identity actually sees -- which on a forward-auth call is
+# the verify call itself. Without this line that fallback would produce
+# a return target of "/verify?roles=user": a login that lands on a
+# 204 with no page. Named here rather than guarded at the call site,
+# because the fallback is exactly the path nobody will be watching.
+NOT_A_RETURN = frozenset({"/auth/login", "/auth/logout", "/auth/terminal",
+                          "/verify", "/throttle"})
+
+
+def _return_target(raw):
+    """A place inside this platform, or "" (RFC-0040 D5).
+
+    A return target taken from a URL is the classic open-redirect hole:
+    a link to our own login page that sends the visitor to somebody
+    else's site AFTER they signed in, which is where a convincing
+    phishing page belongs. So only a local path passes, and the rule is
+    written here once rather than trusted to a code review.
+
+    Refused: anything not starting with a single "/" (a scheme, a bare
+    word), "//host" and "/\\host" -- the second because browsers have
+    historically read a backslash as a slash, so it is protocol-relative
+    to a browser and local-looking to a regex. Control characters,
+    because a header cannot carry them and a splitter might. And the
+    platform's own auth plumbing (NOT_A_RETURN below), because bouncing
+    back into the flow that just ran is a loop, not a return.
+    """
+    if not raw or len(raw) > RETURN_MAX:
+        return ""
+    if not raw.startswith("/") or raw[:2] in ("//", "/\\"):
+        return ""
+    if any(ord(c) < 32 or ord(c) == 127 for c in raw):
+        return ""
+    if raw.split("?", 1)[0].rstrip("/") in NOT_A_RETURN:
+        return ""
+    return raw
+
+
+
+def _requested_uri():
+    """Where the caller was actually going.
+
+    On a forward-auth call that is the gateway's X-Forwarded-Uri -- the
+    only place the original address still exists, because the request
+    identity sees was rewritten to /verify. Read whole, NOT through
+    _forwarded(): that helper takes the first comma-separated element,
+    and a URI may legitimately contain a comma.
+
+    On a direct call (identity's own pages, reached through the
+    reserved /auth/* handler) the request itself is the answer.
+    """
+    fwd = request.headers.get("X-Forwarded-Uri", "")
+    if fwd:
+        return fwd
+    return request.full_path[:-1] if request.full_path.endswith("?") \
+        else request.full_path
+
+
+def login_redirect():
+    """Send an unauthenticated visitor to the login form -- and remember
+    where they were going (RFC-0040 §5).
+    """
+    target = _return_target(_requested_uri())
+    if not target or target == "/":
+        return redirect("/auth/login", code=303)
+    return redirect("/auth/login?next=" + quote(target, safe=""), code=303)
 
 
 def other_active_server_admin_exists(users, username):
@@ -673,11 +966,11 @@ def _by_session():
     if (not user or not user["active"]
             or session.get("epoch") != user.get("session_epoch", 0)):
         session.clear()
-        return None, "session", redirect("/auth/login", code=303)
+        return None, "session", login_redirect()
     kid = session.get("terminal_key")
     if kid and not _terminal_key_ok(kid):
         session.clear()
-        return None, "session", redirect("/auth/login", code=303)
+        return None, "session", login_redirect()
     return user, "session", None
 
 
@@ -752,6 +1045,7 @@ LOGIN_PAGE = _HEAD + "<title>Anmelden — OAAP</title>" + _CARD_STYLE + _MARK_SV
   Installationsausgabe).</p>
 {% endif %}
 <form method="post" action="/auth/login">
+{% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
   <label>Benutzername <input name="username" autofocus autocomplete="username"></label>
   <label>Passwort <input name="password" type="password" autocomplete="current-password"></label>
   <button>Anmelden</button>
@@ -796,11 +1090,11 @@ PROFILE_PAGE = _HEAD + "<title>Profil — OAAP</title>" + _CARD_STYLE + _MARK_SV
 @app.get("/auth/profile")
 def profile_form():
     if not session_username():
-        return redirect("/auth/login", code=303)
+        return login_redirect()
     users = load_users()
     u = find_user(users, session_username() or "")
     if not u or not u["active"]:
-        return redirect("/auth/login", code=303)
+        return login_redirect()
     return render_template_string(
         PROFILE_PAGE, error=None, done=False,
         display_name=u.get("display_name") or "")
@@ -816,17 +1110,19 @@ def profile_change():
     previously stuck behind "ask an admin" for no security reason: a
     misspelled or outdated display name carries no privilege.
     """
-    users = load_users()
-    u = find_user(users, session_username() or "")
-    if not u or not u["active"]:
-        return redirect("/auth/login", code=303)
     name = (request.form.get("display_name") or "").strip()
-    if len(name) > 80:
-        return render_template_string(
-            PROFILE_PAGE, error="Der Anzeigename darf höchstens 80 Zeichen haben.",
-            done=False, display_name=name[:80]), 400
-    u["display_name"] = name
-    _save(USERS_FILE, users)
+    with users_rw() as users:
+        u = find_user(users, session_username() or "")
+        if not u or not u["active"]:
+            return login_redirect()
+        if len(name) > DISPLAY_NAME_MAX:
+            return render_template_string(
+                PROFILE_PAGE,
+                error=f"Der Anzeigename darf höchstens {DISPLAY_NAME_MAX} "
+                      "Zeichen haben.",
+                done=False, display_name=name[:DISPLAY_NAME_MAX]), 400
+        u["display_name"] = name
+        save_users(users)
     print(f"profile changed: {u['username']} (display_name)", flush=True)
     return render_template_string(PROFILE_PAGE, error=None, done=True,
                                   display_name=name)
@@ -1000,15 +1296,14 @@ def verify():
         mine = resolve_tenant(user.get("tenant"))
         if want is None or mine is None or want != mine:
             return "Forbidden: this app belongs to another tenant", 403
-    return "", 204, {
-        "X-OAAP-User": user["username"],
-        "X-OAAP-Roles": ",".join(user["roles"]),
-    }
+    return "", 204, identity_headers(user)
 
 
 @app.get("/auth/login")
 def login_form():
-    return render_template_string(LOGIN_PAGE, error=None, has_users=bool(load_users()))
+    return render_template_string(
+        LOGIN_PAGE, error=None, has_users=bool(load_users()),
+        next=_return_target(request.args.get("next", "")))
 
 
 @app.post("/auth/login")
@@ -1016,11 +1311,15 @@ def login():
     users = load_users()
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
+    # Validated again on the way out, not only on the way in: the form
+    # travels through the visitor's browser, so what comes back is an
+    # input like any other (RFC-0040 D5).
+    target = _return_target(request.form.get("next", ""))
     throttle_key = f"{_client_ip()}|{username}"
     if _login_blocked(throttle_key):
         return render_template_string(
             LOGIN_PAGE, error="Zu viele Fehlversuche — bitte eine Minute warten.",
-            has_users=bool(users)), 429
+            has_users=bool(users), next=target), 429
     u = find_user(users, username)
     # Generic error either way — no username enumeration (spec 4.4).
     # A machine principal has no password (RFC-0027 3.1) and must not
@@ -1033,11 +1332,16 @@ def login():
         session["user"] = u["username"]
         session["epoch"] = u.get("session_epoch", 0)
         print(f"login ok: {u['username']} from {_client_ip()}", flush=True)
-        return redirect("/", code=303)
+        # Back to where they were going, or the start page (RFC-0040
+        # §5). The instance always survived, because the browser stays
+        # on the same hostname; the path and query did not, which is
+        # what turned every invitation link into a landing on "/".
+        return redirect(target or "/", code=303)
     _login_failed(throttle_key)
     print(f"login failed: '{username}' from {_client_ip()}", flush=True)
     return render_template_string(
-        LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.", has_users=bool(users)
+        LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.",
+        has_users=bool(users), next=target
     ), 401
 
 
@@ -1046,11 +1350,11 @@ def _revoke_sessions(username):
     cookie immediately (see load_users()/verify()) — used by logout and
     password change, since a signed cookie cannot otherwise be revoked.
     """
-    users = load_users()
-    u = find_user(users, username)
-    if u:
-        u["session_epoch"] = u.get("session_epoch", 0) + 1
-        _save(USERS_FILE, users)
+    with users_rw() as users:
+        u = find_user(users, username)
+        if u:
+            u["session_epoch"] = u.get("session_epoch", 0) + 1
+            save_users(users)
 
 
 TERMINAL_DONE = """
@@ -1114,38 +1418,42 @@ def logout():
         _revoke_sessions(username)
         print(f"logout: {username}", flush=True)
     session.clear()
+    # No return target here, deliberately (RFC-0040 §5 is about a
+    # refused request, not a deliberate sign-out): somebody who signs
+    # out asked to LEAVE the page they were on, and sending them back
+    # to it after the next login would undo that.
     return redirect("/auth/login", code=303)
 
 
 @app.get("/auth/password")
 def password_form():
     if not session_username():
-        return redirect("/auth/login", code=303)
+        return login_redirect()
     return render_template_string(PASSWORD_PAGE, error=None, done=False)
 
 
 @app.post("/auth/password")
 def password_change():
     """Self-service password change (spec 2.4)."""
-    users = load_users()
-    u = find_user(users, session_username() or "")
-    if not u or not u["active"]:
-        return redirect("/auth/login", code=303)
-    if not check_password_hash(u["password_hash"], request.form.get("current", "")):
-        return render_template_string(
-            PASSWORD_PAGE, error="Das aktuelle Passwort stimmt nicht.", done=False), 403
-    new = request.form.get("new", "")
-    if len(new) < 8:
-        return render_template_string(
-            PASSWORD_PAGE, error="Das neue Passwort braucht mindestens 8 Zeichen.", done=False), 400
-    u["password_hash"] = generate_password_hash(new)
-    # Standard practice: a password change signs out every OTHER copy of
-    # this user's cookie. Keep this browser signed in by advancing its
-    # own session to match (else the request right after this one would
-    # find itself logged out too).
-    u["session_epoch"] = u.get("session_epoch", 0) + 1
-    session["epoch"] = u["session_epoch"]
-    _save(USERS_FILE, users)
+    with users_rw() as users:
+        u = find_user(users, session_username() or "")
+        if not u or not u["active"]:
+            return login_redirect()
+        if not check_password_hash(u["password_hash"], request.form.get("current", "")):
+            return render_template_string(
+                PASSWORD_PAGE, error="Das aktuelle Passwort stimmt nicht.", done=False), 403
+        new = request.form.get("new", "")
+        if len(new) < 8:
+            return render_template_string(
+                PASSWORD_PAGE, error="Das neue Passwort braucht mindestens 8 Zeichen.", done=False), 400
+        u["password_hash"] = generate_password_hash(new)
+        # Standard practice: a password change signs out every OTHER copy of
+        # this user's cookie. Keep this browser signed in by advancing its
+        # own session to match (else the request right after this one would
+        # find itself logged out too).
+        u["session_epoch"] = u.get("session_epoch", 0) + 1
+        session["epoch"] = u["session_epoch"]
+        save_users(users)
     print(f"password changed: {u['username']} (other sessions revoked)", flush=True)
     return render_template_string(PASSWORD_PAGE, error=None, done=True)
 
@@ -1190,8 +1498,17 @@ def whoami():
     links = {"logout": "/auth/logout"}
     if user.get("kind", "human") != "machine":
         links["password"] = "/auth/password"
+    # RFC-0040: the same three values the headers carry, for the same
+    # reason `roles` is here -- a page that can read one truth should
+    # not have to guess the other. NOT percent-encoded: this is JSON,
+    # which carries Unicode natively, and D4's encoding exists only
+    # because HTTP headers do not. `email` follows D2 exactly: a proven
+    # address or an empty string, never an unproven one with a flag.
     return ({"username": user["username"],
+             "id": user.get("id", ""),
              "display_name": user.get("display_name") or "",
+             "email": ((user.get("email") or "")
+                       if user.get("email_verified") else ""),
              "roles": list(user["roles"]),
              "kind": user.get("kind", "human"),
              "method": method,
@@ -1532,12 +1849,23 @@ def internal_throttle_braked():
 
 @app.post("/internal/setup")
 def internal_setup():
-    """Create the first admin. Called by the portal's first-run wizard."""
+    """Create the first admin. Called by the portal's first-run wizard.
+
+    Under the user-file lock (RFC-0040 D6) like every other write: two
+    wizard submissions arriving together would both find the store
+    empty, and the second would overwrite the first -- leaving a node
+    whose one administrator cannot sign in with the password its
+    operator just chose.
+    """
+    with _users_lock():
+        return _first_admin()
+
+
+def _first_admin():
     state = _load(STATE_FILE, {})
     if state.get("setup_done"):
         return {"error": "Die Einrichtung ist bereits abgeschlossen; das Token ist nicht mehr gültig."}, 410
-    users = load_users()
-    if users:
+    if load_users():
         return {"error": "Es existieren bereits Benutzer."}, 409
 
     body = request.get_json(force=True)
@@ -1551,7 +1879,13 @@ def internal_setup():
 
     _save(USERS_FILE, [{
         "username": username,
+        # RFC-0040 §3.1: the first user gets an identity like every
+        # other one. Written here rather than left to the backfill so
+        # that the very first record on a node is complete.
+        "id": new_user_id(),
         "display_name": "",
+        "email": "",
+        "email_verified": False,
         "password_hash": generate_password_hash(password),
         # RFC-0008: the initial user gets both server_admin (platform
         # authority — can designate further server admins) and admin
@@ -1580,6 +1914,17 @@ def _validated_roles(raw):
     if not roles:
         raise ValueError("Mindestens eine gültige Rolle ist erforderlich.")
     return sorted(set(roles))
+
+
+def _validated_email(raw):
+    """An address, or "" (RFC-0040 §3.2). Never a guess."""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if len(value) > EMAIL_MAX or not EMAIL_RE.fullmatch(value):
+        raise ValueError("Das sieht nicht wie eine E-Mail-Adresse aus "
+                         "(name@beispiel.de).")
+    return value
 
 
 def _validated_groups(raw):
@@ -1728,7 +2073,17 @@ def users_create():
     role, actor_tenant, err = authority(actor_name)
     if not role:
         return {"error": err or "Nicht berechtigt."}, 403
-    users = load_users()
+    # Under the lock from here (RFC-0040 D6): the duplicate-name check
+    # and the append have to be one indivisible step, or two requests
+    # naming the same user both find it free and one of them is lost.
+    # That is unreachable while an administrator types names in the
+    # portal, and ordinary the moment records appear through incoming
+    # traffic (RFC-0040 §4).
+    with users_rw() as users:
+        return _create_user(body, users, actor_name, role, actor_tenant)
+
+
+def _create_user(body, users, actor_name, role, actor_tenant):
     username = (body.get("username") or "").strip()
     if not USERNAME_RE.fullmatch(username):
         return {"error": "Benutzername: Kleinbuchstaben/Ziffern/._- (2–40 Zeichen)."}, 400
@@ -1743,6 +2098,7 @@ def users_create():
     try:
         roles = _validated_roles(body.get("roles"))
         groups = _validated_groups(body.get("groups"))
+        email = _validated_email(body.get("email"))
     except ValueError as e:
         return {"error": str(e)}, 400
     # Which tenant the account is created into (spec 2.2). A
@@ -1773,7 +2129,15 @@ def users_create():
                          "halten (RFC-0027 D2)."}, 400
     users.append({
         "username": username,
-        "display_name": (body.get("display_name") or "").strip(),
+        # RFC-0040 D1: assigned here, at creation, and never again.
+        "id": new_user_id(),
+        "display_name": (body.get("display_name") or "").strip()[:DISPLAY_NAME_MAX],
+        # An address an administrator types is not thereby proven. The
+        # flag is set in a separate, deliberate step (users_update), so
+        # that asserting "this address is real" is never something that
+        # happens as a side effect of filling in a form.
+        "email": email,
+        "email_verified": False,
         "password_hash": ("" if kind == "machine"
                           else generate_password_hash(body["password"])),
         "kind": kind,
@@ -1782,7 +2146,7 @@ def users_create():
         "tenant": tenant,
         "active": True,
     })
-    _save(USERS_FILE, users)
+    save_users(users)
     audit("user.create", tenant, username, who=actor_name, role=role,
           detail=("machine, " if kind == "machine" else "")
                  + "roles: " + ",".join(roles))
@@ -1796,7 +2160,11 @@ def users_update(username):
     role, actor_tenant, err = authority(actor_name)
     if not role:
         return {"error": err or "Nicht berechtigt."}, 403
-    users = load_users()
+    with users_rw() as users:
+        return _update_user(username, body, users, actor_name, role, actor_tenant)
+
+
+def _update_user(username, body, users, actor_name, role, actor_tenant):
     u = find_user(users, username)
     # "Not found", not "forbidden", for a user of another tenant: the
     # difference between the two answers tells a tenant_admin that the
@@ -1810,6 +2178,7 @@ def users_update(username):
     try:
         roles = _validated_roles(body.get("roles"))
         groups = _validated_groups(body.get("groups"))
+        email = _validated_email(body.get("email"))
     except ValueError as e:
         return {"error": str(e)}, 400
     active = bool(body.get("active", True))
@@ -1822,19 +2191,43 @@ def users_update(username):
         return {"error": "Das ist der letzte aktive server_admin — "
                          "bitte zuerst jemand anderem server_admin geben."}, 409
     was_roles, was_active = list(u["roles"]), u["active"]
+    was_email, was_verified = u.get("email", ""), bool(u.get("email_verified"))
     u["roles"] = roles
     u["groups"] = groups
     u["active"] = active
-    u["display_name"] = (body.get("display_name") or "").strip()
+    u["display_name"] = (body.get("display_name") or "").strip()[:DISPLAY_NAME_MAX]
+    # RFC-0040 §3.2: a CHANGED address is an address nobody proved, so
+    # the flag falls with it -- the caller cannot keep an old assertion
+    # alive under a new address by simply not mentioning the flag. An
+    # unchanged address keeps whatever the request says, which is how an
+    # administrator asserts one ("I know this person, this is their
+    # address"), the only writer of the flag until an identity provider
+    # brings a verification flow (§6).
+    u["email"] = email
+    u["email_verified"] = (bool(body.get("email_verified"))
+                           and bool(email) and email == was_email)
     # The tenant is deliberately NOT settable here (spec 2.2): moving a
     # user between tenants is moving a person between customers, and the
     # honest form of that is a new account, not a field edit.
-    _save(USERS_FILE, users)
+    # The `id` is not settable at all, by anybody, ever (RFC-0040 D1) --
+    # it is not in this list, and there is no request that puts it there.
+    save_users(users)
     detail = "roles: " + ",".join(roles)
     if set(was_roles) != set(roles):
         detail += " (was " + ",".join(was_roles) + ")"
     if was_active != active:
         detail += "; deactivated" if not active else "; reactivated"
+    if was_email != email:
+        detail += "; e-mail set" if email else "; e-mail removed"
+    if u["email_verified"] != was_verified:
+        detail += ("; e-mail asserted as verified" if u["email_verified"]
+                   else "; e-mail no longer verified")
+    elif bool(body.get("email_verified")) and not u["email_verified"]:
+        # Said in the log, not swallowed: the caller asked for the
+        # assertion and did not get it, because the address changed in
+        # the same request. A silent "no" here is how an administrator
+        # comes to believe an address was proven.
+        detail += "; verification refused (the address changed)"
     audit("user.change", resolve_tenant(u.get("tenant")) or "", username,
           who=actor_name, role=role, detail=detail)
     return {"ok": True}
@@ -1847,14 +2240,14 @@ def users_set_password(username):
     role, actor_tenant, err = authority(actor_name)
     if not role:
         return {"error": err or "Nicht berechtigt."}, 403
-    users = load_users()
-    u = find_user(users, username)
-    if not u or not may_see(role, actor_tenant, u):
-        return {"error": "Benutzer nicht gefunden."}, 404
-    if len(body.get("password") or "") < 8:
-        return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
-    u["password_hash"] = generate_password_hash(body["password"])
-    _save(USERS_FILE, users)
+    with users_rw() as users:
+        u = find_user(users, username)
+        if not u or not may_see(role, actor_tenant, u):
+            return {"error": "Benutzer nicht gefunden."}, 404
+        if len(body.get("password") or "") < 8:
+            return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
+        u["password_hash"] = generate_password_hash(body["password"])
+        save_users(users)
     audit("user.password", resolve_tenant(u.get("tenant")) or "", username,
           who=actor_name, role=role)
     return {"ok": True}
