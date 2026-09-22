@@ -1736,6 +1736,43 @@ def cmd_migrate_tenant_routes(_args):
           "on the unauthenticated preflight that precedes it.")
 
 
+def cmd_migrate_tenant_places(_args):
+    """Write the tenant places into a node that updated into RFC-0042.
+
+    The sites are generated, so a node that changes nothing after the
+    update would keep an `external.caddy` without them -- the address
+    would exist in the code and nowhere on the machine. Written once
+    here, quiet and idempotent afterwards.
+
+    Reloads rather than restarts the gateway: a restart cuts every open
+    connection of every app on the node, and this change touches none
+    of them (the 0.1.109 lesson).
+    """
+    host = load_external()
+    want = [f for f, _t in tenant_place_hosts(host)]
+    if not want:
+        return
+    path = os.path.join(CADDY_APPS_DIR, "external.caddy")
+    try:
+        with open(path, encoding="utf-8") as f:
+            have = f.read()
+    except OSError:
+        have = ""
+    missing = [f for f in want if f"://{f} {{" not in have]
+    if not missing:
+        return
+    print("")
+    print("Giving each tenant its own address (RFC-0042) ...")
+    refresh_generated_sites()
+    reload_gateway()
+    for f in missing:
+        print(f"  {f}")
+    print(f"  {len(missing)} tenant address(es) now answer. The portal is")
+    print("  what answers there, scoped to that tenant -- and a login is")
+    print("  required, exactly as on this node's own address.")
+    print("  Nothing was cut: the gateway was reloaded, not restarted.")
+
+
 def cmd_migrate_stream_close(_args):
     """Carry STREAM_CLOSE_DELAY into sites written before it (0.1.102).
 
@@ -4179,6 +4216,20 @@ def write_external_caddy():
     lines += _LOG_BLOCK
     lines += _portal_site_body()
     lines.append("}")
+    # The tenant as a place (RFC-0042 T2): the SAME portal, the same
+    # session, the same role and group filters -- the only new thing is
+    # that the host says which tenant. A second app would have had to
+    # re-acquire the launchpad, both filters, the tenant boundary and
+    # the session, and that is precisely how this codebase produces its
+    # most expensive defects.
+    for fqdn, _tid in tenant_place_hosts(host):
+        lines.append(f"# {fqdn} -> the place of tenant {_tid}")
+        lines.append(f"{scheme}://{fqdn} {{")
+        if edge:
+            lines += _edge_guard(edge)
+        lines += _LOG_BLOCK
+        lines += _portal_site_body()
+        lines.append("}")
     if not edge:
         # The bare :80 catch-all would happily serve plain HTTP for the
         # external names — redirect them to HTTPS explicitly.
@@ -4222,6 +4273,36 @@ def write_external_caddy():
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return skipped
+
+
+def tenant_place_hosts(ext_host=None):
+    """Every `<label>.<node>` this node answers at (RFC-0042 T1/T2).
+
+    The empty slot in the naming scheme. Instances have always been
+    `<instance>.<label>.<node>`, so the level above was described by
+    the scheme and never filled in -- `cls.oaap.joomp.de` is not an
+    addition to it, it is the part that was missing.
+
+    The default tenant contributes nothing: its label is the absence of
+    a label, so its place IS the node's apex, which the portal already
+    serves. Every other tenant contributes its current label and each
+    unexpired former one, exactly as `tenant_host_prefixes` does for
+    instances -- a club that has just been renamed keeps finding its
+    page while the word gets around (RFC-0026 3.3).
+
+    Composed HERE and nowhere else, for the reason `instance_auto_hosts`
+    gives: the gateway writes its sites from this and every message that
+    prints the address reads from it, so the two cannot drift apart.
+    """
+    ext = load_external() if ext_host is None else ext_host
+    if not ext:
+        return []
+    out = []
+    for tid in sorted(load_tenants()):
+        for prefix in tenant_host_prefixes(tid):
+            if prefix:
+                out.append((f"{prefix}.{ext}", tid))
+    return out
 
 
 def instance_names(inst):
@@ -12858,6 +12939,10 @@ def main():
                          help="internal: put the tenant boundary into gateway "
                               "sites written before oaap.core.tenant 0.2")
     pmr.set_defaults(fn=cmd_migrate_tenant_routes)
+    pmp = sub.add_parser("migrate-tenant-places",
+                         help="internal: give each tenant its address "
+                              "<label>.<node> (RFC-0042 T1/T2)")
+    pmp.set_defaults(fn=cmd_migrate_tenant_places)
     pms = sub.add_parser("migrate-stream-close",
                          help="internal: keep open streams alive across "
                               "gateway reloads in sites written before 0.1.102")

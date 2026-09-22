@@ -40,6 +40,7 @@ python3 test/test_event_relay.py     # Identity-Teil braucht flask
 
 python3 test/test_cli_routes.py      # der Befehlsaufsatz bin/oaap
 python3 test/test_tenant_address.py  # ein Namensraum, zwei Arten von Namen
+python3 test/test_tenant_place.py    # der Mandant als Ort: <kuerzel>.<knoten>
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```

@@ -243,6 +243,16 @@ say "Checking the tenant boundary in the gateway sites ..."
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-routes \
   2>&1 | sed 's/^/  /' || say "  WARNING: the gateway sites could not be rewritten — run 'oaap status'."
 
+# --- the tenant as a place (0.1.116, RFC-0042 T1/T2) ---
+# `<label>.<node>` was the slot in the naming scheme that was described
+# and never filled. The sites are GENERATED, so a node that changes
+# nothing after the update would carry the address in its code and
+# nowhere on its machine. Written once here; quiet afterwards, and
+# silent on a node with no tenants and on one with no external name.
+# Reloads the gateway, never restarts it — this cuts nothing.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-places \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the tenant addresses could not be written — run 'oaap status'."
+
 # --- open streams survive gateway reloads (0.1.102) ---
 # Every deployment reloads the gateway, and a reload used to cut every
 # open WebSocket/SSE stream of every app on the node. The delay that

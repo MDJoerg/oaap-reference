@@ -284,8 +284,23 @@ LAYOUT = STYLE + """
 </html>
 """
 
+# Der Ort eines Mandanten, den es hier nicht gibt (RFC-0042 T2). Sagt,
+# dass es ihn hier nicht gibt -- nicht, ob es ihn anderswo gibt.
+REFUSAL_BODY = """
+<h1>Nicht gefunden</h1>
+<div class="card"><p>{{ message }}</p></div>
+"""
+
 DASHBOARD_BODY = """
-<h1>Apps</h1>
+<h1>{{ place_title or "Apps" }}</h1>
+{# RFC-0042 T3: Traegt die Seite das Gesicht eines Mandanten, steht
+   sein Name darauf -- nicht als Zierde, sondern als Anker. Noch ohne
+   Farben (Stufe 3), aber der Anker gehoert zur Adresse, nicht zum
+   Design: er ist genau dann noetig, wenn die Seite jemandem gehoert. #}
+{% if place_title %}
+<p class="muted">Der Ort von <strong>{{ place_title }}</strong> auf diesem
+   Knoten. Die Apps dieses Mandanten, so weit Ihre Rollen reichen.</p>
+{% endif %}
 {% if sections %}
   {% for label, tiles in sections %}
   {# RFC-0036 D2: the label a developer's manifest suggested
@@ -2964,6 +2979,67 @@ def external_host():
         return ""
 
 
+def tenant_id_by_label(label):
+    """(id) of the tenant answering to this label, current or former.
+
+    A former label resolves for as long as it is unexpired, the same
+    grace `tenant_host_prefixes` gives an instance address -- the
+    gateway writes a site for it, so the portal has to recognise it or
+    the club's old address would reach a page that refuses them.
+    """
+    label = (label or "").strip().lower()
+    # Compared as ISO strings, which is sound only because every such
+    # timestamp is written by the host in UTC with the same precision
+    # -- `former_labels` in appctl says the same thing from the other
+    # side. Anything else sorts as expired, the safe direction.
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for tid, t in sorted(load_tenants().items()):
+        if t.get("label") == label:
+            return tid
+        for f in (t.get("former_labels") or []):
+            if f.get("label") == label and str(f.get("until", "")) > now:
+                return tid
+    return None
+
+
+def host_tenant_scope(host):
+    """Which tenant this HOST names: (tenant_id_or_None, resolved).
+
+    RFC-0042 T2. Three answers, and the third is the whole point:
+
+    * the node's own apex, a LAN name, an operator's CNAME -- no tenant
+      in the host, so the portal shows the node view it always did
+      (None, True);
+    * `<label>.<node>` naming a tenant this node has -- that tenant
+      scopes the launchpad for EVERYONE reached through this host, a
+      server_admin included (tid, True);
+    * `<label>.<node>` naming a tenant this node does NOT have -- serve
+      nothing (None, False). Falling back to the operator's own view
+      would be the exact substitution the resolution rules exist to
+      prevent, and it is the same fail-closed direction
+      `tenant_host_prefixes` already takes on the other side.
+
+    `<instance>.<label>.<node>` has its own site pointing at the app's
+    container, so the portal never sees it -- but it is answered here
+    too rather than assumed away.
+    """
+    host = (host or "").split(":")[0].lower()
+    ext = (external_host() or "").lower()
+    if not ext or host == ext or not host.endswith("." + ext):
+        return None, True
+    label = host[: -len(ext) - 1]
+    if "." in label:
+        return None, True
+    tid = tenant_id_by_label(label)
+    if tid is None:
+        return None, False
+    # The default tenant's place IS the apex; its label never appears
+    # in a host, so a host that spells it out is not its address.
+    if tid == default_tenant_id():
+        return None, False
+    return tid, True
+
+
 def local_name(key, inst):
     """What an instance is called inside its tenant (RFC-0025 8.1).
 
@@ -3022,7 +3098,8 @@ import instance_view as iv  # noqa: E402
 import diagnose_view as dv  # noqa: E402
 
 
-def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
+def launchpad_tiles(user_roles, user_groups, host, user_tenant=None,
+                    host_tenant=None):
     """Role- and group-filtered app tiles from the instance registry
     (spec 2.5, RFC-0007). The filter is UX only — the gateway enforces
     both on every request regardless of what the portal shows (mirrored
@@ -3048,6 +3125,16 @@ def launchpad_tiles(user_roles, user_groups, host, user_tenant=None):
     is_server_admin = "server_admin" in user_roles
     tiles, hidden = [], 0
     for name, inst in sorted(load_instances().items()):
+        # The HOST scopes, and it scopes everybody (RFC-0042 T2). This
+        # sits ABOVE the server_admin bypass on purpose: a server_admin
+        # who asked for a tenant's place asked for that tenant's page,
+        # not for the node's. The node view is one hostname away, and
+        # a page that silently answers a wider question than the
+        # address asked is how an operator mistakes whose screen they
+        # are looking at.
+        if (host_tenant is not None
+                and (resolve_tenant(inst.get("tenant")) or "") != host_tenant):
+            continue
         # The tenant boundary, before role and group: an app of another
         # tenant is not "hidden" from this caller, it is none of their
         # business, and the gateway would refuse them anyway (spec 3.1).
@@ -3125,6 +3212,25 @@ def setup_done() -> bool:
     return INTERNAL.get(f"{IDENTITY}/internal/status", timeout=5).json()["setup_done"]
 
 
+@app.before_request
+def _refuse_unknown_place():
+    """A host naming a tenant this node does not have serves NOTHING.
+
+    At the door rather than on the launchpad, because "serves nothing"
+    has to mean the whole portal: an unknown place must not answer the
+    instance list, the store or the deploy hook either. Falling back to
+    the operator's own view is the one thing this must never do
+    (RFC-0042 T2, and the same fail-closed direction as spec 2.5).
+
+    Every other host — the apex, a LAN name, an operator's CNAME —
+    resolves to "no tenant in the host" and passes straight through, so
+    a single-tenant node never notices this exists.
+    """
+    if not host_tenant_scope(request.host)[1]:
+        return page(REFUSAL_BODY, "Nicht gefunden", "apps", status=404,
+                    message="Diesen Ort gibt es auf diesem Knoten nicht.")
+
+
 @app.get("/")
 def dashboard():
     roles = caller_roles()
@@ -3132,13 +3238,20 @@ def dashboard():
     # where it can change what is shown. On a node with one tenant it
     # is the same answer for everybody and changes nothing.
     mine = caller_scope()[1] if multi_tenant() else None
+    # Only "which tenant" is asked here; "is this host a place at all"
+    # was already answered at the door (_refuse_unknown_place), and
+    # asking it twice is how a rule ends up in two places.
+    place = host_tenant_scope(request.host)[0]
     tiles, hidden = launchpad_tiles(roles, caller_groups(),
                                     request.host.split(":")[0],
-                                    user_tenant=mine)
+                                    user_tenant=mine, host_tenant=place)
     # Only a server_admin is told about tileless instances: they are the
     # only ones who can do anything about it, and everybody else would
     # be told to miss something they were never meant to operate.
-    return page(DASHBOARD_BODY, "Apps", "apps", sections=iv.grouped_tiles(tiles),
+    place_title = tenant_name(place) if place else ""
+    return page(DASHBOARD_BODY, place_title or "Apps", "apps",
+                sections=iv.grouped_tiles(tiles),
+                place_title=place_title,
                 hidden_count=hidden if "server_admin" in roles else 0)
 
 
