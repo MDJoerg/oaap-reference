@@ -264,6 +264,17 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-stream-close
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-identity-headers \
   2>&1 | sed 's/^/  /' || say "  WARNING: the identity headers could not be carried into the gateway sites — run 'oaap status'."
 
+# --- notes about data that is in use again (0.1.110) ---
+# `oaap app remove` without --purge leaves a note so that reinstalling
+# under the same name finds the data again. The reinstall then does
+# exactly that -- and the note stayed. `oaap app list` went on offering
+# to delete storage that a RUNNING instance holds, and the deletion is
+# addressed by the very instance id the reinstall recovered. Closed at
+# the source in save_registry(); this carries it into the nodes that
+# already hold such a note.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-retained \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the retained-data notes could not be checked — run 'oaap app list'."
+
 # --- access-log lines from before the filter (0.1.104) ---
 # The filter above covers every line written from now on. The lines
 # written before keep full URIs -- query strings with share keys in

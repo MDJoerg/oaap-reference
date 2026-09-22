@@ -178,5 +178,98 @@ ok("danach darf der Name neu vergeben werden",
    m.retained_data_refusal("crm", cls_id) == "")
 
 print("")
+print("Ein Vermerk ueber Daten, die wieder in Benutzung sind (0.1.110)")
+
+# Der zweite Befund aus Eintrag 140: entfernen ohne --purge, dann unter
+# demselben Namen neu ausrollen. Die Installation holt sich die Kennung
+# absichtlich aus dem Vermerk zurueck (instance_identity) -- der Vermerk
+# blieb aber liegen. `oaap app list` lud danach zu einem `purge` ein,
+# das die Daten der LAUFENDEN Instanz meint, denn geloescht wird nach
+# genau dieser Kennung.
+iid = m.new_instance_id()
+key = m.instance_key(cls_id, "viewer")
+reg = m.load_registry()
+reg.setdefault("retained", {})[m.retained_key(cls_id, "viewer")] = {
+    "id": iid, "name": "viewer", "tenant": cls_id,
+    "app_name": "Viewer", "removed": "2026-09-01T10:00:00Z"}
+m.save_registry(reg)
+ok("der Vermerk allein bleibt stehen -- die Daten liegen wirklich brach",
+   m.retained_record(m.load_registry(), cls_id, "viewer") is not None)
+
+reg = m.load_registry()
+reg["instances"][key] = {"app_id": "viewer", "app_name": "Viewer",
+                         "version": "1.0", "channel": "test", "port": 8998,
+                         "tenant": cls_id, "name": "viewer", "id": iid}
+m.save_registry(reg)
+ok("sobald eine Instanz dieselbe Kennung traegt, ist er weg",
+   m.retained_record(m.load_registry(), cls_id, "viewer") is None,
+   "eine Instanz und ein 'zurueckgelassen'-Vermerk auf derselben Kennung "
+   "koennen nicht beide recht haben, und die Instanz laeuft")
+
+# Ein Knoten, der von 0.1.109 hochkommt, TRAEGT den falschen Vermerk
+# bereits. Deshalb wird er hier von Hand zurueckgeschrieben, an
+# save_registry vorbei -- sonst pruefte der Test eine Lage, die es auf
+# einer echten Maschine gibt, im Testlauf aber nie.
+import json as _json                                          # noqa: E402
+
+raw = _json.load(open(m.REGISTRY, encoding="utf-8"))
+raw.setdefault("retained", {})[m.retained_key(cls_id, "viewer")] = {
+    "id": iid, "name": "viewer", "tenant": cls_id,
+    "app_name": "Viewer", "removed": "2026-09-01T10:00:00Z"}
+with open(m.REGISTRY, "w", encoding="utf-8") as f:
+    _json.dump(raw, f)
+live_dir = m.instance_dir(key, raw["instances"][key])
+os.makedirs(os.path.join(live_dir, "storage"), exist_ok=True)
+
+buf = _io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        m.cmd_purge(argparse.Namespace(name="viewer", yes=True))
+    refused = False
+except SystemExit:
+    refused = True
+ok("und selbst mit dem alten Vermerk loescht 'purge viewer' nichts",
+   refused and os.path.isdir(live_dir), buf.getvalue())
+ok("die Ablehnung nennt den Schluessel, unter dem die Instanz laeuft",
+   key in buf.getvalue(), buf.getvalue())
+
+print("")
+print("Und der Schritt, der die Knoten erreicht, auf denen er schon liegt")
+
+# Die Lehre aus 0.1.108, eine Stufe frueher angewandt: save_registry()
+# haelt den falschen Vermerk davon ab, neu zu entstehen -- erreicht aber
+# keinen Knoten, der ihn schon traegt. Und das ist jeder, der je eine
+# Instanz ohne --purge entfernt und unter demselben Namen wieder
+# ausgerollt hat.
+raw = _json.load(open(m.REGISTRY, encoding="utf-8"))
+raw.setdefault("retained", {})[m.retained_key(cls_id, "viewer")] = {
+    "id": iid, "name": "viewer", "tenant": cls_id,
+    "app_name": "Viewer", "removed": "2026-09-01T10:00:00Z"}
+with open(m.REGISTRY, "w", encoding="utf-8") as f:
+    _json.dump(raw, f)
+
+buf = _io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.cmd_migrate_retained(None)
+said = buf.getvalue()
+ok("die Migration raeumt den Altbestand weg",
+   m.retained_record(m.load_registry(), cls_id, "viewer") is None, said)
+ok("und sagt, was sie getan hat", "viewer" in said and "1 note" in said, said)
+
+buf = _io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.cmd_migrate_retained(None)
+ok("beim zweiten Lauf ist sie still -- ein Update soll dazu nichts sagen",
+   buf.getvalue().strip() == "", buf.getvalue())
+
+PLATFORM = os.path.join(HERE, "..", "platform")
+ok("und `oaap update` ruft sie ueberhaupt auf",
+   "migrate-retained" in open(os.path.join(PLATFORM, "migrate.sh"),
+                              encoding="utf-8").read())
+ok("die CLI kennt den Schritt",
+   'sub.add_parser("migrate-retained"' in open(
+       os.path.join(PLATFORM, "appctl.py"), encoding="utf-8").read())
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

@@ -490,6 +490,23 @@ def load_registry():
 
 
 def save_registry(reg):
+    # A "left behind" note about data an INSTALLED instance is using is
+    # not stale, it is false -- and it is the dangerous kind of false,
+    # because `oaap app purge` deletes by the instance id in that note
+    # (0.1.110). Reinstalling under the same name deliberately RECOVERS
+    # that identity (instance_identity), so every reinstall onto kept
+    # data left a note pointing at live storage, while `oaap app list`
+    # went on inviting the operator to delete it.
+    #
+    # Dropped here rather than in the three install paths, because this
+    # is the one place that sees both sides of the contradiction. A
+    # record and an instance claiming the same id cannot both be right,
+    # and the instance is the one that is running.
+    live = {i.get("id") for i in (reg.get("instances") or {}).values()
+            if i.get("id")}
+    kept = reg.get("retained") or {}
+    for k in [k for k, v in kept.items() if v.get("id") in live]:
+        del kept[k]
     os.makedirs(APPS_DIR, exist_ok=True)
     tmp = REGISTRY + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1662,6 +1679,36 @@ def cmd_migrate_stream_close(_args):
     if unfiltered:
         print("  The gateway access log no longer records query strings or "
               f"credential values ({', '.join(unfiltered)} rewritten).")
+
+
+def cmd_migrate_retained(_args):
+    """Drop 'left behind' notes about data that is in use (0.1.110).
+
+    save_registry() keeps this from arising again -- but it cannot reach
+    a node that already carries such a note, and every node that ever
+    removed an instance without --purge and then reinstalled it under
+    the same name does. That is the lesson of 0.1.108 applied a step
+    earlier: the fix belongs where the files already lie, not only where
+    the next one is written.
+
+    The work itself is a load and a save; the pruning rule lives in
+    save_registry, which is the point -- one rule, and the migration is
+    only the occasion to apply it. Silent when there is nothing to do,
+    so a second `oaap update` says nothing about it.
+    """
+    reg = load_registry()
+    live = {i.get("id") for i in (reg.get("instances") or {}).values()
+            if i.get("id")}
+    stale = sorted(v.get("name", "?") for v in (reg.get("retained") or {}).values()
+                   if v.get("id") in live)
+    if not stale:
+        return
+    print("")
+    print("Clearing notes about data that is in use again ...")
+    save_registry(reg)
+    print(f"  {len(stale)} note(s) dropped ({', '.join(stale)}). "
+          "'oaap app list' no longer offers to delete the storage of a "
+          "running instance.")
 
 
 def cmd_migrate_identity_headers(_args):
@@ -5618,6 +5665,44 @@ def resolve_tenant_arg(label):
     return tid
 
 
+def resolve_channel(inst, requested, name):
+    """Which channel this install lands on (0.1.110).
+
+    `--channel` defaulted to `production`, and the default applied to a
+    REDEPLOY as well. So `oaap app install ./paket.zip --name studio`
+    against a TEST instance moved it to production without being asked
+    to -- and with it went its deploy token and every open artifact
+    grant (runtime spec 2.5, RFC-0019). One line at the end said
+    "channel production"; nothing said what had just been given up, and
+    on the same version there is no way back.
+
+    The tenant of an instance already works the way this now does: what
+    an existing instance says wins, and only a NEW one takes the
+    default. The portal's store install and the rollback path had the
+    channel right too (`inst["channel"] if inst else "production"`).
+    This was the CLI standing alone against the rest -- the same shape
+    as 0.1.109's thirty-against-one, and the reason both CLI paths now
+    ask here instead of reading `args.channel` themselves.
+
+    A switch stays possible: typing `--channel` IS the explicit act the
+    rule asks for. It just has to be typed, and it says what it costs.
+    """
+    if not inst:
+        return requested or "production"
+    current = inst.get("channel") or "test"
+    if not requested or requested == current:
+        return current
+    if requested == "production":
+        print(f"NOTE: '{name}' moves from the test channel to production "
+              "-- its deploy token and any open artifact grants are "
+              "dropped (runtime spec 2.5, RFC-0019).")
+    else:
+        print(f"NOTE: '{name}' moves from production back to the test "
+              "channel -- it becomes redeployable in place on the same "
+              "version and may hold a deploy token again.")
+    return requested
+
+
 def cmd_install(args):
     # Store integration: the package may be a Git URL (+ --path inside
     # the repo) instead of a local directory.
@@ -5683,7 +5768,11 @@ def cmd_install(args):
                     # the name is taken, never by whom (spec 2.4)
                     die(f"an instance named '{local}' already exists")
                 permit = {"tenant": owner, "name": local}
-        if inst and args.channel == "test" and inst.get("channel") == "test":
+        # What an existing instance already is decides, not the flag's
+        # default (0.1.110). Resolved before the envelope review below,
+        # because that review only applies on the test channel.
+        channel = resolve_channel(inst, args.channel, local)
+        if inst and channel == "test" and inst.get("channel") == "test":
             # the envelope rule applies to the CLI too — the difference is
             # that here a person is standing at the machine, so a widening
             # is reported and then proceeds
@@ -5704,7 +5793,7 @@ def cmd_install(args):
             for line in notes:
                 print(f"NOTE: {line}")
         try:
-            install_artifact(name, args.package, None, channel=args.channel,
+            install_artifact(name, args.package, None, channel=channel,
                              path=args.path, permit=permit)
         except ArtifactRejected as e:
             die(str(e))
@@ -5737,7 +5826,6 @@ def _install_from_dir(pkg, args, source):
     local = args.name or app["id"]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local):
         die("instance name: lowercase [a-z0-9-]")
-    channel = args.channel
     # A tenant chosen for this install: a label from the command line, an
     # id from a creation permit, or nothing. Only consulted for a NEW
     # instance -- what an existing one says always wins, so a redeploy
@@ -5777,6 +5865,9 @@ def _install_from_dir(pkg, args, source):
                 # Says that the name is taken, never by whom
                 # (oaap.core.tenant 2.4).
                 die(f"an instance named '{local}' already exists")
+    # Which channel this lands on -- asked HERE, because the answer
+    # depends on the instance that was just resolved (0.1.110).
+    channel = resolve_channel(inst, args.channel, local)
     if not inst:
         # A NEW instance only: a redeploy keeps its own data by
         # definition, and its tenant cannot change (see
@@ -5785,7 +5876,13 @@ def _install_from_dir(pkg, args, source):
             name, tenant_for_new_instance(None, permit={"tenant": chosen_tenant}))
         if refusal:
             die(refusal)
-    if inst and inst["channel"] == "production" and inst["version"] == app["version"]:
+    # Same version onto production is refused (runtime spec 2.3) -- but
+    # only while it STAYS production. `--channel test` on the same
+    # version is the way back down, and the old wording blocked exactly
+    # that: an instance that had wandered up could not be moved back at
+    # all, which is what turned an accident into a one-way door.
+    if (inst and inst["channel"] == "production" and channel == "production"
+            and inst["version"] == app["version"]):
         die(f"production instance '{name}' already runs version {app['version']} — bump the version (spec: redeploy semantics)")
 
     # A rehearsal is NOT redeployable (spec 2.15.1, RFC-0030 D2). Wrong
@@ -6264,6 +6361,21 @@ def cmd_purge(args):
         if held is None:
             die(f"no data left behind under the name '{name}'")
         d = os.path.join(APPS_DIR, name)
+
+    # The guard at the top of this function asks by registry KEY. `name`
+    # here is what the customer calls the instance, and since 0.1.58 the
+    # key carries the tenant's short name in front of it -- so on a node
+    # with a named tenant an installed instance walks straight past that
+    # guard. What gets deleted below is addressed by the instance ID,
+    # and a reinstall recovers exactly that id from the retained record.
+    # Both together: this could delete the storage of a running
+    # instance. Ask about the DIRECTORY, because the directory is what
+    # is deleted (0.1.110).
+    for key, i in sorted(reg["instances"].items()):
+        if os.path.abspath(instance_dir(key, i)) == os.path.abspath(d):
+            die(f"{d} is the storage of the installed instance '{key}' — "
+                f"remove it first ('oaap app remove {key} --purge' deletes "
+                f"it with its data)")
 
     if not args.yes:
         label = tenant_label(held) if held else ""
@@ -11425,7 +11537,10 @@ def main():
     pi.add_argument("--path", default="", help="package path inside the directory/repo")
     pi.add_argument("--ref", default="", help="git branch/tag to install from (git sources)")
     pi.add_argument("--name")
-    pi.add_argument("--channel", choices=["production", "test"], default="production")
+    pi.add_argument("--channel", choices=["production", "test"], default=None,
+                    help="channel for a NEW instance (default: production). "
+                         "A redeploy keeps the channel the instance has; "
+                         "passing this moves it, and says what that costs")
     pi.add_argument("--tenant", default="",
                     help="tenant label for a NEW instance (default: this "
                          "node's own). Ignored on a redeploy — an instance "
@@ -11526,6 +11641,10 @@ def main():
                          help="internal: keep open streams alive across "
                               "gateway reloads in sites written before 0.1.102")
     pms.set_defaults(fn=cmd_migrate_stream_close)
+    pmr = sub.add_parser("migrate-retained",
+                         help="internal: drop 'left behind' notes about data "
+                              "an installed instance is using")
+    pmr.set_defaults(fn=cmd_migrate_retained)
     pmi = sub.add_parser("migrate-identity-headers",
                          help="internal: carry RFC-0040's identity headers "
                               "into sites written before 0.1.107")
