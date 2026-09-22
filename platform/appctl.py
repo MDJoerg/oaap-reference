@@ -934,12 +934,122 @@ def tenant_by_label(label, include_former=True):
     return None, None
 
 
+# --- one host namespace, two kinds of name (RFC-0042 T1) -------------
+#
+# `<label>.<node>` and `<instance>.<node>` are the same shape. Tenant
+# labels and the DEFAULT tenant's instance names therefore share one
+# namespace -- and until the tenant address existed, nothing checked
+# across them: `label_is_free` asked only about tenants, instance
+# creation asked only about the registry.
+#
+# That was harmless only while nothing answered at `<label>.<node>`.
+# The moment it does, a tenant labelled `studio` and the default
+# tenant's instance `studio` both want the same host, and whichever
+# site the gateway writes last wins -- silently, which is this
+# project's recurring failure shape.
+#
+# Measured on oaapx01 before building this (2026-09-22): no collision
+# among `cls`, `hbvp`, `pxx` and twelve default-tenant instance names.
+# That is a property of today's CONTENTS, not of the system. Hence a
+# guard, and hence it lands BEFORE anything answers there -- afterwards
+# the same change would be a migration.
+#
+# Instances of every OTHER tenant live one level deeper
+# (`<instance>.<label>.<node>`) and cannot collide with a label, which
+# is why only the default tenant's names are counted here.
+
+
+def default_tenant_host_names(reg=None):
+    """Every host label the default tenant's instances occupy.
+
+    Current names and unexpired former ones alike: a name that still
+    routes somewhere must not be handed to someone else (RFC-0026 3.3),
+    which is exactly the rule `former_labels` already carries on the
+    tenant side.
+    """
+    did = default_tenant_id()
+    if not did:
+        return set()
+    reg = load_registry() if reg is None else reg
+    out = set()
+    for key, inst in (reg.get("instances") or {}).items():
+        if (inst.get("tenant") or did) != did:
+            continue
+        out.add(instance_name(key, inst))
+        out.update(former_names(inst))
+    return {n for n in out if n}
+
+
 def label_is_free(label):
     """A label may be taken by a current tenant OR by an unexpired
     former one -- reusing a name that still routes somewhere else would
-    silently hand one tenant another's traffic."""
+    silently hand one tenant another's traffic.
+
+    Since RFC-0042 T1 a default-tenant INSTANCE name takes it too, for
+    the same reason and in the same namespace. The refusal that follows
+    is deliberately the one it always was: the name is taken, never by
+    whom, and not even which kind of thing holds it (`oaap.core.tenant`
+    2.4).
+    """
     tid, _t = tenant_by_label(label, include_former=True)
-    return tid is None
+    if tid is not None:
+        return False
+    return (label or "").strip().lower() not in default_tenant_host_names()
+
+
+def label_taken_by_tenant(tenant, local):
+    """True when a tenant label blocks this instance name.
+
+    The other direction of `label_is_free`, and the reason both exist
+    in one place: a rule that lives at one door and not the other is
+    how this codebase produces its most expensive defects. Only asked
+    for the default tenant -- see the note above.
+
+    Deliberately NOT a message: every caller already has its own
+    refusal sentence for a taken name, and reusing it keeps a tenant
+    collision indistinguishable from an instance collision. A caller
+    who may create here can list both namespaces anyway; a caller who
+    may not learns nothing new.
+    """
+    did = default_tenant_id()
+    if not did or (tenant or did) != did:
+        return False
+    tid, _t = tenant_by_label(local, include_former=True)
+    return tid is not None
+
+
+def name_taken_msg(local):
+    """The ONE sentence that says an instance name is not available.
+
+    It exists as a function so that `test_tenant_address.py` can COUNT:
+    the literal may appear exactly once in this file, which means a
+    tenth door into the namespace cannot quietly write its own refusal
+    -- it has to come through here, and here is next to the check.
+
+    Says that the name is taken, never by whom, and not which kind of
+    thing holds it (`oaap.core.tenant` 2.4). Since RFC-0042 T1 that
+    second half matters more: the holder may now be a tenant label.
+    """
+    return f"an instance named '{local}' already exists"
+
+
+def instance_name_taken(reg, tenant, local, key=None):
+    """True when no NEW instance may be created under this name.
+
+    THE place that answers it. There are nine doors into the instance
+    namespace (the CLI's deploy and install, rename, the artifact
+    grant, sideloading, the rehearsal, and three in the portal's
+    worker) -- so the question they all ask has to be one function, or
+    the ninth door will be the one that does not ask (0.1.109, 0.1.110,
+    0.1.111, 0.1.114 were all exactly that).
+    """
+    reg = load_registry() if reg is None else reg
+    key = instance_key(tenant, local) if key is None else key
+    if key in (reg.get("instances") or {}):
+        return True
+    if find_instance(reg, tenant, local)[1] is not None:
+        return True
+    return label_taken_by_tenant(tenant, local)
 
 
 def single_tenant():
@@ -1059,7 +1169,7 @@ def cross_tenant_refusal(action, name):
       has always answered this way, and the store path now agrees.
     """
     if action == "install":
-        return f"an instance named '{name}' already exists"
+        return name_taken_msg(name)
     return "unknown instance"
 
 
@@ -5976,9 +6086,9 @@ def cmd_install(args):
                 name, inst = found_key, found
             else:
                 name = instance_key(owner, local)
-                if name in reg["instances"]:
+                if instance_name_taken(reg, owner, local, name):
                     # the name is taken, never by whom (spec 2.4)
-                    die(f"an instance named '{local}' already exists")
+                    die(name_taken_msg(local))
                 permit = {"tenant": owner, "name": local}
         # What an existing instance already is decides, not the flag's
         # default (0.1.110).
@@ -6122,10 +6232,10 @@ def _install_from_dir(pkg, args, source):
             name, inst = found_key, found
         else:
             name, inst = instance_key(target, local), None
-            if name in reg["instances"]:
+            if instance_name_taken(reg, target, local, name):
                 # Says that the name is taken, never by whom
                 # (oaap.core.tenant 2.4).
-                die(f"an instance named '{local}' already exists")
+                die(name_taken_msg(local))
     # Which channel this lands on -- asked HERE, because the answer
     # depends on the instance that was just resolved (0.1.110).
     channel = resolve_channel(inst, args.channel, local)
@@ -6740,10 +6850,12 @@ def rename_check(reg, given, new):
     tid = resolve_tenant(inst.get("tenant"))
     if instance_name(key, inst) == new:
         return "", f"'{new}' is already its name"
-    if find_instance(reg, tid, new)[1] is not None:
-        return "", f"an instance named '{new}' already exists"
-    if instance_key(tid, new) in reg["instances"]:
-        return "", f"an instance named '{new}' already exists"
+    if instance_name_taken(reg, tid, new):
+        # Covers both halves of the namespace since RFC-0042 T1: a
+        # sibling instance, and -- in the default tenant -- a tenant
+        # label. A rename is a door into the host namespace exactly
+        # like a create, and was the easiest one to forget.
+        return "", name_taken_msg(new)
     return key, ""
 
 
@@ -8219,8 +8331,9 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
         # is actually installed (phase 3), so a failed upload does not
         # cost the operator their permission.
         if inst:
-            raise ArtifactRejected(f"an instance named '{name}' already exists "
-                                   "— use its deploy token, not a creation grant")
+            raise ArtifactRejected(
+                name_taken_msg(name)
+                + " — use its deploy token, not a creation grant")
         if not has_profile("dev"):
             raise ArtifactRejected(
                 "this node has no profile 'dev' — creating instances is a "
@@ -8787,9 +8900,9 @@ def sideload_review(reg, zip_path, tenant, target_name, path=""):
             raise SideloadRefused(
                 "instance name: lowercase letters, digits and hyphens")
         # Says that the name is taken, never by whom (oaap.core.tenant 2.4)
-        if key in reg["instances"]:
+        if instance_name_taken(reg, tenant, target_name, key):
             raise SideloadRefused(
-                f"an instance named '{target_name}' already exists")
+                name_taken_msg(target_name))
         refusal = retained_data_refusal(key, tenant)
         if refusal:
             raise SideloadRefused(refusal)
@@ -9073,9 +9186,8 @@ def rehearsal_review(reg, source, new_name, code_from="", archive="", days=0):
         raise RehearsalRefused("instance name: lowercase letters, digits and "
                                "hyphens")
     key = instance_key(tenant, new_name)
-    found_key, found = find_instance(reg, tenant, new_name)
-    if found is not None or key in (reg.get("instances") or {}):
-        raise RehearsalRefused(f"an instance named '{new_name}' already exists")
+    if instance_name_taken(reg, tenant, new_name, key):
+        raise RehearsalRefused(name_taken_msg(new_name))
     refusal = retained_data_refusal(key, tenant)
     if refusal:
         raise RehearsalRefused(refusal)
@@ -10220,8 +10332,8 @@ def cmd_process_deploys(_args):
             if not has_profile("dev"):
                 msg = ("this node has no profile 'dev' — creating instances "
                        "from the portal is a development act (RFC-0011)")
-            elif inst:
-                msg = f"an instance named '{local_name}' already exists"
+            elif instance_name_taken(reg, act_tenant, local_name, name):
+                msg = name_taken_msg(local_name)
             elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local_name):
                 msg = "instance name: lowercase letters, digits and hyphens"
             elif req.get("from") == "store":
@@ -10342,7 +10454,7 @@ def cmd_process_deploys(_args):
                     msg = ("no valid upload grant — announce the version "
                            "first, and upload within 15 minutes")
                 elif creating and inst:
-                    msg = f"an instance named '{name}' already exists"
+                    msg = name_taken_msg(name)
                 elif creating and not has_profile("dev"):
                     msg = ("this node has no profile 'dev' — creating "
                            "instances is a development act (RFC-0011)")
@@ -10637,7 +10749,7 @@ def cmd_process_deploys(_args):
                 msg = ("this node has no profile 'dev' — creating instances "
                        "is a development act (RFC-0011)")
             elif inst:
-                msg = f"an instance named '{local_name}' already exists"
+                msg = name_taken_msg(local_name)
             elif not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local_name or ""):
                 msg = "instance name: lowercase letters, digits and hyphens"
             elif not re.fullmatch(r"[0-9a-f]{64}", req.get("digest", "")):
@@ -10670,8 +10782,14 @@ def cmd_process_deploys(_args):
                     # carries the tenant-local name too, because after
                     # this nothing else knows what the human typed.
                     key = instance_key(permit_tenant, local_name)
-                    if key in reg["instances"]:
-                        msg = f"an instance named '{local_name}' already exists"
+                    if instance_name_taken(reg, permit_tenant, local_name, key):
+                        # This is where the key into the host namespace
+                        # is MINTED, before any instance exists -- so
+                        # this is where T1's guard has to stand. The
+                        # announcement and the upload check the same key
+                        # again later, but neither of them is a door:
+                        # they can only ever see what this permit fixed.
+                        msg = name_taken_msg(local_name)
                     else:
                         name = key
                         grant_create("create", key, req["digest"],
