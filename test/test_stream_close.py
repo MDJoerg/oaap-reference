@@ -131,5 +131,65 @@ ok("zweiter Lauf tut nichts (kein Neuladen, das selbst Streams kostet)",
    len(reloads) == 1)
 
 print()
+print("Ein Plattform-Update laedt das Gateway neu, statt es neu zu starten (0.1.109)")
+
+# Die Verzoegerung oben haelt einen Stream ueber ein NEULADEN. Ein
+# `docker restart` des Gateway-Containers geht daran vorbei und trennt
+# alles -- die Zusage aus oaap.core.gateway 0.2.8 war damit auf jedem
+# Knoten gebrochen, dessen Caddyfile sich aenderte, also bei fast jedem
+# Update. Gefunden auf oaapx01 beim Ausrollen von 0.1.108, wo
+# LiveKit-Signalisierung und die Hallendisplays daran haengen.
+SH = os.path.join(HERE, "..", "platform")
+
+
+def sh_lines(name):
+    """Die Zeilen eines Skripts ohne Kommentare -- Fortsetzungen
+    zusammengefuegt, weil ein Befehl ueber zwei Zeilen fuer die Shell
+    EIN Befehl ist. Zeilenweise zu pruefen, ohne das zu tun, sucht nach
+    einer Schreibweise, die es so nie gibt."""
+    with open(os.path.join(SH, name), encoding="utf-8") as f:
+        raw = [ln.strip() for ln in f if not ln.lstrip().startswith("#")]
+    joined, buf = [], ""
+    for ln in raw:
+        if ln.endswith("\\"):
+            buf += ln[:-1].rstrip() + " "
+            continue
+        joined.append(buf + ln)
+        buf = ""
+    if buf:
+        joined.append(buf)
+    return joined
+
+
+up, mig = sh_lines("update.sh"), sh_lines("migrate.sh")
+RESTART = "docker restart oaap-gateway-1 >/dev/null"
+
+ok("update.sh laedt das Gateway neu",
+   any("caddy reload" in ln and "/etc/caddy/Caddyfile" in ln for ln in up),
+   "sonst startet das Update weiter hart neu")
+ok("und nennt denselben Konfigurationspfad wie appctl.reload_gateway",
+   "/etc/caddy/Caddyfile" in " ".join(up),
+   "zwei Pfade waeren zwei Wahrheiten")
+ok("migrate.sh startet das Gateway gar nicht mehr hart neu",
+   not any(RESTART in ln for ln in mig), mig)
+ok("in update.sh bleibt genau EIN harter Neustart: der Notnagel",
+   sum(RESTART in ln for ln in up) == 1,
+   "mehr als einer hiesse, ein Pfad wurde vergessen")
+
+# Der Notnagel ist kein Schoenheitsfehler, sondern die Bedingung dafuer,
+# dass das Neuladen ueberhaupt sicher ist: ein abgelehntes Neuladen
+# laesst Caddy auf der ALTEN Konfiguration weiterlaufen, waehrend die
+# Dateien etwas anderes sagen. Lautlos ist das schlimmer als getrennte
+# Streams.
+up_src = open(os.path.join(SH, "update.sh"), encoding="utf-8").read()
+tail = up_src.split("caddy reload", 1)[1]
+ok("und er meldet sich, statt lautlos zu greifen",
+   "WARNING" in tail.split(RESTART)[0],
+   "ein stiller Rueckfall ist ein Knoten, der nach gestrigen Regeln routet")
+ok("und sagt auch, was er gekostet hat",
+   "cut" in tail.split(RESTART)[0].lower(),
+   "der Betreiber muss wissen, dass Verbindungen abgerissen sind")
+
+print()
 print("ALLE PRUEFUNGEN BESTANDEN" if not fails else f"{fails} FEHLSCHLAG(E)")
 sys.exit(1 if fails else 0)

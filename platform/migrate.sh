@@ -153,8 +153,11 @@ EXTC="$APP_DIR/apps-caddy/external.caddy"
 if [ -f "$EXTC" ] && ! grep -q 'handle /fleet/\*' "$EXTC"; then
   say ""
   say "Adding the fleet status route to the external gateway sites (RFC-0021) ..."
-  if OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 -c "import sys; sys.path.insert(0, '$APP_DIR'); import appctl; appctl.write_external_caddy()" >/dev/null \
-     && docker restart oaap-gateway-1 >/dev/null; then
+  # appctl.reload_gateway() rather than `docker restart` (0.1.109): a
+  # restart cuts every open WebSocket/SSE connection on the node, and
+  # stream_close_delay only covers a reload. Same fix as in update.sh,
+  # and the same reason it was wrong here: this line predates 0.1.102.
+  if OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 -c "import sys; sys.path.insert(0, '$APP_DIR'); import appctl; appctl.write_external_caddy(); appctl.reload_gateway()" >/dev/null; then
     say "  Done — /fleet/status answers under the external name too."
   else
     say "  WARNING: could not regenerate the external sites — run 'oaap external set <name>' once by hand."

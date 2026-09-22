@@ -208,8 +208,38 @@ docker compose --project-directory "$APP_DIR" --project-name oaap \
 
 caddy_after="$(md5sum "$APP_DIR/Caddyfile" 2>/dev/null | cut -d' ' -f1)"
 if [ "$caddy_before" != "$caddy_after" ]; then
-  say "Caddyfile changed — restarting the gateway ..."
-  docker restart oaap-gateway-1 >/dev/null
+  # A RELOAD, not a restart (0.1.109). `docker restart` drops every open
+  # WebSocket and SSE connection on the node -- precisely what
+  # stream_close_delay (0.1.102) exists to prevent. That delay holds a
+  # stream on the OLD configuration for 12h, but only across a RELOAD;
+  # a container restart walks straight past it. So oaap.core.gateway
+  # 0.2.8 promised open connections survive, and every update that
+  # touched the Caddyfile -- which is most of them -- broke the promise
+  # on every node. Found on oaapx01 while rolling out 0.1.108, where
+  # LiveKit signalling and the Handball-Infoboard's hall displays hang
+  # off exactly these connections. Every other caller in this codebase
+  # (30 of them, via appctl.reload_gateway) already did it this way;
+  # the update path was the one that did not.
+  #
+  # The fallback matters as much as the reload. A refused reload leaves
+  # Caddy serving the PREVIOUS configuration while the files on disk
+  # say otherwise -- a node quietly routing by yesterday's rules is
+  # worse than one that cut some streams, and it is the failure this
+  # codebase keeps repeating. So if the reload does not take, restart
+  # after all, and say both things out loud rather than either quietly.
+  #
+  # Not covered, and it cannot be: if the compose step above RECREATED
+  # the gateway container (its image or compose entry changed), the
+  # connections are already gone before we get here. That is rare --
+  # the gateway runs a stock image -- and there is nothing to hold a
+  # stream open across a container that no longer exists.
+  say "Caddyfile changed — reloading the gateway (open connections stay) ..."
+  if ! docker exec oaap-gateway-1 caddy reload \
+         --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
+    say "  WARNING: the gateway refused the new configuration — restarting it."
+    say "           Open connections were cut. Check 'oaap status'."
+    docker restart oaap-gateway-1 >/dev/null
+  fi
 fi
 
 echo "$new_rev" > "$APP_DIR/REVISION"
