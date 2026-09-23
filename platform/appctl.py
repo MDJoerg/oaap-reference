@@ -2297,9 +2297,22 @@ def cmd_tenant(args):
         print("tenants.json and therefore never in a tenant archive.")
         print("")
         host = load_external()
-        where = f"https://{label}.{host}" if host else "this node's address"
-        print("Register this exact redirect URI in the provider's client:")
-        print(f"  {where}/auth/oidc/callback")
+        print("Register this redirect URI in the provider's client, and it")
+        print("must match TO THE CHARACTER -- including the scheme, which is")
+        print("the one the VISITOR'S BROWSER uses, not the one inside the")
+        print("container:")
+        if host:
+            print(f"  https://{label}.{host}/auth/oidc/callback")
+            # Measured on oaap-test 2026-09-23: on a node reached over
+            # plain http this line is the one that matters, and printing
+            # only the https form sends the operator into a rejection
+            # from the provider that names no cause.
+            print(f"  http://{label}.{host}/auth/oidc/callback"
+                  "   (only if this node is reached without TLS)")
+        else:
+            print("  <scheme>://<this node>/auth/oidc/callback")
+            print("  -- this node has no external name yet, so the tenant has")
+            print("     no address of its own: `oaap external set` first.")
         print("")
         pol = idp.policy_of(t)
         print(f"A first login through it currently means '{pol['first_login']}'"
@@ -8159,6 +8172,23 @@ def cmd_user(args):
         # it signs the person out at the same moment -- a session that
         # outlived the credential it came from is the bug RFC-0028
         # already had to fix once for terminal keys.
+        #
+        # AND IT DEACTIVATES THE RECORD, unless the operator says
+        # otherwise. Measured on oaap-test 2026-09-23, and it was not
+        # what the first version of this command claimed: after an
+        # unbind, the next login through the provider does NOT find its
+        # way back to this record -- it creates a NEW one
+        # (`bernd` -> `bernd-2`). That is not a bug to fix; it is the
+        # only behaviour compatible with K4, because the alternative is
+        # to recognise somebody by their NAME, which is the account
+        # takeover this platform refuses one function further up.
+        #
+        # What follows from it is that an unbound record without a local
+        # password is a record with rights and no way in -- a ghost
+        # carrying a role. So unbinding deactivates it, which is what
+        # "revoke this person's access" meant in the first place.
+        # --keep-active is for the other case: repairing a binding, not
+        # revoking access.
         if not args.username:
             die("'user unbind' needs a username")
         out = _identity_exec(
@@ -8171,20 +8201,45 @@ def cmd_user(args):
             " if not bound:\n"
             "  print('not bound', file=sys.stderr); sys.exit(2)\n"
             " u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
+            " had_pw = bool(u.get('password_hash'))\n"
+            " keep = os.environ['OAAP_CLI_KEEP'] == '1'\n"
+            " deact = not keep and not had_pw\n"
+            " if deact:\n"
+            "  u['active'] = False\n"
             " m.save_users(users)\n"
             " print(json.dumps({'provider': bound.get('provider',''),\n"
-            "                   'tenant': u.get('tenant','')}))\n",
-            {"OAAP_CLI_USERNAME": args.username})
+            "                   'tenant': u.get('tenant',''),\n"
+            "                   'roles': u.get('roles') or [],\n"
+            "                   'password': had_pw,\n"
+            "                   'deactivated': deact}))\n",
+            {"OAAP_CLI_USERNAME": args.username,
+             "OAAP_CLI_KEEP": "1" if args.keep_active else "0"})
         gone = json.loads(out.strip().splitlines()[-1])
         audit_tenant("user.idp-unbound", gone["tenant"],
-                     subject=args.username, detail=gone["provider"],
+                     subject=args.username,
+                     detail=(gone["provider"]
+                             + ("; deactivated" if gone["deactivated"]
+                                else "; kept active")),
                      who=os.environ.get("SUDO_USER") or "root")
         print(f"'{args.username}' is no longer bound to "
               f"{gone['provider'] or 'any provider'}; open sessions were "
               "signed out.")
-        print("The account itself is untouched. It can only sign in again")
-        print("through the provider (which binds afresh) or with a local")
-        print("password, if it has one.")
+        if gone["deactivated"]:
+            print("The account was DEACTIVATED, because it has no local")
+            print("password and would otherwise be a record with roles")
+            print(f"({','.join(gone['roles']) or 'none'}) and no way in.")
+        elif gone["password"]:
+            print("The account keeps its local password and can still sign")
+            print("in with it.")
+        else:
+            print("The account was left ACTIVE as asked, although it has no")
+            print("local password -- nobody can currently sign in as it.")
+        print("")
+        print("If this person signs in through the provider again, they get")
+        print("a NEW account with the tenant's first-login rights. They are")
+        print("not recognised as this one: a binding is the only thing that")
+        print("says who somebody is, and matching by name would be the")
+        print("account takeover this platform refuses (RFC-0041 K4).")
         return
 
     # password
@@ -13805,6 +13860,10 @@ def main():
     pk.set_defaults(fn=cmd_key)
     pu = sub.add_parser("user")
     pu.add_argument("action", choices=["list", "password", "unbind"])
+    pu.add_argument("--keep-active", dest="keep_active", action="store_true",
+                    help="'unbind' only: break the binding without "
+                         "deactivating the account (repairing a binding "
+                         "rather than revoking access)")
     pu.add_argument("username", nargs="?")
     pu.add_argument("password", nargs="?",
                     help="omit to be prompted (hidden input) -- 'password' action only")

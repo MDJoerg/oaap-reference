@@ -205,11 +205,21 @@ ok("und sagt, dass das keine Zugriffskontrolle ist",
 # ersten Anlauf und der Test prüfte die Dialogseite statt einer Instanz.
 names = [n for n in re.findall(r'href="/instances/([a-z0-9][a-z0-9-]*)"', body)
          if n != "new"]
-target = names[0] if names else ""
-ok("mindestens eine Instanz zum Pruefen gefunden", bool(target), str(names[:5]))
 
-st, body7, url = get(f"/instances/{target}")
-ok("die Instanzseite kommt", st == 200, f"{st} {url}")
+# ... und zwar eine, die UEBERHAUPT eine Kachel hat. Der Test nahm
+# frueher einfach die erste, und am 23.09.2026 war die erste auf
+# oaap-test ein Hintergrunddienst (der Anmeldedienst aus RFC-0041) --
+# eine Kachel abzuschalten, die es nicht gibt, aendert nichts, und
+# drei Pruefungen schlugen fehl, ohne dass irgendetwas kaputt war.
+# Eine willkuerliche Auswahl ist keine Auswahl.
+target, body7 = "", ""
+for candidate in names:
+    st, page, _u = get(f"/instances/{candidate}")
+    if st == 200 and "keine Kachel" not in page:
+        target, body7 = candidate, page
+        break
+ok("eine Instanz MIT Kachel zum Pruefen gefunden", bool(target), str(names[:8]))
+ok("die Instanzseite kommt", bool(body7), target)
 ok("sie hat die Karte fuer die Kachel", "Kachel im Launchpad" in body7)
 # Beides ist richtig, je nachdem, ob die App eine Klasse erklaert. Was
 # NICHT vorkommen darf, ist eine App zu zitieren, die nichts gesagt hat.

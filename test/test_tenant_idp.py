@@ -201,6 +201,16 @@ ok("ein unbekannter Anbieter-Typ wird abgelehnt",
 ok("ein vollstaendiges Anbieter-Objekt wird angenommen",
    not idp.provider_refusal("oidc", "https://a.example/realms/x", "oaap-node",
                             "x" * 32))
+# Kein Anbieter ist kein Anbieter namens "". Gemessen auf oaap-test:
+# ohne diese Unterscheidung meldete die ALLERERSTE Anbindung "ISSUER
+# CHANGED, every binding it had is void" -- und schlimmer als die
+# Formulierung: "oidc|" ist ein Schluessel, und ein Schluessel trifft.
+ok("ohne Anbieter gibt es keinen Schluessel", idp.provider_key({}) == ""
+   and idp.provider_key({"issuer": ""}) == "", idp.provider_key({}))
+ok("und ein leerer Schluessel bindet an nichts",
+   idp.find_binding([{"username": "x", "tenant": "T",
+                      "idp": {"provider": "", "subject": "S"}}],
+                    idp.provider_key({}), "S", "T") is None)
 
 # Das Entdeckungsdokument muss sich selbst so nennen, wie wir es
 # konfiguriert haben -- sonst uebernaehme eine Weiterleitung lautlos die
@@ -350,6 +360,14 @@ good, msg = m.tenant_set_provider(
     hbvp, "oidc", f"http://127.0.0.1:1/realms/hbvp", "oaap-node", SECRET,
     label="Mit dem Vereinskonto anmelden")
 ok("ein brauchbarer Anbieter wird angenommen", good, msg)
+ok("die ERSTE Anbindung warnt nicht vor verlorenen Bindungen",
+   "ISSUER CHANGED" not in msg and "no longer match" not in msg, msg)
+moved, msg2 = m.tenant_set_provider(
+    hbvp, "oidc", "http://127.0.0.1:2/realms/hbvp", "oaap-node", SECRET)
+ok("ein WECHSEL des Ausstellers warnt sehr wohl",
+   moved and "no longer match" in msg2, msg2)
+m.tenant_set_provider(hbvp, "oidc", "http://127.0.0.1:1/realms/hbvp",
+                      "oaap-node", SECRET)
 
 stored = json.dumps(m.load_tenants()[hbvp])
 ok("das Geheimnis steht NICHT im Mandantensatz", SECRET not in stored, stored)
@@ -616,9 +634,40 @@ c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
 ok("eine zweite Anmeldung legt keinen dritten Satz an",
    len(ident.load_users()) == 2, ident.load_users())
 
+# Was eine geloeste Bindung WIRKLICH bedeutet. Gemessen auf oaap-test:
+# eine erneute Anmeldung findet nicht zurueck, sie legt einen NEUEN Satz
+# an. Das ist kein Fehler, sondern die einzige Folge, die zu K4 passt --
+# die Alternative waere, jemanden an seinem NAMEN wiederzuerkennen, und
+# genau das ist die Kontouebernahme, die eine Funktion weiter oben
+# abgelehnt wird. Der Befehl an der Maschine sagt das inzwischen.
+users = ident.load_users()
+for x in users:
+    if (x.get("idp") or {}).get("subject") == "S-PROBE":
+        x.pop("idp")
+        x["active"] = False
+ident.save_users(users)
+r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
+params = dict(p.split("=", 1)
+              for p in r.headers["Location"].split("?", 1)[1].split("&"))
+CLAIMS["nonce"] = unquote(params["nonce"])
+CLAIMS["exp"] = int(time.time()) + 300
+c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
+      headers={"Host": f"hbvp.{HOST}"})
+after = ident.load_users()
+ok("nach dem Loesen der Bindung entsteht ein NEUER Satz, kein Rueckweg "
+   "in den alten", len(after) == 3, [x["username"] for x in after])
+ok("der geloeste Satz bleibt deaktiviert und ungebunden",
+   any(not x.get("active") and not x.get("idp")
+       and x.get("username") == "mueller-2" for x in after),
+   [(x["username"], x.get("active"), bool(x.get("idp"))) for x in after])
+ok("der Befehl an der Maschine sagt genau das",
+   "a NEW account" in APPCTL_SRC and "matching by name" in APPCTL_SRC)
+ok("und er deaktiviert einen Satz ohne lokales Passwort",
+   "--keep-active" in APPCTL_SRC and "was DEACTIVATED" in APPCTL_SRC)
+
 # Und das lokale Formular bleibt fuer den Anbieter-Satz verschlossen.
 r = c.post("/auth/login",
-           data={"username": u.get("username", "?"), "password": ""},
+           data={"username": "mueller-2", "password": ""},
            headers={"Host": f"hbvp.{HOST}"})
 ok("das lokale Anmeldeformular laesst diesen Satz nicht herein",
    r.status_code == 401, r.status_code)

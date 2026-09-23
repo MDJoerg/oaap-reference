@@ -189,7 +189,15 @@ def provider_key(provider):
     the provider object is a URL.
     """
     p = provider or {}
-    return f"{(p.get('kind') or 'oidc').lower()}|{p.get('issuer') or ''}"
+    issuer = (p.get("issuer") or "").strip()
+    # No provider is not a provider called "". Measured on oaap-test
+    # 2026-09-23: without this line the very FIRST attachment announced
+    # "ISSUER CHANGED, every binding it had is void" -- a frightening
+    # sentence about a tenant that had never had a provider. Worse than
+    # the wording: "oidc|" is a key, and a key matches.
+    if not issuer:
+        return ""
+    return f"{(p.get('kind') or 'oidc').lower()}|{issuer}"
 
 
 def discovery_url(issuer):
