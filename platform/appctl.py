@@ -2170,6 +2170,9 @@ def _print_connector(name, c, note=True):
     print(f"    address    {c.get('base_url', '')}")
     print(f"    credential {c.get('auth', '')} '{c.get('admin_id', '')}' "
           f"in realm '{c.get('auth_realm') or decl.get('auth_realm', '')}'")
+    if c.get("accept_version"):
+        print(f"    version    {c['accept_version']} -- STATED by the "
+              "operator, not read")
     if note:
         for line in textwrap.wrap(
                 idp_admin.credential_note(c.get("kind"), c.get("auth"),
@@ -2225,6 +2228,7 @@ def cmd_idp(args):
             name, args.idp_kind_admin, args.url or "", args.auth,
             args.admin_id or "", args.admin_secret or "",
             auth_realm=args.auth_realm or "",
+            accept_version=args.accept_version or "",
             who=os.environ.get("SUDO_USER") or getpass.getuser())
         if not ok:
             die(msg)
@@ -2267,21 +2271,27 @@ def cmd_idp(args):
         said, err = admin.version()
         if err:
             die("  " + err)
-        bad = idp_admin.version_refusal(c["kind"], said)
         decl = idp_admin.connector_of(c["kind"])
-        print(f"  version    {decl['product']} {said}"
-              + ("  (the pinned one)" if not bad else "  -- NOT the pinned "
-                 f"{decl['pinned']}"))
+        how, bad = idp_admin.version_check(c["kind"], said,
+                                           c.get("accept_version", ""))
         if bad:
+            print(f"  version    {decl['product']} REFUSED")
             print("")
             for line in textwrap.wrap(bad, 68):
                 print("  " + line)
             sys.exit(1)
+        seen = said or c.get("accept_version", "")
+        print(f"  version    {decl['product']} "
+              + idp_admin.version_words(how, seen, c["kind"]))
         print("")
-        print("This is the version this build was measured against, so the")
-        print("admin path is the one that was tested. That sentence is")
-        print("worth something only because it was asked -- a pinned")
-        print("version nobody checks is a comment (RFC-0041 K3.1).")
+        if how == idp_admin.MEASURED:
+            print("Read from the server, not from a note. A pinned version")
+            print("nobody asks about is a comment (RFC-0041 K3.1).")
+        else:
+            print("NOT read: this credential is too narrow to see it, which")
+            print("is the price of it being too narrow to read anybody's")
+            print("members. The number above is the operator's word, and it")
+            print("is printed as the operator's word everywhere it appears.")
         return
 
     if action == "provision":
@@ -2328,7 +2338,8 @@ def cmd_idp(args):
                                 auth_realm=c.get("auth_realm", ""))
         ok, got, msg = admin.provision(
             space, client_id, uris, title=t.get("name") or t.get("label", ""),
-            accept_version=args.accept_version or "")
+            accept_version=(args.accept_version
+                            or c.get("accept_version", "")))
         for line in admin.trace:
             print("  " + line)
         if not ok:
@@ -2344,7 +2355,8 @@ def cmd_idp(args):
         ok, said = tenant_set_provider(
             tid, got["kind"], got["issuer"], got["client_id"],
             got["client_secret"], label=args.idp_label or "",
-            version=got["version"], connector=name, space=space,
+            version=got["version"], version_how=got.get("version_how", ""),
+            connector=name, space=space,
             who=os.environ.get("SUDO_USER") or getpass.getuser())
         if not ok:
             die("the provider was made and OAAP will not record it: " + said)
@@ -2353,7 +2365,9 @@ def cmd_idp(args):
         print("")
         print(f"  issuer       {got['issuer']}")
         print(f"  client       {got['client_id']}")
-        print(f"  measured     {decl['product']} {got['version']}")
+        print(f"  version      {decl['product']} "
+              + idp_admin.version_words(got.get("version_how", ""),
+                                        got["version"], c["kind"]))
         print("  secret       fetched from the provider and held 0600 on "
               "this node")
         print("")
@@ -2391,7 +2405,10 @@ def _print_idp(label, t):
         print(f"  provider     {provider['kind']} {provider['issuer']}")
         print(f"  client       {provider['client_id']}")
         if provider["version"]:
-            print(f"  built for    Keycloak {provider['version']}")
+            print(f"  built for    Keycloak {provider['version']}"
+                  + {"measured": " (read from the server)",
+                     "asserted": " (STATED by the operator, not read)"}
+                  .get(provider["version_how"], ""))
         if provider["label"]:
             print(f"  button says  {provider['label']}")
         if provider["connector"]:
@@ -5667,7 +5684,7 @@ def ensure_idp_admin_dir():
 
 
 def connector_add(name, kind, base_url, auth, admin_id, admin_secret,
-                  auth_realm="", who="root"):
+                  auth_realm="", accept_version="", who="root"):
     """Record a connector on this node. (ok, sentence).
 
     The refusal comes from services/idp_admin.py, not from here, for
@@ -5691,6 +5708,11 @@ def connector_add(name, kind, base_url, auth, admin_id, admin_secret,
         "admin_id": (admin_id or "").strip(),
         "admin_secret": (admin_secret or "").strip(),
         "auth_realm": (auth_realm or "").strip(),
+        # The version an operator STATED for this server, because a
+        # narrow credential cannot read it (measured 2026-09-23, see
+        # idp_admin.version_check). Typed once, here, and printed as
+        # stated wherever it appears afterwards.
+        "accept_version": (accept_version or "").strip(),
         "added": (held.get(name) or {}).get("added") or _iso_now(),
         "written": _iso_now(),
         "by": who,
@@ -5744,7 +5766,7 @@ def ensure_idp_dir():
 
 def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                         label="", version="", who="root", role="root",
-                        connector="", space=""):
+                        connector="", space="", version_how=""):
     """Attach or change a tenant's identity provider. (ok, sentence).
 
     Refused for the DEFAULT tenant? No -- deliberately allowed. The
@@ -5772,6 +5794,7 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                 # because the binding is the issuer and nothing else.
                 "connector": (connector or "").strip(),
                 "space": (space or "").strip(),
+                "version_how": (version_how or "").strip(),
                 "added": (t.get("idp") or {}).get("added") or _iso_now()}
     tenants[tid] = t
     save_tenants(tenants)
@@ -14121,8 +14144,9 @@ def main():
                       help="for 'provision': what the button on the login "
                            "page says")
     pidp.add_argument("--accept-version", dest="accept_version", default=None,
-                      help="proceed against a version this build was NOT "
-                           "measured against, by naming it")
+                      help="state the server's version yourself -- for a "
+                           "credential too narrow to read it, or for a "
+                           "version this build was not measured against")
     pidp.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="print every call this would make, and make none")
     pidp.set_defaults(fn=cmd_idp)

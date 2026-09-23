@@ -198,6 +198,10 @@ def provider_of(tenant):
         # same thing is a second chance to match on the wrong one.
         "connector": (p.get("connector") or "").strip(),
         "space": (p.get("space") or "").strip(),
+        # Whether that version was READ from the server or STATED by
+        # the operator. The difference is the whole of what the pin is
+        # worth, so it travels with the number and is printed with it.
+        "version_how": (p.get("version_how") or "").strip(),
     }
 
 

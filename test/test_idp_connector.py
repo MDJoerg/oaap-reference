@@ -167,6 +167,30 @@ ok("eine andere getippte Zahl hilft nicht",
    a.version_refusal("keycloak", "26.9.0", "26.8.0"))
 ok("ein Server, der seine Fassung verschweigt, wird abgelehnt",
    a.version_refusal("keycloak", ""))
+
+# Der dritte Ausgang, an der Maschine gefunden und nicht im Entwurf:
+# /admin/serverinfo antwortet einer engen Vollmacht OHNE Fassung. K3.1
+# will sie pruefbar, K3.4 will die Vollmacht eng -- beides zusammen gibt
+# es bei Keycloak 26.7.4 nicht. Also: ein Mensch nennt die Zahl, und
+# OAAP sagt ueberall dazu, dass sie genannt und nicht gelesen wurde.
+how, bad = a.version_check("keycloak", PIN)
+ok("gelesen heisst gemessen", how == a.MEASURED and not bad)
+how, bad = a.version_check("keycloak", "", PIN)
+ok("verschwiegen plus getippt heisst BEHAUPTET",
+   how == a.ASSERTED and not bad, (how, bad))
+how, bad = a.version_check("keycloak", "", "")
+ok("verschwiegen und nichts getippt wird abgelehnt", not how and bool(bad))
+ok("... und die Ablehnung nennt die gemessene Ursache",
+   "trimmed" in bad and "2026-09-23" in bad, bad)
+# Die Regel, die eine Behauptung ungefaehrlich macht: sie schlaegt eine
+# Messung nie. Sagt der Server etwas, gilt das -- auch gegen den Zettel.
+how, bad = a.version_check("keycloak", "26.9.9", PIN)
+ok("eine Behauptung schlaegt eine Messung NICHT", not how and bool(bad),
+   (how, bad))
+ok("das Wort fuer eine gelesene Zahl sagt, woher sie kommt",
+   "/admin/serverinfo" in a.version_words(a.MEASURED, PIN, "keycloak"))
+ok("das Wort fuer eine genannte Zahl sagt, dass sie genannt ist",
+   "STATED" in a.version_words(a.ASSERTED, PIN, "keycloak"))
 ok("die Fassung wird an der Stelle gelesen, die der Vertrag nennt",
    a.version_said("keycloak", {"systemInfo": {"version": "26.7.4"}})
    == "26.7.4")
@@ -262,7 +286,7 @@ ok("eine unbekannte Art baut gar keinen Koerper",
 print("\nEin erfundenes Keycloak, und ein echter Durchlauf")
 
 STATE = {"realms": {}, "clients": {}, "writes": 0, "version": PIN,
-         "methods": [], "forbidden": set()}
+         "methods": [], "forbidden": set(), "trim": False}
 
 
 class Fake(BaseHTTPRequestHandler):
@@ -286,6 +310,10 @@ class Fake(BaseHTTPRequestHandler):
         if not self._auth():
             return self._json({"error": "forbidden"}, 401)
         if path == "/admin/serverinfo":
+            if STATE["trim"]:
+                # Genau das, was eine enge Vollmacht bei Keycloak
+                # 26.7.4 zurueckbekommt: ein Dokument ohne systemInfo.
+                return self._json({"profileInfo": {"name": "default"}})
             return self._json({"systemInfo": {"version": STATE["version"]}})
         m = re.match(r"^/admin/realms/([^/]+)$", path)
         if m:
@@ -470,6 +498,32 @@ ok("ein Realm, den diese Vollmacht nicht ansehen darf, bricht ab", died)
 ok("... und es wurde nichts darueber angelegt", STATE["writes"] == 0,
    STATE["methods"][-4:])
 STATE["forbidden"].clear()
+
+# Und derselbe Abbruch noch einmal, mit der Ursache, die an der
+# Maschine gefunden wurde: der Server ANTWORTET, nennt aber keine
+# Fassung. Auch das legt nichts an.
+STATE["trim"] = True
+STATE["writes"] = 0
+try:
+    provision(space="trimm")
+    died = False
+except SystemExit as e:
+    died = e.code != 0
+ok("ein Server, der die Fassung verschweigt, bricht ab", died)
+ok("... und es wurde nichts angelegt", STATE["writes"] == 0)
+ok("... und 'trimm' gibt es beim Anbieter nicht",
+   "trimm" not in STATE["realms"], list(STATE["realms"]))
+# Mit der genannten Zahl geht es -- und der Mandantensatz sagt, dass
+# sie genannt und nicht gelesen wurde.
+provision(space="trimm", accept_version=PIN)
+ok("mit der genannten Zahl geht es", "trimm" in STATE["realms"])
+prov_t = idp.provider_of(m.load_tenants()[hbvp])
+ok("und der Satz haelt fest, dass sie BEHAUPTET war",
+   prov_t["version_how"] == a.ASSERTED, prov_t)
+STATE["trim"] = False
+provision()
+ok("wird sie danach wieder gelesen, steht das auch da",
+   idp.provider_of(m.load_tenants()[hbvp])["version_how"] == a.MEASURED)
 
 # Ein zweiter Durchlauf. K3.3: was OAAP vorfindet, nimmt es, wie es ist.
 writes_before = STATE["writes"]

@@ -249,12 +249,15 @@ def credential_note(kind, auth, realm=""):
         return (f"a service account in the '{realm}' realm -- grant it "
                 "`create-realm` and nothing else; it can then make "
                 f"{c['space_word']}s and administer the ones it made, and "
-                "it can read nobody else's people")
+                "it can read nobody else's people. What it CANNOT do is "
+                "read the server's version, so that number is stated "
+                "once with --accept-version and printed as stated")
     return (f"a USER's login in the '{realm}' realm. It can do whatever "
             "that user can do -- on a shared node that is usually every "
-            "club on this server. It works, and a service account with "
-            "`create-realm` is the credential this was designed for "
-            "(RFC-0041 K3.4)")
+            "club on this server. It can read the server's version, "
+            "which the narrow credential cannot; that is the whole of "
+            "what it buys, and a service account with `create-realm` is "
+            "the credential this was designed for (RFC-0041 K3.4)")
 
 
 # ---------------------------------------------------------------------------
@@ -451,32 +454,85 @@ def version_said(kind, doc):
     return str(cur or "").strip()
 
 
-def version_refusal(kind, said, accepted=""):
-    """K3.2, loudly: name the call, both numbers, and the way forward.
+MEASURED = "measured"
+ASSERTED = "asserted"
 
-    An operator who has tested a newer Keycloak on `oaap-test` says so
-    by TYPING the number, not by clicking past a warning. The number
-    then lands in the provider object and in the tenant's log, and the
-    next person can read which version this was actually built against
-    instead of which version we wished it were.
+
+def version_check(kind, said, accepted=""):
+    """(how, refusal). How the version of this server became known.
+
+    Three ends, not two, and the third one was found on the machine
+    rather than in the design (2026-09-23, Keycloak 26.7.4):
+
+    * `measured` -- the server stated it and it is the pinned one, or
+      it is one the operator has explicitly accepted.
+    * a refusal -- the server stated a version nobody measured against
+      and nobody accepted. K3.2.
+    * `asserted` -- the server would not state it AT ALL, and the
+      operator has typed the number instead.
+
+    The third case is not a loophole, it is the only thing left after a
+    measurement that went against the design. K3.1 wants the pinned
+    version checkable; K3.4 wants a credential that is not the server's
+    administrator. At Keycloak those two cannot both be had: the
+    version lives at /admin/serverinfo, and that document comes back
+    TRIMMED -- `profileInfo` and nothing else -- for a credential that
+    is not a full server administrator. Measured for `create-realm`
+    alone and for `create-realm` + `view-realm`; the second one buys no
+    version and costs the ability to enumerate every realm on the
+    server, which is every club on it.
+
+    So what is kept is the substance of K3.1: nothing is created
+    against a version nobody has checked, and where OAAP cannot check
+    it, a HUMAN states it and OAAP says everywhere that this number was
+    stated and not read. An assertion never overrides a reading -- if
+    the server does say a version, that is the one that counts, and a
+    contradicting assertion is refused like any other mismatch.
     """
     bad = kind_refusal(kind)
     if bad:
-        return bad
+        return "", bad
     c = connector_of(kind)
     said = (said or "").strip()
-    if not said:
-        return (f"{c['version_path']} did not say which version this "
-                f"{c['product']} is -- refusing rather than guessing "
-                "(RFC-0041 K3.2)")
-    if said == c["pinned"] or (accepted or "").strip() == said:
-        return ""
-    return (f"this build was measured against {c['product']} {c['pinned']} "
+    accepted = (accepted or "").strip()
+    if said:
+        if said == c["pinned"] or said == accepted:
+            return MEASURED, ""
+        return "", (
+            f"this build was measured against {c['product']} {c['pinned']} "
             f"(on {c['measured']}), and {c['version_path']} says {said}. "
             f"OAAP creates {c['space_word']}s through this server's admin "
             "API, and that integration ages invisibly -- so it refuses "
             f"instead of guessing. Test {said} on oaap-test, then say "
             f"--accept-version {said}.")
+    if accepted:
+        return ASSERTED, ""
+    return "", (
+        f"{c['version_path']} answered, but named no version. At "
+        f"{c['product']} that document is trimmed for a credential that "
+        "is not a full server administrator -- and the narrow one this "
+        "was designed for deliberately is not (measured 2026-09-23). "
+        "Read the version yourself and state it: `--accept-version "
+        f"{c['pinned']}`. It is then recorded as STATED, not read, "
+        "everywhere OAAP prints it (RFC-0041 K3.1/K3.4).")
+
+
+def version_refusal(kind, said, accepted=""):
+    """Why this server may not be managed. '' when it may."""
+    return version_check(kind, said, accepted)[1]
+
+
+def version_words(how, version, kind):
+    """How an operator should read this number."""
+    c = connector_of(kind)
+    if how == MEASURED:
+        return (f"{version} -- read from {c.get('version_path', 'the server')}"
+                + ("" if version == c.get("pinned")
+                   else ", and accepted by hand"))
+    if how == ASSERTED:
+        return (f"{version} -- STATED by the operator; this credential "
+                "cannot read it")
+    return "unknown"
 
 
 def _keycloak_space_body(space, title=""):
@@ -834,13 +890,12 @@ class Admin:
         said, err = self.version()
         if err:
             return False, {}, err
-        bad = version_refusal(self.kind, said, accept_version)
+        how, bad = version_check(self.kind, said, accept_version)
         if bad:
             return False, {}, bad
-        self._note(f"{self.decl['product']} {said} -- the version this build "
-                   "was measured against"
-                   + (" (accepted by hand)" if said != self.decl["pinned"]
-                      else ""))
+        seen = said or (accept_version or "").strip()
+        self._note(f"{self.decl['product']} "
+                   + version_words(how, seen, self.kind))
         exists, err = self.find_space(space)
         if err:
             return False, {}, err
@@ -877,6 +932,7 @@ class Admin:
             "issuer": issuer_for(self.kind, self.base, space),
             "client_id": client_id,
             "client_secret": secret,
-            "version": said,
+            "version": seen,
+            "version_how": how,
             "space": space,
         }, f"'{space}' is ready at {self.base}"
