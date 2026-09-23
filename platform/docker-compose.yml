@@ -87,6 +87,14 @@ services:
       # app subdomains of the registered external hostname, and
       # tenants.json — identity reads the tenant store, appctl owns it
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+      # read-only, and deliberately NOT a corner of /platform-apps:
+      # the OIDC client secrets of the tenants' identity providers
+      # (RFC-0041 3). The portal mounts /platform-apps as well, so a
+      # secret placed there would be readable by a second service for
+      # no reason. Its own directory keeps the list of readers at one,
+      # and read-only keeps identity from ever writing it -- appctl on
+      # the host owns this file, exactly as it owns tenants.json.
+      - "${OAAP_DATA_DIR}/data/idp:/platform-idp:ro"
       # writable, and the only thing identity writes outside its own
       # data: the tenant audit log (oaap.core.tenant 1.7). User
       # administration is the one state change that never passes the

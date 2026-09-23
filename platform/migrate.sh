@@ -264,6 +264,15 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-place
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-place-assets \
   2>&1 | sed 's/^/  /' || say "  WARNING: the tenant logos could not be written - run 'oaap status'."
 
+# --- a tenant's identity provider (0.1.120, RFC-0041) ---
+# The OIDC client secret of a tenant's provider is NOT in tenants.json:
+# that file is world-readable and travels in a tenant archive. It lives
+# 0600 in a directory only the identity service mounts, and the mount
+# needs the directory to exist before the container starts. Made here
+# rather than left to Docker, which would create it root:root with the
+# daemon's umask -- and 0.1.118 is what a missing mountpoint costs.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-idp-dir   2>&1 | sed 's/^/  /' || say "  WARNING: the provider-secret directory could not be prepared."
+
 # --- open streams survive gateway reloads (0.1.102) ---
 # Every deployment reloads the gateway, and a reload used to cut every
 # open WebSocket/SSE stream of every app on the node. The delay that

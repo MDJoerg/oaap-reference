@@ -681,10 +681,22 @@ else:
             "role": "server_admin", "action": "instance.install",
             "tenant": KUNDE, "tenant_label": "k7f3", "subject": "viewer",
             "result": "ok", "detail": ""}]
+    # Der Weg herein (RFC-0041): ein tenant_admin SIEHT, was ein erster
+    # Login bedeutet, und kann es nicht aendern. Hier unkonfiguriert,
+    # also die Vorgabe.
+    NO_IDP = {"issuer": "", "label": "den eigenen Anmeldedienst",
+              "where": "lokal", "first_login": "eingang",
+              "first_login_text": "eine Identitaet und keine Rechte",
+              "self_registration": False}
     mine_page = render("TENANT_BODY", is_server_admin=False, tenants=[],
                        me={"label": "k7f3", "name": "Kunde A",
-                           "created": "heute", "users": 2, "instances": 1},
+                           "created": "heute", "users": 2, "instances": 1,
+                           "idp": NO_IDP},
                        host="oaap.example.org", entries=log)
+    check("der Mandant sieht, was ein erster Login bedeutet, und dass nur "
+          "der Betreiber das aendert",
+          "eine Identitaet und keine Rechte" in mine_page
+          and "nur der Betreiber" in mine_page)
     check("die Mandantenseite zeigt dem Kunden den Eingriff des Betreibers",
           "joerg" in mine_page and "server_admin" in mine_page
           and "instance.install" in mine_page,
@@ -694,7 +706,7 @@ else:
     all_page = render("TENANT_BODY", is_server_admin=True,
                       tenants=[{"label": "k7f3", "name": "Kunde A",
                                 "created": "heute", "users": 2,
-                                "instances": 1}],
+                                "instances": 1, "idp": NO_IDP}],
                       me=None, host="oaap.example.org", entries=log)
     check("der Betreiber sieht alle Mandanten und alle Eintraege",
           "k7f3" in all_page and "instance.install" in all_page)

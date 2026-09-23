@@ -34,6 +34,7 @@ _SIBLING = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if os.path.isfile(os.path.join(_SIBLING, "place.py")):
     sys.path.insert(0, _SIBLING)
 import place  # noqa: E402
+import idp  # noqa: E402
 import relay_view
 import twin_view
 
@@ -1485,14 +1486,36 @@ TENANT_BODY = """
   {% endif %}
   <p><a class="btn" href="/tenant/face">Das Gesicht aendern</a></p>
 </div>
+<div class="card">
+  <h2>Der Weg herein</h2>
+  {% if me.idp.issuer %}
+  <p>Mitglieder melden sich über <strong>{{ me.idp.label }}</strong> an
+     (<code>{{ me.idp.issuer }}</code>).</p>
+  {% else %}
+  <p>Mitglieder melden sich mit einem Konto dieses Knotens an. Ein eigener
+     Anmeldedienst ist nicht hinterlegt.</p>
+  {% endif %}
+  <p>Wer sich zum <em>ersten Mal</em> anmeldet, bekommt:
+     <strong>{{ me.idp.first_login_text }}</strong></p>
+  {% if me.idp.self_registration %}
+  <p class="muted">Selbstregistrierung im Anmeldedienst ist eingeschaltet.</p>
+  {% endif %}
+  <p class="muted">Diese Einstellungen ändert nur der Betreiber dieses
+     Knotens, nicht der Mandant. Der Grund steht im Protokoll unten: Auf
+     dieser Maschine liegen mehrere Kunden, und wer sich selbst eine Tür
+     öffnen könnte, öffnete sie auf einer Maschine, die ihm nicht allein
+     gehört. Jede Änderung daran steht hier im Protokoll.</p>
+</div>
 {% else %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
   <tr><th>Kürzel</th><th>Name</th><th>Benutzer</th><th>Instanzen</th>
-      <th>Angelegt</th><th></th></tr>
+      <th>Anmeldung</th><th>Erster Login</th><th>Angelegt</th><th></th></tr>
   {% for t in tenants %}
   <tr><td><code>{{ t.label }}</code></td><td>{{ t.name }}</td>
       <td>{{ t.users }}</td><td>{{ t.instances }}</td>
+      <td>{{ t.idp.where }}</td>
+      <td class="muted">{{ t.idp.first_login }}</td>
       <td class="muted">{{ t.created }}</td>
       <td>{% if not t.is_default %}<a class="rowaction"
           href="/tenant/face?tenant={{ t.label }}">Gesicht</a>{% endif %}</td></tr>
@@ -1516,6 +1539,12 @@ TENANT_BODY = """
      umbenannt werden (<code>sudo oaap tenant rename</code>, der alte Name
      antwortet noch eine Weile), gelöscht wird er nicht: Er hält Benutzer,
      Instanzen und deren Daten, und das wäre Exportieren-dann-Vernichten.</p>
+  <p class="muted">Den Anmeldedienst eines Mandanten und das, was ein
+     erster Login bedeutet, setzt der Betreiber an der Maschine:
+     <code>sudo oaap tenant idp &lt;kürzel&gt; --issuer … --client-id …
+     --client-secret …</code> und <code>sudo oaap tenant policy
+     &lt;kürzel&gt; --first-login …</code>. Absichtlich nicht hier: Das
+     Geheimnis gehört in kein Formular, das durch einen Browser läuft.</p>
   <form method="post" action="/tenant/create">
     <label>Kürzel
       <input type="text" name="label" required pattern="[a-z0-9][a-z0-9-]{0,30}"
@@ -3903,6 +3932,7 @@ def tenant_page():
         for tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
             n_users, n_inst = counts(tid)
             rows.append({"label": t.get("label", "?"),
+                         "idp": _idp_view(t),
                          "name": t.get("name") or "—",
                          "created": t.get("created", "?"),
                          # The node's own tenant has no place of its own
@@ -3918,7 +3948,8 @@ def tenant_page():
     t = tenants.get(mine) or {}
     n_users, n_inst = counts(mine)
     me = {"label": t.get("label", "?"), "name": t.get("name") or t.get("label", "?"),
-          "created": t.get("created", "?"), "users": n_users, "instances": n_inst}
+          "created": t.get("created", "?"), "users": n_users,
+          "instances": n_inst, "idp": _idp_view(t)}
     # The tenant is taken from the caller's own record, so the log they
     # get is theirs by construction — there is no parameter to tamper
     # with and therefore no other tenant's log to ask for.
@@ -3927,6 +3958,34 @@ def tenant_page():
                 entries=read_audit(mine),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
+
+
+def _idp_view(t):
+    """A tenant's way in, in words, for a page that may not change it.
+
+    RFC-0041 3 says a tenant_admin SEES `first_login`, self-registration
+    and 2FA and cannot move them. Seeing is not a courtesy here: it is
+    what makes "only the operator changes this" honest rather than
+    merely quiet. The client secret is not in this view and cannot be
+    -- the portal does not even mount the file it lives in.
+    """
+    provider = idp.provider_of(t)
+    policy = idp.policy_of(t)
+    words = {
+        "eingang": "eine Identität und keine Rechte, sichtbar im Eingang",
+        "role": f"die Rolle {policy['default_role']}",
+        "groups": (f"die Rolle {policy['default_role']} und die "
+                   "zugeordneten Sichtbarkeitsgruppen"),
+    }
+    return {
+        "issuer": provider.get("issuer", ""),
+        "label": provider.get("label") or "den eigenen Anmeldedienst",
+        "where": (provider.get("issuer", "").split("//")[-1].split("/")[0]
+                  or "lokal"),
+        "first_login": policy["first_login"],
+        "first_login_text": words.get(policy["first_login"], "nichts"),
+        "self_registration": policy["self_registration"],
+    }
 
 
 TENANT_WAIT_SECONDS = 20   # a small JSON file plus one DNS lookup

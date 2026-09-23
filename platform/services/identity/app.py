@@ -10,7 +10,9 @@ on every call — sessions carry only the username, never roles — so
 role changes and deactivation act on the user's next request.
 """
 
+import base64
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -20,7 +22,9 @@ import tempfile
 import time
 import uuid
 from datetime import timedelta
-from urllib.parse import quote
+import urllib.error
+import urllib.request
+from urllib.parse import quote, urlencode
 
 from datetime import datetime, timezone
 
@@ -30,7 +34,8 @@ from flask.sessions import SecureCookieSessionInterface
 from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
 
-# Which tenant a host names, and what its face is (RFC-0042 T2/T3).
+# Which tenant a host names and what its face is (RFC-0042 T2/T3), and
+# what a tenant's own identity provider may do (RFC-0041).
 # The SAME file the portal has -- see docker-compose.yml. The login page
 # is the first page a club member ever sees, and it has to reach the
 # same answer as the portal behind it; two readings of one hostname is
@@ -44,6 +49,7 @@ _SIBLING = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if os.path.isfile(os.path.join(_SIBLING, "place.py")):
     sys.path.insert(0, _SIBLING)
 import place  # noqa: E402
+import idp  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -667,6 +673,7 @@ RETURN_MAX = 512
 # 204 with no page. Named here rather than guarded at the call site,
 # because the fallback is exactly the path nobody will be watching.
 NOT_A_RETURN = frozenset({"/auth/login", "/auth/logout", "/auth/terminal",
+                          "/auth/oidc/start", "/auth/oidc/callback",
                           "/verify", "/throttle"})
 
 
@@ -1080,12 +1087,34 @@ LOGIN_PAGE = _HEAD + "<title>Anmelden — {{ face.title if at_place else 'OAAP' 
   Einrichtung abschließen (URL und Token stehen in der
   Installationsausgabe).</p>
 {% endif %}
+{% if provider %}
+<form method="get" action="/auth/oidc/start">
+{% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+  <button>{{ provider }}</button>
+</form>
+<p class="hint" style="text-align:center;margin:.9rem 0">oder mit einem
+   Konto dieses Knotens</p>
+{% endif %}
 <form method="post" action="/auth/login">
 {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
   <label>Benutzername <input name="username" autofocus autocomplete="username"></label>
   <label>Passwort <input name="password" type="password" autocomplete="current-password"></label>
   <button>Anmelden</button>
 </form>
+</div></body></html>"""])
+
+
+# The page a failed provider login lands on. Its own template rather
+# than the login form with an error, because the two say different
+# things: the form says "try again", this says "the way in is broken
+# and here is which part". RFC-0041 3 -- failure is closed AND legible.
+IDP_FAILED_PAGE = _HEAD + "<title>Anmeldung — OAAP</title>" + _CARD_STYLE \
+    + "{{ theme_style }}" + _MARK_SVG.join([
+        "<body><div class='card'>",
+        """<h1>Anmeldung nicht m&ouml;glich</h1>
+<p class="err">{{ reason }}</p>
+<p class="hint">Es wurde keine Sitzung angelegt.</p>
+<p><a href="/auth/login">Zur&uuml;ck zur Anmeldung</a></p>
 </div></body></html>"""])
 
 PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE + "{{ theme_style }}" + _MARK_SVG.join([
@@ -1383,6 +1412,7 @@ def verify():
 def login_form():
     return render_template_string(
         LOGIN_PAGE, error=None, has_users=bool(load_users()),
+        provider=login_provider_label(),
         next=_return_target(request.args.get("next", "")))
 
 
@@ -1399,14 +1429,24 @@ def login():
     if _login_blocked(throttle_key):
         return render_template_string(
             LOGIN_PAGE, error="Zu viele Fehlversuche — bitte eine Minute warten.",
-            has_users=bool(users), next=target), 429
+            has_users=bool(users), provider=login_provider_label(),
+            next=target), 429
     u = find_user(users, username)
     # Generic error either way — no username enumeration (spec 4.4).
     # A machine principal has no password (RFC-0027 3.1) and must not
     # be able to acquire a session by any route -- said explicitly here
     # rather than relying on check_password_hash refusing an empty
     # stored hash, which is a library behaviour, not a decision of ours.
+    # A record that has no local password cannot acquire a local
+    # session -- said out loud, not left to what check_password_hash
+    # does with an empty string. Since RFC-0041 that is not only the
+    # machine principals of RFC-0027 but every person a realm
+    # introduced: "never falls back to a local password for a
+    # realm-backed identity" (RFC-0041 3) is only true if the fallback
+    # does not exist, and it is asked here as a FUNCTION so a test can
+    # run the rule instead of reading it.
     if (u and u["active"] and u.get("kind", "human") != "machine"
+            and idp.has_local_password(u)
             and check_password_hash(u["password_hash"], password)):
         _login_succeeded(throttle_key)
         session["user"] = u["username"]
@@ -1421,8 +1461,358 @@ def login():
     print(f"login failed: '{username}' from {_client_ip()}", flush=True)
     return render_template_string(
         LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.",
-        has_users=bool(users), next=target
+        has_users=bool(users), provider=login_provider_label(), next=target
     ), 401
+
+
+# ---------------------------------------------------------------------------
+# LOGGING IN THROUGH A TENANT'S OWN IDENTITY PROVIDER (RFC-0041)
+#
+# K1: the relying party is Identity, not the gateway. Everything an
+# OIDC client needs is already here -- /auth/* on every entry point,
+# the session cookie, the throttle, the return target -- and the
+# gateway has none of it.
+#
+# Worth saying plainly, because it is what keeps the blast radius
+# small: this is NOT a third method in resolve_principal(). It is a
+# second way to ESTABLISH the session that method 1 already reads.
+# Nothing downstream -- /verify, the headers, the tenant boundary, an
+# app -- can tell the difference, and that is RFC-0040 6's promise
+# ("the app never sees the provider") held structurally rather than by
+# discipline.
+#
+# The client secret is NOT in tenants.json: that file is world-readable
+# on the node and travels in a tenant archive. It lives in a 0600 file
+# of its own, written by appctl on the host and mounted READ-ONLY here
+# -- its own mount rather than a corner of /platform-apps, so that the
+# portal, which mounts that directory too, is structurally unable to
+# see it (RFC-0041 3: never visible to an app, and the fewer readers
+# the shorter the sentence stays true).
+IDP_SECRETS_FILE = "/platform-idp/secrets.json"
+OIDC_DISCOVERY_TTL = 300
+OIDC_HTTP_TIMEOUT = 8
+_discovery_cache = {}
+
+
+def tenant_provider(tid):
+    """(provider object, client secret) for a tenant, or ({}, "")."""
+    t = known_tenants().get(tid or "") or {}
+    provider = idp.provider_of(t)
+    if not provider:
+        return {}, ""
+    try:
+        with open(IDP_SECRETS_FILE, encoding="utf-8") as f:
+            held = (json.load(f) or {}).get("providers") or {}
+    except (OSError, ValueError):
+        held = {}
+    return provider, str((held.get(tid) or {}).get("client_secret") or "")
+
+
+def login_tenant():
+    """Which tenant's provider THIS entry point offers (K5).
+
+    The host decides, exactly as it decides the face: a login through
+    `hbvp.<node>` goes to the hbvp realm and produces a principal in
+    the hbvp tenant. The same human arriving through `cls.<node>` is a
+    different principal in a different tenant -- RFC-0022 D3 made
+    operational instead of theoretical.
+
+    None means "this entry point offers nothing", which is the only
+    safe answer for a host naming a place this node does not have. The
+    node's own apex means the default tenant, whose place IS the apex.
+    """
+    ext = _external_host()
+    tenants = known_tenants()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    dflt = default_tenant_id()
+    tid, resolved = place.host_place(request.host, ext, tenants, dflt, now)
+    if not resolved:
+        return None
+    return tid or dflt or ""
+
+
+def login_provider_label():
+    """The wording on the provider button, or "" when there is none."""
+    try:
+        tid = login_tenant()
+        if tid is None:
+            return ""
+        provider, secret = tenant_provider(tid)
+        if not provider or not secret:
+            return ""
+        return provider.get("label") or "Mit dem Vereinskonto anmelden"
+    except Exception:            # noqa: BLE001 -- a broken provider must
+        return ""                # never take the password form with it
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects on the back channel.
+
+    A redirect on the token endpoint is a request to send the client
+    secret somewhere else, and on the discovery document it is a
+    request to be a different issuer. Neither is ever legitimate for a
+    provider object that names its issuer exactly (RFC-0041 K3: fail
+    loudly, never guess).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _back_channel(url, data=None, headers=None):
+    """One back-channel call: (parsed json, refusal sentence).
+
+    Never raises. A provider that is unreachable must produce a
+    LEGIBLE refusal, not a stack trace and not a login.
+    """
+    req = urllib.request.Request(url, data=data, headers=headers or {})
+    opener = urllib.request.build_opener(_NoRedirect)
+    where = url.split("?")[0]
+    try:
+        with opener.open(req, timeout=OIDC_HTTP_TIMEOUT) as r:
+            return json.loads(r.read(1 << 20).decode("utf-8")), ""
+    except urllib.error.HTTPError as e:
+        return None, f"{where} antwortete mit {e.code}"
+    except ValueError:
+        return None, f"{where} antwortete nicht mit JSON"
+    except Exception as e:       # noqa: BLE001 -- socket, TLS, DNS, timeout
+        return None, (f"{where} ist nicht erreichbar "
+                      f"({e.__class__.__name__})")
+
+
+def _discovery(issuer):
+    """The provider's own description of itself: (doc, refusal).
+
+    Cached briefly, because it is asked twice per login and a provider
+    is not expected to move between the two. Checked every time it is
+    USED, not only when it is fetched: `endpoints_refusal` insists that
+    the document names the issuer we configured, to the character.
+    """
+    hit = _discovery_cache.get(issuer)
+    if hit and hit[0] > time.time():
+        return hit[1], ""
+    doc, bad = _back_channel(idp.discovery_url(issuer))
+    if bad:
+        return None, bad
+    bad = idp.endpoints_refusal(doc, issuer)
+    if bad:
+        return None, bad
+    _discovery_cache[issuer] = (time.time() + OIDC_DISCOVERY_TTL, doc)
+    return doc, ""
+
+
+def _oidc_redirect_uri():
+    """Where the provider sends the browser back -- absolute, per host.
+
+    Per host on purpose: the tenant address IS the entry point (K5), so
+    `hbvp.<node>` and the apex are two redirect URIs and the realm
+    registers the one that belongs to it. Built from what the gateway
+    forwarded, because inside the container the request arrived on
+    http:8000 no matter what the visitor typed.
+    """
+    scheme = (request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+              or request.scheme)
+    host = request.headers.get("X-Forwarded-Host", "").split(",")[0].strip() \
+        or request.host
+    return f"{scheme}://{host}/auth/oidc/callback"
+
+
+def _idp_failed(reason, status=400, who="?", tid="", detail=""):
+    """Refuse a provider login: no session, a sentence, a log line."""
+    print(f"idp login refused: {reason}", flush=True)
+    audit("user.idp-login", tid, who, result="denied", who=who, role="-",
+          detail=detail or reason)
+    return render_template_string(IDP_FAILED_PAGE, reason=reason), status
+
+
+@app.get("/auth/oidc/start")
+def oidc_start():
+    """Send the visitor to their tenant's provider."""
+    tid = login_tenant()
+    if tid is None:
+        return _idp_failed("Diese Adresse gehört zu keinem Mandanten "
+                           "dieses Knotens.", 404)
+    provider, secret = tenant_provider(tid)
+    if not provider or not secret:
+        return _idp_failed("Für diesen Zugang ist kein Anmeldedienst "
+                           "hinterlegt.", 404, tid=tid)
+    doc, bad = _discovery(provider["issuer"])
+    if bad:
+        return _idp_failed(f"Der Anmeldedienst ist nicht verfügbar: {bad}",
+                           502, tid=tid)
+    ends = idp.endpoints_of(doc)
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode()
+    state, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+    redirect_uri = _oidc_redirect_uri()
+    # The whole attempt travels in the (signed) session cookie, so the
+    # callback compares against what THIS browser started and not
+    # against anything a request could carry.
+    session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier,
+                       "tenant": tid, "issuer": provider["issuer"],
+                       "redirect_uri": redirect_uri,
+                       "next": _return_target(request.args.get("next", ""))}
+    query = urlencode({"response_type": "code", "scope": "openid profile email",
+                       "client_id": provider["client_id"],
+                       "redirect_uri": redirect_uri, "state": state,
+                       "nonce": nonce, "code_challenge": challenge,
+                       "code_challenge_method": "S256"})
+    sep = "&" if "?" in ends["authorize"] else "?"
+    return redirect(ends["authorize"] + sep + query, code=303)
+
+
+def _token_auth(doc, client_id, client_secret, form):
+    """How this provider wants the client to prove itself.
+
+    Basic when it is offered (the OIDC default), form fields when only
+    those are, and a refusal when neither -- K3's "fail loudly, never
+    guess" applied to the one call that carries the secret.
+    """
+    supported = doc.get("token_endpoint_auth_methods_supported") or \
+        ["client_secret_basic"]
+    headers = {"Content-Type": "application/x-www-form-urlencoded",
+               "Accept": "application/json"}
+    if "client_secret_basic" in supported:
+        raw = f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}"
+        headers["Authorization"] = "Basic " + base64.b64encode(
+            raw.encode("utf-8")).decode("ascii")
+        return headers, form, ""
+    if "client_secret_post" in supported:
+        return headers, dict(form, client_id=client_id,
+                             client_secret=client_secret), ""
+    return None, None, ("Der Anmeldedienst verlangt ein Verfahren zur "
+                        "Client-Anmeldung, das diese Fassung nicht kennt "
+                        f"({', '.join(map(str, supported))[:120]})")
+
+
+@app.get("/auth/oidc/callback")
+def oidc_callback():
+    """Take the provider's answer and turn it into a local session."""
+    started = session.pop("oidc", None) or {}
+    if not started:
+        return _idp_failed("Zu dieser Rückmeldung gibt es keinen "
+                           "begonnenen Anmeldeversuch.", 400)
+    if request.args.get("error"):
+        return _idp_failed("Der Anmeldedienst hat die Anmeldung abgelehnt "
+                           f"({str(request.args.get('error'))[:80]}).", 403,
+                           tid=started.get("tenant", ""))
+    if not secrets.compare_digest(str(request.args.get("state", "")),
+                                  str(started.get("state", ""))):
+        return _idp_failed("Diese Rückmeldung gehört nicht zu diesem "
+                           "Anmeldeversuch.", 400,
+                           tid=started.get("tenant", ""))
+    tid = started.get("tenant", "")
+    provider, secret = tenant_provider(tid)
+    if not provider or not secret \
+            or provider["issuer"] != started.get("issuer"):
+        return _idp_failed("Der Anmeldedienst dieses Mandanten hat sich "
+                           "während der Anmeldung geändert.", 409, tid=tid)
+    doc, bad = _discovery(provider["issuer"])
+    if bad:
+        return _idp_failed(f"Der Anmeldedienst ist nicht verfügbar: {bad}",
+                           502, tid=tid)
+    ends = idp.endpoints_of(doc)
+    form = {"grant_type": "authorization_code",
+            "code": request.args.get("code", ""),
+            "redirect_uri": started.get("redirect_uri", ""),
+            "code_verifier": started.get("verifier", "")}
+    headers, form, bad = _token_auth(doc, provider["client_id"], secret, form)
+    if bad:
+        return _idp_failed(bad, 502, tid=tid)
+    tok, bad = _back_channel(ends["token"],
+                             data=urlencode(form).encode("ascii"),
+                             headers=headers)
+    if bad:
+        return _idp_failed(f"Der Anmeldedienst hat den Code nicht "
+                           f"eingelöst: {bad}", 502, tid=tid)
+    claims = idp.jwt_claims((tok or {}).get("id_token") or "")
+    bad = idp.claims_refusal(claims, provider["issuer"], provider["client_id"],
+                             started.get("nonce", ""), time.time())
+    if bad:
+        return _idp_failed(f"Die Antwort des Anmeldedienstes ist nicht "
+                           f"verwendbar: {bad}", 403, tid=tid)
+    user, bad = _idp_principal(tid, provider, claims)
+    if bad:
+        return _idp_failed(bad, 403, tid=tid,
+                           who=str(claims.get("sub"))[:40])
+    session["user"] = user["username"]
+    session["epoch"] = user.get("session_epoch", 0)
+    session["idp"] = {"provider": idp.provider_key(provider),
+                      "factor": idp.second_factor(claims)}
+    print(f"idp login ok: {user['username']} from {_client_ip()}", flush=True)
+    return redirect(_return_target(started.get("next", "")) or "/", code=303)
+
+
+def _idp_principal(tid, provider, claims):
+    """The local record behind this assertion: (user, refusal).
+
+    Binds, or creates and binds. Both under the write lock, because
+    this is exactly the path RFC-0040 D6 built it for: records created
+    by INCOMING TRAFFIC rather than by an administrator, two of which
+    can arrive in the same second.
+    """
+    pkey = idp.provider_key(provider)
+    subject = str(claims.get("sub") or "").strip()
+    tenant_rec = known_tenants().get(tid) or {}
+    policy = idp.policy_of(tenant_rec)
+    profile = idp.profile_from(claims)
+    factor = idp.second_factor(claims)
+    with users_rw() as users:
+        u = idp.find_binding(users, pkey, subject, tid)
+        if u is not None:
+            if not u.get("active", True):
+                return None, ("Dieses Konto ist auf diesem Knoten "
+                              "deaktiviert.")
+            # The provider owns the address; OAAP owns what it may do.
+            # `email_verified` is copied only when the provider asserted
+            # it -- an address nobody proved must not arrive here
+            # wearing a flag that says somebody did (RFC-0040 3.2).
+            changed = False
+            for field in ("display_name", "email"):
+                if profile[field] and u.get(field, "") != profile[field]:
+                    u[field] = profile[field]
+                    changed = True
+            if profile["email"] and \
+                    bool(u.get("email_verified")) != profile["email_verified"]:
+                u["email_verified"] = profile["email_verified"]
+                changed = True
+            u["idp"]["last_login"] = _now_iso()
+            u["idp"]["factor"] = factor
+            save_users(users)
+            audit("user.idp-login", tid, u["username"], who=u["username"],
+                  role="-", detail=f"{pkey} · {factor or 'kein Faktor genannt'}"
+                  + (" · Profil aktualisiert" if changed else ""))
+            return u, ""
+        roles, groups = idp.first_login_grant(policy, claims)
+        username = idp.local_username(
+            claims, [x.get("username", "") for x in users])
+        if not username:
+            return None, "Für dieses Konto war kein freier Name zu finden."
+        record = {
+            "username": username,
+            # No local password, ever, unless an administrator sets one
+            # later. login() asks idp.has_local_password() rather than
+            # relying on what check_password_hash does with "".
+            "password_hash": "",
+            "roles": roles, "groups": groups, "active": True,
+            "kind": "human", "tenant": tid,
+            "display_name": profile["display_name"],
+            "email": profile["email"],
+            "email_verified": profile["email_verified"],
+            "id": new_user_id(), "session_epoch": 0,
+            "idp": {"provider": pkey, "subject": subject,
+                    "bound": _now_iso(), "last_login": _now_iso(),
+                    "factor": factor},
+        }
+        users.append(record)
+        save_users(users)
+    audit("user.idp-first-login", tid, username, who=username, role="-",
+          detail=f"{pkey} · {policy['first_login']} · "
+                 f"Rollen: {','.join(roles) or '-'} · "
+                 f"Gruppen: {','.join(groups) or '-'} · "
+                 f"{factor or 'kein Faktor genannt'}")
+    return record, ""
 
 
 def _revoke_sessions(username):

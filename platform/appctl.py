@@ -61,6 +61,10 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "services"))
 import place  # noqa: E402  (after the path insert, necessarily)
+# The same arrangement for a tenant's identity provider (RFC-0041):
+# identity performs the login, this file configures it, and one file
+# holds the judgement both of them need.
+import idp  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -1944,6 +1948,19 @@ def cmd_migrate_tenant_places(_args):
     print("  Nothing was cut: the gateway was reloaded, not restarted.")
 
 
+def cmd_migrate_idp_dir(_args):
+    """Create the provider-secrets directory before the mount needs it.
+
+    Quiet and idempotent. It exists as a step of its own because of
+    what 0.1.118 cost: a mountpoint the container runtime is asked to
+    invent is a mountpoint that can fail to appear, and then a core
+    service does not start. This one is not inside a read-only mount,
+    so it would succeed -- as root:root with the daemon's umask, for a
+    directory that holds client secrets. Made here instead, 0700.
+    """
+    ensure_idp_dir()
+
+
 def cmd_migrate_place_assets(_args):
     """Make a tenant's face reachable: the pictures, and the route.
 
@@ -2122,6 +2139,46 @@ def cmd_migrate_identity_headers(_args):
           "is overwritten again instead of passing straight through.")
 
 
+def _print_idp(label, t):
+    """What this tenant's way in looks like right now.
+
+    One printer for both `tenant idp` and `tenant policy` with no
+    arguments, because they are two halves of one answer and an
+    operator asking either of them wants to see both.
+    """
+    provider = idp.provider_of(t)
+    pol = idp.policy_of(t)
+    print(f"Tenant '{label}'")
+    if provider:
+        print(f"  provider     {provider['kind']} {provider['issuer']}")
+        print(f"  client       {provider['client_id']}")
+        if provider["version"]:
+            print(f"  built for    Keycloak {provider['version']}")
+        if provider["label"]:
+            print(f"  button says  {provider['label']}")
+        tid = next((k for k, x in load_tenants().items()
+                    if x.get("label") == label), "")
+        held = load_idp_secrets().get(tid) or {}
+        print("  secret       " + ("held on this node"
+                                   if held.get("client_secret")
+                                   else "MISSING -- the login cannot work"))
+    else:
+        print("  provider     none -- this tenant signs in with local "
+              "accounts only")
+    print(f"  first login  {pol['first_login']}"
+          + (f" -> role {pol['default_role']}" if pol["default_role"] else ""))
+    if pol["group_map"]:
+        for realm_group, oaap_group in sorted(pol["group_map"].items()):
+            print(f"  group map    {realm_group} -> {oaap_group}")
+    print("  self-reg.    " + ("on" if pol["self_registration"] else "off"))
+    if pol["reason"]:
+        print(f"  reason       {pol['reason']}")
+    if not pol["set"]:
+        print("")
+        print("Nothing has been chosen here, so this is the platform's")
+        print("default: an identity and no rights (RFC-0041 K4b).")
+
+
 def cmd_tenant(args):
     """This node's tenants (spec 2.1/2.2).
 
@@ -2203,6 +2260,91 @@ def cmd_tenant(args):
         if not (t.get("theme") or {}).get("color_primary")                 and args.color_primary is None:
             print("")
             print("No colours set -- this place still wears the platform's.")
+        return
+
+    if args.action == "idp":
+        label = (args.name or "").strip().lower()
+        tid, t = tenant_by_label(label, include_former=False)
+        if not tid:
+            die(f"no tenant with the label '{label}'")
+        if args.clear_idp:
+            ok, msg = tenant_clear_provider(
+                tid, who=os.environ.get("SUDO_USER") or getpass.getuser())
+            if not ok:
+                die(msg)
+            print(msg + ".")
+            return
+        if not (args.issuer or args.client_id or args.client_secret):
+            _print_idp(label, t)
+            return
+        # K3: the version this object was built against travels WITH
+        # it. Written down here, not verified here -- the admin path
+        # that asks /admin/serverinfo and refuses a server it does not
+        # recognise is the next build step, and until it exists this
+        # field is a record of intent and is described as one.
+        version = (args.idp_version or idp.KEYCLOAK_PINNED).strip()
+        ok, msg = tenant_set_provider(
+            tid, args.idp_kind, args.issuer or "", args.client_id or "",
+            args.client_secret or "", label=args.idp_label or "",
+            version=version,
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die(msg)
+        print(msg[0].upper() + msg[1:] + ".")
+        print("")
+        print("The client secret is held on this node only, 0600, in a")
+        print("directory only the identity service mounts -- never in")
+        print("tenants.json and therefore never in a tenant archive.")
+        print("")
+        host = load_external()
+        where = f"https://{label}.{host}" if host else "this node's address"
+        print("Register this exact redirect URI in the provider's client:")
+        print(f"  {where}/auth/oidc/callback")
+        print("")
+        pol = idp.policy_of(t)
+        print(f"A first login through it currently means '{pol['first_login']}'"
+              + (f" ({pol['default_role']})" if pol["default_role"] else "")
+              + ".")
+        if pol["first_login"] == idp.FIRST_LOGIN_DEFAULT:
+            print("That is the default: an identity and no rights, visible in")
+            print("the Eingang. Change it with `oaap tenant policy`.")
+        return
+
+    if args.action == "policy":
+        label = (args.name or "").strip().lower()
+        tid, t = tenant_by_label(label, include_former=False)
+        if not tid:
+            die(f"no tenant with the label '{label}'")
+        asked = (args.first_login, args.default_role, args.self_registration,
+                 args.group_map)
+        if all(a is None for a in asked):
+            _print_idp(label, t)
+            return
+        gmap = None
+        if args.group_map is not None:
+            gmap = {}
+            for pair in args.group_map.split(","):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if "=" not in pair:
+                    die(f"--group-map wants realm-group=oaap-group, got '{pair}'")
+                left, right = pair.split("=", 1)
+                gmap[left.strip()] = right.strip().lower()
+        self_reg = None
+        if args.self_registration is not None:
+            self_reg = args.self_registration == "on"
+        ok, msg = tenant_set_policy(
+            tid, first_login=args.first_login, default_role=args.default_role,
+            self_registration=self_reg, group_map=gmap,
+            reason=args.idp_reason or "",
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die(msg)
+        print(msg[0].upper() + msg[1:] + ".")
+        print("")
+        print("Only the operator may move this switch, and the change is in")
+        print(f"this tenant's own log: sudo oaap tenant log {label}")
         return
 
     if args.action == "rename":
@@ -5178,6 +5320,186 @@ GATEWAY_LOG_DIR = os.path.join(DATA_DIR, "data", "gateway", "logs")
 # instead of implying it.
 PLACE_ASSETS_DIR = os.path.join(DATA_DIR, "data", "gateway", "place")
 
+# ---------------------------------------------------------------------------
+# A tenant's identity provider (RFC-0041)
+#
+# The provider OBJECT -- kind, issuer, client id, the version it was
+# built against -- lives in tenants.json beside the face, because
+# identity and the portal both have to see it and none of it is a
+# secret. The CLIENT SECRET does not: tenants.json is 0644 on the node
+# and travels in a tenant archive (RFC-0029 D5), and a secret in a
+# backup is a secret in every copy of that backup.
+#
+# So it lives here, 0600, in a directory only identity mounts, and
+# read-only even there. The same posture twin-secrets.json has had
+# since RFC-0031, one reader fewer.
+IDP_DIR = os.path.join(DATA_DIR, "data", "idp")
+IDP_SECRETS_FILE = os.path.join(IDP_DIR, "secrets.json")
+
+
+def load_idp_secrets():
+    try:
+        with open(IDP_SECRETS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("providers") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_idp_secrets(providers):
+    """Write the client secrets, 0600, and never any wider.
+
+    The mode is set on the TEMPORARY file before it is moved into
+    place, not afterwards: a chmod after os.replace leaves a window in
+    which the file exists readable, and a window is all a secret needs.
+    """
+    os.makedirs(IDP_DIR, exist_ok=True)
+    os.chmod(IDP_DIR, 0o700)
+    tmp = IDP_SECRETS_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"providers": providers}, f, indent=2)
+    os.replace(tmp, IDP_SECRETS_FILE)
+
+
+def ensure_idp_dir():
+    """The directory identity mounts, created before the mount exists.
+
+    Docker would create it -- but as root:root with whatever umask the
+    daemon has, and a directory holding client secrets should not
+    depend on that. Created here on every update, which is also what
+    0.1.118 taught: a mountpoint that has to exist is one this side
+    makes, not one the container runtime is asked to invent.
+    """
+    try:
+        os.makedirs(IDP_DIR, exist_ok=True)
+        os.chmod(IDP_DIR, 0o700)
+    except OSError as e:
+        print(f"WARNING: could not prepare {IDP_DIR}: {e}")
+
+
+def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
+                        label="", version="", who="root", role="root"):
+    """Attach or change a tenant's identity provider. (ok, sentence).
+
+    Refused for the DEFAULT tenant? No -- deliberately allowed. The
+    operator's own tenant may perfectly well have a realm, and K2's
+    rule (the platform must not know the provider is local) says
+    nothing about which tenant it belongs to. What IS refused is a
+    provider object this node cannot use, and the refusal comes from
+    services/idp.py so that a second door cannot phrase it differently.
+    """
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    bad = idp.provider_refusal(kind, issuer, client_id, client_secret)
+    if bad:
+        return False, bad
+    before = idp.provider_key(idp.provider_of(t))
+    t["idp"] = {"kind": kind, "issuer": issuer.strip(),
+                "client_id": client_id.strip(),
+                "version": (version or "").strip(),
+                "label": (label or "").strip(),
+                "added": (t.get("idp") or {}).get("added") or _iso_now()}
+    tenants[tid] = t
+    save_tenants(tenants)
+    held = load_idp_secrets()
+    held[tid] = {"client_secret": client_secret.strip(),
+                 "written": _iso_now()}
+    save_idp_secrets(held)
+    after = idp.provider_key(idp.provider_of(t))
+    moved = bool(before and before != after)
+    audit_tenant("tenant.idp", tid, issuer.strip(), who=who, role=role,
+                 detail=f"{kind} · client {client_id.strip()}"
+                        + (f" · version {version}" if version else "")
+                        + (" · ISSUER CHANGED, every binding it had is void"
+                           if moved else ""))
+    msg = f"'{t['label']}' now signs in through {issuer.strip()}"
+    if moved:
+        msg += (" -- this is a DIFFERENT issuer, so the bindings made "
+                "under the old one no longer match anybody")
+    return True, msg
+
+
+def tenant_clear_provider(tid, who="root", role="root"):
+    """Detach a provider. (ok, sentence).
+
+    The BINDINGS are left alone on purpose. Detaching a provider is
+    usually a repair or a move, and a detach that also deleted every
+    binding would turn a five-minute correction into a re-onboarding of
+    the whole club. `oaap user unbind` breaks one binding, deliberately
+    and one at a time; this only takes the door away.
+    """
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    if not idp.provider_of(t):
+        return False, "this tenant has no identity provider"
+    issuer = (t.get("idp") or {}).get("issuer", "")
+    t.pop("idp", None)
+    tenants[tid] = t
+    save_tenants(tenants)
+    held = load_idp_secrets()
+    if held.pop(tid, None) is not None:
+        save_idp_secrets(held)
+    audit_tenant("tenant.idp-removed", tid, issuer, who=who, role=role,
+                 detail="the bindings of its users are kept; "
+                        "'oaap user unbind' breaks one")
+    return True, (f"'{t['label']}' no longer signs in through {issuer}. "
+                  "The bindings its users hold are untouched")
+
+
+def tenant_set_policy(tid, first_login=None, default_role=None,
+                      self_registration=None, group_map=None, reason="",
+                      who="root", role="root"):
+    """What a first login through the provider BECOMES. (ok, sentence).
+
+    K4b's authority is NOT checked here -- it is checked by
+    idp.policy_target() at each door, because the caller's role is
+    something only the door knows. What is checked here is the policy
+    itself, and it is checked against the record as it will be, not
+    against the fields that happened to be passed: a call that only
+    changes self-registration must still be refused if the value
+    already stored makes the pair dangerous.
+    """
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    now = idp.policy_of(t)
+    want_first = (first_login if first_login is not None
+                  else now["first_login"])
+    want_role = (default_role if default_role is not None
+                 else now["default_role"])
+    want_self = (bool(self_registration) if self_registration is not None
+                 else now["self_registration"])
+    want_map = group_map if group_map is not None else now["group_map"]
+    want_reason = (reason or "").strip() or now["reason"]
+    bad = idp.policy_refusal(want_first, want_role, want_self, want_map,
+                             want_reason)
+    if bad:
+        return False, bad
+    t["idp_policy"] = {"first_login": want_first,
+                       "default_role": want_role,
+                       "self_registration": want_self,
+                       "group_map": want_map,
+                       "reason": want_reason,
+                       "changed": _iso_now(), "by": who}
+    tenants[tid] = t
+    save_tenants(tenants)
+    detail = (f"first_login={want_first}"
+              + (f" · Rolle {want_role}" if want_role else "")
+              + (" · Selbstregistrierung an" if want_self
+                 else " · Selbstregistrierung aus")
+              + (f" · {len(want_map)} Gruppenabbildung(en)" if want_map else "")
+              + (f" · Begruendung: {want_reason}" if want_reason else ""))
+    audit_tenant("tenant.idp-policy", tid, want_first, who=who, role=role,
+                 detail=detail)
+    return True, (f"a first login in '{t['label']}' now means "
+                  f"'{want_first}'"
+                  + (f" with the role {want_role}" if want_role else ""))
+
 
 # --- scrubbing access-log lines written before 0.1.103 (Jörg, 18.09.) ---
 #
@@ -7830,6 +8152,39 @@ def cmd_user(args):
             groups = ",".join(u.get("groups") or []) or "-"
             status = "active" if u["active"] else "INACTIVE"
             print(f"{u['username']:<20} roles={roles:<32} groups={groups:<20} {status}")
+        return
+
+    if args.action == "unbind":
+        # RFC-0041 3: every binding is visible and REVOCABLE. Breaking
+        # it signs the person out at the same moment -- a session that
+        # outlived the credential it came from is the bug RFC-0028
+        # already had to fix once for terminal keys.
+        if not args.username:
+            die("'user unbind' needs a username")
+        out = _identity_exec(
+            "import json, os, sys, app as m\n"
+            "with m.users_rw() as users:\n"
+            " u = m.find_user(users, os.environ['OAAP_CLI_USERNAME'])\n"
+            " if not u:\n"
+            "  print('no such user', file=sys.stderr); sys.exit(1)\n"
+            " bound = u.pop('idp', None)\n"
+            " if not bound:\n"
+            "  print('not bound', file=sys.stderr); sys.exit(2)\n"
+            " u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
+            " m.save_users(users)\n"
+            " print(json.dumps({'provider': bound.get('provider',''),\n"
+            "                   'tenant': u.get('tenant','')}))\n",
+            {"OAAP_CLI_USERNAME": args.username})
+        gone = json.loads(out.strip().splitlines()[-1])
+        audit_tenant("user.idp-unbound", gone["tenant"],
+                     subject=args.username, detail=gone["provider"],
+                     who=os.environ.get("SUDO_USER") or "root")
+        print(f"'{args.username}' is no longer bound to "
+              f"{gone['provider'] or 'any provider'}; open sessions were "
+              "signed out.")
+        print("The account itself is untouched. It can only sign in again")
+        print("through the provider (which binds afresh) or with a local")
+        print("password, if it has one.")
         return
 
     # password
@@ -13289,6 +13644,11 @@ def main():
                           help="internal: write every tenant logo where the "
                                "gateway serves it (RFC-0042 T3)")
     pmpa.set_defaults(fn=cmd_migrate_place_assets)
+    pmi = sub.add_parser("migrate-idp-dir",
+                         help="internal: prepare the 0600 directory the "
+                              "identity service mounts for provider secrets "
+                              "(RFC-0041)")
+    pmi.set_defaults(fn=cmd_migrate_idp_dir)
     pms = sub.add_parser("migrate-stream-close",
                          help="internal: keep open streams alive across "
                               "gateway reloads in sites written before 0.1.102")
@@ -13313,7 +13673,7 @@ def main():
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
-                               "rename", "face"])
+                               "rename", "face", "idp", "policy"])
     pten.add_argument("name", nargs="?", help="tenant label (default: 'default')")
     pten.add_argument("target", nargs="?", help="the new label, for 'rename'")
     pten.add_argument("--name", dest="title", default="",
@@ -13343,6 +13703,42 @@ def main():
                       help="path to a PNG, JPEG, WebP or GIF (max 512 KB)")
     pten.add_argument("--clear-logo", dest="clear_logo", action="store_true",
                       help="remove this tenant's logo")
+    # The identity provider (RFC-0041 K2). Deliberately an issuer URL and
+    # nothing that says "local": that one property is what makes a club's
+    # later move to its own node an edit rather than a project.
+    pten.add_argument("--issuer", default=None,
+                      help="the provider's issuer URL, e.g. "
+                           "https://auth.example.org/realms/hbvp")
+    pten.add_argument("--client-id", dest="client_id", default=None,
+                      help="the OIDC client this node presents itself as")
+    pten.add_argument("--client-secret", dest="client_secret", default=None,
+                      help="that client's secret; kept 0600 on this node only")
+    pten.add_argument("--idp-kind", dest="idp_kind", default="oidc",
+                      choices=list(idp.PROVIDER_KINDS),
+                      help="provider kind (default oidc)")
+    pten.add_argument("--idp-label", dest="idp_label", default=None,
+                      help="what the button on the login page says")
+    pten.add_argument("--idp-version", dest="idp_version", default=None,
+                      help=f"the provider version this was built against "
+                           f"(Keycloak {idp.KEYCLOAK_PINNED} is pinned)")
+    pten.add_argument("--clear-idp", dest="clear_idp", action="store_true",
+                      help="detach the provider; the users' bindings stay")
+    # What a FIRST login becomes (K4). Only server_admin gets here at
+    # all -- on the machine that is whoever may run this command.
+    pten.add_argument("--first-login", dest="first_login", default=None,
+                      choices=list(idp.FIRST_LOGIN_VALUES),
+                      help="eingang (default) | role | groups")
+    pten.add_argument("--default-role", dest="default_role", default=None,
+                      help="the role a first login receives, for role/groups")
+    pten.add_argument("--self-registration", dest="self_registration",
+                      default=None, choices=["on", "off"],
+                      help="whether the realm lets people register themselves")
+    pten.add_argument("--group-map", dest="group_map", default=None,
+                      help="realm-group=oaap-group,... -- an explicit local "
+                           "mapping; an unmapped group grants nothing")
+    pten.add_argument("--reason", dest="idp_reason", default=None,
+                      help="why a dangerous combination is wanted; goes into "
+                           "this tenant's log")
     pten.set_defaults(fn=cmd_tenant)
     pep = sub.add_parser("endpoint", help="non-HTTP endpoints (RFC-0015)")
     pep.add_argument("action", choices=["list", "allow", "deny"])
@@ -13408,7 +13804,7 @@ def main():
                     help="validity in days (1-365, default 90)")
     pk.set_defaults(fn=cmd_key)
     pu = sub.add_parser("user")
-    pu.add_argument("action", choices=["list", "password"])
+    pu.add_argument("action", choices=["list", "password", "unbind"])
     pu.add_argument("username", nargs="?")
     pu.add_argument("password", nargs="?",
                     help="omit to be prompted (hidden input) -- 'password' action only")
