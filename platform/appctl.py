@@ -2384,10 +2384,24 @@ def cmd_idp(args):
             print("That is the default: an identity and no rights, visible")
             print("in the Eingang. Change it with `oaap tenant policy`.")
         print("")
-        print(f"Nobody is in the {word} yet. Add the club's people there,")
-        print(f"or let them in themselves: `oaap idp settings {name} "
-              f"--tenant {label}")
-        print("--self-registration on` (RFC-0041 K7).")
+        # Asked rather than assumed. Provisioning uses a space it
+        # finds as it is (K3.3), so after a move this realm is full of
+        # the club's people -- and "nobody is in it yet" was printed
+        # to an operator who had just imported two. Measured on
+        # oaap-demo, 2026-09-23.
+        count, err = admin.count_people(space)
+        if err or count is None:
+            print(f"How many people are in the {word} was not readable "
+                  "here, so nothing is said about it.")
+        elif count == 0:
+            print(f"Nobody is in the {word} yet. Add the club's people "
+                  "there,")
+            print(f"or let them in themselves: `oaap idp settings {name} "
+                  f"--tenant {label}")
+            print("--self-registration on` (RFC-0041 K7).")
+        else:
+            print(f"{count} person(s) are already in this {word} -- it was "
+                  "found, not made, and OAAP changed nothing about them.")
         return
 
     if action == "settings":
