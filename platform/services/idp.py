@@ -213,10 +213,27 @@ def provider_key(provider):
     by construction -- which is right, because a different issuer is a
     different authority and the subjects it names are its own.
 
-    K6's move is the case that must NOT break, and it does not: the
-    club's realm is exported and imported, so the issuer keeps its
-    name while the machine behind it changes. That is the whole reason
-    the provider object is a URL.
+    K6's move was written here as the case that does not break,
+    because the realm is exported and imported and so "keeps its
+    name". **That was wrong, and the machine said so on 2026-09-23.**
+    An exported realm keeps its name; the ISSUER is not its name, it
+    is `<node>/realms/<name>` -- the address of the node. A move is
+    exactly a change of node, so the issuer always changes, and this
+    key always breaks.
+
+    Measured after a real adoption: the `sub` was byte-for-byte the
+    same on both nodes (which is what RFC-0041 §5.0 had measured) and
+    the provider half still named the node the tenant had left. Every
+    member would have arrived at the new node as a stranger, into the
+    Eingang, with their roles gone -- and the move would have looked
+    like it worked.
+
+    So the move DOES need a re-point, and it is the one situation
+    where re-pointing is allowed: `tenant_repoint_bindings`, permitted
+    only when the tenant carries a provider from an adoption, so that
+    OAAP knows from its own record that this is the same realm at a
+    new address. Every other issuer change still voids the bindings,
+    loudly and by construction.
     """
     p = provider or {}
     issuer = (p.get("issuer") or "").strip()

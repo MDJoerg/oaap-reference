@@ -372,12 +372,72 @@ ok("die Datei entsteht mit 0600",
    and "os.chmod(tmp, 0o600)" in APPCTL_SRC)
 ok("eine Datei, die die Zaehlprobe nicht besteht, wird entfernt",
    "os.remove(out)" in APPCTL_SRC)
-ok("die Uebernahme schreibt die Benutzer nur bei stehendem Anmeldedienst",
-   '"docker", "stop", IDENTITY_CONTAINER' in APPCTL_SRC)
+ok("appctl schreibt den Benutzerspeicher an genau EINER Stelle",
+   APPCTL_SRC.count("def _rewrite_identity_users") == 1
+   and APPCTL_SRC.count('"docker", "stop", IDENTITY_CONTAINER') == 1)
+ok("... und nur bei stehendem Anmeldedienst",
+   '"docker", "stop", IDENTITY_CONTAINER'
+   in APPCTL_SRC.split("def _rewrite_identity_users")[1][:2000])
 ok("... und startet ihn wieder, auch wenn etwas schiefgeht",
-   "finally:" in APPCTL_SRC.split("def _adopt_users")[1][:3000])
+   "finally:" in APPCTL_SRC.split("def _rewrite_identity_users")[1][:3000])
+ok("beide Schreiber gehen durch dieselbe Tuer",
+   "_rewrite_identity_users(" in APPCTL_SRC.split("def _adopt_users")[1][:400]
+   and "_rewrite_identity_users("
+   in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
 ok("die Uebernahme sagt, dass der alte Knoten alles noch hat",
    "this club exists twice" in APPCTL_SRC)
+
+# ---------------------------------------------------------------------------
+print("\nDie zweite Haelfte des Schluessels (gemessen 23.09., Schritt 7)")
+
+# RFC-0041 §5.0 hat gemessen, dass ein Realm-Export den `sub` erhaelt,
+# und daraus geschlossen, dass der Umzug kein Neu-Binden braucht. K4
+# bindet aber an ein PAAR, und die andere Haelfte ist der Aussteller --
+# also die Adresse des Knotens, und genau die wechselt beim Umzug.
+ALT = "oidc|http://alt.example/realms/hbvp"
+NEU = "oidc|http://neu.example/realms/hbvp"
+CARRIED = {"kind": "oidc", "issuer": "http://alt.example/realms/hbvp"}
+
+ok("nach einem Umzug duerfen die Bindungen umgehaengt werden",
+   move.rebind_refusal(CARRIED, ALT, NEU) == "",
+   move.rebind_refusal(CARRIED, ALT, NEU))
+ok("OHNE Umzug nicht -- und das ist die gefaehrliche Haelfte",
+   bool(move.rebind_refusal({}, ALT, NEU)))
+ok("... und der Satz sagt, warum: niemand hat versprochen, dass es "
+   "dieselben Menschen sind",
+   "same people" in move.rebind_refusal({}, ALT, NEU))
+ok("derselbe Aussteller: nichts zu tun",
+   bool(move.rebind_refusal(CARRIED, ALT, ALT)))
+ok("eine fehlende Haelfte: abgelehnt",
+   bool(move.rebind_refusal(CARRIED, "", NEU))
+   and bool(move.rebind_refusal(CARRIED, ALT, "")))
+W = move.rebind_words(ALT, NEU, 12)
+ok("der Betreiber erfaehrt, was umgehaengt wurde",
+   any("12 binding" in l for l in W))
+ok("... dass der SUBJECT unangetastet bleibt",
+   any("SUBJECT of each binding is untouched" in l for l in W))
+ok("... und was ohne das passiert waere",
+   any("stranger" in l for l in W))
+ok("die Regel nennt die Messung, die sie widerlegt hat",
+   "5.0" in MOVE_SRC.split("def rebind_refusal")[1][:2500])
+
+ok("umgehaengt wird nur beim Abloesen eines MITGEBRACHTEN Anbieters",
+   "move.rebind_refusal" in APPCTL_SRC
+   and APPCTL_SRC.count("tenant_repoint_bindings(") == 2)
+ok("... und nur fuer die Menschen DIESES Mandanten",
+   'resolve_tenant(u.get("tenant")) != tid'
+   in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
+ok("... und nur fuer Bindungen mit GENAU dem alten Schluessel",
+   'b.get("provider") != old_key'
+   in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
+ok("... der subject wird nicht angefasst",
+   '"subject"' not in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
+ok("... und es steht im Protokoll des Mandanten",
+   "tenant.idp-repointed" in APPCTL_SRC)
+ok("die widerlegte Zusage steht nicht mehr als Zusage im Code",
+   "so the issuer keeps its" not in read(SERVICES, "idp.py"))
+ok("... sondern als das, was gemessen wurde",
+   "That was wrong" in read(SERVICES, "idp.py"))
 
 # ---------------------------------------------------------------------------
 print("\nAn einer erfundenen Maschine: die Zahl kommt vom Anbieter")
@@ -422,6 +482,14 @@ class Fake(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        # Den Rumpf IMMER lesen, auch wenn er nicht gebraucht wird.
+        # Ohne das bleibt er in der Leitung stehen, und der naechste
+        # Aufruf bekommt gelegentlich ein 401 statt einer Antwort --
+        # ein flatternder Test, der wie ein Befund aussieht.
+        try:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        except (ValueError, OSError):
+            pass
         if self.path.endswith("/protocol/openid-connect/token"):
             return self._json({"access_token": "fake-admin-token"})
         return self._json({"error": "no"}, 404)
@@ -435,7 +503,10 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 def admin():
     ad = a.Admin("keycloak", BASE, "client", "oaap-admin",
                  "geheim-geheim-geheim-1234")
-    ad.login()
+    got, why = ad.login()
+    # Laut scheitern statt still weiterzulaufen: eine misslungene
+    # Anmeldung sieht sonst wie ein 401 an einer ganz anderen Tuer aus.
+    ok("die Anmeldung am erfundenen Server gelingt", got, why)
     return ad
 
 

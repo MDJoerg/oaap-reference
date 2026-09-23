@@ -339,6 +339,71 @@ def provider_parked(record):
         "their passwords travel in the realm export (RFC-0041 §5.0).")
 
 
+def rebind_refusal(carried, old_key, new_key, tenant_label=""):
+    """Why the bindings of a moved tenant may NOT be re-pointed.
+
+    The rule that the machine forced, and the one that corrects this
+    RFC's own §5.0. That measurement asked whether a realm export
+    preserves the identity K4 binds to and answered yes -- but K4
+    binds to a PAIR, `(issuer, sub)`, and it only measured the `sub`.
+    The issuer is the other half, and in a move it changes by
+    definition: it is the new node's address.
+
+    Measured on 2026-09-23, after a real adoption: the subject was
+    byte-for-byte the same on both nodes and the provider half still
+    named the node the tenant had left. So every member of the club
+    would have arrived at the new node as a stranger -- a first login,
+    into the Eingang, with their roles gone. The move would have
+    "worked" and quietly undone every permission the club had.
+
+    Re-pointing is therefore necessary, and it is also dangerous, so
+    it is allowed in exactly one situation and no other: the tenant
+    carries a provider from a move, and the new one replaces it. Then
+    OAAP knows both halves of the key from its own record, and the
+    premise -- that the subjects are unchanged -- is the thing §5.0
+    really did measure, because the realm was MOVED and not rebuilt.
+
+    An ordinary issuer change is NOT this. There the operator pointed
+    a tenant somewhere else, nobody promised the people are the same,
+    and re-pointing would bind a club's members to whoever happens to
+    hold those subjects at the new provider. That case keeps the old
+    sentence: the bindings are void, and `oaap user unbind` exists.
+    """
+    if not carried:
+        return ("this tenant did not come from a move, so OAAP does not "
+                "know that the people behind these subjects are the same "
+                "people. An issuer that simply changed makes the bindings "
+                "void; it does not make them re-pointable")
+    if not old_key or not new_key:
+        return "a re-point needs both the old and the new provider"
+    if old_key == new_key:
+        return ("the provider carried in from the move is the same one "
+                "being set -- there is nothing to re-point")
+    return ""
+
+
+def rebind_words(old_key, new_key, count):
+    """What an operator is told when bindings were re-pointed."""
+    return [
+        f"{count} binding(s) re-pointed from the node this tenant left.",
+        f"  was   {old_key}",
+        f"  is    {new_key}",
+        "",
+        "The SUBJECT of each binding is untouched. Only the provider "
+        "half",
+        "changed, because that half is the address of a node and the "
+        "node",
+        "is what moved. Measured: a realm export carries the same "
+        "subjects,",
+        "which is why this is a re-point and not a re-binding "
+        "(RFC-0041 §5.0).",
+        "",
+        "Without this, every member would have arrived here as a "
+        "stranger:",
+        "a first login, into the Eingang, with their roles gone.",
+    ]
+
+
 def parked_lines(parked):
     """What `tenant idp` prints about a parked provider."""
     if not parked:

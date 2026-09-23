@@ -3068,15 +3068,20 @@ def _tenant_adopt(args):
           "until it happens this club exists twice.")
 
 
-def _adopt_users(users):
-    """(count, error). Add the archive's people to the user store.
+def _rewrite_identity_users(change, why):
+    """(count, error). The ONE way appctl writes the user store.
 
     appctl does not write this file beside its owner -- identity
     rewrites it on every user change, and two writers to one JSON file
     is a lost update waiting for two admins to click at the same
-    moment. So identity is STOPPED for the merge and started again,
+    moment. So identity is STOPPED for the write and started again,
     which is a short platform outage said out loud rather than a race
     nobody sees.
+
+    `change(users)` returns `(new_users, count)`. Both things appctl
+    does to this file -- adopting a tenant's people and re-pointing
+    their bindings after a move -- come through here, so the stopping
+    and the file's mode are written once.
 
     The mode and ownership of the existing file are kept, because the
     next reader of it is a container and not this process.
@@ -3087,7 +3092,7 @@ def _adopt_users(users):
                           f"name=^{IDENTITY_CONTAINER}$"],
                          capture_output=True, text=True)
     if (got.stdout or "").strip():
-        print("Stopping the identity service for the user merge "
+        print(f"Stopping the identity service {why} "
               "(nobody can sign in for a few seconds) ...")
         subprocess.run(["docker", "stop", IDENTITY_CONTAINER],
                        capture_output=True, text=True)
@@ -3101,11 +3106,11 @@ def _adopt_users(users):
             st = os.stat(path)
         except OSError:
             pass
-        merged = list(have) + [u for u in users]
+        new, count = change(list(have))
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(merged, f, indent=2)
+            json.dump(new, f, indent=2)
         os.chmod(tmp, st.st_mode & 0o7777 if st else 0o600)
         if st:
             try:
@@ -3113,12 +3118,60 @@ def _adopt_users(users):
             except (OSError, AttributeError):
                 pass
         os.replace(tmp, path)
-        return len(users), ""
+        return count, ""
     finally:
         if stopped:
             subprocess.run(["docker", "start", IDENTITY_CONTAINER],
                            capture_output=True, text=True)
             print("Identity service started again.")
+
+
+def _adopt_users(users):
+    """(count, error). Add the archive's people to the user store."""
+    return _rewrite_identity_users(
+        lambda have: (have + list(users), len(users)), "for the user merge")
+
+
+def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
+    """(count, sentence). Move a club's bindings onto the new node.
+
+    K4 binds a person to the PAIR `(issuer, sub)`. A move changes the
+    issuer -- it is the address of the node, and the node is what
+    moved -- so without this every member arrives at the new node as a
+    stranger, into the Eingang, with their roles gone. Measured on
+    2026-09-23, on a tenant that had really been adopted.
+
+    Only the provider half is touched, only for this tenant's people,
+    and only for bindings that hold EXACTLY the old key. Whether it
+    may happen at all is decided in services/move.py, from the fact
+    that the tenant carried a provider -- not from here.
+    """
+    def change(users):
+        n = 0
+        for u in users:
+            if resolve_tenant(u.get("tenant")) != tid:
+                continue
+            b = u.get("idp") or {}
+            if b.get("provider") != old_key:
+                continue
+            b["provider"] = new_key
+            b["repointed"] = _iso_now()
+            u["idp"] = b
+            n += 1
+        return users, n
+
+    count, err = _rewrite_identity_users(
+        change, "to re-point the bindings of the move")
+    if err:
+        return 0, err
+    if count:
+        audit_tenant("tenant.idp-repointed", tid, new_key, who=who,
+                     role=role,
+                     detail=f"{count} binding(s) moved from {old_key} -- "
+                            "the subject of each is unchanged; only the "
+                            "provider half, which is the address of the "
+                            "node that moved (RFC-0041 K6)")
+    return count, ""
 
 
 def cmd_tenant(args):
@@ -6519,6 +6572,7 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                         + (f" · version {version}" if version else "")
                         + (" · ISSUER CHANGED, every binding it had is void"
                            if moved else ""))
+    repointed = 0
     if was_carried:
         audit_tenant("tenant.idp-move-done", tid, issuer.strip(), who=who,
                      role=role,
@@ -6526,11 +6580,24 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                             f"{was_carried.get('issuer', 'another node')} "
                             "is replaced by this one -- the move is "
                             "complete on this side")
+        # And the half of K4's key that the move changes. Allowed here
+        # and nowhere else, because only here does OAAP know from its
+        # own record that this is the SAME realm at a new address.
+        old_key = idp.provider_key(idp.provider_of({"idp": was_carried}))
+        if not move.rebind_refusal(was_carried, old_key, after,
+                                   t.get("label", "")):
+            repointed, err = tenant_repoint_bindings(
+                tid, old_key, after, who=who, role=role)
+            if err:
+                return False, ("the provider was recorded and the "
+                               "bindings of the move could not be "
+                               "re-pointed: " + err)
     msg = f"'{t['label']}' now signs in through {issuer.strip()}"
     if was_carried:
         msg += (" -- and the provider it arrived with, "
                 f"{was_carried.get('issuer', '?')}, is no longer carried. "
-                "Nobody had to register again")
+                f"{repointed} binding(s) came with it, so nobody had to "
+                "register again and nobody lost a role")
     if moved:
         msg += (" -- this is a DIFFERENT issuer, so the bindings made "
                 "under the old one no longer match anybody")
