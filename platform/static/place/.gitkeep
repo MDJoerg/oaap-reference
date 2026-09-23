@@ -1,0 +1,17 @@
+This directory must EXIST before the gateway container starts, and that
+is the whole reason this file is here.
+
+The tenant logos (RFC-0042 T3) are mounted in from the host at
+/etc/caddy/static/place -- inside /etc/caddy/static, which is itself a
+READ-ONLY bind mount. Docker creates a missing mountpoint before
+mounting, and it cannot create one inside a read-only mount: the
+gateway then refuses to start at all.
+
+Found the hard way on oaap-test, 2026-09-23: the update rebuilt both
+services, recreated the gateway, and the gateway did not come back --
+  make mountpoint "/etc/caddy/static/place": read-only file system
+Every HTTP route on the node was down until the directory existed.
+
+So it exists here, it is copied to $APP_DIR/static/place by update.sh
+like every other platform file, and Docker finds a mountpoint instead
+of trying to make one.

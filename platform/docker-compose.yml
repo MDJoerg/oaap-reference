@@ -35,6 +35,12 @@ services:
       # the LOGIN page can show one (it has no session by definition).
       # Read-only here, written only on the host, and rebuildable: the
       # file that counts lives in oaap.data.files.
+      #
+      # ./static/place MUST exist in the image's source tree (it does,
+      # with a .gitkeep that explains itself): ./static above is a
+      # read-only bind mount, and Docker cannot CREATE a mountpoint
+      # inside one. Without the directory the gateway refuses to start
+      # and the whole node is dark -- measured on oaap-test 2026-09-23.
       - "${OAAP_DATA_DIR}/data/gateway/place:/etc/caddy/static/place:ro"
       # ACME account/certificates must survive container recreation
       - "${OAAP_DATA_DIR}/data/gateway/caddy-data:/data"

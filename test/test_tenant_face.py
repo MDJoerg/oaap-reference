@@ -268,6 +268,36 @@ compose = read(HERE, "..", "platform", "docker-compose.yml")
 ok("das Gateway hat das Verzeichnis INNERHALB seines static-Ordners",
    "/etc/caddy/static/place:ro" in compose, compose[:0])
 
+# Und die Falle dahinter, allgemein geprueft: Ein Mount INNERHALB eines
+# schreibgeschuetzten Mounts braucht einen Einhaengepunkt, den es schon
+# gibt -- Docker kann keinen in einem read-only Mount anlegen, und der
+# Dienst startet dann gar nicht. Am 23.09.2026 auf oaap-test genau so
+# passiert: Jede HTTP-Route des Knotens war weg, bis das Verzeichnis da
+# war. Geprueft fuer JEDEN verschachtelten Mount, nicht nur fuer diesen.
+import yaml                                                    # noqa: E402
+
+PLATFORM = os.path.join(HERE, "..", "platform")
+mounts = []
+for svc in yaml.safe_load(compose).get("services", {}).values():
+    for vol in (svc.get("volumes") or []):
+        if not isinstance(vol, str):
+            continue
+        parts = vol.split(":")
+        if len(parts) >= 2:
+            mounts.append((parts[0], parts[1], "ro" in parts[2:]))
+nested = [(src, dst, osrc, odst)
+          for src, dst, _ro in mounts
+          for osrc, odst, oro in mounts
+          if oro and odst != dst and dst.startswith(odst + "/")]
+ok("es gibt ueberhaupt einen solchen verschachtelten Mount (sonst prueft "
+   "das hier nichts)", len(nested) >= 1, mounts)
+for src, dst, osrc, odst in nested:
+    inner = os.path.join(PLATFORM, osrc.lstrip("./"), dst[len(odst) + 1:])
+    ok(f"der Einhaengepunkt {dst} liegt schon im Baum",
+       os.path.isdir(inner),
+       f"{inner} fehlt -- Docker legt in einem read-only Mount keinen an, "
+       f"und der Dienst startet dann nicht")
+
 ok("ein zweiter Lauf aendert nichts", m.refresh_place_assets() == 0)
 os.remove(os.path.join(m.PLACE_ASSETS_DIR, png_name))
 ok("geloescht wird sie aus dem Byte-Speicher neu geschrieben",
