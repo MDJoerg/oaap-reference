@@ -1760,14 +1760,20 @@ def _idp_principal(tid, provider, claims):
     factor = idp.second_factor(claims)
     # K7 is explicit that OAAP does not enforce a second factor: the
     # realm does, and a login that arrives here is one the realm let
-    # through. What OAAP can do is notice the silence. A tenant whose
-    # space was set to require a second factor, and whose login says
-    # nothing about one, is a sentence somebody has to be able to find
-    # afterwards -- not a refusal of an authentication OAAP did not
-    # perform (RFC-0041 K7, step 6).
-    if not factor and idp.factor_expected(policy):
-        factor = ("kein Faktor genannt, obwohl der Ort einen verlangen "
-                  "soll")
+    # through. What OAAP can do is notice that none was NAMED -- not
+    # refuse an authentication it did not perform (RFC-0041 K7).
+    #
+    # It asks `idp.factor_asserted` rather than looking for silence,
+    # and that is a correction the machine made on 2026-09-23: Keycloak
+    # answers `acr=1` to an ordinary password login, so the provider is
+    # never silent and a rule waiting for silence never fires. Measured
+    # with a person who was already in the realm when the switch was
+    # turned on -- Keycloak let them in without a factor, exactly as it
+    # should, and the log said nothing about it.
+    if idp.factor_expected(policy) and not idp.factor_asserted(claims):
+        factor = ((factor + " · " if factor else "")
+                  + "kein zweiter Faktor genannt, obwohl der Ort einen "
+                    "verlangen soll")
     with users_rw() as users:
         u = idp.find_binding(users, pkey, subject, tid)
         if u is not None:

@@ -699,15 +699,41 @@ r = c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
 ok("die Anmeldung wird NICHT abgelehnt -- OAAP prueft den Faktor nicht",
    r.status_code == 303, r.status_code)
 idlog = read(ident.AUDIT_LOG)
-ok("aber das Schweigen steht im Protokoll",
+ok("aber das Fehlen steht im Protokoll",
    "obwohl der Ort einen verlangen soll" in idlog, idlog[-400:])
 u = next((x for x in ident.load_users()
           if (x.get("idp") or {}).get("subject") == "S-OHNE-FAKTOR"), {})
 ok("... und es gehoert zum Satz dieses Menschen", bool(u), u)
 ok("... der ohne Rechte hereinkam", u.get("roles") == [], u.get("roles"))
 
+# Und der Fall, an dem die erste Fassung dieser Regel scheiterte
+# (gemessen auf oaap-test am 23.09.2026): Keycloak antwortet auf eine
+# gewoehnliche Passwort-Anmeldung mit `acr=1`. Der Anbieter schweigt
+# also NIE -- eine Regel, die auf Schweigen wartet, feuert dort nie.
+# Gelesen wird deshalb `amr`, das Methoden nennt.
+ok("'acr=1' ist kein zweiter Faktor",
+   not idp.factor_asserted({"acr": "1"}))
+ok("'amr: pwd' allein auch nicht",
+   not idp.factor_asserted({"amr": ["pwd"]}))
+ok("'amr: pwd,otp' schon", idp.factor_asserted({"amr": ["pwd", "otp"]}))
+ok("und aufgeschrieben wird trotzdem beides",
+   "acr=1" in idp.second_factor({"acr": "1"}))
+r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
+params = dict(p.split("=", 1)
+              for p in r.headers["Location"].split("?", 1)[1].split("&"))
+CLAIMS.update({"sub": "S-NUR-ACR", "preferred_username": "nuracr",
+               "nonce": unquote(params["nonce"]),
+               "exp": int(time.time()) + 300, "acr": "1"})
+c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
+      headers={"Host": f"hbvp.{HOST}"})
+last = read(ident.AUDIT_LOG).strip().splitlines()[-1]
+ok("eine Anmeldung mit NUR acr wird als 'keiner genannt' notiert",
+   "obwohl der Ort einen verlangen soll" in last, last[-220:])
+ok("... und die Behauptung des Anbieters steht trotzdem dabei",
+   "acr=1" in last, last[-220:])
+
 # Die Gegenprobe: derselbe Ort, dieselbe Erwartung, aber der Anbieter
-# sagt etwas -- dann steht das da und kein Vorwurf.
+# nennt eine Methode -- dann steht das da und kein Vorwurf.
 r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
 params = dict(p.split("=", 1)
               for p in r.headers["Location"].split("?", 1)[1].split("&"))

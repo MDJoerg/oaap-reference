@@ -303,6 +303,18 @@ REASON_MIN = 10
 SECOND_FACTOR_VALUES = ("off", "required")
 SECOND_FACTOR_DEFAULT = "off"
 
+# The `amr` values that NAME something beyond a password (RFC 8176).
+# Deliberately methods, and deliberately not `acr`: what an acr value
+# means is decided inside the realm. Measured on oaap-test on
+# 2026-09-23 -- Keycloak answers `acr=1` to an ordinary password login,
+# so a rule that waits for the provider to say NOTHING never fires
+# there. `amr` is the part of the assertion that names how somebody
+# proved who they are; `acr` is a number whose meaning belongs to
+# somebody else, and reading it as evidence would be OAAP deciding
+# what that number means.
+SECOND_FACTOR_METHODS = ("otp", "mfa", "hwk", "swk", "sms", "tel", "pop",
+                         "face", "fpt", "iris", "retina", "vbm")
+
 
 def policy_of(tenant):
     """The tenant's identity policy -- ALWAYS a complete answer.
@@ -754,6 +766,24 @@ def second_factor(claims):
     if acr:
         parts.append("acr=" + acr)
     return " ".join(parts)
+
+
+def factor_asserted(claims):
+    """Whether the provider NAMED a second factor.
+
+    A reading of what was said, never a judgement of the login itself
+    -- K7 is explicit that the realm decides and OAAP only learns that
+    it let somebody through. This exists so that a login which names
+    none, in a tenant whose space is supposed to require one, leaves a
+    sentence somebody can find afterwards.
+
+    `second_factor` above keeps recording everything the provider said,
+    including the `acr` this does not read. Recording and judging are
+    two different acts, and only one of them belongs here.
+    """
+    amr = (claims or {}).get("amr")
+    amr = [amr] if isinstance(amr, str) else list(amr or ())
+    return any(str(x).strip().lower() in SECOND_FACTOR_METHODS for x in amr)
 
 
 def profile_from(claims):
