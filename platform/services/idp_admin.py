@@ -25,14 +25,27 @@ A connector is these verbs and nothing else:
     settings  the two switches of K7 INSIDE that space -- who may
               register themselves, and whether a second factor is asked
               for (RFC-0041 step 6, built 2026-09-23)
+    export    that space and its people in one file, for the move
+              (RFC-0041 K6, step 7, built 2026-09-23)
 
-The first four are required of any connector; `settings` is optional
-and declared, so a product that cannot do it says so instead of
-failing at an operator. What is still absent is declared too:
-`export` is step 7's move, and `users` is in `never` rather than in
-`later`, because OAAP does not create people in somebody's realm and
-is not going to start. A verb that is named and absent is a smaller
-lie than one that is silently missing.
+The first four are required of any connector; `settings` and `export`
+are optional and declared, so a product that cannot do one says so
+instead of failing at an operator. `later` is empty now, and `users`
+is in `never` rather than in `later`, because OAAP does not create
+people in somebody's realm and is not going to start. A verb that is
+named and absent is a smaller lie than one that is silently missing.
+
+`export` is the verb that broke the shape of this file in a useful
+way, and it is worth saying why. Every other verb is an HTTP call to
+the product's admin API. This one is NOT -- not at Keycloak, and the
+reason was measured rather than reasoned: the admin API's export
+answers 200, carries the clients and the client secret, and contains
+**not one person**. So a connector row now says which DOOR a verb
+comes through, and `export` at Keycloak comes through the product's
+own tool, run in a throwaway container beside the database the
+serving one uses. That door is not a detail of Keycloak. It is the
+first evidence that "a connector" is not the same thing as "an API
+client", and the table had room for the difference.
 
 `settings` carries the rule that this step is about, and it is the
 second half of the sentence Joerg wrote the shape with -- *make the
@@ -129,12 +142,54 @@ CONNECTOR_KINDS = {
         "auth_realm": "master",
         "token_template": "{base}/realms/{realm}/protocol/openid-connect/token",
         "auth_kinds": ("client", "password"),
-        "verbs": ("version", "space", "client", "issuer", "settings"),
-        # Named and not built: the realm export of the move (K6, step
-        # 7). Named and never to be built: OAAP does not create, change
-        # or remove people in somebody's realm -- that is the club's,
-        # and K3.3 is the whole reason this file has no DELETE.
-        "later": ("export",),
+        # The move's export (K6, step 7), and the one verb here that
+        # is not an HTTP call. `door` says so out loud. What the
+        # measuring found, on 2026-09-23 against 26.7.4:
+        #
+        #   * POST /admin/realms/{r}/partial-export answers 200 and
+        #     carries clients, roles, groups and the CLIENT SECRET --
+        #     and no users at all. A file that looks complete.
+        #   * `kc.sh export` run inside the SERVING container finds no
+        #     KC_DB_* there (the entrypoint exports them into its own
+        #     process, so `docker exec` never sees them), silently
+        #     falls back to the built-in empty H2, and writes a
+        #     flawless export of a realm nobody has ever used. Exit 0.
+        #     It also re-persists that container's configuration, which
+        #     is a second reason not to run it there.
+        #   * The same tool in a THROWAWAY container, on the same
+        #     private network and the serving container's database,
+        #     writes the realm with its people and their password
+        #     hashes.
+        #
+        # So: the third door, and `move.export_count_refusal` counts
+        # the file afterwards -- because two of those three doors
+        # produce a wrong file without failing, and a rule that counts
+        # does not care how the next door is built.
+        "export": {
+            "door": "container",
+            # Which OAAP app carries this product, so a connector can
+            # be matched to the instance that serves it. Without an
+            # instance on THIS node there is no container door, and
+            # `oaap idp export` says that instead of guessing.
+            "app_id": "keycloak",
+            "service": "keycloak",
+            "db_service": "db",
+            "dir": "/tmp/oaap-export",
+            "file": "/tmp/oaap-export/{space}-realm.json",
+            # Where the product itself says how many people are in a
+            # space. The counting rule needs a second opinion, and it
+            # has to come from the provider, not from the file.
+            "count_path": "/admin/realms/{space}/users/count",
+            "people_key": "users",
+        },
+        "verbs": ("version", "space", "client", "issuer", "settings",
+                  "export"),
+        # Empty since step 7, and left here on purpose: a connector
+        # that grows a verb should have somewhere to name it first.
+        "later": (),
+        # Named and never to be built: OAAP does not create, change or
+        # remove people in somebody's realm -- that is the club's, and
+        # K3.3 is the whole reason this file has no DELETE.
         "never": ("users",),
         "provider_kind": "oidc",
     },
@@ -230,17 +285,32 @@ def missing_verbs(kind):
 
 
 def incoherent_verbs(kind):
-    """Verbs this connector both claims and swears off.
+    """Verbs this connector says two things about, or no thing at all.
 
     A row that declares `users` and also lists it under `never` is not
     a small inconsistency -- it is a table saying two things about
     whether OAAP touches somebody's members. Caught here, at the
     contract, rather than at the door.
+
+    `later` is read the same way, and that was a gap until step 7
+    emptied it: a typo there named nothing, promised nothing and sat
+    in the table looking like a considered position. `later` is a list
+    of PROMISES, so every entry has to be a verb that could be kept.
+
+    `never` deliberately is not held to that. What it names is not a
+    verb this build has -- `users` is not in KNOWN_VERBS and must not
+    be, because the whole point of the entry is that OAAP will not
+    grow one. What `never` IS held to is not saying the opposite of
+    another list.
     """
     c = connector_of(kind)
     have = set(c.get("verbs") or ())
-    unknown = tuple(v for v in sorted(have) if v not in KNOWN_VERBS)
-    both = tuple(v for v in sorted(have & set(c.get("never") or ())))
+    later = set(c.get("later") or ())
+    never = set(c.get("never") or ())
+    unknown = tuple(v for v in sorted(have | later)
+                    if v not in KNOWN_VERBS)
+    both = tuple(v for v in sorted((have & never) | (have & later)
+                                   | (later & never)))
     return unknown + both
 
 
@@ -511,12 +581,29 @@ def plan_refusal(plan):
         return ("a plan must ask the server which version it is before it "
                 "does anything else (RFC-0041 K3.2)")
     for i, step in enumerate(plan):
-        bad = method_refusal(step.get("method"))
-        if bad:
-            return bad
         if step.get("writes") and i <= where:
             return (f"'{step.get('verb')}' would write before the version "
                     "has been checked (RFC-0041 K3.2)")
+        if (step.get("door") or "api") == "container":
+            # Not an HTTP call: the product's own tool, run beside its
+            # database (step 7's export). Judged by the two rules that
+            # actually apply -- it comes after the version check, and
+            # it changes nothing at the provider -- and not by a method
+            # it does not have. A container step that WRITES is refused
+            # outright: K3.3 does not get an exception for arriving
+            # through a different door.
+            if step.get("writes"):
+                return (f"'{step.get('verb')}' would change the provider "
+                        "through its own tool rather than its API, and "
+                        "that is not a door OAAP writes through "
+                        "(RFC-0041 K3.3)")
+            if not (step.get("run") or ""):
+                return (f"'{step.get('verb')}' has no command at this "
+                        "connector")
+            continue
+        bad = method_refusal(step.get("method"))
+        if bad:
+            return bad
         if not (step.get("path") or ""):
             return f"'{step.get('verb')}' has no address at this connector"
     return ""
@@ -528,7 +615,13 @@ def plan_lines(plan):
     for step in plan:
         mark = {"absent": "if absent", "found": "if present",
                 "different": "if it differs"}.get(step.get("when"), "")
-        out.append(f"  {step['method']:<5}{step['path']}")
+        if (step.get("door") or "api") == "container":
+            out.append(f"  {'RUN':<5}{step.get('run', '')}")
+            out.append("        in a THROWAWAY container from this "
+                       "instance's own image -- the serving one is not "
+                       "touched")
+        else:
+            out.append(f"  {step['method']:<5}{step['path']}")
         out.append(f"        {mark + ': ' if mark else ''}{step['why']}")
     return out
 
@@ -733,6 +826,48 @@ def _keycloak_settings_write(switch, value, doc, space):
     return "", "", {}
 
 
+def _keycloak_export_shell(space, where):
+    """Keycloak's own export, as one line for a throwaway container.
+
+    `--users realm_file` puts the people INTO the realm file rather
+    than beside it, so there is one file to move and one file to
+    count. The log goes to stderr and the file to stdout, and the
+    caller catches stdout into a 0600 file on the node: the club's
+    credentials never touch a directory two processes can see. The
+    same reason step 4 piped a client secret straight into the command
+    that needed it.
+    """
+    entry = "/opt/keycloak/bin/kc.sh"
+    return (f"{entry} export --dir {where['dir']} --realm {space} "
+            f"--users realm_file >&2 && "
+            f"cat {where['file'].format(space=space)}")
+
+
+def _keycloak_export_env(space, where):
+    """What the throwaway container needs to see the REAL database.
+
+    The measured trap, in two lines of configuration. Keycloak's OAAP
+    app exports KC_DB_* inside its entrypoint, so they live in the
+    serving PROCESS and not in the container's environment -- and a
+    tool started next to it therefore sees none of them and quietly
+    uses its own empty one instead.
+
+    `from_serving` names what has to be copied across from the serving
+    container rather than written here, because it is a secret and
+    belongs in exactly one place.
+    """
+    svc = where.get("db_service", "db")
+    return ({"KC_DB": "postgres",
+             "KC_DB_URL": f"jdbc:postgresql://{svc}:5432/postgres",
+             "KC_DB_USERNAME": "postgres"},
+            {"KC_DB_PASSWORD": "POSTGRES_PASSWORD"})
+
+
+def _keycloak_export_people(doc):
+    """The people in an export file, as this product writes them."""
+    return list((doc or {}).get("users") or [])
+
+
 # The one place where a product's own field names live. A second
 # connector is a file with these functions and a row in
 # CONNECTOR_KINDS.
@@ -742,6 +877,11 @@ _BODIES = {
 
 _SETTINGS = {
     "keycloak": (_keycloak_settings_read, _keycloak_settings_write),
+}
+
+_EXPORTS = {
+    "keycloak": (_keycloak_export_shell, _keycloak_export_env,
+                 _keycloak_export_people),
 }
 
 
@@ -958,6 +1098,132 @@ def settings_disagreement(kind, wanted, got):
                     "provider's answer and not the instruction "
                     "(RFC-0041 K7)")
     return ""
+
+
+# ---------------------------------------------------------------------------
+# The export verb (RFC-0041 K6, step 7)
+#
+# The move needs one file: the club's space, its people, and their
+# credentials. Everything here is about WHERE that file may come from
+# and how it is judged afterwards -- never about trusting the tool
+# that wrote it.
+
+def export_of(kind):
+    """This connector's export declaration, or {}."""
+    return dict(connector_of(kind).get("export") or {})
+
+
+def export_refusal(kind):
+    """Why this connector cannot be asked for an export. '' when it can."""
+    bad = verb_refusal(kind, "export")
+    if bad:
+        return bad
+    if not export_of(kind):
+        return (f"'{kind}' declares the verb 'export' and says nothing "
+                "about how to reach it -- that is a connector row to fix, "
+                "not something an operator can work around")
+    return ""
+
+
+def export_door(kind):
+    """'container', 'api', or '' -- how an export is reached here.
+
+    Asked out loud because the answer decides what the operator needs
+    on this node. A container door means the product has to BE here;
+    an API door would work against somebody else's server.
+    """
+    return (export_of(kind).get("door") or "")
+
+
+def export_app_id(kind):
+    """Which OAAP app carries this product, for finding the instance."""
+    return (export_of(kind).get("app_id") or "")
+
+
+def export_file(kind, space):
+    """Where the product writes the file, inside its own container."""
+    tpl = export_of(kind).get("file") or ""
+    return tpl.format(space=space) if tpl else ""
+
+
+def export_count_path(kind, space):
+    """Where the product says how many people are in a space.
+
+    The second opinion the counting rule needs. It has to come from
+    the provider rather than from the file, or the file would be
+    checked against itself.
+    """
+    tpl = export_of(kind).get("count_path") or ""
+    return tpl.format(space=space) if tpl else ""
+
+
+def export_shell(kind, space):
+    """The one command a throwaway container runs, or ''."""
+    fn = _EXPORTS.get((kind or "").strip().lower())
+    return fn[0](space, export_of(kind)) if fn else ""
+
+
+def export_env(kind, space):
+    """(env, from_serving) for the throwaway container.
+
+    `from_serving` maps a variable the export needs to the variable of
+    the SERVING container it must be copied from. Kept as a mapping
+    rather than a value because the thing being copied is a secret and
+    has exactly one home.
+    """
+    fn = _EXPORTS.get((kind or "").strip().lower())
+    return fn[1](space, export_of(kind)) if fn else ({}, {})
+
+
+def export_people(kind, doc):
+    """The people an export file carries, as this product writes them."""
+    fn = _EXPORTS.get((kind or "").strip().lower())
+    return fn[2](doc) if fn else []
+
+
+def export_plan(kind, space):
+    """Every step an export takes, in order.
+
+    Judged by the SAME `plan_refusal` as provisioning and settings,
+    which is the reason the container step had to be spelled out in
+    the plan rather than done quietly beside it: a step that no rule
+    reads is a step no rule applies to.
+
+    The counting step is in the plan for the same reason the read-back
+    was in step 6's -- it is not an afterthought, it is what makes the
+    file mean anything, and an operator reading `--dry-run` should see
+    that the file will be judged before they are given it.
+    """
+    if export_refusal(kind):
+        return []
+    c = connector_of(kind)
+    word = c["space_word"]
+    return [
+        {"verb": "version", "method": "GET", "when": "always",
+         "writes": False, "path": c["version_path"],
+         "why": f"which {c['product']} is this? an export read at the "
+                "wrong version is read wrongly"},
+        {"verb": "space", "method": "GET", "when": "always", "writes": False,
+         "path": path_of(kind, "space", space=space),
+         "why": f"does this {word} exist? nothing is exported from a "
+                "space OAAP cannot see"},
+        {"verb": "export", "method": "GET", "when": "always", "writes": False,
+         "path": export_count_path(kind, space),
+         "why": f"how many people does the {word} say it has? asked "
+                "BEFORE the file exists, so the number is not taken from "
+                "the thing it is meant to check"},
+        {"verb": "export", "door": "container", "when": "always",
+         "writes": False, "run": export_shell(kind, space),
+         "why": f"the {c['product']} export of this {word}, with its "
+                "people and their credentials, straight into a 0600 file "
+                "on this node"},
+        {"verb": "export", "method": "GET", "when": "always", "writes": False,
+         "path": export_count_path(kind, space),
+         "why": "count the file against the provider. Two of the three "
+                "doors to an export write a file with no people in it "
+                "and do not fail (measured) -- so the file is counted, "
+                "never trusted"},
+    ]
 
 
 def space_body(kind, space, title=""):
@@ -1291,6 +1557,37 @@ class Admin:
                 return {}, f"reading the sign-in rules answered {status}"
             docs[where] = doc
         return settings_of(self.kind, docs), ""
+
+    def count_people(self, space):
+        """(count, error). How many people the space says are in it.
+
+        The second opinion `move.export_count_refusal` needs. It is a
+        pure read and it is the ONLY thing this class does for the
+        export verb -- the file itself comes out of a container, and
+        this class speaks HTTP and nothing else.
+
+        `None` on any doubt, never 0: an export checked against a
+        number nobody answered would pass exactly when it matters.
+        """
+        path = export_count_path(self.kind, space)
+        if not path:
+            return None, (f"this connector does not say where "
+                          f"{self.decl['product']} counts the people in a "
+                          f"{self.decl['space_word']}")
+        status, doc, err = self._call("GET", path)
+        if err:
+            return None, err
+        if status == 403:
+            return None, self._not_ours(space, "count the people in")
+        if status != 200:
+            return None, (f"counting the people in "
+                          f"'{space}' answered {status}")
+        try:
+            return int(doc), ""
+        except (TypeError, ValueError):
+            return None, (f"{self.decl['product']} answered something "
+                          f"other than a number when asked how many "
+                          f"people are in '{space}'")
 
     def write_switch(self, space, switch, value, doc):
         """(ok, sentence). Move one switch, and touch nothing else."""

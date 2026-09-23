@@ -96,8 +96,14 @@ for kind in a.connector_kinds():
        bool(decl.get("version_path")) and bool(decl.get("version_field")))
     ok(f"'{kind}' ist auf eine Fassung festgenagelt",
        re.match(r"^\d+\.\d+", decl.get("pinned", "")), decl.get("pinned"))
-    ok(f"'{kind}' sagt, was es NOCH nicht kann",
-       bool(decl.get("later")), decl.get("later"))
+    # `later` DARF leer sein -- seit Schritt 7 ist es das auch. Was
+    # zaehlt, ist dass die Liste da ist und dass jeder Eintrag darin
+    # ein Verb ist, das es gibt.
+    ok(f"'{kind}' hat eine Liste fuer das, was noch nicht geht",
+       isinstance(decl.get("later"), tuple), decl.get("later"))
+    ok(f"'{kind}' nennt darin nur echte Verben",
+       all(v in a.KNOWN_VERBS for v in (decl.get("later") or ())),
+       decl.get("later"))
     ok(f"'{kind}' sagt auch, was es NIE tun wird",
        "users" in (decl.get("never") or ()), decl.get("never"))
     ok(f"'{kind}' ist sich darueber einig", not a.incoherent_verbs(kind),
@@ -109,11 +115,34 @@ for kind in a.connector_kinds():
 ok("'settings' steht jetzt IM Vertrag", a.declares("keycloak", "settings"))
 ok("... und ist keine Pflicht fuer einen Konnektor",
    "settings" not in a.REQUIRED_VERBS and "settings" in a.OPTIONAL_VERBS)
-ok("'export' ist genannt und nicht gebaut (das ist Schritt 7)",
-   bool(a.verb_refusal("keycloak", "export")),
+# Schritt 7 hat 'export' gebaut, und damit ist `later` leer. Die
+# Regel, die dabei bleibt, ist die fuer den NAECHSTEN Eintrag: ein
+# genanntes und nicht gebautes Verb wird als solches abgelehnt.
+ok("'export' ist gebaut und wird nicht mehr abgelehnt",
+   a.verb_refusal("keycloak", "export") == "",
    a.verb_refusal("keycloak", "export"))
-ok("... und der Satz sagt, dass das PRODUKT es koennte",
-   "OAAP cannot" in a.verb_refusal("keycloak", "export"))
+ok("... und ist keine Pflicht fuer einen Konnektor",
+   "export" not in a.REQUIRED_VERBS and "export" in a.OPTIONAL_VERBS)
+_saved = dict(a.CONNECTOR_KINDS["keycloak"])
+a.CONNECTOR_KINDS["vertagt"] = dict(_saved, verbs=a.REQUIRED_VERBS,
+                                    later=("settings",), never=("users",))
+try:
+    ok("ein genanntes und nicht gebautes Verb wird als solches abgelehnt",
+       "OAAP cannot" in a.verb_refusal("vertagt", "settings"),
+       a.verb_refusal("vertagt", "settings"))
+    ok("... und diese Zeile ist in sich stimmig",
+       not a.incoherent_verbs("vertagt"))
+    a.CONNECTOR_KINDS["tippfehler2"] = dict(_saved, later=("expot",))
+    ok("ein TIPPFEHLER in 'later' faellt am Vertrag auf",
+       "expot" in a.incoherent_verbs("tippfehler2"),
+       a.incoherent_verbs("tippfehler2"))
+    a.CONNECTOR_KINDS["beides"] = dict(_saved, later=("users",))
+    ok("ein Verb, das 'noch nicht' UND 'nie' ist, faellt auf",
+       "users" in a.incoherent_verbs("beides"),
+       a.incoherent_verbs("beides"))
+finally:
+    for k in ("vertagt", "tippfehler2", "beides"):
+        a.CONNECTOR_KINDS.pop(k, None)
 # Die schaerfere Haelfte: 'users' ist nicht vertagt, sondern
 # abgeschworen. Der Satz dazu darf kein "noch nicht" sein.
 bad_users = a.verb_refusal("keycloak", "users")

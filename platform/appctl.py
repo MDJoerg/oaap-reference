@@ -73,6 +73,7 @@ import idp  # noqa: E402
 # yet: nothing inside a container needs it, and an admin credential is
 # not a thing to put within reach of one that does not.
 import idp_admin  # noqa: E402
+import move  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -2392,7 +2393,244 @@ def cmd_idp(args):
     if action == "settings":
         return _idp_settings(args, name, c)
 
+    if action == "export":
+        return _idp_export(args, name, c)
+
     die(f"unknown action '{action}'")
+
+
+def _connector_instance(kind):
+    """(instance name, record, error) -- the instance that serves this
+    connector's product on THIS node.
+
+    The export verb needs the product to be here, because its door is a
+    container and not an API (RFC-0041 K6, measured). Matched on the
+    app the connector names, never on a URL: a base URL can point at
+    the same server through three different names, and an app id
+    cannot.
+
+    Several instances of that app is an answer, not an error -- but it
+    is the operator's answer, so `--instance` is asked for rather than
+    one of them being picked.
+    """
+    app_id = idp_admin.export_app_id(kind)
+    if not app_id:
+        return "", {}, ("this connector does not say which OAAP app "
+                        "carries its product")
+    reg = load_registry()
+    mine = sorted(n for n, i in reg["instances"].items()
+                  if i.get("app_id") == app_id)
+    if not mine:
+        return "", {}, (f"no instance of the app '{app_id}' on this node. "
+                        "An export comes out of the product's own tool, "
+                        "beside its own database -- so the product has to "
+                        "be HERE. A connector pointing at somebody else's "
+                        f"server can be used for everything except this "
+                        "(RFC-0041 K6)")
+    if len(mine) > 1:
+        return "", {}, (f"{len(mine)} instances of '{app_id}' on this node "
+                        f"({', '.join(mine)}) -- which one serves this "
+                        "connector? `--instance <name>`")
+    return mine[0], reg["instances"][mine[0]], ""
+
+
+def _idp_export(args, name, c):
+    """The move's export: one space, its people, and their credentials.
+
+    RFC-0041 K6, step 7. Three things make this more than a command
+    that runs somebody else's tool, and all three came from measuring
+    rather than from the design:
+
+    * **The door.** Not the admin API -- its export answers 200 and
+      carries no people at all. The product's own tool, in a THROWAWAY
+      container on the serving one's database and network.
+    * **The file is counted, not trusted.** Two of the three doors
+      write a plausible file with nobody in it and do not fail. So the
+      space is asked how many people it has BEFORE the file exists, the
+      file is counted afterwards, and a difference throws the file
+      away.
+    * **The file is a secret.** It carries the client secret and every
+      member's password hash (measured, §5.0). It goes straight down a
+      pipe into a 0600 file owned by root -- never through a directory
+      two processes can see, never inside the platform's data
+      directory, never over an existing file.
+    """
+    kind = c["kind"]
+    bad = idp_admin.export_refusal(kind)
+    if bad:
+        die(bad)
+    decl = idp_admin.connector_of(kind)
+    word = decl["space_word"]
+
+    label = (args.tenant or "").strip().lower()
+    if not label:
+        die(f"which tenant? `oaap idp export {name} --tenant hbvp "
+            "--out /root/hbvp-realm.json`")
+    tid, t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the label '{label}'")
+    space = (args.space or (t.get("idp") or {}).get("space")
+             or idp_admin.space_for(label)).strip().lower()
+
+    out = os.path.abspath(os.path.expanduser((args.out or "").strip()))
+    bad = move.export_target_refusal(out, DATA_DIR)
+    if bad:
+        die(bad)
+
+    inst_name = (args.instance or "").strip()
+    if inst_name:
+        reg = load_registry()
+        inst = reg["instances"].get(inst_name)
+        if not inst:
+            die(f"no instance called '{inst_name}' on this node")
+    else:
+        inst_name, inst, err = _connector_instance(kind)
+        if err:
+            die(err)
+
+    plan = idp_admin.export_plan(kind, space)
+    bad = idp_admin.plan_refusal(plan)
+    if bad:
+        die(bad)
+
+    print(f"'{label}' -> {word} '{space}' at {c['base_url']}")
+    print(f"  from         instance '{inst_name}' on this node")
+    print(f"  into         {out}")
+    print("")
+    print("What this may call, in order:")
+    for line in idp_admin.plan_lines(plan):
+        print(line)
+    print("")
+    if args.dry_run:
+        print("Nothing was called and no file was written: --dry-run.")
+        return
+
+    admin = idp_admin.Admin(kind, c["base_url"], c["auth"], c["admin_id"],
+                            c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    ok, msg = admin.login()
+    if not ok:
+        die(msg)
+    said, bad = admin.version()
+    how, vbad = idp_admin.version_check(
+        kind, said, args.accept_version or c.get("accept_version", ""))
+    if vbad:
+        die(vbad)
+    doc, err = admin.find_space(space)
+    if err:
+        die(err)
+    if doc is None:
+        die(f"there is no {word} '{space}' at this provider -- nothing was "
+            "exported, and this step does not create one")
+    # Asked BEFORE the file exists, so the number cannot come from the
+    # thing it is meant to check.
+    said_people, err = admin.count_people(space)
+    if err:
+        die(err)
+    for line in admin.trace:
+        print("  " + line)
+
+    count, err = _run_export(kind, space, inst_name, inst, out)
+    if err:
+        die(err)
+
+    bad = move.export_count_refusal(said_people, count, word, decl["product"])
+    if bad:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        print("")
+        for line in textwrap.wrap(bad, 68):
+            print(line)
+        sys.exit(1)
+
+    audit_tenant("tenant.idp-export", tid, space,
+                 who=os.environ.get("SUDO_USER") or getpass.getuser(),
+                 detail=f"{decl['product']} {word} '{space}' · "
+                        f"{count} person(s) · written 0600 to {out}")
+    print("")
+    print("Written.")
+    print("")
+    for line in move.export_words(out, space, word, count):
+        print(line)
+
+
+def _run_export(kind, space, inst_name, inst, out):
+    """(count, error). Run the product's own export and count the file.
+
+    The throwaway container is the whole point. Running the tool inside
+    the SERVING container was measured doing two wrong things at once:
+    it saw no database configuration there (the app's entrypoint
+    exports it into its own process) and silently used its built-in
+    empty one, and it re-persisted that container's configuration on
+    the way past. A container that is created for this and removed
+    after it can do neither.
+    """
+    where = idp_admin.export_of(kind)
+    shell = idp_admin.export_shell(kind, space)
+    env, from_serving = idp_admin.export_env(kind, space)
+    svc = where.get("service") or ""
+    serving = next((s.get("container") for s in instance_services(inst)
+                    if s.get("service") == svc), inst.get("container"))
+    image = next((s.get("image") for s in instance_services(inst)
+                  if s.get("service") == svc), inst.get("image"))
+    if not serving or not image:
+        return 0, (f"instance '{inst_name}' does not have a service "
+                   f"'{svc}' -- this connector cannot export from it")
+
+    # The serving container's own environment, read once. What comes
+    # out of here is a secret and is handed to `docker run` as an
+    # argument list, never through a shell.
+    got = run(["docker", "inspect", serving, "--format",
+               "{{range .Config.Env}}{{println .}}{{end}}"]).stdout
+    have = dict(line.split("=", 1) for line in got.splitlines()
+                if "=" in line)
+    argv = ["docker", "run", "--rm", "--network", app_network(inst_name)]
+    for k, v in sorted(env.items()):
+        argv += ["-e", f"{k}={v}"]
+    for k, src in sorted(from_serving.items()):
+        if src not in have:
+            return 0, (f"the serving container does not carry '{src}', "
+                       "which the export needs to reach the product's own "
+                       "database. Nothing was run")
+        argv += ["-e", f"{k}={have[src]}"]
+    argv += ["--entrypoint", "sh", image, "-c", shell]
+
+    tmp = out + ".part"
+    old = os.umask(0o077)
+    try:
+        with open(tmp, "wb") as f:
+            proc = subprocess.run(argv, stdout=f, stderr=subprocess.PIPE)
+    except OSError as e:
+        os.umask(old)
+        return 0, f"cannot write {tmp}: {e}"
+    os.umask(old)
+    if proc.returncode != 0:
+        _drop(tmp)
+        tail = [l for l in (proc.stderr or b"").decode(
+            "utf-8", "replace").splitlines() if "ERROR" in l][-3:]
+        return 0, ("the product's own export tool failed"
+                   + ((": " + " / ".join(tail)) if tail else ""))
+    try:
+        with open(tmp, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError) as e:
+        _drop(tmp)
+        return 0, (f"the export is not readable as one document ({e}) -- "
+                   "nothing was kept")
+    count = len(idp_admin.export_people(kind, doc))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, out)
+    return count, ""
+
+
+def _drop(path):
+    """Remove a half-written secret without making a fuss about it."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _idp_settings(args, name, c):
@@ -2552,6 +2790,16 @@ def _print_idp(label, t):
     else:
         print("  provider     none -- this tenant signs in with local "
               "accounts only")
+    # A provider that came along in a move (RFC-0041 K6). Read by
+    # nothing and printed here, because the honest answer to "how does
+    # this club sign in" is that it used to sign in somewhere else and
+    # cannot yet sign in here.
+    for line in move.parked_lines(t.get("idp_carried") or {}):
+        print(line)
+    if (t.get("idp_carried") or {}) and not provider:
+        print("    Import the club's realm into this node's identity")
+        print(f"    service, then: oaap idp provision <connector> "
+              f"--tenant {label}")
     print(f"  first login  {pol['first_login']}"
           + (f" -> role {pol['default_role']}" if pol["default_role"] else ""))
     if pol["group_map"]:
@@ -2579,10 +2827,293 @@ def _print_idp(label, t):
             print("  " + wrapped)
     if pol["reason"]:
         print(f"  reason       {pol['reason']}")
+    ad = t.get("adopted") or {}
+    if ad:
+        print(f"  came from    {ad.get('from') or 'another node'} "
+              f"({(ad.get('when') or '')[:16]})")
     if not pol["set"]:
         print("")
         print("Nothing has been chosen here, so this is the platform's")
         print("default: an identity and no rights (RFC-0041 K4b).")
+
+
+def _archive_json(path, member, required=True):
+    """One JSON member out of a tenant archive, or {} / die.
+
+    Read out of the file rather than unpacked, because everything the
+    refusals are made of has to be knowable BEFORE anything lands on
+    this node.
+    """
+    got = subprocess.run(["tar", "-xzOf", path, member],
+                         capture_output=True, text=True)
+    if got.returncode != 0 or not (got.stdout or "").strip():
+        if required:
+            return None
+        return {}
+    try:
+        return json.loads(got.stdout)
+    except ValueError:
+        return None
+
+
+def _published_ports():
+    """Every host port this node already publishes."""
+    out = set()
+    for inst in (load_registry()["instances"] or {}).values():
+        try:
+            out.add(int(inst.get("port") or 0))
+        except (TypeError, ValueError):
+            continue
+    return {p for p in out if p}
+
+
+def _tenant_adopt(args):
+    """Adopt a tenant archive into an empty node (RFC-0041 K6, step 7).
+
+    The complement of a refusal, not its reversal. `oaap backup create
+    --tenant` will not promise to merge a tenant into a running node,
+    and this does not either -- it does the direction that is tractable
+    BECAUSE the target is empty, and it proves the target is empty
+    rather than assuming it.
+
+    Everything that can refuse, refuses before anything is written:
+    the format, the build that wrote it, and every name, port and
+    person in the archive looked for here. After the first write there
+    is no half-adopted state to explain, because by then there is
+    nothing left that could have refused.
+
+    The provider is the one thing that does NOT come into force. It
+    points at the node this tenant is leaving, and the client secret
+    that would let this one use it is deliberately not in the archive
+    (RFC-0041 K3). A record claiming otherwise would be a sentence a
+    tenant_admin reads and nothing in the world backs up -- which is
+    step 6's rule, one level up.
+    """
+    path = os.path.abspath(os.path.expanduser((args.archive or "").strip()))
+    if not os.path.isfile(path):
+        die(f"no such archive: {path}")
+
+    manifest = _archive_json(path, "tenant-manifest.json")
+    if manifest is None:
+        # Not a tenant archive at all, or a node archive. Both get an
+        # answer about what the file IS.
+        node = _archive_json(path, "backup-manifest.json", required=False)
+        if node:
+            die(move.format_refusal({"backup_format": "node", "scope": "node"}))
+        die(move.format_refusal({}))
+    bad = move.format_refusal(manifest)
+    if bad:
+        die(bad)
+    bad = move.version_refusal(manifest.get("platform_version"),
+                               _platform_env().get("OAAP_VERSION", ""))
+    if bad:
+        die(bad)
+
+    rec = _archive_json(path, "tenant-record.json") or {}
+    record = dict(rec.get("record") or {})
+    reg_in = _archive_json(path, "tenant-registry.json") or {}
+    instances = dict(reg_in.get("instances") or {})
+    users = _archive_json(path, "tenant-users.json")
+    if users is None or not isinstance(users, list):
+        die("this archive carries no readable user list -- it is not one "
+            "`oaap backup create --tenant` wrote")
+    if not record:
+        die("this archive carries no tenant record. That is what "
+            f"{move.ARCHIVE_FORMAT} added and it is why 0.1 is refused")
+
+    tid = (manifest.get("tenant") or "").strip()
+    label = (record.get("label") or manifest.get("tenant_label") or "").strip()
+    here = _read_identity_users()
+    if here is None:
+        die("cannot read the user store -- run this as root "
+            "(sudo oaap tenant adopt ...). An adoption that cannot see "
+            "who is already here cannot tell whether this node is empty.")
+
+    found = move.collisions(manifest, record, instances, users,
+                            load_tenants(), load_registry()["instances"],
+                            here, _published_ports())
+    carried, carried_says = move.provider_parked(record)
+    plan = move.adopt_plan(manifest, record, instances, users,
+                           carried=bool(carried))
+    bad = move.plan_refusal(plan)
+    if bad:
+        die(bad)
+
+    print(f"'{label}' from {manifest.get('hostname', 'another node')}, "
+          f"written {manifest.get('created', '?')} by OAAP "
+          f"{manifest.get('platform_version', '?')}")
+    print(f"  tenant       {tid}")
+    print(f"  instances    {len(instances)}")
+    print(f"  people       {len(users)}")
+    print("")
+    print("What this does, in order:")
+    for line in move.plan_lines(plan):
+        print(line)
+    print("")
+
+    if found:
+        print("This node is NOT empty for this tenant:")
+        for line in move.collision_lines(found):
+            print(line)
+        print("")
+        for line in textwrap.wrap(move.collision_refusal(found), 68):
+            print(line)
+        sys.exit(1)
+    print("Nothing on this node collides with this archive: not the "
+          "tenant, not its name, not an instance, not a port, not a "
+          "person. So this is a copy and not a merge.")
+    print("")
+    if args.dry_run:
+        print("Nothing was written: --dry-run.")
+        return
+
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+
+    # --- the record ---------------------------------------------------
+    tenants = load_tenants()
+    if carried:
+        # Carried, visible, and NOT in force. `idp` is what identity
+        # reads to let somebody in; `idp_carried` is read by nothing
+        # and printed by `oaap tenant idp`.
+        record.pop("idp", None)
+        record["idp_carried"] = dict(carried)
+    record["adopted"] = {
+        "when": _iso_now(), "from": manifest.get("hostname", ""),
+        "archive_created": manifest.get("created", ""),
+        "by": who}
+    tenants[tid] = record
+    save_tenants(tenants)
+    audit_tenant("tenant.adopted", tid, manifest.get("hostname", ""),
+                 who=who,
+                 detail=f"from an archive written {manifest.get('created','?')}"
+                        f" · {len(instances)} instance(s) · {len(users)} "
+                        "person(s)"
+                        + (" · provider CARRIED, not in force" if carried
+                           else ""))
+    print(f"Tenant record written: '{label}'.")
+
+    # --- the data ------------------------------------------------------
+    subtrees = [m for m in (f"tenants/{tid}", f"files/{tid}")
+                if archive_holds(path, m)]
+    if subtrees:
+        run(["tar", "-xzf", path, "-C", DATA_DIR, "--no-same-owner",
+             *subtrees])
+    print(f"Data unpacked: {len(subtrees)} subtree(s).")
+
+    # --- the registry ---------------------------------------------------
+    reg = load_registry()
+    reg["instances"].update(instances)
+    save_registry(reg)
+    print(f"Registry: {len(instances)} instance record(s) added.")
+
+    # --- the people ------------------------------------------------------
+    added, err = _adopt_users(users)
+    if err:
+        die(err)
+    print(f"People: {added} record(s) added.")
+
+    # --- the log ----------------------------------------------------------
+    lines = subprocess.run(["tar", "-xzOf", path, "tenant-audit.jsonl"],
+                           capture_output=True, text=True).stdout
+    kept = 0
+    with open(TENANT_LOG, "a", encoding="utf-8") as f:
+        for line in (lines or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)
+            except ValueError:
+                continue
+            f.write(line + "\n")
+            kept += 1
+    print(f"Audit log: {kept} entry/entries from the other node kept.")
+
+    # --- the instances -----------------------------------------------------
+    ok = skipped = 0
+    for name, inst in sorted(instances.items()):
+        if not inst.get("routes") or not inst.get("svc_port"):
+            print(f"SKIPPED {name}: registry entry predates route capture "
+                  "— reinstall it from its package.")
+            skipped += 1
+            continue
+        try:
+            if _deploy_from_registry(name, inst):
+                ok += 1
+            else:
+                skipped += 1
+        except subprocess.CalledProcessError as e:
+            print(f"SKIPPED {name}: {(e.stderr or str(e)).strip()}")
+            skipped += 1
+    refresh_generated_sites()
+    refresh_place_assets()
+    reload_gateway()
+    print(f"Instances: {ok} up, {skipped} skipped.")
+    print("")
+    print(f"'{label}' is on this node.")
+
+    if carried:
+        print("")
+        for line in textwrap.wrap(carried_says, 68):
+            print(line)
+    print("")
+    print("The other node still has all of this. OAAP does not reach onto "
+          "a machine it is not running on, and it does not delete — so "
+          "letting go over there is a deliberate act by a person, and "
+          "until it happens this club exists twice.")
+
+
+def _adopt_users(users):
+    """(count, error). Add the archive's people to the user store.
+
+    appctl does not write this file beside its owner -- identity
+    rewrites it on every user change, and two writers to one JSON file
+    is a lost update waiting for two admins to click at the same
+    moment. So identity is STOPPED for the merge and started again,
+    which is a short platform outage said out loud rather than a race
+    nobody sees.
+
+    The mode and ownership of the existing file are kept, because the
+    next reader of it is a container and not this process.
+    """
+    path = _identity_users_path()
+    stopped = False
+    got = subprocess.run(["docker", "ps", "-q", "--filter",
+                          f"name=^{IDENTITY_CONTAINER}$"],
+                         capture_output=True, text=True)
+    if (got.stdout or "").strip():
+        print("Stopping the identity service for the user merge "
+              "(nobody can sign in for a few seconds) ...")
+        subprocess.run(["docker", "stop", IDENTITY_CONTAINER],
+                       capture_output=True, text=True)
+        stopped = True
+    try:
+        have = _read_identity_users()
+        if have is None:
+            return 0, "the user store could not be read"
+        st = None
+        try:
+            st = os.stat(path)
+        except OSError:
+            pass
+        merged = list(have) + [u for u in users]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(merged, f, indent=2)
+        os.chmod(tmp, st.st_mode & 0o7777 if st else 0o600)
+        if st:
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except (OSError, AttributeError):
+                pass
+        os.replace(tmp, path)
+        return len(users), ""
+    finally:
+        if stopped:
+            subprocess.run(["docker", "start", IDENTITY_CONTAINER],
+                           capture_output=True, text=True)
+            print("Identity service started again.")
 
 
 def cmd_tenant(args):
@@ -2595,6 +3126,9 @@ def cmd_tenant(args):
     tenants = load_tenants()
     if not tenants:
         die("this node has no tenant store yet -- run `oaap update`")
+
+    if args.action == "adopt":
+        return _tenant_adopt(args)
 
     if args.action == "create":
         label = (args.name or "").strip().lower()
@@ -5964,6 +6498,15 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
     held[tid] = {"client_secret": client_secret.strip(),
                  "written": _iso_now()}
     save_idp_secrets(held)
+    # A provider carried in from a move is what this one replaces
+    # (RFC-0041 K6). Dropped rather than kept beside the live one: two
+    # provider records on one tenant is the ambiguity the parking was
+    # invented to avoid, and the audit line below is where it stays
+    # visible.
+    was_carried = dict(t.pop("idp_carried", None) or {})
+    if was_carried:
+        tenants[tid] = t
+        save_tenants(tenants)
     after = idp.provider_key(idp.provider_of(t))
     moved = bool(before and before != after)
     audit_tenant("tenant.idp", tid, issuer.strip(), who=who, role=role,
@@ -5971,7 +6514,18 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                         + (f" · version {version}" if version else "")
                         + (" · ISSUER CHANGED, every binding it had is void"
                            if moved else ""))
+    if was_carried:
+        audit_tenant("tenant.idp-move-done", tid, issuer.strip(), who=who,
+                     role=role,
+                     detail="the provider carried in from "
+                            f"{was_carried.get('issuer', 'another node')} "
+                            "is replaced by this one -- the move is "
+                            "complete on this side")
     msg = f"'{t['label']}' now signs in through {issuer.strip()}"
+    if was_carried:
+        msg += (" -- and the provider it arrived with, "
+                f"{was_carried.get('issuer', '?')}, is no longer carried. "
+                "Nobody had to register again")
     if moved:
         msg += (" -- this is a DIFFERENT issuer, so the bindings made "
                 "under the old one no longer match anybody")
@@ -13317,8 +13871,9 @@ def _tenant_archive(tid, label, out_dir, out_file):
     """One tenant's archive (RFC-0029 D5). Returns the path written.
 
     What it is: everything this node holds that belongs to this tenant —
-    its instance subtree, its registry entries, its users, its audit log
-    and, where the node carries `store`, its twin schema.
+    its own record, its instance subtree, its registry entries, its
+    users, its audit log and, where the node carries `store`, its twin
+    schema.
 
     What it is NOT, and the archive says so itself: something the
     installer can restore. A whole-node restore REPLACES a machine;
@@ -13329,6 +13884,20 @@ def _tenant_archive(tid, label, out_dir, out_file):
     both. Answering those badly loses another customer's data while
     restoring this one's. So the archive is produced and the merge is
     not promised; that is a separate round (RFC-0029 D5).
+
+    **`tenant-0.2` since 2026-09-23 (RFC-0041 K6).** Building the other
+    end of this — `oaap tenant adopt`, into an EMPTY node, which is the
+    tractable direction — found that `tenant-0.1` carried a tenant's
+    data and not the tenant's own RECORD. Its label, its face, its
+    first-login policy and its provider were simply not in the file,
+    and nobody had noticed because until the move nothing read an
+    archive back. That is the ordinary fate of a format with no reader.
+
+    The CLIENT SECRET still does not travel, and that is not an
+    oversight either (RFC-0041 K3): a secret in a backup is a secret in
+    every copy of that backup. The consequence is that an adopted
+    provider cannot work, so `tenant adopt` parks it rather than
+    letting the record claim otherwise.
 
     Only this tenant's containers stop, and only for the copy — the
     other customers on the machine never notice.
@@ -13357,7 +13926,7 @@ def _tenant_archive(tid, label, out_dir, out_file):
         # A DIFFERENT name from the node archive's `backup-manifest.json`,
         # deliberately: the installer looks for that one, and an archive
         # it must not restore must not look restorable.
-        "backup_format": "tenant-0.1",
+        "backup_format": move.ARCHIVE_FORMAT,
         "scope": "tenant",
         "tenant": tid, "tenant_label": label,
         "platform_version": _platform_env().get("OAAP_VERSION", "unknown"),
@@ -13370,11 +13939,18 @@ def _tenant_archive(tid, label, out_dir, out_file):
                       for n, i in sorted(mine.items())},
         "users": len(theirs),
         "restorable": False,
+        # Named in the manifest, because an archive should say what CAN
+        # be done with it and not only what cannot (RFC-0041 K6).
+        "adoptable": True,
+        "carries_provider": bool((load_tenants().get(tid) or {}).get("idp")),
         "note": ("This archive holds one tenant. The installer cannot "
                  "restore it: merging a tenant into a running node that "
                  "has other customers on it is a separate, undecided "
-                 "problem (RFC-0029 D5). What this archive guarantees is "
-                 "that the data EXISTS outside this machine."),
+                 "problem (RFC-0029 D5). What it CAN do is move this "
+                 "tenant onto an empty node -- `sudo oaap tenant adopt "
+                 "<this file>` (RFC-0041 K6). What this archive "
+                 "guarantees either way is that the data EXISTS outside "
+                 "this machine."),
     }
     subtrees = [d for d in (os.path.join("tenants", tid),
                             os.path.join("files", tid))
@@ -13382,6 +13958,14 @@ def _tenant_archive(tid, label, out_dir, out_file):
     with open(os.path.join(stage, "tenant-manifest.json"), "w",
               encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+    # The tenant's own record, as this node holds it. Everything a
+    # reader of `tenants.json` would see and nothing more -- and in
+    # particular not the client secret, which lives at 0600 in a
+    # directory only identity mounts and stays there.
+    record = dict((load_tenants().get(tid) or {}))
+    with open(os.path.join(stage, "tenant-record.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"tenant": tid, "record": record}, f, indent=2)
     with open(os.path.join(stage, "tenant-registry.json"), "w",
               encoding="utf-8") as f:
         json.dump({"instances": mine}, f, indent=2)
@@ -13394,8 +13978,7 @@ def _tenant_archive(tid, label, out_dir, out_file):
               encoding="utf-8") as f:
         for e in log:
             f.write(json.dumps(e) + "\n")
-    parts = ["tenant-manifest.json", "tenant-registry.json",
-             "tenant-users.json", "tenant-audit.jsonl"]
+    parts = list(move.ARCHIVE_PARTS)
     # The tenant's twin schema, where the node carries one (oaap.data.store
     # 0.1). One schema, not the whole cluster: the other schemas belong
     # to other customers and have no business in this file.
@@ -13479,6 +14062,17 @@ def _tenant_archive(tid, label, out_dir, out_file):
           "tenant into a running node is a separate problem and is not "
           "promised here (RFC-0029 D5); what it guarantees is that the "
           "data exists outside this machine.")
+    print("")
+    print("What it CAN do is move this tenant onto an EMPTY node:")
+    print(f"  sudo oaap tenant adopt {out_file}")
+    print("That direction is tractable for the same reason the other one "
+          "is not — there is nothing there to merge with (RFC-0041 K6).")
+    if (load_tenants().get(tid) or {}).get("idp"):
+        print("")
+        print("This tenant signs in through an identity provider. Its "
+              "record travels; its CLIENT SECRET deliberately does not, "
+              "and neither does the realm. Export the realm separately "
+              "(`oaap idp export`) and treat that file as a secret.")
     return out_path
 
 
@@ -14348,7 +14942,7 @@ def main():
                                       "(RFC-0041 K3)")
     pidp.add_argument("action",
                       choices=["list", "add", "remove", "check", "provision",
-                               "settings"])
+                               "settings", "export"])
     pidp.add_argument("name", nargs="?", help="the connector's short name")
     pidp.add_argument("--kind", dest="idp_kind_admin", default="keycloak",
                       choices=list(idp_admin.connector_kinds()),
@@ -14397,6 +14991,15 @@ def main():
     pidp.add_argument("--reason", dest="idp_reason", default=None,
                       help="why a dangerous combination is wanted; goes into "
                            "this tenant's log")
+    pidp.add_argument("--out", default=None,
+                      help="for 'export': where the file goes. Absolute, "
+                           "outside the platform's data directory, and "
+                           "never over an existing file -- it carries the "
+                           "club's credentials (RFC-0041 K6)")
+    pidp.add_argument("--instance", default=None,
+                      help="for 'export': which instance of this product "
+                           "serves the connector (only needed when there "
+                           "is more than one)")
     pidp.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="print every call this would make, and make none")
     pidp.set_defaults(fn=cmd_idp)
@@ -14404,7 +15007,12 @@ def main():
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
-                               "rename", "face", "idp", "policy"])
+                               "rename", "face", "idp", "policy", "adopt"])
+    pten.add_argument("--archive", default=None,
+                      help="for 'adopt': the tenant archive to take on. "
+                           "Only onto a node that is EMPTY for this tenant "
+                           "-- every collision is named and nothing is "
+                           "merged (RFC-0041 K6)")
     pten.add_argument("name", nargs="?", help="tenant label (default: 'default')")
     pten.add_argument("target", nargs="?", help="the new label, for 'rename'")
     pten.add_argument("--name", dest="title", default="",
@@ -14452,6 +15060,9 @@ def main():
     pten.add_argument("--idp-version", dest="idp_version", default=None,
                       help=f"the provider version this was built against "
                            f"(Keycloak {idp.KEYCLOAK_PINNED} is pinned)")
+    pten.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="for 'adopt': say what would happen, write "
+                           "nothing")
     pten.add_argument("--clear-idp", dest="clear_idp", action="store_true",
                       help="detach the provider; the users' bindings stay")
     # What a FIRST login becomes (K4). Only server_admin gets here at
