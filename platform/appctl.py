@@ -46,6 +46,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import uuid
 import zipfile
@@ -65,6 +66,13 @@ import place  # noqa: E402  (after the path insert, necessarily)
 # identity performs the login, this file configures it, and one file
 # holds the judgement both of them need.
 import idp  # noqa: E402
+# And the admin path of K3 (RFC-0041 step 4): OAAP creates the realm
+# and the client itself. Beside idp.py on purpose -- the portal wizard
+# of RFC-0041 6 is the second door, and when it comes it imports this
+# rather than growing its own copy. Not copied into a service image
+# yet: nothing inside a container needs it, and an admin credential is
+# not a thing to put within reach of one that does not.
+import idp_admin  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -1957,8 +1965,14 @@ def cmd_migrate_idp_dir(_args):
     service does not start. This one is not inside a read-only mount,
     so it would succeed -- as root:root with the daemon's umask, for a
     directory that holds client secrets. Made here instead, 0700.
+
+    Two directories now, and they are deliberately not one: the
+    connector credentials of K3 are mounted nowhere, because a service
+    that completes logins has no business holding a credential that
+    creates realms.
     """
     ensure_idp_dir()
+    ensure_idp_admin_dir()
 
 
 def cmd_migrate_place_assets(_args):
@@ -2139,6 +2153,230 @@ def cmd_migrate_identity_headers(_args):
           "is overwritten again instead of passing straight through.")
 
 
+def _print_connector(name, c, note=True):
+    """One connector as an operator reads it.
+
+    The secret is never printed, and neither is a hint of its length.
+    What IS printed is what the credential can do -- see
+    `idp_admin.credential_note`: K3.4 asked for a credential that is
+    never the master realm's, building it found that creating a realm
+    IS a master-realm act, and where an intention cannot be kept it is
+    named instead of quietly dropped.
+    """
+    decl = idp_admin.connector_of(c.get("kind"))
+    print(f"  {name}")
+    print(f"    product    {decl.get('product') or c.get('kind')} "
+          f"(pinned {decl.get('pinned', '?')})")
+    print(f"    address    {c.get('base_url', '')}")
+    print(f"    credential {c.get('auth', '')} '{c.get('admin_id', '')}' "
+          f"in realm '{c.get('auth_realm') or decl.get('auth_realm', '')}'")
+    if note:
+        for line in textwrap.wrap(
+                idp_admin.credential_note(c.get("kind"), c.get("auth"),
+                                          c.get("auth_realm")), 60):
+            print(f"               {line}")
+
+
+def cmd_idp(args):
+    """The identity providers this node can MANAGE (RFC-0041 K3).
+
+    Deliberately its own command and not a corner of `oaap tenant`. A
+    connector is a thing of the NODE: one Keycloak serves every club on
+    it, and the credential that can create realms belongs to the
+    operator, not to any one tenant. `oaap tenant idp` stays what it
+    was -- what one tenant's door looks like.
+    """
+    action = args.action
+    held = load_idp_connectors()
+
+    if action == "list":
+        if not held:
+            print("This node manages no identity provider.")
+            print("")
+            print("A tenant can still HAVE one: `oaap tenant idp <label>`")
+            print("takes four values somebody typed in by hand, and that")
+            print("path is unchanged and will stay. A connector is the")
+            print("other way round -- OAAP makes the realm and the client")
+            print("itself (RFC-0041 K3).")
+            return
+        print(f"{len(held)} connector(s) on this node:")
+        for name in sorted(held):
+            print("")
+            _print_connector(name, held[name])
+        print("")
+        tenants = load_tenants()
+        used = [(t.get("label"), (t.get("idp") or {}).get("connector"))
+                for t in tenants.values()
+                if (t.get("idp") or {}).get("connector")]
+        if used:
+            print("Tenants provisioned through one of them:")
+            for label, by in sorted(used):
+                print(f"  {label:<16} {by}")
+        else:
+            print("No tenant on this node was provisioned through one.")
+        return
+
+    name = (args.name or "").strip().lower()
+
+    if action == "add":
+        if not name:
+            die("which connector? `oaap idp add <name> --url ...`")
+        ok, msg = connector_add(
+            name, args.idp_kind_admin, args.url or "", args.auth,
+            args.admin_id or "", args.admin_secret or "",
+            auth_realm=args.auth_realm or "",
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die(msg)
+        print(msg[0].upper() + msg[1:] + ".")
+        print("")
+        print(f"The credential is held 0600 in {IDP_ADMIN_DIR}, which no")
+        print("container mounts -- not even the identity service, which")
+        print("holds the tenants' client secrets and has no business with")
+        print("one that can create realms.")
+        print("")
+        print("Nothing was asked of the provider yet. `oaap idp check "
+              f"{name}`")
+        print("does that, and says which version it is.")
+        return
+
+    if action == "remove":
+        ok, msg = connector_remove(
+            name, who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die(msg)
+        print(msg[0].upper() + msg[1:] + ".")
+        return
+
+    c = held.get(name)
+    if not c:
+        die(f"no connector called '{name}' on this node -- `oaap idp list`")
+
+    if action == "check":
+        print(f"Connector '{name}'")
+        _print_connector(name, c, note=False)
+        print("")
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        ok, msg = admin.login()
+        print(("  credential OK -- " if ok else "  credential REFUSED -- ")
+              + msg)
+        if not ok:
+            sys.exit(1)
+        said, err = admin.version()
+        if err:
+            die("  " + err)
+        bad = idp_admin.version_refusal(c["kind"], said)
+        decl = idp_admin.connector_of(c["kind"])
+        print(f"  version    {decl['product']} {said}"
+              + ("  (the pinned one)" if not bad else "  -- NOT the pinned "
+                 f"{decl['pinned']}"))
+        if bad:
+            print("")
+            for line in textwrap.wrap(bad, 68):
+                print("  " + line)
+            sys.exit(1)
+        print("")
+        print("This is the version this build was measured against, so the")
+        print("admin path is the one that was tested. That sentence is")
+        print("worth something only because it was asked -- a pinned")
+        print("version nobody checks is a comment (RFC-0041 K3.1).")
+        return
+
+    if action == "provision":
+        label = (args.tenant or "").strip().lower()
+        if not label:
+            die("which tenant? `oaap idp provision <connector> --tenant hbvp`")
+        tid, t = tenant_by_label(label, include_former=False)
+        if not tid:
+            die(f"no tenant with the label '{label}'")
+        host = load_external()
+        if not host:
+            die("this node has no external name yet, so the tenant has no "
+                "address of its own and there is no redirect URI to "
+                "register: `oaap external set` first")
+        space = (args.space or idp_admin.space_for(label)).strip().lower()
+        client_id = (args.client_id
+                     or idp_admin.client_for(host)).strip()
+        uris = idp_admin.redirect_uris_for(label, host)
+        bad = idp_admin.space_refusal(c["kind"], space)
+        if bad:
+            die(bad)
+        decl = idp_admin.connector_of(c["kind"])
+        word = decl["space_word"]
+
+        plan = idp_admin.provision_plan(c["kind"], space, client_id)
+        bad = idp_admin.plan_refusal(plan)
+        if bad:
+            die(bad)
+        print(f"'{label}' -> {word} '{space}' at {c['base_url']}")
+        print(f"  client       {client_id}")
+        for u in uris:
+            print(f"  comes back   {u}")
+        print("")
+        print("What this may call, in order:")
+        for line in idp_admin.plan_lines(plan):
+            print(line)
+        print("")
+        if args.dry_run:
+            print("Nothing was called: --dry-run.")
+            return
+
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        ok, got, msg = admin.provision(
+            space, client_id, uris, title=t.get("name") or t.get("label", ""),
+            accept_version=args.accept_version or "")
+        for line in admin.trace:
+            print("  " + line)
+        if not ok:
+            print("")
+            for line in textwrap.wrap(msg, 68):
+                print(line)
+            print("")
+            print("Nothing was half-made: OAAP stops at the first call it")
+            print("does not understand rather than leaving a realm behind")
+            print("in a state nobody asked for (RFC-0041 K3.2).")
+            sys.exit(1)
+
+        ok, said = tenant_set_provider(
+            tid, got["kind"], got["issuer"], got["client_id"],
+            got["client_secret"], label=args.idp_label or "",
+            version=got["version"], connector=name, space=space,
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die("the provider was made and OAAP will not record it: " + said)
+        print("")
+        print(said[0].upper() + said[1:] + ".")
+        print("")
+        print(f"  issuer       {got['issuer']}")
+        print(f"  client       {got['client_id']}")
+        print(f"  measured     {decl['product']} {got['version']}")
+        print("  secret       fetched from the provider and held 0600 on "
+              "this node")
+        print("")
+        print("The redirect URIs above are registered at the client. Both")
+        print("schemes, because the one that counts is the one the")
+        print("VISITOR'S BROWSER uses, not the one inside the container.")
+        print("")
+        pol = idp.policy_of(t)
+        print(f"A first login through it means '{pol['first_login']}'"
+              + (f" ({pol['default_role']})" if pol["default_role"] else "")
+              + ".")
+        if pol["first_login"] == idp.FIRST_LOGIN_DEFAULT:
+            print("That is the default: an identity and no rights, visible")
+            print("in the Eingang. Change it with `oaap tenant policy`.")
+        print("")
+        print(f"Nobody is in the {word} yet. Add the club's people there,")
+        print("or switch self-registration on IN the realm -- OAAP does")
+        print("not do that half yet (RFC-0041 step 6).")
+        return
+
+    die(f"unknown action '{action}'")
+
+
 def _print_idp(label, t):
     """What this tenant's way in looks like right now.
 
@@ -2156,6 +2394,9 @@ def _print_idp(label, t):
             print(f"  built for    Keycloak {provider['version']}")
         if provider["label"]:
             print(f"  button says  {provider['label']}")
+        if provider["connector"]:
+            print(f"  made by      connector '{provider['connector']}'"
+                  + (f", {provider['space']}" if provider["space"] else ""))
         tid = next((k for k, x in load_tenants().items()
                     if x.get("label") == label), "")
         held = load_idp_secrets().get(tid) or {}
@@ -2278,10 +2519,13 @@ def cmd_tenant(args):
             _print_idp(label, t)
             return
         # K3: the version this object was built against travels WITH
-        # it. Written down here, not verified here -- the admin path
-        # that asks /admin/serverinfo and refuses a server it does not
-        # recognise is the next build step, and until it exists this
-        # field is a record of intent and is described as one.
+        # it. Typed here and therefore a record of INTENT -- nothing on
+        # this path asks the server anything. `oaap idp provision`
+        # writes the same field with the version the server actually
+        # stated, and `oaap idp check` compares them later. Two ways to
+        # fill one field, and the difference between them is worth
+        # keeping: one is what somebody meant, the other is what was
+        # measured.
         version = (args.idp_version or idp.KEYCLOAK_PINNED).strip()
         ok, msg = tenant_set_provider(
             tid, args.idp_kind, args.issuer or "", args.client_id or "",
@@ -5374,6 +5618,114 @@ def save_idp_secrets(providers):
     os.replace(tmp, IDP_SECRETS_FILE)
 
 
+# The connectors this node holds (RFC-0041 K3, step 4). A DIFFERENT
+# directory from the client secrets above, and the difference is the
+# whole point: `data/idp` is mounted into identity read-only, because
+# identity needs a tenant's client secret to complete a login. It does
+# not need a credential that can CREATE realms, and a network-facing
+# service should not be able to read one.
+#
+# So this directory is mounted nowhere at all. Only this file, running
+# as root on the host, ever opens it. Same reasoning as the client
+# secret not living in tenants.json, one step further: a secret belongs
+# where its reader is and no further.
+IDP_ADMIN_DIR = os.path.join(DATA_DIR, "data", "idp-admin")
+IDP_CONNECTORS_FILE = os.path.join(IDP_ADMIN_DIR, "connectors.json")
+
+
+def load_idp_connectors():
+    try:
+        with open(IDP_CONNECTORS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("connectors") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_idp_connectors(connectors):
+    """Write the admin credentials, 0600, and never any wider.
+
+    The mode goes on the temporary file before the move, for the reason
+    `save_idp_secrets` gives: a chmod after os.replace leaves a window
+    in which the file exists readable, and a window is all a secret
+    needs.
+    """
+    os.makedirs(IDP_ADMIN_DIR, exist_ok=True)
+    os.chmod(IDP_ADMIN_DIR, 0o700)
+    tmp = IDP_CONNECTORS_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"connectors": connectors}, f, indent=2)
+    os.replace(tmp, IDP_CONNECTORS_FILE)
+
+
+def ensure_idp_admin_dir():
+    try:
+        os.makedirs(IDP_ADMIN_DIR, exist_ok=True)
+        os.chmod(IDP_ADMIN_DIR, 0o700)
+    except OSError as e:
+        print(f"WARNING: could not prepare {IDP_ADMIN_DIR}: {e}")
+
+
+def connector_add(name, kind, base_url, auth, admin_id, admin_secret,
+                  auth_realm="", who="root"):
+    """Record a connector on this node. (ok, sentence).
+
+    The refusal comes from services/idp_admin.py, not from here, for
+    the reason the whole of RFC-0041 keeps running into: there will be
+    a second door (the portal wizard), and a refusal that can only be
+    phrased in one place is one a second door cannot soften.
+    """
+    name = (name or "").strip().lower()
+    kind = (kind or "").strip().lower()
+    base_url = (base_url or "").strip()
+    bad = idp_admin.connector_refusal(kind, name, base_url, auth, admin_id,
+                                      admin_secret)
+    if bad:
+        return False, bad
+    held = load_idp_connectors()
+    was = name in held
+    held[name] = {
+        "kind": kind,
+        "base_url": base_url.rstrip("/"),
+        "auth": (auth or "client").strip().lower(),
+        "admin_id": (admin_id or "").strip(),
+        "admin_secret": (admin_secret or "").strip(),
+        "auth_realm": (auth_realm or "").strip(),
+        "added": (held.get(name) or {}).get("added") or _iso_now(),
+        "written": _iso_now(),
+        "by": who,
+    }
+    save_idp_connectors(held)
+    audit_tenant("node.idp-connector", "", name, who=who,
+                 detail=f"{kind} at {base_url}"
+                        + (" (replaced)" if was else ""))
+    return True, (f"connector '{name}' "
+                  + ("replaced" if was else "recorded")
+                  + f": {idp_admin.connector_of(kind)['product']} at "
+                  + base_url)
+
+
+def connector_remove(name, who="root"):
+    """Forget a connector. (ok, sentence).
+
+    Forgets the credential and NOTHING at the provider. Realms, clients
+    and people stay exactly where they are -- K3.3, and the tenants
+    that already sign in through them keep signing in, because their
+    provider object is a URL and a client secret of their own.
+    """
+    name = (name or "").strip().lower()
+    held = load_idp_connectors()
+    if name not in held:
+        return False, f"no connector called '{name}' on this node"
+    held.pop(name)
+    save_idp_connectors(held)
+    audit_tenant("node.idp-connector-removed", "", name, who=who,
+                 detail="the credential is gone; nothing at the provider "
+                        "was touched")
+    return True, (f"connector '{name}' forgotten -- the credential is gone "
+                  "and nothing at the provider was touched")
+
+
 def ensure_idp_dir():
     """The directory identity mounts, created before the mount exists.
 
@@ -5391,7 +5743,8 @@ def ensure_idp_dir():
 
 
 def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
-                        label="", version="", who="root", role="root"):
+                        label="", version="", who="root", role="root",
+                        connector="", space=""):
     """Attach or change a tenant's identity provider. (ok, sentence).
 
     Refused for the DEFAULT tenant? No -- deliberately allowed. The
@@ -5413,6 +5766,12 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                 "client_id": client_id.strip(),
                 "version": (version or "").strip(),
                 "label": (label or "").strip(),
+                # Which connector made this, and what it is called at
+                # the provider. Both are for a human reading `tenant
+                # idp` later; neither is ever used to FIND anything,
+                # because the binding is the issuer and nothing else.
+                "connector": (connector or "").strip(),
+                "space": (space or "").strip(),
                 "added": (t.get("idp") or {}).get("added") or _iso_now()}
     tenants[tid] = t
     save_tenants(tenants)
@@ -13724,6 +14083,49 @@ def main():
                           help="internal: name the accounts still holding "
                                "both 'partner' and 'support' (RFC-0039)")
     pscn.set_defaults(fn=cmd_support_cleanup_note)
+    # The providers this node MANAGES (RFC-0041 K3, step 4). A command
+    # of the node and not of a tenant: one Keycloak serves every club
+    # on the machine, and a credential that can create realms belongs
+    # to the operator.
+    pidp = sub.add_parser("idp", help="identity providers this node manages "
+                                      "(RFC-0041 K3)")
+    pidp.add_argument("action",
+                      choices=["list", "add", "remove", "check", "provision"])
+    pidp.add_argument("name", nargs="?", help="the connector's short name")
+    pidp.add_argument("--kind", dest="idp_kind_admin", default="keycloak",
+                      choices=list(idp_admin.connector_kinds()),
+                      help="which product is behind it (default keycloak)")
+    pidp.add_argument("--url", default=None,
+                      help="the provider's base address, e.g. "
+                           "https://auth.example.org")
+    pidp.add_argument("--auth", default="client",
+                      choices=["client", "password"],
+                      help="a service account (recommended) or a user login")
+    pidp.add_argument("--admin-id", dest="admin_id", default=None,
+                      help="the service account's client id, or a user name")
+    pidp.add_argument("--admin-secret", dest="admin_secret", default=None,
+                      help="that credential's secret; kept 0600, mounted "
+                           "into no container at all")
+    pidp.add_argument("--auth-realm", dest="auth_realm", default=None,
+                      help="where the credential lives (default: the "
+                           "product's server realm)")
+    pidp.add_argument("--tenant", default=None,
+                      help="for 'provision': whose space to make")
+    pidp.add_argument("--space", default=None,
+                      help="for 'provision': the realm name (default: the "
+                           "tenant's label -- it travels with the move)")
+    pidp.add_argument("--client-id", dest="client_id", default=None,
+                      help="for 'provision': the client OAAP presents "
+                           "itself as (default: oaap-<node>)")
+    pidp.add_argument("--idp-label", dest="idp_label", default=None,
+                      help="for 'provision': what the button on the login "
+                           "page says")
+    pidp.add_argument("--accept-version", dest="accept_version", default=None,
+                      help="proceed against a version this build was NOT "
+                           "measured against, by naming it")
+    pidp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="print every call this would make, and make none")
+    pidp.set_defaults(fn=cmd_idp)
     pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",

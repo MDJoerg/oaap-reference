@@ -91,8 +91,8 @@ def unroutable_host(host):
     return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
 
 
-def issuer_refusal(issuer):
-    """Why this issuer URL may not be used, or '' if it may.
+def channel_refusal(url, what="the issuer", carries=""):
+    """Why this address may not be spoken to, or '' if it may.
 
     THE CHANNEL RULE, and it carries more weight here than it looks.
     The ID token is fetched over the back channel and its signature is
@@ -104,31 +104,51 @@ def issuer_refusal(issuer):
     here, it IS the authentication of the issuer.
 
     Hence: `https` everywhere, with ONE exception that is a statement
-    of fact rather than a relaxation -- an `http` issuer whose host
+    of fact rather than a relaxation -- an `http` address whose host
     cannot be reached from the internet at all (loopback, a private
     address, a container name). Traffic that never leaves the machine
     or the club's own cable has exactly the exposure the node's own
     portal already has on such a network; refusing it there would be
     theatre, and refusing it anywhere else is not.
+
+    Written with a `what` because there is now a SECOND address of this
+    shape: K3's admin path speaks to the server rather than to the
+    realm (`idp_admin.py`), and the reasoning applies to it letter for
+    letter -- a credential that can create realms travels that
+    connection. Two copies of this rule would be two chances to soften
+    one of them, and this project has paid for that seven times.
     """
-    issuer = (issuer or "").strip()
-    if not issuer:
-        return "an identity provider needs an issuer URL"
-    if not re.match(r"^https?://", issuer, re.I):
-        return "the issuer must be an absolute http(s) URL"
-    if issuer != issuer.rstrip("/"):
-        return "the issuer must be written without a trailing slash"
-    if any(c in issuer for c in "?# "):
-        return "the issuer must carry no query and no fragment"
-    host = _host_of(issuer)
+    url = (url or "").strip()
+    if not url:
+        return f"{what} needs a URL"
+    if not re.match(r"^https?://", url, re.I):
+        return f"{what} must be an absolute http(s) URL"
+    if url != url.rstrip("/"):
+        return f"{what} must be written without a trailing slash"
+    if any(c in url for c in "?# "):
+        return f"{what} must carry no query and no fragment"
+    host = _host_of(url)
     if not host:
-        return "the issuer names no host"
-    if issuer.lower().startswith("http://") and not unroutable_host(host):
-        return (f"'{host}' can be reached from the internet, so the issuer "
-                "must be https: the client secret and the identity token "
-                "travel this connection, and nothing else proves who "
-                "answered it (RFC-0041 3)")
+        return f"{what} names no host"
+    if url.lower().startswith("http://") and not unroutable_host(host):
+        return (f"'{host}' can be reached from the internet, so {what} "
+                "must be https: "
+                + (carries
+                   or "the client secret and the identity token travel")
+                + " this connection, and nothing else proves who answered "
+                "it (RFC-0041 3)")
     return ""
+
+
+def issuer_refusal(issuer):
+    """The channel rule for the address a token names itself after.
+
+    Kept as its own name because it is the one every caller means, and
+    because an empty one has a better sentence than the generic.
+    """
+    if not (issuer or "").strip():
+        return "an identity provider needs an issuer URL"
+    return channel_refusal(issuer, "the issuer")
 
 
 def provider_refusal(kind, issuer, client_id, client_secret):
@@ -172,6 +192,12 @@ def provider_of(tenant):
         "version": (p.get("version") or "").strip(),
         "label": (p.get("label") or "").strip(),
         "added": (p.get("added") or "").strip(),
+        # Which connector made this and what it is called there (K3).
+        # Carried for a human to READ. Nothing looks anything up by
+        # them: the binding is the issuer, and a second name for the
+        # same thing is a second chance to match on the wrong one.
+        "connector": (p.get("connector") or "").strip(),
+        "space": (p.get("space") or "").strip(),
     }
 
 
