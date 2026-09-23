@@ -1,0 +1,5 @@
+# The build context is this whole directory now (docker-compose.yml),
+# so keep out what no image needs: bytecode caches and the sibling
+# services' trees are copied by name, never wholesale.
+__pycache__/
+*.pyc

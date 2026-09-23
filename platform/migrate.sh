@@ -253,6 +253,17 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-route
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-tenant-places \
   2>&1 | sed 's/^/  /' || say "  WARNING: the tenant addresses could not be written — run 'oaap status'."
 
+# --- the face of a tenant (0.1.117, RFC-0042 T3) ---
+# A tenant logo lives in the byte store (oaap.data.files) and is
+# PROJECTED into a directory the gateway serves, so the login page can
+# show it without a session. That projection is derived state: no
+# archive carries it, so it has to be written after an update and after
+# a restore, or a node would hold the bytes and still show a hole.
+# Silent when there is nothing to write, which is every node without a
+# tenant logo.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-place-assets \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the tenant logos could not be written - run 'oaap status'."
+
 # --- open streams survive gateway reloads (0.1.102) ---
 # Every deployment reloads the gateway, and a reload used to cut every
 # open WebSocket/SSE stream of every app on the node. The delay that

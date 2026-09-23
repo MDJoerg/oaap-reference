@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import re
+import sys
 import secrets
 import tempfile
 import time
@@ -21,10 +22,28 @@ import uuid
 from datetime import timedelta
 from urllib.parse import quote
 
+from datetime import datetime, timezone
+
 from flask import (Flask, make_response, redirect, render_template_string,
                    request, session)
 from flask.sessions import SecureCookieSessionInterface
+from markupsafe import Markup
 from werkzeug.security import check_password_hash, generate_password_hash
+
+# Which tenant a host names, and what its face is (RFC-0042 T2/T3).
+# The SAME file the portal has -- see docker-compose.yml. The login page
+# is the first page a club member ever sees, and it has to reach the
+# same answer as the portal behind it; two readings of one hostname is
+# how a login page ends up wearing one club's colours in front of
+# another club's portal.
+# place.py sits BESIDE this file in the image (the build context is
+# services/, see docker-compose.yml) and one level up in the
+# repository, where a test runs app.py straight from the tree. Both
+# are true at once only if we say so.
+_SIBLING = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.isfile(os.path.join(_SIBLING, "place.py")):
+    sys.path.insert(0, _SIBLING)
+import place  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -999,31 +1018,46 @@ def resolve_principal(instance=""):
 _CARD_STYLE = """
 <style>
   :root{--blue-600:#2563eb;--blue-700:#1d4ed8;--bg:#f4f6fa;--text:#1f2937;
-        --muted:#6b7280;--border:#e5e7eb;--err:#b91c1c;--ok:#15803d}
+        --muted:#6b7280;--border:#e5e7eb;--err:#b91c1c;--ok:#15803d;
+        /* RFC-0042 T3: what a tenant theme moves on this page. Unset,
+           they are the platform's own values, so there is one code path
+           and not a themed and an unthemed one. */
+        --brand:#1e3a8a;--btn-text:#ffffff}
   *{box-sizing:border-box}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
        display:grid;place-items:center;min-height:100vh;margin:0;
        background:var(--bg);color:var(--text)}
   .card{background:#fff;padding:2rem;border-radius:.6rem;border:1px solid var(--border);
        box-shadow:0 1px 3px rgba(23,37,84,.06);width:min(22rem,92vw)}
-  .mark{text-align:center;margin-bottom:.4rem}
+  .mark{text-align:center;margin-bottom:.4rem;color:var(--brand)}
+  .mark img{max-height:3.4rem;max-width:12rem}
+  .place{text-align:center;color:var(--muted);font-size:.78rem;
+       margin:.1rem 0 .9rem;word-break:break-word}
   h1{font-size:1.2rem;margin:.2rem 0 1rem;text-align:center}
-  .wordmark{text-align:center;letter-spacing:.08em;font-weight:700;color:var(--blue-600)}
+  .wordmark{text-align:center;letter-spacing:.08em;font-weight:700;
+       color:var(--brand)}
   input{width:100%;padding:.55rem;margin:.25rem 0 1rem;border:1px solid var(--border);
        border-radius:.4rem;font-size:.95rem}
   button{width:100%;padding:.65rem;border:0;border-radius:.4rem;background:var(--blue-600);
-       color:#fff;font-size:1rem;cursor:pointer;min-height:44px}
+       color:var(--btn-text);font-size:1rem;cursor:pointer;min-height:44px}
   button:hover{background:var(--blue-700)}
   .err{color:var(--err)}.ok{color:var(--ok)}.hint{color:var(--muted);font-size:.9rem}
   a{color:var(--blue-600)}
 </style>
 """
 
+# The platform's mark, or -- at a tenant's own address with a logo set
+# -- that tenant's picture. Either way the line underneath names the
+# ADDRESS, which is built from the label and cannot be chosen freely:
+# that is the anchor T3 asks for, and it is what keeps a face from
+# claiming to be somebody else's.
 _MARK_SVG = """
-<p class="mark"><svg viewBox="0 0 100 100" width="46" height="46" aria-hidden="true">
+<p class="mark">{% if show_face and face.logo_url %}<img src="{{ face.logo_url }}" alt="">
+{% else %}<svg viewBox="0 0 100 100" width="46" height="46" aria-hidden="true">
   <polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="none"
-           stroke="#2563eb" stroke-width="6" stroke-linejoin="round"/>
-  <polygon points="50,28 69,39 69,61 50,72 31,61 31,39" fill="#2563eb"/></svg></p>
+           stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>
+  <polygon points="50,28 69,39 69,61 50,72 31,61 31,39" fill="currentColor"/></svg>
+{% endif %}</p>
 """
 
 _FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' "
@@ -1034,9 +1068,11 @@ _HEAD = ('<!doctype html><html lang="de"><meta charset="utf-8">'
          '<meta name="viewport" content="width=device-width, initial-scale=1">'
          f'<link rel="icon" href="{_FAVICON}">')
 
-LOGIN_PAGE = _HEAD + "<title>Anmelden — OAAP</title>" + _CARD_STYLE + _MARK_SVG.join([
+LOGIN_PAGE = _HEAD + "<title>Anmelden — {{ face.title if at_place else 'OAAP' }}</title>"     + _CARD_STYLE + "{{ theme_style }}" + _MARK_SVG.join([
     "<body><div class='card'>",
-    """<div class="wordmark">OAAP</div>
+    """<div class="wordmark">{{ face.title if at_place else "OAAP" }}</div>
+{% if at_place %}<p class="place">{{ face.address }} ·
+   {{ "Betreibersicht" if not show_face else "OAAP" }}</p>{% endif %}
 <h1>Anmelden</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if not has_users %}
@@ -1052,7 +1088,7 @@ LOGIN_PAGE = _HEAD + "<title>Anmelden — OAAP</title>" + _CARD_STYLE + _MARK_SV
 </form>
 </div></body></html>"""])
 
-PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE + _MARK_SVG.join([
+PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE + "{{ theme_style }}" + _MARK_SVG.join([
     "<body><div class='card'>",
     """<h1>Passwort ändern</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -1071,7 +1107,7 @@ PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE
 </div></body></html>"""])
 
 
-PROFILE_PAGE = _HEAD + "<title>Profil — OAAP</title>" + _CARD_STYLE + _MARK_SVG.join([
+PROFILE_PAGE = _HEAD + "<title>Profil — OAAP</title>" + _CARD_STYLE + "{{ theme_style }}" + _MARK_SVG.join([
     "<body><div class='card'>",
     """<h1>Profil</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -1085,6 +1121,50 @@ PROFILE_PAGE = _HEAD + "<title>Profil — OAAP</title>" + _CARD_STYLE + _MARK_SV
 </form>
 <p><a href="/">Zurück zum Portal</a></p>
 </div></body></html>"""])
+
+
+def request_face():
+    """(tenant_id or None, face, show it?) for the host of this request.
+
+    RFC-0042 T2/T3. The judgement is `place.host_place` -- the very same
+    call the portal makes -- so the login page and the page behind it
+    cannot disagree about whose address this is.
+
+    `show` is the second half of T3's first rule: a caller holding
+    node-wide power gets the PLATFORM's chrome even here. Somebody who
+    is not logged in holds no role at all and therefore DOES see the
+    tenant's face, which is the entire reason for theming this page.
+    """
+    ext = _external_host()
+    tenants = known_tenants()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    tid, _resolved = place.host_place(request.host, ext, tenants,
+                                      default_tenant_id(), now)
+    t = (tenants.get(tid) or {}) if tid else {}
+    face = place.theme_of(t, t.get("label", ""), ext)
+    roles = ()
+    who = session_username()
+    if who:
+        roles = (find_user(load_users(), who) or {}).get("roles") or ()
+    show = bool(tid and face["themed"] and not place.platform_chrome(roles))
+    return tid, face, show
+
+
+@app.context_processor
+def _face_context():
+    """Give every card page its face, without touching ten render calls.
+
+    Wrapped, and deliberately: a node whose tenant store cannot be read
+    must still be able to show a LOGIN form. A missing face is a page in
+    the platform's own colours; a raised exception is a node nobody can
+    get into.
+    """
+    try:
+        tid, face, show = request_face()
+    except Exception:            # noqa: BLE001 -- see the docstring
+        tid, face, show = None, place.theme_of({}), False
+    return {"face": face, "at_place": bool(tid), "show_face": show,
+            "theme_style": Markup(place.card_style(face) if show else "")}
 
 
 @app.get("/auth/profile")

@@ -16,6 +16,7 @@ resources.
 
 import json
 import os
+import sys
 from datetime import date, datetime, timezone
 from urllib.parse import quote
 
@@ -25,6 +26,14 @@ from flask import (Flask, g, redirect, render_template_string, request,
 from markupsafe import Markup
 
 import fleet_view
+# place.py sits BESIDE this file in the image (the build context is
+# services/, see docker-compose.yml) and one level up in the
+# repository, where a test runs app.py straight from the tree. Both
+# are true at once only if we say so.
+_SIBLING = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if os.path.isfile(os.path.join(_SIBLING, "place.py")):
+    sys.path.insert(0, _SIBLING)
+import place  # noqa: E402
 import relay_view
 import twin_view
 
@@ -102,9 +111,12 @@ CHANNEL_LABELS = {"test": "Test", "production": "Produktiv"}
 # dark header) — inline, because OAAP UIs load nothing from outside.
 LOGO_SVG = Markup(
     '<svg viewBox="0 0 100 100" width="34" height="34" aria-hidden="true">'
+    # currentColor, not white: a tenant theme may give this header a pale
+    # background, and then its text -- and this mark with it -- flips to
+    # dark (RFC-0042 T3, services/place.readable_on).
     '<polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="none" '
-    'stroke="#ffffff" stroke-width="6" stroke-linejoin="round"/>'
-    '<polygon points="50,28 69,39 69,61 50,72 31,61 31,39" fill="#ffffff"/></svg>'
+    'stroke="currentColor" stroke-width="6" stroke-linejoin="round"/>'
+    '<polygon points="50,28 69,39 69,61 50,72 31,61 31,39" fill="currentColor"/></svg>'
 )
 FAVICON = (
     "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E"
@@ -118,30 +130,45 @@ STYLE = """
     --oaap-blue-600:#2563eb; --oaap-blue-100:#dbeafe;
     --oaap-bg:#f4f6fa; --oaap-surface:#fff; --oaap-text:#1f2937;
     --oaap-muted:#6b7280; --oaap-border:#e5e7eb;
+    /* RFC-0042 T3: the four values a tenant theme redefines, and the
+       three the platform DERIVES from them so that a chosen colour
+       cannot make text vanish into its own background. A club picks
+       the hue; keeping the page readable stays our job. Unthemed,
+       these are exactly the values the page always had. */
+    --oaap-header-text:#ffffff; --oaap-accent-text:#ffffff;
+    --oaap-ink:#1e3a8a;
     --ok:#15803d; --err:#b91c1c; --warn:#b45309;
   }
   *{box-sizing:border-box}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
        margin:0;background:var(--oaap-bg);color:var(--oaap-text)}
   header.oaap{background:linear-gradient(135deg,var(--oaap-blue-900),var(--oaap-blue-950));
-       color:#fff;display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
+       color:var(--oaap-header-text);display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
        padding:.6rem 1.2rem}
-  .brand{display:flex;align-items:center;gap:.6rem;text-decoration:none;color:#fff}
+  .brand{display:flex;align-items:center;gap:.6rem;text-decoration:none;
+       color:var(--oaap-header-text)}
+  .brand img{height:34px;width:auto;max-width:10rem;border-radius:.25rem;
+       background:rgba(255,255,255,.9);padding:.15rem}
   .brand b{font-size:1.15rem;letter-spacing:.08em}
   .brand small{display:block;font-size:.62rem;opacity:.75;letter-spacing:.02em}
   nav.main{display:flex;gap:.25rem;margin-left:1rem;flex:1}
-  nav.main a{color:#fff;text-decoration:none;padding:.55rem .9rem;border-radius:.4rem;
+  nav.main a{color:var(--oaap-header-text);text-decoration:none;
+       padding:.55rem .9rem;border-radius:.4rem;
        opacity:.85;border-bottom:3px solid transparent}
-  nav.main a:hover{background:rgba(255,255,255,.12);opacity:1}
+  /* A neutral grey, not white: the header may now be light (a theme
+     with a pale primary flips its text to dark), and a white veil on
+     a white header is a hover nobody can see. */
+  nav.main a:hover{background:rgba(127,127,127,.25);opacity:1}
   nav.main a.active{border-bottom-color:var(--oaap-blue-100);opacity:1;font-weight:600}
   .userbox{display:flex;align-items:center;gap:.7rem;font-size:.9rem}
   .userbox .who{text-align:right;line-height:1.2}
   .userbox .who small{opacity:.75}
-  .userbox a{color:var(--oaap-blue-100)}
+  .userbox a{color:var(--oaap-header-text);opacity:.85}
   .userbox form{margin:0}
-  .userbox button{background:rgba(255,255,255,.14);color:#fff;border:1px solid rgba(255,255,255,.35);
+  .userbox button{background:rgba(127,127,127,.22);color:var(--oaap-header-text);
+       border:1px solid rgba(127,127,127,.45);
        border-radius:.4rem;padding:.45rem .9rem;font-size:.85rem;cursor:pointer}
-  .userbox button:hover{background:rgba(255,255,255,.25)}
+  .userbox button:hover{background:rgba(127,127,127,.38)}
   main{max-width:62rem;margin:1.6rem auto;padding:0 1.2rem}
   h1{font-size:1.35rem;margin:.2rem 0 1rem}
   h2{font-size:1.02rem;margin:0 0 .8rem}
@@ -197,7 +224,7 @@ STYLE = """
   .tile .meta{color:var(--oaap-muted);font-size:.8rem}
   .hexdot{flex:none}
   .badge{font-size:.72rem;padding:.15rem .55rem;border-radius:1rem;
-       background:var(--oaap-blue-100);color:var(--oaap-blue-900);white-space:nowrap}
+       background:var(--oaap-blue-100);color:var(--oaap-ink);white-space:nowrap}
   .badge.test{background:#fef3c7;color:#92400e}
   .badge.off{background:#f3f4f6;color:#6b7280}
   .badge.todo{background:#fee2e2;color:#991b1b}
@@ -205,12 +232,13 @@ STYLE = """
   .dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
   .dot.warn{background:var(--warn)} .dot.unknown{background:#9ca3af}
   a.btn{display:inline-block;padding:.6rem 1.3rem;border-radius:.4rem;
-       background:var(--oaap-blue-600);color:#fff;text-decoration:none;min-height:44px}
+       background:var(--oaap-blue-600);color:var(--oaap-accent-text);
+       text-decoration:none;min-height:44px}
   a.btn:hover{background:var(--oaap-blue-700)}
   input,select{width:100%;padding:.55rem;margin:.25rem 0 1rem;
        border:1px solid var(--oaap-border);border-radius:.4rem;font-size:.95rem}
   button{padding:.6rem 1.3rem;border:0;border-radius:.4rem;background:var(--oaap-blue-600);
-       color:#fff;font-size:.95rem;cursor:pointer;min-height:44px}
+       color:var(--oaap-accent-text);font-size:.95rem;cursor:pointer;min-height:44px}
   button:hover{background:var(--oaap-blue-700)}
   .err{color:var(--err)}.ok{color:var(--ok)}.muted{color:var(--oaap-muted);font-size:.9rem}
   table{width:100%;border-collapse:collapse}
@@ -253,10 +281,24 @@ LAYOUT = STYLE + """
 <!doctype html><html lang="de"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href=\"""" + FAVICON + """\">
-<title>{{ title }} — OAAP</title>
+<title>{{ title }} — {{ place.title if at_place else "OAAP" }}</title>
+{{ theme_style }}
 <header class="oaap">
-  <a class="brand" href="/">{{ logo }}
+  {# RFC-0042 T3, rule two. The face a tenant chose is the TITLE and the
+     picture; the anchor beside it is the ADDRESS, which is built from
+     the label and can therefore not be chosen freely -- a label is
+     unique on this node and public by construction. So a theme can look
+     like anything and still cannot claim to be somebody else, and the
+     word OAAP never leaves the header. #}
+  <a class="brand" href="/">
+    {% if show_face and place.logo_url %}<img src="{{ place.logo_url }}" alt="">
+    {% else %}{{ logo }}{% endif %}
+    {% if at_place %}
+    <span><b>{{ place.title }}</b><small>{{ place.address }} ·
+      {{ "Betreibersicht" if not show_face else "OAAP" }}</small></span>
+    {% else %}
     <span><b>OAAP</b><small>Open Application &amp; Automation Platform</small></span>
+    {% endif %}
   </a>
   <nav class="main">
     <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
@@ -293,13 +335,12 @@ REFUSAL_BODY = """
 
 DASHBOARD_BODY = """
 <h1>{{ place_title or "Apps" }}</h1>
-{# RFC-0042 T3: Traegt die Seite das Gesicht eines Mandanten, steht
-   sein Name darauf -- nicht als Zierde, sondern als Anker. Noch ohne
-   Farben (Stufe 3), aber der Anker gehoert zur Adresse, nicht zum
-   Design: er ist genau dann noetig, wenn die Seite jemandem gehoert. #}
+{# RFC-0042 T3: Der Anker -- Name und Adresse des Mandanten -- steht
+   seit 0.1.117 in der Kopfzeile, also auf JEDER Seite und nicht nur
+   auf dieser. Hier bleibt der Satz, der erklaert, warum die Liste hier
+   kuerzer ist als an der Wurzel. #}
 {% if place_title %}
-<p class="muted">Der Ort von <strong>{{ place_title }}</strong> auf diesem
-   Knoten. Die Apps dieses Mandanten, so weit Ihre Rollen reichen.</p>
+<p class="muted">Die Apps dieses Mandanten, so weit Ihre Rollen reichen.</p>
 {% endif %}
 {% if sections %}
   {% for label, tiles in sections %}
@@ -1439,17 +1480,22 @@ TENANT_BODY = """
   <p>{{ me.users }} Benutzer, {{ me.instances }} Instanz(en).</p>
   {% if host %}
   <p class="muted">Apps dieses Mandanten sind erreichbar unter
-     <code>&lt;instanz&gt;.{{ me.label }}.{{ host }}</code>.</p>
+     <code>&lt;instanz&gt;.{{ me.label }}.{{ host }}</code>, dieser Mandant
+     selbst unter <code>{{ me.label }}.{{ host }}</code>.</p>
   {% endif %}
+  <p><a class="btn" href="/tenant/face">Das Gesicht aendern</a></p>
 </div>
 {% else %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Kürzel</th><th>Name</th><th>Benutzer</th><th>Instanzen</th><th>Angelegt</th></tr>
+  <tr><th>Kürzel</th><th>Name</th><th>Benutzer</th><th>Instanzen</th>
+      <th>Angelegt</th><th></th></tr>
   {% for t in tenants %}
   <tr><td><code>{{ t.label }}</code></td><td>{{ t.name }}</td>
       <td>{{ t.users }}</td><td>{{ t.instances }}</td>
-      <td class="muted">{{ t.created }}</td></tr>
+      <td class="muted">{{ t.created }}</td>
+      <td>{% if not t.is_default %}<a class="rowaction"
+          href="/tenant/face?tenant={{ t.label }}">Gesicht</a>{% endif %}</td></tr>
   {% endfor %}
 </table>
 </div>
@@ -1513,6 +1559,109 @@ TENANT_BODY = """
 {% else %}
 <div class="card"><p class="muted">Noch keine Einträge.</p></div>
 {% endif %}
+"""
+
+# RFC-0042 T3. Bewusst vier Felder und kein Stylesheet: Wer eigenes CSS
+# mitbringen darf, kann jedes Bedienelement auf einer Seite verschieben,
+# verstecken oder faelschen, fuer die die Plattform geradesteht.
+FACE_BODY = """
+<a class="back" href="/tenant">&larr; Mandant</a>
+<h1>Das Gesicht von {{ t.label }}</h1>
+{% if msg %}
+<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
+{% endif %}
+<div class="card">
+  <p>So sieht dieser Mandant unter seiner eigenen Adresse aus
+     {% if address %}(<code>{{ address }}</code>){% endif %} &mdash;
+     <strong>auch auf der Anmeldeseite</strong>, und die ist die erste
+     Seite, die ein Mitglied dieses Mandanten je sieht.</p>
+  <p class="err" style="font-weight:600">Titel und Logo sind oeffentlich.</p>
+  <p class="muted">Die Anmeldeseite verlangt keine Anmeldung &mdash; wer die
+     Adresse kennt, sieht beides. Der <strong>Klarname</strong> des Mandanten
+     ({{ t.name or "nicht gesetzt" }}) ist ein anderes Feld und bleibt im
+     Haus; er steht auf keiner oeffentlichen Seite.</p>
+  <p class="muted">Vier Werte, kein Stylesheet: Farben und Bild, sonst
+     nichts. Was auf der Seite steht und wo es steht, bleibt Sache der
+     Plattform &mdash; sonst koennte ein Design ein Bedienelement
+     verschieben, verstecken oder faelschen.</p>
+</div>
+
+<div class="card">
+  <h2>Heute</h2>
+  <table class="mini">
+    <tr><th>Oeffentlicher Titel</th>
+        <td>{% if face.title != t.label %}{{ face.title }}{% else %}
+            <span class="muted">nicht gesetzt &mdash; es steht das Kuerzel
+            <code>{{ t.label }}</code></span>{% endif %}</td></tr>
+    <tr><th>Hauptfarbe</th><td>
+        <span style="display:inline-block;width:1.1rem;height:1.1rem;
+              vertical-align:-.2rem;border:1px solid var(--oaap-border);
+              border-radius:.2rem;background:{{ face.color_primary }}"></span>
+        <code>{{ face.color_primary }}</code>
+        {% if not set_primary %}<span class="muted">(die der Plattform)</span>{% endif %}</td></tr>
+    <tr><th>Akzentfarbe</th><td>
+        <span style="display:inline-block;width:1.1rem;height:1.1rem;
+              vertical-align:-.2rem;border:1px solid var(--oaap-border);
+              border-radius:.2rem;background:{{ face.color_accent }}"></span>
+        <code>{{ face.color_accent }}</code>
+        {% if not set_accent %}<span class="muted">(die der Plattform)</span>{% endif %}</td></tr>
+    <tr><th>Logo</th><td>
+        {% if face.logo_url %}<img src="{{ face.logo_url }}" alt=""
+             style="max-height:3rem;max-width:12rem">{% else %}
+        <span class="muted">keins &mdash; es steht das Plattform-Zeichen</span>{% endif %}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Aendern</h2>
+  <form method="post" action="/tenant/face" enctype="multipart/form-data">
+    {% if label_param %}<input type="hidden" name="tenant" value="{{ t.label }}">{% endif %}
+    <div class="cfgfield">
+      <label for="f-title">Oeffentlicher Titel</label>
+      <p class="hint muted">Wie dieser Mandant sich selbst nennt. Leer
+         lassen heisst: es steht das Kuerzel. Hoechstens 60 Zeichen.</p>
+      <input id="f-title" type="text" name="title" maxlength="60"
+             value="{{ theme.title or '' }}" autocomplete="off">
+    </div>
+    <div class="cfgfield">
+      <label for="f-primary">Hauptfarbe</label>
+      <p class="hint muted">Die Farbe, die die Marke traegt &mdash; sie faerbt
+         die Kopfzeile. Sechs Hex-Ziffern mit <code>#</code>, z. B.
+         <code>#1f4e79</code>. Leer lassen: die der Plattform.</p>
+      <input id="f-primary" type="text" name="color_primary"
+             pattern="#[0-9a-fA-F]{6}" placeholder="#1f4e79"
+             value="{{ theme.color_primary or '' }}" autocomplete="off">
+    </div>
+    <div class="cfgfield">
+      <label for="f-accent">Akzentfarbe</label>
+      <p class="hint muted">Die zweite Farbe, fuer Schalter und
+         Hervorhebungen.</p>
+      <input id="f-accent" type="text" name="color_accent"
+             pattern="#[0-9a-fA-F]{6}" placeholder="#e07b00"
+             value="{{ theme.color_accent or '' }}" autocomplete="off">
+    </div>
+    <div class="cfgfield">
+      <label for="f-logo">Logo</label>
+      <p class="hint muted">PNG, JPEG, WebP oder GIF, hoechstens
+         {{ max_kb }} KB. <strong>Kein SVG</strong>: Es wird unter der
+         Adresse dieser Plattform ausgeliefert, und ein Bild, das ein
+         Skript tragen kann, sitzt dort neben der Sitzung jedes Benutzers.</p>
+      <input id="f-logo" type="file" name="logo"
+             accept="image/png,image/jpeg,image/webp,image/gif">
+      {% if face.logo_url %}
+      <label class="checkline"><input type="checkbox" name="clear_logo" value="1">
+         Logo entfernen</label>
+      {% endif %}
+    </div>
+    <div class="cfgsave">
+      <p class="muted">Die Plattform haelt die Seite lesbar: Zu einer hellen
+         Hauptfarbe wird die Schrift der Kopfzeile dunkel, und Text auf
+         weissem Grund wird so weit abgedunkelt, dass er lesbar bleibt.
+         Die Farbe waehlt der Mandant, die Lesbarkeit die Plattform.</p>
+      <button>Speichern</button>
+    </div>
+  </form>
+</div>
 """
 
 INSTANCES_LIST_BODY = """
@@ -2892,9 +3041,22 @@ def page(body_template, title, active, status=200, **ctx):
     roles = request.headers.get("X-OAAP-Roles", "")
     caller = caller_roles()
     multi = multi_tenant()
+    # RFC-0042 T3, rule one: a caller who holds node-wide power sees the
+    # PLATFORM's chrome, on every address including a customer's. An
+    # operator has to be able to tell by looking that they are on a page
+    # where they can act on the whole node, and a themed node
+    # administration is a page that can be mistaken for a customer's.
+    #
+    # They still see WHOSE place they are on -- the header says so, and
+    # says "Betreibersicht" where a club would read "OAAP". What they
+    # do not get is the club's colours.
+    at, face = request_place()
+    show_face = bool(at and face["themed"] and not place.platform_chrome(caller))
     return render_template_string(
         LAYOUT,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
+        place=face, at_place=bool(at), show_face=show_face,
+        theme_style=Markup(place.theme_style(face) if show_face else ""),
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
         is_server_admin="server_admin" in caller,
         # Who may reach user administration and the instance list — the
@@ -2980,64 +3142,36 @@ def external_host():
 
 
 def tenant_id_by_label(label):
-    """(id) of the tenant answering to this label, current or former.
-
-    A former label resolves for as long as it is unexpired, the same
-    grace `tenant_host_prefixes` gives an instance address -- the
-    gateway writes a site for it, so the portal has to recognise it or
-    the club's old address would reach a page that refuses them.
-    """
-    label = (label or "").strip().lower()
-    # Compared as ISO strings, which is sound only because every such
-    # timestamp is written by the host in UTC with the same precision
-    # -- `former_labels` in appctl says the same thing from the other
-    # side. Anything else sorts as expired, the safe direction.
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    for tid, t in sorted(load_tenants().items()):
-        if t.get("label") == label:
-            return tid
-        for f in (t.get("former_labels") or []):
-            if f.get("label") == label and str(f.get("until", "")) > now:
-                return tid
-    return None
+    """The tenant answering to this label, current or former, or None."""
+    return place.tenant_id_by_label(
+        label, load_tenants(),
+        datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
 def host_tenant_scope(host):
     """Which tenant this HOST names: (tenant_id_or_None, resolved).
 
-    RFC-0042 T2. Three answers, and the third is the whole point:
-
-    * the node's own apex, a LAN name, an operator's CNAME -- no tenant
-      in the host, so the portal shows the node view it always did
-      (None, True);
-    * `<label>.<node>` naming a tenant this node has -- that tenant
-      scopes the launchpad for EVERYONE reached through this host, a
-      server_admin included (tid, True);
-    * `<label>.<node>` naming a tenant this node does NOT have -- serve
-      nothing (None, False). Falling back to the operator's own view
-      would be the exact substitution the resolution rules exist to
-      prevent, and it is the same fail-closed direction
-      `tenant_host_prefixes` already takes on the other side.
-
-    `<instance>.<label>.<node>` has its own site pointing at the app's
-    container, so the portal never sees it -- but it is answered here
-    too rather than assumed away.
+    RFC-0042 T2, and the judgement itself lives in `services/place.py`
+    because IDENTITY has to reach the same answer for the login page.
+    Two readings of one host is how a login page ends up wearing one
+    club's colours in front of another club's portal -- which is the
+    impersonation T3 forbids in so many words, arrived at by accident.
     """
-    host = (host or "").split(":")[0].lower()
-    ext = (external_host() or "").lower()
-    if not ext or host == ext or not host.endswith("." + ext):
-        return None, True
-    label = host[: -len(ext) - 1]
-    if "." in label:
-        return None, True
-    tid = tenant_id_by_label(label)
-    if tid is None:
-        return None, False
-    # The default tenant's place IS the apex; its label never appears
-    # in a host, so a host that spells it out is not its address.
-    if tid == default_tenant_id():
-        return None, False
-    return tid, True
+    return place.host_place(
+        host, external_host(), load_tenants(), default_tenant_id(),
+        datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+
+def request_place():
+    """(tenant_id or None, face) for the host this request came in on.
+
+    Always a complete face, even at the node's own address: there is no
+    "unthemed" branch anywhere above this line, only a face that happens
+    to carry the platform's own values (RFC-0042 T3).
+    """
+    tid = host_tenant_scope(request.host)[0]
+    t = (load_tenants().get(tid) or {}) if tid else {}
+    return tid, place.theme_of(t, t.get("label", ""), external_host())
 
 
 def local_name(key, inst):
@@ -3771,6 +3905,10 @@ def tenant_page():
             rows.append({"label": t.get("label", "?"),
                          "name": t.get("name") or "—",
                          "created": t.get("created", "?"),
+                         # The node's own tenant has no place of its own
+                         # -- its address IS the apex -- so it has no
+                         # face to change (RFC-0042 T1/T3).
+                         "is_default": tid == default_tenant_id(),
                          "users": n_users, "instances": n_inst})
         return page(TENANT_BODY, "Mandanten", "tenant", tenants=rows, me=None,
                     is_server_admin=True, host=external_host(),
@@ -3792,6 +3930,118 @@ def tenant_page():
 
 
 TENANT_WAIT_SECONDS = 20   # a small JSON file plus one DNS lookup
+FACE_WAIT_SECONDS = 20     # a small JSON file, one small picture, no docker
+
+
+def _face_target():
+    """(tenant_id, tenant_record, named_explicitly) or a refusal redirect.
+
+    A tenant_admin dresses their OWN place and may not name another;
+    only a server_admin may, and then it has to be a tenant this node
+    actually has. Checked here so the refusal is a page, and checked
+    AGAIN on the host, because the spool is data and not trust.
+    """
+    role, mine = caller_scope()
+    want = (request.values.get("tenant") or "").strip().lower()
+    # The SAME function the host worker asks (services/place.face_target).
+    # Here it makes the refusal a page instead of a spool round trip;
+    # there it is the one that counts, because the spool is data and
+    # not trust.
+    tid, refusal = place.face_target(role, mine,
+                                     tenant_id_by_label(want) if want else "")
+    if refusal:
+        return None, None, redirect(
+            "/tenant?err=1&msg=" + quote("Ein Mandant verwaltet nur seinen "
+                                         "eigenen Ort."), code=303)
+    t = load_tenants().get(tid or "")
+    if not t:
+        return None, None, redirect(
+            "/tenant?err=1&msg=" + quote("Diesen Mandanten gibt es auf "
+                                         "diesem Knoten nicht."), code=303)
+    if tid == default_tenant_id():
+        return None, None, redirect(
+            "/tenant?err=1&msg=" + quote(
+                "Der Standard-Mandant ist dieser Knoten selbst — sein "
+                "Gesicht IST das der Plattform."), code=303)
+    return tid, t, bool(want)
+
+
+@app.get("/tenant/face")
+def tenant_face_form():
+    """The four values a tenant may choose about how its place looks."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, t, refusal = _face_target()
+    if refusal:
+        return refusal
+    host = external_host()
+    theme = t.get("theme") or {}
+    face = place.theme_of(t, t.get("label", ""), host)
+    return page(FACE_BODY, "Gesicht", "tenant",
+                t={"label": t.get("label", "?"), "name": t.get("name") or ""},
+                face=face, theme=theme,
+                set_primary=bool(theme.get("color_primary")),
+                set_accent=bool(theme.get("color_accent")),
+                address=f"{t.get('label', '')}.{host}" if host else "",
+                max_kb=place.LOGO_MAX_BYTES // 1024,
+                label_param=bool(request.args.get("tenant")),
+                msg=request.args.get("msg"),
+                msg_ok=request.args.get("err") is None)
+
+
+@app.post("/tenant/face")
+def tenant_face_post():
+    """Hand the change to the host worker (the registry mount is read-only).
+
+    The picture travels as a FILE beside the request, the way an
+    artifact package already does -- a spool entry is a small JSON
+    document and has no business carrying half a megabyte of base64.
+    """
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, t, refusal = _face_target()
+    if refusal:
+        return refusal
+    back = "/tenant/face" + (f"?tenant={t.get('label', '')}"
+                             if request.form.get("tenant") else "")
+
+    def done(text, ok=True):
+        joiner = "&" if "?" in back else "?"
+        return redirect(f"{back}{joiner}msg={quote(text)}"
+                        + ("" if ok else "&err=1"), code=303)
+
+    rid = _uuid.uuid4().hex
+    payload = {"action": "tenant-face", "tenant": tid,
+               "title": request.form.get("title", ""),
+               "color_primary": request.form.get("color_primary", ""),
+               "color_accent": request.form.get("color_accent", "")}
+    if request.form.get("clear_logo"):
+        payload["clear_logo"] = True
+    upload = request.files.get("logo")
+    if upload is not None and upload.filename:
+        data = upload.read(place.LOGO_MAX_BYTES + 1)
+        # Refused here only to save the round trip and to answer in
+        # German; the host refuses it again, with the same sentence
+        # from the same function (services/place.logo_refusal).
+        if place.logo_refusal(data):
+            return done("Das Bild wurde nicht angenommen: "
+                        + place.logo_refusal(data), ok=False)
+        os.makedirs(SPOOL_UPLOADS, exist_ok=True)
+        tmp = os.path.join(SPOOL_DIR, f".logo-{rid}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, os.path.join(SPOOL_UPLOADS, f"{rid}.logo"))
+        payload["logo"] = True
+    res = _queue_with_id(rid, "", payload, FACE_WAIT_SECONDS)
+    if res is None:
+        return done("Der Server hat nicht rechtzeitig geantwortet — die "
+                    "Anzeige oben zeigt den tatsächlichen Stand.",
+                    ok=False)
+    text = res.get("message", "unbekanntes Ergebnis")
+    return done(text[0].upper() + text[1:], ok=bool(res.get("ok")))
 
 
 @app.post("/tenant/create")

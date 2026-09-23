@@ -52,6 +52,16 @@ import zipfile
 
 import yaml
 
+# The tenant place and its face (RFC-0042). Shared, deliberately, with
+# the two container services that also have to answer "which tenant is
+# this host, and what does it look like?" -- see services/place.py for
+# why that is one file and not three copies. Beside this one in the
+# repository and beside it again in $APP_DIR after an update, so the
+# path is the same in both.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "services"))
+import place  # noqa: E402  (after the path insert, necessarily)
+
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
 APPS_DIR = os.path.join(DATA_DIR, "apps")          # platform files (registry etc.)
@@ -1655,6 +1665,167 @@ def tenant_create(label, name="", account="", account_name=""):
     return tid, tenants
 
 
+# ---------------------------------------------------------------------------
+# The face of a tenant (RFC-0042 T3): a public title, two colours, a logo.
+#
+# Deliberately NOT a stylesheet. A tenant that can ship CSS can move,
+# hide or fake any control on a page the platform is responsible for;
+# three values and a picture cannot. What they CAN do is make text
+# vanish into its own background, so the platform computes the
+# readable pairings itself (services/place.py) -- the club chooses the
+# hue, the platform keeps the page legible.
+#
+# And NOT the tenant's `name` either, which is the Klarname. The page
+# that asks for that one promises in writing that it stays in the
+# house; the public title is a second field precisely so that promise
+# survives a login page anybody can open.
+
+def place_labels(t):
+    """Every label this tenant's place answers at -- current and former.
+
+    The gateway writes a site per unexpired former label (RFC-0026 3.3),
+    so the logo has to be reachable under those names too, or a club
+    that was just renamed sees its own page with the picture missing.
+    """
+    if not t or t.get("label") == DEFAULT_TENANT_LABEL:
+        return []
+    return [l for l in [t.get("label", "")] + former_labels(t) if l]
+
+
+def refresh_place_assets():
+    """Project every tenant's logo where the gateway serves it.
+
+    Derived state, rebuilt from the byte store and from nothing else:
+    delete this directory and the next call writes it again. That is
+    why it is regenerated on an update, after a rename and after a
+    restore, rather than being backed up -- a copy in the archive could
+    disagree with the store, and then two files would claim to be the
+    same logo.
+
+    Quiet and idempotent: content already in place is left alone (so no
+    browser is told a file changed when it did not), and anything not
+    claimed by a live tenant is removed -- including the file of a
+    former label whose grace has run out.
+    """
+    want = {}
+    for tid, t in sorted(load_tenants().items()):
+        theme = t.get("theme") or {}
+        sha = (theme.get("logo") or "").strip().lower()
+        kind = (theme.get("logo_type") or "").strip().lower()
+        if not sha or not kind:
+            continue
+        src = files_get(tid, sha)
+        if not src:
+            # The record points at bytes the store does not have. Not
+            # repaired here and not hidden either: `oaap files verify`
+            # is what answers for the store, and inventing a picture
+            # would be this platform's worst habit (a repair that only
+            # claims to have happened).
+            continue
+        for label in place_labels(t):
+            want[f"{label}.{kind}"] = (src, sha)
+    try:
+        os.makedirs(PLACE_ASSETS_DIR, exist_ok=True)
+        os.chmod(PLACE_ASSETS_DIR, 0o755)
+        have = set(os.listdir(PLACE_ASSETS_DIR))
+    except OSError:
+        return 0
+    changed = 0
+    for fn in sorted(have - set(want)):
+        try:
+            os.remove(os.path.join(PLACE_ASSETS_DIR, fn))
+            changed += 1
+        except OSError:
+            pass
+    for fn, (src, sha) in sorted(want.items()):
+        dest = os.path.join(PLACE_ASSETS_DIR, fn)
+        if os.path.isfile(dest) and _sha256_file(dest) == sha:
+            continue
+        tmp = dest + ".part"
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o644)      # public content, served as such
+        os.replace(tmp, dest)
+        changed += 1
+    return changed
+
+
+def tenant_set_theme(tid, title=None, primary=None, accent=None,
+                     logo_bytes=None, clear_logo=False, who="root",
+                     role="root"):
+    """Give a tenant its face. Returns (ok, sentence).
+
+    Shared by `oaap tenant face` and the portal's request, so the
+    record cannot come out differently depending on which door it came
+    through -- and so both doors refuse with the same words, which is
+    the 0.1.115 lesson applied while there are only two of them.
+
+    `None` means "do not touch"; an empty string clears a value. That
+    distinction is the whole reason a form can leave a field blank
+    without wiping the colour beside it.
+    """
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant on this node"
+    if t.get("label") == DEFAULT_TENANT_LABEL:
+        return False, ("the default tenant is this node itself -- its face IS "
+                       "the platform's, and a node that could disguise its "
+                       "own address is the impersonation T3 forbids")
+    theme = dict(t.get("theme") or {})
+    err = place.theme_refusal(
+        theme.get("title") if title is None else title,
+        theme.get("color_primary") if primary is None else primary,
+        theme.get("color_accent") if accent is None else accent)
+    if err:
+        return False, err
+    if logo_bytes is not None and clear_logo:
+        return False, "a logo cannot be set and removed in the same breath"
+    done = []
+    if title is not None:
+        theme["title"] = (title or "").strip()
+        done.append(f"title '{theme['title']}'" if theme["title"]
+                    else "title cleared")
+    for key, val, word in (("color_primary", primary, "primary colour"),
+                           ("color_accent", accent, "accent colour")):
+        if val is None:
+            continue
+        theme[key] = (val or "").strip().lower()
+        done.append(f"{word} {theme[key]}" if theme[key] else f"{word} cleared")
+    if clear_logo:
+        theme.pop("logo", None)
+        theme.pop("logo_type", None)
+        done.append("logo removed")
+    elif logo_bytes is not None:
+        refusal = place.logo_refusal(logo_bytes)
+        if refusal:
+            return False, refusal
+        kind = place.logo_type(logo_bytes)
+        fd, tmp = tempfile.mkstemp(prefix="oaap-logo-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(logo_bytes)
+            sha, _stored = files_put(tid, tmp)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        theme["logo"] = sha
+        theme["logo_type"] = kind
+        done.append(f"logo ({kind}, {len(logo_bytes) // 1024 or 1} KB)")
+    if not done:
+        return True, "nothing to change"
+    theme["updated"] = _iso_now()
+    theme["updated_by"] = who or "root"
+    t["theme"] = {k: v for k, v in theme.items() if v}
+    save_tenants(tenants)
+    refresh_place_assets()
+    label = t.get("label", "?")
+    audit_tenant("tenant.face", tid, label, who=who, role=role,
+                 detail=", ".join(done))
+    return True, f"the face of '{label}' was changed: " + ", ".join(done)
+
+
 def cmd_migrate_tenant_routes(_args):
     """Put the generated parameters into sites written before them.
 
@@ -1771,6 +1942,23 @@ def cmd_migrate_tenant_places(_args):
     print("  what answers there, scoped to that tenant -- and a login is")
     print("  required, exactly as on this node's own address.")
     print("  Nothing was cut: the gateway was reloaded, not restarted.")
+
+
+def cmd_migrate_place_assets(_args):
+    """Write the tenant logos where the gateway can serve them.
+
+    The projection is derived state that no archive carries, so it has
+    to be written after an update and after a restore -- a node that
+    restored yesterday's archive holds the BYTES (they are in the
+    store) and would still show a broken picture until something put
+    them where the gateway looks.
+
+    Silent when it changes nothing, like every step in migrate.sh.
+    """
+    n = refresh_place_assets()
+    if n:
+        print("")
+        print(f"Tenant logos written for the gateway ({n} file(s)).")
 
 
 def cmd_migrate_stream_close(_args):
@@ -1954,6 +2142,48 @@ def cmd_tenant(args):
         print("there the tenant administers itself.")
         return
 
+    if args.action == "face":
+        label = (args.name or "").strip().lower()
+        tid, t = tenant_by_label(label, include_former=False)
+        if not tid:
+            die(f"no tenant with the label '{label}'")
+        if args.logo and args.clear_logo:
+            die("--logo and --clear-logo ask for opposite things")
+        data = None
+        if args.logo:
+            if not os.path.isfile(args.logo):
+                die(f"no such file: {args.logo}")
+            # Read whole and judged by CONTENT, never by the extension:
+            # what the platform is about to serve under its own hostname
+            # is decided by the bytes, not by what the file is called.
+            with open(args.logo, "rb") as f:
+                data = f.read(place.LOGO_MAX_BYTES + 1)
+        ok, msg = tenant_set_theme(
+            tid, title=args.face_title,
+            primary=args.color_primary, accent=args.color_accent,
+            logo_bytes=data, clear_logo=args.clear_logo,
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die(msg)
+        print(msg[0].upper() + msg[1:] + ".")
+        host = load_external()
+        if host:
+            print("")
+            print(f"Seen at https://{label}.{host} -- on the login page too, "
+                  "which is")
+            print("the first page a member of this tenant ever sees.")
+        print("")
+        # Said where the value is chosen, in the same voice the label
+        # rule already uses (spec 3.4): what goes on a page without a
+        # login is public, and the Klarname is not that field.
+        print("The title and the logo are PUBLIC: the login page shows them")
+        print("to anyone who opens this address. The tenant's name in plain")
+        print("words (--name) is a different field and stays in the house.")
+        if not (t.get("theme") or {}).get("color_primary")                 and args.color_primary is None:
+            print("")
+            print("No colours set -- this place still wears the platform's.")
+        return
+
     if args.action == "rename":
         old = (args.name or "").strip().lower()
         new = (args.target or "").strip().lower()
@@ -2027,6 +2257,10 @@ def cmd_tenant(args):
             local = instance_name(key, reg["instances"][key])
             rekey_instance(reg, key, instance_key(tid, local), grace)
         audit_tenant("tenant.rename", tid, new, detail=f"was '{old}'")
+        # The logo is served under the LABEL, so a rename moves its file
+        # too -- and leaves the old name in place while the grace period
+        # runs, exactly as the address does (RFC-0042 T3).
+        refresh_place_assets()
         refresh_generated_sites()
         refresh_name_links()
         reload_gateway()
@@ -4892,6 +5126,18 @@ DIAGNOSE_DIR = os.path.join(APPS_DIR, "diagnose")
 # What the gateway may be asked to collect for one instance (D3). Lives
 # next to the external access log, which the portal already mounts.
 GATEWAY_LOG_DIR = os.path.join(DATA_DIR, "data", "gateway", "logs")
+# Tenant logos, projected out of the byte store for the gateway to serve
+# (RFC-0042 T3). Mounted into the gateway inside its static directory,
+# so they are reachable on the already-public /platform/* route -- which
+# is what lets the LOGIN page show one, with no session and no new door.
+#
+# Derived, never authoritative: the file that counts lives in
+# `oaap.data.files` (in the backup, in the tenant archive, in the
+# rehearsal). Anything here can be thrown away and is written again by
+# `refresh_place_assets()`. Putting a logo on a public login page makes
+# it public, and a directory the gateway serves says that out loud
+# instead of implying it.
+PLACE_ASSETS_DIR = os.path.join(DATA_DIR, "data", "gateway", "place")
 
 
 # --- scrubbing access-log lines written before 0.1.103 (Jörg, 18.09.) ---
@@ -11002,6 +11248,58 @@ def cmd_process_deploys(_args):
                             "tenants become visible: every caller sees their "
                             "own and no other. Nothing about the existing "
                             "tenant changes.")
+        elif action == "tenant-face":
+            # The face of a tenant from the portal (RFC-0042 T3).
+            #
+            # Its OWN action name rather than an `op` under "tenant",
+            # for one small reason with teeth: the audit table below is
+            # keyed on the action and maps "tenant" to "tenant.create".
+            # A second operation hiding under that key would be written
+            # into the customer's log as a creation -- a log that says
+            # the wrong thing is worse than one that says nothing, and
+            # this project has the entries to prove it.
+            #
+            # Successes are logged by tenant_set_theme(), which also
+            # serves the CLI; the refusal is written here, the same
+            # split RFC-0038's actions already use.
+            #
+            # A tenant_admin may dress their OWN place and no other. The
+            # target is decided here and not taken from the request,
+            # because the spool is data and not trust -- a request
+            # naming somebody else's tenant would otherwise be a way
+            # out of the boundary (spec 2.3 rule 1).
+            want = str(req.get("tenant") or "").strip()
+            tid, refusal = place.face_target(act_role, act_tenant, want)
+            audit_tenant_id = tid or act_tenant
+            name = tenant_label(tid) or (tid or "?")
+            upload = os.path.join(SPOOL_DIR, "uploads", f"{rid}.logo")
+            data = None
+            if req.get("logo"):
+                try:
+                    with open(upload, "rb") as f:
+                        data = f.read(place.LOGO_MAX_BYTES + 1)
+                except OSError:
+                    data = b""
+            if refusal:
+                msg = refusal
+            else:
+                def _given(key):
+                    """Absent means "leave it"; "" means "clear it"."""
+                    return None if key not in req else str(req.get(key) or "")
+                ok, msg = tenant_set_theme(
+                    tid, title=_given("title"),
+                    primary=_given("color_primary"),
+                    accent=_given("color_accent"),
+                    logo_bytes=data, clear_logo=bool(req.get("clear_logo")),
+                    who=actor or "portal", role=act_role or "-")
+            try:
+                os.remove(upload)
+            except OSError:
+                pass
+            if not ok:
+                audit_tenant("tenant.face", tid or ensure_default_tenant(),
+                             name, "denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
         elif action == "source":
             # Store sources from the portal (RFC-0012 §7). Same reason as
             # visibility below: the portal's /apps-registry mount is
@@ -12657,6 +12955,11 @@ def cmd_restore_instances(_args):
             print(f"SKIPPED {name}: {(e.stderr or str(e)).strip()}")
             skipped += 1
     refresh_generated_sites()
+    # The tenant logos are a PROJECTION of the byte store, which the
+    # archive does carry -- the projection itself it does not. Written
+    # again here, or a restored node would hold every logo and show
+    # none of them (RFC-0042 T3).
+    refresh_place_assets()
     reload_gateway()
     print(f"App instances: {ok} restored, {skipped} skipped.")
 
@@ -12943,6 +13246,10 @@ def main():
                          help="internal: give each tenant its address "
                               "<label>.<node> (RFC-0042 T1/T2)")
     pmp.set_defaults(fn=cmd_migrate_tenant_places)
+    pmpa = sub.add_parser("migrate-place-assets",
+                          help="internal: write every tenant logo where the "
+                               "gateway serves it (RFC-0042 T3)")
+    pmpa.set_defaults(fn=cmd_migrate_place_assets)
     pms = sub.add_parser("migrate-stream-close",
                          help="internal: keep open streams alive across "
                               "gateway reloads in sites written before 0.1.102")
@@ -12966,7 +13273,8 @@ def main():
     pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
-                      choices=["list", "show", "check", "log", "create", "rename"])
+                      choices=["list", "show", "check", "log", "create",
+                               "rename", "face"])
     pten.add_argument("name", nargs="?", help="tenant label (default: 'default')")
     pten.add_argument("target", nargs="?", help="the new label, for 'rename'")
     pten.add_argument("--name", dest="title", default="",
@@ -12983,6 +13291,19 @@ def main():
                       help="carry out a rename after reading its consequences")
     pten.add_argument("-n", dest="count", type=int, default=50,
                       help="how many audit entries to show (default 50)")
+    # The face (RFC-0042 T3). --title is a SECOND name on purpose: --name
+    # above is the Klarname and stays in the house, this one goes on a
+    # login page anybody can open.
+    pten.add_argument("--title", dest="face_title", default=None,
+                      help="public title of this tenant's place; '' clears it")
+    pten.add_argument("--color-primary", dest="color_primary", default=None,
+                      help="the colour that carries the brand, as #rrggbb")
+    pten.add_argument("--color-accent", dest="color_accent", default=None,
+                      help="the second colour, for states and emphasis")
+    pten.add_argument("--logo", default=None,
+                      help="path to a PNG, JPEG, WebP or GIF (max 512 KB)")
+    pten.add_argument("--clear-logo", dest="clear_logo", action="store_true",
+                      help="remove this tenant's logo")
     pten.set_defaults(fn=cmd_tenant)
     pep = sub.add_parser("endpoint", help="non-HTTP endpoints (RFC-0015)")
     pep.add_argument("action", choices=["list", "allow", "deny"])

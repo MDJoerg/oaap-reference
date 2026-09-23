@@ -321,14 +321,25 @@ print("\n=== Dockerfile: jedes 'import <lokales Modul>' in app.py hat "
       "erfolgreich importiert hatte (dort liegt twin_view.py ja daneben) ===")
 with open(os.path.join(PORTAL_DIR, "Dockerfile"), encoding="utf-8") as f:
     DOCKERFILE = f.read()
-copy_line = next((l for l in DOCKERFILE.splitlines() if l.startswith("COPY app.py")), "")
+# The whole COPY block, not one line: since 0.1.117 the build context
+# is services/ (so that place.py can be in TWO images), the copies are
+# prefixed and wrapped across lines, and a check that only read a line
+# starting with "COPY app.py" would have gone quietly green forever.
+copies = " ".join(l for l in DOCKERFILE.splitlines()
+                  if l.startswith("COPY") or l.startswith("     "))
 local_modules = []
 for node in ast.walk(TREE):
     if isinstance(node, ast.Import):
         for alias in node.names:
-            if os.path.isfile(os.path.join(PORTAL_DIR, f"{alias.name}.py")):
+            # Beside app.py, or one level up in services/ -- place.py
+            # lives there BECAUSE identity needs the same file, and a
+            # shared module is exactly the kind that goes missing from
+            # an image (RFC-0042 T3).
+            if (os.path.isfile(os.path.join(PORTAL_DIR, f"{alias.name}.py"))
+                    or os.path.isfile(os.path.join(
+                        PORTAL_DIR, "..", f"{alias.name}.py"))):
                 local_modules.append(alias.name)
-missing = [m for m in local_modules if f"{m}.py" not in copy_line]
+missing = [m for m in local_modules if f"{m}.py" not in copies]
 ok("jedes lokal importierte Modul steht auch in der COPY-Zeile "
    f"({', '.join(local_modules)})", not missing, missing)
 

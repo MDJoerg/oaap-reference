@@ -29,6 +29,13 @@ services:
       # RFC-0035: shared platform assets served directly by the
       # gateway, e.g. /platform/theme.css -- no app-facing service.
       - ./static:/etc/caddy/static:ro
+      # RFC-0042 T3: the tenant logos, projected out of the byte store by
+      # appctl. INSIDE the static directory on purpose -- that puts them
+      # on the already-public /platform/* route, which is the only way
+      # the LOGIN page can show one (it has no session by definition).
+      # Read-only here, written only on the host, and rebuildable: the
+      # file that counts lives in oaap.data.files.
+      - "${OAAP_DATA_DIR}/data/gateway/place:/etc/caddy/static/place:ro"
       # ACME account/certificates must survive container recreation
       - "${OAAP_DATA_DIR}/data/gateway/caddy-data:/data"
       # access log of the external sites (portal shows the last hit)
@@ -38,7 +45,14 @@ services:
       - portal
 
   identity:
-    build: ./services/identity
+    # Context is the whole services/ directory, not identity/, so that
+    # this image and the portal's can hold the SAME place.py -- which
+    # tenant a host names, and what its face is (RFC-0042 T2/T3). Two
+    # copies of that judgement is how a login page ends up wearing one
+    # club's colours in front of another club's portal.
+    build:
+      context: ./services
+      dockerfile: identity/Dockerfile
     restart: unless-stopped
     logging:
       driver: json-file
@@ -75,7 +89,10 @@ services:
       - "${OAAP_DATA_DIR}/data/audit:/audit"
 
   portal:
-    build: ./services/portal
+    # See identity above: one place.py, two images.
+    build:
+      context: ./services
+      dockerfile: portal/Dockerfile
     restart: unless-stopped
     logging:
       driver: json-file
