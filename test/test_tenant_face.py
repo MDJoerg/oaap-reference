@@ -299,6 +299,44 @@ for src, dst, osrc, odst in nested:
        f"und der Dienst startet dann nicht")
 
 ok("ein zweiter Lauf aendert nichts", m.refresh_place_assets() == 0)
+
+# ... und sie muss auf den ERZEUGTEN Sites auch wirklich ausgeliefert
+# werden. Die Basis-Caddyfile traegt /platform/* seit 0.1, aber nur auf
+# der :80-Site; jede Site fuer einen externen Namen wurde ohne sie
+# geschrieben. Auf oaap-test gemessen (23.09.): Die Anmeldeseite schrieb
+# die Logo-Adresse in sich hinein, und genau diese Adresse antwortete
+# mit 303 auf das Anmeldeformular. Ein kaputtes Bild, und nichts sagte
+# es.
+import json                                                    # noqa: E402
+
+with open(m.EXTERNAL_FILE, "w", encoding="utf-8") as f:
+    json.dump({"host": HOST}, f)
+m.refresh_generated_sites()
+site = read(m.CADDY_APPS_DIR, "external.caddy")
+ok("die erzeugte externe Site liefert /platform/* aus",
+   "handle /platform/* {" in site, site[:400])
+ok("und zwar auf jeder Portal-Site, auch am Ort eines Mandanten",
+   site.count("handle /platform/* {") == site.count("handle /auth/* {"),
+   (site.count("handle /platform/* {"), site.count("handle /auth/* {")))
+ok("ohne Sitzung -- keine forward_auth in diesem Block",
+   "forward_auth" not in site.split("handle /platform/* {")[1].split("}")[0])
+
+with open(os.path.join(m.CADDY_APPS_DIR, "external.caddy"), "w",
+          encoding="utf-8") as f:
+    f.write("# eine Site, wie ein Knoten sie vor 0.1.119 geschrieben hat\n")
+out = _io.StringIO()
+with contextlib.redirect_stdout(out):
+    m.cmd_migrate_place_assets(None)
+ok("der Umstieg zieht die Route in einen bestehenden Knoten nach",
+   "handle /platform/* {" in read(m.CADDY_APPS_DIR, "external.caddy"),
+   out.getvalue())
+ok("und sagt dabei, dass nichts getrennt wurde",
+   "reloaded, not restarted" in out.getvalue(), out.getvalue())
+out = _io.StringIO()
+with contextlib.redirect_stdout(out):
+    m.cmd_migrate_place_assets(None)
+ok("beim zweiten Lauf ist er still", out.getvalue().strip() == "",
+   out.getvalue())
 os.remove(os.path.join(m.PLACE_ASSETS_DIR, png_name))
 ok("geloescht wird sie aus dem Byte-Speicher neu geschrieben",
    m.refresh_place_assets() == 1

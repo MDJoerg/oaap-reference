@@ -1945,20 +1945,41 @@ def cmd_migrate_tenant_places(_args):
 
 
 def cmd_migrate_place_assets(_args):
-    """Write the tenant logos where the gateway can serve them.
+    """Make a tenant's face reachable: the pictures, and the route.
 
-    The projection is derived state that no archive carries, so it has
-    to be written after an update and after a restore -- a node that
-    restored yesterday's archive holds the BYTES (they are in the
-    store) and would still show a broken picture until something put
-    them where the gateway looks.
+    Two things, because both are generated and neither is in any
+    archive.
 
-    Silent when it changes nothing, like every step in migrate.sh.
+    The projection is derived state -- a node that restored yesterday's
+    archive holds the BYTES (they are in the store) and would still
+    show a broken picture until something put them where the gateway
+    looks.
+
+    And the ROUTE. `/platform/*` has been public on the base Caddyfile
+    since 0.1, but every site generated for an external hostname was
+    written without it. On such a node the shared stylesheet of
+    RFC-0035 -- and now a tenant logo -- answered 303 to the login
+    form. Found on oaap-test 2026-09-23 by fetching the URL the login
+    page had just put into itself: a broken image, and nothing saying
+    so.
+
+    Silent when it changes nothing, like every step in migrate.sh, and
+    it reloads the gateway rather than restarting it.
     """
     n = refresh_place_assets()
     if n:
         print("")
         print(f"Tenant logos written for the gateway ({n} file(s)).")
+    path = os.path.join(CADDY_APPS_DIR, "external.caddy")
+    have = _read_file(path) or ""
+    if have and "handle /platform/* {" not in have:
+        print("")
+        print("Opening /platform/* on the external sites (RFC-0035 D2) ...")
+        refresh_generated_sites()
+        reload_gateway()
+        print("  The shared stylesheet and the tenant logos are served")
+        print("  there now; until now they answered with the login form.")
+        print("  Nothing was cut: the gateway was reloaded, not restarted.")
 
 
 def cmd_migrate_stream_close(_args):
@@ -4385,6 +4406,24 @@ def _portal_site_body():
     lines.append("\thandle /setup* {")
     lines += strip_identity()
     lines.append("\t\treverse_proxy portal:8000")
+    lines.append("\t}")
+    # Shared platform assets (RFC-0035 D2), and since 0.1.117 the
+    # tenant logos under /platform/place/ (RFC-0042 T3). Public,
+    # because the LOGIN page shows one and a login page has no
+    # session by definition.
+    #
+    # The base Caddyfile has carried this route since 0.1 -- but
+    # only on the :80 site. Every site generated for an external
+    # hostname was written without it, so on a node with an
+    # external name /platform/theme.css answered 303 to the login
+    # form, and a tenant logo would have done the same. Measured on
+    # oaap-test 2026-09-23, by fetching the URL the login page had
+    # just written into itself.
+    lines.append("\thandle /platform/* {")
+    lines += strip_identity()
+    lines.append("\t\turi strip_prefix /platform")
+    lines.append("\t\troot * /etc/caddy/static")
+    lines.append("\t\tfile_server")
     lines.append("\t}")
     # deploy hook (runtime spec 2.5): bearer token instead of session —
     # the portal validates the token, so no forward_auth here
