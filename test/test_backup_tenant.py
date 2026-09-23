@@ -282,5 +282,29 @@ ok("und sieht auch das in seinem Protokoll",
    any(e.get("action") == "backup.included" for e in log), log)
 
 print("")
+print("Kein Zwilling ist kein Fehler (gefunden 23.09.2026, Schritt 7)")
+
+# Auf einem Knoten mit dem Profil `store` schlug `oaap backup create
+# --tenant` fuer JEDEN Mandanten fehl, der nie einen Zwilling hatte --
+# seit 0.1.112, ungesehen, weil bis zum Umzug niemand so ein Archiv
+# angefordert hat. `pg_dump -n` beendet sich bei "Schema gibt es nicht"
+# genauso wie bei "Schema ist kaputt", und das eine ist ein Grund zu
+# verweigern, das andere ist der Normalfall.
+SRC = io.open(os.path.join(HERE, "..", "platform", "appctl.py"),
+              encoding="utf-8").read()
+ok("es wird gefragt, OB es den Zwilling gibt",
+   "def _twin_schema_exists" in SRC)
+ok("... und zwar bevor gesichert wird",
+   SRC.index("def _twin_schema_exists")
+   < SRC.index("if _twin_schema_exists(schema):"))
+BLOCK = SRC.split("if _twin_schema_exists(schema):")[1][:1600]
+ok("gibt es ihn nicht, wird es GESAGT statt abgebrochen",
+   "has no twin schema" in BLOCK and "else:" in BLOCK, BLOCK[:200])
+ok("gibt es ihn und er laesst sich nicht lesen, bleibt es ein Abbruch",
+   "could not be dumped" in BLOCK)
+ok("und die Frage geht an pg_namespace, nicht an pg_dump",
+   "pg_namespace" in SRC.split("def _twin_schema_exists")[1][:900])
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

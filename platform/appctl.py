@@ -13867,6 +13867,21 @@ def cmd_backup_status(_args):
               "so before it starts anything.")
 
 
+def _twin_schema_exists(schema):
+    """Does this tenant actually have a twin schema on this node?
+
+    Asked because "no twin" and "the twin could not be read" are
+    different answers and only one of them is a reason to refuse an
+    archive. `pg_dump -n` gives the same exit code for both.
+    """
+    got = subprocess.run(
+        ["docker", "exec", "-u", "postgres", STORE_CONTAINER, "psql",
+         "-tAc", "select 1 from pg_namespace where nspname = "
+                 f"'{schema}'", "postgres"],
+        capture_output=True, text=True)
+    return got.returncode == 0 and (got.stdout or "").strip() == "1"
+
+
 def _tenant_archive(tid, label, out_dir, out_file):
     """One tenant's archive (RFC-0029 D5). Returns the path written.
 
@@ -13982,21 +13997,39 @@ def _tenant_archive(tid, label, out_dir, out_file):
     # The tenant's twin schema, where the node carries one (oaap.data.store
     # 0.1). One schema, not the whole cluster: the other schemas belong
     # to other customers and have no business in this file.
+    #
+    # A tenant that HAS one and cannot have it dumped is a hard failure
+    # and stays one. A tenant that simply has no twin is not: it is
+    # most tenants on most nodes, and `pg_dump -n` on a schema that
+    # does not exist exits 1 with "no matching schemas were found",
+    # which the old code could not tell apart from a broken dump.
+    #
+    # Found on 2026-09-23 by building the READER (RFC-0041 K6): on a
+    # node carrying `store`, `oaap backup create --tenant` refused for
+    # every tenant that had never had a twin -- since 0.1.112, unseen,
+    # because until the move nothing ever asked for such an archive.
     if has_profile("store") and _store_running():
         schema = f"twin_{tid}"
-        try:
-            dump = run(["docker", "exec", "-u", "postgres", STORE_CONTAINER,
-                        "pg_dump", "-n", schema, "postgres"]).stdout
-            if dump.strip():
-                with open(os.path.join(stage, "tenant-store-dump.sql"), "w",
-                          encoding="utf-8") as f:
-                    f.write(dump)
-                parts.append("tenant-store-dump.sql")
-        except subprocess.CalledProcessError:
-            shutil.rmtree(stage, ignore_errors=True)
-            die(f"the twin schema '{schema}' could not be dumped — nothing "
-                "was written. An archive that silently lacks a tenant's "
-                "twin is the failure this whole section exists to prevent.")
+        if _twin_schema_exists(schema):
+            try:
+                dump = run(["docker", "exec", "-u", "postgres",
+                            STORE_CONTAINER, "pg_dump", "-n", schema,
+                            "postgres"]).stdout
+                if dump.strip():
+                    with open(os.path.join(stage, "tenant-store-dump.sql"),
+                              "w", encoding="utf-8") as f:
+                        f.write(dump)
+                    parts.append("tenant-store-dump.sql")
+            except subprocess.CalledProcessError:
+                shutil.rmtree(stage, ignore_errors=True)
+                die(f"the twin schema '{schema}' could not be dumped — "
+                    "nothing was written. An archive that silently lacks a "
+                    "tenant's twin is the failure this whole section "
+                    "exists to prevent.")
+        else:
+            print(f"This tenant has no twin schema on this node "
+                  f"('{schema}' does not exist), so the archive carries "
+                  "none — said here rather than left to be noticed.")
 
     containers = [s["container"] for i in mine.values()
                   for s in instance_services(i) if s.get("container")]

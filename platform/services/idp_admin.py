@@ -1578,7 +1578,7 @@ class Admin:
         if err:
             return None, err
         if status == 403:
-            return None, self._not_ours(space, "count the people in")
+            return None, self._not_ours(space, "count the people")
         if status != 200:
             return None, (f"counting the people in "
                           f"'{space}' answered {status}")
