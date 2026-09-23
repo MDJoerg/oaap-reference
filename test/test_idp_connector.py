@@ -286,7 +286,8 @@ ok("eine unbekannte Art baut gar keinen Koerper",
 print("\nEin erfundenes Keycloak, und ein echter Durchlauf")
 
 STATE = {"realms": {}, "clients": {}, "writes": 0, "version": PIN,
-         "methods": [], "forbidden": set(), "trim": False}
+         "methods": [], "forbidden": set(), "trim": False,
+         "clients_forbidden": set()}
 
 
 class Fake(BaseHTTPRequestHandler):
@@ -324,6 +325,8 @@ class Fake(BaseHTTPRequestHandler):
             return self._json({"error": "not found"}, 404)
         m = re.match(r"^/admin/realms/([^/]+)/clients$", path)
         if m:
+            if m.group(1) in STATE["clients_forbidden"]:
+                return self._json({"error": "forbidden"}, 403)
             hit = re.search(r"clientId=([^&]+)", self.path)
             want = hit.group(1) if hit else ""
             found = [c for c in STATE["clients"].values()
@@ -498,6 +501,39 @@ ok("ein Realm, den diese Vollmacht nicht ansehen darf, bricht ab", died)
 ok("... und es wurde nichts darueber angelegt", STATE["writes"] == 0,
    STATE["methods"][-4:])
 STATE["forbidden"].clear()
+
+# Und der Fall, der an der Maschine WIRKLICH auftrat (23.09.2026): Eine
+# `create-realm`-Vollmacht darf SEHEN, dass ein fremder Realm existiert
+# (200), und erst der Blick auf seine Clients wird abgelehnt. Der Satz
+# war fuer die erste Tuer geschrieben und kam an der zweiten nie an.
+STATE["realms"]["fremd"] = {"realm": "fremd"}
+STATE["clients_forbidden"].add("fremd")
+STATE["writes"] = 0
+CAP = []
+_print = print
+
+
+def _catch(*args, **kw):
+    CAP.append(" ".join(str(x) for x in args))
+    _print(*args, **kw)
+
+
+import builtins                                                # noqa: E402
+
+builtins.print = _catch
+try:
+    provision(space="fremd")
+    died = False
+except SystemExit as e:
+    died = e.code != 0
+builtins.print = _print
+said = " ".join(" ".join(CAP).split())
+ok("ein Realm, dessen Clients uns nicht gehoeren, bricht ab", died)
+ok("... und sagt DENSELBEN Satz wie an der ersten Tuer",
+   "somebody else's club" in said and "K3.3" in said, said[-300:])
+ok("... und legt nichts an", STATE["writes"] == 0)
+STATE["clients_forbidden"].clear()
+STATE["realms"].pop("fremd", None)
 
 # Und derselbe Abbruch noch einmal, mit der Ursache, die an der
 # Maschine gefunden wurde: der Server ANTWORTET, nennt aber keine

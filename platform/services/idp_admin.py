@@ -758,14 +758,29 @@ class Admin:
     def _path(self, name, space="", uuid="", query=None):
         return path_of(self.kind, name, space=space, uuid=uuid, query=query)
 
-    def find_space(self, space):
-        """(exists, error).
+    def _not_ours(self, space, doing):
+        """The sentence for a 403, wherever it arrives.
 
-        A 403 is NOT "absent". It means this space is there and this
-        credential may not look at it -- which on a shared server is
-        somebody else's club, and creating over it is the last thing
-        anybody wants. Loudly, per K3.2.
+        A 403 is NOT "absent". It says this space is there and this
+        credential may not have it -- which on a shared server means
+        somebody else's club.
+
+        One sentence on every door, because of where the machine said
+        it actually arrives (oaap-test, 2026-09-23). The careful wording
+        was written for the REALM lookup, and that one answered 200: a
+        `create-realm` credential may see that a realm exists. The
+        refusal lands one call later, at the CLIENTS lookup -- and that
+        one had the bare status and no sentence. A rule worth saying is
+        worth saying at every door it can come through.
         """
+        return (f"this credential may not {doing} in the "
+                f"{self.decl['space_word']} '{space}'. It exists and it is "
+                "not ours: on a shared server that is somebody else's club, "
+                "and OAAP manages only what it is allowed to manage "
+                "(RFC-0041 K3.3)")
+
+    def find_space(self, space):
+        """(exists, error). A 403 here is not "absent" -- see _not_ours."""
         word = self.decl["space_word"]
         status, _doc, err = self._call("GET", self._path("space", space=space))
         if err:
@@ -775,9 +790,7 @@ class Admin:
         if status == 404:
             return False, ""
         if status == 403:
-            return False, (f"this credential may not look at the {word} "
-                           f"'{space}': either it belongs to somebody else "
-                           "on this server, or the grant is missing")
+            return False, self._not_ours(space, "look")
         return False, f"asking for the {word} '{space}' answered {status}"
 
     def create_space(self, space, title=""):
@@ -791,6 +804,11 @@ class Admin:
             return True, ""
         if status == 409:
             return True, ""
+        if status == 403:
+            return False, (f"this credential may not create a "
+                           f"{self.decl['space_word']} at all -- it needs "
+                           "the one grant this was designed around "
+                           "(RFC-0041 K3.4)")
         return False, (f"creating the {self.decl['space_word']} '{space}' "
                        f"answered {status}"
                        + (f": {doc.get('errorMessage')}"
@@ -804,6 +822,8 @@ class Admin:
                               query={"clientId": client_id}))
         if err:
             return "", {}, err
+        if status == 403:
+            return "", {}, self._not_ours(space, "look at the clients")
         if status != 200:
             return "", {}, f"looking for the client answered {status}"
         uuid = client_uuid(doc, client_id)
@@ -824,6 +844,8 @@ class Admin:
             return True, ""
         if status == 409:
             return True, ""
+        if status == 403:
+            return False, self._not_ours(space, "create a client")
         return False, (f"creating the client '{client_id}' answered {status}"
                        + (f": {doc.get('errorMessage')}"
                           if isinstance(doc, dict) and doc.get("errorMessage")
@@ -847,6 +869,8 @@ class Admin:
             "PUT", self._path("client", space=space, uuid=uuid), body=body)
         if err:
             return False, err
+        if status == 403:
+            return False, self._not_ours(space, "change a client")
         if status not in (200, 204):
             return False, f"adding the redirect URI answered {status}"
         self._note("added this node's redirect URI to the existing client: "
@@ -859,6 +883,8 @@ class Admin:
             "GET", self._path("client_secret", space=space, uuid=uuid))
         if err:
             return "", err
+        if status == 403:
+            return "", self._not_ours(space, "read a client's secret")
         if status != 200:
             return "", f"fetching the client secret answered {status}"
         secret = secret_from(doc)
