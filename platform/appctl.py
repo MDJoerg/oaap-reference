@@ -2889,7 +2889,12 @@ def _tenant_adopt(args):
     tenant_admin reads and nothing in the world backs up -- which is
     step 6's rule, one level up.
     """
-    path = os.path.abspath(os.path.expanduser((args.archive or "").strip()))
+    # Both spellings, because the sentence `backup create` prints uses
+    # the plain one and a hint that does not work is worse than none.
+    given = (args.archive or args.name or "").strip()
+    if not given:
+        die("which archive? `sudo oaap tenant adopt <file.tar.gz>`")
+    path = os.path.abspath(os.path.expanduser(given))
     if not os.path.isfile(path):
         die(f"no such archive: {path}")
 
