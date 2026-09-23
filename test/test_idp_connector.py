@@ -322,9 +322,16 @@ ok("ein brauchbarer Name geht", not a.space_refusal("keycloak", "hbvp"))
 URIS = a.redirect_uris_for("hbvp", HOST)
 ok("die Rueckkehradresse liegt am ORT des Mandanten",
    all(u.split("://")[1].startswith("hbvp." + HOST) for u in URIS), URIS)
-ok("und es sind BEIDE Schemata -- das Schema ist das des Browsers",
-   {u.split(":")[0] for u in URIS} == {"http", "https"}, URIS)
+ok("von sich aus nur https -- das Gateway schickt die http-Form weg",
+   [u.split(":")[0] for u in URIS] == ["https"], URIS)
+PLAIN = a.redirect_uris_for("hbvp", HOST, plain=True)
+ok("auf das Wort des Betreibers hin auch die http-Form",
+   {u.split(":")[0] for u in PLAIN} == {"http", "https"}, PLAIN)
+ok("... und es bleibt derselbe Ort",
+   all(u.split("://")[1].startswith("hbvp." + HOST) for u in PLAIN), PLAIN)
 ok("ohne externen Namen gibt es keine", a.redirect_uris_for("hbvp", "") == [])
+ok("... auch nicht auf das Wort des Betreibers hin",
+   a.redirect_uris_for("hbvp", "", plain=True) == [])
 ok("der Aussteller wird aus Adresse und Realm gebildet",
    a.issuer_for("keycloak", "https://auth.x/", "hbvp")
    == "https://auth.x/realms/hbvp")
@@ -524,7 +531,7 @@ ok("und Selbstregistrierung ist darin AUS",
    STATE["realms"]["hbvp"].get("registrationAllowed") is False)
 client = list(STATE["clients"].values())[0]
 ok("der Client ist vertraulich", client.get("publicClient") is False)
-ok("er kennt beide Rueckkehradressen",
+ok("er kennt genau die Rueckkehradresse, die gilt",
    set(client.get("redirectUris") or []) == set(URIS),
    client.get("redirectUris"))
 

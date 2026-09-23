@@ -451,20 +451,36 @@ def client_for(node_name):
     return ("oaap-" + node.strip("-"))[:64] or "oaap"
 
 
-def redirect_uris_for(tenant_label, host, schemes=("https", "http")):
+def redirect_uris_for(tenant_label, host, plain=False):
     """Every address at which this node's login may come back.
 
-    Both schemes on purpose, and this is not sloppiness -- it is the
-    finding of 2026-09-23. The redirect URI must match to the
-    character, and the scheme in it is the one the VISITOR'S BROWSER
-    used, which on a node reached without TLS is `http`. A provider
-    that holds only the https form rejects the login without naming a
-    cause, and the operator has nothing to read.
+    The redirect URI must match to the character, and the scheme in it
+    is the one the VISITOR'S BROWSER used, not the one inside the
+    container -- the finding of 2026-09-23. Until 0.1.125 the answer
+    to that was to register BOTH schemes and let whichever one arrives
+    match.
+
+    Measured on 2026-09-23 on the internet node, that answer was too
+    wide by exactly one address. Both modes a node with an external
+    name can be in put TLS in front of the browser: direct means ACME
+    on 443 plus an explicit http->https redirect for these very names
+    (`http://pxx.oaap.joomp.de/auth/oidc/callback` answered **301**),
+    and behind-edge means the edge terminates TLS and redirects there
+    (measured in the generated `edge.caddy` on the edge node). So the
+    `http` form was not merely unused -- it was unreachable: this
+    product's own gateway sends that address away.
+
+    It stays available, because a node whose sites this software does
+    not generate can still be reached in plain. But then a human says
+    so (`plain=True`, `oaap idp provision --plain-callback`), the way
+    a human states the server's version in K3.1, and it is printed as
+    the operator's word rather than as something read.
     """
     label = (tenant_label or "").strip().lower()
     host = (host or "").strip().lower()
     if not label or not host:
         return []
+    schemes = ("https", "http") if plain else ("https",)
     return [f"{s}://{label}.{host}/auth/oidc/callback" for s in schemes]
 
 

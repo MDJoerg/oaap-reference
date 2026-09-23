@@ -2310,7 +2310,8 @@ def cmd_idp(args):
         space = (args.space or idp_admin.space_for(label)).strip().lower()
         client_id = (args.client_id
                      or idp_admin.client_for(host)).strip()
-        uris = idp_admin.redirect_uris_for(label, host)
+        plain = bool(getattr(args, "plain_callback", False))
+        uris = idp_admin.redirect_uris_for(label, host, plain=plain)
         bad = idp_admin.space_refusal(c["kind"], space)
         if bad:
             die(bad)
@@ -2325,6 +2326,15 @@ def cmd_idp(args):
         print(f"  client       {client_id}")
         for u in uris:
             print(f"  comes back   {u}")
+        if plain:
+            print("               both schemes on the operator's word "
+                  "(--plain-callback),")
+            print("               not read from this node")
+        else:
+            print("               https only -- this node's gateway answers "
+                  "301 for")
+            print("               the http form of these names, so nothing "
+                  "can come back there")
         print("")
         print("What this may call, in order:")
         for line in idp_admin.plan_lines(plan):
@@ -15119,6 +15129,15 @@ def main():
                       help="for 'export': which instance of this product "
                            "serves the connector (only needed when there "
                            "is more than one)")
+    # The second half of the 2026-09-23 finding: a node with an
+    # external name is reached over TLS in both modes this software
+    # generates sites for, so `provision` registered a callback
+    # address its own gateway sends away. Where that is not true, the
+    # operator says so -- and it is printed as the operator's word.
+    pidp.add_argument("--plain-callback", dest="plain_callback",
+                      action="store_true",
+                      help="for 'provision': this node is reached over "
+                           "plain http, so register the http callback too")
     pidp.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="print every call this would make, and make none")
     pidp.set_defaults(fn=cmd_idp)
