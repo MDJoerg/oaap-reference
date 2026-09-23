@@ -1498,8 +1498,22 @@ TENANT_BODY = """
   <p>Wer sich zum <em>ersten Mal</em> anmeldet, bekommt:
      <strong>{{ me.idp.first_login_text }}</strong></p>
   {% if me.idp.self_registration %}
-  <p class="muted">Selbstregistrierung im Anmeldedienst ist eingeschaltet.</p>
+  <p class="muted">Selbstregistrierung im Anmeldedienst ist eingeschaltet:
+     Wer die Seite erreicht, bekommt hier eine Identität — und genau das,
+     was oben steht, und nicht mehr.</p>
   {% endif %}
+  {% if me.idp.second_factor == 'required' %}
+  <p class="muted">Der Anmeldedienst verlangt einen zweiten Faktor. Geprüft
+     wird er dort, nicht hier: OAAP erfährt nur, dass die Anmeldung
+     geklappt hat, und schreibt auf, was dabei behauptet wurde.</p>
+  {% endif %}
+  {% if me.idp.realm_read %}
+  <p class="muted">Zuletzt am Ort <code>{{ me.idp.realm_space }}</code>
+     nachgelesen: {{ me.idp.realm_read }}.</p>
+  {% endif %}
+  {% for line in me.idp.drift %}
+  <p class="muted"><strong>Unterschied:</strong> {{ line }}</p>
+  {% endfor %}
   <p class="muted">Diese Einstellungen ändert nur der Betreiber dieses
      Knotens, nicht der Mandant. Der Grund steht im Protokoll unten: Auf
      dieser Maschine liegen mehrere Kunden, und wer sich selbst eine Tür
@@ -3984,7 +3998,17 @@ def _idp_view(t):
                   or "lokal"),
         "first_login": policy["first_login"],
         "first_login_text": words.get(policy["first_login"], "nichts"),
-        "self_registration": policy["self_registration"],
+        # Both halves of K7's switches, and deliberately not merged into
+        # one number. What the record says is what somebody wrote down;
+        # what the space says is what happens at the registration page.
+        # A tenant_admin who may not MOVE these has all the more right
+        # to see which of the two they are reading (step 6).
+        "self_registration": idp.self_registration_open(policy),
+        "self_registration_recorded": policy["self_registration"],
+        "second_factor": policy["second_factor"],
+        "realm_read": (policy["realm"] or {}).get("read", "")[:16],
+        "realm_space": (policy["realm"] or {}).get("space", ""),
+        "drift": idp.drift_lines(policy),
     }
 
 

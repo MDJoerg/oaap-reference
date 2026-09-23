@@ -296,6 +296,13 @@ GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 REALM_GROUP_MAX = 120
 REASON_MIN = 10
 
+# K7's second switch, in OAAP's words. "required" is a statement about
+# the PROVIDER's realm, never about OAAP: OAAP does not enforce a
+# second factor and must not claim to. What it does is ask the realm to
+# ask, and then record what the realm answered.
+SECOND_FACTOR_VALUES = ("off", "required")
+SECOND_FACTOR_DEFAULT = "off"
+
 
 def policy_of(tenant):
     """The tenant's identity policy -- ALWAYS a complete answer.
@@ -316,14 +323,113 @@ def policy_of(tenant):
             key, val = str(k).strip(), str(v).strip().lower()
             if key and GROUP_RE.match(val):
                 group_map[key] = val
+    factor = (p.get("second_factor") or "").strip().lower()
+    if factor not in SECOND_FACTOR_VALUES:
+        factor = SECOND_FACTOR_DEFAULT
     return {
         "first_login": first,
         "default_role": (p.get("default_role") or "").strip().lower(),
         "group_map": group_map,
         "self_registration": bool(p.get("self_registration")),
+        "second_factor": factor,
         "reason": (p.get("reason") or "").strip(),
+        # What the PROVIDER's space last said about the same two
+        # switches, and when. Kept beside the intention rather than
+        # instead of it, because the two can differ and the difference
+        # is the thing an operator has to be shown (RFC-0041 K7,
+        # step 6).
+        "realm": realm_reading(p.get("realm")),
         "set": bool(p),
     }
+
+
+def realm_reading(raw):
+    """What the space last ANSWERED about K7's switches, normalised.
+
+    Never what OAAP asked for. `settings_call` sends an instruction and
+    `read_settings` fetches the answer; only the answer gets this far,
+    and only through `tenant_record_realm_settings`. A reading with no
+    timestamp is not a reading -- it is a guess that once passed
+    through here, and it reads as absent.
+    """
+    r = raw if isinstance(raw, dict) else {}
+    when = str(r.get("read") or "").strip()
+    if not when:
+        return {}
+    factor = str(r.get("second_factor") or "").strip().lower()
+    out = {"read": when,
+           "connector": str(r.get("connector") or "").strip(),
+           "space": str(r.get("space") or "").strip()}
+    if "self_registration" in r:
+        out["self_registration"] = bool(r.get("self_registration"))
+    if factor in SECOND_FACTOR_VALUES:
+        out["second_factor"] = factor
+    return out
+
+
+def self_registration_open(policy):
+    """Whether anybody can walk into this tenant, as far as is KNOWN.
+
+    Either half counts. The record's own flag is the intention; the
+    realm's answer is what actually happens at the page. A tenant whose
+    record says "off" while its realm says "on" is open, and every rule
+    that exists because self-registration is dangerous has to read it
+    that way or it protects nothing.
+    """
+    p = policy or {}
+    return bool(p.get("self_registration")) or \
+        bool((p.get("realm") or {}).get("self_registration"))
+
+
+def drift_lines(policy):
+    """Where the record and the space disagree, in sentences.
+
+    Empty after every `oaap idp settings`, because that command writes
+    the record from the space's own answer. It fills up when somebody
+    moves a switch at the provider's console, or sets OAAP's half alone
+    -- and then an operator gets told rather than left reading a number
+    that nothing backs up.
+    """
+    p = policy or {}
+    realm = p.get("realm") or {}
+    if not realm:
+        return []
+    where = (f"the space '{realm['space']}'" if realm.get("space")
+             else "the provider's space")
+    out = []
+    if "self_registration" in realm and \
+            bool(realm["self_registration"]) != bool(p.get("self_registration")):
+        out.append(
+            "self-registration: this record says "
+            + ("on" if p.get("self_registration") else "off")
+            + f", and {where} said "
+            + ("on" if realm["self_registration"] else "off")
+            + f" when it was last read ({realm['read'][:16]}). The space "
+            "is what decides; this record is only what somebody wrote "
+            "down.")
+    if "second_factor" in realm and realm["second_factor"] != \
+            (p.get("second_factor") or SECOND_FACTOR_DEFAULT):
+        out.append(
+            f"second factor: this record says "
+            f"'{p.get('second_factor') or SECOND_FACTOR_DEFAULT}', and "
+            f"{where} said "
+            f"'{realm['second_factor']}' when it was last read "
+            f"({realm['read'][:16]}).")
+    return out
+
+
+def factor_expected(policy):
+    """Whether a login through this tenant's provider should carry one.
+
+    Used ONLY to make a login that carries none legible in the log. K7
+    is explicit that OAAP does not enforce a second factor -- the realm
+    does, and a login that got through is a login the realm let
+    through. Turning this into a refusal would put OAAP in the business
+    of second-guessing an authentication it did not perform.
+    """
+    p = policy or {}
+    return (p.get("realm") or {}).get("second_factor", "") == "required" or \
+        (p.get("second_factor") or SECOND_FACTOR_DEFAULT) == "required"
 
 
 def policy_target(role, own_tenant, wanted=""):
@@ -351,7 +457,8 @@ def policy_target(role, own_tenant, wanted=""):
 
 
 def policy_refusal(first_login, default_role, self_registration,
-                   group_map=None, reason=""):
+                   group_map=None, reason="", second_factor=None,
+                   realm=None):
     """The ONE sentence that refuses an identity policy.
 
     The combination that has to be caught here is `role`/`groups`
@@ -360,6 +467,14 @@ def policy_refusal(first_login, default_role, self_registration,
     nothing else in the system would notice. It is refused unless it is
     set DELIBERATELY, with a reason -- and the reason is what lands in
     the tenant's log, so that the decision has an author.
+
+    `realm` is the space's own last answer, and it is a parameter
+    rather than something read from a record here because of what step
+    6 made possible on 2026-09-23: the registration page belongs to the
+    REALM, so a record that says "off" protects nobody if the realm
+    says "on". The dangerous pair is judged against whichever half is
+    open, and the refusal says which half that was -- otherwise an
+    operator reads a sentence about a switch they can see is off.
     """
     first = (first_login or "").strip().lower()
     if first not in FIRST_LOGIN_VALUES:
@@ -389,12 +504,27 @@ def policy_refusal(first_login, default_role, self_registration,
         if not GROUP_RE.match(str(oaap_group).strip().lower()):
             return (f"'{oaap_group}' is not a visibility group name "
                     "([a-z0-9][a-z0-9._-]*)")
-    if self_registration and first != "eingang":
+    factor = (second_factor if second_factor is not None
+              else SECOND_FACTOR_DEFAULT)
+    factor = str(factor).strip().lower()
+    if factor not in SECOND_FACTOR_VALUES:
+        return (f"'{second_factor}' is not a second-factor setting -- "
+                f"{', '.join(SECOND_FACTOR_VALUES)}. It says what the "
+                "PROVIDER'S space is asked to require; OAAP never checks "
+                "a second factor itself (RFC-0041 K7)")
+    open_here = self_registration_open(
+        {"self_registration": self_registration, "realm": realm})
+    if open_here and first != "eingang":
         if len((reason or "").strip()) < REASON_MIN:
+            by_realm = (not self_registration) and bool(
+                (realm or {}).get("self_registration"))
             return (f"self-registration together with '{first}' hands a role "
                     "to anybody who can reach the registration page. It is "
                     "allowed only deliberately: say why, and the reason goes "
-                    "into this tenant's log (RFC-0041 K7)")
+                    "into this tenant's log (RFC-0041 K7)"
+                    + (" -- and here it is the SPACE that has it switched "
+                       "on, whatever this record says. Close it there, or "
+                       "say why it may stay open." if by_realm else ""))
     return ""
 
 

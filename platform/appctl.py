@@ -2384,11 +2384,140 @@ def cmd_idp(args):
             print("in the Eingang. Change it with `oaap tenant policy`.")
         print("")
         print(f"Nobody is in the {word} yet. Add the club's people there,")
-        print("or switch self-registration on IN the realm -- OAAP does")
-        print("not do that half yet (RFC-0041 step 6).")
+        print(f"or let them in themselves: `oaap idp settings {name} "
+              f"--tenant {label}")
+        print("--self-registration on` (RFC-0041 K7).")
         return
 
+    if action == "settings":
+        return _idp_settings(args, name, c)
+
     die(f"unknown action '{action}'")
+
+
+def _idp_settings(args, name, c):
+    """K7's two switches, inside the space and in our own record.
+
+    The second half of the sentence this whole connector was shaped by:
+    make the settings that matter to us, and then write them into our
+    own configuration. What gets written is what the space ANSWERED --
+    which is why the record is written even when the run fails, and why
+    it is written from the read-back rather than from the flags.
+    """
+    kind = c["kind"]
+    bad = idp_admin.verb_refusal(kind, "settings")
+    if bad:
+        die(bad)
+    label = (args.tenant or "").strip().lower()
+    if not label:
+        die(f"which tenant? `oaap idp settings {name} --tenant hbvp`")
+    tid, t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the label '{label}'")
+    provider = idp.provider_of(t)
+    pol = idp.policy_of(t)
+    space = (args.space or (provider or {}).get("space")
+             or (pol["realm"] or {}).get("space")
+             or idp_admin.space_for(label)).strip().lower()
+    decl = idp_admin.connector_of(kind)
+    word = decl["space_word"]
+
+    wants = {}
+    if args.self_registration is not None:
+        wants["self_registration"] = args.self_registration == "on"
+    if args.second_factor is not None:
+        wants["second_factor"] = args.second_factor
+    for switch, value in wants.items():
+        bad = idp_admin.switch_refusal(kind, switch, value)
+        if bad:
+            die(bad)
+
+    # K7's dangerous pair, judged BEFORE the space is touched. A realm
+    # that is opened and only then refused would have been opened.
+    if "self_registration" in wants:
+        bad = idp.policy_refusal(
+            pol["first_login"], pol["default_role"],
+            wants["self_registration"], pol["group_map"],
+            args.idp_reason if args.idp_reason is not None else pol["reason"],
+            second_factor=wants.get("second_factor", pol["second_factor"]),
+            realm=pol["realm"])
+        if bad:
+            print(f"Refused before anything at {c['base_url']} was touched.")
+            print("")
+            for line in textwrap.wrap(bad, 68):
+                print(line)
+            sys.exit(1)
+
+    plan = idp_admin.settings_plan(kind, space, wants)
+    bad = idp_admin.plan_refusal(plan)
+    if bad:
+        die(bad)
+    print(f"'{label}' -> {word} '{space}' at {c['base_url']}")
+    print("")
+    if wants:
+        for switch, value in wants.items():
+            print(f"  {switch.replace('_', ' '):<18} -> "
+                  f"{idp_admin.switch_word(switch, value)}")
+            note = idp_admin.settings_reach(kind, switch, value)
+            for line in textwrap.wrap(note, 62):
+                print(f"      {line}")
+        print("")
+    print("What this may call, in order:")
+    for line in idp_admin.plan_lines(plan):
+        print(line)
+    print("")
+    if args.dry_run:
+        print("Nothing was called: --dry-run.")
+        return
+
+    admin = idp_admin.Admin(kind, c["base_url"], c["auth"], c["admin_id"],
+                            c["admin_secret"], auth_realm=c.get("auth_realm",
+                                                                ""))
+    ok, said, msg = admin.settings(
+        space, wants, accept_version=(args.accept_version
+                                      or c.get("accept_version", "")))
+    for line in admin.trace:
+        print("  " + line)
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+
+    # Recorded whether or not the run succeeded, because `said` is what
+    # the space answered either way. A failure that left the old record
+    # standing would leave a tenant_admin reading a number the space has
+    # already contradicted.
+    if said:
+        good, note = tenant_record_realm_settings(tid, name, space, said,
+                                                  wanted=wants, who=who,
+                                                  role="root")
+        if not good:
+            die("the space answered and OAAP will not record it: " + note)
+    if not ok:
+        print("")
+        for line in textwrap.wrap(msg, 68):
+            print(line)
+        if said:
+            print("")
+            print("What the space says NOW is recorded above -- OAAP writes")
+            print("down the answer, never the instruction (RFC-0041 K7).")
+        sys.exit(1)
+
+    print("")
+    for line in idp_admin.settings_words(kind, said):
+        print("  " + line)
+    print("")
+    print("Both halves moved together: the switch in the "
+          f"{word}, and this")
+    print("tenant's record of it. The record holds the space's own answer,")
+    print("read back after the change and not copied from the request.")
+    if wants:
+        print("")
+        print(f"In this tenant's log: sudo oaap tenant log {label}")
+    fresh = idp.policy_of(load_tenants()[tid])
+    if fresh["first_login"] == idp.FIRST_LOGIN_DEFAULT and \
+            said.get("self_registration"):
+        print("")
+        print("Whoever registers arrives with an identity and no rights,")
+        print("in the Eingang. That is this tenant's first-login policy")
+        print("and it is the reason self-registration is safe here.")
 
 
 def _print_idp(label, t):
@@ -2429,6 +2558,25 @@ def _print_idp(label, t):
         for realm_group, oaap_group in sorted(pol["group_map"].items()):
             print(f"  group map    {realm_group} -> {oaap_group}")
     print("  self-reg.    " + ("on" if pol["self_registration"] else "off"))
+    print("  2nd factor   " + pol["second_factor"]
+          + ("  (the realm asks; OAAP never checks it itself)"
+             if pol["second_factor"] == "required" else ""))
+    realm = pol["realm"]
+    if realm:
+        said = []
+        for switch in ("self_registration", "second_factor"):
+            if switch in realm:
+                said.append(switch.replace("_", " ") + " "
+                            + idp_admin.switch_word(switch, realm[switch]))
+        print(f"  the space    {realm.get('space') or '?'} says: "
+              + ", ".join(said) + f"  (read {realm['read'][:16]})")
+    elif provider:
+        print("  the space    never read -- `oaap idp settings <connector> "
+              f"--tenant {label}`")
+    for line in idp.drift_lines(pol):
+        print("")
+        for wrapped in textwrap.wrap("DIFFERENT: " + line, 66):
+            print("  " + wrapped)
     if pol["reason"]:
         print(f"  reason       {pol['reason']}")
     if not pol["set"]:
@@ -2590,7 +2738,7 @@ def cmd_tenant(args):
         if not tid:
             die(f"no tenant with the label '{label}'")
         asked = (args.first_login, args.default_role, args.self_registration,
-                 args.group_map)
+                 args.group_map, args.second_factor)
         if all(a is None for a in asked):
             _print_idp(label, t)
             return
@@ -2611,7 +2759,7 @@ def cmd_tenant(args):
         ok, msg = tenant_set_policy(
             tid, first_login=args.first_login, default_role=args.default_role,
             self_registration=self_reg, group_map=gmap,
-            reason=args.idp_reason or "",
+            reason=args.idp_reason or "", second_factor=args.second_factor,
             who=os.environ.get("SUDO_USER") or getpass.getuser())
         if not ok:
             die(msg)
@@ -2619,6 +2767,20 @@ def cmd_tenant(args):
         print("")
         print("Only the operator may move this switch, and the change is in")
         print(f"this tenant's own log: sudo oaap tenant log {label}")
+        # This command has asked the provider NOTHING. Where one of the
+        # two switches of K7 was just written down, an operator has to be
+        # told that the space itself has not heard about it -- otherwise
+        # the record says one thing and the registration page does
+        # another, which is exactly what step 6 exists to prevent.
+        if self_reg is not None or args.second_factor is not None:
+            conn = (idp.provider_of(load_tenants()[tid]) or {}).get(
+                "connector", "")
+            print("")
+            print("This wrote down an INTENTION. The space itself was not")
+            print("asked and has not changed: `oaap idp settings "
+                  f"{conn or '<connector>'} --tenant {label}`")
+            print("moves both halves in one act, and records what the space")
+            print("answers afterwards (RFC-0041 K7).")
         return
 
     if args.action == "rename":
@@ -5845,9 +6007,65 @@ def tenant_clear_provider(tid, who="root", role="root"):
                   "The bindings its users hold are untouched")
 
 
+def tenant_record_realm_settings(tid, connector, space, settings,
+                                 wanted=None, who="root", role="root"):
+    """Write down what the provider's space ANSWERED. (ok, sentence).
+
+    The only way a realm reading gets into a tenant record. It is a
+    separate function from `tenant_set_policy` on purpose: that one
+    records what somebody WANTS, this one records what somebody MEASURED,
+    and the whole of RFC-0041 step 6 rests on those two not being the
+    same act. Both halves are then visible side by side, and where they
+    disagree `idp.drift_lines` says so.
+
+    `wanted` is the switches somebody actually asked to move, and only
+    those have their INTENTION written as well -- and only where the
+    space actually did what it was told. Two rules, and this step's own
+    test found both:
+
+    * A pure read must not touch the intention. A read that adopted the
+      space's value would erase the disagreement in the very act of
+      discovering it, and an operator would be told nothing while the
+      record quietly changed its mind.
+    * An instruction that did not take does not become the intention
+      either. It stays as it was, so the unfinished business goes on
+      showing as a disagreement instead of being tidied away by the
+      failure it caused.
+    """
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    pol = dict(t.get("idp_policy") or {})
+    reading = {"read": _iso_now(),
+               "connector": (connector or "").strip(),
+               "space": (space or "").strip()}
+    said = []
+    for switch in idp_admin.SWITCHES:
+        if switch not in (settings or {}):
+            continue
+        reading[switch] = settings[switch]
+        if switch in (wanted or {}) and wanted[switch] == settings[switch]:
+            pol[switch] = settings[switch]
+        said.append(f"{switch}={idp_admin.switch_word(switch, settings[switch])}")
+    pol["realm"] = reading
+    pol.setdefault("first_login", idp.policy_of(t)["first_login"])
+    pol["changed"] = _iso_now()
+    pol["by"] = who
+    t["idp_policy"] = pol
+    tenants[tid] = t
+    save_tenants(tenants)
+    audit_tenant("tenant.idp-realm", tid, (space or ""), who=who, role=role,
+                 detail=" · ".join(said) + f" · gelesen am Ort '{space}'"
+                        + (f" ueber Konnektor '{connector}'" if connector
+                           else ""))
+    return True, (f"'{t['label']}' now records what the space '{space}' "
+                  "actually says")
+
+
 def tenant_set_policy(tid, first_login=None, default_role=None,
                       self_registration=None, group_map=None, reason="",
-                      who="root", role="root"):
+                      second_factor=None, who="root", role="root"):
     """What a first login through the provider BECOMES. (ok, sentence).
 
     K4b's authority is NOT checked here -- it is checked by
@@ -5871,15 +6089,29 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
                  else now["self_registration"])
     want_map = group_map if group_map is not None else now["group_map"]
     want_reason = (reason or "").strip() or now["reason"]
+    want_factor = (second_factor if second_factor is not None
+                   else now["second_factor"])
+    # The realm's own last answer goes in, because the registration
+    # page belongs to the REALM: a record that says "off" while the
+    # space says "on" must not let the dangerous pair through
+    # (RFC-0041 K7, found while building step 6).
     bad = idp.policy_refusal(want_first, want_role, want_self, want_map,
-                             want_reason)
+                             want_reason, second_factor=want_factor,
+                             realm=now["realm"])
     if bad:
         return False, bad
     t["idp_policy"] = {"first_login": want_first,
                        "default_role": want_role,
                        "self_registration": want_self,
+                       "second_factor": want_factor,
                        "group_map": want_map,
                        "reason": want_reason,
+                       # Kept as it was: this command records an
+                       # INTENTION and has asked the space nothing, so
+                       # it has no business overwriting what the space
+                       # last said. That is what makes the drift visible
+                       # instead of quietly resolved.
+                       "realm": now["realm"],
                        "changed": _iso_now(), "by": who}
     tenants[tid] = t
     save_tenants(tenants)
@@ -5888,6 +6120,8 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
               + (" · Selbstregistrierung an" if want_self
                  else " · Selbstregistrierung aus")
               + (f" · {len(want_map)} Gruppenabbildung(en)" if want_map else "")
+              + (f" · zweiter Faktor {want_factor}" if want_factor
+                 else "")
               + (f" · Begruendung: {want_reason}" if want_reason else ""))
     audit_tenant("tenant.idp-policy", tid, want_first, who=who, role=role,
                  detail=detail)
@@ -14113,7 +14347,8 @@ def main():
     pidp = sub.add_parser("idp", help="identity providers this node manages "
                                       "(RFC-0041 K3)")
     pidp.add_argument("action",
-                      choices=["list", "add", "remove", "check", "provision"])
+                      choices=["list", "add", "remove", "check", "provision",
+                               "settings"])
     pidp.add_argument("name", nargs="?", help="the connector's short name")
     pidp.add_argument("--kind", dest="idp_kind_admin", default="keycloak",
                       choices=list(idp_admin.connector_kinds()),
@@ -14147,6 +14382,21 @@ def main():
                       help="state the server's version yourself -- for a "
                            "credential too narrow to read it, or for a "
                            "version this build was not measured against")
+    # K7's two switches, inside the space (RFC-0041 step 6). The same
+    # two words as `oaap tenant policy`, because they are the same two
+    # switches -- that command writes down an intention, this one moves
+    # the space and then writes down what the space answered.
+    pidp.add_argument("--self-registration", dest="self_registration",
+                      default=None, choices=["on", "off"],
+                      help="for 'settings': whether the space lets people "
+                           "register themselves")
+    pidp.add_argument("--second-factor", dest="second_factor", default=None,
+                      choices=list(idp.SECOND_FACTOR_VALUES),
+                      help="for 'settings': whether the space asks for a "
+                           "second factor; OAAP never checks one itself")
+    pidp.add_argument("--reason", dest="idp_reason", default=None,
+                      help="why a dangerous combination is wanted; goes into "
+                           "this tenant's log")
     pidp.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="print every call this would make, and make none")
     pidp.set_defaults(fn=cmd_idp)
@@ -14213,7 +14463,13 @@ def main():
                       help="the role a first login receives, for role/groups")
     pten.add_argument("--self-registration", dest="self_registration",
                       default=None, choices=["on", "off"],
-                      help="whether the realm lets people register themselves")
+                      help="whether the realm lets people register themselves "
+                           "-- written down here, MOVED by `oaap idp "
+                           "settings`")
+    pten.add_argument("--second-factor", dest="second_factor", default=None,
+                      choices=list(idp.SECOND_FACTOR_VALUES),
+                      help="whether the realm asks for a second factor; "
+                           "OAAP never checks one itself (RFC-0041 K7)")
     pten.add_argument("--group-map", dest="group_map", default=None,
                       help="realm-group=oaap-group,... -- an explicit local "
                            "mapping; an unmapped group grants nothing")

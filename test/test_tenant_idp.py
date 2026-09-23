@@ -672,6 +672,54 @@ r = c.post("/auth/login",
 ok("das lokale Anmeldeformular laesst diesen Satz nicht herein",
    r.status_code == 401, r.status_code)
 
+# ---------------------------------------------------------------------------
+print("\nEin zweiter Faktor, der verlangt wird und nicht kommt (K7, Schritt 6)")
+
+# K7 ist ausdruecklich: OAAP erzwingt keinen zweiten Faktor. Der Realm
+# tut das, und eine Anmeldung, die hier ankommt, hat er durchgelassen.
+# Was OAAP kann, ist das SCHWEIGEN bemerken -- sonst steht spaeter im
+# Protokoll nichts, wenn jemand fragt, wer wirklich einen zweiten
+# Faktor hatte.
+TENANTS[hbvp]["idp_policy"] = {
+    "first_login": "eingang",
+    "realm": {"second_factor": "required", "space": "hbvp",
+              "read": "2026-09-23T23:00:00Z", "connector": "auth"}}
+ok("der Ort soll einen zweiten Faktor verlangen",
+   idp.factor_expected(idp.policy_of(TENANTS[hbvp])))
+r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
+params = dict(p.split("=", 1)
+              for p in r.headers["Location"].split("?", 1)[1].split("&"))
+CLAIMS.clear()
+CLAIMS.update({"iss": ISSUER, "aud": "oaap-node", "sub": "S-OHNE-FAKTOR",
+               "nonce": unquote(params["nonce"]),
+               "exp": int(time.time()) + 300,
+               "preferred_username": "ohnefaktor"})
+r = c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
+          headers={"Host": f"hbvp.{HOST}"})
+ok("die Anmeldung wird NICHT abgelehnt -- OAAP prueft den Faktor nicht",
+   r.status_code == 303, r.status_code)
+idlog = read(ident.AUDIT_LOG)
+ok("aber das Schweigen steht im Protokoll",
+   "obwohl der Ort einen verlangen soll" in idlog, idlog[-400:])
+u = next((x for x in ident.load_users()
+          if (x.get("idp") or {}).get("subject") == "S-OHNE-FAKTOR"), {})
+ok("... und es gehoert zum Satz dieses Menschen", bool(u), u)
+ok("... der ohne Rechte hereinkam", u.get("roles") == [], u.get("roles"))
+
+# Die Gegenprobe: derselbe Ort, dieselbe Erwartung, aber der Anbieter
+# sagt etwas -- dann steht das da und kein Vorwurf.
+r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
+params = dict(p.split("=", 1)
+              for p in r.headers["Location"].split("?", 1)[1].split("&"))
+CLAIMS.update({"sub": "S-MIT-FAKTOR", "preferred_username": "mitfaktor",
+               "nonce": unquote(params["nonce"]),
+               "exp": int(time.time()) + 300, "amr": ["pwd", "otp"]})
+c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
+      headers={"Host": f"hbvp.{HOST}"})
+last = read(ident.AUDIT_LOG).strip().splitlines()[-1]
+ok("wird einer genannt, steht er da", "otp" in last, last[-200:])
+ok("... und ohne den Vorwurf", "obwohl der Ort" not in last, last[-200:])
+
 srv.shutdown()
 
 # ---------------------------------------------------------------------------

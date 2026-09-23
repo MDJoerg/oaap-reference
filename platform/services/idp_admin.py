@@ -15,18 +15,34 @@ second SSO product arrives -- one whose settings we also want to make
 and then write into our own configuration -- it should be a file and a
 row in a table, not a redesign.
 
-A connector is four verbs and nothing else:
+A connector is these verbs and nothing else:
 
     version   what the product says it is, so the pinned number is
               CHECKED rather than merely written down
     space     the place one tenant's people live in (Keycloak: a realm)
     client    the confidential OIDC client OAAP presents itself as
     issuer    the URL that space writes into its tokens
+    settings  the two switches of K7 INSIDE that space -- who may
+              register themselves, and whether a second factor is asked
+              for (RFC-0041 step 6, built 2026-09-23)
 
-`settings` is declared and NOT implemented: turning self-registration
-and a second factor on inside the space is RFC-0041 step 6. A verb that
-is named and absent is a smaller lie than one that is silently missing,
-and `missing_verbs()` says so out loud.
+The first four are required of any connector; `settings` is optional
+and declared, so a product that cannot do it says so instead of
+failing at an operator. What is still absent is declared too:
+`export` is step 7's move, and `users` is in `never` rather than in
+`later`, because OAAP does not create people in somebody's realm and
+is not going to start. A verb that is named and absent is a smaller
+lie than one that is silently missing.
+
+`settings` carries the rule that this step is about, and it is the
+second half of the sentence Joerg wrote the shape with -- *make the
+settings that matter to us, and then write them into our own
+configuration*. What is written into our configuration is what the
+space ANSWERED afterwards, never what OAAP asked for. The same
+distinction as `measured` against `asserted` one level up: a record
+that says what somebody intended, while the realm says something else,
+is worse than no record, because the operator reads it and stops
+looking.
 
 Three rules here are not settings and never become settings:
 
@@ -94,20 +110,48 @@ CONNECTOR_KINDS = {
             "client": "/admin/realms/{space}/clients/{uuid}",
             "client_secret":
                 "/admin/realms/{space}/clients/{uuid}/client-secret",
+            "required_action":
+                "/admin/realms/{space}/authentication/required-actions/"
+                "{alias}",
+        },
+        # K7's two switches in this product's own words. `where` names
+        # the document that holds the switch -- at Keycloak they live
+        # in two different ones, which is exactly the sort of thing a
+        # table is for and an `if` in the middle of a plan is not.
+        "switches": {
+            "self_registration": {
+                "where": "space", "field": "registrationAllowed"},
+            "second_factor": {
+                "where": "required_action", "alias": "CONFIGURE_TOTP"},
         },
         # Where a credential is redeemed for an admin token. `master`
         # is Keycloak's server realm; see `credential_note`.
         "auth_realm": "master",
         "token_template": "{base}/realms/{realm}/protocol/openid-connect/token",
         "auth_kinds": ("client", "password"),
-        "verbs": ("version", "space", "client", "issuer"),
-        "later": ("settings",),
+        "verbs": ("version", "space", "client", "issuer", "settings"),
+        # Named and not built: the realm export of the move (K6, step
+        # 7). Named and never to be built: OAAP does not create, change
+        # or remove people in somebody's realm -- that is the club's,
+        # and K3.3 is the whole reason this file has no DELETE.
+        "later": ("export",),
+        "never": ("users",),
         "provider_kind": "oidc",
     },
 }
 
 # What every connector must be able to do to be usable at all.
 REQUIRED_VERBS = ("version", "space", "client", "issuer")
+
+# What a connector MAY declare. A verb outside both lists is a typo
+# that would otherwise sit in the table looking like a capability.
+OPTIONAL_VERBS = ("settings", "export")
+KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
+
+# The switches of K7, in OAAP's words rather than any product's. The
+# values are OAAP's too: a product that spells them differently spells
+# them differently in its own row, not here.
+SWITCHES = ("self_registration", "second_factor")
 
 # The methods OAAP uses against somebody else's identity server.
 # DELETE is absent and stays absent -- see `method_refusal`. PATCH is
@@ -129,7 +173,36 @@ def connector_kinds():
     return tuple(sorted(CONNECTOR_KINDS))
 
 
-def path_of(kind, name, space="", uuid="", query=None):
+def declares(kind, verb):
+    """Whether this connector says it can do this verb at all.
+
+    Asked before every optional verb is used. The four required ones
+    are checked once, by `kind_refusal`; the optional ones have to be
+    asked about here, because "this build cannot do it at this product"
+    is an answer an operator can act on and a traceback is not.
+    """
+    return (verb or "") in (connector_of(kind).get("verbs") or ())
+
+
+def verb_refusal(kind, verb):
+    """Why this connector cannot be asked for this verb."""
+    bad = kind_refusal(kind)
+    if bad:
+        return bad
+    c = connector_of(kind)
+    if declares(kind, verb):
+        return ""
+    if verb in (c.get("never") or ()):
+        return (f"OAAP does not do '{verb}' at any provider, and this is "
+                "not a gap: the people in a space are the tenant's, not "
+                "OAAP's (RFC-0041 K3.3)")
+    if verb in (c.get("later") or ()):
+        return (f"'{verb}' is named in this connector and not built yet "
+                f"-- {c['product']} can do it, OAAP cannot")
+    return f"'{verb}' is not something a connector does"
+
+
+def path_of(kind, name, space="", uuid="", alias="", query=None):
     """One of this connector's addresses, filled in.
 
     Both the plan and the run come through here. A plan that printed
@@ -140,7 +213,7 @@ def path_of(kind, name, space="", uuid="", query=None):
     tpl = ((c.get("paths") or {}).get(name) or "")
     if not tpl:
         return ""
-    path = tpl.format(space=space, uuid=uuid)
+    path = tpl.format(space=space, uuid=uuid, alias=alias)
     if query:
         path += "?" + urllib.parse.urlencode(query)
     return path
@@ -154,6 +227,21 @@ def missing_verbs(kind):
     """
     have = set(connector_of(kind).get("verbs") or ())
     return tuple(v for v in REQUIRED_VERBS if v not in have)
+
+
+def incoherent_verbs(kind):
+    """Verbs this connector both claims and swears off.
+
+    A row that declares `users` and also lists it under `never` is not
+    a small inconsistency -- it is a table saying two things about
+    whether OAAP touches somebody's members. Caught here, at the
+    contract, rather than at the door.
+    """
+    c = connector_of(kind)
+    have = set(c.get("verbs") or ())
+    unknown = tuple(v for v in sorted(have) if v not in KNOWN_VERBS)
+    both = tuple(v for v in sorted(have & set(c.get("never") or ())))
+    return unknown + both
 
 
 def method_refusal(method):
@@ -186,6 +274,11 @@ def kind_refusal(kind):
     if absent:
         return (f"the connector '{kind}' does not declare "
                 f"{', '.join(absent)} and cannot manage anything")
+    muddled = incoherent_verbs(kind)
+    if muddled:
+        return (f"the connector '{kind}' is not coherent about "
+                f"{', '.join(muddled)}: a verb is known and claimed, or "
+                "it is sworn off, and never both")
     return ""
 
 
@@ -433,10 +526,10 @@ def plan_lines(plan):
     """The plan as an operator reads it."""
     out = []
     for step in plan:
-        mark = {"always": "   ", "absent": "if absent  ",
-                "found": "if present "}.get(step.get("when"), "")
+        mark = {"absent": "if absent", "found": "if present",
+                "different": "if it differs"}.get(step.get("when"), "")
         out.append(f"  {step['method']:<5}{step['path']}")
-        out.append(f"        {mark and mark.strip() + ': ' or ''}{step['why']}")
+        out.append(f"        {mark + ': ' if mark else ''}{step['why']}")
     return out
 
 
@@ -538,10 +631,15 @@ def version_words(how, version, kind):
 def _keycloak_space_body(space, title=""):
     """The realm OAAP asks Keycloak for.
 
-    Self-registration and the second factor are deliberately NOT set
-    here. They are RFC-0041 step 6, and K7 says the tenant's policy and
-    the realm's switches move together -- setting one of them now would
-    leave a `tenant_admin` reading one number and living under another.
+    Born CLOSED: `registrationAllowed` is false, and it stays false
+    until somebody decides otherwise in the open. Step 6 is what moves
+    it, and it moves the tenant's record in the same act -- because K7
+    says a `tenant_admin` must not read one number and live under
+    another.
+
+    Creation still sets it explicitly rather than leaving it to the
+    product's default. A default is somebody else's decision that
+    changes in somebody else's release.
     """
     return {
         "realm": space,
@@ -583,11 +681,283 @@ def _keycloak_client_body(client_id, redirect_uris, name=""):
     }
 
 
+def _keycloak_settings_read(docs):
+    """Keycloak's two documents, in OAAP's two words.
+
+    `registrationAllowed` is a field of the realm and reads straight
+    across. The second factor is not a field at all: it is the required
+    action CONFIGURE_TOTP, and "required" means `enabled` AND
+    `defaultAction` together. The first half only makes the second
+    factor possible; the second is what makes Keycloak ask for it.
+    """
+    out = {}
+    realm = (docs or {}).get("space")
+    if isinstance(realm, dict):
+        out["self_registration"] = bool(realm.get("registrationAllowed"))
+    action = (docs or {}).get("required_action")
+    if isinstance(action, dict):
+        out["second_factor"] = (
+            "required" if (action.get("enabled")
+                           and action.get("defaultAction")) else "off")
+    return out
+
+
+def _keycloak_settings_write(switch, value, doc, space):
+    """The ONE call that moves one switch: (where, method, body).
+
+    The realm is written PARTIALLY -- its name and the single field --
+    and not as a whole document read back and sent again. K3.3 again: a
+    realm OAAP manages may hold settings nobody in this build has heard
+    of, and returning a whole representation is how those quietly
+    become whatever this build happens to think they are. Keycloak
+    applies the fields a request names and leaves the rest alone.
+
+    The required action is written whole, because there the document IS
+    the switch: a handful of fields, all of them about this one thing.
+
+    "off" leaves the action ENABLED and only clears `defaultAction`,
+    which is Keycloak's own resting state: members who have already set
+    up a second factor keep being asked for it. Disabling the action
+    outright would take something away from people who chose it, and
+    taking things away from a club's members is not what this switch
+    is for.
+    """
+    if switch == "self_registration":
+        return "space", "PUT", {"realm": space,
+                                "registrationAllowed": bool(value)}
+    if switch == "second_factor":
+        body = dict(doc or {})
+        body["enabled"] = True
+        body["defaultAction"] = (value == "required")
+        return "required_action", "PUT", body
+    return "", "", {}
+
+
 # The one place where a product's own field names live. A second
-# connector is a file with two of these and a row in CONNECTOR_KINDS.
+# connector is a file with these functions and a row in
+# CONNECTOR_KINDS.
 _BODIES = {
     "keycloak": (_keycloak_space_body, _keycloak_client_body),
 }
+
+_SETTINGS = {
+    "keycloak": (_keycloak_settings_read, _keycloak_settings_write),
+}
+
+
+# ---------------------------------------------------------------------------
+# The settings verb (RFC-0041 K7, step 6)
+#
+# Two switches, and the whole difficulty is that each of them exists in
+# two places: in the space, where it decides what actually happens, and
+# in OAAP's record, where a tenant_admin reads it. This section keeps
+# them one thing by never letting OAAP write down what it merely asked
+# for.
+
+SWITCH_VALUES = {
+    "self_registration": (True, False),
+    "second_factor": ("required", "off"),
+}
+
+
+def switch_refusal(kind, switch, value):
+    """Why this switch may not be moved to this value."""
+    bad = verb_refusal(kind, "settings")
+    if bad:
+        return bad
+    c = connector_of(kind)
+    if switch not in SWITCHES:
+        return (f"'{switch}' is not a switch OAAP knows -- "
+                f"{', '.join(SWITCHES)} (RFC-0041 K7)")
+    if switch not in (c.get("switches") or {}):
+        return (f"{c['product']} has no {c['space_word']} switch for "
+                f"'{switch}' in this build")
+    if value not in SWITCH_VALUES[switch]:
+        allowed = ", ".join(str(v).lower() for v in SWITCH_VALUES[switch])
+        return f"'{value}' is not a value for '{switch}' -- {allowed}"
+    return ""
+
+
+def switch_where(kind, switch):
+    """Which of this product's documents holds this switch."""
+    c = connector_of(kind)
+    return ((c.get("switches") or {}).get(switch) or {}).get("where", "")
+
+
+def switch_path(kind, space, switch):
+    """The address of the document that holds this switch."""
+    c = connector_of(kind)
+    sw = (c.get("switches") or {}).get(switch) or {}
+    if not sw:
+        return ""
+    return path_of(kind, sw["where"], space=space, alias=sw.get("alias", ""))
+
+
+def settings_of(kind, docs):
+    """What the space's own documents say, in OAAP's words.
+
+    `docs` is {where: document}, and a `where` that is missing simply
+    yields no answer for its switch -- a switch OAAP did not read is
+    absent from the result rather than defaulting to something
+    comfortable.
+    """
+    reader = _SETTINGS.get((kind or "").strip().lower())
+    return reader[0](docs or {}) if reader else {}
+
+
+def settings_call(kind, switch, value, doc, space):
+    """The one call that moves one switch: (where, method, body)."""
+    writer = _SETTINGS.get((kind or "").strip().lower())
+    if not writer:
+        return "", "", {}
+    return writer[1](switch, value, doc, space)
+
+
+def settings_kinds():
+    """Which kinds can actually read and write their switches.
+
+    Held against the table by the test, the same way `body_kinds` is: a
+    row that declares `settings` with nothing behind it is a connector
+    that refuses at the last moment instead of at the first.
+    """
+    return tuple(sorted(_SETTINGS))
+
+
+def settings_plan(kind, space, wants):
+    """Every call moving these switches may make, in order.
+
+    Judged by the same `plan_refusal` as provisioning, and that is the
+    point of it being a plan at all: the version comes first, nothing
+    writes before it, nothing deletes.
+
+    The READ-BACK is part of the plan rather than an afterthought. What
+    OAAP records is what the space answers once the writing is done --
+    so an operator reading `--dry-run` sees that too, and a test can
+    assert that the last word belongs to the provider.
+    """
+    if verb_refusal(kind, "settings"):
+        return []
+    c = connector_of(kind)
+    word = c["space_word"]
+    wants = {k: v for k, v in (wants or {}).items() if k in SWITCHES}
+    steps = [
+        {"verb": "version", "method": "GET", "when": "always", "writes": False,
+         "path": c["version_path"],
+         "why": f"which {c['product']} is this? a switch read at the wrong "
+                "version is read wrongly"},
+    ]
+    reads = []
+    for switch in SWITCHES:
+        where = switch_where(kind, switch)
+        if where and where not in reads:
+            reads.append(where)
+            steps.append(
+                {"verb": "settings", "method": "GET", "when": "always",
+                 "writes": False, "path": switch_path(kind, space, switch),
+                 "why": f"what does the {word} say about "
+                        f"{switch.replace('_', ' ')} right now?"})
+    for switch in SWITCHES:
+        if switch not in wants:
+            continue
+        steps.append(
+            {"verb": "settings", "method": "PUT", "when": "different",
+             "writes": True, "path": switch_path(kind, space, switch),
+             "why": f"set {switch.replace('_', ' ')} to "
+                    f"'{switch_word(switch, wants[switch])}' -- and only "
+                    "this field of that document"})
+    for where in reads:
+        switch = next(s for s in SWITCHES if switch_where(kind, s) == where)
+        steps.append(
+            {"verb": "settings", "method": "GET", "when": "always",
+             "writes": False, "path": switch_path(kind, space, switch),
+             "why": "read it back: what OAAP writes into its own "
+                    f"configuration is what the {word} says afterwards, "
+                    "never what OAAP asked for"})
+    return steps
+
+
+def switch_word(switch, value):
+    """One switch's value as a person says it."""
+    if switch == "self_registration":
+        return "on" if value else "off"
+    return str(value or "off")
+
+
+def settings_words(kind, settings):
+    """The switches as an operator reads them."""
+    c = connector_of(kind)
+    word = c.get("space_word", "space")
+    out = []
+    for switch in SWITCHES:
+        if switch not in (settings or {}):
+            continue
+        said = switch_word(switch, settings[switch])
+        if switch == "self_registration":
+            out.append(f"self-registration in the {word}: {said}"
+                       + ("  (anybody who can reach the page gets an "
+                          "identity here)" if said == "on" else ""))
+        else:
+            out.append(f"second factor in the {word}: {said}"
+                       + ("  (asked of everybody who joins from now on)"
+                          if said == "required" else ""))
+    return out
+
+
+def settings_reach(kind, switch, value):
+    """What a switch does NOT reach, said before anybody assumes it does.
+
+    Measured at Keycloak 26.7.4 and true of the product rather than of
+    this build: a required action marked as a default action is handed
+    to people who arrive AFTER it was marked. The members already in
+    the realm are not asked retroactively -- Keycloak would need the
+    action written onto each of them, one person at a time, and OAAP
+    does not write onto people (K3.3, and `never: users`).
+
+    A switch whose reach is smaller than its name is the sort of thing
+    an operator has to be told once, out loud, rather than discover
+    when an audit asks who actually has a second factor.
+    """
+    c = connector_of(kind)
+    if switch == "second_factor" and value == "required":
+        return (f"This asks it of everybody who joins the "
+                f"{c['space_word']} from now on. The members already in "
+                "it are not asked retroactively -- that would mean "
+                f"writing onto each person in the {c['space_word']}, and "
+                "OAAP does not touch a club's people (RFC-0041 K3.3). "
+                f"{c['product']} can do it per person in its own console.")
+    if switch == "self_registration" and value:
+        return ("Whoever reaches the registration page gets an identity "
+                "in this tenant. What that identity MAY do is OAAP's "
+                "first-login policy and nothing the provider asserts "
+                "(RFC-0041 K4).")
+    return ""
+
+
+def settings_disagreement(kind, wanted, got):
+    """Why a read-back may not be recorded as success. '' when it may.
+
+    The sharpest sentence of step 6. OAAP asked the space to be one
+    way, the space says it is another -- and the temptation is to
+    record the intention, because that is what the operator typed and
+    it reads better. Recording it would put a number in front of a
+    tenant_admin that nothing in the world backs up.
+    """
+    c = connector_of(kind)
+    for switch, value in (wanted or {}).items():
+        if switch not in (got or {}):
+            return (f"the {c['space_word']} was asked about "
+                    f"'{switch.replace('_', ' ')}' afterwards and did not "
+                    "answer -- so nothing is known, and nothing that is "
+                    "not known is written down")
+        if got[switch] != value:
+            return (f"the {c['space_word']} was told to set "
+                    f"'{switch.replace('_', ' ')}' to "
+                    f"'{switch_word(switch, value)}' and says it is "
+                    f"'{switch_word(switch, got[switch])}'. OAAP records "
+                    "what the provider says, so the record now holds the "
+                    "provider's answer and not the instruction "
+                    "(RFC-0041 K7)")
+    return ""
 
 
 def space_body(kind, space, title=""):
@@ -892,6 +1262,142 @@ class Admin:
             return "", ("the provider returned no client secret -- is this "
                         "client confidential?")
         return secret, ""
+
+    def read_settings(self, space):
+        """(settings, error). What the space says about K7's switches.
+
+        Every document the switches live in, asked for by the table and
+        not by a name written here. A `where` that answers 403 gets the
+        same sentence as every other door -- a space that exists and is
+        not ours is not a space whose switches we report on.
+        """
+        docs, seen = {}, []
+        for switch in SWITCHES:
+            where = switch_where(self.kind, switch)
+            if not where or where in seen:
+                continue
+            seen.append(where)
+            path = switch_path(self.kind, space, switch)
+            status, doc, err = self._call("GET", path)
+            if err:
+                return {}, err
+            if status == 403:
+                return {}, self._not_ours(space, "read the sign-in rules")
+            if status == 404:
+                return {}, (f"{path} is not there at this "
+                            f"{self.decl['product']} -- this build was "
+                            f"measured against {self.decl['pinned']}")
+            if status != 200:
+                return {}, f"reading the sign-in rules answered {status}"
+            docs[where] = doc
+        return settings_of(self.kind, docs), ""
+
+    def write_switch(self, space, switch, value, doc):
+        """(ok, sentence). Move one switch, and touch nothing else."""
+        where, method, body = settings_call(self.kind, switch, value, doc,
+                                            space)
+        if not where:
+            return False, f"this connector cannot move '{switch}'"
+        path = switch_path(self.kind, space, switch)
+        status, got, err = self._call(method, path, body=body)
+        if err:
+            return False, err
+        if status == 403:
+            return False, self._not_ours(space, "change the sign-in rules")
+        if status not in (200, 204):
+            return False, (f"setting '{switch.replace('_', ' ')}' answered "
+                           f"{status}"
+                           + (f": {got.get('errorMessage')}"
+                              if isinstance(got, dict)
+                              and got.get("errorMessage") else ""))
+        self._note(f"set {switch.replace('_', ' ')} to "
+                   f"'{switch_word(switch, value)}' in the "
+                   f"{self.decl['space_word']} '{space}'")
+        return True, ""
+
+    def settings(self, space, wants=None, accept_version=""):
+        """Read, and if asked move, K7's switches. (ok, settings, sentence).
+
+        `settings` is ALWAYS what the space answered at the end, even
+        when this returns not-ok. That is the contract the caller needs:
+        the record can then be corrected to the truth in the same breath
+        as the failure is reported, instead of being left holding an
+        instruction that did not take.
+
+        The version is checked even for a pure read. A document read at
+        a product two releases along is read WRONGLY rather than not at
+        all -- `defaultAction` meaning something else is exactly the
+        kind of ageing K3.1 exists for.
+        """
+        wants = {k: v for k, v in (wants or {}).items() if k in SWITCHES}
+        plan = settings_plan(self.kind, space, wants)
+        bad = plan_refusal(plan)
+        if bad:
+            return False, {}, bad
+        for switch, value in wants.items():
+            bad = switch_refusal(self.kind, switch, value)
+            if bad:
+                return False, {}, bad
+        bad = space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        ok, msg = self.login()
+        if not ok:
+            return False, {}, msg
+        said, err = self.version()
+        if err:
+            return False, {}, err
+        how, bad = version_check(self.kind, said, accept_version)
+        if bad:
+            return False, {}, bad
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        if not exists:
+            return False, {}, (
+                f"there is no {self.decl['space_word']} '{space}' at "
+                f"{self.base}. These are switches INSIDE a space, and "
+                "this step does not create one -- `oaap idp provision` "
+                "does that, deliberately in its own act")
+        docs = {}
+        for switch in SWITCHES:
+            where = switch_where(self.kind, switch)
+            if where and where not in docs:
+                status, doc, err = self._call(
+                    "GET", switch_path(self.kind, space, switch))
+                if err:
+                    return False, {}, err
+                if status == 403:
+                    return False, {}, self._not_ours(
+                        space, "read the sign-in rules")
+                if status != 200:
+                    return False, {}, (f"reading the sign-in rules answered "
+                                       f"{status}")
+                docs[where] = doc
+        now = settings_of(self.kind, docs)
+        for switch, value in wants.items():
+            if now.get(switch) == value:
+                self._note(f"{switch.replace('_', ' ')} was already "
+                           f"'{switch_word(switch, value)}'")
+                continue
+            ok, msg = self.write_switch(
+                space, switch, value, docs.get(switch_where(self.kind,
+                                                            switch)))
+            if not ok:
+                after, _err = self.read_settings(space)
+                return False, (after or now), msg
+        after, err = self.read_settings(space)
+        if err:
+            return False, now, err
+        bad = settings_disagreement(self.kind, wants, after)
+        if bad:
+            return False, after, bad
+        seen = said or (accept_version or "").strip()
+        self._note(f"{self.decl['product']} "
+                   + version_words(how, seen, self.kind))
+        return True, after, (f"the {self.decl['space_word']} '{space}' "
+                             "answered, and that answer is what OAAP "
+                             "writes down")
 
     # -- the whole of it --------------------------------------------
     def provision(self, space, client_id, redirect_uris, title="",

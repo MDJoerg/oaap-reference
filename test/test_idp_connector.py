@@ -97,13 +97,50 @@ for kind in a.connector_kinds():
     ok(f"'{kind}' ist auf eine Fassung festgenagelt",
        re.match(r"^\d+\.\d+", decl.get("pinned", "")), decl.get("pinned"))
     ok(f"'{kind}' sagt, was es NOCH nicht kann",
-       "settings" in (decl.get("later") or ()), decl.get("later"))
+       bool(decl.get("later")), decl.get("later"))
+    ok(f"'{kind}' sagt auch, was es NIE tun wird",
+       "users" in (decl.get("never") or ()), decl.get("never"))
+    ok(f"'{kind}' ist sich darueber einig", not a.incoherent_verbs(kind),
+       a.incoherent_verbs(kind))
 
-# Ein genanntes und nicht gebautes Verb ist die kleinere Luege -- aber
-# nur, solange es auch wirklich nicht gebaut ist. Waere es da, muesste
-# es im Vertrag stehen und nicht in `later`.
-ok("'settings' ist genannt und NICHT gebaut (das ist Schritt 6)",
-   "def set_settings" not in ADMIN_SRC and "settings" not in a.REQUIRED_VERBS)
+# 'settings' war bis 0.1.122 genannt und nicht gebaut. Seit Schritt 6
+# ist es gebaut -- und damit gehoert es in den Vertrag und nicht mehr
+# in die Liste der Versprechen.
+ok("'settings' steht jetzt IM Vertrag", a.declares("keycloak", "settings"))
+ok("... und ist keine Pflicht fuer einen Konnektor",
+   "settings" not in a.REQUIRED_VERBS and "settings" in a.OPTIONAL_VERBS)
+ok("'export' ist genannt und nicht gebaut (das ist Schritt 7)",
+   bool(a.verb_refusal("keycloak", "export")),
+   a.verb_refusal("keycloak", "export"))
+ok("... und der Satz sagt, dass das PRODUKT es koennte",
+   "OAAP cannot" in a.verb_refusal("keycloak", "export"))
+# Die schaerfere Haelfte: 'users' ist nicht vertagt, sondern
+# abgeschworen. Der Satz dazu darf kein "noch nicht" sein.
+bad_users = a.verb_refusal("keycloak", "users")
+ok("'users' wird abgelehnt", bool(bad_users))
+ok("... und zwar nicht als 'noch nicht', sondern als NIE",
+   "not a gap" in bad_users and "K3.3" in bad_users, bad_users)
+# Eine Zeile, die ein Verb gleichzeitig verspricht und abschwoert, ist
+# keine Kleinigkeit -- sie sagt zwei Dinge darueber, ob OAAP die
+# Mitglieder eines Vereins anfasst.
+# Dafuer werden zwei Zeilen erfunden und wieder weggeraeumt: die
+# Pruefung soll die TABELLE pruefen, nicht ein Produkt.
+_real = dict(a.CONNECTOR_KINDS["keycloak"])
+a.CONNECTOR_KINDS["widerspruch"] = dict(
+    _real, verbs=_real["verbs"] + ("users",), never=("users",))
+a.CONNECTOR_KINDS["tippfehler"] = dict(_real, verbs=_real["verbs"] + ("sso",))
+ok("eine Art, die 'users' behauptet UND abschwoert, faellt auf",
+   bool(a.incoherent_verbs("widerspruch")))
+ok("... und die Ablehnung der Art nennt es",
+   "not coherent" in a.kind_refusal("widerspruch"),
+   a.kind_refusal("widerspruch"))
+ok("... und ein erfundenes Verb faellt genauso auf",
+   a.incoherent_verbs("tippfehler") == ("sso",),
+   a.incoherent_verbs("tippfehler"))
+a.CONNECTOR_KINDS.pop("widerspruch")
+a.CONNECTOR_KINDS.pop("tippfehler")
+ok("und danach ist die Tabelle wieder, wie sie war",
+   a.connector_kinds() == ("keycloak",), a.connector_kinds())
 ok("eine unbekannte Art wird abgelehnt", a.kind_refusal("okta"))
 ok("die Plattform-Version steht an EINER Stelle",
    a.connector_of("keycloak")["pinned"] == idp.KEYCLOAK_PINNED)

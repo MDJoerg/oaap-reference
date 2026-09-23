@@ -1758,6 +1758,16 @@ def _idp_principal(tid, provider, claims):
     policy = idp.policy_of(tenant_rec)
     profile = idp.profile_from(claims)
     factor = idp.second_factor(claims)
+    # K7 is explicit that OAAP does not enforce a second factor: the
+    # realm does, and a login that arrives here is one the realm let
+    # through. What OAAP can do is notice the silence. A tenant whose
+    # space was set to require a second factor, and whose login says
+    # nothing about one, is a sentence somebody has to be able to find
+    # afterwards -- not a refusal of an authentication OAAP did not
+    # perform (RFC-0041 K7, step 6).
+    if not factor and idp.factor_expected(policy):
+        factor = ("kein Faktor genannt, obwohl der Ort einen verlangen "
+                  "soll")
     with users_rw() as users:
         u = idp.find_binding(users, pkey, subject, tid)
         if u is not None:
