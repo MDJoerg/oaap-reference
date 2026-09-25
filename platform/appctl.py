@@ -5783,6 +5783,101 @@ def instance_names(inst):
     return [canon] + [a for a in (inst.get("aliases") or []) if a and a != canon]
 
 
+# ------------------------------------------------------ RFC-0043: names
+# The instance tells the app its own names. Until 0.1.126 nothing did:
+# an app saw the Host of the request in front of it and nothing else,
+# so an app that PUBLISHES an address (a short link, a QR code) had to
+# keep a second list of the names -- and on oaapx01 that list and the
+# registry disagreed within an hour (CURRENT_STATE 181). One writer,
+# one variable, and the container is the place the truth is read from.
+
+INSTANCE_NAMES_ENV = "OAAP_INSTANCE_NAMES"
+
+
+def instance_names_env(name, inst, ext_conf=None):
+    """Every public origin of an instance as the app is told it (RFC-0043
+    §2.1): the canonical name first, then the aliases in registry order,
+    then the automatic node addresses -- each with the scheme the gateway
+    actually serves it under (`http` behind an edge, `https` otherwise),
+    never a path. Empty when the instance has no public name at all,
+    and then the variable is absent rather than blank."""
+    host, edge = load_external_conf() if ext_conf is None else ext_conf
+    scheme = "http" if edge else "https"
+    names = instance_names(inst or {}) + instance_auto_hosts(name, inst, ext_host=host)
+    return ",".join(f"{scheme}://{h}" for h in dict.fromkeys(names))
+
+
+def container_env(container):
+    """The environment a container really carries, or None when there is
+    no such container. RFC-0043 §4 step 4: what the app reads is the
+    CONTAINER's environment, not instance.env -- a file that is fresh
+    and a container that is stale are two truths, and only this one
+    counts."""
+    if not container:
+        return None
+    got = subprocess.run(["docker", "inspect", container, "--format",
+                          "{{range .Config.Env}}{{println .}}{{end}}"],
+                         capture_output=True, text=True)
+    if got.returncode != 0:
+        return None
+    return dict(line.split("=", 1) for line in got.stdout.splitlines()
+                if "=" in line)
+
+
+def sync_instance_names(reg, only=None, recreate=True):
+    """Bring `OAAP_INSTANCE_NAMES` up to date (RFC-0043 §2.2), for one
+    instance (`only`) or all of them: instance.env always, and the
+    containers whose environment says something else are recreated when
+    `recreate` is set, else only reported. Returns (recreated, stale) --
+    `stale` names the instances whose running container still carries
+    old names or none; they learn them at their next restart.
+
+    `recreate=False` is for the moments that touch EVERY site at once
+    (a platform update regenerating the gateway): recreating every app
+    on a node for a variable most of them do not read yet is not a
+    platform's call to make. A change of names is -- and comes through
+    `commit_instance_names` with `recreate=True`."""
+    ext = load_external_conf()
+    recreated, stale = [], []
+    for name, inst in sorted(reg["instances"].items()):
+        if only and name != only:
+            continue
+        value = instance_names_env(name, inst, ext)
+        env = load_env(name, inst)
+        if (env.get(INSTANCE_NAMES_ENV) or "") != value:
+            if value:
+                env[INSTANCE_NAMES_ENV] = value
+            else:
+                env.pop(INSTANCE_NAMES_ENV, None)
+            save_env(name, env, inst)
+        have = container_env(inst.get("container", ""))
+        if have is None or (have.get(INSTANCE_NAMES_ENV) or "") == value:
+            continue
+        if recreate:
+            recreate_instance_containers(name, instance_services(inst),
+                                         inst.get("storage") or [],
+                                         inst.get("endpoints"), inst=inst)
+            recreated.append(name)
+        else:
+            stale.append(name)
+    return recreated, stale
+
+
+def commit_instance_names(reg, name):
+    """The ONE door a change of an instance's own names goes through:
+    registry, gateway sites, gateway reload -- and the container, which
+    learns its names from its environment and is recreated when they
+    changed (RFC-0043 §2.2). The CLI and the portal's spool both come
+    through here, so neither can forget the last step."""
+    save_registry(reg)
+    write_instance_address_caddy()
+    reload_gateway()
+    recreated, _ = sync_instance_names(reg, only=name)
+    for n in recreated:
+        print(f"Container of '{n}' recreated -- {INSTANCE_NAMES_ENV} now "
+              f"lists its names.")
+
+
 def write_instance_address_caddy():
     """(Re)generate sites for instances carrying their own public name(s).
 
@@ -5869,10 +5964,24 @@ def write_internal_health_caddy():
 
 
 def refresh_generated_sites():
-    """Regenerate every site file derived from the registry."""
+    """Regenerate every site file derived from the registry -- and, since
+    0.1.126, the names each instance is told (RFC-0043): instance.env
+    follows the registry here, the running containers do not (see
+    `sync_instance_names`); a platform update is not the moment to
+    restart every app on the node."""
     write_external_caddy()
     write_instance_address_caddy()
     write_internal_health_caddy()
+    sync_instance_names(load_registry(), recreate=False)
+
+
+def _report_names_sync(recreated, stale):
+    for n in recreated:
+        print(f"Container of '{n}' recreated -- {INSTANCE_NAMES_ENV} now "
+              f"lists its names.")
+    for n in stale:
+        print(f"'{n}' still runs with old names in {INSTANCE_NAMES_ENV}; "
+              f"'oaap app restart {n}' hands over the new ones.")
 
 
 HOSTNAME_RE = r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+"
@@ -5894,6 +6003,7 @@ def cmd_external(args):
         refresh_generated_sites()
         reload_gateway()
         print("External hostname removed; gateway reloaded.")
+        _report_names_sync(*sync_instance_names(load_registry()))
         return
     host = (args.hostname or "").lower().strip().rstrip(".")
     if not re.fullmatch(HOSTNAME_RE, host):
@@ -5912,6 +6022,9 @@ def cmd_external(args):
     skipped = write_external_caddy()
     write_instance_address_caddy()
     reload_gateway()
+    # RFC-0043: the automatic name of every instance just changed, and
+    # so did the scheme if an edge came or went.
+    _report_names_sync(*sync_instance_names(load_registry()))
     if edge:
         # behind-edge mode (RFC-0006 / gateway spec edge section): the
         # edge terminates TLS; this node serves plain HTTP, no redirect,
@@ -6055,7 +6168,8 @@ def reload_gateway():
 # the old values. install, restore and 'app config set' all go through
 # start_instance_container so the container shape stays identical.
 
-RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL"}  # platform-owned, never operator-editable
+RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
+                "OAAP_INSTANCE_NAMES"}  # platform-owned, never operator-editable
 
 
 def tenant_dir(tid):
@@ -7658,6 +7772,19 @@ def cmd_address(args):
         if ext_host and not autos:
             print("Automatic node address: none — this instance names a "
                   "tenant this node does not have")
+        # RFC-0043: the names as the APP sees them -- read from the
+        # container, because that is where the app reads them.
+        have = container_env(inst.get("container", ""))
+        told = (have or {}).get(INSTANCE_NAMES_ENV, "")
+        want = instance_names_env(name, inst)
+        if have is None:
+            print(f"As the app sees it ({INSTANCE_NAMES_ENV}): no container")
+        elif told == want:
+            print(f"As the app sees it ({INSTANCE_NAMES_ENV}): {told or '(not set)'}")
+        else:
+            print(f"As the app sees it ({INSTANCE_NAMES_ENV}): {told or '(not set)'}"
+                  f" -- STALE, the names are {want or '(none)'}; "
+                  f"'oaap app restart {name}' hands them over")
         return
 
     if args.action == "remove":
@@ -7669,9 +7796,7 @@ def cmd_address(args):
                 f"'oaap app address set {name} <alias>' — an instance must "
                 f"not keep aliases without a canonical address.")
         old = inst.pop("address")
-        save_registry(reg)
-        write_instance_address_caddy()
-        reload_gateway()
+        commit_instance_names(reg, name)
         print(f"Removed {old} from '{name}'.")
         for auto in instance_auto_hosts(name, inst, ext_host=ext_host):
             print(f"Still reachable at https://{auto}/")
@@ -7690,9 +7815,7 @@ def cmd_address(args):
         if host in aliases:
             die(f"{host} is already an alias of '{name}'")
         inst.setdefault("aliases", []).append(host)
-        save_registry(reg)
-        write_instance_address_caddy()
-        reload_gateway()
+        commit_instance_names(reg, name)
         print(f"'{name}' now also answers for {host} (alias).")
         _address_setup_hint(host, edge)
         return
@@ -7706,9 +7829,7 @@ def cmd_address(args):
         inst["aliases"] = [a for a in aliases if a != host]
         if not inst["aliases"]:
             inst.pop("aliases", None)
-        save_registry(reg)
-        write_instance_address_caddy()
-        reload_gateway()
+        commit_instance_names(reg, name)
         print(f"Removed alias {host} from '{name}'.")
         return
 
@@ -7722,9 +7843,7 @@ def cmd_address(args):
             f"first if you want it as the canonical name: "
             f"'oaap app address alias-remove {name} {host}'.")
     inst["address"] = host
-    save_registry(reg)
-    write_instance_address_caddy()
-    reload_gateway()
+    commit_instance_names(reg, name)
     print(f"'{name}' now answers for {host}.")
     _address_setup_hint(host, edge)
     print("The automatic node address keeps working — clients can move over "
@@ -8401,6 +8520,16 @@ def _install_from_dir(pkg, args, source):
               "E1) -- OAAP_PLATFORM_KEY/OAAP_TWIN_URL are in its environment.")
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
+    # RFC-0043: the instance's own names, canonical first, so the app
+    # can publish an address that is the operator's and not the one the
+    # administrator happened to use. From the existing record on a
+    # redeploy; a first install has only the automatic node address,
+    # under the tenant the permit names.
+    names_env = instance_names_env(name, dict(inst or {}, tenant=ident["tenant"]))
+    if names_env:
+        env[INSTANCE_NAMES_ENV] = names_env
+    else:
+        env.pop(INSTANCE_NAMES_ENV, None)
     save_env(name, env, ident)
 
     # a granted non-HTTP endpoint (RFC-0015) survives redeploy like the
@@ -8554,6 +8683,10 @@ def _install_from_dir(pkg, args, source):
         grants_drop_for(name, "instance is on the production channel")
     refresh_generated_sites()
     reload_gateway()
+    # RFC-0043: the record is complete now; if the names computed before
+    # the record existed differ from the names it carries, the container
+    # is recreated once here rather than told a wrong list.
+    sync_instance_names(reg, only=name)
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
     print(f"Entry point: port {port} (through the gateway, login required)")
     for auto in instance_auto_hosts(name, reg["instances"][name]):
@@ -11363,7 +11496,10 @@ def _scrub_rehearsal_env(key, ident, secret_keys):
     Returns the keys that were actually dropped, so the operator is told
     what to fill in rather than left to discover it from a crash loop.
     """
-    platform_owned = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL"}
+    platform_owned = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
+                      # RFC-0043: a rehearsal has its own names; the
+                      # install below computes them afresh
+                      "OAAP_INSTANCE_NAMES"}
     env = load_env(key, ident)
     dropped = sorted(k for k in list(env)
                      if k in platform_owned or k in secret_keys)
@@ -13243,9 +13379,7 @@ def cmd_process_deploys(_args):
                            "without a canonical address")
                 else:
                     old = inst.pop("address", "")
-                    save_registry(reg)
-                    write_instance_address_caddy()
-                    reload_gateway()
+                    commit_instance_names(reg, name)
                     ok = True
                     msg = f"address {old} removed" if old else "no address was set"
             elif op == "alias-remove":
@@ -13256,9 +13390,7 @@ def cmd_process_deploys(_args):
                     inst["aliases"] = [a for a in aliases if a != host]
                     if not inst["aliases"]:
                         inst.pop("aliases", None)
-                    save_registry(reg)
-                    write_instance_address_caddy()
-                    reload_gateway()
+                    commit_instance_names(reg, name)
                     ok, msg = True, f"alias {host} removed"
             elif op == "alias-add":
                 if not inst.get("address"):
@@ -13273,9 +13405,7 @@ def cmd_process_deploys(_args):
                             msg = f"{host} is already an alias"
                         else:
                             inst.setdefault("aliases", []).append(host)
-                            save_registry(reg)
-                            write_instance_address_caddy()
-                            reload_gateway()
+                            commit_instance_names(reg, name)
                             ok, msg = True, f"alias {host} added"
                     except ValueError as e:
                         msg = str(e)
@@ -13288,9 +13418,7 @@ def cmd_process_deploys(_args):
                                f"alias first to make it the canonical name")
                     else:
                         inst["address"] = host
-                        save_registry(reg)
-                        write_instance_address_caddy()
-                        reload_gateway()
+                        commit_instance_names(reg, name)
                         ok, msg = True, f"address set to {host}"
                 except ValueError as e:
                     msg = str(e)
