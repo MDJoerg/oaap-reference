@@ -91,6 +91,11 @@ app = Flask(__name__)
 PLATFORM_APPS_DIR = "/platform-apps"
 REGISTRY_FILE = os.path.join(PLATFORM_APPS_DIR, "registry.json")
 SECRETS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-secrets.json")
+# oaap.data.twin 0.4 §2.14: readers on ANOTHER node, reached through a
+# tunnel (RFC-0033 §6, D10). Written by appctl only, like the registry;
+# no secret in it.
+READERS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-readers.json")
+REMOTE_PREFIX = "remote:"
 STORE_HOST = os.environ.get("STORE_HOST", "store")
 STORE_PORT = int(os.environ.get("STORE_PORT", "5432"))
 
@@ -144,6 +149,22 @@ def resolve_instance(name):
     return {"tenant": inst["tenant"], "origin": f"app:{inst['app_id']}"}
 
 
+def resolve_remote(label):
+    """{'tenant', 'origin', 'reads'} for a remote reader (§2.14), or
+    None. The same shape of trust as resolve_instance: the NAME comes
+    from identity's verification, everything else from a file only the
+    operator writes."""
+    r = (_load_json(READERS_FILE, {}).get("readers") or {}).get(label)
+    if not r or not r.get("tenant"):
+        return None
+    return {"tenant": r["tenant"], "origin": REMOTE_PREFIX + label,
+            "reads": [t for t in r.get("reads") or [] if isinstance(t, str)]}
+
+
+def is_remote(name):
+    return name.startswith(REMOTE_PREFIX)
+
+
 def require_caller():
     """(instance_name, tenant, origin) or None -- writes the 401/403
     onto Flask's request-local error path via abort-by-return.
@@ -154,6 +175,14 @@ def require_caller():
     route, per the deployment contract every other protected route
     already relies on)."""
     user = request.headers.get("X-OAAP-User", "")
+    if is_remote(user):
+        # oaap.data.twin 0.4 §2.14 -- the caller's NAME is the full
+        # principal ('remote:<label>'), so no binding row of a local
+        # instance can ever be mistaken for it
+        resolved = resolve_remote(user[len(REMOTE_PREFIX):])
+        if resolved is None:
+            return None, f"'{user}' is not a remote reader of this node", 403
+        return (user, resolved["tenant"], resolved["origin"]), None, None
     if not user.startswith("instance:"):
         return None, ("this route is for an app instance's own credential, "
                        "not a person (RFC-0031 §8) -- a browser reaches this "
@@ -219,6 +248,14 @@ def get_conn(tenant_id):
 
 
 def _bindings(conn, instance):
+    """The caller's bindings. A remote reader has none in the model
+    registry -- it has no manifest -- so it gets one `consumes` row per
+    type the operator gave it, and nothing that could write (§2.14)."""
+    if is_remote(instance):
+        r = resolve_remote(instance[len(REMOTE_PREFIX):]) or {}
+        return [{"type_key": t, "direction": "consumes", "role": None,
+                 "group_key": None, "declared_as": "remote reader"}
+                for t in r.get("reads") or []]
     with conn.cursor() as cur:
         cur.execute(
             "SELECT type_key, direction, role, group_key, declared_as "
@@ -426,6 +463,9 @@ def create_object():
     if err:
         return err, code
     name, tenant_id, origin = caller
+    if is_remote(name):
+        return ("a remote reader reads only (oaap.data.twin 0.4 §2.14) -- "
+                "writing belongs to an app on the node that holds the data"), 403
     body = request.get_json(silent=True) or {}
     type_key = (body.get("type") or "").strip()
     title = (body.get("title") or "").strip()
@@ -581,6 +621,9 @@ def write_group(obj_id, group_key):
     if err:
         return err, code
     name, tenant_id, origin = caller
+    if is_remote(name):
+        return ("a remote reader reads only (oaap.data.twin 0.4 §2.14) -- "
+                "writing belongs to an app on the node that holds the data"), 403
     m = OBJ_ID_RE.match(obj_id)
     if not m or not KEY_RE.match(group_key.replace(".", "")):
         return "malformed object id or group key", 400

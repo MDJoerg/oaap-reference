@@ -244,8 +244,10 @@ ok("neither services nor data_model -- still refused for missing services, "
 
 print("\n=== 'oaap data model' is registered as an object of the 'data' verb ===")
 appctl_src = read("appctl.py")
+# Not the literal choices list: 0.1.130 added 'twin' (oaap.data.twin 2.14)
+# and a test that pins the whole list breaks on every new object.
 ok("'model' is a choice alongside 'store'",
-   'choices=["store", "model"]' in appctl_src)
+   '"store", "model"' in appctl_src and 'pdt.add_argument("object", choices=' in appctl_src)
 ok("cmd_data dispatches 'model' to its own function",
    'if args.object == "model":' in appctl_src
    and "return cmd_data_model(args)" in appctl_src)

@@ -5206,8 +5206,10 @@ def cmd_data(args):
     """
     if args.object == "model":
         return cmd_data_model(args)
+    if args.object == "twin":
+        return cmd_data_twin(args)
     if args.object != "store":
-        die(f"unknown object '{args.object}' — available: store, model")
+        die(f"unknown object '{args.object}' — available: store, model, twin")
 
     if args.action == "status":
         if not has_profile("store"):
@@ -6500,6 +6502,166 @@ def _twin_issue_instance_key(name, tenant_id):
         {"OAAP_T_NAME": principal, "OAAP_T_INST": name, "OAAP_T_TENANT": tenant_id,
          "OAAP_T_SCOPE": TWIN_KEY_SCOPE})
     return json.loads(out)
+
+
+# ------------------------------- remote twin readers (oaap.data.twin 0.4)
+# A reader on ANOTHER node, reached through a tunnel (RFC-0033 §6, D10;
+# oaap.data.twin 2.14). Measured before this existed: the tunnel carried
+# the call, identity accepted the key, and the twin refused -- it looked
+# every caller up in THIS node's registry. The reader gets its own name
+# space (`remote:<label>`) and its own file instead of a stand-in entry
+# in the registry, which every other reader of that file would then have
+# to know does not run here.
+TWIN_READERS_FILE = os.path.join(APPS_DIR, "twin-readers.json")
+TWIN_REMOTE_PREFIX = "remote:"
+
+
+def load_twin_readers():
+    try:
+        with open(TWIN_READERS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("readers") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_twin_readers(readers):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = TWIN_READERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "readers": readers}, f, indent=2)
+    os.replace(tmp, TWIN_READERS_FILE)
+    # labels, tenants, type keys -- no secret; the twin reads this mount
+    os.chmod(TWIN_READERS_FILE, 0o644)
+
+
+def twin_reader_add(label, tid, reads, days=None, who="root", active_types=None):
+    """Create `remote:<label>` in tenant `tid`, reading exactly `reads`.
+    Returns the key -- shown once, meant for the outer node's
+    destination, never for an app (oaap.net.destinations 2.3)."""
+    if not re.fullmatch(DEST_NAME_RE, label or ""):
+        die("a reader label is [a-z0-9-], 2-40 characters, starting and "
+            "ending with a letter or digit")
+    types = sorted({t.strip() for t in (reads or "").split(",") if t.strip()})
+    if not types:
+        die("--reads names the types this reader may read -- there is no "
+            "default (oaap.data.twin 2.14)")
+    if label in load_twin_readers():
+        die(f"a remote reader '{label}' exists -- remove it first")
+    if active_types is None:
+        active_types = {t["key"] for t in model_types(tid)}
+    missing = [t for t in types if t not in active_types]
+    if missing:
+        die("not active for this tenant: " + ", ".join(missing)
+            + " (oaap data model types --tenant ...)")
+    principal = TWIN_REMOTE_PREFIX + label
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_R_NAME']\n"
+        "    u = m.find_user(users, name)\n"
+        "    if u is None:\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_R_TITLE'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_R_TENANT'],\n"
+        "                      'active': True})\n"
+        "    elif u.get('kind') != 'machine' or u.get('tenant') != os.environ['OAAP_R_TENANT']:\n"
+        "        print(json.dumps({'error': 'a principal of that name exists elsewhere'})); raise SystemExit\n"
+        "    else:\n"
+        "        u['active'] = True\n"
+        "    m.save_users(users)\n"
+        "try:\n"
+        "    rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_R_SCOPE'],\n"
+        "        os.environ['OAAP_R_LABEL'], os.environ.get('OAAP_R_DAYS') or None, 'root')\n"
+        "except ValueError as e:\n"
+        "    print(json.dumps({'error': str(e)})); raise SystemExit\n"
+        "print(json.dumps({'secret': secret, 'id': rec['id'], 'expires': rec['expires']}))\n",
+        {"OAAP_R_NAME": principal, "OAAP_R_TENANT": tid,
+         "OAAP_R_TITLE": f"remote twin reader {label}",
+         "OAAP_R_SCOPE": TWIN_KEY_SCOPE,
+         "OAAP_R_LABEL": f"oaap.data.twin remote reader ({','.join(types)})",
+         "OAAP_R_DAYS": str(days or "")})
+    res = json.loads(out.strip().splitlines()[-1])
+    if res.get("error"):
+        die(res["error"])
+    readers = load_twin_readers()
+    readers[label] = {"tenant": tid, "reads": types, "created": _iso_now(),
+                      "created_by": who, "key": res["id"], "expires": res["expires"]}
+    save_twin_readers(readers)
+    audit_tenant("twin.reader.add", tid, subject=principal, who=who,
+                 detail="reads " + ",".join(types) + f", key {res['id']}")
+    return res["secret"], res["expires"]
+
+
+def twin_reader_remove(label, who="root"):
+    readers = load_twin_readers()
+    r = readers.pop(label, None)
+    if r is None:
+        die(f"no remote reader '{label}' on this node")
+    principal = TWIN_REMOTE_PREFIX + label
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "name = os.environ['OAAP_R_NAME']\n"
+        "n = 0\n"
+        "for k in m.load_keys():\n"
+        "    if k['principal'] == name and not k.get('revoked'):\n"
+        "        m.revoke_key(k['id']); n += 1\n"
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, name)\n"
+        "    if u is not None:\n"
+        "        u['active'] = False\n"
+        "        m.save_users(users)\n"
+        "print(json.dumps({'revoked': n}))\n",
+        {"OAAP_R_NAME": principal})
+    n = json.loads(out.strip().splitlines()[-1]).get("revoked", 0)
+    # the record goes LAST: if identity could not be reached, die() above
+    # left it in place, and the twin still names who this reader is
+    save_twin_readers(readers)
+    audit_tenant("twin.reader.remove", r.get("tenant", ""), subject=principal,
+                 who=who, detail=f"{n} key(s) revoked, principal deactivated")
+    return n
+
+
+def cmd_data_twin(args):
+    """`oaap data twin readers|add-reader|remove-reader` (oaap.data.twin 2.14)."""
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.action == "readers":
+        readers = load_twin_readers()
+        if not readers:
+            print("No remote readers. Nobody on another node reads this node's twin.")
+            return
+        for label, r in sorted(readers.items()):
+            print(f"  {TWIN_REMOTE_PREFIX}{label:<20} tenant {tenant_label(r['tenant']) or 'default'}"
+                  f"  reads {','.join(r.get('reads') or [])}  key {r.get('key', '?')} "
+                  f"until {r.get('expires', '?')}")
+        return
+    label = args.arg1 or die(f"'data twin {args.action}' needs a reader label")
+    if args.action == "add-reader":
+        if not has_profile("store") or not _store_running():
+            die("this node's twin is not running (profile 'store') -- nothing to read")
+        tid = resolve_tenant(args.tenant) if args.tenant else ensure_default_tenant()
+        if tid is None:
+            die(f"this node has no tenant '{args.tenant}'")
+        key, expires = twin_reader_add(label, tid, args.reads, args.days, who=who)
+        print(f"Remote reader '{TWIN_REMOTE_PREFIX}{label}' reads "
+              f"{args.reads} of tenant '{tenant_label(tid) or 'default'}', read-only.")
+        print(f"Its key, shown ONCE (valid until {expires}):")
+        print("")
+        print(f"  {key}")
+        print("")
+        print("It belongs into the destination on the OTHER node, never into an app:")
+        print("  sudo oaap destination add <name> --target via:<tunnel>/<offer> "
+              "--auth bearer --secret-stdin")
+        print("and this node offers its twin through the connector, e.g.:")
+        print("  sudo oaap connector offer add <connector> twin --to http://gateway:80/twin "
+              "--methods GET,HEAD")
+    elif args.action == "remove-reader":
+        n = twin_reader_remove(label, who=who)
+        print(f"Remote reader '{TWIN_REMOTE_PREFIX}{label}' removed: {n} key(s) revoked, "
+              "the principal deactivated. Its next call is refused.")
+    else:
+        die(f"'data twin' knows readers, add-reader, remove-reader")
 
 
 def image_uid(image):
@@ -17050,12 +17212,14 @@ def main():
                          help="managed Postgres, type registry and other "
                               "data-platform services (oaap.data.store 0.1, "
                               "oaap.data.model 0.1, RFC-0031)")
-    pdt.add_argument("object", choices=["store", "model"])
+    pdt.add_argument("object", choices=["store", "model", "twin"])
     pdt.add_argument("action", choices=["status", "schemas", "create",
                                         "copy", "drop", "restore",
                                         "migrate-twin",
                                         "types", "show", "register",
-                                        "alias", "bindings"])
+                                        "alias", "bindings",
+                                        "readers", "add-reader",
+                                        "remove-reader"])
     pdt.add_argument("arg1", nargs="?",
                      help="create: purpose; copy/drop: schema; restore: "
                           "dump file; model show/register/alias: type key "
@@ -17070,7 +17234,13 @@ def main():
                           "was actually migrated (migrate.sh)")
     pdt.add_argument("--tenant", default="",
                      help="model types/register: tenant-id (RFC-0031 §4 "
-                          "third origin — the twin browser's CLI stand-in)")
+                          "third origin — the twin browser's CLI stand-in); "
+                          "twin add-reader: the tenant it reads")
+    pdt.add_argument("--reads", default="",
+                     help="twin add-reader: the type keys it may read, "
+                          "comma-separated (oaap.data.twin 2.14)")
+    pdt.add_argument("--days", type=int, default=None,
+                     help="twin add-reader: key validity in days (default 90, max 365)")
     pdt.set_defaults(fn=cmd_data)
     pe = sub.add_parser("external")
     pe.add_argument("action", choices=["show", "set", "remove"])
@@ -17097,7 +17267,8 @@ def main():
                  # types`/`show`/`bindings` are the same shape one level up
                  # (oaap.data.model 0.1) -- register/alias change the node.
                  or (args.cmd == "data" and args.action in
-                     ("status", "schemas", "types", "show", "bindings"))
+                     ("status", "schemas", "types", "show", "bindings",
+                      "readers"))
                  # `tenant` reads without root — including `check`, which
                  # reports and deliberately repairs nothing. Creating and
                  # renaming change the node and need root like everything
