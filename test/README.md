@@ -43,6 +43,8 @@ python3 test/test_tenant_address.py  # ein Namensraum, zwei Arten von Namen
 python3 test/test_tenant_place.py    # der Mandant als Ort: <kuerzel>.<knoten>
 python3 test/test_tenant_face.py     # das Gesicht: Titel, zwei Farben, ein Logo
 python3 test/test_destinations.py    # Destinationen: binden, Proxy, Uebergabe, keine in der Generalprobe
+python3 test/test_connector.py       # Tunnel, Plattformseite: Schluessel, Connector, Angebote, via, Route
+python3 test/test_connector_tunnel.py # Tunnel, echte Prozesse aussen+innen (braucht aiohttp)
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```

@@ -167,7 +167,7 @@ def attention_items(core, instances, dns_rows, pending_names):
 
 
 def build_document(node, version, profiles, now_iso, core, instances,
-                   dns_rows, pending_names, public_ip=""):
+                   dns_rows, pending_names, public_ip="", extra_attention=()):
     """Assemble the versioned status document (RFC-0021 §1).
 
     Schema 0.2 adds `names` (published names with the node's own DNS
@@ -185,8 +185,11 @@ def build_document(node, version, profiles, now_iso, core, instances,
                  for c in core],
         "instances": instances,
         "names": [name_row(r) for r in dns_rows or []],
+        # extra_attention: kinds owned by other specs -- the tunnel's
+        # connector_down / tunnel_down (oaap.net.connector 2.7). The list
+        # is the schema's open end; consumers tolerate unknown kinds.
         "attention": attention_items(core, instances, dns_rows,
-                                     pending_names),
+                                     pending_names) + list(extra_attention),
     }
     if public_ip:
         doc["public_ip"] = public_ip

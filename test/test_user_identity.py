@@ -122,12 +122,17 @@ ok("der /auth/*-Block jeder Instanz entfernt alle fuenf",
 stripped = [l.strip().removeprefix("request_header -")
             for l in caddyfile.splitlines()
             if l.strip().startswith("request_header -X-OAAP-")]
-ok("der feste Caddyfile strippt an fuenf Stellen",
-   len(stripped) == 5 * len(appctl.IDENTITY_HEADERS),
+# Sechs seit 0.1.129: /connect/tunnel (oaap.net.connector) ist die
+# sechste oeffentliche Route. Die Zahl steht hier, damit eine siebte
+# Route diesen Test anfassen muss -- und dabei jede Stelle mit allen
+# fuenf Kopfzeilen.
+PUBLIC_ROUTES = 6
+ok(f"der feste Caddyfile strippt an {PUBLIC_ROUTES} Stellen",
+   len(stripped) == PUBLIC_ROUTES * len(appctl.IDENTITY_HEADERS),
    f"{len(stripped)} Zeilen: {sorted(set(stripped))}")
 for h in appctl.IDENTITY_HEADERS:
     ok(f"und jede dieser Stellen nennt {h}",
-       stripped.count(h) == 5, stripped.count(h))
+       stripped.count(h) == PUBLIC_ROUTES, stripped.count(h))
 
 # --- 3. das Zugriffsprotokoll: Name und Adresse gehoeren nicht hinein -----
 logf = "\n".join(appctl._log_filter("\t"))

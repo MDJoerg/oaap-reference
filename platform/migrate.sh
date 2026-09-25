@@ -273,6 +273,13 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-place-assets
 # daemon's umask -- and 0.1.118 is what a missing mountpoint costs.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-idp-dir   2>&1 | sed 's/^/  /' || say "  WARNING: the provider-secret directory could not be prepared."
 
+# --- the tunnel (oaap.net.connector 0.1, 0.1.129) ---
+# The connector service's directories (the key one 0700), and the
+# /connect/tunnel route on the external sites -- generated once and
+# kept, so a route added to the generator needs this step to arrive.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-connect \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the tunnel route could not be prepared — run 'oaap status'."
+
 # --- open streams survive gateway reloads (0.1.102) ---
 # Every deployment reloads the gateway, and a reload used to cut every
 # open WebSocket/SSE stream of every app on the node. The delay that

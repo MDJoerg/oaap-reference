@@ -898,6 +898,58 @@ HEALTH_BODY = """
      hinkt hinterher.</p>
 </div>
 {% endif %}
+{% if cx and (cx.tunnels or cx.connectors) %}
+<div class="card">
+  <h2>Tunnel (Connector)</h2>
+  <p class="muted">Ein <strong>innerer</strong> Knoten baut von sich aus einen
+     Tunnel zu einem <strong>äußeren</strong> auf und bietet dort benannte
+     Ziele an. Der äußere Knoten sieht nur die Namen der Angebote, nie ihre
+     Adressen (oaap.net.connector).</p>
+  {% if not cx.reported %}<p class="err">Der Verbindungsdienst meldet keinen
+     Zustand — läuft <code>oaap-connect-1</code>?</p>{% endif %}
+  {% if cx.connectors %}
+  <h3>Dieser Knoten wählt hinaus</h3>
+  <table class="mini">
+    <tr><th>Connector</th><th>Zustand</th><th>Angebote</th></tr>
+    {% for c in cx.connectors %}
+    <tr>
+      <td><code>{{ c.label }}</code><br><span class="muted">{{ c.endpoint }}</span>
+          {% if c.plain %}<br><strong>unverschlüsselt (http)</strong>{% endif %}</td>
+      <td>{% if c.paused %}<span class="dot warn"></span>pausiert
+          {% elif not c.key %}<span class="dot err"></span>Schlüssel fehlt
+          {% elif c.connected %}<span class="dot ok"></span>verbunden seit {{ c.since }}
+          {% else %}<span class="dot err"></span>nicht verbunden
+            {% if c.last_error %}<br><span class="muted">{{ c.last_error }}</span>{% endif %}
+            {% if c.next_attempt %}<br><span class="muted">nächster Versuch {{ c.next_attempt }}</span>{% endif %}
+          {% endif %}</td>
+      <td>{% for o in c.offers %}<code>{{ o.name }}</code> → {{ o.to }}
+            {% if o.path %}<span class="muted">nur unter {{ o.path }}</span>{% endif %}
+            {% if o.methods %}<span class="muted">{{ o.methods|join(", ") }}</span>{% endif %}<br>
+          {% else %}<span class="muted">bietet nichts an</span>{% endfor %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Pausieren schließt den Tunnel sofort, und der äußere Knoten
+     kann ihn nicht wieder öffnen: <code>oaap connector pause &lt;label&gt;</code></p>
+  {% endif %}
+  {% if cx.tunnels %}
+  <h3>Hier wählen innere Knoten ein</h3>
+  <table class="mini">
+    <tr><th>Tunnel</th><th>Zustand</th><th>Angebote</th><th>Genutzt von</th></tr>
+    {% for t in cx.tunnels %}
+    <tr>
+      <td><code>{{ t.label }}</code><br><span class="muted">Mandant {{ t.tenant }}</span></td>
+      <td>{% if t.connected %}<span class="dot ok"></span>verbunden seit {{ t.since }}
+            <br><span class="muted">von {{ t.remote }}</span>
+          {% else %}<span class="dot err"></span>nicht verbunden{% endif %}</td>
+      <td>{% for o in t.offers %}<code>{{ o }}</code> {% else %}<span class="muted">–</span>{% endfor %}</td>
+      <td>{% for d in t.used_by %}<code>{{ d }}</code> {% else %}<span class="muted">keine Destination</span>{% endfor %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endif %}
 {% if reach and reach.rows %}
 <div class="card">
   <h2>Direkte Ports (Erreichbarkeit)</h2>
@@ -3168,6 +3220,16 @@ def load_instances():
 DESTINATIONS_FILE = "/apps-registry/destinations.json"
 
 
+def _dest_target_label(target, tunnels):
+    """The direct address, or `via` with the tunnel's state -- an app
+    cannot tell the two apart (oaap.net.connector 1), its operator must."""
+    via = target.get("via")
+    if not via:
+        return target.get("direct", "")
+    up = (tunnels.get(via.split("/")[0]) or {}).get("connected")
+    return f"über Tunnel {via} ({'verbunden' if up else 'NICHT verbunden'})"
+
+
 def _destination_view(inst):
     """What the instance page says about destinations: every declared
     need and every binding, and for each whether the proxy holds or the
@@ -3181,6 +3243,7 @@ def _destination_view(inst):
     own = dests.get(resolve_tenant(inst.get("tenant")) or "") or {}
     binds = inst.get("destinations") or {}
     needs = {d.get("name"): d for d in inst.get("declared_destinations") or []}
+    tunnels = ((_read_json(CONNECT_STATE) or {}).get("tunnels") or {})
     rows = []
     for need in sorted(set(binds) | set(needs)):
         decl = needs.get(need) or {}
@@ -3190,13 +3253,90 @@ def _destination_view(inst):
             "need": need, "purpose": decl.get("purpose", ""),
             "declared": bool(decl), "kind": (d or decl).get("kind", ""),
             "destination": dname, "missing": bool(dname) and not d,
-            "target": ((d or {}).get("target") or {}).get("direct", ""),
+            "target": _dest_target_label((d or {}).get("target") or {}, tunnels),
             "mode": ("" if not d else "Proxy" if d["kind"] == "http"
                      else "Übergabe"),
             "env": ("OAAP_DESTINATION_" + need.upper().replace("-", "_") + "_URL"
                     if d and d["kind"] == "http" else ""),
         })
     return rows
+
+
+# oaap.net.connector 2.7: the objects from the registry mount, the state
+# from the connector service's own directory. Never the keys: those live
+# in data/connect/secrets, which this container does not mount.
+CONNECT_FILE = "/apps-registry/connect.json"
+CONNECT_STATE = "/connect-state/state.json"
+
+
+def _connect_data():
+    conf = _read_json(CONNECT_FILE) or {}
+    st = _read_json(CONNECT_STATE)
+    return conf, st
+
+
+def _load_destinations_all():
+    try:
+        with open(DESTINATIONS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("destinations") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _via_users(label, dests=None):
+    dests = _load_destinations_all() if dests is None else dests
+    return [name for _tid, own in sorted(dests.items())
+            for name, d in sorted(own.items())
+            if (((d.get("target") or {}).get("via") or "").split("/")[0] == label)]
+
+
+def connect_view():
+    conf, st = _connect_data()
+    keys = conf.get("keys") or {}
+    conns = conf.get("connectors") or {}
+    if not keys and not conns:
+        return None
+    st_t = (st or {}).get("tunnels") or {}
+    st_c = (st or {}).get("connectors") or {}
+    dests = _load_destinations_all()
+    tunnels = []
+    for label, rec in sorted(keys.items()):
+        t = st_t.get(label) or {}
+        tunnels.append({"label": label, "tenant": tenant_label(rec.get("tenant", "")),
+                        "connected": bool(t.get("connected")), "since": t.get("since", ""),
+                        "remote": t.get("remote", ""),
+                        "offers": [o.get("name", "") for o in t.get("offers") or []],
+                        "used_by": _via_users(label, dests)})
+    connectors = []
+    for label, c in sorted(conns.items()):
+        s_ = st_c.get(label) or {}
+        connectors.append({
+            "label": label, "endpoint": c.get("endpoint", ""), "plain": bool(c.get("plain")),
+            "paused": bool(c.get("paused")), "key": bool(s_.get("key", True)),
+            "connected": bool(s_.get("connected")), "since": s_.get("since", ""),
+            "last_error": s_.get("last_error", ""), "next_attempt": s_.get("next_attempt", ""),
+            "offers": [{"name": n, "to": o.get("to", ""), "path": o.get("path", ""),
+                        "methods": o.get("methods") or []}
+                       for n, o in sorted((c.get("offers") or {}).items())]})
+    return {"tunnels": tunnels, "connectors": connectors, "reported": st is not None}
+
+
+def connect_attention():
+    """oaap.fleet.status: `connector_down` (inner, not paused, not
+    connected) and `tunnel_down` (outer, a tunnel a destination uses is
+    not connected). Nothing when this node has neither role."""
+    conf, st = _connect_data()
+    items = []
+    st_t = (st or {}).get("tunnels") or {}
+    st_c = (st or {}).get("connectors") or {}
+    for label, c in sorted((conf.get("connectors") or {}).items()):
+        if not c.get("paused") and not (st_c.get(label) or {}).get("connected"):
+            items.append({"kind": "connector_down", "detail": label})
+    dests = _load_destinations_all()
+    for label in sorted(conf.get("keys") or {}):
+        if _via_users(label, dests) and not (st_t.get(label) or {}).get("connected"):
+            items.append({"kind": "tunnel_down", "detail": label})
+    return items
 
 
 EXTERNAL_FILE = "/apps-registry/external.json"
@@ -4707,7 +4847,7 @@ def health():
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
                 core=core, apps=apps, ext=external_access(),
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
-                deploys=recent_deploys(), bk=backup_state(),
+                deploys=recent_deploys(), bk=backup_state(), cx=connect_view(),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
 
@@ -4806,6 +4946,7 @@ def fleet_status():
         dns_rows=dns.get("rows"),
         pending_names=pending,
         public_ip=dns.get("public_ip", ""),
+        extra_attention=connect_attention(),
     )
 
 

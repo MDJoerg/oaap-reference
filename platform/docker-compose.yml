@@ -132,6 +132,45 @@ services:
       # deploy hook (runtime spec 2.5): the portal queues requests here,
       # the host-side worker (oaap-deployd path unit) executes them
       - "${OAAP_DATA_DIR}/data/deploy-spool:/deploy-spool"
+      # read-only: what the connector service reports -- tunnels,
+      # connectors, offers (oaap.net.connector 2.7). Its own directory,
+      # never the one with the keys next to it.
+      - "${OAAP_DATA_DIR}/data/connect/state:/connect-state:ro"
+
+  # The tunnel (oaap.net.connector 0.1, RFC-0033 stage 2). One service,
+  # two roles, decided by what the operator configured: OUTER when this
+  # node issued connect keys (inner nodes dial in through the gateway's
+  # public /connect/tunnel), INNER when it has connectors (it dials out
+  # and answers from its offer list). Idle when neither -- which is why
+  # it carries no profile: a node becomes an outer or inner node by a
+  # command, not by an update.
+  #
+  # No 'ports:' -- deliberate. The gateway reaches it over this compose
+  # network; /via (the destination listener's door) refuses anything
+  # without the gateway's key, and the inner role has no listener at all.
+  connect:
+    build: ./services/connect
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        # RFC-0038 D5: Docker keeps container logs without any limit
+        # unless told otherwise, and no OAAP node configures a
+        # daemon.json. The app containers get this at `docker run`
+        # (appctl.CONTAINER_LOG_OPTS); the core services need it
+        # spelled out here.
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # connect.json (key hashes, connectors, offers) -- read-only, the
+      # same mount identity and twin have; appctl owns the file
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+      # the inner side's keys in the clear and the gateway's /via key --
+      # read-only, and mounted by NO other container (the posture of
+      # data/destinations and data/idp)
+      - "${OAAP_DATA_DIR}/data/connect/secrets:/secrets:ro"
+      # the one thing it writes: state.json and the stream logs
+      - "${OAAP_DATA_DIR}/data/connect/state:/state"
 
   # Managed Postgres (oaap.data.store 0.1, RFC-0031 Schritt 1). Gated by
   # the node profile 'store' (RFC-0011, oaap.core.host 2.5) through

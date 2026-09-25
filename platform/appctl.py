@@ -714,9 +714,7 @@ def write_destinations_caddy(reg=None):
                           'this node -- a server_admin has to set it again '
                           '(oaap destination set-secret)." 503', "\t}"]
                 continue
-            scheme, host, port, base = parse_dest_target("http", d["target"]["direct"])
-            default = {"http": 80, "https": 443}[scheme]
-            hostport = host if not port or port == default else f"{host}:{port}"
+            via = (d.get("target") or {}).get("via")
             # `route`, not bare directives: inside `handle` Caddy SORTS
             # directives, and `rewrite` sorts before `uri`. Measured on
             # oaap-test 2026-09-25 -- the target received
@@ -724,10 +722,27 @@ def write_destinations_caddy(reg=None):
             lines.append("\t\troute {")
             lines += strip_identity("\t\t\t")
             lines.append(f"\t\t\turi strip_prefix /destinations/{need}")
-            if base:
-                lines.append(f"\t\t\trewrite * {base}{{uri}}")
-            lines.append(f"\t\t\treverse_proxy {scheme}://{host}:{port or default} {{")
-            lines.append(f"\t\t\t\theader_up Host {hostport}")
+            if via:
+                # oaap.net.connector 2.5: the same call, carried into the
+                # tunnel by the connector service. Three headers of the
+                # gateway's own -- set, never passed on, so whatever the
+                # app sent under these names is overwritten here.
+                tunnel, offer = via.split("/", 1)
+                lines.append(f"\t\t\trewrite * /via/{tunnel}/{offer}{{uri}}")
+                lines.append(f"\t\t\treverse_proxy {CONNECT_SERVICE} {{")
+                lines.append(f"\t\t\t\theader_up {CONNECT_GW_KEY} "
+                             f"{_caddy_quote(connect_gateway_key())}")
+                lines.append(f"\t\t\t\theader_up {CONNECT_GW_CALLER} {_caddy_quote(name)}")
+                lines.append(f"\t\t\t\theader_up {CONNECT_GW_DEST} "
+                             f"{_caddy_quote(f'{tid}/{dname}')}")
+            else:
+                scheme, host, port, base = parse_dest_target("http", d["target"]["direct"])
+                default = {"http": 80, "https": 443}[scheme]
+                hostport = host if not port or port == default else f"{host}:{port}"
+                if base:
+                    lines.append(f"\t\t\trewrite * {base}{{uri}}")
+                lines.append(f"\t\t\treverse_proxy {scheme}://{host}:{port or default} {{")
+                lines.append(f"\t\t\t\theader_up Host {hostport}")
             for h in ("X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host"):
                 lines.append(f"\t\t\t\theader_up -{h}")
             if auth["type"] == "basic":
@@ -785,13 +800,26 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
                                  "letter or digit")
     if kind not in DEST_KINDS:
         raise DestinationRefused(f"kind is one of {', '.join(DEST_KINDS)}")
-    if (target or "").startswith("via:"):
-        raise DestinationRefused("targets through a connector (via) are "
-                                 "RFC-0033 stage 2 and not built yet")
-    _s, host, _p, _b = parse_dest_target(kind, target)
-    why = dest_target_refusal(host)
-    if why:
-        raise DestinationRefused(why)
+    if (target or "").strip().startswith("via:"):
+        # oaap.net.connector 2.5: through a tunnel this node accepts.
+        # HTTP only in 0.1, and only a tunnel of THIS tenant -- the
+        # connector service checks the same again on every call.
+        if kind != "http":
+            raise DestinationRefused("a tcp destination through a tunnel is not "
+                                     "part of oaap.net.connector 0.1 -- http only")
+        tunnel, offer = parse_via(target)
+        rec = (load_connect().get("keys") or {}).get(tunnel)
+        if not rec or rec.get("tenant") != tid:
+            # another tenant's tunnel is answered as one that is not there
+            raise DestinationRefused(f"this tenant has no tunnel '{tunnel}' on this "
+                                     "node (oaap connect key list)")
+        target_obj = {"via": f"{tunnel}/{offer}"}
+    else:
+        _s, host, _p, _b = parse_dest_target(kind, target)
+        why = dest_target_refusal(host)
+        if why:
+            raise DestinationRefused(why)
+        target_obj = {"direct": target.strip()}
     if auth_type not in DEST_AUTH[kind]:
         raise DestinationRefused(f"a {kind} destination authenticates with "
                                  f"{' | '.join(DEST_AUTH[kind])}")
@@ -812,7 +840,7 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
     own = dests.setdefault(tid, {})
     if name in own:
         raise DestinationRefused(f"this tenant already has a destination '{name}'")
-    own[name] = {"kind": kind, "target": {"direct": target.strip()},
+    own[name] = {"kind": kind, "target": target_obj,
                  "auth": auth, "secret": auth_type != "none",
                  "created": _iso_now(), "created_by": who}
     if auth_type != "none":
@@ -948,7 +976,7 @@ def _dest_line(tid, name, d, dest_secrets, reg):
               else ", SECRET MISSING -- calls are refused until it is set")
     mode = "proxy" if d["kind"] == "http" else "handover"
     bound = destination_bindings(reg, tid, name)
-    return (f"  {name:<20} {d['kind']:<4} {mode:<8} {d['target']['direct']}\n"
+    return (f"  {name:<20} {d['kind']:<4} {mode:<8} {dest_target_text(d)}\n"
             f"  {'':<20} auth {a}\n"
             f"  {'':<20} bound: "
             + (", ".join(f"{k} (as {n})" for k, n in bound) or "nothing"))
@@ -1089,6 +1117,514 @@ def destination_unbind(reg, key, need, who="root", role="root"):
                  subject=key, who=who, role=role, detail=f"{need} -> {name}")
     refresh_destinations(reg)
     sync_destination_env(reg, only=key)
+
+
+# ------------------------------------------- connector (RFC-0033 stage 2)
+# The tunnel (oaap.net.connector 0.1). The INNER node dials out to the
+# OUTER node and answers calls from its offer list; the outer node sees
+# offer names, never addresses. Both roles are one compose service,
+# `connect`, which READS what is written here and writes only its state.
+#
+# Three places again, three readers:
+#   apps/connect.json         keys (SHA-256 only, label, tenant) and
+#                             connectors (endpoint, paused, offers) --
+#                             no secret, in the backup, read by the
+#                             connect service and the portal
+#   data/connect/secrets/     the inner side's keys in the clear and the
+#                             gateway's key for /via -- 0600 in 0700,
+#                             mounted into `connect` only, NOT in the
+#                             backup (the posture of data/destinations)
+#   data/connect/state/       written by `connect`: state.json and the
+#                             stream logs; the portal reads it
+CONNECT_FILE = os.path.join(APPS_DIR, "connect.json")
+CONNECT_DIR = os.path.join(DATA_DIR, "data", "connect")
+CONNECT_SECRETS_DIR = os.path.join(CONNECT_DIR, "secrets")
+CONNECTOR_KEYS_FILE = os.path.join(CONNECT_SECRETS_DIR, "connector-keys.json")
+CONNECT_GATEWAY_KEY_FILE = os.path.join(CONNECT_SECRETS_DIR, "gateway.key")
+CONNECT_STATE_DIR = os.path.join(CONNECT_DIR, "state")
+CONNECT_SERVICE = "connect:8000"
+CONNECT_ROUTE = "/connect/tunnel"
+CONNECT_CONTAINER = "oaap-connect-1"
+CONNECT_KEY_PREFIX = "oaapc_"
+# MUST match services/connect/app.py -- test_connector.py checks it.
+CONNECT_GW_KEY = "X-OAAP-Connect-Gateway"
+CONNECT_GW_CALLER = "X-OAAP-Connect-Caller"
+CONNECT_GW_DEST = "X-OAAP-Connect-Destination"
+CONNECT_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+# spec 2.3: the node's own platform services, never an offer. The same
+# list is in the service, which re-checks every call -- a file can be
+# edited by hand, and the check that counts is the one at the stream.
+CONNECT_PLATFORM_HOSTS = ("identity", "portal", "store", "twin", "broker",
+                          "relay", "connect", "localhost")
+CONNECT_FRONT_DOOR = ("gateway", GATEWAY_CONTAINER)
+
+
+def load_connect():
+    try:
+        with open(CONNECT_FILE, encoding="utf-8") as f:
+            c = json.load(f) or {}
+    except (OSError, ValueError):
+        c = {}
+    c.setdefault("keys", {})
+    c.setdefault("connectors", {})
+    return c
+
+
+def save_connect(c):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = CONNECT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "keys": c.get("keys") or {},
+                   "connectors": c.get("connectors") or {}}, f, indent=2)
+    os.replace(tmp, CONNECT_FILE)
+    os.chmod(CONNECT_FILE, 0o644)
+
+
+def _connect_secrets_dir():
+    os.makedirs(CONNECT_SECRETS_DIR, exist_ok=True)
+    os.chmod(CONNECT_SECRETS_DIR, 0o700)
+
+
+def _write_secret_file(path, text):
+    """0600 on the temporary file, before the move (save_dest_secrets)."""
+    _connect_secrets_dir()
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def load_connector_keys():
+    try:
+        with open(CONNECTOR_KEYS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("keys") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_connector_keys(keys):
+    _write_secret_file(CONNECTOR_KEYS_FILE, json.dumps({"keys": keys}, indent=2))
+
+
+def connect_gateway_key():
+    """What the gateway presents on /via (spec 2.5). Made on first use;
+    held by the destination listener (0600) and the connect service."""
+    have = (_read_file(CONNECT_GATEWAY_KEY_FILE) or "").strip()
+    if have:
+        return have
+    key = secrets.token_urlsafe(32)
+    _write_secret_file(CONNECT_GATEWAY_KEY_FILE, key + "\n")
+    return key
+
+
+def connect_state():
+    try:
+        with open(os.path.join(CONNECT_STATE_DIR, "state.json"), encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def connect_service_running():
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}",
+                        CONNECT_CONTAINER], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def parse_via(target):
+    """`via:<tunnel>/<offer>` -> (tunnel, offer), or raise."""
+    t = (target or "").strip()
+    m = re.fullmatch(rf"via:({DEST_NAME_RE})/({DEST_NAME_RE})", t)
+    if not m:
+        raise DestinationRefused("a tunnel target is via:<tunnel>/<offer>, both "
+                                 f"[a-z0-9-] (got '{t}')")
+    return m.group(1), m.group(2)
+
+
+def dest_target_text(d):
+    t = d.get("target") or {}
+    return f"via {t['via']}" if t.get("via") else t.get("direct", "")
+
+
+def via_destinations(tunnel):
+    """Every (tenant, destination) that points at this tunnel."""
+    return [(tid, name) for tid, own in sorted(load_destinations().items())
+            for name, d in sorted(own.items())
+            if ((d.get("target") or {}).get("via") or "").split("/")[0] == tunnel]
+
+
+def _check_label(label, what):
+    if not re.fullmatch(DEST_NAME_RE, label or ""):
+        raise DestinationRefused(f"a {what} is [a-z0-9-], 2-40 characters, starting "
+                                 "and ending with a letter or digit")
+
+
+def connect_key_issue(label, tid, who="root", role="root"):
+    """Outer side, spec 2.2. Returns the key -- the only time it exists
+    in the clear on this node."""
+    _check_label(label, "tunnel label")
+    c = load_connect()
+    if label in c["keys"]:
+        raise DestinationRefused(f"a tunnel '{label}' exists on this node -- revoke it "
+                                 "first, or choose another label")
+    key = CONNECT_KEY_PREFIX + secrets.token_urlsafe(32)
+    c["keys"][label] = {"hash": hashlib.sha256(key.encode()).hexdigest(),
+                        "tenant": tid, "issued": _iso_now(), "issued_by": who}
+    save_connect(c)
+    audit_tenant("connect.key.issue", tid, subject=label, who=who, role=role)
+    return key
+
+
+def connect_key_revoke(label, who="root", role="root"):
+    """Always succeeds for an existing key -- it is the emergency action
+    (spec 2.2). Returns the destinations it cut."""
+    c = load_connect()
+    rec = c["keys"].pop(label, None)
+    if not rec:
+        raise DestinationRefused(f"no tunnel '{label}' on this node")
+    save_connect(c)
+    cut = via_destinations(label)
+    audit_tenant("connect.key.revoke", rec.get("tenant", ""), subject=label,
+                 who=who, role=role,
+                 detail=("cuts " + ", ".join(n for _t, n in cut)) if cut else "")
+    return cut
+
+
+def tunnel_endpoint_check(endpoint, plain):
+    import urllib.parse
+    e = (endpoint or "").strip().rstrip("/")
+    u = urllib.parse.urlsplit(e)
+    if u.scheme not in ("https", "http") or not u.hostname:
+        raise DestinationRefused("the endpoint is the outer node's address, "
+                                 "https://<host>[:port]")
+    if u.scheme == "http" and not plain:
+        raise DestinationRefused("an http:// endpoint sends the key in the clear -- "
+                                 "https:// it is, or say --plain for a LAN rehearsal")
+    if u.username or u.password or u.query or u.fragment or u.path not in ("", "/"):
+        raise DestinationRefused("the endpoint is scheme, host and port -- nothing else")
+    return e
+
+
+def check_connect_key(key):
+    if not re.fullmatch(CONNECT_KEY_PREFIX + r"[A-Za-z0-9_-]{20,}", key or ""):
+        raise DestinationRefused(f"that is not a connect key (it starts with "
+                                 f"{CONNECT_KEY_PREFIX} and was shown by "
+                                 "'oaap connect key issue' on the outer node)")
+
+
+def tunnel_connector_add(label, endpoint, key, plain=False, who="root", role="root"):
+    _check_label(label, "connector label")
+    e = tunnel_endpoint_check(endpoint, plain)
+    check_connect_key(key)
+    c = load_connect()
+    if label in c["connectors"]:
+        raise DestinationRefused(f"a connector '{label}' exists on this node")
+    c["connectors"][label] = {"endpoint": e, "plain": e.startswith("http://"),
+                              "paused": False, "offers": {},
+                              "created": _iso_now(), "created_by": who}
+    keys = load_connector_keys()
+    keys[label] = key
+    save_connector_keys(keys)
+    save_connect(c)
+    audit_tenant("connector.add", "", subject=label, who=who, role=role,
+                 detail=e + (" (PLAIN http)" if e.startswith("http://") else ""))
+
+
+def tunnel_connector_set_key(label, key, who="root", role="root"):
+    if label not in load_connect()["connectors"]:
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    check_connect_key(key)
+    keys = load_connector_keys()
+    keys[label] = key
+    save_connector_keys(keys)
+    audit_tenant("connector.key", "", subject=label, who=who, role=role)
+
+
+def tunnel_connector_remove(label, who="root", role="root"):
+    c = load_connect()
+    if not c["connectors"].pop(label, None):
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    save_connect(c)
+    keys = load_connector_keys()
+    if keys.pop(label, None) is not None:
+        save_connector_keys(keys)
+    audit_tenant("connector.remove", "", subject=label, who=who, role=role)
+
+
+def tunnel_connector_set_paused(label, paused, who="root", role="root"):
+    c = load_connect()
+    conn = c["connectors"].get(label)
+    if not conn:
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    if bool(conn.get("paused")) == paused:
+        return False
+    conn["paused"] = paused
+    save_connect(c)
+    audit_tenant("connector.pause" if paused else "connector.resume", "",
+                 subject=label, who=who, role=role)
+    return True
+
+
+def offer_target_refusal(to):
+    """Why this offer must not be carried, or "" (spec 2.3). The service
+    applies the same rule to every call (services/connect/app.py)."""
+    import urllib.parse
+    try:
+        u = urllib.parse.urlsplit(to or "")
+        port = u.port
+    except ValueError:
+        return "not a usable URL"
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return "an offer is an http:// or https:// URL"
+    if u.username or u.password or u.query or u.fragment or "@" in u.netloc:
+        return "an offer carries no user, query or fragment"
+    h = u.hostname.lower()
+    if h in CONNECT_PLATFORM_HOSTS or h.startswith("127.") or h in ("::1", "0.0.0.0"):
+        return f"'{h}' is a platform service or this machine"
+    if re.fullmatch(r"oaap-[a-z0-9-]+-\d+", h) and h not in CONNECT_FRONT_DOOR:
+        return f"'{h}' is a platform container"
+    if h in CONNECT_FRONT_DOOR and (port or (443 if u.scheme == "https" else 80)) not in (80, 443):
+        return "the gateway is offered on its public ports (80, 443) only"
+    return ""
+
+
+def tunnel_offer_add(label, offer, to, path="", methods="", who="root", role="root"):
+    _check_label(offer, "offer name")
+    c = load_connect()
+    conn = c["connectors"].get(label)
+    if not conn:
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    to = (to or "").strip()
+    why = offer_target_refusal(to)
+    if why:
+        raise DestinationRefused(why)
+    path = (path or "").strip()
+    if path and not re.fullmatch(r"(/[A-Za-z0-9._~-]+)+/?", path):
+        raise DestinationRefused("--path is a prefix like /api/, letters, digits "
+                                 "and . _ ~ - only")
+    if any(seg in (".", "..") for seg in path.split("/")):
+        raise DestinationRefused("--path has no '.' or '..' segment")
+    ms = [m.strip().upper() for m in (methods or "").split(",") if m.strip()]
+    bad = [m for m in ms if m not in CONNECT_METHODS]
+    if bad:
+        raise DestinationRefused(f"unknown method(s): {', '.join(bad)}")
+    o = {"to": to}
+    if path:
+        o["path"] = path.rstrip("/") or "/"
+    if ms:
+        o["methods"] = ms
+    was = (conn.get("offers") or {}).get(offer)
+    conn.setdefault("offers", {})[offer] = o
+    save_connect(c)
+    audit_tenant("connector.offer.add", "", subject=f"{label}/{offer}", who=who,
+                 role=role, detail=to + (f" path {o['path']}" if path else "")
+                 + (f" methods {','.join(ms)}" if ms else "")
+                 + (" (replaced)" if was else ""))
+    return bool(was)
+
+
+def tunnel_offer_remove(label, offer, who="root", role="root"):
+    c = load_connect()
+    conn = c["connectors"].get(label)
+    if not conn or offer not in (conn.get("offers") or {}):
+        raise DestinationRefused(f"connector '{label}' has no offer '{offer}'")
+    del conn["offers"][offer]
+    save_connect(c)
+    audit_tenant("connector.offer.remove", "", subject=f"{label}/{offer}",
+                 who=who, role=role)
+
+
+def _connect_log_tail(name, n):
+    path = os.path.join(CONNECT_STATE_DIR, "log", name + ".jsonl")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+    except OSError:
+        print("No calls recorded yet.")
+        return
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        print(f"  {r.get('time', '')}  {r.get('status', ''):>3}  {r.get('method', ''):<6} "
+              f"{r.get('offer', '')}{r.get('path', '')}  caller {r.get('caller', '') or '?'}"
+              f"  {r.get('ms', '?')} ms  {r.get('result', '')}")
+
+
+def _service_note():
+    if not connect_service_running():
+        print("  NOTE: the connector service is not running on this node "
+              f"({CONNECT_CONTAINER}) -- nothing dials and nothing is accepted.")
+
+
+def cmd_connect(args):
+    """`oaap connect ...` -- the OUTER side (spec 2.2)."""
+    who = _dest_who()
+    try:
+        if args.action == "key":
+            sub_ = args.name or die("'connect key' needs issue, revoke or list")
+            if sub_ == "list":
+                args.action = "list"
+            elif sub_ == "issue":
+                label = args.second or die("'connect key issue' needs a label")
+                tid = resolve_tenant_arg(args.tenant) or ensure_default_tenant()
+                key = connect_key_issue(label, tid, who=who)
+                print(f"Connect key for tunnel '{label}' (tenant "
+                      f"'{tenant_label(tid)}'). Shown ONCE -- this node keeps "
+                      "only its hash:")
+                print("")
+                print(f"  {key}")
+                print("")
+                print("On the inner node:")
+                print(f"  sudo oaap connector add {label} --endpoint "
+                      f"https://{load_external() or '<this node>'} --key-stdin")
+                return
+            elif sub_ == "revoke":
+                label = args.second or die("'connect key revoke' needs a label")
+                cut = connect_key_revoke(label, who=who)
+                print(f"Key of tunnel '{label}' revoked. A connected tunnel closes "
+                      "within 5 seconds.")
+                if cut:
+                    print("  These destinations now answer 502: "
+                          + ", ".join(f"'{n}'" for _t, n in cut))
+                return
+            else:
+                die("'connect key' needs issue, revoke or list")
+        c, st = load_connect(), connect_state()
+        tunnels = st.get("tunnels") or {}
+        if args.action == "list":
+            if not c["keys"]:
+                print("No connect keys. No inner node can dial in "
+                      "(oaap connect key issue <label> --tenant <t>).")
+                return
+            for label, rec in sorted(c["keys"].items()):
+                t = tunnels.get(label) or {}
+                state = (f"connected since {t.get('since', '?')} from {t.get('remote', '?')}"
+                         if t.get("connected") else "NOT CONNECTED")
+                print(f"  {label:<20} tenant {tenant_label(rec.get('tenant', ''))}  {state}")
+                if t.get("connected"):
+                    print(f"  {'':<20} offers: "
+                          + (", ".join(o["name"] for o in t.get("offers") or []) or "none"))
+                used = via_destinations(label)
+                print(f"  {'':<20} used by: "
+                      + (", ".join(n for _t, n in used) or "no destination"))
+            _service_note()
+            return
+        label = args.name or die(f"'connect {args.action}' needs a tunnel label")
+        if label not in c["keys"]:
+            die(f"no tunnel '{label}' on this node")
+        if args.action == "offers":
+            t = tunnels.get(label) or {}
+            if not t.get("connected"):
+                print(f"'{label}' is not connected -- no offers known right now.")
+                return
+            for o in t.get("offers") or []:
+                print(f"  {o['name']:<20} {o.get('kind', 'http')}")
+            if not t.get("offers"):
+                print("The inner node offers nothing on this tunnel.")
+        elif args.action == "log":
+            _connect_log_tail("tunnel-" + label, args.lines)
+    except DestinationRefused as e:
+        die(str(e))
+
+
+def cmd_connector(args):
+    """`oaap connector ...` -- the INNER side (spec 2.3)."""
+    who = _dest_who()
+    try:
+        c, st = load_connect(), connect_state()
+        states = st.get("connectors") or {}
+        keys = load_connector_keys()
+        if args.action == "list":
+            if not c["connectors"]:
+                print("No connectors. This node dials nowhere "
+                      "(oaap connector add <label> --endpoint https://...).")
+                return
+            for label, conn in sorted(c["connectors"].items()):
+                s = states.get(label) or {}
+                if conn.get("paused"):
+                    state = "PAUSED"
+                elif not keys.get(label):
+                    state = "KEY MISSING (oaap connector set-key " + label + ")"
+                elif s.get("connected"):
+                    state = f"connected since {s.get('since', '?')}"
+                else:
+                    state = ("NOT CONNECTED -- " + (s.get("last_error") or "not tried yet")
+                             + (f"; next attempt {s['next_attempt']}"
+                                if s.get("next_attempt") else ""))
+                print(f"  {label:<20} {conn['endpoint']}"
+                      + ("  (PLAIN http)" if conn.get("plain") else ""))
+                print(f"  {'':<20} {state}")
+                for name, o in sorted((conn.get("offers") or {}).items()):
+                    print(f"  {'':<20} offer {name:<16} -> {o['to']}"
+                          + (f"  path {o['path']}" if o.get("path") else "")
+                          + (f"  {','.join(o['methods'])}" if o.get("methods") else ""))
+                if not conn.get("offers"):
+                    print(f"  {'':<20} offers nothing -- the tunnel carries no call")
+            _service_note()
+            return
+        if args.action == "offer":
+            op = args.name or die("'connector offer' needs add or remove")
+            label = args.second or die(f"'connector offer {op}' needs the connector")
+            offer = args.third or die(f"'connector offer {op}' needs the offer name")
+            if op == "add":
+                if not args.to:
+                    die("'connector offer add' needs --to <url>")
+                replaced = tunnel_offer_add(label, offer, args.to, args.path,
+                                               args.methods, who=who)
+                print(f"Offer '{offer}' {'replaced' if replaced else 'added'} on "
+                      f"'{label}'. The outer node learns its NAME within seconds, "
+                      "never the address.")
+            elif op == "remove":
+                tunnel_offer_remove(label, offer, who=who)
+                print(f"Offer '{offer}' removed. Every destination that used it is "
+                      "cut now -- nobody on the outer node was asked.")
+            else:
+                die("'connector offer' needs add or remove")
+            return
+        label = args.name or die(f"'connector {args.action}' needs a label")
+        if args.action == "add":
+            tunnel_connector_add(label, args.endpoint, _read_connect_key(args),
+                          plain=args.plain, who=who)
+            print(f"Connector '{label}' added. It dials within seconds and offers "
+                  "nothing yet:")
+            print(f"  sudo oaap connector offer add {label} <offer> --to http://...")
+        elif args.action == "set-key":
+            tunnel_connector_set_key(label, _read_connect_key(args), who=who)
+            print(f"Key of '{label}' replaced; it redials within seconds.")
+        elif args.action == "remove":
+            tunnel_connector_remove(label, who=who)
+            print(f"Connector '{label}' removed, with its key. The tunnel closes "
+                  "within seconds.")
+        elif args.action in ("pause", "resume"):
+            paused = args.action == "pause"
+            if tunnel_connector_set_paused(label, paused, who=who):
+                print(f"'{label}' " + ("paused: the tunnel closes within 5 seconds "
+                                       "and stays closed until 'resume'. The outer "
+                                       "node cannot reopen it." if paused else
+                                       "resumed: it dials within seconds."))
+            else:
+                print(f"'{label}' is already {'paused' if paused else 'running'}.")
+        elif args.action == "show":
+            conn = c["connectors"].get(label) or die(f"no connector '{label}' on this node")
+            s = states.get(label) or {}
+            print(json.dumps({"connector": label, **conn, "key": bool(keys.get(label)),
+                              "state": s}, indent=2, ensure_ascii=False))
+        elif args.action == "log":
+            if label not in c["connectors"]:
+                die(f"no connector '{label}' on this node")
+            _connect_log_tail("connector-" + label, args.lines)
+    except DestinationRefused as e:
+        die(str(e))
+
+
+def _read_connect_key(args):
+    """Hidden prompt, or stdin with --key-stdin -- never an argument."""
+    if getattr(args, "key_stdin", False):
+        return sys.stdin.readline().strip()
+    return getpass.getpass("Connect key (hidden): ").strip()
 
 
 # ------------------------------------------------ network migration (RFC-0016)
@@ -2765,6 +3301,32 @@ def cmd_migrate_place_assets(_args):
         print("  The shared stylesheet and the tenant logos are served")
         print("  there now; until now they answered with the login form.")
         print("  Nothing was cut: the gateway was reloaded, not restarted.")
+
+
+def cmd_migrate_connect(_args):
+    """Prepare a node for the tunnel (oaap.net.connector 0.1, 0.1.129).
+
+    Two things. The directories: `connect` mounts data/connect/secrets
+    and data/connect/state, and a directory Docker creates for a mount
+    is root's with the daemon's umask -- the secrets one must be 0700.
+
+    And the ROUTE on the external sites. An inner node on the internet
+    dials the outer node's NAME, and the sites for names are generated
+    once and kept -- the /platform/* lesson of 0.1.117: a route added to
+    the generator reaches no node until something rewrites the file.
+    Silent when it changes nothing; a reload, never a restart.
+    """
+    os.makedirs(CONNECT_STATE_DIR, exist_ok=True)
+    _connect_secrets_dir()
+    path = os.path.join(CADDY_APPS_DIR, "external.caddy")
+    have = _read_file(path) or ""
+    if have and f"handle {CONNECT_ROUTE} {{" not in have:
+        print("")
+        print("Opening the tunnel route on the external sites (oaap.net.connector) ...")
+        refresh_generated_sites()
+        reload_gateway()
+        print(f"  {CONNECT_ROUTE} answers now; nothing dials in until a key is")
+        print("  issued (oaap connect key issue). Reloaded, not restarted.")
 
 
 def cmd_migrate_stream_close(_args):
@@ -6448,6 +7010,13 @@ def _portal_site_body():
     lines.append("\thandle /fleet/* {")
     lines += strip_identity()
     lines.append("\t\treverse_proxy portal:8000")
+    lines.append("\t}")
+    # the tunnel (oaap.net.connector 2.4): an inner node on the internet
+    # dials the node's NAME, which is this site -- the base Caddyfile's
+    # :80 block alone would be the /platform/* mistake again
+    lines.append(f"\thandle {CONNECT_ROUTE} {{")
+    lines += strip_identity()
+    lines += _proxy(CONNECT_SERVICE, "\t\t")
     lines.append("\t}")
     lines.append("\thandle {")
     lines.append("\t\tforward_auth identity:8000 {")
@@ -15981,7 +16550,8 @@ def main():
     pdst.add_argument("--tenant", default="", help="tenant label (default: the default tenant)")
     pdst.add_argument("--kind", choices=list(DEST_KINDS), default="http")
     pdst.add_argument("--target", default="",
-                      help="https://host[:port][/base] or tcp://host:port")
+                      help="https://host[:port][/base], tcp://host:port, or "
+                           "via:<tunnel>/<offer> (oaap.net.connector)")
     pdst.add_argument("--auth", choices=["none", "basic", "bearer", "header"],
                       default="none")
     pdst.add_argument("--user", default="", help="basic: the user name")
@@ -15993,6 +16563,38 @@ def main():
     pdst.add_argument("--rehearsal-exception", action="store_true",
                       help="bind: deliberately bind a rehearsal (logged, RFC-0030)")
     pdst.set_defaults(fn=cmd_destination)
+    pcn = sub.add_parser("connect",
+                         help="the outer side of a tunnel: keys inner nodes dial "
+                              "in with (oaap.net.connector 0.1, RFC-0033)")
+    pcn.add_argument("action", choices=["key", "list", "offers", "log"])
+    pcn.add_argument("name", nargs="?",
+                     help="key: issue|revoke|list; offers/log: the tunnel label")
+    pcn.add_argument("second", nargs="?", help="key issue/revoke: the tunnel label")
+    pcn.add_argument("--tenant", default="",
+                     help="key issue: the tenant the tunnel serves (default: the default tenant)")
+    pcn.add_argument("-n", "--lines", type=int, default=30, help="log: how many calls")
+    pcn.set_defaults(fn=cmd_connect)
+    pco = sub.add_parser("connector",
+                         help="the inner side of a tunnel: dial out, offer "
+                              "backends by name (oaap.net.connector 0.1)")
+    pco.add_argument("action", choices=["list", "show", "add", "remove", "set-key",
+                                        "pause", "resume", "log", "offer"])
+    pco.add_argument("name", nargs="?",
+                     help="the connector label; offer: add|remove")
+    pco.add_argument("second", nargs="?", help="offer: the connector label")
+    pco.add_argument("third", nargs="?", help="offer: the offer name")
+    pco.add_argument("--endpoint", default="",
+                     help="add: the outer node, https://<host>")
+    pco.add_argument("--plain", action="store_true",
+                     help="add: accept an http:// endpoint (LAN rehearsal only)")
+    pco.add_argument("--key-stdin", action="store_true",
+                     help="add/set-key: read the connect key from standard input")
+    pco.add_argument("--to", default="", help="offer add: the backend, http(s)://host[:port][/base]")
+    pco.add_argument("--path", default="", help="offer add: only paths below this prefix")
+    pco.add_argument("--methods", default="",
+                     help="offer add: only these methods, e.g. GET,POST")
+    pco.add_argument("-n", "--lines", type=int, default=30, help="log: how many calls")
+    pco.set_defaults(fn=cmd_connector)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])
     pk.add_argument("source", nargs="?", help="the instance that may reach the target")
@@ -16055,6 +16657,10 @@ def main():
                          help="internal: give each tenant its address "
                               "<label>.<node> (RFC-0042 T1/T2)")
     pmp.set_defaults(fn=cmd_migrate_tenant_places)
+    pmcn = sub.add_parser("migrate-connect",
+                          help="internal: prepare the tunnel's directories and "
+                               "route (called by update)")
+    pmcn.set_defaults(fn=cmd_migrate_connect)
     pmpa = sub.add_parser("migrate-place-assets",
                           help="internal: write every tenant logo where the "
                                "gateway serves it (RFC-0042 T3)")

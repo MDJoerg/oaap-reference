@@ -89,6 +89,24 @@
 		reverse_proxy portal:8000
 	}
 
+	# The tunnel (oaap.net.connector 0.1, RFC-0033 stage 2): inner nodes
+	# dial in here with a connect key, which the connector service checks
+	# -- no session, no identity headers, like the deploy hook. EXACTLY
+	# this path: the service's other door, /via, is for the destination
+	# listener (apps-caddy/_destinations.caddy) and is not routed from
+	# here. The stream survives reloads like every other held socket;
+	# same value and reasoning as STREAM_CLOSE_DELAY in appctl.py.
+	handle /connect/tunnel {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
+		reverse_proxy connect:8000 {
+			stream_close_delay 12h
+		}
+	}
+
 	# The digital twin (oaap.data.twin 0.1, RFC-0031 Schritt 3): the one
 	# route every app instance reaches through, never each other's site.
 	# Verified the same way every other protected route is -- the caller

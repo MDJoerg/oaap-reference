@@ -152,8 +152,10 @@ for target, why in [("http://portal:8000/", "Name ohne Punkt = Container/Dienst"
                     ("ftp://erp.example.com/", "falsches Schema")]:
     ok(f"abgelehnt: {target} ({why})",
        bool(refused(m.destination_add, DEFAULT, "bad", "http", target)))
-ok("via-Ziele sind Stufe 2 und werden abgelehnt",
-   "stage 2" in refused(m.destination_add, DEFAULT, "bad", "http", "via:x01/erp"))
+# Seit Stufe 2 (oaap.net.connector) gibt es via-Ziele -- aber nur ueber
+# einen Tunnel, den dieser Knoten fuer DIESEN Mandanten kennt.
+ok("ein via-Ziel ohne Tunnel auf diesem Knoten wird abgelehnt",
+   "no tunnel" in refused(m.destination_add, DEFAULT, "bad", "http", "via:x01/erp"))
 ok("ein bearer-Geheimnis mit geschweifter Klammer wird abgelehnt, nicht maskiert",
    "refused" in refused(m.destination_add, DEFAULT, "tok", "http",
                         "https://api.example.com/", "bearer", secret="a{env.X}b"))
