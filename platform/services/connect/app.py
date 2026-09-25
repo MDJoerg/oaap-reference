@@ -67,7 +67,13 @@ GW_DEST = "X-OAAP-Connect-Destination"
 # RFC 7230 6.1 plus the ones a proxy must never pass on. X-Forwarded-*
 # would tell the backend where the call came from on the OUTER node --
 # nothing it has a use for, and nothing the inner side chose to learn.
-HOP = {"connection", "keep-alive", "proxy-authenticate",
+#
+# `expect` too, measured on oaap-test 2026-09-25: curl sends
+# "Expect: 100-continue" for a body over 1 MiB, the gateway already
+# answered it -- and passed on, it made the inner client wait for a 100
+# from a backend that was waiting for the body. 120 s, then 504. An
+# expectation is between two neighbours, like the rest of this list.
+HOP = {"connection", "keep-alive", "proxy-authenticate", "expect",
        "proxy-authorization", "te", "trailer", "trailers",
        "transfer-encoding", "upgrade", "host", "content-length",
        "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host",

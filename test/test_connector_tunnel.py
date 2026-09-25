@@ -254,6 +254,14 @@ async def main():
                 b = await r.json() if r.status == 200 else {}
             ok("a 1 MiB request body arrives whole",
                b.get("len") == len(blob) and b.get("sha") == hashlib.sha256(blob).hexdigest(), b)
+            # oaap-test 2026-09-25: an Expect passed on hung every large
+            # upload for 120 s -- the backend here would answer it, a
+            # plain http.server does not, so the rule is: it never arrives
+            async with http.post(base + "/via/x01/erp/api/upload", data=blob,
+                                 headers={**gw(), "Expect": "100-continue"}) as r:
+                b = await r.json() if r.status == 200 else {}
+            ok("Expect: 100-continue is answered here, never passed to the backend",
+               r.status == 200 and "Expect" not in (b.get("headers") or {}), (r.status, b))
             async with http.get(base + "/via/x01/erp/api/big", headers=gw()) as r:
                 big = await r.read()
             ok("a 3 MiB answer arrives whole", len(big) == 3 * 1024 * 1024 + 7, len(big))
