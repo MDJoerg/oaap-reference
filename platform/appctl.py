@@ -8652,6 +8652,12 @@ def _install_from_dir(pkg, args, source):
     # visibility — clients must not lose their address to a deployment
     if inst and inst.get("address"):
         reg["instances"][name]["address"] = inst["address"]
+        # ... and its aliases (RFC-0018). Found 2026-09-25 during the
+        # 0.1.126 fleet run: a redeploy kept the canonical name and
+        # silently dropped every alias -- go.objid.info vanished from
+        # oaapx01 twice, each time right after a Wegweiser redeploy.
+        if inst.get("aliases"):
+            reg["instances"][name]["aliases"] = list(inst["aliases"])
     # same for a throttle override (RFC-0010): a deployment must not
     # silently reset an operator's rate decision to the default
     if inst and inst.get("throttle") is not None:
