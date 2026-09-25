@@ -286,7 +286,9 @@ async def main():
             async with http.get(base + "/via/x01/erp/api/x", headers=gw(key="wrong")) as r:
                 ok("T7 /via with a wrong key -> 403", r.status == 403, r.status)
             async with http.get(base + "/via/x01/erp/api/x", headers=gw(tenant="t2")) as r:
-                ok("T6 a destination of another tenant -> refused", r.status == 403, r.status)
+                other_tenant = (r.status, await r.text())
+            ok("T6 a destination of another tenant -> refused", other_tenant[0] == 502,
+               other_tenant)
             ok("T6/T7 the backend received none of them", SEEN == [], SEEN)
 
             # the stream log: one line per call, no header value, no query
@@ -364,6 +366,10 @@ async def main():
                                 headers={"Authorization": "Bearer " + KEY}) as r:
                 ok("T1 a revoked key gets the same 401 as an unknown one", r.status == 401,
                    r.status)
+            async with http.get(base + "/via/x01/erp/api/x", headers=gw()) as r:
+                revoked = (r.status, await r.text())
+            ok("T6 a revoked tunnel and another tenant's get the SAME answer",
+               revoked == other_tenant, (revoked, other_tenant))
             told = await until(lambda: "401" in (read_state(inner)["connectors"]["x01"]
                                                  .get("last_error") or "")
                                or "revoked" in (read_state(inner)["connectors"]["x01"]

@@ -396,8 +396,13 @@ class Node:
         rec = self.key_records().get(label)
         if not rec or not dest_tenant or rec.get("tenant") != dest_tenant:
             # a destination of another tenant cannot select this tunnel
-            # (spec 2.2, 2.5) -- answered like a tunnel that is not there
-            return text(403, f"There is no tunnel '{label}' for this destination's tenant.")
+            # (spec 2.2, 2.5) -- answered EXACTLY like a revoked one, so
+            # the answer says nothing about another tenant's tunnels.
+            # 502 for both: measured on oaap-test, a revoked key used to
+            # get 403 here while `oaap connect key revoke` promised 502.
+            return text(502, f"There is no tunnel '{label}' for this destination on "
+                             "this node -- its key was revoked, or never issued "
+                             "for this tenant (oaap connect list).")
         t = self.tunnels.get(label)
         if not t or t.closed:
             return text(502, f"The tunnel '{label}' is not connected -- the inner "

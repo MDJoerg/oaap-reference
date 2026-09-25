@@ -3333,8 +3333,13 @@ def connect_attention():
         if not c.get("paused") and not (st_c.get(label) or {}).get("connected"):
             items.append({"kind": "connector_down", "detail": label})
     dests = _load_destinations_all()
-    for label in sorted(conf.get("keys") or {}):
-        if _via_users(label, dests) and not (st_t.get(label) or {}).get("connected"):
+    # every tunnel a destination points at -- also one whose key is gone:
+    # after a revoke the destination still exists and answers 502, and
+    # that is exactly the moment somebody should be told
+    used = {((d.get("target") or {}).get("via") or "").split("/")[0]
+            for own in dests.values() for d in own.values()} - {""}
+    for label in sorted(used):
+        if not (st_t.get(label) or {}).get("connected"):
             items.append({"kind": "tunnel_down", "detail": label})
     return items
 
