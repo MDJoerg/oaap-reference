@@ -236,6 +236,10 @@ def remove_app_network(name):
                    capture_output=True, text=True)
     subprocess.run(["docker", "network", "rm", net],
                    capture_output=True, text=True)
+    # The range this network held is free now, and Docker hands it to
+    # the next network it creates. The destination listener must forget
+    # it before that happens (oaap.net.destinations 2.3).
+    refresh_destinations()
 
 
 def container_networks(container):
@@ -343,6 +347,750 @@ def reconcile_links(reg):
                 setup_link_network(reg, a, b)
 
 
+# ------------------------------------------ destinations (RFC-0033 stage 1)
+# A destination is a named target of a tenant: an ERP, a webhook
+# receiver, a mail server (oaap.net.destinations 0.1). An operator BINDS
+# an instance to it. For HTTP the app calls the gateway, which adds the
+# credential and forwards -- the app never holds it (RFC-0033 D1). For
+# TCP the values are handed over through the environment, and every
+# surface says so.
+#
+# Three files, three readers, on purpose:
+#   apps/destinations.json   the objects, no secret -- the portal reads
+#                            it (its registry mount is apps/, read-only)
+#   data/destinations/       the secrets, 0600 in a 0700 directory that
+#                            NO container mounts. Not in the backup
+#                            either, the same posture as data/idp: a
+#                            secret in a backup is a secret in every
+#                            copy of it
+#   apps-caddy/_destinations.caddy
+#                            the gateway's listener, 0600, holding the
+#                            secret in the only form its one reader needs
+DESTINATIONS_FILE = os.path.join(APPS_DIR, "destinations.json")
+DEST_SECRETS_DIR = os.path.join(DATA_DIR, "data", "destinations")
+DEST_SECRETS_FILE = os.path.join(DEST_SECRETS_DIR, "secrets.json")
+# The listener apps call. NOT published on the host (docker-compose.yml
+# publishes 80, 443 and 8100-8199 only), and that is load-bearing: the
+# caller is recognised by the network its connection comes from, and
+# Docker hands out instance networks from 192.168.0.0/16 as well --
+# measured on oaap-test 2026-09-25, two of fifteen were already there.
+# A published port with a preserved client address would let a LAN
+# machine in such a range pass for an instance (spec 2.3).
+DEST_PORT = 8098
+DEST_SITE = "_destinations.caddy"
+DEST_ENV_PREFIX = "OAAP_DESTINATION_"
+DEST_NAME_RE = r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"
+DEST_KINDS = ("http", "tcp")
+DEST_AUTH = {"http": ("none", "basic", "bearer", "header"),
+             "tcp": ("none", "basic")}
+# What a header value may contain without being interpreted: printable
+# ASCII minus whitespace, quotes, backslash and braces. Braces are the
+# Caddyfile's placeholders -- a secret containing `{env.X}` would be
+# EXPANDED by the gateway. Refused, never escaped: an escaping rule that
+# is wrong once turns a password into a configuration directive.
+DEST_SECRET_RE = r"[!#-\[\]-z|~]+"
+DEST_HEADER_RE = r"[A-Za-z][A-Za-z0-9-]{0,63}"
+
+
+class DestinationRefused(Exception):
+    """A destination request that must not happen, said in one sentence.
+    Raised rather than die()d so the CLI and, later, the portal's spool
+    worker each answer in their own way."""
+
+
+def load_destinations():
+    """{tenant-id: {name: record}} -- the objects, never a secret."""
+    try:
+        with open(DESTINATIONS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("destinations") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_destinations(dests):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = DESTINATIONS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "destinations": dests}, f, indent=2)
+    os.replace(tmp, DESTINATIONS_FILE)
+    # Targets and names, no secret -- the portal reads this mount.
+    os.chmod(DESTINATIONS_FILE, 0o644)
+
+
+def load_dest_secrets():
+    """{tenant-id: {name: secret}}."""
+    try:
+        with open(DEST_SECRETS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("secrets") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_dest_secrets(secrets_):
+    """0600 on the TEMPORARY file, before the move -- the reason
+    `save_idp_secrets` gives: a chmod afterwards leaves a window."""
+    os.makedirs(DEST_SECRETS_DIR, exist_ok=True)
+    os.chmod(DEST_SECRETS_DIR, 0o700)
+    tmp = DEST_SECRETS_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"secrets": secrets_}, f, indent=2)
+    os.replace(tmp, DEST_SECRETS_FILE)
+
+
+def docker_subnets(net=None):
+    """The address ranges of one Docker network, or of every network
+    Docker manages when `net` is None. Empty when Docker cannot say --
+    every caller treats "unknown" as "nothing matches"."""
+    import ipaddress
+    if net is None:
+        ls = subprocess.run(["docker", "network", "ls", "-q"],
+                            capture_output=True, text=True)
+        nets = ls.stdout.split() if ls.returncode == 0 else []
+        if not nets:
+            return []
+    else:
+        nets = [net]
+    r = subprocess.run(["docker", "network", "inspect", "-f",
+                        "{{range .IPAM.Config}}{{.Subnet}} {{end}}", *nets],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    out = []
+    for s in r.stdout.split():
+        try:
+            out.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            continue
+    return out
+
+
+def parse_dest_target(kind, target):
+    """(scheme, host, port, base_path) of a `direct` target, or raise.
+
+    Deliberately narrow: no user info (a credential belongs in `auth`,
+    where it is kept out of the container), no query, no fragment -- a
+    target is a place, not a request.
+    """
+    import urllib.parse
+    t = (target or "").strip()
+    u = urllib.parse.urlsplit(t)
+    want = ("http", "https") if kind == "http" else ("tcp",)
+    if u.scheme not in want:
+        raise DestinationRefused(
+            f"a {kind} target starts with "
+            + " or ".join(f"{s}://" for s in want) + f" (got '{t}')")
+    if u.username or u.password or "@" in u.netloc:
+        raise DestinationRefused(
+            "the target must not carry a user or password -- put the "
+            "credential into the destination's authentication, where the "
+            "app never sees it")
+    if u.query or u.fragment or "?" in t or "#" in t:
+        raise DestinationRefused("the target must not carry a query or a fragment")
+    host = (u.hostname or "").lower()
+    if not host or not re.fullmatch(r"[a-z0-9.:-]+", host):
+        raise DestinationRefused(f"the target has no usable host ('{t}')")
+    try:
+        port = u.port
+    except ValueError:
+        raise DestinationRefused(f"the target's port is not a number ('{t}')") from None
+    if kind == "tcp":
+        if not port:
+            raise DestinationRefused("a tcp target needs a port: tcp://<host>:<port>")
+        if u.path not in ("", "/"):
+            raise DestinationRefused("a tcp target has no path")
+        return "tcp", host, port, ""
+    base = u.path.rstrip("/")
+    if base and not re.fullmatch(r"(/[A-Za-z0-9._~-]+)+", base):
+        raise DestinationRefused(
+            f"the target's path may hold letters, digits and . _ ~ - only ('{u.path}')")
+    return u.scheme, host, port, base
+
+
+def dest_target_refusal(host):
+    """Why this host must not be a destination, or "" (spec 2.1).
+
+    The gateway performs the call, and the gateway sits on the platform
+    network and on EVERY instance network. A target naming a neighbour
+    there would be a way around the gateway's own login and around the
+    isolation of other tenants' apps. What this cannot see -- a DNS name
+    that later resolves inward -- is the reason destinations stay
+    server_admin's in 0.1 (spec 2.7, §4).
+    """
+    import ipaddress
+    h = host.strip("[]").lower()
+    if h in ("localhost", "localhost.localdomain") or h.endswith(".localhost"):
+        return f"'{host}' is this machine"
+    try:
+        addr = ipaddress.ip_address(h)
+    except ValueError:
+        addr = None
+    if addr is None:
+        if "." not in h:
+            return (f"'{host}' has no dot -- that is how containers and "
+                    "platform services are named, and the gateway would "
+                    "reach them from inside")
+        if h.endswith(".internal") or h.endswith(".oaap"):
+            return f"'{host}' is a platform-internal name"
+        return ""
+    if addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        return f"'{host}' is not an address a destination may point at"
+    for net in docker_subnets():
+        if addr.version == net.version and addr in net:
+            return (f"'{host}' lies inside the Docker network {net} on this "
+                    "node -- the gateway would reach a container there")
+    return ""
+
+
+def dest_env_name(need):
+    return f"{DEST_ENV_PREFIX}{need.upper().replace('-', '_')}_URL"
+
+
+def dest_url(need):
+    return f"http://{GATEWAY_CONTAINER}:{DEST_PORT}/destinations/{need}/"
+
+
+def declared_dest_needs(inst):
+    """{need-name: declaration} of what the manifest said this app can use."""
+    return {d["name"]: d for d in (inst or {}).get("declared_destinations") or []
+            if d.get("name")}
+
+
+def dest_handover_fields(inst):
+    """Every environment key a declared tcp need hands values into."""
+    out = set()
+    for d in declared_dest_needs(inst).values():
+        if d.get("kind") == "tcp":
+            out |= {v for v in (d.get("env") or {}).values() if v}
+    return out
+
+
+def is_platform_env(key, inst=None):
+    """Keys the platform writes and no operator may: the fixed set, every
+    destination URL, and the fields a bound tcp need is handed into."""
+    return (key in RESERVED_ENV or key.startswith(DEST_ENV_PREFIX)
+            or key in dest_handover_fields(inst))
+
+
+def destination_env(inst, dests=None, dest_secrets=None):
+    """(wanted, managed) for one instance's environment.
+
+    `wanted` is what the bindings put there; `managed` is every key this
+    function owns and may therefore remove -- all destination URLs and
+    every handed-over field the manifest declares. A binding whose
+    destination no longer exists (a restore, a tenant adoption) yields
+    nothing: the call would only be refused, and an address that leads
+    to a refusal is a worse answer than no address.
+    """
+    dests = load_destinations() if dests is None else dests
+    dest_secrets = load_dest_secrets() if dest_secrets is None else dest_secrets
+    tid = resolve_tenant((inst or {}).get("tenant"))
+    own = dests.get(tid or "") or {}
+    needs = declared_dest_needs(inst)
+    managed = set(dest_handover_fields(inst))
+    wanted = {}
+    for need, dname in sorted(((inst or {}).get("destinations") or {}).items()):
+        d = own.get(dname)
+        if not d:
+            continue
+        if d["kind"] == "http":
+            wanted[dest_env_name(need)] = dest_url(need)
+            continue
+        fields = (needs.get(need) or {}).get("env") or {}
+        if (needs.get(need) or {}).get("kind") != "tcp" or not fields:
+            continue
+        _s, host, port, _b = parse_dest_target("tcp", d["target"]["direct"])
+        values = {"host": host, "port": str(port)}
+        if (d.get("auth") or {}).get("type") == "basic":
+            values["user"] = d["auth"].get("user", "")
+            values["password"] = (dest_secrets.get(tid) or {}).get(dname, "")
+        for part, key in fields.items():
+            if key and part in values:
+                wanted[key] = values[part]
+    return wanted, managed
+
+
+def apply_destination_env(env, inst):
+    """Bring an env dict in line with the instance's bindings. In place;
+    returns True when anything changed."""
+    wanted, managed = destination_env(inst)
+    changed = False
+    for k in list(env):
+        if (k.startswith(DEST_ENV_PREFIX) or k in managed) and k not in wanted:
+            env.pop(k)
+            changed = True
+    for k, v in wanted.items():
+        if env.get(k) != v:
+            env[k] = v
+            changed = True
+    return changed
+
+
+def sync_destination_env(reg, only=None, recreate=True):
+    """instance.env always, and the container when its environment says
+    something else -- the shape of `sync_instance_names`. Returns
+    (recreated, stale)."""
+    recreated, stale = [], []
+    for name, inst in sorted(reg["instances"].items()):
+        if only and name != only:
+            continue
+        env = load_env(name, inst)
+        if apply_destination_env(env, inst):
+            save_env(name, env, inst)
+        have = container_env(inst.get("container", ""))
+        if have is None:
+            continue
+        wanted, managed = destination_env(inst)
+        keys = set(wanted) | managed | {k for k in have if k.startswith(DEST_ENV_PREFIX)}
+        if all((have.get(k) or "") == (wanted.get(k) or "") for k in keys):
+            continue
+        if recreate:
+            recreate_instance_containers(name, instance_services(inst),
+                                         inst.get("storage") or [],
+                                         inst.get("endpoints"), inst=inst)
+            recreated.append(name)
+        else:
+            stale.append(name)
+    return recreated, stale
+
+
+def _caddy_quote(s):
+    # Only ever called on values the checks above let through: no quote,
+    # no backslash, no brace can reach this line.
+    return '"' + s + '"'
+
+
+def write_destinations_caddy(reg=None):
+    """(Re)generate the gateway's destination listener. Returns True when
+    the file changed -- the caller reloads the gateway then.
+
+    One matcher per binding: the calling instance's network ranges AND
+    the need's path. The ranges are read from Docker NOW, and only for a
+    network that exists NOW. Docker reuses a freed range for the next
+    network it creates, so a mapping that outlives its network hands
+    one instance's bindings to whoever inherits the range -- which is
+    why every path that removes a network ends here (spec 2.3).
+    """
+    import base64
+    reg = load_registry() if reg is None else reg
+    dests = load_destinations()
+    dest_secrets = load_dest_secrets()
+    path = os.path.join(CADDY_APPS_DIR, DEST_SITE)
+    lines = [f"# generated by appctl -- destinations (oaap.net.destinations 0.1,",
+             f"# RFC-0033 stage 1). Holds credentials: 0600, never edit by hand.",
+             f":{DEST_PORT} {{"]
+    n = 0
+    for name, inst in sorted(reg["instances"].items()):
+        binds = inst.get("destinations") or {}
+        rehearsal = is_rehearsal(inst)
+        if not binds and not rehearsal:
+            continue
+        nets = docker_subnets(app_network(name))
+        if not nets:
+            continue
+        ranges = " ".join(str(x) for x in nets)
+        tid = resolve_tenant(inst.get("tenant"))
+        own = dests.get(tid or "") or {}
+        lines.append(f"\t# instance {name}")
+        for need, dname in sorted(binds.items()):
+            d = own.get(dname)
+            if not d or d.get("kind") != "http":
+                continue
+            n += 1
+            m = f"@d{n}"
+            lines += [f"\t{m} {{",
+                      f"\t\tremote_ip {ranges}",
+                      f"\t\tpath /destinations/{need} /destinations/{need}/*",
+                      "\t}",
+                      f"\thandle {m} {{"]
+            auth = d.get("auth") or {"type": "none"}
+            secret = (dest_secrets.get(tid) or {}).get(dname, "")
+            if auth["type"] != "none" and not secret:
+                # After a restore the object is back and its secret is
+                # not (data/destinations is not in the backup). Calling
+                # the target WITHOUT the credential would be the quiet
+                # wrong answer; this is the loud one.
+                lines += ['\t\trespond "This destination has no credential on '
+                          'this node -- a server_admin has to set it again '
+                          '(oaap destination set-secret)." 503', "\t}"]
+                continue
+            scheme, host, port, base = parse_dest_target("http", d["target"]["direct"])
+            default = {"http": 80, "https": 443}[scheme]
+            hostport = host if not port or port == default else f"{host}:{port}"
+            # `route`, not bare directives: inside `handle` Caddy SORTS
+            # directives, and `rewrite` sorts before `uri`. Measured on
+            # oaap-test 2026-09-25 -- the target received
+            # /base/destinations/echo/orders/42. A route runs as written.
+            lines.append("\t\troute {")
+            lines += strip_identity("\t\t\t")
+            lines.append(f"\t\t\turi strip_prefix /destinations/{need}")
+            if base:
+                lines.append(f"\t\t\trewrite * {base}{{uri}}")
+            lines.append(f"\t\t\treverse_proxy {scheme}://{host}:{port or default} {{")
+            lines.append(f"\t\t\t\theader_up Host {hostport}")
+            for h in ("X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host"):
+                lines.append(f"\t\t\t\theader_up -{h}")
+            if auth["type"] == "basic":
+                token = base64.b64encode(
+                    f"{auth.get('user', '')}:{secret}".encode()).decode()
+                lines.append(f"\t\t\t\theader_up Authorization {_caddy_quote('Basic ' + token)}")
+            elif auth["type"] == "bearer":
+                lines.append(f"\t\t\t\theader_up Authorization {_caddy_quote('Bearer ' + secret)}")
+            elif auth["type"] == "header":
+                lines.append(f"\t\t\t\theader_up {auth['header']} {_caddy_quote(secret)}")
+            lines += ["\t\t\t}", "\t\t}", "\t}"]
+        if rehearsal:
+            n += 1
+            lines += [f"\t@r{n} remote_ip {ranges}",
+                      f"\thandle @r{n} {{",
+                      f"\t\trespond \"'{name}' is a rehearsal (RFC-0030): it reaches "
+                      "no destination unless one was bound to it deliberately.\" 403",
+                      "\t}"]
+    lines += ["\thandle {",
+              '\t\trespond "No destination is bound under this name for the '
+              'calling instance (oaap.net.destinations 2.3)." 403',
+              "\t}", "}"]
+    text = "\n".join(lines) + "\n"
+    if _read_file(path) == text:
+        return False
+    os.makedirs(CADDY_APPS_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def refresh_destinations(reg=None):
+    """Write the listener and reload the gateway if it changed. The one
+    call every network change and every binding change ends in."""
+    try:
+        if write_destinations_caddy(reg):
+            reload_gateway()
+    except Exception as e:                           # noqa: BLE001
+        print(f"WARNING: the destination listener could not be refreshed: {e}",
+              file=sys.stderr)
+
+
+def _dest_who():
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+def destination_add(tid, name, kind, target, auth_type="none", user="",
+                    header="", secret="", who="root", role="root"):
+    if not re.fullmatch(DEST_NAME_RE, name or ""):
+        raise DestinationRefused("a destination name is [a-z0-9-], 2-40 "
+                                 "characters, starting and ending with a "
+                                 "letter or digit")
+    if kind not in DEST_KINDS:
+        raise DestinationRefused(f"kind is one of {', '.join(DEST_KINDS)}")
+    if (target or "").startswith("via:"):
+        raise DestinationRefused("targets through a connector (via) are "
+                                 "RFC-0033 stage 2 and not built yet")
+    _s, host, _p, _b = parse_dest_target(kind, target)
+    why = dest_target_refusal(host)
+    if why:
+        raise DestinationRefused(why)
+    if auth_type not in DEST_AUTH[kind]:
+        raise DestinationRefused(f"a {kind} destination authenticates with "
+                                 f"{' | '.join(DEST_AUTH[kind])}")
+    auth = {"type": auth_type}
+    if auth_type == "basic":
+        if not user or ":" in user or not re.fullmatch(r"[\x21-\x7e]+", user):
+            raise DestinationRefused("basic needs a user without ':' or spaces")
+        auth["user"] = user
+    if auth_type == "header":
+        if not re.fullmatch(DEST_HEADER_RE, header or ""):
+            raise DestinationRefused("header needs a header name, e.g. X-Api-Key")
+        if header.lower() in {h.lower() for h in IDENTITY_HEADERS} | {"host"}:
+            raise DestinationRefused(f"'{header}' is not a header a destination may set")
+        auth["header"] = header
+    if auth_type != "none":
+        check_dest_secret(auth_type, secret)
+    dests = load_destinations()
+    own = dests.setdefault(tid, {})
+    if name in own:
+        raise DestinationRefused(f"this tenant already has a destination '{name}'")
+    own[name] = {"kind": kind, "target": {"direct": target.strip()},
+                 "auth": auth, "secret": auth_type != "none",
+                 "created": _iso_now(), "created_by": who}
+    if auth_type != "none":
+        s = load_dest_secrets()
+        s.setdefault(tid, {})[name] = secret
+        save_dest_secrets(s)
+    save_destinations(dests)
+    audit_tenant("destination.add", tid, subject=name, who=who, role=role,
+                 detail=f"{kind} {target.strip()} auth {auth_type}")
+    return own[name]
+
+
+def check_dest_secret(auth_type, secret):
+    if not secret:
+        raise DestinationRefused("this authentication needs a secret")
+    if auth_type == "basic":
+        # encoded by the platform, so anything printable may go in --
+        # except what the line-based env file of a tcp handover cannot carry
+        if "\n" in secret or "\r" in secret:
+            raise DestinationRefused("the secret must be one line")
+        return
+    if not re.fullmatch(DEST_SECRET_RE, secret):
+        raise DestinationRefused(
+            "the secret may hold printable characters without spaces, "
+            "quotes, backslashes or braces -- anything else is refused rather "
+            "than escaped (oaap.net.destinations 2.5)")
+
+
+def destination_bindings(reg, tid, name):
+    """Every (instance, need) bound to this destination of this tenant."""
+    return [(k, need) for k, i in sorted(reg["instances"].items())
+            if resolve_tenant(i.get("tenant")) == tid
+            for need, d in sorted((i.get("destinations") or {}).items())
+            if d == name]
+
+
+def destination_remove(tid, name, who="root", role="root"):
+    dests = load_destinations()
+    if name not in (dests.get(tid) or {}):
+        raise DestinationRefused(f"no destination '{name}' in this tenant")
+    bound = destination_bindings(load_registry(), tid, name)
+    if bound:
+        raise DestinationRefused(
+            f"'{name}' is still bound to " + ", ".join(
+                f"'{k}' (as {n})" for k, n in bound)
+            + " -- unbind first; removing it would cut those apps off without "
+              "anybody having decided to")
+    del dests[tid][name]
+    if not dests[tid]:
+        del dests[tid]
+    save_destinations(dests)
+    s = load_dest_secrets()
+    if name in (s.get(tid) or {}):
+        del s[tid][name]
+        save_dest_secrets(s)
+    audit_tenant("destination.remove", tid, subject=name, who=who, role=role)
+
+
+def destination_set_secret(tid, name, secret, who="root", role="root"):
+    d = (load_destinations().get(tid) or {}).get(name)
+    if not d:
+        raise DestinationRefused(f"no destination '{name}' in this tenant")
+    auth_type = (d.get("auth") or {}).get("type", "none")
+    if auth_type == "none":
+        raise DestinationRefused(f"'{name}' authenticates with nothing -- "
+                                 "there is no secret to set")
+    check_dest_secret(auth_type, secret)
+    s = load_dest_secrets()
+    s.setdefault(tid, {})[name] = secret
+    save_dest_secrets(s)
+    audit_tenant("destination.secret", tid, subject=name, who=who, role=role)
+    # The listener and every tcp handover carry the value -- both follow.
+    reg = load_registry()
+    refresh_destinations(reg)
+    for k, _need in destination_bindings(reg, tid, name):
+        sync_destination_env(reg, only=k)
+
+
+def destination_bind(reg, key, name, need="", rehearsal_exception=False,
+                     who="root", role="root"):
+    """Bind instance `key` to its tenant's destination `name` under `need`."""
+    inst = reg["instances"].get(key)
+    if not inst:
+        raise DestinationRefused(f"no instance named '{key}'")
+    tid = resolve_tenant(inst.get("tenant"))
+    d = (load_destinations().get(tid or "") or {}).get(name)
+    if not d:
+        # oaap.core.tenant 2.3: another tenant's object is answered as
+        # one that does not exist -- "that is someone else's" is already
+        # an answer across the boundary.
+        raise DestinationRefused(f"no destination '{name}' in this instance's tenant")
+    need = need or name
+    if not re.fullmatch(DEST_NAME_RE, need):
+        raise DestinationRefused("the need name is [a-z0-9-], 2-40 characters")
+    if is_rehearsal(inst) and not rehearsal_exception:
+        raise DestinationRefused(
+            f"'{key}' is a rehearsal (RFC-0030) -- it reaches nothing outward. "
+            "If this rehearsal really must reach this destination, say so with "
+            "--rehearsal-exception; the tenant's log will record it")
+    declared = declared_dest_needs(inst).get(need)
+    if d["kind"] == "tcp" and (not declared or declared.get("kind") != "tcp"):
+        raise DestinationRefused(
+            f"'{name}' is a tcp destination, and '{key}' declares no tcp need "
+            f"'{need}' -- only the manifest names the fields the app reads "
+            "(oaap.net.destinations 2.2)")
+    if declared and declared.get("kind") != d["kind"]:
+        raise DestinationRefused(f"'{key}' declares '{need}' as "
+                                 f"{declared.get('kind')}, '{name}' is {d['kind']}")
+    binds = dict(inst.get("destinations") or {})
+    if binds.get(need) == name:
+        return False
+    binds[need] = name
+    inst["destinations"] = binds
+    save_registry(reg)
+    audit_tenant("destination.bind", tid, subject=key, who=who, role=role,
+                 detail=f"{need} -> {name} ({d['kind']}"
+                        + (", handover" if d["kind"] == "tcp" else "") + ")"
+                        + (" -- REHEARSAL EXCEPTION" if is_rehearsal(inst) else ""))
+    refresh_destinations(reg)
+    sync_destination_env(reg, only=key)
+    return True
+
+
+def _dest_line(tid, name, d, dest_secrets, reg):
+    auth = d.get("auth") or {}
+    a = auth.get("type", "none")
+    if a == "basic":
+        a += f" ({auth.get('user', '')})"
+    elif a == "header":
+        a += f" ({auth.get('header', '')})"
+    if d.get("secret"):
+        a += (", secret set" if (dest_secrets.get(tid) or {}).get(name)
+              else ", SECRET MISSING -- calls are refused until it is set")
+    mode = "proxy" if d["kind"] == "http" else "handover"
+    bound = destination_bindings(reg, tid, name)
+    return (f"  {name:<20} {d['kind']:<4} {mode:<8} {d['target']['direct']}\n"
+            f"  {'':<20} auth {a}\n"
+            f"  {'':<20} bound: "
+            + (", ".join(f"{k} (as {n})" for k, n in bound) or "nothing"))
+
+
+def cmd_destination(args):
+    """`oaap destination ...` and `oaap app destination ...` -- one command,
+    both spellings (oaap.net.destinations 0.1). server_admin territory
+    in 0.1 (spec 2.7): root here."""
+    who = _dest_who()
+    reg = load_registry()
+    try:
+        if args.action == "list":
+            tids = ([resolve_tenant_arg(args.tenant)] if args.tenant
+                    else sorted(load_tenants()))
+            dests, dest_secrets = load_destinations(), load_dest_secrets()
+            shown = False
+            for tid in tids:
+                own = dests.get(tid) or {}
+                if not own:
+                    continue
+                if not single_tenant():
+                    print(f"Tenant '{tenant_label(tid)}':")
+                for name in sorted(own):
+                    print(_dest_line(tid, name, own[name], dest_secrets, reg))
+                shown = True
+            if not shown:
+                print("No destinations. An app reaches nothing through the "
+                      "platform until one is added and bound "
+                      "(oaap destination add ...).")
+            return
+        if args.action == "bindings":
+            key = args.name or die("'destination bindings' needs an instance")
+            inst = reg["instances"].get(key) or die(f"no instance named '{key}'")
+            tid = resolve_tenant(inst.get("tenant"))
+            own = load_destinations().get(tid or "") or {}
+            binds = inst.get("destinations") or {}
+            needs = declared_dest_needs(inst)
+            if not binds and not needs:
+                print(f"'{key}' declares no destination need and has no binding.")
+            for need in sorted(set(binds) | set(needs)):
+                d = own.get(binds.get(need, ""))
+                decl = needs.get(need)
+                what = (f"{decl['kind']} need" + (f" -- {decl['purpose']}"
+                                                  if decl.get("purpose") else "")
+                        if decl else "not declared by the manifest")
+                if need not in binds:
+                    print(f"  {need:<20} UNBOUND ({what})")
+                elif not d:
+                    print(f"  {need:<20} -> {binds[need]} -- DESTINATION MISSING "
+                          f"on this node, nothing is handed over ({what})")
+                else:
+                    mode = ("proxy, " + dest_env_name(need) if d["kind"] == "http"
+                            else "handover -- the credential is in the container")
+                    print(f"  {need:<20} -> {binds[need]} ({mode}; {what})")
+            if is_rehearsal(inst):
+                print("  (a rehearsal: bindings here are deliberate exceptions, "
+                      "RFC-0030)")
+            return
+        if args.action in ("bind", "unbind"):
+            key = args.name or die(f"'destination {args.action}' needs an instance")
+            other = args.second or die(
+                f"'destination {args.action}' needs "
+                + ("a destination" if args.action == "bind" else "the need name"))
+            if args.action == "bind":
+                if destination_bind(reg, key, other, need=args.as_ or "",
+                                    rehearsal_exception=args.rehearsal_exception,
+                                    who=who):
+                    need = args.as_ or other
+                    d = load_destinations()[resolve_tenant(
+                        reg["instances"][key].get("tenant"))][other]
+                    print(f"Bound: '{key}' reaches '{other}' as '{need}'.")
+                    if d["kind"] == "http":
+                        print(f"  The app calls {dest_env_name(need)}="
+                              f"{dest_url(need)} -- the platform adds the "
+                              "credential, the app never sees it.")
+                    else:
+                        print("  HANDOVER: host, port and credential are in the "
+                              "container's environment now (spec 2.4).")
+                else:
+                    print(f"'{key}' is already bound to '{other}'.")
+            else:
+                destination_unbind(reg, key, other, who=who)
+                print(f"Unbound: '{key}' no longer reaches anything as '{other}'.")
+            return
+        # the object itself
+        tid = resolve_tenant_arg(args.tenant) or ensure_default_tenant()
+        name = args.name or die(f"'destination {args.action}' needs a name")
+        if args.action == "add":
+            auth_type = args.auth or "none"
+            secret = ""
+            if auth_type != "none":
+                secret = _read_dest_secret(args)
+            destination_add(tid, name, args.kind or "http", args.target or "",
+                            auth_type, args.user or "", args.header or "",
+                            secret, who=who)
+            print(f"Destination '{name}' added. Nothing reaches it until an "
+                  f"instance is bound: oaap destination bind <instance> {name}")
+        elif args.action == "remove":
+            destination_remove(tid, name, who=who)
+            print(f"Destination '{name}' removed, with its secret.")
+        elif args.action == "set-secret":
+            destination_set_secret(tid, name, _read_dest_secret(args), who=who)
+            print(f"Secret of '{name}' set; the gateway and every bound "
+                  "instance have it now.")
+        elif args.action == "show":
+            d = (load_destinations().get(tid) or {}).get(name) or die(
+                f"no destination '{name}' in this tenant")
+            print(_dest_line(tid, name, d, load_dest_secrets(), reg))
+            print(f"  {'':<20} created {d.get('created', '?')} by "
+                  f"{d.get('created_by', '?')}")
+    except DestinationRefused as e:
+        die(str(e))
+
+
+def _read_dest_secret(args):
+    """Hidden prompt, or stdin with --secret-stdin -- never an argument:
+    an argument lands in the shell history."""
+    if getattr(args, "secret_stdin", False):
+        return sys.stdin.readline().rstrip("\r\n")
+    return getpass.getpass("Secret (hidden): ")
+
+
+def destination_unbind(reg, key, need, who="root", role="root"):
+    inst = reg["instances"].get(key)
+    if not inst:
+        raise DestinationRefused(f"no instance named '{key}'")
+    binds = dict(inst.get("destinations") or {})
+    if need not in binds:
+        raise DestinationRefused(f"'{key}' has no destination bound as '{need}'")
+    name = binds.pop(need)
+    if binds:
+        inst["destinations"] = binds
+    else:
+        inst.pop("destinations", None)
+    save_registry(reg)
+    audit_tenant("destination.unbind", resolve_tenant(inst.get("tenant")),
+                 subject=key, who=who, role=role, detail=f"{need} -> {name}")
+    refresh_destinations(reg)
+    sync_destination_env(reg, only=key)
+
+
 # ------------------------------------------------ network migration (RFC-0016)
 # Runs from migrate.sh on every `oaap update`. Two jobs, both idempotent
 # and quiet when there is nothing to do:
@@ -389,6 +1137,10 @@ def cmd_migrate_networks(_args):
     health_before = _read_file(os.path.join(CADDY_APPS_DIR, "_internal-health.caddy"))
     write_internal_health_caddy()
     health_changed = _read_file(os.path.join(CADDY_APPS_DIR, "_internal-health.caddy")) != health_before
+    # the destination listener (oaap.net.destinations 0.1) is written
+    # from the networks as they are NOW -- after the isolation above
+    dest_changed = write_destinations_caddy()
+    health_changed = health_changed or dest_changed
     if isolated or reconnected or health_changed:
         if health_changed:
             try:
@@ -420,11 +1172,12 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 4      # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 5      # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
-                        # (RFC-0036 Teil B)
+                        # (RFC-0036 Teil B); 0.5 adds destinations
+                        # (oaap.net.destinations 0.1, RFC-0033)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -4386,9 +5139,74 @@ def validate_manifest(m):
                             "app has more than one service")
         if not str((m.get("health") or {}).get("path", "")).startswith("/"):
             errs.append("health.path: required, must start with /")
+        errs.extend(validate_destination_needs(m))
     errs.extend(validate_data_model_sections(m))
     if errs:
         die("manifest invalid:\n  - " + "\n  - ".join(errs))
+
+
+def validate_destination_needs(m):
+    """Manifest 0.5 `destinations` (oaap.net.destinations 0.1 §2.2). A
+    declaration grants nothing, so the checks are about the SHAPE -- and
+    about one collision that would be a silent takeover: a handed-over
+    field that is also a config key or a platform variable would have
+    two writers, and the operator's value would lose without a word."""
+    errs = []
+    needs = m.get("destinations") or []
+    if not isinstance(needs, list):
+        return ["destinations: list expected"]
+    config_keys = {c.get("key") for c in (m.get("config") or []) if isinstance(c, dict)}
+    seen, fields = set(), set()
+    for d in needs:
+        if not isinstance(d, dict):
+            errs.append("destinations: each entry must be a mapping")
+            continue
+        name = str(d.get("name", ""))
+        if not re.fullmatch(DEST_NAME_RE, name):
+            errs.append(f"destinations: name '{name}' invalid ([a-z0-9-], 2-40 chars)")
+        if name in seen:
+            errs.append(f"destinations: '{name}' declared twice")
+        seen.add(name)
+        kind = d.get("kind")
+        if kind not in DEST_KINDS:
+            errs.append(f"destinations {name}: kind must be http | tcp")
+        env = d.get("env")
+        if kind == "tcp":
+            if not isinstance(env, dict) or not env.get("host") or not env.get("port"):
+                errs.append(f"destinations {name}: a tcp need names at least "
+                            "env.host and env.port -- the fields the app reads")
+                continue
+            for part, key in env.items():
+                if part not in ("host", "port", "user", "password"):
+                    errs.append(f"destinations {name}: env.{part} unknown "
+                                "(host | port | user | password)")
+                elif not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", str(key)):
+                    errs.append(f"destinations {name}: env.{part} '{key}' is no variable name")
+                elif (key in config_keys or key in RESERVED_ENV
+                      or str(key).startswith("OAAP_") or key in fields):
+                    errs.append(f"destinations {name}: env.{part} '{key}' is already "
+                                "a config key, a platform variable or another "
+                                "need's field")
+                fields.add(key)
+        elif env:
+            errs.append(f"destinations {name}: only a tcp need hands values over "
+                        "(env); an http need is reached through the gateway")
+    return errs
+
+
+def normalized_dest_needs(m):
+    """What the registry records of the manifest's needs -- re-read on
+    every install, like declared_endpoints: it describes the app."""
+    out = []
+    for d in m.get("destinations") or []:
+        if isinstance(d, dict) and d.get("kind") in DEST_KINDS:
+            rec = {"name": d["name"], "kind": d["kind"],
+                   "purpose": str(d.get("purpose") or "")}
+            if d["kind"] == "tcp":
+                rec["env"] = {k: v for k, v in (d.get("env") or {}).items()
+                              if k in ("host", "port", "user", "password")}
+            out.append(rec)
+    return out
 
 
 def validate_data_model_sections(m):
@@ -5930,10 +6748,10 @@ def write_instance_address_caddy():
 # so it is the only one that can reach an app to check its health. The
 # portal used to probe apps by container name directly; after isolation
 # it cannot. This internal site lets the portal ask the gateway to probe
-# for it: a listener on :8099 — reachable only container-to-container on
-# the platform network (never published, and apps are not on that
-# network) — with one no-auth route per instance that proxies to the
-# app's health endpoint. Health checks are the only thing it exposes.
+# for it: a listener on :8099 — never published, and answering only
+# callers whose address lies in the platform network (checked by the
+# gateway since 0.1.128, see below) — with one no-auth route per
+# instance that proxies to the app's health endpoint.
 HEALTH_PROBE_PORT = 8099
 
 
@@ -5946,19 +6764,29 @@ def write_internal_health_caddy():
         if os.path.exists(path):
             os.remove(path)
         return
+    # "Reachable only from the platform network" was a claim about who
+    # is ON that network, and the listener does not care: the gateway
+    # answers on every interface it has, and it has one in every
+    # instance network. Measured on oaap-test 2026-09-25 -- a container
+    # on raci's network got 200 from /h/vaultwarden, another app's
+    # health page. So the claim is now a rule the gateway checks: the
+    # caller's address must lie in the platform network. When Docker
+    # cannot name that range nothing matches, and the portal's probe
+    # fails loudly instead of the endpoint opening quietly.
+    platform = " ".join(str(n) for n in docker_subnets(PLATFORM_NETWORK))
     lines = [f"# generated by appctl — internal health probe endpoint "
-             f"(RFC-0016); reachable only from the platform network",
-             f":{HEALTH_PROBE_PORT} {{"]
+             f"(RFC-0016); answers the platform network only",
+             f":{HEALTH_PROBE_PORT} {{",
+             f"\t@platform remote_ip {platform or '255.255.255.255/32'}",
+             "\thandle @platform {"]
     for name, inst in insts:
         hp = inst.get("health_path") or "/"
-        lines.append(f"\thandle /h/{name} {{")
-        lines.append(f"\t\trewrite * {hp}")
-        lines.append(f"\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
-        lines.append("\t}")
-    lines.append("\thandle {")
-    lines.append("\t\trespond 404")
-    lines.append("\t}")
-    lines.append("}")
+        lines.append(f"\t\thandle /h/{name} {{")
+        lines.append(f"\t\t\trewrite * {hp}")
+        lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+        lines.append("\t\t}")
+    lines += ["\t\thandle {", "\t\t\trespond 404", "\t\t}", "\t}",
+              "\thandle {", "\t\trespond 403", "\t}", "}"]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -5972,6 +6800,10 @@ def refresh_generated_sites():
     write_external_caddy()
     write_instance_address_caddy()
     write_internal_health_caddy()
+    # written like the others and reloaded by the caller like the others;
+    # the moments that must not wait for a caller (a network removed, a
+    # binding changed) reload through refresh_destinations() themselves
+    write_destinations_caddy()
     sync_instance_names(load_registry(), recreate=False)
 
 
@@ -6389,7 +7221,7 @@ def config_entries(name, inst):
     declared = inst.get("config")
     if declared is None:
         declared = [{"key": k, "label": k, "secret": True}
-                    for k in env if k not in RESERVED_ENV]
+                    for k in env if not is_platform_env(k, inst)]
     entries = []
     for c in declared:
         key = c["key"]
@@ -8530,6 +9362,19 @@ def _install_from_dir(pkg, args, source):
         env[INSTANCE_NAMES_ENV] = names_env
     else:
         env.pop(INSTANCE_NAMES_ENV, None)
+    # oaap.net.destinations 0.1: the bindings survive a redeploy, and the
+    # environment is computed from them BEFORE any container starts --
+    # from the new manifest's needs, after dropping the fields the old
+    # one handed values into. A rehearsal carries none (spec 2.6): its
+    # record is new, and the copied environment was scrubbed already;
+    # asked here again against the manifest actually being installed.
+    carried_dest = {} if rehearsal else dict((inst or {}).get("destinations") or {})
+    dest_needs = normalized_dest_needs(m)
+    for k in dest_handover_fields(inst or {}):
+        env.pop(k, None)
+    apply_destination_env(env, {"tenant": ident["tenant"],
+                                "destinations": carried_dest,
+                                "declared_destinations": dest_needs})
     save_env(name, env, ident)
 
     # a granted non-HTTP endpoint (RFC-0015) survives redeploy like the
@@ -8616,6 +9461,9 @@ def _install_from_dir(pkg, args, source):
         # manifest on every install; publication needs a separate operator
         # grant (stored in "endpoints" below), which survives redeploy.
         "declared_endpoints": m.get("endpoints") or [],
+        # destination needs the app DECLARES (oaap.net.destinations 2.2)
+        # -- a declaration grants nothing; the bindings below do
+        "declared_destinations": dest_needs,
         # declared config keys (labels + secret flags) so the CLI and the
         # portal can offer them for editing without the manifest at hand
         "config": [{"key": c["key"], "label": c.get("label", ""),
@@ -8675,6 +9523,10 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["endpoints"] = inst["endpoints"]
     if inst and inst.get("links"):
         reg["instances"][name]["links"] = inst["links"]
+    # destination bindings (oaap.net.destinations 2.2) are the operator's
+    # grant, like links -- a deployment must not undo them
+    if carried_dest:
+        reg["instances"][name]["destinations"] = carried_dest
     # What this instance is a rehearsal OF, and when it goes away
     # (spec 2.15.1). Written LAST and unconditionally when present, so a
     # record cannot end up a rehearsal by data and an ordinary instance
@@ -11475,7 +12327,7 @@ def _extract_instance_subtree(archive, member, dest):
          f"--strip-components={depth}", member])
 
 
-def _scrub_rehearsal_env(key, ident, secret_keys):
+def _scrub_rehearsal_env(key, ident, secret_keys, handover_fields=()):
     """Take the secrets out of the copied `instance.env` (D3, spec 2.15.2).
 
     AFTER the extraction, never before and never by hoping: the archive
@@ -11506,9 +12358,17 @@ def _scrub_rehearsal_env(key, ident, secret_keys):
                       # RFC-0043: a rehearsal has its own names; the
                       # install below computes them afresh
                       "OAAP_INSTANCE_NAMES"}
+    # oaap.net.destinations 2.6: a rehearsal has no bindings -- every
+    # destination URL and every handed-over field of the production
+    # instance goes, before any container exists. Platform-owned, so not
+    # reported as "fill this in": the answer to a missing destination
+    # is a deliberate binding, never a pasted production credential.
+    platform_owned |= set(handover_fields or ())
     env = load_env(key, ident)
     dropped = sorted(k for k in list(env)
-                     if k in platform_owned or k in secret_keys)
+                     if k in platform_owned or k in secret_keys
+                     or k.startswith(DEST_ENV_PREFIX))
+    platform_owned |= {k for k in dropped if k.startswith(DEST_ENV_PREFIX)}
     for k in dropped:
         env.pop(k, None)
     save_env(key, env, ident)
@@ -11540,7 +12400,8 @@ def create_rehearsal(plan, who="root", role="root"):
              "extensions": 0}
     try:
         _extract_instance_subtree(plan["archive"], plan["member"], dest)
-        dropped = _scrub_rehearsal_env(plan["key"], ident, secret_keys)
+        dropped = _scrub_rehearsal_env(plan["key"], ident, secret_keys,
+                                       dest_handover_fields(src))
         install_artifact(plan["key"], plan["package"], None,
                          channel="production", path=plan["package_path"],
                          permit={"tenant": plan["tenant"],
@@ -15106,6 +15967,32 @@ def main():
     pv.add_argument("groups", nargs="?", default="",
                     help="comma-separated group tags, e.g. buero,finanzen (with 'groups')")
     pv.set_defaults(fn=cmd_visibility)
+    pdst = sub.add_parser("destination",
+                          help="named targets an instance may be bound to "
+                               "(oaap.net.destinations 0.1, RFC-0033)")
+    pdst.add_argument("action", choices=["list", "show", "add", "remove",
+                                         "set-secret", "bind", "unbind",
+                                         "bindings"])
+    pdst.add_argument("name", nargs="?",
+                      help="the destination (list/show/add/remove/set-secret) "
+                           "or the instance (bind/unbind/bindings)")
+    pdst.add_argument("second", nargs="?",
+                      help="bind: the destination; unbind: the need name")
+    pdst.add_argument("--tenant", default="", help="tenant label (default: the default tenant)")
+    pdst.add_argument("--kind", choices=list(DEST_KINDS), default="http")
+    pdst.add_argument("--target", default="",
+                      help="https://host[:port][/base] or tcp://host:port")
+    pdst.add_argument("--auth", choices=["none", "basic", "bearer", "header"],
+                      default="none")
+    pdst.add_argument("--user", default="", help="basic: the user name")
+    pdst.add_argument("--header", default="", help="header: the header name")
+    pdst.add_argument("--secret-stdin", action="store_true",
+                      help="read the secret from standard input (else: hidden prompt)")
+    pdst.add_argument("--as", dest="as_", default="",
+                      help="bind: the need name the app knows (default: the destination's name)")
+    pdst.add_argument("--rehearsal-exception", action="store_true",
+                      help="bind: deliberately bind a rehearsal (logged, RFC-0030)")
+    pdst.set_defaults(fn=cmd_destination)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])
     pk.add_argument("source", nargs="?", help="the instance that may reach the target")

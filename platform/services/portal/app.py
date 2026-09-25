@@ -2233,6 +2233,36 @@ INSTANCE_EDIT_BODY = """
   </form>
   {% endif %}
 </div>
+<div class="card">
+  <h2>Destinationen</h2>
+  <p class="muted">Ziele außerhalb dieser App, etwa ein ERP oder ein
+     Mailserver. Die App erreicht eines nur, wenn es ihr ausdrücklich
+     zugeordnet ist. Bei <strong>Proxy</strong> ruft sie das Gateway, und die
+     Plattform ergänzt die Anmeldung: Die App sieht das Passwort nie. Bei
+     <strong>Übergabe</strong> (Mailserver, Datenbank) liegen Adresse und
+     Zugangsdaten in der Umgebung der App.</p>
+  {% if i.destinations %}
+  <table class="mini">
+    <tr><th>Bedarf</th><th>Zugeordnet</th><th>Art</th></tr>
+    {% for d in i.destinations %}
+    <tr>
+      <td><code>{{ d.need }}</code>{% if d.purpose %}<br><span class="muted">{{ d.purpose }}</span>{% endif %}
+          {% if not d.declared %}<br><span class="muted">nicht im Manifest erklärt</span>{% endif %}</td>
+      <td>{% if d.missing %}<code>{{ d.destination }}</code> — <strong>fehlt auf diesem Knoten</strong>
+          {% elif d.destination %}<code>{{ d.destination }}</code><br><span class="muted">{{ d.target }}</span>
+          {% else %}<span class="muted">nicht zugeordnet</span>{% endif %}</td>
+      <td>{% if d.mode == "Proxy" %}Proxy<br><span class="muted"><code>{{ d.env }}</code></span>
+          {% elif d.mode %}<strong>Übergabe</strong><br><span class="muted">Zugangsdaten im Container</span>
+          {% else %}{{ d.kind }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Diese App erklärt keinen Bedarf und hat keine Zuordnung.</p>
+  {% endif %}
+  <p class="muted">Zuordnen geht in dieser Version über die Kommandozeile:
+     <code>oaap destination bind {{ i.key }} &lt;destination&gt;</code></p>
+</div>
 </section>
 
 <section class="panel {{ 'active' if tab == 'deployment' }}">
@@ -3129,6 +3159,44 @@ def load_instances():
             return json.load(f).get("instances", {})
     except (OSError, ValueError):
         return {}
+
+
+# Destinations (oaap.net.destinations 0.1, RFC-0033 stage 1). The
+# objects only -- the secrets live in a directory no container mounts,
+# this one included. Shown, not changed: in 0.1 binding is the CLI's
+# (spec 2.7).
+DESTINATIONS_FILE = "/apps-registry/destinations.json"
+
+
+def _destination_view(inst):
+    """What the instance page says about destinations: every declared
+    need and every binding, and for each whether the proxy holds or the
+    credential was handed into the container. `handover` is said on
+    every surface that shows a binding (spec 2.4)."""
+    try:
+        with open(DESTINATIONS_FILE, encoding="utf-8") as f:
+            dests = (json.load(f) or {}).get("destinations") or {}
+    except (OSError, ValueError):
+        dests = {}
+    own = dests.get(resolve_tenant(inst.get("tenant")) or "") or {}
+    binds = inst.get("destinations") or {}
+    needs = {d.get("name"): d for d in inst.get("declared_destinations") or []}
+    rows = []
+    for need in sorted(set(binds) | set(needs)):
+        decl = needs.get(need) or {}
+        dname = binds.get(need, "")
+        d = own.get(dname) if dname else None
+        rows.append({
+            "need": need, "purpose": decl.get("purpose", ""),
+            "declared": bool(decl), "kind": (d or decl).get("kind", ""),
+            "destination": dname, "missing": bool(dname) and not d,
+            "target": ((d or {}).get("target") or {}).get("direct", ""),
+            "mode": ("" if not d else "Proxy" if d["kind"] == "http"
+                     else "Übergabe"),
+            "env": ("OAAP_DESTINATION_" + need.upper().replace("-", "_") + "_URL"
+                    if d and d["kind"] == "http" else ""),
+        })
+    return rows
 
 
 EXTERNAL_FILE = "/apps-registry/external.json"
@@ -6452,6 +6520,7 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # app-to-app links (RFC-0016): the instances this one may reach,
          # and the other instances still available to link to
          "links": inst.get("links") or [],
+         "destinations": _destination_view(inst),
          "link_candidates": sorted(n for n in load_instances()
                                    if n != name
                                    and n not in (inst.get("links") or [])),
