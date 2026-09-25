@@ -6640,9 +6640,10 @@ def cmd_data_twin(args):
     if args.action == "add-reader":
         if not has_profile("store") or not _store_running():
             die("this node's twin is not running (profile 'store') -- nothing to read")
-        tid = resolve_tenant(args.tenant) if args.tenant else ensure_default_tenant()
-        if tid is None:
-            die(f"this node has no tenant '{args.tenant}'")
+        # a LABEL, like every other --tenant here (resolve_tenant_arg);
+        # resolve_tenant() takes ids only -- `--tenant default` was
+        # refused on oaap-test by the first real use of this command
+        tid = resolve_tenant_arg(args.tenant) or ensure_default_tenant()
         key, expires = twin_reader_add(label, tid, args.reads, args.days, who=who)
         print(f"Remote reader '{TWIN_REMOTE_PREFIX}{label}' reads "
               f"{args.reads} of tenant '{tenant_label(tid) or 'default'}', read-only.")

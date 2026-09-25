@@ -252,6 +252,21 @@ ok("CLI: data twin add-reader parses",
    (a.object, a.action, a.arg1, a.tenant, a.reads, a.days)
    == ("twin", "add-reader", "x01-aipc", "meier", "machine,customer", 30))
 
+# oaap-test 2026-09-25: `--tenant default` was refused -- the command
+# took ids only. Run the command itself, with a label, as a person would.
+m.has_profile = lambda p: True
+m._store_running = lambda: True
+m.model_types = lambda tid=None: [{"key": "machine"}]
+CALLS.clear()
+try:
+    m.cmd_data_twin(argparse.Namespace(action="add-reader", arg1="lbl-check",
+                                       tenant="default", reads="machine", days=None))
+    label_ok = True
+except SystemExit:
+    label_ok = False
+ok("CLI: --tenant takes the tenant's LABEL", label_ok
+   and m.load_twin_readers()["lbl-check"]["tenant"] == DEFAULT)
+
 print("")
 print("OK" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)
