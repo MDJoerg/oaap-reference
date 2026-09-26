@@ -15256,6 +15256,62 @@ def cmd_process_deploys(_args):
                     msg = f"link {name} -> {target} removed"
                 else:
                     msg = f"unknown link op '{op}'"
+        elif action == "destination":
+            # Bind or unbind a destination from the portal
+            # (oaap.net.destinations 2.7, RFC-0033 §1.2: a tenant_admin
+            # binds). The same functions the CLI calls, so the checks
+            # (own tenant, declared kind, need name) are the same ones --
+            # and they run here because the spool is data, not trust.
+            #
+            # A tenant_admin may bind only what their tenant owns: the
+            # destination is looked up in the INSTANCE's tenant, and a
+            # request for another tenant's instance never reaches this
+            # branch (cross_tenant above). They cannot author a target,
+            # which is why this may open while `destination add` stays
+            # server_admin's (2.1, DNS rebinding).
+            #
+            # destination_bind/unbind write their own tenant-log lines
+            # (with the actor and the mode), so this action is NOT in
+            # TENANT_AUDITED -- one line per event, not two.
+            #
+            # A rehearsal is never bound from here: RFC-0033 §1.5 wants
+            # that to be a deliberate act on the machine
+            # (--rehearsal-exception), and a button is not deliberate.
+            op = req.get("op", "")
+            need = str(req.get("need") or "")
+            dname = str(req.get("destination") or "")
+            who = actor or "portal"
+            if not inst:
+                msg = "unknown instance"
+            elif actor and act_role not in ("server_admin", "tenant_admin"):
+                msg = ("changing a destination binding requires "
+                       "server_admin or tenant_admin")
+                audit_tenant("destination." + (op or "bind"),
+                             resolve_tenant(inst.get("tenant"))
+                             or ensure_default_tenant(),
+                             subject=name, result="denied", who=who,
+                             role=act_role or "-", detail=msg)
+            elif op == "bind" and is_rehearsal(inst):
+                msg = (f"'{name}' is a rehearsal (RFC-0030) -- it reaches "
+                       "nothing outward. Bind it by hand on the node with "
+                       "--rehearsal-exception if it really must")
+            else:
+                try:
+                    if op == "bind":
+                        if destination_bind(reg, name, dname, need=need,
+                                            who=who, role=act_role or "-"):
+                            ok, msg = True, (f"bound: '{name}' reaches "
+                                             f"'{dname}' as '{need or dname}'")
+                        else:
+                            ok, msg = True, f"'{name}' is already bound to '{dname}'"
+                    elif op == "unbind":
+                        destination_unbind(reg, name, need, who=who,
+                                           role=act_role or "-")
+                        ok, msg = True, f"unbound: '{name}' no longer reaches '{need}'"
+                    else:
+                        msg = f"unknown destination op '{op}'"
+                except DestinationRefused as e:
+                    msg = str(e)
         elif action == "tile":
             # Launchpad tile override (runtime spec 2.10). Registry only
             # — no gateway work, because this changes nothing about who
@@ -15564,6 +15620,7 @@ def cmd_process_deploys(_args):
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
+               "destination": "portal",
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",

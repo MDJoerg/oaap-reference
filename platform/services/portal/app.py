@@ -2323,7 +2323,30 @@ INSTANCE_EDIT_BODY = """
           {% if not d.declared %}<br><span class="muted">nicht im Manifest erklärt</span>{% endif %}</td>
       <td>{% if d.missing %}<code>{{ d.destination }}</code> — <strong>fehlt auf diesem Knoten</strong>
           {% elif d.destination %}<code>{{ d.destination }}</code><br><span class="muted">{{ d.target }}</span>
-          {% else %}<span class="muted">nicht zugeordnet</span>{% endif %}</td>
+          {% else %}<span class="muted">nicht zugeordnet</span>{% endif %}
+          {% if d.bound %}
+          <form method="post" action="/instances/{{ i.key }}/destination">
+            <input type="hidden" name="tab" value="netz">
+            <input type="hidden" name="op" value="unbind">
+            <input type="hidden" name="need" value="{{ d.need }}">
+            <button class="secondary">Lösen</button>
+          </form>
+          {% elif d.options and not i.rehearsal %}
+          <form method="post" action="/instances/{{ i.key }}/destination">
+            <input type="hidden" name="tab" value="netz">
+            <input type="hidden" name="op" value="bind">
+            <input type="hidden" name="need" value="{{ d.need }}">
+            <select name="destination" aria-label="Destination für {{ d.need }}">
+              {% for o in d.options %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+            </select>
+            <button>Zuordnen</button>
+            {% if d.kind == "tcp" %}<br><span class="muted"><strong>Übergabe:</strong>
+              Adresse und Zugangsdaten liegen danach in der Umgebung der App.</span>{% endif %}
+          </form>
+          {% elif d.declared and not d.options and not i.rehearsal %}
+          <br><span class="muted">Dein Mandant hat keine Destination der Art {{ d.kind }}. Anlegen
+             kann sie der Betreiber des Knotens.</span>
+          {% endif %}</td>
       <td>{% if d.mode == "Proxy" %}Proxy<br><span class="muted"><code>{{ d.env }}</code></span>
           {% elif d.mode %}<strong>Übergabe</strong><br><span class="muted">Zugangsdaten im Container</span>
           {% else %}{{ d.kind }}{% endif %}</td>
@@ -2333,8 +2356,17 @@ INSTANCE_EDIT_BODY = """
   {% else %}
   <p class="muted">Diese App erklärt keinen Bedarf und hat keine Zuordnung.</p>
   {% endif %}
-  <p class="muted">Zuordnen geht in dieser Version über die Kommandozeile:
-     <code>oaap destination bind {{ i.key }} &lt;destination&gt;</code></p>
+  {% if i.rehearsal %}
+  <p class="muted">Das ist eine Generalprobe: Sie erreicht kein Ziel nach außen. Wer
+     ihr trotzdem eines zuordnen muss, tut das am Knoten mit
+     <code>oaap destination bind {{ i.key }} &lt;destination&gt; --rehearsal-exception</code>;
+     das Protokoll des Mandanten vermerkt es.</p>
+  {% else %}
+  <p class="muted">Zuordnen und Lösen dauert einen Moment: Die App wird dabei mit der
+     neuen Umgebung neu gestartet. Ein Bedarf, den das Manifest nicht nennt, und ein
+     Anlegen neuer Destinationen laufen über die Kommandozeile:
+     <code>oaap destination bind {{ i.key }} &lt;destination&gt; --as &lt;bedarf&gt;</code></p>
+  {% endif %}
 </div>
 </section>
 
@@ -3279,6 +3311,14 @@ def _destination_view(inst):
                      else "Übergabe"),
             "env": ("OAAP_DESTINATION_" + need.upper().replace("-", "_") + "_URL"
                     if d and d["kind"] == "http" else ""),
+            # what the form may offer: an unbound, DECLARED need can be
+            # satisfied by this tenant's destinations of the same kind.
+            # An undeclared name stays with the CLI (--as): only the
+            # manifest says what an app reads.
+            "options": ([] if dname or not decl else
+                        sorted(n for n, o in own.items()
+                               if o.get("kind") == decl.get("kind"))),
+            "bound": bool(dname),
         })
     return rows
 
@@ -6798,6 +6838,37 @@ def instance_link(name):
         return _inst_back(name, err="Bitte eine Ziel-Instanz wählen.")
     return _queue_and_redirect(name, {"action": "link", "op": op, "target": target},
                                LINK_WAIT_SECONDS)
+
+
+DESTINATION_WAIT_SECONDS = 90  # a binding recreates the container, like a config save
+
+
+@app.post("/instances/<name>/destination")
+def instance_destination(name):
+    """Bind or unbind a destination (oaap.net.destinations 2.7,
+    RFC-0033 §1.2). server_admin, or the tenant_admin of THIS instance
+    -- `require_instance_admin` answers another tenant's instance as one
+    that does not exist. Queued through the spool worker, which runs the
+    same checks again and writes the tenant-log line: the button is not
+    the boundary."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    op = request.form.get("op", "bind")
+    need = (request.form.get("need") or "").strip()
+    dest = (request.form.get("destination") or "").strip()
+    if op not in ("bind", "unbind"):
+        return _inst_back(name, err="Unbekannte Aktion.")
+    if not need:
+        return _inst_back(name, err="Kein Bedarf angegeben.")
+    if op == "bind" and not dest:
+        return _inst_back(name, err="Bitte eine Destination wählen.")
+    return _queue_and_redirect(
+        name, {"action": "destination", "op": op, "need": need,
+               "destination": dest if op == "bind" else ""},
+        DESTINATION_WAIT_SECONDS)
 
 
 @app.post("/instances/<name>/visibility")
