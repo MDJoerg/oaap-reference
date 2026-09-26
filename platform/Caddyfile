@@ -107,6 +107,18 @@
 		}
 	}
 
+	# The laptop client of the exposures (oaap.net.connector 0.2, spec
+	# 2.8.5), downloaded from the node it talks to: a file with no secret
+	# in it, so no session -- and EXACTLY this path, like the tunnel.
+	handle /connect/client {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
+		reverse_proxy connect:8000
+	}
+
 	# The digital twin (oaap.data.twin 0.1, RFC-0031 Schritt 3): the one
 	# route every app instance reaches through, never each other's site.
 	# Verified the same way every other protected route is -- the caller

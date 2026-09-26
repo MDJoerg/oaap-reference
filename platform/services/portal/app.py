@@ -898,7 +898,7 @@ HEALTH_BODY = """
      hinkt hinterher.</p>
 </div>
 {% endif %}
-{% if cx and (cx.tunnels or cx.connectors) %}
+{% if cx and (cx.tunnels or cx.connectors or cx.exposures) %}
 <div class="card">
   <h2>Tunnel (Connector)</h2>
   <p class="muted">Ein <strong>innerer</strong> Knoten baut von sich aus einen
@@ -931,6 +931,27 @@ HEALTH_BODY = """
   </table>
   <p class="muted">Pausieren schließt den Tunnel sofort, und der äußere Knoten
      kann ihn nicht wieder öffnen: <code>oaap connector pause &lt;label&gt;</code></p>
+  {% endif %}
+  {% if cx.exposures %}
+  <h3>Freigaben (öffentliche Zufallsnamen)</h3>
+  <table class="mini">
+    <tr><th>Adresse</th><th>Mandant</th><th>Zugriff</th><th>Geöffnet von</th><th>Bis (UTC)</th></tr>
+    {% for e in cx.exposures %}
+    <tr>
+      <td><code>{{ cx.scheme }}://{{ e.host }}/</code>
+          {% if not e.connected %}<br><span class="muted">Gegenstelle gerade nicht verbunden</span>{% endif %}</td>
+      <td>{{ e.tenant }}</td>
+      <td>{% if e.public %}<span class="dot warn"></span><strong>öffentlich</strong> (ohne Anmeldung, gebremst)
+          {% else %}<span class="dot ok"></span>hinter der Anmeldung{% endif %}
+          <br><span class="muted">{{ e.calls }} Aufrufe</span></td>
+      <td>{{ e.by }}</td>
+      <td>{{ e.expires }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">{{ cx.certs_week }} Namen in den letzten 7 Tagen geöffnet; Let's
+     Encrypt stellt höchstens {{ cx.certs_limit }} Zertifikate je Domain und
+     Woche aus. Beenden: <code>oaap connect exposure close &lt;name&gt;</code>.</p>
   {% endif %}
   {% if cx.tunnels %}
   <h3>Hier wählen innere Knoten ein</h3>
@@ -3294,7 +3315,8 @@ def connect_view():
     conf, st = _connect_data()
     keys = conf.get("keys") or {}
     conns = conf.get("connectors") or {}
-    if not keys and not conns:
+    live = ((st or {}).get("exposures") or {})
+    if not keys and not conns and not live:
         return None
     st_t = (st or {}).get("tunnels") or {}
     st_c = (st or {}).get("connectors") or {}
@@ -3318,7 +3340,15 @@ def connect_view():
             "offers": [{"name": n, "to": o.get("to", ""), "path": o.get("path", ""),
                         "methods": o.get("methods") or []}
                        for n, o in sorted((c.get("offers") or {}).items())]})
-    return {"tunnels": tunnels, "connectors": connectors, "reported": st is not None}
+    exposures = [{"name": n, "host": e.get("host", ""), "tenant": tenant_label(e.get("tenant", "")),
+                  "public": bool(e.get("public")), "by": e.get("opened_by", ""),
+                  "expires": (e.get("expires") or "")[:16].replace("T", " "),
+                  "calls": e.get("calls", 0), "connected": bool(e.get("connected"))}
+                 for n, e in sorted(live.items(), key=lambda kv: kv[1].get("opened", ""))]
+    return {"tunnels": tunnels, "connectors": connectors, "reported": st is not None,
+            "exposures": exposures, "scheme": (st or {}).get("scheme") or "https",
+            "certs_week": int((st or {}).get("certs_week") or 0),
+            "certs_limit": int((st or {}).get("certs_limit") or 50)}
 
 
 def connect_attention():
@@ -3475,6 +3505,18 @@ def edge_tls_ask():
         h = r.get("host", "")
         if h and (domain == h or domain.endswith("." + h)):
             return "ok", 200
+    # oaap.net.connector 2.8.7: the exposure zone. Exactly the name of an
+    # exposure that is alive NOW -- not the zone, not any other name under
+    # it, not one whose time just ran out. The service writes the state
+    # within a second of a change; the certificate is asked for at the
+    # first handshake, which is after the exposure exists.
+    ext = external_host()
+    if ext and domain.endswith(".t." + ext):
+        import time as _time
+        now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        for e in ((_read_json(CONNECT_STATE) or {}).get("exposures") or {}).values():
+            if e.get("host") == domain and (e.get("expires") or "") > now:
+                return "ok", 200
     return "not an edge-routed name", 404
 
 

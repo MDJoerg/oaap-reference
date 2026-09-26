@@ -1144,12 +1144,23 @@ CONNECT_GATEWAY_KEY_FILE = os.path.join(CONNECT_SECRETS_DIR, "gateway.key")
 CONNECT_STATE_DIR = os.path.join(CONNECT_DIR, "state")
 CONNECT_SERVICE = "connect:8000"
 CONNECT_ROUTE = "/connect/tunnel"
+CONNECT_CLIENT_ROUTE = "/connect/client"
 CONNECT_CONTAINER = "oaap-connect-1"
 CONNECT_KEY_PREFIX = "oaapc_"
 # MUST match services/connect/app.py -- test_connector.py checks it.
 CONNECT_GW_KEY = "X-OAAP-Connect-Gateway"
 CONNECT_GW_CALLER = "X-OAAP-Connect-Caller"
 CONNECT_GW_DEST = "X-OAAP-Connect-Destination"
+# exposures (oaap.net.connector 2.8): the requested name and the client
+CONNECT_GW_HOST = "X-OAAP-Connect-Host"
+CONNECT_GW_CLIENT = "X-OAAP-Connect-Client"
+# where the names live: t.<external host> (spec 2.8.1), and the limits of 2.8.3
+EXPOSE_ZONE_LABEL = "t"
+EXPOSE_SITE = "_exposures.caddy"
+EXPOSE_DEFAULT_TTL = 8 * 3600
+EXPOSE_MIN_TTL = 60
+EXPOSE_MAX_TTL = 7 * 86400
+CERT_WEEK_LIMIT, CERT_WEEK_WARN = 50, 40
 CONNECT_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 # spec 2.3: the node's own platform services, never an offer. The same
 # list is in the service, which re-checks every call -- a file can be
@@ -1167,6 +1178,8 @@ def load_connect():
         c = {}
     c.setdefault("keys", {})
     c.setdefault("connectors", {})
+    c.setdefault("exposure", {})
+    c.setdefault("exposure_closed", {})
     return c
 
 
@@ -1174,8 +1187,10 @@ def save_connect(c):
     os.makedirs(APPS_DIR, exist_ok=True)
     tmp = CONNECT_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"schema": "0.1", "keys": c.get("keys") or {},
-                   "connectors": c.get("connectors") or {}}, f, indent=2)
+        json.dump({"schema": "0.2", "keys": c.get("keys") or {},
+                   "connectors": c.get("connectors") or {},
+                   "exposure": c.get("exposure") or {},
+                   "exposure_closed": c.get("exposure_closed") or {}}, f, indent=2)
     os.replace(tmp, CONNECT_FILE)
     os.chmod(CONNECT_FILE, 0o644)
 
@@ -1435,6 +1450,286 @@ def tunnel_offer_remove(label, offer, who="root", role="root"):
                  who=who, role=role)
 
 
+# --------------------------------------- exposures (RFC-0033 stage 3, 2.8)
+# A random public name for one target, for a while. The names live in a
+# zone under the node's external hostname; the connect service allocates
+# them, and this file only says WHERE the zone is and writes the one
+# gateway site that serves it.
+
+def exposure_zone(ext_conf=None):
+    """(zone, scheme) -- ("", "") on a node with no external hostname."""
+    host, edge = load_external_conf() if ext_conf is None else ext_conf
+    if not host:
+        return "", ""
+    return f"{EXPOSE_ZONE_LABEL}.{host}", ("http" if edge else "https")
+
+
+def parse_ttl(text, default=EXPOSE_DEFAULT_TTL):
+    """`30m`, `8h`, `2d`, `90s`, or a bare number of seconds."""
+    t = (text or "").strip().lower()
+    if not t:
+        return default
+    m = re.fullmatch(r"(\d+)\s*([smhd]?)", t)
+    if not m:
+        raise DestinationRefused("--ttl is a time like 30m, 8h or 2d")
+    secs = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    if secs < EXPOSE_MIN_TTL:
+        raise DestinationRefused(f"an exposure lasts at least {EXPOSE_MIN_TTL} seconds")
+    if secs > EXPOSE_MAX_TTL:
+        raise DestinationRefused("an exposure lasts at most 7 days -- open it again "
+                                 "when the time is up, that is a new act with a "
+                                 "new audit line")
+    return secs
+
+
+def write_exposure_conf():
+    """Tell the connect service where the zone is (connect.json)."""
+    zone, scheme = exposure_zone()
+    want = {"zone": zone, "scheme": scheme} if zone else {}
+    c = load_connect()
+    closed = c.get("exposure_closed") or {}
+    stale = [n for n, when in closed.items() if (when or "") < _iso_days_ago(1)]
+    for n in stale:
+        del closed[n]
+    if (c.get("exposure") or {}) != want or stale:
+        c["exposure"] = want
+        save_connect(c)
+
+
+def _iso_days_ago(days):
+    import datetime
+    return (datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def write_exposures_caddy():
+    """(Re)generate the gateway site of the exposure zone (spec 2.8, gateway
+    0.2.14). Returns True when the file changed -- the caller reloads then.
+
+    ONE site for every name in the zone, so opening an exposure never
+    touches the gateway. Direct mode: on-demand TLS, approved per name by
+    the portal (which says yes to a live exposure and to nothing else);
+    behind an edge: plain http and only the edge is let in, like every
+    generated site.
+
+    It holds the connect service's key, so it is written like the
+    destination listener: 0600, its own file.
+
+    `route`, not bare directives: inside `handle` Caddy SORTS directives
+    (the lesson of 0.1.128), and here the ORDER is the rule -- strip what
+    a client sent, ask, then rewrite, then proxy.
+    """
+    path = os.path.join(CADDY_APPS_DIR, EXPOSE_SITE)
+    ext = load_external_conf()
+    zone, scheme = exposure_zone(ext)
+    if not zone:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+        return False
+    edge = ext[1]
+    key = _caddy_quote(connect_gateway_key())
+    client = ("{http.request.header.X-Forwarded-For}" if edge
+              else "{http.request.remote.host}")
+    hup = [f"header_up {CONNECT_GW_KEY} {key}",
+           f"header_up {CONNECT_GW_HOST} {{http.request.host}}",
+           f"header_up {CONNECT_GW_CLIENT} {client}"]
+    mode = f"behind edge {edge}" if edge else "direct (TLS on demand)"
+    lines = [f"# generated by appctl -- the exposure zone {zone}, {mode}",
+             "# (oaap.net.connector 0.2, RFC-0033 stage 3). Holds a key: 0600.",
+             f"{scheme}://*.{zone} {{"]
+    if not edge:
+        lines += ["\ttls {", "\t\ton_demand", "\t}"]
+    else:
+        lines += _edge_guard(edge)
+    lines += _LOG_BLOCK
+    lines += ["\thandle /auth/* {"] + strip_identity() + \
+             ["\t\treverse_proxy identity:8000", "\t}",
+              "\thandle {", "\t\troute {"]
+    lines += strip_identity("\t\t\t")
+    lines += ["\t\t\tforward_auth " + CONNECT_SERVICE + " {",
+              "\t\t\t\turi /exposure/verify"]
+    lines += ["\t\t\t\t" + h for h in hup]
+    lines += ["\t\t\t\t" + _COPY_IDENTITY,
+              "\t\t\t\theader_up -Connection", "\t\t\t\theader_up -Upgrade",
+              "\t\t\t}",
+              "\t\t\trewrite * /exposed{uri}",
+              f"\t\t\treverse_proxy {CONNECT_SERVICE} {{"]
+    lines += ["\t\t\t\t" + h for h in hup]
+    lines += [f"\t\t\t\tstream_close_delay {STREAM_CLOSE_DELAY}", "\t\t\t}",
+              "\t\t}", "\t}", "}"]
+    if not edge:
+        lines += [f"http://*.{zone} {{",
+                  "\tredir https://{host}{uri} permanent", "}"]
+    text = "\n".join(lines) + "\n"
+    if _read_file(path) == text:
+        return False
+    os.makedirs(CADDY_APPS_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return True
+
+
+def write_exposures():
+    """The zone in connect.json and the zone's gateway site. One call, so
+    no place that changes the external hostname can do one and forget the
+    other."""
+    write_exposure_conf()
+    return write_exposures_caddy()
+
+
+def _expose_wait(label, ref, seconds=20):
+    """The answer of the outer node for one exposure, as far as it comes
+    within `seconds` -- read from the state the service writes."""
+    end = time.time() + seconds
+    while time.time() < end:
+        x = ((connect_state().get("connectors") or {}).get(label) or {}) \
+            .get("exposures", {}).get(ref) or {}
+        if x.get("url") or x.get("error"):
+            return x
+        time.sleep(0.5)
+    return {}
+
+
+def tunnel_exposure_add(label, target, ttl, public=False, who="root", role="root"):
+    """Inner side: ask for an exposure of `target` (spec 2.8). Returns the
+    ref. The end is written as an absolute time, so a restart or a
+    reconnect never gives it a fresh lease."""
+    c = load_connect()
+    conn = c["connectors"].get(label)
+    if not conn:
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    target = (target or "").strip()
+    why = offer_target_refusal(target)
+    if why:
+        raise DestinationRefused(why)
+    exps = conn.setdefault("exposures", {})
+    for r in [r for r, w in exps.items() if float(w.get("expires_at") or 0) < time.time() - 3600]:
+        del exps[r]
+    if len(exps) >= 10:
+        raise DestinationRefused("at most 10 exposures per connector "
+                                 "(oaap connector unexpose ...)")
+    ref = "x-" + secrets.token_hex(3)
+    exps[ref] = {"target": target, "public": bool(public),
+                 "expires_at": time.time() + ttl, "created": _iso_now(),
+                 "created_by": who}
+    save_connect(c)
+    audit_tenant("connector.expose", "", subject=f"{label}/{ref}", who=who, role=role,
+                 detail=("PUBLIC, " if public else "login, ") + f"for {ttl // 60} min")
+    return ref
+
+
+def tunnel_exposure_find(conn, key):
+    """A ref from what the operator typed: the ref, or the public name."""
+    exps = conn.get("exposures") or {}
+    if key in exps:
+        return key
+    return None
+
+
+def tunnel_exposure_remove(label, key, who="root", role="root"):
+    c = load_connect()
+    conn = c["connectors"].get(label)
+    if not conn:
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    ref = tunnel_exposure_find(conn, key)
+    if ref is None:
+        # the operator may have typed the name on the internet
+        for r, x in ((connect_state().get("connectors") or {}).get(label) or {}) \
+                .get("exposures", {}).items():
+            if x.get("name") == key and r in (conn.get("exposures") or {}):
+                ref = r
+    if ref is None:
+        raise DestinationRefused(f"connector '{label}' holds no exposure '{key}'")
+    del conn["exposures"][ref]
+    save_connect(c)
+    audit_tenant("connector.unexpose", "", subject=f"{label}/{ref}", who=who, role=role)
+
+
+def tunnel_exposure_extend(label, key, ttl, who="root", role="root"):
+    c = load_connect()
+    conn = c["connectors"].get(label)
+    if not conn:
+        raise DestinationRefused(f"no connector '{label}' on this node")
+    ref = tunnel_exposure_find(conn, key)
+    if ref is None:
+        raise DestinationRefused(f"connector '{label}' holds no exposure '{key}'")
+    w = conn["exposures"][ref]
+    if float(w.get("expires_at") or 0) < time.time():
+        raise DestinationRefused("that exposure has run out -- open a new one "
+                                 "(oaap connector expose)")
+    w["expires_at"] = time.time() + ttl
+    save_connect(c)
+    audit_tenant("connector.extend", "", subject=f"{label}/{ref}", who=who, role=role,
+                 detail=f"for {ttl // 60} min from now")
+
+
+def _print_exposure_state(label, ref, x, w=None):
+    if x.get("url"):
+        print(f"  {ref:<10} {x['url']}   until {x.get('expires', '?')}  "
+              + ("PUBLIC (no login)" if x.get("public") else "behind the login"))
+    elif x.get("error"):
+        print(f"  {ref:<10} REFUSED by the outer node: {x['error']}")
+    elif x.get("expired"):
+        print(f"  {ref:<10} ended ({x['expired']})")
+    else:
+        print(f"  {ref:<10} no answer from the outer node yet"
+              + ("" if not w else " -- is the connector connected? (oaap connector list)"))
+
+
+def cmd_connect_exposures(args):
+    """`oaap connect exposures` and `oaap connect exposure close|log` --
+    the OUTER side of spec 2.8."""
+    st = connect_state()
+    if args.action == "exposure":
+        op = args.name or die("'connect exposure' needs close or log")
+        if op == "log":
+            _connect_log_tail("exposures", args.lines)
+            return
+        if op != "close":
+            die("'connect exposure' needs close or log")
+        name = (args.second or die("'connect exposure close' needs the name")).lower()
+        live = st.get("exposures") or {}
+        if name not in live:
+            die(f"no live exposure '{name}' on this node (oaap connect exposures)")
+        c = load_connect()
+        c.setdefault("exposure_closed", {})[name] = _iso_now()
+        save_connect(c)
+        e = live[name]
+        audit_tenant("exposure.close.requested", e.get("tenant", ""), subject=e.get("host", name),
+                     who=_dest_who(), role="server_admin",
+                     detail="closed by the operator of this node")
+        print(f"Exposure '{name}' is closed within seconds, and the name cannot be "
+              "resumed.")
+        return
+    live = st.get("exposures") or {}
+    zone = st.get("zone") or exposure_zone()[0]
+    if not zone:
+        print("This node has no external hostname, so it has no exposure zone "
+              "(oaap external set <host>).")
+        return
+    print(f"Zone {zone}")
+    if not live:
+        print("  No live exposures.")
+    scheme = st.get("scheme") or "https"
+    for name, e in sorted(live.items(), key=lambda kv: kv[1].get("opened", "")):
+        print(f"  {name}  {scheme}://{e['host']}/  tenant {tenant_label(e.get('tenant', ''))}  "
+              + ("PUBLIC" if e.get("public") else "login") + f"  by {e.get('opened_by', '?')}"
+              f"  until {e.get('expires', '?')}  {e.get('calls', 0)} calls"
+              + ("" if e.get("connected") else "  (client not connected)"))
+    n = int(st.get("certs_week") or 0)
+    warn = "  -- NEAR THE LIMIT: new names may get no certificate" if n >= CERT_WEEK_WARN else ""
+    print(f"  {n} names opened in the last 7 days; Let's Encrypt issues at most "
+          f"{CERT_WEEK_LIMIT} certificates per registered domain per week{warn}")
+    for person in st.get("people") or []:
+        print(f"  laptop: {person.get('user')} (tenant {tenant_label(person.get('tenant', ''))}) "
+              f"since {person.get('since')} from {person.get('remote')}")
+    _service_note()
+
+
 def _connect_log_tail(name, n):
     path = os.path.join(CONNECT_STATE_DIR, "log", name + ".jsonl")
     try:
@@ -1462,6 +1757,8 @@ def _service_note():
 def cmd_connect(args):
     """`oaap connect ...` -- the OUTER side (spec 2.2)."""
     who = _dest_who()
+    if args.action in ("exposures", "exposure"):
+        return cmd_connect_exposures(args)
     try:
         if args.action == "key":
             sub_ = args.name or die("'connect key' needs issue, revoke or list")
@@ -1563,7 +1860,42 @@ def cmd_connector(args):
                           + (f"  {','.join(o['methods'])}" if o.get("methods") else ""))
                 if not conn.get("offers"):
                     print(f"  {'':<20} offers nothing -- the tunnel carries no call")
+                for ref, w in sorted((conn.get("exposures") or {}).items()):
+                    if float(w.get("expires_at") or 0) < time.time():
+                        continue
+                    x = (s.get("exposures") or {}).get(ref) or {}
+                    print(f"  {'':<20} expose {ref:<9} -> {w['target']}  "
+                          + (x.get("url") or (x.get("error") and "REFUSED: " + x["error"])
+                             or (x.get("expired") and f"ended ({x['expired']})")
+                             or "no answer yet"))
             _service_note()
+            return
+        if args.action == "expose":
+            label = args.name or die("'connector expose' needs the connector")
+            target = args.second or die("'connector expose' needs the target "
+                                        "(http://host:port)")
+            if label not in c["connectors"]:
+                die(f"no connector '{label}' on this node")
+            ref = tunnel_exposure_add(label, target, parse_ttl(args.ttl), args.public, who=who)
+            print(f"Asking the outer node for a name ({'PUBLIC, no login' if args.public else 'behind its login'}) ...")
+            x = _expose_wait(label, ref)
+            if not x:
+                print(f"  No answer within 20 s. The request stays ({ref}); it is answered when "
+                      "the connector is connected.")
+                _service_note()
+            else:
+                _print_exposure_state(label, ref, x)
+            print(f"End it with: sudo oaap connector unexpose {label} {ref}")
+            return
+        if args.action in ("unexpose", "extend"):
+            label = args.name or die(f"'connector {args.action}' needs the connector")
+            key = args.second or die(f"'connector {args.action}' needs the exposure (ref or name)")
+            if args.action == "unexpose":
+                tunnel_exposure_remove(label, key, who=who)
+                print(f"Exposure '{key}' let go; the outer node ends it within seconds.")
+            else:
+                tunnel_exposure_extend(label, key, parse_ttl(args.ttl), who=who)
+                print(f"Exposure '{key}' now runs for {args.ttl or '8h'} from now.")
             return
         if args.action == "offer":
             op = args.name or die("'connector offer' needs add or remove")
@@ -3327,6 +3659,24 @@ def cmd_migrate_connect(_args):
         reload_gateway()
         print(f"  {CONNECT_ROUTE} answers now; nothing dials in until a key is")
         print("  issued (oaap connect key issue). Reloaded, not restarted.")
+    elif have and f"handle {CONNECT_CLIENT_ROUTE} {{" not in have:
+        # 0.1.131: the laptop client is downloaded from the node
+        print("")
+        print("Opening the laptop-client route on the external sites "
+              "(oaap.net.connector 0.2) ...")
+        refresh_generated_sites()
+        reload_gateway()
+        print(f"  {CONNECT_CLIENT_ROUTE} answers now. Reloaded, not restarted.")
+    if load_external() and not os.path.exists(os.path.join(CADDY_APPS_DIR, EXPOSE_SITE)):
+        # the exposure zone (oaap.net.connector 2.8.1): one site, written
+        # once and then kept -- the same lesson as the routes above
+        print("")
+        print("Opening the exposure zone (oaap.net.connector 0.2) ...")
+        write_exposures()
+        reload_gateway()
+        zone, _s = exposure_zone()
+        print(f"  *.{zone} answers now; nothing is exposed until someone asks "
+              "for a name. Reloaded, not restarted.")
 
 
 def cmd_migrate_stream_close(_args):
@@ -7181,6 +7531,12 @@ def _portal_site_body():
     lines += strip_identity()
     lines += _proxy(CONNECT_SERVICE, "\t\t")
     lines.append("\t}")
+    # the laptop client of the exposures (oaap.net.connector 2.8.5): a
+    # file with no secret in it, downloaded from the node it talks to
+    lines.append(f"\thandle {CONNECT_CLIENT_ROUTE} {{")
+    lines += strip_identity()
+    lines += _proxy(CONNECT_SERVICE, "\t\t")
+    lines.append("\t}")
     lines.append("\thandle {")
     lines.append("\t\tforward_auth identity:8000 {")
     lines.append("\t\t\turi /verify")
@@ -7536,6 +7892,7 @@ def refresh_generated_sites():
     # the moments that must not wait for a caller (a network removed, a
     # binding changed) reload through refresh_destinations() themselves
     write_destinations_caddy()
+    write_exposures()
     sync_instance_names(load_registry(), recreate=False)
 
 
@@ -7585,6 +7942,7 @@ def cmd_external(args):
     os.replace(tmp, EXTERNAL_FILE)
     skipped = write_external_caddy()
     write_instance_address_caddy()
+    write_exposures()
     reload_gateway()
     # RFC-0043: the automatic name of every instance just changed, and
     # so did the scheme if an edge came or went.
@@ -16729,10 +17087,13 @@ def main():
     pcn = sub.add_parser("connect",
                          help="the outer side of a tunnel: keys inner nodes dial "
                               "in with (oaap.net.connector 0.1, RFC-0033)")
-    pcn.add_argument("action", choices=["key", "list", "offers", "log"])
+    pcn.add_argument("action", choices=["key", "list", "offers", "log",
+                                        "exposures", "exposure"])
     pcn.add_argument("name", nargs="?",
-                     help="key: issue|revoke|list; offers/log: the tunnel label")
-    pcn.add_argument("second", nargs="?", help="key issue/revoke: the tunnel label")
+                     help="key: issue|revoke|list; offers/log: the tunnel label; "
+                          "exposure: close|log")
+    pcn.add_argument("second", nargs="?",
+                     help="key issue/revoke: the tunnel label; exposure close: the name")
     pcn.add_argument("--tenant", default="",
                      help="key issue: the tenant the tunnel serves (default: the default tenant)")
     pcn.add_argument("-n", "--lines", type=int, default=30, help="log: how many calls")
@@ -16741,10 +17102,13 @@ def main():
                          help="the inner side of a tunnel: dial out, offer "
                               "backends by name (oaap.net.connector 0.1)")
     pco.add_argument("action", choices=["list", "show", "add", "remove", "set-key",
-                                        "pause", "resume", "log", "offer"])
+                                        "pause", "resume", "log", "offer",
+                                        "expose", "unexpose", "extend"])
     pco.add_argument("name", nargs="?",
                      help="the connector label; offer: add|remove")
-    pco.add_argument("second", nargs="?", help="offer: the connector label")
+    pco.add_argument("second", nargs="?",
+                     help="offer: the connector label; expose: the target URL; "
+                          "unexpose/extend: the exposure")
     pco.add_argument("third", nargs="?", help="offer: the offer name")
     pco.add_argument("--endpoint", default="",
                      help="add: the outer node, https://<host>")
@@ -16756,6 +17120,10 @@ def main():
     pco.add_argument("--path", default="", help="offer add: only paths below this prefix")
     pco.add_argument("--methods", default="",
                      help="offer add: only these methods, e.g. GET,POST")
+    pco.add_argument("--ttl", default="",
+                     help="expose/extend: how long, 30m, 8h, 2d (default 8h, at most 7d)")
+    pco.add_argument("--public", action="store_true",
+                     help="expose: no login for visitors (braked, still expires)")
     pco.add_argument("-n", "--lines", type=int, default=30, help="log: how many calls")
     pco.set_defaults(fn=cmd_connector)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")

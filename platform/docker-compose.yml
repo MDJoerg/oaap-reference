@@ -171,6 +171,9 @@ services:
       - "${OAAP_DATA_DIR}/data/connect/secrets:/secrets:ro"
       # the one thing it writes: state.json and the stream logs
       - "${OAAP_DATA_DIR}/data/connect/state:/state"
+      # append only, and the same file identity appends to: one line for
+      # each decision of a person about an exposure (spec 2.8.8)
+      - "${OAAP_DATA_DIR}/data/audit:/audit"
 
   # Managed Postgres (oaap.data.store 0.1, RFC-0031 Schritt 1). Gated by
   # the node profile 'store' (RFC-0011, oaap.core.host 2.5) through

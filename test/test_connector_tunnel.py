@@ -217,8 +217,10 @@ async def main():
             ok("T10 outer state names the offers", names == ["all", "erp"], names)
             ok("T10 outer state carries no address",
                str(bport) not in json.dumps(st) and bhost not in json.dumps(st))
-            ist = read_state(inner)
-            ok("inner state: connected", ist.get("connectors", {}).get("x01", {}).get("connected"))
+            # the state file follows a change within about a second -- poll it,
+            # do not read it once (the one flaky line of this test)
+            ok("inner state: connected", await until(
+                lambda: read_state(inner).get("connectors", {}).get("x01", {}).get("connected"), 5))
 
             def gw(tenant="t1", key=GW):
                 h = {connect.GW_CALLER: "orders", connect.GW_DEST: f"{tenant}/erp",
