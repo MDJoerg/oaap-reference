@@ -5311,16 +5311,17 @@ PROFILES = {
               "a platform service. The raw device port (no identity, RFC-"
               "0015) is only published when the node ALSO carries "
               "'exposed' — see _broker_compose_files below.",
-    "remote-access": "remote-access node — carries the WireGuard "
-                     "listener of oaap.net.remote-access 0.3 (RFC-0044 "
-                     "D4): a person may be given a peer into one "
-                     "instance network, fenced by a host firewall rule "
-                     "(§5.1). Like 'store' this actually starts a host "
-                     "service, not a container — a node-own key pair is "
-                     "generated on first add and kept. THE FENCE THIS "
-                     "PROFILE RELIES ON HAS NOT BEEN MEASURED ON A REAL "
-                     "NODE YET (D2's consequence): add it only to take "
-                     "that measurement, not to hand out access.",
+    "remote-access": "remote-access node — carries WireGuard peer "
+                     "access of oaap.net.remote-access 0.4 (RFC-0044 D4): "
+                     "a person may be given a peer into one instance "
+                     "network, fenced by a host firewall rule (§5.1). "
+                     "Unlike 'store' nothing starts when this is added — "
+                     "each instance gets its OWN namespace/interface/"
+                     "bridge-veth apparatus, brought up on its first peer "
+                     "and torn down with its last (§5.1a, measured on "
+                     "oaap-test 2026-09-27: a single node-wide interface "
+                     "cannot get past Docker's own anti-spoofing rule, "
+                     "this design works with it instead).",
 }
 
 
@@ -5454,20 +5455,22 @@ def cmd_node(args):
                 print("WARNING: could not republish the broker's raw port "
                       "— check 'docker ps' / 'docker compose ... up -d broker'.")
         if profile == "remote-access":
-            # Same reasoning as 'store'/'broker': nothing to check at
-            # request time, so the effect happens now -- except this one
-            # is a HOST interface, not a container (RFC-0044 §5.2).
-            try:
-                wg_ensure_interface()
-                print(f"This node's own WireGuard identity and '{WG_INTERFACE}' "
-                      f"are up (listen port {WG_LISTEN_PORT}). No peer exists "
-                      "yet — 'oaap app access open <instance> --shape "
-                      "wireguard --endpoint <address> --holder <name>'.")
-                print("REMINDER: the firewall fence this relies on (spec §5.1) "
-                      "has not been measured on a real node. Add this profile "
-                      "to take that measurement, not to hand out access.")
-            except WireguardRefused as e:
-                print(f"WARNING: could not bring up '{WG_INTERFACE}': {e}")
+            # Unlike 'store'/'broker', nothing host-wide starts here
+            # any more (spec §5.1a) -- each instance gets its OWN
+            # namespace/interface/bridge-veth apparatus, brought up
+            # lazily on its first peer (wg_instance_up()) and torn
+            # down with its last (RFC-0044 §5.2). This just checks the
+            # tooling is there.
+            if not wg_available():
+                print("WARNING: wireguard-tools is not installed on this "
+                      "node (apt install wireguard-tools) -- 'oaap app "
+                      "access open --shape wireguard' will refuse until "
+                      "it is.")
+            else:
+                print("This node can now carry WireGuard peers (RFC-0044 "
+                      "§5). Nothing starts until the first 'oaap app "
+                      "access open <instance> --shape wireguard --endpoint "
+                      "<address> --holder <name>'.")
     else:
         if profile not in profiles:
             die(f"node does not have profile '{profile}'")
@@ -5520,10 +5523,8 @@ def cmd_node(args):
                 print("WARNING: could not unpublish the broker's raw port "
                       "— check 'docker ps' / 'docker compose ... up -d broker'.")
         if profile == "remote-access":
-            wg_teardown_interface()
-            print(f"'{WG_INTERFACE}' is down. The node's own key pair is "
-                  "kept -- adding the profile again brings the same "
-                  "interface back, not a new identity.")
+            print("Removed. No instance had an open WireGuard access, so "
+                  "there was no apparatus left to take down.")
 
 
 # -------------------------------------------- managed Postgres (oaap.data.store 0.1)
@@ -9553,34 +9554,61 @@ def access_alive(rec):
 
 # --- RFC-0044 §5: the WireGuard peer -- mechanics only, CLI only ------
 #
-# Built and locally tested (the exact `iptables`/`wg` argument lists,
-# against a mocked binary); NOT measured against a real Docker
-# network, a real gateway container or a real peer. D2's consequence
-# is explicit that this measurement comes before a WireGuard file is
-# offered anywhere but the command line -- so cmd_access below never
-# reaches the portal worker for this shape, only `oaap app access
-# open --shape wireguard` does. Do not treat this section as a safe
-# fence until that measurement exists and is written down (spec §9).
-WG_INTERFACE = "wg0"
-WG_LISTEN_PORT = 51820
+# Measured on a real node (oaap-test, 2026-09-27, spec §5.1a): a single
+# node-wide 'wg0', reached by routing alone, never works -- Docker
+# writes its OWN `table ip raw` PREROUTING rule for every container on
+# every network ("ip daddr <container> iifname != <its own bridge>
+# drop"), which fires before conntrack/nat/filter and so before any of
+# this file's own DOCKER-USER fence is even reached. There is no
+# routing trick inside the SAME rule's hook that gets around it.
+#
+# The design below works WITH that rule instead of against it (Jörg's
+# choice, 2026-09-27: "mit docker arbeiten"): each instance that has at
+# least one open 'wireguard' access gets its OWN small apparatus --
+#   - a dedicated network namespace ("oaap-wg-<instance>"), holding
+#   - a WireGuard interface created DIRECTLY inside that namespace
+#     (never `ip link set <if> netns <ns>` afterwards -- moving it
+#     this way leaves its UDP socket bound in the WRONG namespace and
+#     the handshake never completes; measured the same day),
+#   - one veth pair whose ROOT-side end is a genuine port of the
+#     instance's OWN Docker bridge (`master br-...`) -- traffic
+#     arriving this way is bridged, not routed, so Docker's own
+#     raw-table rule reports the BRIDGE as ingress and lets it through
+#     (measured working end-to-end against a real app container),
+#   - a second veth pair reaching into the root namespace so the
+#     WireGuard UDP port itself can be dialled from outside, with one
+#     externally-DNAT'd port per instance (peers of DIFFERENT
+#     instances must be told apart before decryption, which the
+#     WireGuard packet itself cannot do).
+# The RFC-0044 §5.1 firewall fence (three DOCKER-USER rules, per peer)
+# is unchanged by this: Docker's own inter-container isolation on a
+# bridge already depends on FORWARD/DOCKER-USER seeing bridged
+# traffic (br_netfilter's bridge-nf-call-iptables), so a peer arriving
+# via the bridge port above is fenced exactly as a routed one would
+# have been.
+WG_LISTEN_PORT = 51820  # inside EVERY instance's own namespace -- namespaces
+                        # isolate the number, so none of them collide
 WG_DATA_DIR = os.path.join(DATA_DIR, "data", "wireguard")
-WG_SERVER_KEY_FILE = os.path.join(WG_DATA_DIR, "server.key")
-WG_SERVER_PUB_FILE = os.path.join(WG_DATA_DIR, "server.pub")
-# The node's own tunnel subnet -- ONE range for the whole node, not per
-# instance. Which INSTANCE a peer may reach is the firewall fence's
-# job (§5.1), never the interface's: every peer lives in this same
-# small network regardless of which access it belongs to.
+# Every instance's own namespace reuses this SAME tunnel range for its
+# peers -- isolated from every other instance's namespace, so nothing
+# to make node-wide here either.
 WG_SUBNET = ipaddress.ip_network("10.200.0.0/24")
 WG_SERVER_ADDR = ipaddress.ip_address("10.200.0.1")
+# The WAN veth pair's addressing, one /30-worth of index per instance
+# apparatus (10.201.<i>.1 root side, 10.201.<i>.2 namespace side) --
+# up to 251 instances with a live apparatus at once, far more than one
+# node runs.
+WG_WAN_BASE = ipaddress.ip_network("10.201.0.0/16")
 
 
 class WireguardRefused(Exception):
-    """The node's own WireGuard interface (not one access) could not be
+    """One instance's WireGuard apparatus (not one peer) could not be
     brought up or down, with the sentence why."""
 
 
 def wg_available():
-    return bool(shutil.which("wg") and shutil.which("wg-quick"))
+    return bool(shutil.which("wg") and shutil.which("wg-quick")
+                and shutil.which("ip"))
 
 
 def wg_genkey():
@@ -9596,96 +9624,306 @@ def wg_genkey():
     return priv, pub
 
 
-def wg_server_identity():
-    """The node's OWN key pair -- generated once, kept at rest, never
-    shown again after this call created it. Returns the public half,
-    which is what every peer's .conf needs as [Peer] PublicKey."""
+def wg_netns(instance):
+    return f"oaap-wg-{instance}"
+
+
+def _wg_veth_name(instance, role):
+    """A <=15-char veth name for this instance+role -- interface names
+    are kernel-limited (IFNAMSIZ), instance names are not, so a short
+    hash stands in for the name itself. 'role' is one of br/brp
+    (bridge pair, root/netns side) or wr/wp (WAN pair, root/netns
+    side)."""
+    import hashlib
+    h = hashlib.sha1(instance.encode()).hexdigest()[:8]
+    return f"wg{role}{h}"
+
+
+def netns_exists(ns):
+    r = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True)
+    return any((line.split() or [""])[0] == ns for line in r.stdout.splitlines())
+
+
+def wg_instance_state_file(instance):
+    return os.path.join(WG_DATA_DIR, f"{instance}.json")
+
+
+def wg_instance_state(instance):
+    """The apparatus this instance already has, or None -- read fresh
+    every time, never cached: this file, not a running process, is the
+    only place that remembers the external port and WAN index once
+    the call that allocated them has returned."""
+    p = wg_instance_state_file(instance)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _wg_save_instance_state(instance, state):
     os.makedirs(WG_DATA_DIR, exist_ok=True)
-    if not os.path.exists(WG_SERVER_KEY_FILE):
-        priv, pub = wg_genkey()
-        fd = os.open(WG_SERVER_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(priv)
-        with open(WG_SERVER_PUB_FILE, "w", encoding="utf-8") as f:
-            f.write(pub)
-        os.chmod(WG_SERVER_PUB_FILE, 0o644)
-    with open(WG_SERVER_PUB_FILE, encoding="utf-8") as f:
-        return f.read().strip()
+    tmp = wg_instance_state_file(instance) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, wg_instance_state_file(instance))
 
 
-def wg_interface_up():
-    # subprocess.run directly, NOT the run() wrapper -- a missing
-    # interface is an EXPECTED non-zero exit here, not a failure to
-    # raise on, the same distinction _network_exists() draws for a
-    # Docker network.
-    return subprocess.run(["wg", "show", WG_INTERFACE], capture_output=True,
-                          text=True).returncode == 0
+def _wg_all_instance_states():
+    if not os.path.isdir(WG_DATA_DIR):
+        return {}
+    out = {}
+    for name in os.listdir(WG_DATA_DIR):
+        if name.endswith(".json"):
+            st = wg_instance_state(name[:-len(".json")])
+            if st:
+                out[name[:-len(".json")]] = st
+    return out
 
 
-def wg_ensure_interface():
-    """Bring up this node's own 'wg0', idempotent (RFC-0044 D4/§5.2).
+def wg_next_external_port():
+    """The lowest free external UDP port across every instance's
+    apparatus, starting at WG_LISTEN_PORT -- peers of different
+    instances must be told apart by the port they dial, since the
+    WireGuard packet itself carries nothing legible before
+    decryption."""
+    used = {st.get("external_port") for st in _wg_all_instance_states().values()}
+    port = WG_LISTEN_PORT
+    while port in used:
+        port += 1
+    return port
 
-    Raises WireguardRefused if the tools are missing or the interface
-    would not come up -- called from `oaap node add-profile
-    remote-access`, which has nothing to roll back to but must not
-    claim success it did not have.
+
+def wg_next_wan_index():
+    used = {st.get("wan_index") for st in _wg_all_instance_states().values()}
+    for i in range(251):
+        if i not in used:
+            return i
+    raise WireguardRefused("no free WAN link index left for a new instance apparatus")
+
+
+def docker_network_used_ips(net):
+    """Every address a container currently holds on this Docker
+    network -- so the bridge-side veth can be given an address that
+    collides with none of them (Docker does not manage this veth, so
+    nothing else checks this for us)."""
+    r = subprocess.run(["docker", "network", "inspect", "-f",
+                        "{{range .Containers}}{{.IPv4Address}} {{end}}", net],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return set()
+    out = set()
+    for tok in r.stdout.split():
+        try:
+            out.add(str(ipaddress.ip_interface(tok).ip))
+        except ValueError:
+            continue
+    return out
+
+
+def wg_free_bridge_ip(net, instance_subnet, gateway_ip):
+    """A free host address on this instance's own subnet for the
+    bridge-side veth -- scanned from the high end down, since
+    containers are normally handed out low addresses first."""
+    used = docker_network_used_ips(net) | {gateway_ip}
+    for addr in reversed(list(instance_subnet.hosts())):
+        if str(addr) not in used:
+            return addr
+    raise WireguardRefused(f"no free address left on {instance_subnet} for "
+                            "the WireGuard bridge veth")
+
+
+def _wg_ensure_bridge_netfilter():
+    """The RFC-0044 §5.1 fence (three DOCKER-USER rules) only ever sees
+    a bridged peer's traffic if bridged traffic reaches iptables'
+    FORWARD chain at all -- measured MISSING on oaap-test 2026-09-27:
+    with 'br_netfilter' not loaded, a peer's packets cross straight
+    from one bridge port to another and DOCKER-USER's counters never
+    move, gateway included. This is not a one-time setup step: the
+    sysctl does not survive a reboot, so every apparatus bring-up
+    re-asserts it, node-wide, before doing anything else -- a failure
+    here must refuse outright, because nothing built after it would
+    actually be fenced."""
+    subprocess.run(["modprobe", "br_netfilter"], capture_output=True, text=True)
+    r = subprocess.run(["sysctl", "-w", "net.bridge.bridge-nf-call-iptables=1"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise WireguardRefused(
+            "could not enable net.bridge.bridge-nf-call-iptables -- "
+            "without it, the firewall fence (spec §5.1) never sees a "
+            f"bridged peer's traffic at all: {(r.stderr or '').strip()}")
+
+
+def wg_instance_up(instance, net, gateway_ip):
+    """Idempotent: bring up this instance's own WireGuard apparatus
+    (see the module comment above for the shape), or return the
+    existing one unchanged. Returns (pubkey, state).
+
+    Raises WireguardRefused if the tools are missing or any step does
+    not come up -- callers must roll back whatever they already did.
     """
     if not wg_available():
         raise WireguardRefused(
             "wireguard-tools is not installed on this node (apt install "
             "wireguard-tools)")
-    server_pub = wg_server_identity()
-    if wg_interface_up():
-        return server_pub
+    _wg_ensure_bridge_netfilter()
+    st = wg_instance_state(instance)
+    ns = wg_netns(instance)
+    if st and netns_exists(ns):
+        return st["pubkey"], st
+    bridge = _docker_bridge_name(net)
+    if not bridge:
+        raise WireguardRefused("could not find this instance's own Docker "
+                                "bridge device")
+    subnets = docker_subnets(net)
+    if not subnets:
+        raise WireguardRefused("this instance's network has no known "
+                                "address range")
+    instance_subnet = subnets[0]
+    bridge_ip = wg_free_bridge_ip(net, instance_subnet, gateway_ip)
+    wan_index = wg_next_wan_index()
+    wan_net = list(WG_WAN_BASE.subnets(new_prefix=24))[wan_index]
+    wan_root_ip, wan_ns_ip = list(wan_net.hosts())[0], list(wan_net.hosts())[1]
+    external_port = wg_next_external_port()
+    veth_br_root = _wg_veth_name(instance, "br")
+    veth_br_ns = _wg_veth_name(instance, "brp")
+    veth_wan_root = _wg_veth_name(instance, "wr")
+    veth_wan_ns = _wg_veth_name(instance, "wp")
+    os.makedirs(WG_DATA_DIR, exist_ok=True)
+    key_file = os.path.join(WG_DATA_DIR, f"{instance}.key")
+    if not os.path.exists(key_file):
+        priv, pub = wg_genkey()
+        fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(priv)
+    else:
+        with open(key_file, encoding="utf-8") as f:
+            priv = f.read().strip()
+        pub = run(["wg", "pubkey"], input=priv).stdout.strip()
     try:
-        r = subprocess.run(["ip", "link", "add", WG_INTERFACE, "type", "wireguard"],
-                           capture_output=True, text=True)
-        if r.returncode != 0 and "exists" not in (r.stderr or "").lower():
-            raise WireguardRefused(f"'ip link add {WG_INTERFACE}' failed: "
-                                   f"{(r.stderr or '').strip()}")
-        run(["wg", "set", WG_INTERFACE, "private-key", WG_SERVER_KEY_FILE,
-             "listen-port", str(WG_LISTEN_PORT)])
-        subprocess.run(["ip", "addr", "add",
-                       f"{WG_SERVER_ADDR}/{WG_SUBNET.prefixlen}", "dev", WG_INTERFACE],
-                       capture_output=True, text=True)  # "exists" is fine
-        run(["ip", "link", "set", WG_INTERFACE, "up"])
+        run(["ip", "netns", "add", ns])
+        run(["ip", "link", "add", veth_br_root, "type", "veth", "peer",
+             "name", veth_br_ns])
+        run(["ip", "link", "set", veth_br_ns, "netns", ns])
+        run(["ip", "link", "set", veth_br_root, "master", bridge])
+        run(["ip", "link", "set", veth_br_root, "up"])
+        run(["ip", "netns", "exec", ns, "ip", "addr", "add",
+             f"{bridge_ip}/{instance_subnet.prefixlen}", "dev", veth_br_ns])
+        run(["ip", "netns", "exec", ns, "ip", "link", "set", veth_br_ns, "up"])
+        run(["ip", "link", "add", veth_wan_root, "type", "veth", "peer",
+             "name", veth_wan_ns])
+        run(["ip", "link", "set", veth_wan_ns, "netns", ns])
+        run(["ip", "addr", "add", f"{wan_root_ip}/30", "dev", veth_wan_root])
+        run(["ip", "link", "set", veth_wan_root, "up"])
+        run(["ip", "netns", "exec", ns, "ip", "addr", "add",
+             f"{wan_ns_ip}/30", "dev", veth_wan_ns])
+        run(["ip", "netns", "exec", ns, "ip", "link", "set", veth_wan_ns, "up"])
+        run(["ip", "netns", "exec", ns, "ip", "route", "add", "default",
+             "via", str(wan_root_ip)])
+        # ROOT must know how to reach this instance's tunnel subnet
+        # for containers' REPLIES to a peer -- root routes every
+        # container's default gateway, so this is where that route
+        # belongs, not inside the namespace.
+        run(["ip", "route", "add", str(WG_SUBNET), "via", str(bridge_ip),
+             "dev", bridge])
+        run(["ip", "netns", "exec", ns, "ip", "link", "add", "wg0", "type",
+             "wireguard"])
+        run(["ip", "netns", "exec", ns, "wg", "set", "wg0", "private-key",
+             key_file, "listen-port", str(WG_LISTEN_PORT)])
+        run(["ip", "netns", "exec", ns, "ip", "addr", "add",
+             f"{WG_SERVER_ADDR}/{WG_SUBNET.prefixlen}", "dev", "wg0"])
+        run(["ip", "netns", "exec", ns, "ip", "link", "set", "wg0", "up"])
+        run(["iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp",
+             "--dport", str(external_port), "-j", "DNAT", "--to-destination",
+             f"{wan_ns_ip}:{WG_LISTEN_PORT}"])
+        run(["iptables", "-I", "FORWARD", "1", "-d", str(wan_ns_ip), "-p",
+             "udp", "--dport", str(WG_LISTEN_PORT), "-j", "ACCEPT"])
+        # The mirror of the rule above -- measured missing on oaap-test
+        # 2026-09-27: FORWARD's default policy is DROP, and the first
+        # rule only accepts packets INTO the apparatus. Without this
+        # one, the handshake reply (source wan_ns_ip:WG_LISTEN_PORT)
+        # never reaches the peer -- the server sees "received", the
+        # peer never sees "received" back.
+        run(["iptables", "-I", "FORWARD", "1", "-s", str(wan_ns_ip), "-p",
+             "udp", "--sport", str(WG_LISTEN_PORT), "-j", "ACCEPT"])
     except subprocess.CalledProcessError as e:
-        raise WireguardRefused(f"could not bring up '{WG_INTERFACE}': {e}")
-    return server_pub
+        wg_instance_down(instance)
+        raise WireguardRefused(f"could not bring up this instance's "
+                               f"WireGuard apparatus: {e}")
+    state = {"pubkey": pub, "external_port": external_port,
+             "wan_index": wan_index, "netns": ns, "bridge": bridge,
+             "bridge_ip": str(bridge_ip), "instance_subnet": str(instance_subnet),
+             "wan_root_ip": str(wan_root_ip), "wan_ns_ip": str(wan_ns_ip),
+             "veth_br_root": veth_br_root, "veth_wan_root": veth_wan_root}
+    _wg_save_instance_state(instance, state)
+    return pub, state
 
 
-def wg_teardown_interface():
-    """Take 'wg0' down -- the node's own key pair is kept (§5.2: only a
-    live 'wireguard' access, not the profile toggle, is time-boxed).
-    Best-effort, like connect_leave_network(): an interface that is
-    already gone is not a failure worth raising over."""
-    subprocess.run(["ip", "link", "delete", WG_INTERFACE], capture_output=True, text=True)
+def wg_instance_down(instance):
+    """Best-effort teardown, like connect_leave_network(): called both
+    on cleanup-after-failure inside wg_instance_up() and when the last
+    peer of this instance closes. The namespace's own delete takes its
+    WireGuard interface and its bridge-side veth's OTHER end with it;
+    the ROOT-side veths and firewall rules do not live in the
+    namespace and so need their own explicit removal."""
+    st = wg_instance_state(instance)
+    ns = wg_netns(instance)
+    subprocess.run(["ip", "netns", "delete", ns], capture_output=True, text=True)
+    if st:
+        for veth in (st.get("veth_br_root"), st.get("veth_wan_root")):
+            if veth:
+                subprocess.run(["ip", "link", "delete", veth],
+                               capture_output=True, text=True)
+        if st.get("bridge_ip") and st.get("bridge"):
+            subprocess.run(["ip", "route", "del", str(WG_SUBNET), "via",
+                           st["bridge_ip"], "dev", st["bridge"]],
+                           capture_output=True, text=True)
+        if st.get("wan_ns_ip") and st.get("external_port"):
+            subprocess.run(["iptables", "-t", "nat", "-D", "PREROUTING", "-p",
+                           "udp", "--dport", str(st["external_port"]), "-j",
+                           "DNAT", "--to-destination",
+                           f"{st['wan_ns_ip']}:{WG_LISTEN_PORT}"],
+                           capture_output=True, text=True)
+            subprocess.run(["iptables", "-D", "FORWARD", "-d", st["wan_ns_ip"],
+                           "-p", "udp", "--dport", str(WG_LISTEN_PORT), "-j",
+                           "ACCEPT"], capture_output=True, text=True)
+            subprocess.run(["iptables", "-D", "FORWARD", "-s", st["wan_ns_ip"],
+                           "-p", "udp", "--sport", str(WG_LISTEN_PORT), "-j",
+                           "ACCEPT"], capture_output=True, text=True)
+    try:
+        os.remove(wg_instance_state_file(instance))
+    except OSError:
+        pass
 
 
-def wg_add_peer(pubkey, tunnel_ip):
-    run(["wg", "set", WG_INTERFACE, "peer", pubkey, "allowed-ips",
-         f"{tunnel_ip}/32"])
+def wg_add_peer(instance, pubkey, tunnel_ip):
+    run(["ip", "netns", "exec", wg_netns(instance), "wg", "set", "wg0",
+         "peer", pubkey, "allowed-ips", f"{tunnel_ip}/32"])
 
 
-def wg_remove_peer(pubkey):
-    # Best-effort: already gone is not an error.
-    subprocess.run(["wg", "set", WG_INTERFACE, "peer", pubkey, "remove"],
+def wg_remove_peer(instance, pubkey):
+    # Best-effort: already gone (or the whole apparatus already torn
+    # down) is not an error.
+    subprocess.run(["ip", "netns", "exec", wg_netns(instance), "wg", "set",
+                   "wg0", "peer", pubkey, "remove"],
                    capture_output=True, text=True)
 
 
-def wg_used_tunnel_ips():
+def wg_used_tunnel_ips(instance):
     return {r["target"]["tunnel_ip"] for r in load_access().values()
-            if r.get("shape") == "wireguard" and access_alive(r)
-            and (r.get("target") or {}).get("tunnel_ip")}
+            if r.get("shape") == "wireguard" and r.get("instance") == instance
+            and access_alive(r) and (r.get("target") or {}).get("tunnel_ip")}
 
 
-def wg_next_tunnel_ip():
-    """The lowest free /32 in WG_SUBNET, never the server's own address
-    or the network/broadcast ends -- tracked by scanning open
-    'wireguard' accesses, the same way _forward_instances() tracks
-    connect's network membership: no separate counter to drift from
-    the truth."""
-    used = wg_used_tunnel_ips()
+def wg_next_tunnel_ip(instance):
+    """The lowest free /32 in WG_SUBNET for THIS instance's own
+    namespace, never the namespace's own wg0 address -- tracked by
+    scanning open 'wireguard' accesses for this instance, the same way
+    _forward_instances() tracks connect's network membership: no
+    separate counter to drift from the truth."""
+    used = wg_used_tunnel_ips(instance)
     for addr in WG_SUBNET.hosts():
         if addr == WG_SERVER_ADDR:
             continue
@@ -9704,6 +9942,24 @@ def container_ip(container, net):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def _docker_bridge_name(net):
+    """The Linux bridge device backing this Docker network (its
+    'com.docker.network.bridge.name' option, or Docker's own
+    'br-<12 hex of the network id>' default) -- the device the
+    bridge-side veth must join to become a genuine port of it."""
+    r = subprocess.run(["docker", "network", "inspect", "-f",
+                        '{{index .Options "com.docker.network.bridge.name"}}',
+                        net], capture_output=True, text=True)
+    name = r.stdout.strip() if r.returncode == 0 else ""
+    if name:
+        return name
+    r = subprocess.run(["docker", "network", "inspect", "-f", "{{.Id}}", net],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return ""
+    return "br-" + r.stdout.strip()[:12]
+
+
 def _wg_fence_rules(peer_ip, instance_subnet, gateway_ip):
     """The three DOCKER-USER rules of RFC-0044 §5.1, as argument
     lists -- read top to bottom AFTER insertion: exclude the gateway's
@@ -9711,7 +9967,13 @@ def _wg_fence_rules(peer_ip, instance_subnet, gateway_ip):
     instance's subnet, drop everything else from this peer. Docker's
     own default in this chain is a trailing RETURN, so these rules
     must be INSERTED ahead of the chain's existing content, never
-    appended -- appended, they would never be reached."""
+    appended -- appended, they would never be reached.
+
+    Unchanged by the bridge-port redesign: Docker's own inter-container
+    isolation already depends on bridged traffic reaching FORWARD/
+    DOCKER-USER (br_netfilter's bridge-nf-call-iptables), so a peer
+    arriving via the bridge port is fenced exactly as a routed one
+    would have been."""
     return [
         ["-s", f"{peer_ip}/32", "-d", f"{gateway_ip}/32", "-j", "DROP"],
         ["-s", f"{peer_ip}/32", "-d", str(instance_subnet), "-j", "ACCEPT"],
@@ -9739,17 +10001,21 @@ def firewall_fence_remove(peer_ip, instance_subnet, gateway_ip):
                        capture_output=True, text=True)
 
 
-def wg_conf_render(private_key, tunnel_ip, server_pubkey, endpoint, instance_subnet):
+def wg_conf_render(private_key, tunnel_ip, server_pubkey, endpoint,
+                    external_port, instance_subnet):
     """The .conf text handed to the person, once (RFC-0044 §5.3/§5.4).
     AllowedIPs here is the laptop's own routing courtesy -- the actual
-    fence is §5.1's host firewall rule, not this file."""
+    fence is §5.1's host firewall rule, not this file. The endpoint
+    port is THIS instance's own externally-DNAT'd port, not a single
+    node-wide one -- a different instance's peer dials a different
+    port on the same address."""
     return (
         "[Interface]\n"
         f"PrivateKey = {private_key}\n"
         f"Address = {tunnel_ip}/32\n\n"
         "[Peer]\n"
         f"PublicKey = {server_pubkey}\n"
-        f"Endpoint = {endpoint}:{WG_LISTEN_PORT}\n"
+        f"Endpoint = {endpoint}:{external_port}\n"
         f"AllowedIPs = {instance_subnet}\n"
         "PersistentKeepalive = 25\n"
     )
@@ -9792,6 +10058,15 @@ def _forward_instances(accesses):
     decides whether the connect service still needs that network."""
     return {r["instance"] for r in accesses.values()
             if r.get("shape") == "forward" and access_alive(r)}
+
+
+def _wg_instances_with_open_access(accesses):
+    """Which instances still have an open, unexpired 'wireguard' access
+    -- decides whether that instance's own namespace/interface/veth
+    apparatus (wg_instance_up()/wg_instance_down()) still has a reason
+    to exist."""
+    return {r["instance"] for r in accesses.values()
+            if r.get("shape") == "wireguard" and access_alive(r)}
 
 
 def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
@@ -9842,26 +10117,30 @@ def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
             raise AccessRefused("a WireGuard access needs an endpoint -- the "
                                 "address the peer will actually dial")
         net = app_network(instance)
-        subnets = docker_subnets(net)
-        if not subnets:
-            raise AccessRefused("this instance's network has no known address range")
-        instance_subnet = subnets[0]
         gateway_ip = container_ip(GATEWAY_CONTAINER, net)
         if not gateway_ip:
             raise AccessRefused("could not find the gateway's address on "
                                 "this instance's network")
-        server_pub = wg_ensure_interface()
+        # Brings up this instance's OWN namespace/interface/bridge-veth
+        # apparatus on its first peer, idempotent on every one after
+        # (spec §5.1a) -- raises WireguardRefused, which AccessRefused
+        # is not a subclass of, so it is let through unchanged: a
+        # broken apparatus is this node's own fault, not a form error.
+        server_pub, wg_state = wg_instance_up(instance, net, gateway_ip)
+        instance_subnet = ipaddress.ip_network(wg_state["instance_subnet"])
         privkey, pubkey = wg_genkey()
-        tunnel_ip = wg_next_tunnel_ip()
-        wg_add_peer(pubkey, tunnel_ip)
+        tunnel_ip = wg_next_tunnel_ip(instance)
+        wg_add_peer(instance, pubkey, tunnel_ip)
         try:
             firewall_fence_add(str(tunnel_ip), instance_subnet, gateway_ip)
         except subprocess.CalledProcessError:
-            wg_remove_peer(pubkey)
+            wg_remove_peer(instance, pubkey)
+            if not _wg_instances_with_open_access(load_access()):
+                wg_instance_down(instance)
             raise AccessRefused("the firewall fence could not be applied -- "
                                 "the access was not opened")
         conf_text = wg_conf_render(privkey, tunnel_ip, server_pub, endpoint,
-                                   instance_subnet)
+                                   wg_state["external_port"], instance_subnet)
         target = {"peer_pubkey": pubkey, "tunnel_ip": str(tunnel_ip),
                   "instance_subnet": str(instance_subnet), "gateway_ip": gateway_ip}
     if shape == "forward" and not connect_join_network(app_network(instance)):
@@ -9905,10 +10184,14 @@ def access_close(access_id, who="root", role="root", expired=False):
     if rec.get("shape") == "wireguard":
         t = rec.get("target") or {}
         if t.get("peer_pubkey"):
-            wg_remove_peer(t["peer_pubkey"])
+            wg_remove_peer(rec["instance"], t["peer_pubkey"])
         if t.get("tunnel_ip"):
             firewall_fence_remove(t["tunnel_ip"], t.get("instance_subnet", ""),
                                   t.get("gateway_ip", ""))
+        if rec["instance"] not in _wg_instances_with_open_access(accesses):
+            # The last peer of this instance just left -- take its
+            # whole apparatus down with it, not only this one peer.
+            wg_instance_down(rec["instance"])
     audit_tenant("access.expired" if expired else "access.closed",
                  rec.get("tenant") or "", subject=rec.get("instance", ""),
                  who=who, role=role, detail=rec.get("holder", ""))
@@ -10013,8 +10296,10 @@ def cmd_access(args):
 
     'forward' carries real traffic (§4) as soon as it opens; so does
     'wireguard' (§5) -- but ONLY from here, never from the portal
-    worker (spec §9): the firewall fence it relies on has not been
-    measured on a real node. See the module note above access_open().
+    worker (spec §9): the bridge-port apparatus this build (§5.1a)
+    uses has been measured reaching a real container by hand, but not
+    yet end to end through THIS code, from a real outside peer,
+    through the DNAT'd port. See the module note above access_open().
     """
     if args.action == "sweep":
         closed = access_sweep()
@@ -10065,9 +10350,10 @@ def cmd_access(args):
             print("lost it? Close this access and open a new one.")
             print("")
             print(rec["conf"])
-            print("REMINDER: the firewall fence this relies on (spec §5.1) has")
-            print("not been measured on a real node. Do not hand this .conf to")
-            print("anyone but the person taking that measurement.")
+            print("REMINDER: this apparatus has not yet been measured end to")
+            print("end through THIS code from a real outside peer (spec")
+            print("§5.1a). Do not hand this .conf to anyone but the person")
+            print("taking that measurement.")
         return
     # close
     if not args.name:
@@ -15998,10 +16284,10 @@ def cmd_process_deploys(_args):
                              subject=name, result="denied", who=who,
                              role=act_role or "-", detail=msg)
             elif op == "open" and str(req.get("shape") or "forward") == "wireguard":
-                # RFC-0044 spec §9: WireGuard is CLI-only until the
-                # firewall fence has been measured on a real node --
-                # the portal must never reach access_open() for this
-                # shape, whatever the request asks for. No function
+                # RFC-0044 spec §9: WireGuard is CLI-only until this
+                # apparatus has been measured end to end on a real
+                # node -- the portal must never reach access_open()
+                # for this shape, whatever the request asks for. No function
                 # ran, so this is written here, like the role denial
                 # above (but never AS a role denial: a server_admin
                 # asking this way is not doing anything wrong, the
