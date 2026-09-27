@@ -3617,6 +3617,13 @@ PROFILE_LABELS = {
               "oaap.events.broker (RFC-0032 D2), unabhängig von 'store'. "
               "Der rohe Geräte-Port wird nur zusätzlich mit 'exposed' "
               "veröffentlicht.",
+    "remote-access": "Fernzugang-Knoten — trägt den WireGuard-Zugang von "
+                     "oaap.net.remote-access 0.3 (RFC-0044 D4). Startet "
+                     "einen echten Dienst auf dem Knoten, keinen "
+                     "Container. Die Firewall-Regel, auf die sich dieses "
+                     "Profil stützt, ist noch nicht an einem echten "
+                     "Knoten gemessen — dieses Profil gehört nur "
+                     "gesetzt, um genau das zu messen.",
 }
 
 

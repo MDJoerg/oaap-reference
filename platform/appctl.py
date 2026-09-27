@@ -37,6 +37,7 @@ tiles yet; role `public` supported but discouraged.
 
 import argparse
 import getpass
+import ipaddress
 import json
 import os
 import re
@@ -5310,6 +5311,16 @@ PROFILES = {
               "a platform service. The raw device port (no identity, RFC-"
               "0015) is only published when the node ALSO carries "
               "'exposed' — see _broker_compose_files below.",
+    "remote-access": "remote-access node — carries the WireGuard "
+                     "listener of oaap.net.remote-access 0.3 (RFC-0044 "
+                     "D4): a person may be given a peer into one "
+                     "instance network, fenced by a host firewall rule "
+                     "(§5.1). Like 'store' this actually starts a host "
+                     "service, not a container — a node-own key pair is "
+                     "generated on first add and kept. THE FENCE THIS "
+                     "PROFILE RELIES ON HAS NOT BEEN MEASURED ON A REAL "
+                     "NODE YET (D2's consequence): add it only to take "
+                     "that measurement, not to hand out access.",
 }
 
 
@@ -5442,6 +5453,21 @@ def cmd_node(args):
             except (subprocess.CalledProcessError, OSError):
                 print("WARNING: could not republish the broker's raw port "
                       "— check 'docker ps' / 'docker compose ... up -d broker'.")
+        if profile == "remote-access":
+            # Same reasoning as 'store'/'broker': nothing to check at
+            # request time, so the effect happens now -- except this one
+            # is a HOST interface, not a container (RFC-0044 §5.2).
+            try:
+                wg_ensure_interface()
+                print(f"This node's own WireGuard identity and '{WG_INTERFACE}' "
+                      f"are up (listen port {WG_LISTEN_PORT}). No peer exists "
+                      "yet — 'oaap app access open <instance> --shape "
+                      "wireguard --endpoint <address> --holder <name>'.")
+                print("REMINDER: the firewall fence this relies on (spec §5.1) "
+                      "has not been measured on a real node. Add this profile "
+                      "to take that measurement, not to hand out access.")
+            except WireguardRefused as e:
+                print(f"WARNING: could not bring up '{WG_INTERFACE}': {e}")
     else:
         if profile not in profiles:
             die(f"node does not have profile '{profile}'")
@@ -5452,6 +5478,13 @@ def cmd_node(args):
                 die(f"cannot remove profile 'store' — {len(existing)} "
                     f"schema(s) still exist ({names}). Drop them first: "
                     "'oaap data store drop <schema> --yes'.")
+        if profile == "remote-access":
+            open_wg = [r for r in load_access().values()
+                      if r.get("shape") == "wireguard" and access_alive(r)]
+            if open_wg:
+                die(f"cannot remove profile 'remote-access' — "
+                    f"{len(open_wg)} wireguard access(es) still open. Close "
+                    "them first: 'oaap app access close <id>'.")
         save_profiles([p for p in profiles if p != profile])
         print(f"Node profile '{profile}' removed.")
         if profile == "store":
@@ -5486,6 +5519,11 @@ def cmd_node(args):
             except (subprocess.CalledProcessError, OSError):
                 print("WARNING: could not unpublish the broker's raw port "
                       "— check 'docker ps' / 'docker compose ... up -d broker'.")
+        if profile == "remote-access":
+            wg_teardown_interface()
+            print(f"'{WG_INTERFACE}' is down. The node's own key pair is "
+                  "kept -- adding the profile again brings the same "
+                  "interface back, not a new identity.")
 
 
 # -------------------------------------------- managed Postgres (oaap.data.store 0.1)
@@ -9503,14 +9541,218 @@ def save_access(accesses):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"schema": "0.1", "accesses": accesses}, f, indent=2)
     os.replace(tmp, ACCESS_FILE)
-    # ids, instance names, holder names -- no secret lives in this file
-    # (a WireGuard private key, once stage 2 builds it, is shown once
-    # and never written here -- RFC-0044 D10).
+    # ids, instance names, holder names, PUBLIC keys -- no secret lives
+    # in this file. A WireGuard peer's private key (SS5.3) is shown
+    # once, in the CLI's own output, and never written here (D10).
     os.chmod(ACCESS_FILE, 0o644)
 
 
 def access_alive(rec):
     return bool(rec) and not _past(rec.get("expires") or "")
+
+
+# --- RFC-0044 §5: the WireGuard peer -- mechanics only, CLI only ------
+#
+# Built and locally tested (the exact `iptables`/`wg` argument lists,
+# against a mocked binary); NOT measured against a real Docker
+# network, a real gateway container or a real peer. D2's consequence
+# is explicit that this measurement comes before a WireGuard file is
+# offered anywhere but the command line -- so cmd_access below never
+# reaches the portal worker for this shape, only `oaap app access
+# open --shape wireguard` does. Do not treat this section as a safe
+# fence until that measurement exists and is written down (spec §9).
+WG_INTERFACE = "wg0"
+WG_LISTEN_PORT = 51820
+WG_DATA_DIR = os.path.join(DATA_DIR, "data", "wireguard")
+WG_SERVER_KEY_FILE = os.path.join(WG_DATA_DIR, "server.key")
+WG_SERVER_PUB_FILE = os.path.join(WG_DATA_DIR, "server.pub")
+# The node's own tunnel subnet -- ONE range for the whole node, not per
+# instance. Which INSTANCE a peer may reach is the firewall fence's
+# job (§5.1), never the interface's: every peer lives in this same
+# small network regardless of which access it belongs to.
+WG_SUBNET = ipaddress.ip_network("10.200.0.0/24")
+WG_SERVER_ADDR = ipaddress.ip_address("10.200.0.1")
+
+
+class WireguardRefused(Exception):
+    """The node's own WireGuard interface (not one access) could not be
+    brought up or down, with the sentence why."""
+
+
+def wg_available():
+    return bool(shutil.which("wg") and shutil.which("wg-quick"))
+
+
+def wg_genkey():
+    """A fresh WireGuard key pair (private, public) -- `wireguard-tools`,
+    never a Python crypto dependency, because the node needs the same
+    binary for everything else here. `run()` already captures output
+    as text and raises on failure -- passing those again here would
+    collide with it, so neither is repeated below."""
+    priv = run(["wg", "genkey"]).stdout.strip()
+    pub = run(["wg", "pubkey"], input=priv).stdout.strip()
+    if not priv or not pub:
+        raise WireguardRefused("'wg genkey'/'wg pubkey' produced nothing")
+    return priv, pub
+
+
+def wg_server_identity():
+    """The node's OWN key pair -- generated once, kept at rest, never
+    shown again after this call created it. Returns the public half,
+    which is what every peer's .conf needs as [Peer] PublicKey."""
+    os.makedirs(WG_DATA_DIR, exist_ok=True)
+    if not os.path.exists(WG_SERVER_KEY_FILE):
+        priv, pub = wg_genkey()
+        fd = os.open(WG_SERVER_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(priv)
+        with open(WG_SERVER_PUB_FILE, "w", encoding="utf-8") as f:
+            f.write(pub)
+        os.chmod(WG_SERVER_PUB_FILE, 0o644)
+    with open(WG_SERVER_PUB_FILE, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def wg_interface_up():
+    # subprocess.run directly, NOT the run() wrapper -- a missing
+    # interface is an EXPECTED non-zero exit here, not a failure to
+    # raise on, the same distinction _network_exists() draws for a
+    # Docker network.
+    return subprocess.run(["wg", "show", WG_INTERFACE], capture_output=True,
+                          text=True).returncode == 0
+
+
+def wg_ensure_interface():
+    """Bring up this node's own 'wg0', idempotent (RFC-0044 D4/§5.2).
+
+    Raises WireguardRefused if the tools are missing or the interface
+    would not come up -- called from `oaap node add-profile
+    remote-access`, which has nothing to roll back to but must not
+    claim success it did not have.
+    """
+    if not wg_available():
+        raise WireguardRefused(
+            "wireguard-tools is not installed on this node (apt install "
+            "wireguard-tools)")
+    server_pub = wg_server_identity()
+    if wg_interface_up():
+        return server_pub
+    try:
+        r = subprocess.run(["ip", "link", "add", WG_INTERFACE, "type", "wireguard"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 and "exists" not in (r.stderr or "").lower():
+            raise WireguardRefused(f"'ip link add {WG_INTERFACE}' failed: "
+                                   f"{(r.stderr or '').strip()}")
+        run(["wg", "set", WG_INTERFACE, "private-key", WG_SERVER_KEY_FILE,
+             "listen-port", str(WG_LISTEN_PORT)])
+        subprocess.run(["ip", "addr", "add",
+                       f"{WG_SERVER_ADDR}/{WG_SUBNET.prefixlen}", "dev", WG_INTERFACE],
+                       capture_output=True, text=True)  # "exists" is fine
+        run(["ip", "link", "set", WG_INTERFACE, "up"])
+    except subprocess.CalledProcessError as e:
+        raise WireguardRefused(f"could not bring up '{WG_INTERFACE}': {e}")
+    return server_pub
+
+
+def wg_teardown_interface():
+    """Take 'wg0' down -- the node's own key pair is kept (§5.2: only a
+    live 'wireguard' access, not the profile toggle, is time-boxed).
+    Best-effort, like connect_leave_network(): an interface that is
+    already gone is not a failure worth raising over."""
+    subprocess.run(["ip", "link", "delete", WG_INTERFACE], capture_output=True, text=True)
+
+
+def wg_add_peer(pubkey, tunnel_ip):
+    run(["wg", "set", WG_INTERFACE, "peer", pubkey, "allowed-ips",
+         f"{tunnel_ip}/32"])
+
+
+def wg_remove_peer(pubkey):
+    # Best-effort: already gone is not an error.
+    subprocess.run(["wg", "set", WG_INTERFACE, "peer", pubkey, "remove"],
+                   capture_output=True, text=True)
+
+
+def wg_used_tunnel_ips():
+    return {r["target"]["tunnel_ip"] for r in load_access().values()
+            if r.get("shape") == "wireguard" and access_alive(r)
+            and (r.get("target") or {}).get("tunnel_ip")}
+
+
+def wg_next_tunnel_ip():
+    """The lowest free /32 in WG_SUBNET, never the server's own address
+    or the network/broadcast ends -- tracked by scanning open
+    'wireguard' accesses, the same way _forward_instances() tracks
+    connect's network membership: no separate counter to drift from
+    the truth."""
+    used = wg_used_tunnel_ips()
+    for addr in WG_SUBNET.hosts():
+        if addr == WG_SERVER_ADDR:
+            continue
+        if str(addr) not in used:
+            return addr
+    raise AccessRefused(f"no free address left in {WG_SUBNET} for a new peer")
+
+
+def container_ip(container, net):
+    """This container's address on this Docker network, or '' -- same
+    shape as container_networks()/network_members() above."""
+    r = subprocess.run(
+        ["docker", "inspect", "-f",
+         '{{(index .NetworkSettings.Networks "' + net + '").IPAddress}}',
+         container], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _wg_fence_rules(peer_ip, instance_subnet, gateway_ip):
+    """The three DOCKER-USER rules of RFC-0044 §5.1, as argument
+    lists -- read top to bottom AFTER insertion: exclude the gateway's
+    own address on this network first, allow the rest of the
+    instance's subnet, drop everything else from this peer. Docker's
+    own default in this chain is a trailing RETURN, so these rules
+    must be INSERTED ahead of the chain's existing content, never
+    appended -- appended, they would never be reached."""
+    return [
+        ["-s", f"{peer_ip}/32", "-d", f"{gateway_ip}/32", "-j", "DROP"],
+        ["-s", f"{peer_ip}/32", "-d", str(instance_subnet), "-j", "ACCEPT"],
+        ["-s", f"{peer_ip}/32", "-j", "DROP"],
+    ]
+
+
+def firewall_fence_add(peer_ip, instance_subnet, gateway_ip):
+    # Issued in REVERSE of the intended reading order: each
+    # '-I DOCKER-USER 1' prepends, so inserting the catch-all DROP
+    # first and the gateway DROP last leaves the chain reading, top to
+    # bottom, exactly as _wg_fence_rules() lists them. run() raises on
+    # any failure here -- the caller (access_open) must roll back the
+    # peer it just added if a rule does not apply.
+    for rule in reversed(_wg_fence_rules(peer_ip, instance_subnet, gateway_ip)):
+        run(["iptables", "-I", "DOCKER-USER", "1", *rule])
+
+
+def firewall_fence_remove(peer_ip, instance_subnet, gateway_ip):
+    # Order does not matter for deletion -- each -D removes one match,
+    # best-effort like wg_remove_peer(): a rule already gone is not an
+    # error worth raising over on the way out.
+    for rule in _wg_fence_rules(peer_ip, instance_subnet, gateway_ip):
+        subprocess.run(["iptables", "-D", "DOCKER-USER", *rule],
+                       capture_output=True, text=True)
+
+
+def wg_conf_render(private_key, tunnel_ip, server_pubkey, endpoint, instance_subnet):
+    """The .conf text handed to the person, once (RFC-0044 §5.3/§5.4).
+    AllowedIPs here is the laptop's own routing courtesy -- the actual
+    fence is §5.1's host firewall rule, not this file."""
+    return (
+        "[Interface]\n"
+        f"PrivateKey = {private_key}\n"
+        f"Address = {tunnel_ip}/32\n\n"
+        "[Peer]\n"
+        f"PublicKey = {server_pubkey}\n"
+        f"Endpoint = {endpoint}:{WG_LISTEN_PORT}\n"
+        f"AllowedIPs = {instance_subnet}\n"
+        "PersistentKeepalive = 25\n"
+    )
 
 
 def _service_container(inst, service):
@@ -9554,13 +9796,16 @@ def _forward_instances(accesses):
 
 def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
                 target=None, who="root", role="root"):
-    """Open an access (RFC-0044 §1/§3). Returns the record.
+    """Open an access (RFC-0044 §1/§3). Returns the record; for
+    'wireguard' the returned dict ALSO carries a 'conf' key with the
+    peer's .conf text -- shown once by the caller, never saved (D10).
 
     Raises AccessRefused for an unknown instance, an unoffered shape or
     duration, a 'forward' access naming no service/port or an unknown
-    service, or a 'forward' access the connect service could not reach
-    the instance's network for -- checked here, not only in the form
-    the portal shows: the spool is data, not trust.
+    service, a 'forward' access the connect service could not reach
+    the instance's network for, or a 'wireguard' access this node has
+    no profile 'remote-access' for -- checked here, not only in the
+    form the portal shows: the spool is data, not trust.
     """
     import datetime, secrets
     if shape not in ACCESS_SHAPES:
@@ -9573,7 +9818,11 @@ def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
     inst = (reg.get("instances") or {}).get(instance)
     if not inst:
         raise AccessRefused("unknown instance")
+    holder = (holder or who or "").strip()
+    if not holder:
+        raise AccessRefused("an access needs a named holder")
     target = target or {}
+    conf_text = None
     if shape == "forward":
         if not target.get("port"):
             raise AccessRefused("a port forward needs a service and a port")
@@ -9582,9 +9831,39 @@ def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
             raise AccessRefused(f"no service '{target.get('service')}' on this instance")
         target = {"service": target.get("service") or "", "port": int(target["port"]),
                   "container": container}
-    holder = (holder or who or "").strip()
-    if not holder:
-        raise AccessRefused("an access needs a named holder")
+    elif shape == "wireguard":
+        # RFC-0044 §5: the mechanics, CLI-only (spec §9) -- nothing
+        # here is reachable from the portal worker, on purpose.
+        if not has_profile("remote-access"):
+            raise AccessRefused("this node has no profile 'remote-access' -- "
+                                "WireGuard is not offered here (D4)")
+        endpoint = (target.get("endpoint") or "").strip()
+        if not endpoint:
+            raise AccessRefused("a WireGuard access needs an endpoint -- the "
+                                "address the peer will actually dial")
+        net = app_network(instance)
+        subnets = docker_subnets(net)
+        if not subnets:
+            raise AccessRefused("this instance's network has no known address range")
+        instance_subnet = subnets[0]
+        gateway_ip = container_ip(GATEWAY_CONTAINER, net)
+        if not gateway_ip:
+            raise AccessRefused("could not find the gateway's address on "
+                                "this instance's network")
+        server_pub = wg_ensure_interface()
+        privkey, pubkey = wg_genkey()
+        tunnel_ip = wg_next_tunnel_ip()
+        wg_add_peer(pubkey, tunnel_ip)
+        try:
+            firewall_fence_add(str(tunnel_ip), instance_subnet, gateway_ip)
+        except subprocess.CalledProcessError:
+            wg_remove_peer(pubkey)
+            raise AccessRefused("the firewall fence could not be applied -- "
+                                "the access was not opened")
+        conf_text = wg_conf_render(privkey, tunnel_ip, server_pub, endpoint,
+                                   instance_subnet)
+        target = {"peer_pubkey": pubkey, "tunnel_ip": str(tunnel_ip),
+                  "instance_subnet": str(instance_subnet), "gateway_ip": gateway_ip}
     if shape == "forward" and not connect_join_network(app_network(instance)):
         raise AccessRefused("the connect service could not join this instance's "
                             "network -- the access was not opened, try again")
@@ -9604,13 +9883,17 @@ def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
                  detail=f"{shape} for {holder}, {hours} h"
                  + (f", {target.get('service') or target.get('container')}:{target.get('port')}"
                     if shape == "forward" else ""))
+    if conf_text is not None:
+        rec = dict(rec)
+        rec["conf"] = conf_text  # never persisted -- see save_access() above
     return rec
 
 
 def access_close(access_id, who="root", role="root", expired=False):
     """Close one access -- the record, and (for 'forward') the connect
     service's membership in the instance's network, once nothing else
-    open still needs it."""
+    open still needs it; (for 'wireguard') the peer and its firewall
+    fence (RFC-0044 §5)."""
     accesses = load_access()
     rec = accesses.get(access_id)
     if not rec:
@@ -9619,6 +9902,13 @@ def access_close(access_id, who="root", role="root", expired=False):
     save_access(accesses)
     if rec.get("shape") == "forward" and rec["instance"] not in _forward_instances(accesses):
         connect_leave_network(app_network(rec["instance"]))
+    if rec.get("shape") == "wireguard":
+        t = rec.get("target") or {}
+        if t.get("peer_pubkey"):
+            wg_remove_peer(t["peer_pubkey"])
+        if t.get("tunnel_ip"):
+            firewall_fence_remove(t["tunnel_ip"], t.get("instance_subnet", ""),
+                                  t.get("gateway_ip", ""))
     audit_tenant("access.expired" if expired else "access.closed",
                  rec.get("tenant") or "", subject=rec.get("instance", ""),
                  who=who, role=role, detail=rec.get("holder", ""))
@@ -9721,9 +10011,10 @@ def cmd_restart(args):
 def cmd_access(args):
     """`oaap app access open|close|list|sweep` (RFC-0044).
 
-    'forward' carries real traffic (§4) as soon as it opens; 'wireguard'
-    still opens only the record -- see the module note above
-    access_open().
+    'forward' carries real traffic (§4) as soon as it opens; so does
+    'wireguard' (§5) -- but ONLY from here, never from the portal
+    worker (spec §9): the firewall fence it relies on has not been
+    measured on a real node. See the module note above access_open().
     """
     if args.action == "sweep":
         closed = access_sweep()
@@ -9746,8 +10037,15 @@ def cmd_access(args):
     if args.action == "open":
         if not args.name:
             die("'access open' needs an instance -- see 'oaap app list'")
-        target = ({"service": args.service, "port": args.port}
-                  if args.shape == "forward" else None)
+        if args.shape == "forward":
+            target = {"service": args.service, "port": args.port}
+        elif args.shape == "wireguard":
+            if not args.endpoint:
+                die("'access open --shape wireguard' needs --endpoint "
+                    "(the address the peer will actually dial)")
+            target = {"endpoint": args.endpoint}
+        else:
+            target = None
         try:
             rec = access_open(args.name, args.shape, args.holder or who,
                               hours=args.hours, target=target, who=who,
@@ -9762,7 +10060,14 @@ def cmd_access(args):
             print(f"'{rec['holder']}' reaches it with: oaap-expose.py forward "
                   f"--access {rec['id']} --server <this node> --local-port <free>")
         else:
-            print("No traffic yet -- WireGuard is not built (RFC-0044 §5).")
+            print("")
+            print("This is the ONLY time the .conf is shown. It is not stored;")
+            print("lost it? Close this access and open a new one.")
+            print("")
+            print(rec["conf"])
+            print("REMINDER: the firewall fence this relies on (spec §5.1) has")
+            print("not been measured on a real node. Do not hand this .conf to")
+            print("anyone but the person taking that measurement.")
         return
     # close
     if not args.name:
@@ -15692,6 +15997,18 @@ def cmd_process_deploys(_args):
                              or ensure_default_tenant(),
                              subject=name, result="denied", who=who,
                              role=act_role or "-", detail=msg)
+            elif op == "open" and str(req.get("shape") or "forward") == "wireguard":
+                # RFC-0044 spec §9: WireGuard is CLI-only until the
+                # firewall fence has been measured on a real node --
+                # the portal must never reach access_open() for this
+                # shape, whatever the request asks for. No function
+                # ran, so this is written here, like the role denial
+                # above (but never AS a role denial: a server_admin
+                # asking this way is not doing anything wrong, the
+                # portal itself does not offer this yet).
+                msg = ("WireGuard is not offered from the portal yet -- "
+                      "'oaap app access open --shape wireguard' at the "
+                      "machine (RFC-0044 spec §9)")
             elif op == "open":
                 try:
                     shape = str(req.get("shape") or "forward")
@@ -17631,8 +17948,9 @@ def main():
     pdg.set_defaults(fn=cmd_diagnose)
     pac = sub.add_parser("access",
                          help="a time-boxed access into one instance "
-                              "network (RFC-0044, forward carries traffic, "
-                              "wireguard not built yet)")
+                              "network (RFC-0044). 'wireguard' needs node "
+                              "profile 'remote-access' and its firewall "
+                              "fence is not measured on a real node yet")
     pac.add_argument("action", choices=["open", "close", "list", "sweep"])
     pac.add_argument("name", nargs="?", default="",
                      help="open/list: the instance; close: the access id")
@@ -17647,6 +17965,9 @@ def main():
                      help="open --shape forward: the service name")
     pac.add_argument("--port", type=int, default=0,
                      help="open --shape forward: the port")
+    pac.add_argument("--endpoint", default="",
+                     help="open --shape wireguard: the address the peer "
+                          "will dial (this node's own reachable name)")
     pac.set_defaults(fn=cmd_access)
     pms = sub.add_parser("state-index",
                          help="internal: write container state facts where "
