@@ -1145,6 +1145,7 @@ CONNECT_STATE_DIR = os.path.join(CONNECT_DIR, "state")
 CONNECT_SERVICE = "connect:8000"
 CONNECT_ROUTE = "/connect/tunnel"
 CONNECT_CLIENT_ROUTE = "/connect/client"
+CONNECT_FORWARD_ROUTE = "/connect/forward"
 CONNECT_CONTAINER = "oaap-connect-1"
 CONNECT_KEY_PREFIX = "oaapc_"
 # MUST match services/connect/app.py -- test_connector.py checks it.
@@ -3679,6 +3680,15 @@ def cmd_migrate_connect(_args):
         refresh_generated_sites()
         reload_gateway()
         print(f"  {CONNECT_CLIENT_ROUTE} answers now. Reloaded, not restarted.")
+    elif have and f"handle {CONNECT_FORWARD_ROUTE} {{" not in have:
+        # 0.1.135: a person's port forward (RFC-0044 SS4), same reasoning
+        print("")
+        print("Opening the port-forward route on the external sites "
+              "(oaap.net.remote-access 0.2) ...")
+        refresh_generated_sites()
+        reload_gateway()
+        print(f"  {CONNECT_FORWARD_ROUTE} answers now; nothing forwards until an "
+              "access is opened. Reloaded, not restarted.")
     if load_external() and not os.path.exists(os.path.join(CADDY_APPS_DIR, EXPOSE_SITE)):
         # the exposure zone (oaap.net.connector 2.8.1): one site, written
         # once and then kept -- the same lesson as the routes above
@@ -7549,6 +7559,15 @@ def _portal_site_body():
     lines += strip_identity()
     lines += _proxy(CONNECT_SERVICE, "\t\t")
     lines.append("\t}")
+    # a person's port forward (RFC-0044 SS4, oaap.net.remote-access 0.2):
+    # the client dials THIS site's name, same reasoning as the tunnel
+    # above -- the base Caddyfile's :80/:443 block alone would be the
+    # /platform/* mistake again, and this route carries the person's own
+    # API key, never a session
+    lines.append(f"\thandle {CONNECT_FORWARD_ROUTE} {{")
+    lines += strip_identity()
+    lines += _proxy(CONNECT_SERVICE, "\t\t")
+    lines.append("\t}")
     lines.append("\thandle {")
     lines.append("\t\tforward_auth identity:8000 {")
     lines.append("\t\t\turi /verify")
@@ -9447,12 +9466,13 @@ def restart_instance(name, inst, own_rid="", who="root", role="root"):
 # access object, portal card, audit entries and sweep" before "the
 # port forward and the WireGuard peer[, which] both hang on them".
 #
-# Opening an access here records who, for whom, which instance, which
-# shape and until when -- and it expires by itself. It does NOT yet
-# carry traffic: the gateway's dial-through for shape (b) and the
-# WireGuard peer/firewall fence for shape (a) are the next stage
-# (RFC-0044 §4, §5) and are measured on a real node before either is
-# offered anywhere.
+# Stage 2, same day (0.2): a 'forward' access carries real traffic. On
+# open, the connect service joins the instance's network (only it has
+# business there besides the gateway) and dials the ONE
+# container:port the access names, on every connection a laptop client
+# makes to /connect/forward (§4). A 'wireguard' access still carries
+# none -- the firewall fence of §2.2 is measured on a real node before
+# any WireGuard file is offered anywhere (D2's consequence, unchanged).
 #
 # Deliberately NOT part of the registry: RFC-0044 §1 says an access
 # "is not carried by backup, restore or promotion -- an access is an
@@ -9493,14 +9513,54 @@ def access_alive(rec):
     return bool(rec) and not _past(rec.get("expires") or "")
 
 
+def _service_container(inst, service):
+    """The container that carries this service name, or None.
+
+    A single-service instance has nothing to disambiguate -- any name
+    (or none) resolves to its one container, the way instance_services()
+    itself already normalises old and new instances alike. A
+    multi-service instance requires an EXACT match, because a forward
+    picks one specific container and must never guess."""
+    services = instance_services(inst)
+    if len(services) == 1:
+        return services[0]["container"]
+    for s in services:
+        if (s.get("service") or "") == service:
+            return s["container"]
+    return None
+
+
+def connect_join_network(net):
+    """Attach the connect service to an instance network (RFC-0044 §4):
+    it is the only container besides the gateway with business on one,
+    and only for as long as a 'forward' access needs it. Idempotent --
+    Docker returns non-zero if it is already connected."""
+    r = subprocess.run(["docker", "network", "connect", net, CONNECT_CONTAINER],
+                       capture_output=True, text=True)
+    return r.returncode == 0 or "already" in (r.stderr or "").lower()
+
+
+def connect_leave_network(net):
+    subprocess.run(["docker", "network", "disconnect", net, CONNECT_CONTAINER],
+                   capture_output=True, text=True)
+
+
+def _forward_instances(accesses):
+    """Which instances still have an open, unexpired 'forward' access --
+    decides whether the connect service still needs that network."""
+    return {r["instance"] for r in accesses.values()
+            if r.get("shape") == "forward" and access_alive(r)}
+
+
 def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
                 target=None, who="root", role="root"):
     """Open an access (RFC-0044 §1/§3). Returns the record.
 
     Raises AccessRefused for an unknown instance, an unoffered shape or
-    duration, or a 'forward' access without a target -- checked here,
-    not only in the form the portal shows: the spool is data, not
-    trust.
+    duration, a 'forward' access naming no service/port or an unknown
+    service, or a 'forward' access the connect service could not reach
+    the instance's network for -- checked here, not only in the form
+    the portal shows: the spool is data, not trust.
     """
     import datetime, secrets
     if shape not in ACCESS_SHAPES:
@@ -9514,11 +9574,20 @@ def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
     if not inst:
         raise AccessRefused("unknown instance")
     target = target or {}
-    if shape == "forward" and not (target.get("service") and target.get("port")):
-        raise AccessRefused("a port forward needs a service and a port")
+    if shape == "forward":
+        if not target.get("port"):
+            raise AccessRefused("a port forward needs a service and a port")
+        container = _service_container(inst, target.get("service") or "")
+        if not container:
+            raise AccessRefused(f"no service '{target.get('service')}' on this instance")
+        target = {"service": target.get("service") or "", "port": int(target["port"]),
+                  "container": container}
     holder = (holder or who or "").strip()
     if not holder:
         raise AccessRefused("an access needs a named holder")
+    if shape == "forward" and not connect_join_network(app_network(instance)):
+        raise AccessRefused("the connect service could not join this instance's "
+                            "network -- the access was not opened, try again")
     tenant = resolve_tenant(inst.get("tenant")) or ensure_default_tenant()
     now = datetime.datetime.now(datetime.timezone.utc)
     rec_id = secrets.token_hex(4)
@@ -9533,20 +9602,23 @@ def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
     save_access(accesses)
     audit_tenant("access.opened", tenant, subject=instance, who=who, role=role,
                  detail=f"{shape} for {holder}, {hours} h"
-                 + (f", {target.get('service')}:{target.get('port')}"
+                 + (f", {target.get('service') or target.get('container')}:{target.get('port')}"
                     if shape == "forward" else ""))
     return rec
 
 
 def access_close(access_id, who="root", role="root", expired=False):
-    """Close one access -- the record only; stage 1 carries no traffic
-    to tear down."""
+    """Close one access -- the record, and (for 'forward') the connect
+    service's membership in the instance's network, once nothing else
+    open still needs it."""
     accesses = load_access()
     rec = accesses.get(access_id)
     if not rec:
         raise AccessRefused(f"no access '{access_id}'")
     accesses.pop(access_id, None)
     save_access(accesses)
+    if rec.get("shape") == "forward" and rec["instance"] not in _forward_instances(accesses):
+        connect_leave_network(app_network(rec["instance"]))
     audit_tenant("access.expired" if expired else "access.closed",
                  rec.get("tenant") or "", subject=rec.get("instance", ""),
                  who=who, role=role, detail=rec.get("holder", ""))
@@ -9647,10 +9719,10 @@ def cmd_restart(args):
 
 
 def cmd_access(args):
-    """`oaap app access open|close|list|sweep` (RFC-0044 stage 1).
+    """`oaap app access open|close|list|sweep` (RFC-0044).
 
-    Stage 1 only: the record, its expiry and the audit line. No
-    traffic follows an 'open' yet -- see the module note above
+    'forward' carries real traffic (§4) as soon as it opens; 'wireguard'
+    still opens only the record -- see the module note above
     access_open().
     """
     if args.action == "sweep":
@@ -9686,8 +9758,11 @@ def cmd_access(args):
               else "")
         print(f"Access {rec['id']} open until {rec['expires']} for "
               f"'{rec['holder']}' -- {rec['shape']}{tgt}.")
-        print("No traffic yet (oaap.net.remote-access 0.1, stage 1) -- see "
-              "RFC-0044 §11.")
+        if args.shape == "forward":
+            print(f"'{rec['holder']}' reaches it with: oaap-expose.py forward "
+                  f"--access {rec['id']} --server <this node> --local-port <free>")
+        else:
+            print("No traffic yet -- WireGuard is not built (RFC-0044 §5).")
         return
     # close
     if not args.name:
@@ -15588,11 +15663,12 @@ def cmd_process_deploys(_args):
                 except DestinationRefused as e:
                     msg = str(e)
         elif action == "access":
-            # RFC-0044 stage 1: open/close a time-boxed access record
-            # from the instance page. Same functions the CLI calls
-            # (access_open/close), so the two paths cannot drift. No
-            # traffic yet -- see the module note above access_open() in
-            # this file.
+            # RFC-0044: open/close a time-boxed access record from the
+            # instance page. Same functions the CLI calls
+            # (access_open/close), so the two paths cannot drift.
+            # 'forward' carries real traffic as soon as it opens (§4);
+            # 'wireguard' does not yet -- see the module note above
+            # access_open() in this file.
             #
             # server_admin AND the instance tenant's own tenant_admin
             # (D1), the same pair the diagnosis window uses (RFC-0038
@@ -17555,7 +17631,8 @@ def main():
     pdg.set_defaults(fn=cmd_diagnose)
     pac = sub.add_parser("access",
                          help="a time-boxed access into one instance "
-                              "network (RFC-0044 stage 1 -- no traffic yet)")
+                              "network (RFC-0044, forward carries traffic, "
+                              "wireguard not built yet)")
     pac.add_argument("action", choices=["open", "close", "list", "sweep"])
     pac.add_argument("name", nargs="?", default="",
                      help="open/list: the instance; close: the access id")

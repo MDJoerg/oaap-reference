@@ -3022,11 +3022,14 @@ INSTANCE_EDIT_BODY = """
      genau dieses Instanznetz</strong> (RFC-0044) — für eine
      Portweiterleitung auf einen Dienst dieser App, oder als
      WireGuard-Zugang ins ganze Netz.</p>
-  <p class="muted"><strong>Diese Stufe trägt noch keinen Verkehr.</strong>
-     Öffnen legt einen Datensatz mit Ablaufzeit an und schreibt ihn ins
-     Mandantenprotokoll — die eigentliche Verbindung (Portweiterleitung
-     durchs Gateway, WireGuard-Netzzugang mit Firewall-Regel) ist der
-     nächste Schritt.</p>
+  <p class="muted"><strong>Portweiterleitung trägt Verkehr.</strong> Nach dem
+     Öffnen läuft beim Inhaber:in <code>oaap-expose.py forward --access
+     &lt;Id&gt; --server &lt;dieser Knoten&gt; --local-port &lt;frei
+     wählbar&gt;</code> mit dem <strong>eigenen</strong> API-Schlüssel — nicht
+     dem der Person, die den Zugang geöffnet hat. <strong>WireGuard ist noch
+     nicht gebaut</strong> — die Firewall-Regel dafür wird zuerst an einem
+     echten Knoten gemessen, bevor irgendwo eine WireGuard-Datei ausgegeben
+     wird.</p>
 </div>
 
 {% if i.access %}
@@ -3034,9 +3037,10 @@ INSTANCE_EDIT_BODY = """
 <div class="card">
   <h2>Offene Zugänge</h2>
   <table class="mini">
-    <tr><th>Für</th><th>Form</th><th>Ziel</th><th>Bis</th><th></th></tr>
+    <tr><th>Id</th><th>Für</th><th>Form</th><th>Ziel</th><th>Bis</th><th></th></tr>
     {% for a in i.access.rows %}
     <tr>
+      <td><code>{{ a.id }}</code></td>
       <td>{{ a.holder }}</td>
       <td>{{ "Portweiterleitung" if a.shape == "forward" else "WireGuard" }}</td>
       <td>{% if a.shape == "forward" and a.target %}<code>{{ a.target.service }}:{{ a.target.port }}</code>{% else %}<span class="muted">ganzes Netz</span>{% endif %}</td>
@@ -6986,9 +6990,9 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # so kann keiner der vier Namen mit einem Feld der Instanz
          # kollidieren.
          "diag": _diagnose_page(name, inst),
-         # Fernzugang (RFC-0044 Stufe 1, oaap.net.remote-access 0.1):
-         # eigener Schlüssel wie "diag" -- ein anderes Objekt, kein
-         # Feld der Instanz.
+         # Fernzugang (RFC-0044, oaap.net.remote-access 0.2): eigener
+         # Schlüssel wie "diag" -- ein anderes Objekt, kein Feld der
+         # Instanz.
          "access": _access_page(name, inst),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
@@ -8009,9 +8013,9 @@ def _access_alive(rec):
 
 
 def _access_page(name, inst):
-    """Fernzugang-Reiter (RFC-0044 Stufe 1): offene Zugänge dieser
-    Instanz, neueste zuerst. Trägt noch keinen Verkehr -- siehe die
-    Spec, oaap.net.remote-access 0.1 §7."""
+    """Fernzugang-Reiter (RFC-0044): offene Zugänge dieser Instanz,
+    neueste zuerst. 'forward' trägt Verkehr, 'wireguard' noch nicht --
+    siehe die Spec, oaap.net.remote-access 0.2."""
     accesses = (_read_json(ACCESS_FILE) or {}).get("accesses") or {}
     rows = sorted(
         (r for r in accesses.values()
@@ -8025,12 +8029,13 @@ def _access_page(name, inst):
 
 @app.post("/instances/<name>/access")
 def instance_access(name):
-    """Einen Zugang öffnen oder schließen (RFC-0044 Stufe 1).
+    """Einen Zugang öffnen oder schließen (RFC-0044).
 
     `require_instance_admin` ist D1: der `server_admin` des Knotens
     oder der `tenant_admin` DIESER Instanz. Der Host prüft alles erneut
-    (Rolle, Dauer, Form) -- der Spool ist Daten, kein Vertrauen.
-    Trägt noch keinen Verkehr: das Öffnen legt nur den Datensatz an.
+    (Rolle, Dauer, Form, Dienst) -- der Spool ist Daten, kein Vertrauen.
+    Eine Portweiterleitung trägt ab dem Öffnen Verkehr (§4); WireGuard
+    legt weiterhin nur den Datensatz an.
     """
     denied = require_instance_admin(name)
     if denied:
@@ -8081,8 +8086,12 @@ def instance_access(name):
     if not res.get("ok"):
         return _inst_back(name, err=res.get("message", "Öffnen "
                                             "fehlgeschlagen."))
-    return _inst_back(name, msg=res.get("message", "Zugang geöffnet.")
-                      + " Noch ohne Verkehr (Stufe 1) — siehe RFC-0044 §11.")
+    hint = (" Der/die Inhaber:in erreicht ihn mit oaap-expose.py forward "
+            "--access <Id> --server <dieser Knoten> --local-port <frei "
+            "wählbar>, mit dem eigenen API-Schlüssel." if shape == "forward"
+            else " Noch ohne Verkehr — WireGuard ist noch nicht gebaut "
+                 "(RFC-0044 §5).")
+    return _inst_back(name, msg=res.get("message", "Zugang geöffnet.") + hint)
 
 
 @app.post("/instances/<name>/restart")

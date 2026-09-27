@@ -493,7 +493,10 @@ async def main():
 
             # --- the laptop client (2.8.5) ----------------------------------
             async def run_client(key, tenant="club", ttl="2h", public=False, target_=None):
-                args = [sys.executable, CLIENT, target_ or f"http://127.0.0.1:{bport}/dev",
+                # RFC-0044: oaap-expose.py grew a second verb ('forward'),
+                # so 'expose' is no longer the default -- it must be named.
+                args = [sys.executable, CLIENT, "expose",
+                        target_ or f"http://127.0.0.1:{bport}/dev",
                         "--server", base, "--tenant", tenant, "--ttl", ttl]
                 if public:
                     args.append("--public")

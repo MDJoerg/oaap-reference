@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""oaap-expose -- put one address of THIS machine on the internet for a
-while, behind an OAAP node's login (oaap.net.connector 0.2, spec 2.8.5).
+"""oaap-expose -- two verbs, opposite directions, one file.
+
+`expose`: put one address of THIS machine on the internet for a while,
+behind an OAAP node's login (oaap.net.connector 0.2, spec 2.8.5).
 
     export OAAP_KEY=oaapk_...            # your API key, from the portal
-    python oaap-expose.py http://localhost:3000 \\
+    python oaap-expose.py expose http://localhost:3000 \\
            --server https://oaap.example --tenant myclub --ttl 4h
 
 It prints an address like https://k3f9x2mh4a.t.oaap.example/ and keeps
@@ -18,6 +20,23 @@ What it does and does not do:
   * it may expose and nothing else, and only with the API key of a
     tenant_admin;
   * the key is read from OAAP_KEY or a hidden prompt, never an argument.
+
+`forward`: pull ONE port of a node's instance to THIS machine, for the
+duration of an access somebody already opened there (RFC-0044,
+oaap.net.remote-access 0.2 §4 -- "Zugang öffnen" on the instance page,
+or `oaap app access open`).
+
+    export OAAP_KEY=oaapk_...            # YOUR OWN API key, not the opener's
+    python oaap-expose.py forward --access a4c1e7 \\
+           --server https://oaap.example --local-port 5433
+
+It listens on `localhost:5433` and, for each connection there (one
+`psql`, one DBeaver session, ...), opens one WebSocket to the node and
+relays raw bytes both ways until that connection ends. The node checks,
+on every new connection, that the presented key belongs to the
+access's holder and that the access has not expired -- there is no
+standing tunnel to revoke, only individual connections that stop
+succeeding.
 
 Needs Python 3.9+ and aiohttp (pip install aiohttp). One file, same on
 Linux, macOS and Windows.
@@ -43,6 +62,7 @@ except ImportError:                                            # pragma: no cove
     sys.exit("oaap-expose needs aiohttp:  pip install aiohttp")
 
 SUBPROTOCOL = "oaap-connect.1"
+FORWARD_SUBPROTOCOL = "oaap-forward.1"
 WIRE_VERSION = 1
 CHUNK = 64 * 1024
 DATA, END = 1, 2
@@ -357,26 +377,161 @@ async def _deadline(c):
         c.say("  the time is up")
 
 
+# --- forward: pull one port to this machine (RFC-0044 §4) -------------------
+
+
+async def relay_tcp_ws(reader, writer, ws):
+    """Both directions of one forwarded connection -- the client's half
+    of what the node's connect service does on the other end. One
+    WebSocket per local TCP connection, no framing of its own: this is
+    a single hop, nothing else is multiplexed onto it."""
+    async def tcp_to_ws():
+        try:
+            while True:
+                data = await reader.read(CHUNK)
+                if not data:
+                    break
+                await ws.send_bytes(data)
+        except (OSError, ConnectionResetError):
+            pass
+        if not ws.closed:
+            await ws.close()
+
+    async def ws_to_tcp():
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    writer.write(msg.data)
+                    await writer.drain()
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+        except (OSError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                writer.write_eof()
+            except (OSError, RuntimeError):
+                pass
+
+    await asyncio.gather(tcp_to_ws(), ws_to_tcp())
+
+
+class ForwardClient:
+    """Listens locally; every connection there becomes one WebSocket to
+    the node's /connect/forward, checked there against the access and
+    its holder (RFC-0044 §4). There is nothing to reconnect here the
+    way `expose` reconnects its one standing tunnel -- a forward that
+    fails is one connection that failed, not a state to repair."""
+
+    def __init__(self, server, key, access_id, local_host, local_port, quiet=False):
+        self.server = server.rstrip("/")
+        self.key, self.access_id = key, access_id
+        self.local_host, self.local_port = local_host, local_port
+        self.quiet = quiet
+
+    def say(self, msg):
+        if not self.quiet:
+            print(msg, flush=True)
+
+    async def run(self):
+        srv = await asyncio.start_server(self.handle_conn, self.local_host, self.local_port)
+        addrs = ", ".join(str(s.getsockname()) for s in srv.sockets)
+        self.say(f"  listening on {addrs} -- forwarding to access '{self.access_id}' "
+                 f"on {self.server}  (Ctrl-C ends it)")
+        async with srv:
+            await srv.serve_forever()
+
+    async def _why(self, http, status):
+        """The node's sentence for a refusal (mirrors Client.why): the
+        WebSocket handshake error carries no body, so ask the same door
+        again the plain way."""
+        try:
+            async with http.get(self.server + "/connect/forward",
+                                params={"access": self.access_id},
+                                headers={"Authorization": "Bearer " + self.key}) as r:
+                return (await r.text()).strip()[:300]
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError):
+            return "no reason given"
+
+    async def handle_conn(self, reader, writer):
+        peer = writer.get_extra_info("peername")
+        url = self.server + "/connect/forward"
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=20)
+        try:
+            async with aiohttp.ClientSession(trust_env=True, timeout=timeout,
+                                             auto_decompress=False) as http:
+                try:
+                    async with http.ws_connect(
+                            url, params={"access": self.access_id},
+                            protocols=(FORWARD_SUBPROTOCOL,), heartbeat=20,
+                            headers={"Authorization": "Bearer " + self.key}) as ws:
+                        self.say(f"  {peer}: connected")
+                        await relay_tcp_ws(reader, writer, ws)
+                except aiohttp.WSServerHandshakeError as e:
+                    self.say(f"  {peer}: refused ({e.status}): {await self._why(http, e.status)}")
+        except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
+            self.say(f"  {peer}: cannot reach the node ({type(e).__name__})")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                                 # noqa: BLE001
+            # Anything unforeseen still ends this ONE connection with a
+            # sentence instead of a silent hang -- the listener itself
+            # keeps running for the next one.
+            self.say(f"  {peer}: unexpected error: {type(e).__name__}: {e}")
+        finally:
+            writer.close()
+            self.say(f"  {peer}: closed")
+
+
+async def amain_forward(args):
+    key = os.environ.get("OAAP_KEY") or getpass.getpass("API key (oaapk_...): ").strip()
+    if not key.startswith("oaapk_"):
+        raise SystemExit("that is not an API key (it starts with oaapk_ -- portal, Zugänge)")
+    c = ForwardClient(args.server, key, args.access, args.local_host, args.local_port)
+    await c.run()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        prog="oaap-expose", description="Put one address of this machine on the "
-        "internet for a while, behind an OAAP node's login.")
-    ap.add_argument("target", help="what to expose, e.g. http://localhost:3000")
-    ap.add_argument("--server", default=os.environ.get("OAAP_SERVER", ""),
+        prog="oaap-expose", description="Two verbs, opposite directions: put an "
+        "address of this machine on the internet for a while (expose), or pull "
+        "one port of a node's instance to this machine (forward, RFC-0044).")
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    pe = sub.add_parser("expose", help="put one address of this machine on the "
+                        "internet for a while, behind an OAAP node's login")
+    pe.add_argument("target", help="what to expose, e.g. http://localhost:3000")
+    pe.add_argument("--server", default=os.environ.get("OAAP_SERVER", ""),
                     help="the node, e.g. https://oaap.example (or OAAP_SERVER)")
-    ap.add_argument("--tenant", default=os.environ.get("OAAP_TENANT", ""),
+    pe.add_argument("--tenant", default=os.environ.get("OAAP_TENANT", ""),
                     help="your tenant (or OAAP_TENANT)")
-    ap.add_argument("--ttl", type=parse_ttl, default=8 * 3600,
+    pe.add_argument("--ttl", type=parse_ttl, default=8 * 3600,
                     help="how long: 30m, 8h, 2d (default 8h, at most 7d)")
-    ap.add_argument("--public", action="store_true",
+    pe.add_argument("--public", action="store_true",
                     help="no login for visitors (still braked, still expires)")
+
+    pf = sub.add_parser("forward", help="pull one port of a node's instance to "
+                        "this machine, for an access somebody already opened "
+                        "there (RFC-0044)")
+    pf.add_argument("--access", required=True,
+                    help="the access id ('oaap app access open', or the "
+                         "instance page's 'Fernzugang' tab)")
+    pf.add_argument("--server", default=os.environ.get("OAAP_SERVER", ""),
+                    help="the node, e.g. https://oaap.example (or OAAP_SERVER)")
+    pf.add_argument("--local-port", type=int, required=True,
+                    help="the port to listen on, on THIS machine")
+    pf.add_argument("--local-host", default="127.0.0.1",
+                    help="which local address to listen on (default 127.0.0.1)")
+
     args = ap.parse_args(argv)
-    if not args.server or not args.tenant:
-        ap.error("--server and --tenant are needed (or OAAP_SERVER / OAAP_TENANT)")
+    if not args.server:
+        ap.error("--server is needed (or OAAP_SERVER)")
     if not args.server.startswith(("https://", "http://")):
         ap.error("--server is an address like https://oaap.example")
+    if args.verb == "expose" and not args.tenant:
+        ap.error("--tenant is needed for 'expose' (or OAAP_TENANT)")
     try:
-        asyncio.run(amain(args))
+        asyncio.run(amain(args) if args.verb == "expose" else amain_forward(args))
     except KeyboardInterrupt:
         print("\n  closed.")
     except Fatal as e:

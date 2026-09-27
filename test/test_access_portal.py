@@ -64,6 +64,12 @@ m.run = lambda cmd, *a, **kw: types.SimpleNamespace(stdout="", stderr="", return
 m.reload_gateway = lambda: None
 m.recreate_instance_containers = lambda name, *a, **kw: None
 m.container_env = lambda container: None
+# Der echte Docker-Aufruf (RFC-0044 §4): standardmäßig "gelingt immer",
+# einzelne Tests unten schalten ihn gezielt auf "schlägt fehl" um --
+# und rufen ihn danach zurück, damit sie einander nicht beeinflussen.
+JOINS, LEAVES = [], []
+m.connect_join_network = lambda net: (JOINS.append(net) or True)
+m.connect_leave_network = lambda net: LEAVES.append(net)
 os.makedirs(m.CADDY_APPS_DIR, exist_ok=True)
 os.makedirs(m.APPS_DIR, exist_ok=True)
 DEFAULT = m.ensure_default_tenant()
@@ -103,7 +109,7 @@ reg["instances"][K_ORDERS] = {
 reg["instances"][A_ORDERS] = {
     "app_id": "orders", "app_name": "Orders", "channel": "test",
     "tenant": ANDERE, "id": "bbbbbbbbbbbb", "version": "0.1.0",
-    "name": "orders", "container": "oaap-app-andere-orders",
+    "name": "orders", "container": "oaap-app-andere-orders", "image": "",
 }
 m.save_registry(reg)
 
@@ -145,9 +151,11 @@ print("=== oeffnen ===")
 r = queue("karin", K_ORDERS, op="open", shape="forward", service="db", port=5432, hours=8)
 ok("ein tenant_admin oeffnet im eigenen Mandanten", r["ok"], r)
 rows = m.access_list(K_ORDERS)
-ok("... und der Zugang steht in remote-access.json, fuer sie selbst als Inhaberin",
+ok("... und der Zugang steht in remote-access.json, fuer sie selbst als Inhaberin, "
+   "mit dem echten Container-Namen als Ziel (nicht nur dem Dienstnamen)",
    len(rows) == 1 and rows[0]["holder"] == "karin" and rows[0]["shape"] == "forward"
-   and rows[0]["target"] == {"service": "db", "port": 5432}, rows)
+   and rows[0]["target"] == {"service": "db", "port": 5432,
+                             "container": "oaap-app-kunde-orders-db"}, rows)
 ACCESS_ID = rows[0]["id"]
 ok_lines = [e for e in log(KUNDE, "access.opened") if e["result"] == "ok"]
 ok("... im Mandantenprotokoll steht GENAU EINE ERFOLGREICHE Zeile, mit karin und "
@@ -225,6 +233,64 @@ ok("... im Protokoll steht access.expired, nicht access.closed",
 ok("ein zweiter Sweep-Lauf ohne etwas zu tun ist kein Fehler", m.access_sweep() == [])
 
 print("")
+print("=== Portweiterleitung: der connect-Dienst tritt dem Instanznetz bei (RFC-0044 §4) ===")
+JOINS.clear(); LEAVES.clear()
+r = queue("karin", K_ORDERS, op="open", shape="forward", service="db", port=5432)
+ok("das Ziel bekommt den echten Container-Namen aus der Registry, nicht nur den Dienstnamen",
+   any(row["target"].get("container") == "oaap-app-kunde-orders-db"
+       for row in m.access_list(K_ORDERS)), m.access_list(K_ORDERS))
+ok("... und der connect-Dienst wurde dem Instanznetz beigetreten",
+   JOINS == [m.app_network(K_ORDERS)], JOINS)
+FWD_ID = [row["id"] for row in m.access_list(K_ORDERS) if row["target"].get("port") == 5432][-1]
+
+r = queue("karin", K_ORDERS, op="open", shape="forward", service="unbekannt", port=9999)
+ok("ein unbekannter Dienstname wird abgelehnt -- die Instanz hat zwei Dienste, kein Raten",
+   not r["ok"] and "no service" in r["message"], r)
+
+# Ein Knoten, dessen Instanz nur EINEN Dienst hat: jeder (oder gar kein)
+# Dienstname loest ihn auf -- es gibt ja nichts zu unterscheiden.
+reg = m.load_registry()
+K_SOLO = "kunde-solo"
+reg["instances"][K_SOLO] = {
+    "app_id": "solo", "app_name": "Solo", "channel": "test", "tenant": KUNDE,
+    "id": "cccccccccccc", "version": "0.1.0", "name": "solo",
+    "container": "oaap-app-kunde-solo", "image": "",
+}
+m.save_registry(reg)
+r = queue("karin", K_SOLO, op="open", shape="forward", service="irgendwas", port=80)
+ok("bei nur einem Dienst loest JEDER Name ihn auf",
+   r["ok"] and any(row["target"].get("container") == "oaap-app-kunde-solo"
+                   for row in m.access_list(K_SOLO)), r)
+SOLO_ID = m.access_list(K_SOLO)[0]["id"]
+
+print("")
+print("=== Portweiterleitung: schliesst der connect-Dienst NICHT den Docker-Aufruf ===")
+before_leaves = len(LEAVES)
+m.access_close(FWD_ID, who="karin", role="tenant_admin")
+ok("solange noch ein anderer 'forward'-Zugang auf DERSELBEN Instanz offen ist, "
+   "verlaesst der connect-Dienst das Netz NICHT",
+   len(LEAVES) == before_leaves,
+   [row["instance"] for row in m.access_list(K_ORDERS)])
+
+# alle restlichen offenen Zugaenge von K_ORDERS schliessen (es koennen von
+# frueheren Abschnitten noch welche offen sein) und dann pruefen, dass der
+# connect-Dienst das Netz ERST JETZT verlaesst
+for row in list(m.access_list(K_ORDERS)):
+    m.access_close(row["id"], who="karin", role="tenant_admin")
+ok("kein offener 'forward'-Zugang mehr auf K_ORDERS -> der connect-Dienst verliess das Netz",
+   m.app_network(K_ORDERS) in LEAVES, LEAVES)
+
+print("")
+print("=== Portweiterleitung: schlaegt der Docker-Aufruf fehl ===")
+m.connect_join_network = lambda net: False
+r = queue("karin", K_SOLO, op="open", shape="forward", service="", port=81)
+ok("ein Zugang, dem der connect-Dienst nicht folgen kann, wird abgelehnt",
+   not r["ok"] and "could not join" in r["message"], r)
+ok("... und es steht nichts Neues in remote-access.json",
+   len(m.access_list(K_SOLO)) == 1, m.access_list(K_SOLO))  # nur SOLO_ID von oben
+m.connect_join_network = lambda net: (JOINS.append(net) or True)
+
+print("")
 print("=== die Uhr traegt drei Auftraege, nicht zwei ===")
 MIGRATE = open(os.path.join(HERE, "..", "platform", "migrate.sh"), encoding="utf-8").read()
 INSTALL = open(os.path.join(HERE, "..", "install.sh"), encoding="utf-8").read()
@@ -260,8 +326,16 @@ def template_const(name):
 body = template_const("INSTANCE_EDIT_BODY")
 frag = body.split("<section class=\"panel {{ 'active' if tab == 'fernzugang' }}\">")[1]  \
           .split("<section class=\"panel {{ 'active' if tab == 'verwaltung' }}\">")[0]
-ok("die Seite sagt selbst, dass diese Stufe noch keinen Verkehr traegt",
-   "noch keinen Verkehr" in frag, frag[:400])
+# Textzeilen im Quelltext sind umgebrochen (wie ueberall in dieser
+# Vorlage) -- im Browser kollabiert HTML das zu Leerzeichen, hier
+# gleicht das ein einfaches Normalisieren aus, bevor Saetze verglichen
+# werden, die einen Zeilenumbruch im Quelltext ueberspannen.
+flat = " ".join(frag.split())
+ok("die Seite sagt, dass Portweiterleitung Verkehr traegt und wie der Client "
+   "aufgerufen wird",
+   "trägt Verkehr" in flat and "oaap-expose.py forward" in flat, frag[:600])
+ok("... und dass WireGuard weiterhin nicht gebaut ist",
+   "WireGuard ist noch nicht gebaut" in flat, frag[:600])
 CARD = Environment(autoescape=True).from_string(frag)
 
 

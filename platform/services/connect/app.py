@@ -24,13 +24,24 @@ No listener on the host in either role: the port below is reached by
 the gateway over the platform network, and the inner role listens on
 nothing at all.
 
+Since 0.2 (RFC-0044 §4, oaap.net.remote-access) this process also
+carries a person's PORT FORWARD, on `/connect/forward`: one WebSocket
+per forwarded TCP connection, into a container of THIS node's own
+instance network (appctl joins this process to it only while an access
+of shape 'forward' is open, RFC-0044 §1). Unlike the tunnel above this
+is never inter-node -- a laptop's client dials this node directly, and
+the access record (read from `/platform-apps/remote-access.json`, which
+appctl owns like every file below) names the one container:port it may
+reach and the one holder whose key may open it.
+
 Configuration is read, never written, and re-read within a second of
 changing -- appctl on the host owns every file:
 
-    /platform-apps/connect.json    keys (hashes) and connectors (offers)
-    /secrets/connector-keys.json   the inner side's keys, in the clear
-    /secrets/gateway.key           what the gateway presents on /via
-    /platform-apps/tenants.json    tenant ids and labels (read only)
+    /platform-apps/connect.json       keys (hashes) and connectors (offers)
+    /platform-apps/remote-access.json accesses (RFC-0044) -- forward's targets
+    /secrets/connector-keys.json      the inner side's keys, in the clear
+    /secrets/gateway.key              what the gateway presents on /via
+    /platform-apps/tenants.json       tenant ids and labels (read only)
 
 What this process writes is state, stream logs and the exposures it holds
 (to /state), and one line per decision to the tenant audit log (/audit,
@@ -51,6 +62,7 @@ import sys
 import time
 import urllib.parse
 from collections import deque
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
@@ -65,15 +77,20 @@ KEYS_FILE = os.path.join(SECRETS, "connector-keys.json")
 GATEWAY_KEY_FILE = os.path.join(SECRETS, "gateway.key")
 TENANTS_FILE = os.path.join(APPS, "tenants.json")
 EXPOSURES_FILE = os.path.join(STATE, "exposures.json")
+# RFC-0044 §4 (oaap.net.remote-access 0.2): appctl owns this file too --
+# read-only here, exactly like connect.json above.
+ACCESS_FILE = os.path.join(APPS, "remote-access.json")
 AUDIT_LOG = os.environ.get("CONNECT_AUDIT", "/audit/tenant-log.jsonl")
 IDENTITY = os.environ.get("CONNECT_IDENTITY", "http://identity:8000").rstrip("/")
 CLIENT_FILE = os.environ.get("CONNECT_CLIENT_FILE", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "client", "oaap-expose.py"))
 
 SUBPROTOCOL = "oaap-connect.1"
+FORWARD_SUBPROTOCOL = "oaap-forward.1"
 WIRE_VERSION = 1
 CHUNK = 64 * 1024
 DATA, END = 1, 2
+FORWARD_DIAL_TIMEOUT = 10
 HEAD_TIMEOUT = 120          # spec 2.6: no answer within 120 s -> 504
 QUEUE_WAIT = 30             # a reader that stalls this long loses its stream
 BACKOFF_MAX = 60
@@ -166,6 +183,63 @@ def mtime(path):
         return os.stat(path).st_mtime_ns
     except OSError:
         return 0
+
+
+def access_by_id(access_id):
+    """One access record (RFC-0044), freshly read -- appctl owns the
+    file, this process never writes it, so no cache: a forward is rare
+    and short compared to the tunnel's own 5 s sweep loop."""
+    return (read_json(ACCESS_FILE).get("accesses") or {}).get(access_id or "")
+
+
+def access_expired(rec):
+    """An unreadable or missing expiry counts as expired -- the same
+    rule appctl's own _past() applies to a diagnosis window."""
+    try:
+        when = datetime.fromisoformat(str((rec or {}).get("expires") or ""))
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when <= datetime.now(timezone.utc)
+
+
+async def relay_ws_tcp(ws, reader, writer):
+    """Both directions of one forwarded TCP connection (RFC-0044 §4).
+
+    One WebSocket carries exactly one TCP stream -- unlike the tunnel's
+    multiplexed protocol above, a forward is a single hop with nothing
+    else to multiplex, so binary frames go straight through with no
+    framing of their own."""
+    async def ws_to_tcp():
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    writer.write(msg.data)
+                    await writer.drain()
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+        except (OSError, ConnectionResetError):
+            pass
+        finally:
+            try:
+                writer.write_eof()
+            except (OSError, RuntimeError):
+                pass
+
+    async def tcp_to_ws():
+        try:
+            while True:
+                data = await reader.read(CHUNK)
+                if not data:
+                    break
+                await ws.send_bytes(data)
+        except (OSError, ConnectionResetError):
+            pass
+        if not ws.closed:
+            await ws.close()
+
+    await asyncio.gather(ws_to_tcp(), tcp_to_ws())
 
 
 def offer_refusal(to):
@@ -875,6 +949,68 @@ class Node:
                              "oaap.net.connector 0.1.")
         return await t.call(request, offer, caller, dest)
 
+    # --- a person's port forward (RFC-0044 §4, oaap.net.remote-access 0.2) ----
+    async def handle_forward(self, request):
+        """One WebSocket per forwarded TCP connection -- single hop,
+        never inter-node: appctl already joined this process to the
+        instance's network when the access was opened (spec 3), so the
+        only thing left here is to verify the holder and then dial the
+        ONE container:port the access itself names. The request
+        supplies neither -- an access id is not a target."""
+        ip = self._client_ip(request)
+        if self._blocked(ip):
+            return web.Response(status=429, text="too many attempts -- wait a minute\n")
+        rec = access_by_id(request.query.get("access", ""))
+        if not rec or rec.get("shape") != "forward":
+            return text(404, "no such access -- it may have expired or been closed")
+        if access_expired(rec):
+            return text(410, "this access has expired")
+        auth = request.headers.get("Authorization", "")
+        key = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not key.startswith("oaapk_"):
+            return text(401, "a port forward needs the holder's own API key")
+        try:
+            status, headers, _body = await self.identity(
+                "/verify", {"Authorization": "Bearer " + key, "X-Forwarded-For": ip},
+                params={"tenant": rec.get("tenant", "")})
+        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+            return text(502, f"The node could not ask its identity service: {type(ex).__name__}")
+        if status == 429:
+            return web.Response(status=429, text="too many attempts -- wait a minute\n")
+        if status != 204:
+            self._failed(ip)
+            return web.Response(status=401, text="denied\n")
+        principal = headers.get("X-OAAP-User", "")
+        if principal != rec.get("holder"):
+            # answered exactly like "no such access" (401 elsewhere in
+            # this file too): a key that is not this access's holder
+            # learns nothing about who the holder actually is
+            self._failed(ip)
+            return text(403, "this key does not hold this access")
+        target = rec.get("target") or {}
+        host, port = target.get("container", ""), target.get("port")
+        if not host or not port:
+            return text(500, "this access names no target -- it should never "
+                             "have opened this way")
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, int(port)), timeout=FORWARD_DIAL_TIMEOUT)
+        except (OSError, asyncio.TimeoutError) as ex:
+            return text(502, f"could not reach {target.get('service') or host}:{port} "
+                             f"on this instance -- {type(ex).__name__}")
+        ws = web.WebSocketResponse(protocols=(FORWARD_SUBPROTOCOL,), heartbeat=20)
+        await ws.prepare(request)
+        log(f"forward {rec['id']}: {principal} -> {rec['instance']}/{host}:{port}")
+        self.audit("access.forward.connected", rec.get("tenant", ""),
+                   subject=rec.get("instance", ""), who=principal,
+                   detail=f"{target.get('service') or host}:{port}")
+        try:
+            await relay_ws_tcp(ws, reader, writer)
+        finally:
+            writer.close()
+            log(f"forward {rec['id']}: {principal} closed")
+        return ws
+
 
 def text(status, msg):
     return web.Response(status=status, text=msg + "\n",
@@ -1445,6 +1581,7 @@ def make_app(node):
     app.router.add_route("*", r"/via/{tunnel:[a-z0-9-]+}/{offer:[a-z0-9-]+}{rest:(/.*)?}",
                          node.handle_via)
     app.router.add_get("/connect/client", node.handle_client)
+    app.router.add_get("/connect/forward", node.handle_forward)
     app.router.add_get("/exposure/verify", node.handle_expose_verify)
     app.router.add_route("*", r"/exposed{rest:(/.*)?}", node.handle_exposed)
     app.router.add_get("/healthz", lambda _r: web.Response(text="ok\n"))

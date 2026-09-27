@@ -119,6 +119,21 @@
 		reverse_proxy connect:8000
 	}
 
+	# A person's port forward (RFC-0044 SS4, oaap.net.remote-access 0.2):
+	# the client carries the holder's own API key, never a session --
+	# same reasoning as the tunnel above, and the same survival across a
+	# reload while a forward is open.
+	handle /connect/forward {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
+		reverse_proxy connect:8000 {
+			stream_close_delay 12h
+		}
+	}
+
 	# The digital twin (oaap.data.twin 0.1, RFC-0031 Schritt 3): the one
 	# route every app instance reaches through, never each other's site.
 	# Verified the same way every other protected route is -- the caller

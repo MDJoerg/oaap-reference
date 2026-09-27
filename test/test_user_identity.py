@@ -124,10 +124,13 @@ stripped = [l.strip().removeprefix("request_header -")
             if l.strip().startswith("request_header -X-OAAP-")]
 # Sechs seit 0.1.129: /connect/tunnel (oaap.net.connector) ist die
 # sechste oeffentliche Route. Sieben seit 0.1.131: /connect/client, der
-# Laptop-Client der Freigaben (oaap.net.connector 2.8.5). Die Zahl steht
+# Laptop-Client der Freigaben (oaap.net.connector 2.8.5). Acht seit
+# 0.1.135: /connect/forward, der Portweiterleitung eines Zugangs
+# (oaap.net.remote-access 0.2, RFC-0044 SS4) -- traegt den Schluessel
+# der Person, nie eine Sitzung, wie die anderen beiden. Die Zahl steht
 # hier, damit eine weitere Route diesen Test anfassen muss -- und dabei
 # jede Stelle mit allen fuenf Kopfzeilen.
-PUBLIC_ROUTES = 7
+PUBLIC_ROUTES = 8
 ok(f"der feste Caddyfile strippt an {PUBLIC_ROUTES} Stellen",
    len(stripped) == PUBLIC_ROUTES * len(appctl.IDENTITY_HEADERS),
    f"{len(stripped)} Zeilen: {sorted(set(stripped))}")
