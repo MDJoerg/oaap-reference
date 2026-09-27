@@ -465,10 +465,12 @@ BODY = next(ast.literal_eval(n.value) for n in tree.body
 ENV = Environment(autoescape=True)
 sys.modules.pop("instance_view", None)
 iv = importlib.import_module("instance_view")
-ok("es gibt einen eigenen Reiter Diagnose",
+ok("es gibt einen eigenen Reiter Diagnose, vor der Verwaltung",
    "diagnose" in iv.TAB_KEYS
-   and iv.TAB_KEYS.index("diagnose") == len(iv.TAB_KEYS) - 2,
-   "vor der Verwaltung, weil dort das Unwiderrufliche liegt")
+   and iv.TAB_KEYS.index("diagnose") < iv.TAB_KEYS.index("verwaltung"),
+   "weil dort das Unwiderrufliche liegt")
+ok("Verwaltung bleibt der letzte Reiter, auch nachdem Fernzugang dazukam (RFC-0044)",
+   iv.TAB_KEYS.index("verwaltung") == len(iv.TAB_KEYS) - 1)
 
 
 def render(diag, tab="diagnose"):

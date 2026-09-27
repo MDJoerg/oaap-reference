@@ -9438,6 +9438,143 @@ def restart_instance(name, inst, own_rid="", who="root", role="root"):
     return ("restarted" + (f", running since {started} UTC" if started else ""))
 
 
+# --- RFC-0044: an access (Zugang) into one instance network ------------
+#
+# Stage 1 (2026-09-27, oaap.net.remote-access 0.1): the object, its
+# lifecycle and the tenant audit trail -- built exactly like a
+# diagnosis window (RFC-0038 D2) and swept from the same timer,
+# because Jörg's own staging (RFC-0044 D2's consequence) puts "the
+# access object, portal card, audit entries and sweep" before "the
+# port forward and the WireGuard peer[, which] both hang on them".
+#
+# Opening an access here records who, for whom, which instance, which
+# shape and until when -- and it expires by itself. It does NOT yet
+# carry traffic: the gateway's dial-through for shape (b) and the
+# WireGuard peer/firewall fence for shape (a) are the next stage
+# (RFC-0044 §4, §5) and are measured on a real node before either is
+# offered anywhere.
+#
+# Deliberately NOT part of the registry: RFC-0044 §1 says an access
+# "is not carried by backup, restore or promotion -- an access is an
+# act, not configuration", so it lives in its own file, the way
+# connect.json and twin-readers.json hold acts rather than
+# configuration.
+ACCESS_FILE = os.path.join(APPS_DIR, "remote-access.json")
+ACCESS_HOURS = (1, 8, 24)
+ACCESS_DEFAULT_HOURS = 8
+ACCESS_SHAPES = ("forward", "wireguard")
+
+
+class AccessRefused(Exception):
+    """An access that must not open or close, with the sentence why."""
+
+
+def load_access():
+    try:
+        with open(ACCESS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("accesses") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_access(accesses):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = ACCESS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "accesses": accesses}, f, indent=2)
+    os.replace(tmp, ACCESS_FILE)
+    # ids, instance names, holder names -- no secret lives in this file
+    # (a WireGuard private key, once stage 2 builds it, is shown once
+    # and never written here -- RFC-0044 D10).
+    os.chmod(ACCESS_FILE, 0o644)
+
+
+def access_alive(rec):
+    return bool(rec) and not _past(rec.get("expires") or "")
+
+
+def access_open(instance, shape, holder, hours=ACCESS_DEFAULT_HOURS,
+                target=None, who="root", role="root"):
+    """Open an access (RFC-0044 §1/§3). Returns the record.
+
+    Raises AccessRefused for an unknown instance, an unoffered shape or
+    duration, or a 'forward' access without a target -- checked here,
+    not only in the form the portal shows: the spool is data, not
+    trust.
+    """
+    import datetime, secrets
+    if shape not in ACCESS_SHAPES:
+        raise AccessRefused(f"unknown shape '{shape}'")
+    if int(hours) not in ACCESS_HOURS:
+        raise AccessRefused(
+            f"an access lasts {', '.join(str(h) for h in ACCESS_HOURS)} "
+            f"hours, not {hours}")
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(instance)
+    if not inst:
+        raise AccessRefused("unknown instance")
+    target = target or {}
+    if shape == "forward" and not (target.get("service") and target.get("port")):
+        raise AccessRefused("a port forward needs a service and a port")
+    holder = (holder or who or "").strip()
+    if not holder:
+        raise AccessRefused("an access needs a named holder")
+    tenant = resolve_tenant(inst.get("tenant")) or ensure_default_tenant()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rec_id = secrets.token_hex(4)
+    rec = {"id": rec_id, "instance": instance, "tenant": tenant,
+           "shape": shape, "target": target, "holder": holder,
+           "opened_by": who, "opened": now.isoformat(timespec="seconds"),
+           "expires": (now + datetime.timedelta(hours=int(hours)))
+                      .isoformat(timespec="seconds"),
+           "hours": int(hours), "state": "open"}
+    accesses = load_access()
+    accesses[rec_id] = rec
+    save_access(accesses)
+    audit_tenant("access.opened", tenant, subject=instance, who=who, role=role,
+                 detail=f"{shape} for {holder}, {hours} h"
+                 + (f", {target.get('service')}:{target.get('port')}"
+                    if shape == "forward" else ""))
+    return rec
+
+
+def access_close(access_id, who="root", role="root", expired=False):
+    """Close one access -- the record only; stage 1 carries no traffic
+    to tear down."""
+    accesses = load_access()
+    rec = accesses.get(access_id)
+    if not rec:
+        raise AccessRefused(f"no access '{access_id}'")
+    accesses.pop(access_id, None)
+    save_access(accesses)
+    audit_tenant("access.expired" if expired else "access.closed",
+                 rec.get("tenant") or "", subject=rec.get("instance", ""),
+                 who=who, role=role, detail=rec.get("holder", ""))
+    return rec
+
+
+def access_list(instance=None, tenant=None):
+    """Open, unexpired accesses, newest first -- optionally filtered."""
+    out = [rec for rec in load_access().values() if access_alive(rec)
+           and (not instance or rec.get("instance") == instance)
+           and (not tenant or rec.get("tenant") == tenant)]
+    return sorted(out, key=lambda r: r.get("opened", ""), reverse=True)
+
+
+def access_sweep(who="root", role="root"):
+    """Close every access whose time is up (RFC-0044 §3). Runs every
+    minute from oaap-instance-watch.service, beside diagnose_sweep()."""
+    closed = []
+    for access_id, rec in load_access().items():
+        if not access_alive(rec):
+            try:
+                access_close(access_id, who=who, role=role, expired=True)
+                closed.append(access_id)
+            except AccessRefused:
+                pass
+    return closed
+
+
 def cmd_diagnose(args):
     """`oaap app diagnose open|close|sweep|status <instance>`."""
     if args.action == "sweep":
@@ -9507,6 +9644,59 @@ def cmd_restart(args):
     except subprocess.CalledProcessError as e:
         die((e.stderr or str(e)).strip().splitlines()[-1])
     print(f"'{args.name}' {msg}.")
+
+
+def cmd_access(args):
+    """`oaap app access open|close|list|sweep` (RFC-0044 stage 1).
+
+    Stage 1 only: the record, its expiry and the audit line. No
+    traffic follows an 'open' yet -- see the module note above
+    access_open().
+    """
+    if args.action == "sweep":
+        closed = access_sweep()
+        print(f"Closed {len(closed)} expired access(es)"
+              + (": " + ", ".join(closed) if closed else "") + ".")
+        return
+    if args.action == "list":
+        rows = access_list(instance=args.name or None)
+        if not rows:
+            print(f"No open access for '{args.name}'." if args.name
+                  else "No open accesses on this node.")
+            return
+        for r in rows:
+            tgt = (f" -> {r['target'].get('service')}:{r['target'].get('port')}"
+                   if r["shape"] == "forward" and r.get("target") else "")
+            print(f"{r['id']}  {r['instance']:<24} {r['shape']:<10} "
+                  f"{r['holder']:<16} until {r['expires']}{tgt}")
+        return
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.action == "open":
+        if not args.name:
+            die("'access open' needs an instance -- see 'oaap app list'")
+        target = ({"service": args.service, "port": args.port}
+                  if args.shape == "forward" else None)
+        try:
+            rec = access_open(args.name, args.shape, args.holder or who,
+                              hours=args.hours, target=target, who=who,
+                              role="root")
+        except AccessRefused as e:
+            die(str(e))
+        tgt = (f" to {args.service}:{args.port}" if args.shape == "forward"
+              else "")
+        print(f"Access {rec['id']} open until {rec['expires']} for "
+              f"'{rec['holder']}' -- {rec['shape']}{tgt}.")
+        print("No traffic yet (oaap.net.remote-access 0.1, stage 1) -- see "
+              "RFC-0044 §11.")
+        return
+    # close
+    if not args.name:
+        die("'access close' needs an access id -- see 'oaap app access list'")
+    try:
+        rec = access_close(args.name, who=who, role="root")
+    except AccessRefused as e:
+        die(str(e))
+    print(f"Access {rec['id']} closed.")
 
 
 def cmd_config(args):
@@ -15397,6 +15587,58 @@ def cmd_process_deploys(_args):
                         ok, msg = True, f"closed: '{key}'"
                 except DestinationRefused as e:
                     msg = str(e)
+        elif action == "access":
+            # RFC-0044 stage 1: open/close a time-boxed access record
+            # from the instance page. Same functions the CLI calls
+            # (access_open/close), so the two paths cannot drift. No
+            # traffic yet -- see the module note above access_open() in
+            # this file.
+            #
+            # server_admin AND the instance tenant's own tenant_admin
+            # (D1), the same pair the diagnosis window uses (RFC-0038
+            # D2): it is the tenant's own instance, and a cross-tenant
+            # request never reaches this branch (cross_tenant above
+            # already refused it).
+            #
+            # access_open/close write their own tenant-log lines, so
+            # this action is NOT in TENANT_AUDITED -- one line per
+            # event, not two. A REFUSED request is written here,
+            # because no function ran.
+            op = str(req.get("op") or "")
+            who = actor or "portal"
+            if not inst:
+                msg = "unknown instance"
+            elif actor and act_role not in ("server_admin", "tenant_admin"):
+                msg = ("opening or closing an access requires server_admin "
+                       "or tenant_admin")
+                audit_tenant("access." + ("opened" if op == "open" else "closed"),
+                             resolve_tenant(inst.get("tenant"))
+                             or ensure_default_tenant(),
+                             subject=name, result="denied", who=who,
+                             role=act_role or "-", detail=msg)
+            elif op == "open":
+                try:
+                    shape = str(req.get("shape") or "forward")
+                    target = ({"service": str(req.get("service") or ""),
+                              "port": int(req.get("port") or 0)}
+                              if shape == "forward" else None)
+                    rec = access_open(
+                        name, shape, str(req.get("holder") or "") or who,
+                        hours=int(req.get("hours") or ACCESS_DEFAULT_HOURS),
+                        target=target, who=who, role=act_role)
+                    ok = True
+                    msg = f"access {rec['id']} open until {rec['expires']}"
+                except (AccessRefused, ValueError) as e:
+                    msg = str(e)
+            elif op == "close":
+                try:
+                    rec = access_close(str(req.get("ref") or ""), who=who,
+                                       role=act_role)
+                    ok, msg = True, f"access {rec['id']} closed"
+                except AccessRefused as e:
+                    msg = str(e)
+            else:
+                msg = f"unknown access op '{op}'"
         elif action == "tile":
             # Launchpad tile override (runtime spec 2.10). Registry only
             # — no gateway work, because this changes nothing about who
@@ -15706,6 +15948,7 @@ def cmd_process_deploys(_args):
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
                "destination": "portal", "exposure": "portal",
+               "access": "portal",
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
@@ -17310,6 +17553,24 @@ def main():
                      choices=list(DIAGNOSE_MINUTES),
                      help=f"how long (default {DIAGNOSE_DEFAULT_MINUTES})")
     pdg.set_defaults(fn=cmd_diagnose)
+    pac = sub.add_parser("access",
+                         help="a time-boxed access into one instance "
+                              "network (RFC-0044 stage 1 -- no traffic yet)")
+    pac.add_argument("action", choices=["open", "close", "list", "sweep"])
+    pac.add_argument("name", nargs="?", default="",
+                     help="open/list: the instance; close: the access id")
+    pac.add_argument("--shape", default="forward", choices=list(ACCESS_SHAPES),
+                     help="open: forward (default) or wireguard")
+    pac.add_argument("--holder", default="",
+                     help="open: who the access is for (default: you)")
+    pac.add_argument("--hours", type=int, default=ACCESS_DEFAULT_HOURS,
+                     choices=list(ACCESS_HOURS),
+                     help=f"open: how long (default {ACCESS_DEFAULT_HOURS})")
+    pac.add_argument("--service", default="",
+                     help="open --shape forward: the service name")
+    pac.add_argument("--port", type=int, default=0,
+                     help="open --shape forward: the port")
+    pac.set_defaults(fn=cmd_access)
     pms = sub.add_parser("state-index",
                          help="internal: write container state facts where "
                               "the portal can read them (RFC-0038 D1)")

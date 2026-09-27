@@ -381,14 +381,16 @@ EOF
     || say "  WARNING: the rehearsal sweep timer could not be enabled."
 fi
 
-# --- the instance watch timer (RFC-0038 D1/D2) ---
-# Two one-shot jobs a minute: the container facts the instance page
-# shows, and the expiry of diagnosis windows. A node that was UPDATED
-# rather than freshly installed has neither, and without the second one
-# a window would expire on the page while the gateway kept collecting --
-# the one failure this feature must not have, because the time limit IS
-# the promise. Idempotent: the units are rewritten from the same text,
-# and enabling an enabled timer changes nothing.
+# --- the instance watch timer (RFC-0038 D1/D2, RFC-0044 stage 1) ---
+# Three one-shot jobs a minute: the container facts the instance page
+# shows, the expiry of diagnosis windows, and (since oaap.net.remote-
+# access 0.1) the expiry of remote-access records. A node that was
+# UPDATED rather than freshly installed may have none of them, and
+# without the sweep a window/record would expire on the page while the
+# gateway kept collecting (diagnose) or the record kept looking open
+# (access) -- the one failure these features must not have, because
+# the time limit IS the promise. Idempotent: the units are rewritten
+# from the same text, and enabling an enabled timer changes nothing.
 if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
   PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
   if [ ! -f /etc/systemd/system/oaap-instance-watch.timer ]; then
@@ -397,13 +399,14 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
   fi
   cat > /etc/systemd/system/oaap-instance-watch.service <<EOF
 [Unit]
-Description=OAAP instance watch (container state for the portal, expiry of diagnosis windows)
+Description=OAAP instance watch (container state for the portal, expiry of diagnosis windows and remote-access records)
 
 [Service]
 Type=oneshot
 Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
 ExecStart=$PYTHON3 $APP_DIR/appctl.py state-index
 ExecStart=$PYTHON3 $APP_DIR/appctl.py diagnose sweep
+ExecStart=$PYTHON3 $APP_DIR/appctl.py access sweep
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]

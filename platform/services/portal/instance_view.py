@@ -167,6 +167,11 @@ TABS = (
     # die Gateway-Sicht hinter eine ausdrückliche Handlung, weil sie
     # Inhalte zeigen, die die App geschrieben hat.
     ("diagnose", "Diagnose"),
+    # RFC-0044 Stufe 1: ein eigener Reiter, kein Unterpunkt von "Zugang"
+    # (das ist die API-Schlüssel-Seite, RFC-0027) -- ein anderes Objekt,
+    # eine andere Berechtigung, ein anderes Gewicht (öffnet einen Weg in
+    # das Instanznetz, sobald Stufe 2 Verkehr trägt).
+    ("fernzugang", "Fernzugang"),
     ("verwaltung", "Verwaltung"),
 )
 DEFAULT_TAB = TABS[0][0]

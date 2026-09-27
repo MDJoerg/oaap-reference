@@ -771,7 +771,8 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-  # Instance watch (RFC-0038 D1/D2): two small jobs, one minute apart.
+  # Instance watch (RFC-0038 D1/D2, RFC-0044 stage 1): three small jobs,
+  # one minute apart.
   #
   # The first writes the container facts the instance page shows --
   # running or not, since when, how often restarted. The portal cannot
@@ -785,15 +786,20 @@ EOF
   # housekeeping -- the time limit IS the promise the window makes, and
   # a window that expires on the page while the gateway keeps collecting
   # would break it silently.
+  #
+  # The third does the same for a remote-access record (RFC-0044 stage
+  # 1, oaap.net.remote-access 0.1): no traffic hangs off it yet, but the
+  # expiry promise is the same one, so it is swept the same way.
   cat > /etc/systemd/system/oaap-instance-watch.service <<EOF
 [Unit]
-Description=OAAP instance watch (container state for the portal, expiry of diagnosis windows)
+Description=OAAP instance watch (container state for the portal, expiry of diagnosis windows and remote-access records)
 
 [Service]
 Type=oneshot
 Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
 ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py state-index
 ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py diagnose sweep
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py access sweep
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]

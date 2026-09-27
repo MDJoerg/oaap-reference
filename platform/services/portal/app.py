@@ -3015,6 +3015,76 @@ INSTANCE_EDIT_BODY = """
 {% endif %}
 </section>
 
+<section class="panel {{ 'active' if tab == 'fernzugang' }}">
+<div class="card">
+  <h2>Fernzugang</h2>
+  <p>Ein Zugang öffnet ein Zeitfenster für <strong>einen Menschen, in
+     genau dieses Instanznetz</strong> (RFC-0044) — für eine
+     Portweiterleitung auf einen Dienst dieser App, oder als
+     WireGuard-Zugang ins ganze Netz.</p>
+  <p class="muted"><strong>Diese Stufe trägt noch keinen Verkehr.</strong>
+     Öffnen legt einen Datensatz mit Ablaufzeit an und schreibt ihn ins
+     Mandantenprotokoll — die eigentliche Verbindung (Portweiterleitung
+     durchs Gateway, WireGuard-Netzzugang mit Firewall-Regel) ist der
+     nächste Schritt.</p>
+</div>
+
+{% if i.access %}
+{% if i.access.rows %}
+<div class="card">
+  <h2>Offene Zugänge</h2>
+  <table class="mini">
+    <tr><th>Für</th><th>Form</th><th>Ziel</th><th>Bis</th><th></th></tr>
+    {% for a in i.access.rows %}
+    <tr>
+      <td>{{ a.holder }}</td>
+      <td>{{ "Portweiterleitung" if a.shape == "forward" else "WireGuard" }}</td>
+      <td>{% if a.shape == "forward" and a.target %}<code>{{ a.target.service }}:{{ a.target.port }}</code>{% else %}<span class="muted">ganzes Netz</span>{% endif %}</td>
+      <td>{{ a.expires[:16].replace("T", " ") }} UTC</td>
+      <td>
+        <form method="post" action="/instances/{{ i.key }}/access" style="display:inline">
+          <input type="hidden" name="tab" value="fernzugang">
+          <input type="hidden" name="op" value="close">
+          <input type="hidden" name="ref" value="{{ a.id }}">
+          <button class="secondary">Schließen</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<form method="post" action="/instances/{{ i.key }}/access">
+  <input type="hidden" name="tab" value="fernzugang">
+  <div class="card">
+    <h2>Zugang öffnen</h2>
+    <label>Form
+      <select name="shape">
+        <option value="forward">Portweiterleitung (ein Dienst, ein Port)</option>
+        <option value="wireguard">WireGuard (ganzes Netz) — noch nicht gebaut</option>
+      </select></label>
+    <label>Dienst
+      <input name="service" list="access-services" placeholder="{{ i.access.services[0] if i.access.services else 'db' }}"></label>
+    <datalist id="access-services">
+      {% for s in i.access.services %}<option value="{{ s }}">{% endfor %}
+    </datalist>
+    <label>Port
+      <input name="port" type="number" min="1" max="65535"></label>
+    <label>Für wen (Name, leer = du selbst)
+      <input name="holder" placeholder="Zugangs-Inhaber"></label>
+    <label>Wie lange
+      <select name="hours">
+        {% for h in i.access.hours %}
+        <option value="{{ h }}" {{ 'selected' if h == i.access.default_hours }}>{{ h }} Stunden</option>
+        {% endfor %}
+      </select></label>
+    <button>Zugang öffnen</button>
+  </div>
+</form>
+{% endif %}
+</section>
+
 <section class="panel {{ 'active' if tab == 'verwaltung' }}">
 <form method="post" action="/instances/{{ i.key }}/rename">
   <input type="hidden" name="tab" value="verwaltung">
@@ -6916,6 +6986,10 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # so kann keiner der vier Namen mit einem Feld der Instanz
          # kollidieren.
          "diag": _diagnose_page(name, inst),
+         # Fernzugang (RFC-0044 Stufe 1, oaap.net.remote-access 0.1):
+         # eigener Schlüssel wie "diag" -- ein anderes Objekt, kein
+         # Feld der Instanz.
+         "access": _access_page(name, inst),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
@@ -7911,6 +7985,104 @@ def instance_diagnose(name):
                                             "fehlgeschlagen."))
     return _inst_back(name, msg=f"Diagnose-Fenster für {minutes} Minuten "
                                 f"geöffnet. {dv.COLLECT_NOTE}")
+
+
+# RFC-0044 stage 1 (oaap.net.remote-access 0.1): the object from the
+# registry mount, same shape as _connect_data()/_load_destinations_all()
+# above -- no secret ever lives in this file (a WireGuard private key,
+# once stage 2 builds it, is shown once and never written to disk).
+ACCESS_FILE = "/apps-registry/remote-access.json"
+ACCESS_HOURS = (1, 8, 24)
+ACCESS_DEFAULT_HOURS = 8
+ACCESS_WAIT_SECONDS = 20  # a registry file only, no container and no gateway work
+
+
+def _access_alive(rec):
+    exp = str((rec or {}).get("expires") or "")
+    try:
+        when = datetime.fromisoformat(exp)
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when > datetime.now(timezone.utc)
+
+
+def _access_page(name, inst):
+    """Fernzugang-Reiter (RFC-0044 Stufe 1): offene Zugänge dieser
+    Instanz, neueste zuerst. Trägt noch keinen Verkehr -- siehe die
+    Spec, oaap.net.remote-access 0.1 §7."""
+    accesses = (_read_json(ACCESS_FILE) or {}).get("accesses") or {}
+    rows = sorted(
+        (r for r in accesses.values()
+         if r.get("instance") == name and _access_alive(r)),
+        key=lambda r: r.get("opened", ""), reverse=True)
+    return {"rows": rows, "hours": ACCESS_HOURS,
+            "default_hours": ACCESS_DEFAULT_HOURS,
+            "services": [s.get("service") or "" for s in instance_services(inst)
+                         if s.get("service")]}
+
+
+@app.post("/instances/<name>/access")
+def instance_access(name):
+    """Einen Zugang öffnen oder schließen (RFC-0044 Stufe 1).
+
+    `require_instance_admin` ist D1: der `server_admin` des Knotens
+    oder der `tenant_admin` DIESER Instanz. Der Host prüft alles erneut
+    (Rolle, Dauer, Form) -- der Spool ist Daten, kein Vertrauen.
+    Trägt noch keinen Verkehr: das Öffnen legt nur den Datensatz an.
+    """
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    op = (request.form.get("op") or "").strip()
+    if op == "close":
+        ref = (request.form.get("ref") or "").strip()
+        if not ref:
+            return _inst_back(name, err="Kein Zugang angegeben.")
+        res = _queue_and_wait(name, {"action": "access", "op": "close",
+                                     "ref": ref}, ACCESS_WAIT_SECONDS)
+        if res is None:
+            return _inst_back(name, err="Das Schließen läuft noch — bitte "
+                                        "gleich erneut prüfen.")
+        if not res.get("ok"):
+            return _inst_back(name, err=res.get("message",
+                                                "Schließen fehlgeschlagen."))
+        return _inst_back(name, msg="Zugang geschlossen.")
+    if op != "open":
+        return _inst_back(name, err="Unbekannte Aktion.")
+    shape = (request.form.get("shape") or "forward").strip()
+    holder = (request.form.get("holder") or "").strip()
+    try:
+        hours = int(request.form.get("hours") or ACCESS_DEFAULT_HOURS)
+    except ValueError:
+        hours = ACCESS_DEFAULT_HOURS
+    if hours not in ACCESS_HOURS:
+        return _inst_back(name, err="Diese Dauer gibt es nicht — 1, 8 oder "
+                                    "24 Stunden.")
+    service = (request.form.get("service") or "").strip()
+    try:
+        port = int(request.form.get("port") or 0)
+    except ValueError:
+        port = 0
+    if shape == "forward" and not (service and port):
+        return _inst_back(name, err="Eine Portweiterleitung braucht einen "
+                                    "Dienst und einen Port.")
+    res = _queue_and_wait(
+        name, {"action": "access", "op": "open", "shape": shape,
+               "holder": holder, "hours": hours, "service": service,
+               "port": port}, ACCESS_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Das Öffnen läuft noch — bitte gleich "
+                                    "erneut prüfen.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message", "Öffnen "
+                                            "fehlgeschlagen."))
+    return _inst_back(name, msg=res.get("message", "Zugang geöffnet.")
+                      + " Noch ohne Verkehr (Stufe 1) — siehe RFC-0044 §11.")
 
 
 @app.post("/instances/<name>/restart")
