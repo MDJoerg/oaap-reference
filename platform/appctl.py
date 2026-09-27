@@ -1667,6 +1667,24 @@ def tunnel_exposure_extend(label, key, ttl, who="root", role="root"):
                  detail=f"for {ttl // 60} min from now")
 
 
+def exposure_close_outer(name, who="root", role="server_admin"):
+    """Outer side: the operator ends a live exposure and keeps its name
+    from being resumed (spec 2.8.6). One function for the CLI and the
+    portal's worker, so the two cannot come to different rules."""
+    name = (name or "").strip().lower()
+    live = connect_state().get("exposures") or {}
+    if name not in live:
+        raise DestinationRefused(f"no live exposure '{name}' on this node "
+                                 "(oaap connect exposures)")
+    c = load_connect()
+    c.setdefault("exposure_closed", {})[name] = _iso_now()
+    save_connect(c)
+    e = live[name]
+    audit_tenant("exposure.close.requested", e.get("tenant", ""),
+                 subject=e.get("host", name), who=who, role=role,
+                 detail="closed by the operator of this node")
+
+
 def _print_exposure_state(label, ref, x, w=None):
     if x.get("url"):
         print(f"  {ref:<10} {x['url']}   until {x.get('expires', '?')}  "
@@ -1692,16 +1710,10 @@ def cmd_connect_exposures(args):
         if op != "close":
             die("'connect exposure' needs close or log")
         name = (args.second or die("'connect exposure close' needs the name")).lower()
-        live = st.get("exposures") or {}
-        if name not in live:
-            die(f"no live exposure '{name}' on this node (oaap connect exposures)")
-        c = load_connect()
-        c.setdefault("exposure_closed", {})[name] = _iso_now()
-        save_connect(c)
-        e = live[name]
-        audit_tenant("exposure.close.requested", e.get("tenant", ""), subject=e.get("host", name),
-                     who=_dest_who(), role="server_admin",
-                     detail="closed by the operator of this node")
+        try:
+            exposure_close_outer(name, who=_dest_who(), role="server_admin")
+        except DestinationRefused as e:
+            die(str(e))
         print(f"Exposure '{name}' is closed within seconds, and the name cannot be "
               "resumed.")
         return
@@ -15312,6 +15324,79 @@ def cmd_process_deploys(_args):
                         msg = f"unknown destination op '{op}'"
                 except DestinationRefused as e:
                     msg = str(e)
+        elif action == "exposure":
+            # Freigaben aus dem Portal (oaap.net.connector 2.8.10): open,
+            # extend, let go (inner node) and close (outer node). The
+            # functions are the ones the CLI calls, so the rules are the
+            # same ones -- and they run here because the spool is data,
+            # not trust.
+            #
+            # server_admin's alone, and for the reason `destination add`
+            # is: the target is ANY address this node can reach, so
+            # choosing it is a decision about the node's network, not
+            # about a tenant. A tenant_admin who wants to share a laptop
+            # has the client (2.8.5), where the target never leaves the
+            # laptop. Unlike the branches above the role is required, not
+            # only checked when a name is given: a request with nobody
+            # behind it opens nothing.
+            #
+            # The functions write their own tenant-log lines (with the
+            # person and the role), so this action is NOT in
+            # TENANT_AUDITED -- one line per event, not two. A REFUSED
+            # request is written here, because no function ran.
+            op = str(req.get("op") or "")
+            label = str(req.get("connector") or "")
+            key = str(req.get("ref") or req.get("name") or "")
+            who = actor or "portal"
+            logged = {"open": "connector.expose", "extend": "connector.extend",
+                      "unexpose": "connector.unexpose",
+                      "close": "exposure.close.requested"}
+            if op not in logged:
+                msg = f"unknown exposure op '{op}'"
+            elif act_role != "server_admin":
+                msg = ("opening, extending and ending an exposure requires "
+                       "server_admin -- a tenant_admin shares a laptop with "
+                       "the client (oaap-expose.py)")
+                audit_tenant(logged[op], "", subject=label or key, result="denied",
+                             who=who, role=act_role or "-", detail=msg)
+            else:
+                try:
+                    if op == "open":
+                        if label not in load_connect()["connectors"]:
+                            raise DestinationRefused(f"no connector '{label}' on this node")
+                        ref = tunnel_exposure_add(
+                            label, str(req.get("target") or ""),
+                            parse_ttl(str(req.get("ttl") or "")),
+                            req.get("public") is True, who=who, role=act_role)
+                        x = _expose_wait(label, ref)
+                        if x.get("url"):
+                            ok, msg = True, f"exposed: {x['url']}"
+                            detail = {"url": x["url"], "expires": x.get("expires", ""),
+                                      "public": bool(x.get("public"))}
+                        elif x.get("error"):
+                            # the outer node said no: nothing is left
+                            # waiting to be answered later, which a list
+                            # of open exposures would otherwise show
+                            tunnel_exposure_remove(label, ref, who=who, role=act_role)
+                            msg = f"refused by the outer node: {x['error']}"
+                        else:
+                            ok = True
+                            msg = (f"asked ({ref}), no answer within 20 s -- it is "
+                                   "answered when the connector is connected")
+                            detail = {"pending": ref}
+                    elif op == "extend":
+                        tunnel_exposure_extend(label, key,
+                                               parse_ttl(str(req.get("ttl") or "")),
+                                               who=who, role=act_role)
+                        ok, msg = True, f"extended: '{key}'"
+                    elif op == "unexpose":
+                        tunnel_exposure_remove(label, key, who=who, role=act_role)
+                        ok, msg = True, f"let go: '{key}'"
+                    else:
+                        exposure_close_outer(key, who=who, role=act_role)
+                        ok, msg = True, f"closed: '{key}'"
+                except DestinationRefused as e:
+                    msg = str(e)
         elif action == "tile":
             # Launchpad tile override (runtime spec 2.10). Registry only
             # — no gateway work, because this changes nothing about who
@@ -15620,7 +15705,7 @@ def cmd_process_deploys(_args):
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
-               "destination": "portal",
+               "destination": "portal", "exposure": "portal",
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",

@@ -899,7 +899,7 @@ HEALTH_BODY = """
 </div>
 {% endif %}
 {% if cx and (cx.tunnels or cx.connectors or cx.exposures) %}
-<div class="card">
+<div class="card" id="freigaben">
   <h2>Tunnel (Connector)</h2>
   <p class="muted">Ein <strong>innerer</strong> Knoten baut von sich aus einen
      Tunnel zu einem <strong>äußeren</strong> auf und bietet dort benannte
@@ -931,11 +931,78 @@ HEALTH_BODY = """
   </table>
   <p class="muted">Pausieren schließt den Tunnel sofort, und der äußere Knoten
      kann ihn nicht wieder öffnen: <code>oaap connector pause &lt;label&gt;</code></p>
+  <h3>Freigaben, die dieser Knoten angefragt hat</h3>
+  {% set asked = [] %}
+  {% for c in cx.connectors %}{% for x in c.exposures %}{% if asked.append((c, x)) %}{% endif %}{% endfor %}{% endfor %}
+  {% if asked %}
+  <table class="mini">
+    <tr><th>Ziel</th><th>Adresse</th><th>Zugriff</th><th>Bis (UTC)</th>{% if cx.can_edit %}<th></th>{% endif %}</tr>
+    {% for c, x in asked %}
+    <tr>
+      <td><code>{{ x.target }}</code><br><span class="muted">über {{ c.label }}, {{ x.ref }}{% if x.by %}, von {{ x.by }}{% endif %}</span></td>
+      <td>{% if x.url %}<code>{{ x.url }}</code>
+          {% elif x.error %}<span class="dot err"></span>abgelehnt: {{ x.error }}
+          {% elif x.ended %}<span class="dot warn"></span>beendet ({{ x.ended }})
+          {% else %}<span class="dot warn"></span><span class="muted">noch keine Antwort des äußeren Knotens</span>{% endif %}</td>
+      <td>{% if x.public %}<span class="dot warn"></span><strong>öffentlich</strong> (ohne Anmeldung)
+          {% else %}<span class="dot ok"></span>hinter der Anmeldung{% endif %}</td>
+      <td>{{ x.expires }}</td>
+      {% if cx.can_edit %}
+      <td>
+        <form method="post" action="/exposures" style="display:inline">
+          <input type="hidden" name="connector" value="{{ c.label }}">
+          <input type="hidden" name="ref" value="{{ x.ref }}">
+          <select name="ttl" aria-label="Neue Frist ab jetzt">
+            <option value="2h">2 Stunden</option><option value="8h" selected>8 Stunden</option>
+            <option value="1d">1 Tag</option><option value="7d">7 Tage</option></select>
+          <button name="op" value="extend" class="secondary">Verlängern</button>
+          <button name="op" value="unexpose" class="secondary">Beenden</button>
+        </form>
+      </td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Keine. Eine Freigabe gibt <strong>ein</strong> Ziel für begrenzte
+     Zeit unter einem zufälligen Namen ins Internet — der äußere Knoten wählt den
+     Namen und erfährt die Adresse des Ziels nie.</p>
+  {% endif %}
+  {% if cx.can_edit %}
+  {% set live = cx.connectors|rejectattr("paused")|list %}
+  {% if live %}
+  <form method="post" action="/exposures" style="margin-top:1rem">
+    <input type="hidden" name="op" value="open">
+    <label>Ziel (Adresse, die <em>dieser</em> Knoten erreicht)
+      <input type="text" name="target" placeholder="http://192.168.178.20:3000" required
+             style="max-width:22rem"></label>
+    <label>Über den Connector
+      <select name="connector">{% for c in live %}<option value="{{ c.label }}">{{ c.label }}</option>{% endfor %}</select></label>
+    <label>Frist
+      <select name="ttl">
+        <option value="30m">30 Minuten</option><option value="2h">2 Stunden</option>
+        <option value="8h" selected>8 Stunden</option><option value="1d">1 Tag</option>
+        <option value="7d">7 Tage</option></select></label>
+    <label><input type="checkbox" name="public" value="1">
+      <strong>Öffentlich</strong> — ohne Anmeldung, jeder mit dem Link</label>
+    <p class="muted">Ohne Haken kommt nur hinein, wer sich beim äußeren Knoten als
+       Mitglied des Mandanten dieses Connectors anmeldet. Eine öffentliche Freigabe
+       ist gebremst (120 Aufrufe je Minute und Adresse) und läuft in jedem Fall ab.
+       Nicht freigegeben werden können die Dienste dieser Plattform und
+       <code>localhost</code>. Die Zeile im Protokoll des Mandanten nennt dich, die
+       Adresse des Ziels steht nicht darin.</p>
+    <button>Freigabe öffnen</button>
+  </form>
+  {% else %}
+  <p class="muted">Ohne einen Connector, der nicht pausiert ist, gibt es nichts, worüber
+     eine Freigabe geöffnet werden könnte.</p>
+  {% endif %}
+  {% endif %}
   {% endif %}
   {% if cx.exposures %}
   <h3>Freigaben (öffentliche Zufallsnamen)</h3>
   <table class="mini">
-    <tr><th>Adresse</th><th>Mandant</th><th>Zugriff</th><th>Geöffnet von</th><th>Bis (UTC)</th></tr>
+    <tr><th>Adresse</th><th>Mandant</th><th>Zugriff</th><th>Geöffnet von</th><th>Bis (UTC)</th>{% if cx.can_edit %}<th></th>{% endif %}</tr>
     {% for e in cx.exposures %}
     <tr>
       <td><code>{{ cx.scheme }}://{{ e.host }}/</code>
@@ -946,12 +1013,22 @@ HEALTH_BODY = """
           <br><span class="muted">{{ e.calls }} Aufrufe</span></td>
       <td>{{ e.by }}</td>
       <td>{{ e.expires }}</td>
+      {% if cx.can_edit %}
+      <td>
+        <form method="post" action="/exposures" style="display:inline">
+          <input type="hidden" name="op" value="close">
+          <input type="hidden" name="name" value="{{ e.name }}">
+          <button class="secondary">Schließen</button>
+        </form>
+      </td>
+      {% endif %}
     </tr>
     {% endfor %}
   </table>
   <p class="muted">{{ cx.certs_week }} Namen in den letzten 7 Tagen geöffnet; Let's
      Encrypt stellt höchstens {{ cx.certs_limit }} Zertifikate je Domain und
-     Woche aus. Beenden: <code>oaap connect exposure close &lt;name&gt;</code>.</p>
+     Woche aus. „Schließen" beendet die Freigabe und hält den Namen davon ab,
+     wiederaufgenommen zu werden (auch: <code>oaap connect exposure close &lt;name&gt;</code>).</p>
   {% endif %}
   {% if cx.tunnels %}
   <h3>Hier wählen innere Knoten ein</h3>
@@ -3372,7 +3449,23 @@ def connect_view():
     connectors = []
     for label, c in sorted(conns.items()):
         s_ = st_c.get(label) or {}
+        # what THIS node asked the outer node for (oaap.net.connector
+        # 2.8.9): the request from connect.json, the answer from the
+        # service's state. One that has run out is not shown.
+        asked = []
+        for ref, w in sorted((c.get("exposures") or {}).items()):
+            end = float(w.get("expires_at") or 0)
+            if end < _time.time():
+                continue
+            x = (s_.get("exposures") or {}).get(ref) or {}
+            asked.append({
+                "ref": ref, "target": w.get("target", ""), "public": bool(w.get("public")),
+                "url": x.get("url", ""), "error": x.get("error", ""),
+                "ended": x.get("expired", ""), "by": w.get("created_by", ""),
+                "expires": (x.get("expires") or "")[:16].replace("T", " ")
+                           or datetime.fromtimestamp(end, timezone.utc).strftime("%Y-%m-%d %H:%M")})
         connectors.append({
+            "exposures": asked,
             "label": label, "endpoint": c.get("endpoint", ""), "plain": bool(c.get("plain")),
             "paused": bool(c.get("paused")), "key": bool(s_.get("key", True)),
             "connected": bool(s_.get("connected")), "since": s_.get("since", ""),
@@ -3385,7 +3478,10 @@ def connect_view():
                   "expires": (e.get("expires") or "")[:16].replace("T", " "),
                   "calls": e.get("calls", 0), "connected": bool(e.get("connected"))}
                  for n, e in sorted(live.items(), key=lambda kv: kv[1].get("opened", ""))]
+    # `support` sees the page and changes nothing; the worker asks for
+    # server_admin again, so this only decides whether the forms are shown
     return {"tunnels": tunnels, "connectors": connectors, "reported": st is not None,
+            "can_edit": "server_admin" in caller_roles(),
             "exposures": exposures, "scheme": (st or {}).get("scheme") or "https",
             "certs_week": int((st or {}).get("certs_week") or 0),
             "certs_limit": int((st or {}).get("certs_limit") or 50)}
@@ -4974,6 +5070,60 @@ def backup_schedule_post():
             "Die Änderung läuft noch — bitte gleich neu laden."), code=303)
     key = "msg" if res.get("ok") else "err"
     return redirect(f"/health?{key}=" + quote(res.get("message", "")), code=303)
+
+
+EXPOSURE_WAIT_SECONDS = 40  # the worker itself waits up to 20 s for the outer node
+
+
+@app.post("/exposures")
+def exposures_post():
+    """Open, extend or end an exposure, or close one that lives here
+    (oaap.net.connector 2.8.10).
+
+    `server_admin` only, the same reason `destination add` is: the target
+    is any address this node can reach. Queued through the spool worker,
+    which asks for the role again and writes the tenant-log line -- the
+    button is not the boundary. Nothing here reads or checks the target;
+    the worker does, with the rule the CLI uses.
+    """
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: eine Freigabe zu öffnen oder zu beenden "
+                "erfordert die Rolle server_admin — ein tenant_admin gibt "
+                "seinen Laptop mit dem Client frei."), 403
+    op = request.form.get("op", "")
+    if op not in ("open", "extend", "unexpose", "close"):
+        return redirect("/health?err=" + quote("Unbekannte Aktion.") + "#freigaben", code=303)
+    payload = {"action": "exposure", "op": op,
+               "connector": (request.form.get("connector") or "").strip(),
+               "ref": (request.form.get("ref") or "").strip(),
+               "name": (request.form.get("name") or "").strip(),
+               "target": (request.form.get("target") or "").strip(),
+               "ttl": (request.form.get("ttl") or "").strip(),
+               "public": request.form.get("public") == "1"}
+    if op == "open" and not (payload["connector"] and payload["target"]):
+        return redirect("/health?err=" + quote(
+            "Bitte einen Connector und die Adresse des Ziels angeben.") + "#freigaben", code=303)
+    res = _queue_and_wait("", payload, EXPOSURE_WAIT_SECONDS)
+    if res is None:
+        return redirect("/health?err=" + quote(
+            "Die Anfrage läuft noch — bitte gleich neu laden.") + "#freigaben", code=303)
+    if not res.get("ok"):
+        return redirect("/health?err=" + quote(res.get("message", "Fehlgeschlagen."))
+                        + "#freigaben", code=303)
+    d = res.get("detail") or {}
+    if d.get("url"):
+        text = (f"Freigabe geöffnet: {d['url']} — bis {d.get('expires', '?')} UTC, "
+                + ("öffentlich, ohne Anmeldung." if d.get("public")
+                   else "hinter der Anmeldung."))
+    elif d.get("pending"):
+        text = ("Angefragt, aber der äußere Knoten hat noch nicht geantwortet — "
+                "die Adresse steht hier, sobald der Connector verbunden ist.")
+    else:
+        text = {"extend": "Frist verlängert.", "unexpose": "Freigabe beendet — der "
+                "äußere Knoten schließt sie in wenigen Sekunden.",
+                "close": "Freigabe geschlossen; der Name kommt nicht wieder."}.get(
+                    op, "Erledigt.")
+    return redirect("/health?msg=" + quote(text) + "#freigaben", code=303)
 
 
 # --------------------------------------------- fleet status (RFC-0021)
