@@ -9782,11 +9782,25 @@ def wg_instance_up(instance, net, gateway_ip):
         raise WireguardRefused("this instance's network has no known "
                                 "address range")
     instance_subnet = subnets[0]
-    bridge_ip = wg_free_bridge_ip(net, instance_subnet, gateway_ip)
-    wan_index = wg_next_wan_index()
-    wan_net = list(WG_WAN_BASE.subnets(new_prefix=24))[wan_index]
-    wan_root_ip, wan_ns_ip = list(wan_net.hosts())[0], list(wan_net.hosts())[1]
-    external_port = wg_next_external_port()
+    if st:
+        # Rebuilding after a reboot (state survived, the namespace did
+        # not, spec Sec5.2/Sec5.1c): reuse the SAME addressing rather than
+        # asking wg_next_wan_index()/wg_next_external_port() again --
+        # those scan every instance's state file including this one's
+        # own stale entry, so asking again would see this instance's
+        # old port/index as "already taken" and hand it a NEW one,
+        # silently invalidating every .conf already printed to a peer.
+        bridge_ip = ipaddress.ip_address(st["bridge_ip"])
+        wan_index = st["wan_index"]
+        wan_root_ip = ipaddress.ip_address(st["wan_root_ip"])
+        wan_ns_ip = ipaddress.ip_address(st["wan_ns_ip"])
+        external_port = st["external_port"]
+    else:
+        bridge_ip = wg_free_bridge_ip(net, instance_subnet, gateway_ip)
+        wan_index = wg_next_wan_index()
+        wan_net = list(WG_WAN_BASE.subnets(new_prefix=24))[wan_index]
+        wan_root_ip, wan_ns_ip = list(wan_net.hosts())[0], list(wan_net.hosts())[1]
+        external_port = wg_next_external_port()
     veth_br_root = _wg_veth_name(instance, "br")
     veth_br_ns = _wg_veth_name(instance, "brp")
     veth_wan_root = _wg_veth_name(instance, "wr")
@@ -9858,6 +9872,30 @@ def wg_instance_up(instance, net, gateway_ip):
              "wan_root_ip": str(wan_root_ip), "wan_ns_ip": str(wan_ns_ip),
              "veth_br_root": veth_br_root, "veth_wan_root": veth_wan_root}
     _wg_save_instance_state(instance, state)
+    # Restore every OTHER already-open, unexpired peer of this instance
+    # (spec Sec5.1c) -- a rebuild after a reboot brings wg0 up with none
+    # of them: their keys never left remote-access.json (D10 only
+    # withholds the PRIVATE key, never the record), but the interface
+    # that knew them and the DOCKER-USER rules that fenced them both
+    # live only in the kernel and neither survives a reboot. Without
+    # this, only the ONE peer whose own access_open() call triggered
+    # the rebuild comes back; every peer that was already connected
+    # before the reboot would stay orphaned -- reachable in
+    # remote-access.json, silently unreachable in fact. Best-effort per
+    # peer: one failing to re-fence must not stop the rest.
+    for rec in load_access().values():
+        if rec.get("shape") != "wireguard" or rec.get("instance") != instance:
+            continue
+        if not access_alive(rec):
+            continue
+        t = rec.get("target") or {}
+        if not (t.get("peer_pubkey") and t.get("tunnel_ip")):
+            continue
+        wg_add_peer(instance, t["peer_pubkey"], t["tunnel_ip"])
+        try:
+            firewall_fence_add(t["tunnel_ip"], instance_subnet, gateway_ip)
+        except subprocess.CalledProcessError:
+            pass
     return pub, state
 
 
@@ -10186,8 +10224,24 @@ def access_close(access_id, who="root", role="root", expired=False):
         if t.get("peer_pubkey"):
             wg_remove_peer(rec["instance"], t["peer_pubkey"])
         if t.get("tunnel_ip"):
+            # The gateway's OWN address can change between an access
+            # being opened and being closed -- a container recreate or
+            # a node reboot both reassign Docker's per-network addresses
+            # (measured live, 2026-09-27, spec Sec5.1c: gateway and app
+            # container swapped addresses across a reboot).
+            # firewall_fence_add()
+            # always fences against whichever address was CURRENT when
+            # the rule was actually installed -- wg_instance_up()'s own
+            # rebuild-time restore uses today's address, not this
+            # record's. Removal must match that same, CURRENT address,
+            # not the one this record happened to see at open time, or
+            # the gateway-DROP rule (only that one -- the other two
+            # don't name the gateway) survives forever as an orphan
+            # nothing will ever try to remove again.
+            gateway_ip = (container_ip(GATEWAY_CONTAINER, app_network(rec["instance"]))
+                          or t.get("gateway_ip", ""))
             firewall_fence_remove(t["tunnel_ip"], t.get("instance_subnet", ""),
-                                  t.get("gateway_ip", ""))
+                                  gateway_ip)
         if rec["instance"] not in _wg_instances_with_open_access(accesses):
             # The last peer of this instance just left -- take its
             # whole apparatus down with it, not only this one peer.

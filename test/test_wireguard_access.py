@@ -470,6 +470,124 @@ except m.WireguardRefused as e:
 m.shutil.which = old_which
 
 print("")
+print("=== nach einem Reboot: dieselbe Adressierung, dasselbe .conf -- spec "
+      "§5.2 (\"unchanged from the peer's point of view\") ===")
+net_b = m.app_network(K_APP2)
+pub_before, st_before = m.wg_instance_up(K_APP2, net_b, GW_IP_2)
+NS_B = m.wg_netns(K_APP2)
+ok("die Apparatur der zweiten Instanz steht wieder", NS_B in STATE["netns"])
+# Ein Reboot nimmt den Namensraum und seine Interfaces mit, laesst aber
+# die Zustandsdatei (auf Platte) und den Schluessel unberuehrt -- genau
+# das bildet dieser Schritt nach, ohne den Knoten selbst neu zu starten.
+STATE["netns"].discard(NS_B)
+STATE["wg0"].discard(NS_B)
+STATE["peers"].pop(NS_B, None)
+before_dnat_b = len(STATE["dnat"])
+pub_after, st_after = m.wg_instance_up(K_APP2, net_b, GW_IP_2)
+ok("der Namensraum entstand neu", NS_B in STATE["netns"])
+ok("... mit einem neuen DNAT-Eintrag (der alte ging mit dem Reboot)",
+   len(STATE["dnat"]) == before_dnat_b + 1)
+ok("... aber demselben externen Port wie vor dem Reboot (sonst waere jedes "
+   "schon ausgegebene .conf ungueltig) -- vorher schlug dies fehl: "
+   "wg_next_external_port() sah die Instanz EIGENE alte Zustandsdatei als "
+   "'schon vergeben' an und zog ihr einen NEUEN Port",
+   st_after["external_port"] == st_before["external_port"], (st_before, st_after))
+ok("... derselben Bridge-Adresse", st_after["bridge_ip"] == st_before["bridge_ip"],
+   (st_before, st_after))
+ok("... demselben WAN-Index", st_after["wan_index"] == st_before["wan_index"])
+ok("... und demselben Schluessel (er blieb die ganze Zeit auf Platte liegen)",
+   pub_after == pub_before)
+m.wg_instance_down(K_APP2)
+ok("... Aufraeumen danach hinterlaesst wieder nichts",
+   m.wg_instance_state(K_APP2) is None and NS_B not in STATE["netns"])
+
+print("")
+print("=== nach einem Reboot: ALLE noch offenen Peer kommen zurueck, nicht "
+      "nur der eine, dessen access_open() den Wiederaufbau ausloest ===")
+with contextlib.redirect_stdout(io.StringIO()):
+    m.cmd_node(types.SimpleNamespace(action="add-profile", profile="remote-access"))
+rec_x1 = m.access_open(K_APP2, "wireguard", "peer-eins",
+                       target={"endpoint": "node.example"},
+                       who="root", role="server_admin")
+rec_x2 = m.access_open(K_APP2, "wireguard", "peer-zwei",
+                       target={"endpoint": "node.example"},
+                       who="root", role="server_admin")
+NS_X = m.wg_netns(K_APP2)
+ok("zwei Peers stehen jetzt im wg0 dieser Instanz",
+   len(STATE["peers"].get(NS_X, {})) == 2, STATE["peers"].get(NS_X))
+before_iptables = len(STATE["iptables"])
+# Reboot: Namensraum und wg0 weg, remote-access.json (beide Zugaenge
+# noch "offen") und die Schluesseldatei bleiben -- genauso wie oben.
+STATE["netns"].discard(NS_X)
+STATE["wg0"].discard(NS_X)
+STATE["peers"].pop(NS_X, None)
+# Ein DRITTER Peer loest den Wiederaufbau aus (die einzige Art, wie
+# wg_instance_up() heute je wieder aufgerufen wird).
+rec_x3 = m.access_open(K_APP2, "wireguard", "peer-drei",
+                       target={"endpoint": "node.example"},
+                       who="root", role="server_admin")
+ok("nach dem Wiederaufbau stehen alle DREI Peers im frischen wg0 -- vorher "
+   "fehlte hier genau das: nur der DRITTE (der den Wiederaufbau selbst "
+   "ausloeste) kam zurueck, peer-eins/peer-zwei blieben in "
+   "remote-access.json 'offen' und im wg0 unsichtbar",
+   {rec_x1["target"]["peer_pubkey"], rec_x2["target"]["peer_pubkey"],
+    rec_x3["target"]["peer_pubkey"]} == set(STATE["peers"].get(NS_X, {})),
+   STATE["peers"].get(NS_X))
+ok("... und alle drei DOCKER-USER-Fesseln (3 je Peer) sind mit wieder da,"
+   " nicht nur die des dritten",
+   len(STATE["iptables"]) - before_iptables == 9, STATE["iptables"])
+for r in (rec_x1, rec_x2, rec_x3):
+    m.access_close(r["id"], who="root", role="server_admin")
+ok("... Aufraeumen danach hinterlaesst wieder nichts",
+   m.wg_instance_state(K_APP2) is None and NS_X not in STATE["netns"])
+with contextlib.redirect_stdout(io.StringIO()):
+    m.cmd_node(types.SimpleNamespace(action="add-profile", profile="remote-access"))
+
+print("")
+print("=== schliesst ein Peer, dessen Gateway-Adresse sich seit dem "
+      "Oeffnen geaendert hat, geht die Gateway-DROP-Regel trotzdem mit "
+      "-- gemessen auf oaap-test 27.09.: ein Reboot liess Docker Gateway "
+      "und App-Container die Adresse TAUSCHEN, der Wiederaufbau fesselt "
+      "mit der NEUEN Adresse, aber die alte access.json-Zeile kennt nur "
+      "die ALTE ===")
+old_container_ip = m.container_ip
+net_c = m.app_network(K_APP2)
+rec_c1 = m.access_open(K_APP2, "wireguard", "vor-dem-umzug",
+                       target={"endpoint": "node.example"},
+                       who="root", role="server_admin")
+NS_C = m.wg_netns(K_APP2)
+# Reboot: Namensraum weg, die Zustandsdatei UND remote-access.json bleiben.
+STATE["netns"].discard(NS_C)
+STATE["wg0"].discard(NS_C)
+STATE["peers"].pop(NS_C, None)
+GW_IP_2_NEU = "172.31.9.9"
+m.container_ip = lambda container, net: (GW_IP_2_NEU if net == net_c
+                                         else old_container_ip(container, net))
+# Ein zweiter Peer loest den Wiederaufbau aus -- die Fessel des ALTEN
+# Peers wird dabei mit der JETZT aktuellen (neuen) Adresse neu gesetzt.
+rec_c2 = m.access_open(K_APP2, "wireguard", "nach-dem-umzug",
+                       target={"endpoint": "node.example"},
+                       who="root", role="server_admin")
+gw_drop_new = ("-s", f"{rec_c1['target']['tunnel_ip']}/32", "-d",
+              f"{GW_IP_2_NEU}/32", "-j", "DROP")
+ok("die wiederhergestellte Fessel des ALTEN Peers nennt die NEUE "
+   "Gateway-Adresse, nicht die, die sein Zugang beim Oeffnen sah",
+   any(c == ("-I", gw_drop_new) for c in STATE["iptables"]), STATE["iptables"])
+m.access_close(rec_c1["id"], who="root", role="server_admin")
+ok("... UND schliessen dieses ALTEN Peers entfernt alle DREI Regeln, "
+   "nicht nur die zwei ohne Gatewaybezug -- vorher blieb hier die "
+   "Gateway-DROP-Regel als Waise stehen, weil geloescht wurde mit der "
+   "Adresse aus dem ZUGANG (beim Oeffnen gesehen), nicht der, mit der "
+   "die Regel tatsaechlich installiert war (beim Wiederaufbau)",
+   any(c == ("-D", gw_drop_new) for c in STATE["iptables"]), STATE["iptables"])
+m.access_close(rec_c2["id"], who="root", role="server_admin")
+m.container_ip = old_container_ip
+ok("... Aufraeumen danach hinterlaesst wieder nichts",
+   m.wg_instance_state(K_APP2) is None and NS_C not in STATE["netns"])
+with contextlib.redirect_stdout(io.StringIO()):
+    m.cmd_node(types.SimpleNamespace(action="remove-profile", profile="remote-access"))
+
+print("")
 print("=== die zwei Profiltabellen kennen 'remote-access' ===")
 PORTAL_APP = os.path.join(HERE, "..", "platform", "services", "portal", "app.py")
 src = io.open(PORTAL_APP, encoding="utf-8").read()
