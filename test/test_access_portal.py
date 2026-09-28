@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = tempfile.mkdtemp(prefix="oaap-access-portal-test-")
 os.environ["OAAP_DATA_DIR"] = DATA
+sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))
 sys.path.insert(0, os.path.join(HERE, "..", "platform"))
 
 import appctl as m                                            # noqa: E402
@@ -309,6 +310,23 @@ ok("die Route prueft server_admin/tenant_admin ZUERST (require_instance_admin)",
    or "require_instance_admin(name)" in route)
 ok("... und fragt den Worker, sie schreibt remote-access.json nicht selbst",
    '"action": "access"' in route and "save_access" not in route)
+
+print("")
+print("=== _access_page selbst (nicht nur die Vorlage mit erfundenen Diensten) ===")
+# Die Vorlagen-Pruefung unten rendert mit einer von Hand gebauten
+# services-Liste -- sie haette den echten Fehler nie gefunden
+# (instance_services() gab es in app.py nie, nur in appctl.py). Hier
+# der echte Aufruf, wie ihn /instances/<name> auch macht.
+import app as p                                                # noqa: E402
+
+r = p._access_page(K_ORDERS, m.load_registry()["instances"][K_ORDERS])
+ok("liefert die Dienstnamen einer Instanz mit services-Liste, ohne zu werfen",
+   sorted(r["services"]) == ["db", "web"], r)
+LEGACY_INST = {"container": "oaap-app-legacy", "image": "x", "svc_port": 8000}
+r_legacy = p._access_page("legacy", LEGACY_INST)
+ok("bei einer Instanz ohne services-Liste (vor 0.1.31) keine Ausnahme, "
+   "leere Dienstliste statt Absturz",
+   r_legacy["services"] == [], r_legacy)
 
 print("")
 print("=== der Reiter zeigt sich selbst als unfertig ===")

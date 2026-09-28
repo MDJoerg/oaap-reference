@@ -8019,6 +8019,21 @@ def _access_alive(rec):
     return when > datetime.now(timezone.utc)
 
 
+def instance_services(inst):
+    """Normalised list of an instance's services, newest-shape first.
+
+    Mirrors appctl.py's helper of the same name (RFC-0016): each
+    service is {service, container, image, build, port}, primary
+    first. Instances installed before 0.1.31 have no `services` list --
+    synthesise a single one from the flat container/image/svc_port
+    fields so every caller treats old and new the same."""
+    if inst.get("services"):
+        return inst["services"]
+    return [{"service": "", "container": inst.get("container"),
+             "image": inst.get("image"), "build": inst.get("build", ""),
+             "port": inst.get("svc_port")}]
+
+
 def _access_page(name, inst):
     """Fernzugang-Reiter (RFC-0044): offene Zugänge dieser Instanz,
     neueste zuerst. 'forward' trägt Verkehr, 'wireguard' noch nicht --
