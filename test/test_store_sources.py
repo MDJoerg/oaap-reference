@@ -293,7 +293,8 @@ print("\n=== the host-side worker: confirmation and log record (B3) ===")
 # things that touch the outside world are stubbed.
 installed = {}
 appctl.cmd_install = lambda ns: installed.update(
-    package=ns.package, path=ns.path, store_source=ns.store_source)
+    package=ns.package, path=ns.path, store_source=ns.store_source,
+    name=ns.name, tenant=ns.tenant)
 appctl._resolve_revision = lambda src: "deadbee"
 
 QUEUE = os.path.join(appctl.SPOOL_DIR, "queue")
@@ -398,6 +399,50 @@ res = queue({"id": "t1", "instance": "studio", "action": "install",
 ok("a tenant admin can install an app the store lists", res["ok"], str(res))
 ok("resolved by app id, never by the key the node files it under",
    installed.get("path") == "apps/studio", str(installed))
+
+print("\n=== a bare-name match in another tenant must not block this one "
+      "(2026-09-29) ===")
+# Found on oaapx01: `bec-admin` (tenant_admin of a brand-new tenant
+# `bec`) clicked "install" on `wegweiser` and got "an instance named
+# 'wegweiser' already exists" -- although `bec` had never held one.
+# `wegweiser` already existed, unprefixed, in the DEFAULT tenant (its
+# key equals its bare name, RFC-0025 8.1). The worker's very first
+# lookup, `reg["instances"].get(name)` on the RAW requested name, read
+# that name as if it already were a key and handed the unrelated
+# default-tenant instance back as "the" instance this request touches --
+# before the tenant-scoped resolution a few lines below ever got to run
+# -- so the request was refused as a cross-tenant collision, worded (by
+# design, for `install`) exactly like "taken".
+reg = appctl.load_registry()
+reg["instances"]["studio"] = {
+    "tenant": appctl.ensure_default_tenant(), "channel": "production",
+    "app_id": "studio", "version": "0.1.0", "source": {"kind": "git"},
+}
+appctl.save_registry(reg)
+
+with contextlib.redirect_stdout(io.StringIO()):
+    appctl.cmd_tenant(_ap.Namespace(
+        action="create", name="bec", target=None, title="Brandeis Consulting",
+        account="", account_name="", grace_days=30, yes=True, count=50))
+BEC = appctl.tenant_by_label("bec")[0]
+with open(os.path.join(ident, "users.json"), "w", encoding="utf-8") as f:
+    json.dump([{"username": "cls-admin", "roles": ["tenant_admin"],
+                "tenant": CLS, "groups": [], "active": True},
+               {"username": "bec-admin", "roles": ["tenant_admin"],
+                "tenant": BEC, "groups": [], "active": True}], f)
+
+installed.clear()
+res = queue({"id": "t2", "instance": "studio", "action": "install",
+             "by": "bec-admin"})
+ok("a different tenant may install an app id the default tenant already "
+   "holds", res["ok"], str(res))
+ok("resolved as a NEW install for ITS OWN tenant, not a redeploy of the "
+   "default tenant's instance",
+   installed.get("tenant") == BEC and installed.get("name") == "studio",
+   str(installed))
+ok("the default tenant's own instance is untouched",
+   appctl.load_registry()["instances"]["studio"]["tenant"]
+   == appctl.ensure_default_tenant())
 
 print("\n=== sources from the portal go through the same rules (§7) ===")
 # The portal's /apps-registry mount is read-only, so a change is queued

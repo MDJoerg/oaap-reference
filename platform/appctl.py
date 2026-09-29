@@ -15397,8 +15397,19 @@ def cmd_process_deploys(_args):
         # names the key, which is what the portal links and what every
         # other record on this node is filed under. Resolved once, here,
         # so no branch below has to remember which kind of name it got.
+        #
+        # Unconditional, NOT gated on `inst is None`: the naive lookup
+        # above (`reg["instances"].get(name)`) reads the bare name as if
+        # it were already a key, and for the default tenant the key IS
+        # the bare name (8.1). So a tenant_admin of ANY other tenant
+        # installing an app that already exists, unprefixed, in the
+        # default tenant had that unrelated instance handed back as
+        # `inst` -- read as "this request touches someone else's
+        # instance" and refused as a collision, even though the two
+        # never share a key (measured 2026-09-29: `bec-admin` installing
+        # `wegweiser` while the default tenant already has one).
         local_name = name
-        if action in ("create", "install") and inst is None:
+        if action in ("create", "install"):
             found_key, found = find_instance(reg, act_tenant, name)
             if found is not None:
                 name, inst = found_key, found
