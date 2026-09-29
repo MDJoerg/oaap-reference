@@ -3492,6 +3492,11 @@ def cmd_migrate_tenant_routes(_args):
     browser-direct API-key call is silently broken on an app that
     already shipped its own CORS handling.
 
+    And the route in the rate brake (RFC-0010 amendment, 2026-09-29): a
+    public site written before it asks /throttle without `&route=`, and
+    identity then counts every route of the instance in one bucket --
+    the old behaviour, which is exactly what the amendment removes.
+
     Idempotent and silent afterwards, like every step in migrate.sh:
     it looks at what is on disk and does nothing when the answer is
     already there.
@@ -3510,7 +3515,12 @@ def cmd_migrate_tenant_routes(_args):
         # and found stale again -- it has no session to scope and will
         # never grow the parameter. (Found on oaap-test, 2026-08-29:
         # forgejo was rewritten by every run.)
-        if "/verify?" not in body:
+        # A braked public route written before the per-route bucket
+        # (RFC-0010 amendment). Asked by the brake's own name, and
+        # answered by the rewrite: the new file carries `&route=` on
+        # every /throttle call, so it is never found stale again.
+        needs_route = "/throttle?" in body and "&route=" not in body
+        if "/verify?" not in body and not needs_route:
             continue
         # Three things are generated into an authenticated site now: the
         # tenant (0.2), the instance (RFC-0027 D5), and -- on a route
@@ -3524,20 +3534,22 @@ def cmd_migrate_tenant_routes(_args):
         # near-identical migrations -- one migration should stay one.
         gated = any(x for r in inst["routes"] for x in r["roles"] if x != "public")
         needs_preflight = gated and not is_rehearsal(inst) and "@preflight" not in body
-        if "&tenant=" in body and "&instance=" in body and not needs_preflight:
+        auth_current = ("/verify?" not in body
+                        or ("&tenant=" in body and "&instance=" in body))
+        if auth_current and not needs_preflight and not needs_route:
             continue
         stale.append((name, inst, path))
     if not stale:
         return
     print("")
     print("Bringing the gateway sites up to date (tenant boundary, "
-          "instance scope, preflight bypass) ...")
+          "instance scope, preflight bypass, rate brake per route) ...")
     for name, inst, path in stale:
         with open(path, "w", encoding="utf-8") as f:
             f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                                inst["svc_port"],
                                (inst.get("visibility") or {}).get("groups"),
-                               name, throttle_of(inst),
+                               name, throttle_plan(inst),
                                services=route_targets(inst),
                                tenant=instance_tenant_ref(inst),
                                login_only=is_rehearsal(inst)))
@@ -3553,6 +3565,8 @@ def cmd_migrate_tenant_routes(_args):
     print("  A route with roles also gets its own OPTIONS preflight "
           "bypass now -- a browser-direct API-key call no longer dies "
           "on the unauthenticated preflight that precedes it.")
+    print("  A public route's rate brake now counts per route (RFC-0010 "
+          "amendment) -- one route's volume no longer brakes another's.")
 
 
 def cmd_migrate_tenant_places(_args):
@@ -7096,7 +7110,33 @@ def throttle_of(inst):
     return DEFAULT_THROTTLE if t is None else t
 
 
-def _throttle_block(scope, throttle, edge):
+def throttle_routes_of(inst):
+    """Per-route overrides (RFC-0010 amendment): path -> value, {} = off."""
+    return dict(inst.get("throttle_routes") or {})
+
+
+def throttle_plan(inst):
+    """What the gateway needs to brake an instance: the instance's value
+    and the operator's per-route overrides, in ONE argument.
+
+    One argument on purpose. Five places generate a site for an
+    instance; had the overrides been a second parameter, the one place
+    that forgot it would quietly brake a route by the instance value
+    while `throttle show` claimed otherwise. Every generator passes
+    this, and test_throttle_routes.py holds them to it.
+    """
+    return {"default": throttle_of(inst), "routes": throttle_routes_of(inst)}
+
+
+def _route_throttle(plan, path):
+    """The limit a public route is braked with ({} = off)."""
+    if isinstance(plan, dict) and "default" in plan:
+        routes = plan.get("routes") or {}
+        return routes[path] if path in routes else plan["default"]
+    return plan    # a bare instance value: the same limit on every route
+
+
+def _throttle_block(scope, throttle, edge, route=""):
     """Gateway-side request brake for a public route (RFC-0010).
 
     Public routes get no forward_auth for identity, so this is the only
@@ -7105,15 +7145,22 @@ def _throttle_block(scope, throttle, edge):
     client, behind an edge the peer is the edge and the real client
     stands in X-Forwarded-For (which the edge overwrites, so it cannot
     be spoofed). Deriving it inside identity would get this wrong.
+
+    route: the declared path prefix this handler serves. Since the
+    RFC-0010 amendment (2026-09-29) the bucket is (instance, route,
+    client) -- a hall's displays on /display and sixty phones voting on
+    /vote share one address, and the votes must not starve the boards.
     """
     if not throttle:
         return []
+    import urllib.parse
     client = ("{http.request.header.X-Forwarded-For}" if edge
               else "{http.request.remote.host}")
     return [
         "\t\tforward_auth identity:8000 {",
         f"\t\t\turi /throttle?scope={scope}&limit={throttle['limit']}"
-        f"&window={throttle['window']}",
+        f"&window={throttle['window']}"
+        f"&route={urllib.parse.quote(route or '/', safe='/')}",
         f"\t\t\theader_up X-OAAP-Client {client}",
         *_AUTH_NO_UPGRADE,
         "\t\t}",
@@ -7427,7 +7474,8 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
         else:
             # Public route: nothing overwrites the headers, so strip
             # client-sent identity headers explicitly (contract guarantee 1).
-            lines += _throttle_block(scope, throttle, edge)
+            lines += _throttle_block(scope, _route_throttle(throttle, r["path"]),
+                                     edge, route=r["path"])
             lines += strip_identity()
         target_c, target_p = container, svc_port
         if services and r.get("service") in services:
@@ -7472,7 +7520,7 @@ def write_app_caddy(name, inst):
         f.write(caddy_site(inst["port"], inst["routes"], inst["container"],
                            inst["svc_port"],
                            (inst.get("visibility") or {}).get("groups"), name,
-                           throttle_of(inst), services=route_targets(inst),
+                           throttle_plan(inst), services=route_targets(inst),
                            tenant=instance_tenant_ref(inst),
                            login_only=is_rehearsal(inst)))
 
@@ -7708,7 +7756,7 @@ def write_external_caddy():
                 lines += _edge_guard(edge)
             lines += _LOG_BLOCK
             lines += site_body(routes, inst["container"], inst["svc_port"],
-                               groups, name, throttle_of(inst), edge,
+                               groups, name, throttle_plan(inst), edge,
                                services=route_targets(inst),
                                tenant=instance_tenant_ref(inst),
                                login_only=is_rehearsal(inst))
@@ -7888,7 +7936,7 @@ def write_instance_address_caddy():
             lines += _LOG_BLOCK
             lines += site_body(inst["routes"], inst["container"], inst["svc_port"],
                                (inst.get("visibility") or {}).get("groups"),
-                               name, throttle_of(inst), edge,
+                               name, throttle_plan(inst), edge,
                                services=route_targets(inst),
                                tenant=instance_tenant_ref(inst),
                                login_only=is_rehearsal(inst))
@@ -10481,14 +10529,41 @@ def cmd_config(args):
     print("brief downtime, storage and address are unchanged.")
 
 
+def _rate_text(t):
+    return f"{t['limit']}/{t['window']} s" if t else "off"
+
+
 def cmd_throttle(args):
-    """Rate brake for an instance's public routes (RFC-0010)."""
+    """Rate brake for an instance's public routes (RFC-0010).
+
+    Since the RFC-0010 amendment (2026-09-29) every public route has a
+    bucket of its own; the instance value applies to each, and
+    `--route` overrides it for one. The app cannot: there is no manifest
+    field, because a brake the app can lift is not the operator's.
+    """
     reg = load_registry()
     name = args.name
     inst = reg["instances"].get(name)
     if not inst:
         die(f"no instance named '{name}'")
-    has_public = any("public" in r["roles"] for r in inst.get("routes") or [])
+    public = sorted(_public_paths(inst.get("routes")))
+    has_public = bool(public)
+    route = getattr(args, "route", None)
+    if route is not None:
+        if args.action == "show":
+            die("'throttle show' lists every route; leave out --route")
+        route = route.strip()
+        if route != "/":
+            route = route.rstrip("/")
+        # An override whose route a redeploy removed can still be reset:
+        # `show` tells the operator to do exactly that, and a clean-up
+        # that the check refuses would leave the dead entry forever.
+        orphan_reset = (args.action == "reset"
+                        and route in throttle_routes_of(inst))
+        if route not in public and not orphan_reset:
+            known = ", ".join(public) or "none"
+            die(f"'{route}' is not a public route of '{name}' "
+                f"(public routes: {known}) -- only a public route is braked")
 
     if args.action == "show":
         t = throttle_of(inst)
@@ -10499,24 +10574,66 @@ def cmd_throttle(args):
         if not has_public:
             print("No public route — the throttle never applies here; every "
                   "route of this instance is authenticated.")
+        overrides = throttle_routes_of(inst)
+        if has_public:
+            print("Each public route counts on its own (RFC-0010 amendment):")
+            width = max(len(x) for x in public)
+            for path in sorted(public, key=lambda x: (x == "/", x)):
+                if path in overrides:
+                    print(f"  {path:<{width}}  {_rate_text(overrides[path])}"
+                          "  (set for this route)")
+                else:
+                    print(f"  {path:<{width}}  {_rate_text(t)}"
+                          "  (instance value)")
+        for path in sorted(set(overrides) - set(public)):
+            print(f"Override for '{path}' ({_rate_text(overrides[path])}) "
+                  "matches no public route -- it does nothing. Remove it with "
+                  f"'oaap app throttle reset {name} --route {path}'.")
         return
 
-    if args.action == "off":
+    if route is not None:
+        overrides = throttle_routes_of(inst)
+        if args.action == "reset":
+            if route not in overrides:
+                print(f"'{name}' {route}: no override -- it already uses the "
+                      "instance value.")
+                return
+            overrides.pop(route)
+            print(f"'{name}' {route}: back to the instance value "
+                  f"({_rate_text(throttle_of(inst))}).")
+        elif args.action == "off":
+            overrides[route] = {}
+            print(f"Throttle switched OFF for route {route} of '{name}'.")
+            print("WARNING: this public route now has no platform-side rate "
+                  "brake at all.")
+        else:
+            limit, window = _parse_rate(args.rate)
+            overrides[route] = {"limit": limit, "window": window}
+            print(f"'{name}' {route}: at most {limit} requests per {window} s "
+                  "and client address, counted for this route alone.")
+        if overrides:
+            inst["throttle_routes"] = overrides
+        else:
+            inst.pop("throttle_routes", None)
+    elif args.action == "reset":
+        inst.pop("throttle", None)
+        print(f"'{name}': back to the platform default "
+              f"({_rate_text(DEFAULT_THROTTLE)}) on every public route "
+              "without an override of its own.")
+    elif args.action == "off":
         inst["throttle"] = {}
         print(f"Throttle switched OFF for '{name}'.")
         if has_public:
             print("WARNING: this instance has a public route and now has no "
                   "platform-side rate brake at all.")
+        if throttle_routes_of(inst):
+            print("Routes with an override of their own keep it.")
     else:
-        m = re.fullmatch(r"(\d+)/(\d+)", args.rate or "")
-        if not m:
-            die("'app throttle set' needs <requests>/<seconds>, e.g. 300/60")
-        limit, window = int(m.group(1)), int(m.group(2))
-        if limit < 1 or window < 1:
-            die("requests and seconds must both be at least 1")
+        limit, window = _parse_rate(args.rate)
         inst["throttle"] = {"limit": limit, "window": window}
         print(f"'{name}': at most {limit} requests per {window} s and client "
-              "address on public routes.")
+              "address, on each public route separately.")
+    if args.action == "set":
         print(f"Counted per identity worker, so the real ceiling is about "
               f"{limit * IDENTITY_WORKERS} — this is a volume brake against "
               "floods, not a substitute for the app's own key lockout "
@@ -10525,6 +10642,16 @@ def cmd_throttle(args):
     write_app_caddy(name, inst)
     refresh_generated_sites()
     reload_gateway()
+
+
+def _parse_rate(rate):
+    m = re.fullmatch(r"(\d+)/(\d+)", rate or "")
+    if not m:
+        die("'app throttle set' needs <requests>/<seconds>, e.g. 300/60")
+    limit, window = int(m.group(1)), int(m.group(2))
+    if limit < 1 or window < 1:
+        die("requests and seconds must both be at least 1")
+    return limit, window
 
 
 def check_instance_address(reg, name, inst, hostname):
@@ -11407,7 +11534,7 @@ def _install_from_dir(pkg, args, source):
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(port, m["routes"], container, primary["port"],
                            visibility.get("groups"), name,
-                           throttle_of(inst or {}),
+                           throttle_plan(inst or {}),
                            services=(route_targets({"services": services})
                                      if multi else None),
                            tenant=tenant_for_new_instance(
@@ -11522,6 +11649,12 @@ def _install_from_dir(pkg, args, source):
     # silently reset an operator's rate decision to the default
     if inst and inst.get("throttle") is not None:
         reg["instances"][name]["throttle"] = inst["throttle"]
+    # ... and its per-route overrides (RFC-0010 amendment). Kept even when
+    # the new manifest drops the route: the override then does nothing,
+    # `throttle show` names it, and a later version that brings the
+    # route back does not silently forget the operator's decision.
+    if inst and inst.get("throttle_routes"):
+        reg["instances"][name]["throttle_routes"] = dict(inst["throttle_routes"])
     # and for the launchpad tile override (runtime spec 2.10). Note the
     # asymmetry with app_class right above: the CLASS is re-read from
     # every manifest because it describes the app, the OVERRIDE is kept
@@ -18560,10 +18693,13 @@ def main():
                          "with alias-add/alias-remove, the alias name")
     pa.set_defaults(fn=cmd_address)
     pth = sub.add_parser("throttle")
-    pth.add_argument("action", choices=["show", "set", "off"])
+    pth.add_argument("action", choices=["show", "set", "off", "reset"])
     pth.add_argument("name")
     pth.add_argument("rate", nargs="?",
                      help="<requests>/<seconds> per client address, e.g. 300/60")
+    pth.add_argument("--route", default=None,
+                     help="one public route (its declared path, e.g. /vote): "
+                          "override the instance value for this route only")
     pth.set_defaults(fn=cmd_throttle)
     pm = sub.add_parser("machine", help="machine principals (RFC-0027) -- "
                         "accounts that authenticate by key, never by password")

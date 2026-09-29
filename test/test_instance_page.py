@@ -448,5 +448,24 @@ ok("der Umweg ueber Post/Redirect/Get traegt das Feld mit",
    and "keep=()" in _portal_src,
    "sonst geht die Wahl beim Weiterleiten verloren")
 
+print("")
+print("Die Bremse zaehlt je Route (Nachtrag zu RFC-0010, 29.09.)")
+# Werte je Route setzt vorerst nur der Befehl. Die Seite muss sie aber
+# ZEIGEN -- sonst liest jemand oben „Standard (300/60)“ und glaubt, das
+# gelte fuer jede Route.
+zugang = render("zugang", has_public_route=True, throttle_routes=[
+    {"path": "/vote", "text": "600 Anfragen pro 60 Sekunden", "live": True},
+    {"path": "/alt", "text": "aus — keine Bremse", "live": False}])
+ok("die Karte sagt, dass jede oeffentliche Route getrennt zaehlt",
+   "für jede öffentliche Route" in zugang and "getrennt" in zugang)
+ok("ein eigener Wert je Route steht auf der Seite, mit dem Befehl dazu",
+   "<code>/vote</code> — 600 Anfragen pro 60 Sekunden" in zugang
+   and "--route" in zugang, zugang[zugang.find("Drosselung"):][:1500])
+ok("ein Wert fuer eine verschwundene Route wird als wirkungslos benannt",
+   "<code>/alt</code>" in zugang and "wirkt nicht" in zugang)
+ohne = render("zugang", has_public_route=True)
+ok("ohne Werte je Route erscheint die Liste nicht",
+   "Eigene Werte je Route" not in ohne and "Drosselung" in ohne)
+
 print(f"\n{'ALLE PRUEFUNGEN BESTANDEN' if not fails else str(fails) + ' FEHLER'}")
 sys.exit(1 if fails else 0)

@@ -2223,8 +2223,9 @@ INSTANCE_EDIT_BODY = """
     <h2>Drosselung öffentlicher Routen</h2>
     <p class="muted">Diese App hat mindestens eine Route, die <strong>ohne
        Anmeldung</strong> erreichbar ist. Dort begrenzt die Plattform die
-       Anfragen je Client-Adresse — ein gemeinsames Budget über alle Zugänge
-       dieser Instanz.</p>
+       Anfragen je Client-Adresse, und zwar <strong>für jede öffentliche Route
+       getrennt</strong>: Was auf der einen Route los ist, nimmt der anderen
+       nichts weg. Jede Route hat ein Budget über alle Zugänge dieser Instanz.</p>
     <label class="checkline"><input type="radio" name="mode" value="default"
            {{ 'checked' if i.throttle_mode == 'default' }}>Standard ({{ i.throttle_default }})</label>
     <label class="checkline"><input type="radio" name="mode" value="custom"
@@ -2233,6 +2234,17 @@ INSTANCE_EDIT_BODY = """
            placeholder="z. B. 600/60 für 600 Anfragen pro Minute"></label>
     <label class="checkline"><input type="radio" name="mode" value="off"
            {{ 'checked' if i.throttle_mode == 'off' }}>Aus — keine Bremse</label>
+    {% if i.throttle_routes %}
+    <p class="muted">Eigene Werte je Route (gesetzt vom Server-Admin mit
+       <code>oaap app throttle set {{ i.key }} &lt;Anfragen&gt;/&lt;Sekunden&gt; --route &lt;Pfad&gt;</code>;
+       sie bleiben, egal was oben gewählt ist):</p>
+    <ul>
+      {% for r in i.throttle_routes %}
+      <li><code>{{ r.path }}</code> — {{ r.text }}{% if not r.live %} <em>(keine
+          öffentliche Route mehr, wirkt nicht)</em>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% endif %}
     <p class="muted">Das ist eine Mengenbremse, keine Zugangskontrolle: Sie
        begrenzt pro Adresse und hält niemanden auf, der viele Adressen hat.
        Die App muss ihre eigenen Zugangsschlüssel weiterhin selbst schützen.
@@ -7241,8 +7253,18 @@ def _throttle_view(inst):
         mode, rate = "off", ""
     else:
         mode, rate = "custom", f"{t['limit']}/{t['window']}"
+    # Per-route overrides (RFC-0010 amendment) are set on the command
+    # line for now; the page SHOWS them, so nobody reads the instance
+    # value above and believes it is what every route gets.
+    public = {r.get("path") for r in inst.get("routes") or []
+              if "public" in (r.get("roles") or [])}
+    routes = [{"path": path,
+               "text": (f"{v['limit']} Anfragen pro {v['window']} Sekunden"
+                        if v else "aus — keine Bremse"),
+               "live": path in public}
+              for path, v in sorted((inst.get("throttle_routes") or {}).items())]
     return {"throttle_mode": mode, "throttle_rate": rate,
-            "throttle_default": default}
+            "throttle_default": default, "throttle_routes": routes}
 
 
 @app.post("/instances/<name>/address")

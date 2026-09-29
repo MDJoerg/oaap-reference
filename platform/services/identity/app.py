@@ -2010,8 +2010,9 @@ def whoami():
 #
 # Public routes carry no authentication at all — the platform hands the
 # request straight to the app. This is the one gateway-side brake it can
-# still apply: requests per client address per instance. It is a volume
-# brake, not an authentication substitute (see the RFC).
+# still apply: requests per client address per instance and route (the
+# route since the RFC's amendment of 2026-09-29). It is a volume brake,
+# not an authentication substitute (see the RFC).
 #
 # Counters live in process memory on purpose: this runs in the hot path
 # of every public request, and the login throttle's file-per-request
@@ -2109,7 +2110,15 @@ def throttle():
         window = max(1, int(request.args.get("window", "60")))
     except ValueError:
         limit, window = 300, 60
-    key = f"{scope}|{_throttle_client()}"
+    # One bucket per route (RFC-0010 amendment, 2026-09-29): a hall's
+    # displays and sixty voting phones share one address, and the votes
+    # must not starve the boards. A site written before the amendment
+    # sends no route and lands in the instance-wide bucket it always
+    # had, until the update rewrites it. The route comes from the
+    # gateway's own site file, never from the client; the cap only
+    # keeps a broken file from growing the table.
+    route = request.args.get("route", "")[:200]
+    key = f"{scope}|{route}|{_throttle_client()}"
     now = time.time()
     hits = [t for t in _RATE.get(key, ()) if now - t < window]
     if len(hits) >= limit:
