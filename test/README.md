@@ -50,6 +50,7 @@ python3 test/test_exposures.py        # Freigaben, Plattformseite: Zonen-Site un
 python3 test/test_exposures_tunnel.py # Freigaben, echte Prozesse: aussen, innen, der echte Laptop-Client, Anmeldung gespielt (braucht aiohttp)
 python3 test/test_twin_remote_reader.py # Zwilling: entfernter Leser, nur lesen, nur die gegebenen Typen
 python3 test/test_throttle_routes.py   # Bremse je Route: Werte je Route, alle Erzeuger, Redeploy, Migration, identity (braucht flask)
+python3 test/test_status_restarting.py # oaap status: eine Neustartschleife zaehlt nicht als laufend (braucht bash)
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten
 ```
