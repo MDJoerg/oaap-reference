@@ -623,5 +623,54 @@ check("as an instance that does not exist for them",
       res2.get("message") == "unknown instance", res2)
 check("and nothing was installed", not seen, seen)
 
+print("\n-- 'oaap app install x.zip --tenant' does not redeploy a "
+      "DIFFERENT tenant's own instance")
+# Same bug family as the store install fix, found the same day
+# (2026-09-29) while checking the other doors into the instance
+# namespace: 'oaap app install ./paket.zip --name demo --tenant kunde'
+# looked up the bare name 'demo' in the registry BEFORE asking which
+# tenant it belonged to. Since key == name for every DEFAULT tenant
+# instance (RFC-0025 8.1), an app already installed there made every
+# OTHER tenant's attempt to install the same app id silently redeploy
+# the default tenant's instance instead of creating its own.
+reg = m.load_registry()
+reg["instances"]["demo"] = {
+    "channel": "production", "app_id": "demo", "version": "0.1.0",
+    "tenant": m.ensure_default_tenant(),
+    "source": {"kind": "artifact", "version": "0.1.0", "path": ""},
+}
+m.save_registry(reg)
+
+dummy_zip = os.path.join(DATA, "dummy.zip")
+zip_with({"oaap-app.yaml": MANIFEST}, dummy_zip)
+
+
+def _capture_kw(name, zip_path, grant, **kw):
+    seen.update(key=name, permit=kw.get("permit") or {})
+    return "0.1.0", "ef" * 32
+
+
+seen.clear()
+m.install_artifact = _capture_kw
+raised = None
+try:
+    with _cl.redirect_stdout(_io.StringIO()):
+        m.cmd_install(_ap.Namespace(
+            package=dummy_zip, path="", ref="", name="demo", confirm=False,
+            channel=None, tenant="kunde", bind=[]))
+except SystemExit as e:
+    raised = e
+m.install_artifact = _real_install_artifact
+
+check("it is not refused as a same-version redeploy of someone else's "
+      "instance", raised is None, raised)
+check("a different tenant gets its OWN key, not the default tenant's",
+      seen.get("key") == "kunde-demo", seen)
+check("filed as a NEW instance of that tenant, not a redeploy",
+      seen.get("permit", {}).get("tenant") == KUNDE, seen)
+check("the default tenant's own 'demo' is untouched",
+      m.load_registry()["instances"]["demo"]["tenant"]
+      == m.ensure_default_tenant())
+
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

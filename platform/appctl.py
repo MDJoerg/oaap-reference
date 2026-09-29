@@ -11134,10 +11134,18 @@ def cmd_install(args):
         # in the default tenant keyed by whatever was typed.
         local, permit = name, None
         inst = reg["instances"].get(name)
+        requested_tenant = resolve_tenant_arg(getattr(args, "tenant", ""))
+        if inst is not None and requested_tenant and (
+                resolve_tenant(inst.get("tenant")) != requested_tenant):
+            # Same bug as the git/store path (fixed the same day): a bare
+            # name that already exists as a key must not be read as "this
+            # instance" when a DIFFERENT tenant was explicitly asked for
+            # -- outside the default tenant, key == name is exactly what
+            # every default-tenant instance looks like (RFC-0025 8.1).
+            inst = None
         if inst is None:
             owner = tenant_for_new_instance(
-                None, permit={"tenant": resolve_tenant_arg(
-                    getattr(args, "tenant", ""))})
+                None, permit={"tenant": requested_tenant})
             found_key, found = find_instance(reg, owner, local)
             if found is not None:
                 name, inst = found_key, found
@@ -11279,7 +11287,21 @@ def _install_from_dir(pkg, args, source):
         inst = reg["instances"].get(name)
         if inst is not None:
             local = instance_name(name, inst)
-    elif local in reg["instances"]:
+    elif local in reg["instances"] and (
+            not chosen_tenant
+            or resolve_tenant(reg["instances"][local].get("tenant"))
+            == chosen_tenant):
+        # A bare name that IS a key only counts as "the same instance"
+        # when nobody asked for a specific tenant, or the key's OWN
+        # tenant is that one. Outside the default tenant, key == name is
+        # exactly what happens for every instance the default tenant
+        # holds (RFC-0025 8.1) -- so an install explicitly aimed at a
+        # DIFFERENT tenant must not read that unrelated instance as "the"
+        # one this request means, or a second tenant could never install
+        # an app the default tenant already has (measured on oaap-test,
+        # 2026-09-29: chosen_tenant='t9k2', local='wegweiser' -- without
+        # this guard the install silently redeployed the DEFAULT
+        # tenant's own instance instead of creating 't9k2-wegweiser').
         name, inst = local, reg["instances"][local]
         local = instance_name(name, inst)
     else:
