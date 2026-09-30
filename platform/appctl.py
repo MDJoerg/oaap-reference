@@ -14028,7 +14028,20 @@ def cohort_sweep(now=None, dry=False):
         name = u["username"]
         rec, sid = seat_of.get(name, (None, None))
         subject = f"{rec['name']}/{sid}" if rec else name
-        if u["delete_at"] and u["delete_at"] <= now_iso:
+        deleting = bool(u["delete_at"] and u["delete_at"] <= now_iso)
+        # A deactivation that has come is carried out even when the
+        # deletion is due as well and has to wait for an empty seat.
+        if u["active"] and u["deactivate_at"] and u["deactivate_at"] <= now_iso:
+            if dry:
+                note("cohort.sweep", u["tenant"], subject,
+                     f"user {name} would be deactivated ({u['deactivate_at'][:10]})")
+            else:
+                code, res = identity_user_deactivate(name)
+                note("cohort.sweep", u["tenant"], subject,
+                     f"user {name} deactivated (date {u['deactivate_at'][:10]})"
+                     if code == 200 else
+                     f"user {name} NOT deactivated -- {res.get('error') or code}")
+        if deleting:
             alive = []
             if rec:
                 reg = load_registry()
@@ -14070,16 +14083,6 @@ def cohort_sweep(now=None, dry=False):
                          f"user {name} NOT deleted -- {why}")
                 else:
                     out.append((subject, f"user {name} NOT deleted -- {why}"))
-        elif u["active"]:
-            if dry:
-                note("cohort.sweep", u["tenant"], subject,
-                     f"user {name} would be deactivated ({u['deactivate_at'][:10]})")
-                continue
-            code, res = identity_user_deactivate(name)
-            note("cohort.sweep", u["tenant"], subject,
-                 f"user {name} deactivated (date {u['deactivate_at'][:10]})"
-                 if code == 200 else
-                 f"user {name} NOT deactivated -- {res.get('error') or code}")
     return out
 
 

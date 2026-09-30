@@ -766,6 +766,13 @@ ok("kein Termin hat je eine Instanz oder ihren Speicher entfernt -- nur meine be
    len(REMOVED) - REMOVED_BEFORE == 2
    and all(k in a.load_registry()["instances"] for k in keys if k.endswith("-03")))
 
+USERDB["kurs-sweep-tn-03"].update(active=True, deactivate_at="2020-01-01T00:00:00Z")
+sw = sweep(3000, 1, 26)
+ok("sind Deaktivierung UND Loeschung faellig und die Loeschung wartet, wird trotzdem deaktiviert",
+   USERDB["kurs-sweep-tn-03"]["active"] is False
+   and "kurs-sweep-tn-03" in USERDB and any("deactivated" in t for _s, t in sw)
+   and any("waits" in t or "waiting" in t for _s, t in sw), sw)
+
 USERDB["solo"] = {"tenant": TID, "active": True, "deactivate_at": "2999-01-01T00:00:00Z",
                   "delete_at": "", "reason": ""}
 USERDB["solo2"] = {"tenant": TID, "active": True, "deactivate_at": "",
