@@ -161,8 +161,10 @@ ok("Installation (nur die Kennung als inst) traegt die Grenze",
 a.recreate_instance_containers(KEY, svcs, [], inst=a.load_registry()["instances"][KEY])
 ok("Tuer mit vollem Eintrag traegt sie ebenfalls",
    flag(last_run(), "--memory") == "3g")
+ok("Swap ist mit begrenzt: --memory-swap == --memory (sonst gilt das Doppelte)",
+   flag(ident, "--memory-swap") == "3g", ident)
 ok("die Flags stehen VOR dem Image (danach waeren sie Argumente der App)",
-   ident.index("--memory") < ident.index("oaap-app/code-server:0.1.2"))
+   ident.index("--memory-swap") < ident.index("oaap-app/code-server:0.1.2"))
 ok("Log-Grenze und Neustart-Regel sind unberuehrt",
    "--restart" in ident and "max-size=10m" in ident)
 

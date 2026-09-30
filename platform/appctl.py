@@ -8398,7 +8398,12 @@ def resource_args(res):
         return []
     args = []
     if "memory" in clean:
-        args += ["--memory", clean["memory"]]
+        # Swap too: without --memory-swap docker allows TWICE the memory
+        # (RAM + an equal amount of swap), so "3g" would really be 6g.
+        # Measured on oaap-test 2026-09-30: a 256m container held 400 MB
+        # and the kernel counted no OOM event.
+        args += ["--memory", clean["memory"],
+                 "--memory-swap", clean["memory"]]
     if "cpus" in clean:
         args += ["--cpus", f"{clean['cpus']:g}"]
     if "pids" in clean:
