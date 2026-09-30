@@ -51,6 +51,7 @@ python3 test/test_exposures_tunnel.py # Freigaben, echte Prozesse: aussen, innen
 python3 test/test_twin_remote_reader.py # Zwilling: entfernter Leser, nur lesen, nur die gegebenen Typen
 python3 test/test_throttle_routes.py   # Bremse je Route: Werte je Route, alle Erzeuger, Redeploy, Migration, identity (braucht flask)
 python3 test/test_user_lifetime.py    # Lebenszeit einer Person: Passwortzwang an jeder Tuer, Termine, Loeschen mit Verweigerungen, `oaap user add|delete|schedule` (braucht flask)
+python3 test/test_instance_resources.py    # Ressourcen-Grenzen je Instanz: Flags in jedem docker run (auch ohne inst), keine Vorgabe, Redeploy, Werte, Summe, Gesundheitszeile, nur server_admin
 python3 test/test_status_restarting.py # oaap status: eine Neustartschleife zaehlt nicht als laufend (braucht bash)
 
 python3 test/klicktest.py            # braucht einen laufenden Knoten

@@ -3129,6 +3129,30 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'verwaltung' }}">
+{% if i.can_limit %}
+<form method="post" action="/instances/{{ i.key }}/resources">
+  <input type="hidden" name="tab" value="verwaltung">
+  <div class="card">
+    <h2>Ressourcen-Grenzen</h2>
+    <p>Wie viel Arbeitsspeicher, Rechenzeit und wie viele Prozesse ein
+       Container dieser Instanz höchstens bekommt. Ohne Grenze läuft die
+       Instanz wie bisher; mit einer kann sie den Rechner nicht mehr allein
+       leerfressen. Aktuell: <strong>{{ i.resources_text }}</strong>.</p>
+    <label>Speicher <input type="text" name="memory" value="{{ i.resources.memory or '' }}"
+           placeholder="z. B. 3g oder 512m"></label>
+    <label>Rechenkerne <input type="text" name="cpus" value="{{ i.resources.cpus or '' }}"
+           placeholder="z. B. 1.5"></label>
+    <label>Prozesse <input type="text" name="pids" value="{{ i.resources.pids or '' }}"
+           placeholder="z. B. 512"></label>
+    <label class="checkline"><input type="checkbox" name="clear" value="1">Alle
+       Grenzen entfernen</label>
+    <p class="muted">Die App wird dabei <strong>neu gestartet</strong> (Sekunden);
+       Daten und Adresse bleiben. Die Summe aller Grenzen steht auf der
+       Gesundheitsseite.</p>
+    <button>Speichern</button>
+  </div>
+</form>
+{% endif %}
 <form method="post" action="/instances/{{ i.key }}/rename">
   <input type="hidden" name="tab" value="verwaltung">
   <div class="card">
@@ -4751,6 +4775,9 @@ def node_values():
             rows.append({"name": "Arbeitsspeicher", "state": state,
                          "label": f"{_gb(avail)} von {_gb(total)} verfügbar",
                          "detail": "wird knapp" if state == "warn" else ""})
+            lim = _limits_row(total)
+            if lim:
+                rows.append(lim)
     except OSError:
         pass
     try:
@@ -4764,6 +4791,44 @@ def node_values():
     except OSError:
         pass
     return rows
+
+
+def _mem_bytes(text):
+    """`3g` / `512m` -> bytes, or 0 (mirrors appctl.memory_bytes)."""
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)([mMgG])", str(text or "").strip())
+    if not m:
+        return 0
+    return int(float(m.group(1)) * (1024 ** 3 if m.group(2) in "gG"
+                                    else 1024 ** 2))
+
+
+def _limits_row(ram_total):
+    """The health row for the sum of instance memory limits (RFC-0046 §7).
+
+    Said BEFORE the twelfth container is OOM-killed: twelve seats of 3 GB
+    on an 8 GB machine is a sentence the trainer can read while creating
+    them. An instance without a limit is counted apart, never as zero.
+    """
+    total, limited, free = 0, 0, 0
+    for inst in load_instances().values():
+        per = _mem_bytes((inst.get("resources") or {}).get("memory"))
+        if not per:
+            free += 1
+            continue
+        total += per * max(1, len(inst.get("services") or [1]))
+        limited += 1
+    if not limited:
+        return None
+    over = total > ram_total
+    detail = ("die Grenzen zusammen sind mehr, als die Maschine hat — laufen "
+              "alle voll, beendet der Kernel Container" if over else
+              "Summe der Speicher-Grenzen aller Instanzen gegen den "
+              "Arbeitsspeicher der Maschine")
+    if free:
+        detail += f"; {free} Instanz(en) ohne Grenze zählen nicht mit"
+    return {"name": "Speicher-Grenzen", "state": "warn" if over else "ok",
+            "label": f"{_gb(total)} in {limited} Instanz(en) von "
+                     f"{_gb(ram_total)}", "detail": detail}
 
 
 def external_access():
@@ -7057,6 +7122,11 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # only decides whether a button is offered that would be
          # refused.
          "can_export": "server_admin" in caller_roles(),
+         # Resource limits are the node's protection (RFC-0046 §7): only
+         # its administrator sees the card, and the host asks again.
+         "can_limit": "server_admin" in caller_roles(),
+         "resources": inst.get("resources") or {},
+         "resources_text": _limits_text(inst.get("resources")),
          # Instanz-Diagnose (RFC-0038): Zustand, Fenster, Gateway-Sicht
          # und App-Log in einem Stueck, unter einem eigenen Schluessel --
          # so kann keiner der vier Namen mit einem Feld der Instanz
@@ -7355,6 +7425,33 @@ def instance_throttle(name):
         "mode": request.form.get("mode", "default"),
         "rate": request.form.get("rate", ""),
     }, ADDRESS_WAIT_SECONDS)
+
+
+def _limits_text(res):
+    if not res:
+        return "keine Grenzen"
+    names = (("memory", "Speicher"), ("cpus", "Kerne"), ("pids", "Prozesse"))
+    return ", ".join(f"{label} {res[k]}" for k, label in names if k in res)
+
+
+@app.post("/instances/<name>/resources")
+def instance_resources(name):
+    """Ressourcen-Grenzen setzen (RFC-0046 §7) — nur der server_admin."""
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: erfordert die Rolle server_admin."), 403
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    if _deploy_now(name):
+        return _inst_back(name, err="Für diese Instanz läuft gerade ein "
+                                    "Deployment — warte, bis es fertig ist.")
+    clear = bool(request.form.get("clear"))
+    fields = {k: request.form.get(k, "").strip() for k in
+              ("memory", "cpus", "pids")}
+    if not clear and not any(fields.values()):
+        return _inst_back(name, err="Nichts eingetragen.")
+    return _queue_and_redirect(name, {"action": "resources", "clear": clear,
+                                      **fields}, RESTART_WAIT_SECONDS)
 
 
 REMOVE_WAIT_SECONDS = 60  # stops a container and rewrites gateway config

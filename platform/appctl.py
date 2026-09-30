@@ -8325,6 +8325,112 @@ def _endpoint_publish(endpoints, svc_name, primary):
 CONTAINER_LOG_OPTS = ["--log-opt", "max-size=10m", "--log-opt", "max-file=3"]
 
 
+# Resource limits per instance (RFC-0046 §7, oaap.apps.runtime 0.2.32).
+#
+# Operator-owned like config, applied at container (re)creation, and
+# with NO default: an instance without the block runs exactly as before.
+# The limit applies to EVERY service container of the instance (a
+# multi-service app has no single "the" container), so the node-wide
+# sum counts it once per service.
+RESOURCE_MEMORY_MIN = 64 * 1024 ** 2
+RESOURCE_PIDS_MIN, RESOURCE_PIDS_MAX = 16, 100000
+RESOURCE_CPUS_MIN, RESOURCE_CPUS_MAX = 0.1, 256.0
+
+
+def memory_bytes(text):
+    """`3g` / `512m` -> bytes; ValueError for anything else.
+
+    Only m and g: docker also takes b and k, and a memory limit of "512"
+    (bytes, to docker) is a typo that would OOM-kill the app at start.
+    """
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([mMgG])", str(text or "").strip())
+    if not m:
+        raise ValueError("memory: a size like 512m or 3g.")
+    n = int(float(m.group(1)) * (1024 ** 3 if m.group(2) in "gG" else 1024 ** 2))
+    if n < RESOURCE_MEMORY_MIN:
+        raise ValueError("memory: at least 64m — less does not start anything.")
+    return n
+
+
+def parse_resources(memory="", cpus="", pids=""):
+    """The `resources` record for the given fields (empty = not given).
+
+    Raises ValueError with the reason. Returns {} when nothing was given.
+    """
+    out = {}
+    if str(memory or "").strip():
+        memory_bytes(memory)
+        out["memory"] = str(memory).strip().lower()
+    if str(cpus or "").strip():
+        try:
+            c = float(str(cpus).strip())
+        except ValueError:
+            raise ValueError("cpus: a number like 1.5.") from None
+        if not RESOURCE_CPUS_MIN <= c <= RESOURCE_CPUS_MAX:
+            raise ValueError(f"cpus: between {RESOURCE_CPUS_MIN} and "
+                             f"{RESOURCE_CPUS_MAX:g}.")
+        out["cpus"] = c
+    if str(pids or "").strip():
+        try:
+            n = int(str(pids).strip())
+        except ValueError:
+            raise ValueError("pids: a whole number.") from None
+        if not RESOURCE_PIDS_MIN <= n <= RESOURCE_PIDS_MAX:
+            raise ValueError(f"pids: between {RESOURCE_PIDS_MIN} and "
+                             f"{RESOURCE_PIDS_MAX}.")
+        out["pids"] = n
+    return out
+
+
+def resource_args(res):
+    """`docker run` flags for a stored `resources` record.
+
+    Re-validated here, not trusted: the record is data on disk, and a
+    hand-edited registry must not become an unparseable docker command
+    that leaves an instance without its container.
+    """
+    if not isinstance(res, dict) or not res:
+        return []
+    try:
+        clean = parse_resources(res.get("memory"), res.get("cpus"),
+                                res.get("pids"))
+    except ValueError:
+        return []
+    args = []
+    if "memory" in clean:
+        args += ["--memory", clean["memory"]]
+    if "cpus" in clean:
+        args += ["--cpus", f"{clean['cpus']:g}"]
+    if "pids" in clean:
+        args += ["--pids-limit", str(clean["pids"])]
+    return args
+
+
+def resources_sum(instances):
+    """(sum of memory limits in bytes, instances with a memory limit,
+    instances without one) over a registry's `instances`.
+
+    Counts a limit once per service container. An instance without a
+    memory limit is counted separately and NOT as zero: "12 seats of 3 GB
+    and three apps nobody limited" is not the same statement as "36 GB".
+    """
+    total, limited, free = 0, 0, 0
+    for inst in (instances or {}).values():
+        res = inst.get("resources") or {}
+        try:
+            per = memory_bytes(res["memory"])
+        except (KeyError, ValueError):
+            free += 1
+            continue
+        try:
+            n = max(1, len(instance_services(inst)))
+        except (KeyError, TypeError, ValueError):
+            n = 1
+        total += per * n
+        limited += 1
+    return total, limited, free
+
+
 def recreate_instance_containers(name, services, storage, endpoints=None,
                                  inst=None):
     """(Re)create ALL of an instance's service containers on its own
@@ -8339,6 +8445,14 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
     # after a platform update recreates the gateway.
     net = ensure_app_network(name)
     connect_gateway(net)
+    # The operator's limits (RFC-0046 §7). The REGISTRY is asked, not
+    # `inst`: callers pass an incomplete record (a config save and a
+    # restart pass none, an install passes the bare identity), and a
+    # limit must not depend on WHICH door recreated the container, or
+    # the first configuration save would quietly lift it.
+    stored = (load_registry().get("instances") or {}).get(name) or {}
+    limits = resource_args(stored.get("resources")
+                           or (inst or {}).get("resources"))
     for s in services:
         uid = image_uid(s["image"])
         mounts = []
@@ -8359,10 +8473,18 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
         publish = _endpoint_publish(endpoints, s["service"], primary)
         subprocess.run(["docker", "rm", "-f", s["container"]],
                        capture_output=True, text=True)
-        run(["docker", "run", "-d", "--name", s["container"],
-             "--restart", "unless-stopped", "--network", net, *alias,
-             *CONTAINER_LOG_OPTS,
-             "--env-file", env_path(name, inst), *mounts, *publish, s["image"]])
+        done = run(["docker", "run", "-d", "--name", s["container"],
+                    "--restart", "unless-stopped", "--network", net, *alias,
+                    *CONTAINER_LOG_OPTS, *limits,
+                    "--env-file", env_path(name, inst), *mounts, *publish,
+                    s["image"]])
+        # A kernel without the memory cgroup (a Raspberry Pi as shipped)
+        # ACCEPTS the flag, prints one warning and enforces nothing. The
+        # sum on the health page would then be a promise nobody keeps.
+        if limits and "does not support" in (done.stderr or ""):
+            print(f"WARNING: {s['container']}: this kernel cannot enforce "
+                  "the resource limits (" + (done.stderr or "").strip()
+                  .splitlines()[0] + ")", file=sys.stderr)
     # Erklärte App-zu-App-Verbindungen zurückholen: `docker run` kennt nur
     # EIN Netz, also hat der neue Container seine Link-Netze verloren
     # (RFC-0016). Ohne das ist eine Verbindung nach jeder
@@ -10467,6 +10589,87 @@ def cmd_access(args):
     print(f"Access {rec['id']} closed.")
 
 
+def _resources_text(res):
+    if not res:
+        return "unlimited"
+    return ", ".join(f"{k} {res[k]}" for k in ("memory", "cpus", "pids")
+                     if k in res)
+
+
+def apply_resources(name, res, who="root", role="root", own_rid=""):
+    """Store an instance's `resources` (or clear it with {}) and recreate.
+
+    Refused while a deployment of the instance is in flight, for the
+    reason a restart is (spec 2.17). Returns a message.
+    """
+    if deployment_in_flight(name, own_rid):
+        raise DiagnoseRefused(
+            "a deployment of this instance is queued or running — the "
+            "containers are being replaced; wait for it to finish.")
+    reg = load_registry()
+    cur = reg["instances"][name]
+    before = dict(cur.get("resources") or {})
+    if res:
+        cur["resources"] = res
+    else:
+        cur.pop("resources", None)
+    save_registry(reg)
+    recreate_instance_containers(name, instance_services(cur),
+                                 cur.get("storage") or [],
+                                 cur.get("endpoints") or [], inst=cur)
+    state_view_write()
+    audit_tenant("instance.resources", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail=f"{_resources_text(before)} -> {_resources_text(res)}")
+    return "resources " + _resources_text(res)
+
+
+def _node_ram_bytes():
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def cmd_resources(args):
+    """`oaap app resources <instance> [--memory M] [--cpus C] [--pids N]
+    [--clear]` (RFC-0046 §7). Without options: show."""
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"no instance named '{args.name}'")
+    if not (args.memory or args.cpus or args.pids or args.clear):
+        print(f"'{args.name}': {_resources_text(inst.get('resources'))}")
+        return
+    if args.clear and (args.memory or args.cpus or args.pids):
+        die("--clear takes no other option")
+    try:
+        # Given fields MERGE into the block: `--cpus 2` must not
+        # silently drop the memory limit that is already there.
+        merged = dict(inst.get("resources") or {})
+        merged.update(parse_resources(args.memory, args.cpus, args.pids))
+        msg = apply_resources(args.name, {} if args.clear else merged,
+                              who="cli", role="root")
+    except (ValueError, DiagnoseRefused) as e:
+        die(str(e))
+    except subprocess.CalledProcessError as e:
+        die((e.stderr or str(e)).strip().splitlines()[-1])
+    print(f"'{args.name}' {msg} — the containers were recreated (brief "
+          "downtime; storage and address unchanged).")
+    total, limited, free = resources_sum(load_registry().get("instances"))
+    ram = _node_ram_bytes()
+    if ram:
+        print(f"Node: {total / 1024 ** 3:.1f} GB of limits over {limited} "
+              f"instance(s) against {ram / 1024 ** 3:.1f} GB RAM"
+              + (f"; {free} instance(s) have no limit" if free else "") + ".")
+        if total > ram:
+            print("WARNING: the limits add up to more than this machine has.")
+
+
 def cmd_config(args):
     reg = load_registry()
     name = args.name
@@ -11683,6 +11886,10 @@ def _install_from_dir(pkg, args, source):
     # because it is the operator's decision about this instance.
     if inst and inst.get("tile"):
         reg["instances"][name]["tile"] = inst["tile"]
+    # the operator's resource limits (RFC-0046 §7): applied at container
+    # creation above (from the registry), and kept in the record here
+    if inst and inst.get("resources"):
+        reg["instances"][name]["resources"] = dict(inst["resources"])
     # a granted non-HTTP endpoint (RFC-0015) is the operator's decision to
     # open a port — it survives redeploy like the address. The container
     # was already recreated with its publish mapping (via `granted`).
@@ -16910,6 +17117,29 @@ def cmd_process_deploys(_args):
                     ok = True
                     msg = (f"throttle set to {t['limit']}/{t['window']}" if t
                            else "throttle switched off")
+        elif action == "resources":
+            # RFC-0046 §7. The node's protection, not the tenant's
+            # setting: only the node's administrator asks for it, and it
+            # is re-checked here because the spool is data, not trust.
+            if not inst:
+                msg = "unknown instance"
+            elif act_role != "server_admin":
+                msg = "resource limits are set by the node's administrator"
+            else:
+                try:
+                    merged = ({} if req.get("clear")
+                              else dict(inst.get("resources") or {}))
+                    if not req.get("clear"):
+                        merged.update(parse_resources(
+                            req.get("memory"), req.get("cpus"), req.get("pids")))
+                    msg = apply_resources(name, merged,
+                                          who=actor or "portal",
+                                          role=act_role, own_rid=rid)
+                    ok = True
+                except (ValueError, DiagnoseRefused) as e:
+                    msg = str(e)
+                except subprocess.CalledProcessError as e:
+                    msg = (e.stderr or str(e)).strip().splitlines()[-1]
         elif action == "config":
             # Instance configuration (spec 2.3/2.4.3). Same reason as
             # above: the portal cannot write the registry or talk to the
@@ -17061,7 +17291,7 @@ def cmd_process_deploys(_args):
                "rehearsal-extend": "portal",
                "diagnose-open": "portal", "diagnose-close": "portal",
                "diagnose-logs": "portal", "restart": "portal",
-               "config": "portal", "token": "portal",
+               "config": "portal", "token": "portal", "resources": "portal",
                "address": "portal", "throttle": "portal",
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
@@ -18926,6 +19156,15 @@ def main():
                     help="auto = follow the app's own class (default), "
                          "on = always show, off = never show; omit to ask")
     pt.set_defaults(fn=cmd_tile)
+    pres = sub.add_parser("resources")
+    pres.add_argument("name")
+    pres.add_argument("--memory", default="",
+                      help="memory limit per container, e.g. 3g or 512m")
+    pres.add_argument("--cpus", default="", help="CPU limit, e.g. 1.5")
+    pres.add_argument("--pids", default="", help="process limit, e.g. 512")
+    pres.add_argument("--clear", action="store_true",
+                      help="remove every limit")
+    pres.set_defaults(fn=cmd_resources)
     pcf = sub.add_parser("config")
     pcf.add_argument("action", choices=["list", "set", "unset"])
     pcf.add_argument("name")
