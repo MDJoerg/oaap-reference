@@ -299,6 +299,16 @@ appctl._resolve_revision = lambda src: "deadbee"
 
 QUEUE = os.path.join(appctl.SPOOL_DIR, "queue")
 
+# The worker refuses a session request whose `by` names nobody who
+# exists (Doku-Prüfung 2026-09-30, C2) -- so the people these requests
+# name have to be people identity knows.
+OPERATORS = [{"username": u, "roles": ["server_admin"], "tenant": "",
+              "groups": [], "active": True} for u in ("joerg", "lars")]
+os.makedirs(os.path.join(DATA, "data", "identity"), exist_ok=True)
+with open(os.path.join(DATA, "data", "identity", "users.json"), "w",
+          encoding="utf-8") as f:
+    json.dump(OPERATORS, f)
+
 
 def queue(req):
     os.makedirs(QUEUE, exist_ok=True)
@@ -388,8 +398,8 @@ CLS = appctl.tenant_by_label("cls")[0]
 ident = os.path.join(DATA, "data", "identity")
 os.makedirs(ident, exist_ok=True)
 with open(os.path.join(ident, "users.json"), "w", encoding="utf-8") as f:
-    json.dump([{"username": "cls-admin", "roles": ["tenant_admin"],
-                "tenant": CLS, "groups": [], "active": True}], f)
+    json.dump(OPERATORS + [{"username": "cls-admin", "roles": ["tenant_admin"],
+                            "tenant": CLS, "groups": [], "active": True}], f)
 ok("the tenant has a slug, so its keys differ from its names",
    appctl.tenant_slug(CLS) == "cls")
 
@@ -426,7 +436,7 @@ with contextlib.redirect_stdout(io.StringIO()):
         account="", account_name="", grace_days=30, yes=True, count=50))
 BEC = appctl.tenant_by_label("bec")[0]
 with open(os.path.join(ident, "users.json"), "w", encoding="utf-8") as f:
-    json.dump([{"username": "cls-admin", "roles": ["tenant_admin"],
+    json.dump(OPERATORS + [{"username": "cls-admin", "roles": ["tenant_admin"],
                 "tenant": CLS, "groups": [], "active": True},
                {"username": "bec-admin", "roles": ["tenant_admin"],
                 "tenant": BEC, "groups": [], "active": True}], f)

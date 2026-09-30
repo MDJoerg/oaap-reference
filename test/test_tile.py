@@ -235,6 +235,14 @@ print("\n=== the queued path the portal uses ===")
 QUEUE = os.path.join(appctl.SPOOL_DIR, "queue")
 
 
+# The worker refuses a session request whose `by` names nobody who
+# exists (Doku-Prüfung 2026-09-30, C2): the portal always names its user.
+os.makedirs(os.path.join(appctl.DATA_DIR, "data", "identity"), exist_ok=True)
+with open(os.path.join(appctl.DATA_DIR, "data", "identity", "users.json"), "w",
+          encoding="utf-8") as f:
+    json.dump([{"username": "joerg", "roles": ["server_admin"], "tenant": "",
+                "groups": [], "active": True}], f)
+
 def queue(req):
     os.makedirs(QUEUE, exist_ok=True)
     with open(os.path.join(QUEUE, f"{req['id']}.json"), "w", encoding="utf-8") as f:

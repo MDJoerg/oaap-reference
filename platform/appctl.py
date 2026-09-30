@@ -117,6 +117,14 @@ SPOOL_DIR = os.path.join(DATA_DIR, "data", "deploy-spool")
 # "running" instead of guessing, and lets the next run clean up after a
 # worker that died mid-build.
 SPOOL_CLAIMS = os.path.join(SPOOL_DIR, "claims")
+# The spool requests that may name no person, because each carries a
+# proof of its own: the deploy hook ('redeploy', the default action) and
+# the artifact pair ('announce', 'artifact') a deploy token, the
+# first-run wizard's profile ('node') the setup token. Every other
+# action comes from a signed-in session and must name an active user
+# (cmd_process_deploys).
+SPOOL_ACTIONS_WITHOUT_ACTOR = frozenset({"redeploy", "announce", "artifact",
+                                         "node"})
 # How long one deploy request may take before it is called off. A build
 # that hangs used to block every later deployment for every instance,
 # with nothing anywhere saying so (RFC-0024). A recorded failure is
@@ -15843,6 +15851,26 @@ def cmd_process_deploys(_args):
         actor = str(req.get("by") or "")
         act_tenant, act_role, _act_err = (acting_tenant(actor) if actor
                                           else (None, "", ""))
+        # ...and "names nobody" is only an answer for the requests that
+        # carry their own proof: the deploy hook and the artifact pair
+        # (deploy token, checked by the portal; upload grant, spent
+        # here) and the first-run profile (setup token, checked here).
+        # Everything else comes from a session, and the portal always
+        # writes its user into `by`. A request without one used to slip
+        # past every `if actor and act_role ...` check below -- the
+        # backup schedule among them -- so a portal that could write
+        # the spool could skip them all by leaving the field out
+        # (Doku-Prüfung 2026-09-30, C2). Refused here, once, instead of
+        # at each of those checks. The name must also be a person who
+        # exists and is active: a deactivated admin's session is gone,
+        # and so is their authority over this worker.
+        actor_refusal = ""
+        if action not in SPOOL_ACTIONS_WITHOUT_ACTOR:
+            u = next((x for x in (_read_identity_users() or [])
+                      if x.get("username") == actor), None) if actor else None
+            if u is None or not u.get("active", True):
+                actor_refusal = (f"'{action}' must be requested by a signed-in, "
+                                 "active user -- this request names none")
 
         # The two actions that bring an instance into being name it the
         # way the CALLER thinks of it -- inside their tenant -- because
@@ -15942,7 +15970,9 @@ def cmd_process_deploys(_args):
 
         # Re-validate on the host — the spool is data, not trust.
         store_src = None
-        if cross_tenant:
+        if actor_refusal:
+            msg = actor_refusal
+        elif cross_tenant:
             msg = cross_tenant_refusal(action, name)
         elif action == "install":
             # One-click store install (spec 2.6): the request names an

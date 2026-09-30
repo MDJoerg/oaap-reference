@@ -200,15 +200,23 @@ ok("CLI remove: nur die Knoten-Adresse bleibt",
 # Die zweite Tuer: das Portal legt eine Anfrage in den Spool, der Worker
 # arbeitet sie ab -- dieselbe Regel muss auch dort greifen.
 del RECREATED[:]
+
+# The worker refuses a session request whose `by` names nobody who
+# exists (Doku-Prüfung 2026-09-30, C2): the portal always names its user.
+os.makedirs(os.path.join(m.DATA_DIR, "data", "identity"), exist_ok=True)
+with open(os.path.join(m.DATA_DIR, "data", "identity", "users.json"), "w",
+          encoding="utf-8") as f:
+    json.dump([{"username": "joerg", "roles": ["server_admin"], "tenant": "",
+                "groups": [], "active": True}], f)
 queue = os.path.join(m.SPOOL_DIR, "queue")
 os.makedirs(queue, exist_ok=True)
 os.makedirs(os.path.join(m.SPOOL_DIR, "results"), exist_ok=True)
 with open(os.path.join(queue, "0001-crm.json"), "w", encoding="utf-8") as f:
     json.dump({"instance": "crm", "id": "r-1", "action": "address", "op": "set",
-               "hostname": "crm.example.org"}, f)
+               "hostname": "crm.example.org", "by": "joerg"}, f)
 with open(os.path.join(queue, "0002-crm.json"), "w", encoding="utf-8") as f:
     json.dump({"instance": "crm", "id": "r-2", "action": "address", "op": "alias-add",
-               "hostname": "kunden.example.org"}, f)
+               "hostname": "kunden.example.org", "by": "joerg"}, f)
 out = quiet(m.cmd_process_deploys, None)
 crm = m.load_registry()["instances"]["crm"]
 ok("Portal-Spool set + alias-add: das Register hat beide Namen",
