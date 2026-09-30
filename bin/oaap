@@ -119,7 +119,7 @@ uninstall() {
   # about to be deleted, so it fails on every tick from here on --
   # every minute in the case of the instance watch. Removing the
   # platform has to remove what keeps calling it.
-  for unit in oaap-rehearsal-sweep oaap-instance-watch; do
+  for unit in oaap-rehearsal-sweep oaap-cohort-sweep oaap-instance-watch; do
     systemctl disable --now "$unit.timer" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$unit.service" "/etc/systemd/system/$unit.timer"
   done

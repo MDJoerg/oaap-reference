@@ -771,6 +771,31 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  # Cohort sweep (RFC-0046 5): the dates of a course -- instances stopped
+  # after `ends`, participants deactivated and deleted on their dates.
+  # It never deletes an instance or its storage (RFC-0030 D4).
+  cat > /etc/systemd/system/oaap-cohort-sweep.service <<EOF
+[Unit]
+Description=OAAP cohort sweep (ends a course, deactivates and deletes participants on their dates)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py cohort sweep
+EOF
+  cat > /etc/systemd/system/oaap-cohort-sweep.timer <<'EOF'
+[Unit]
+Description=OAAP cohort sweep, daily
+
+[Timer]
+OnCalendar=*-*-* 04:40:00
+# A node that was off at 04:40 still sweeps: a date is a promise to the
+# participant (RFC-0046 5), not a hint.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   # Instance watch (RFC-0038 D1/D2, RFC-0044 stage 1): three small jobs,
   # one minute apart.
   #
@@ -817,6 +842,7 @@ EOF
   systemctl daemon-reload
   systemctl enable --now oaap-deployd.path >/dev/null 2>&1 || true
   systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 || true
+  systemctl enable --now oaap-cohort-sweep.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."

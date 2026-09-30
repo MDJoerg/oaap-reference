@@ -370,7 +370,7 @@ a.subprocess.run = fake_sub_run
 def ns(**kw):
     base = dict(target=None, second=None, third=None, tenant="", seat="",
                 who="", keep_home=False, purge=False, users=False, yes=True,
-                handout_file="", confirm_source="", stdin=False)
+                handout_file="", confirm_source="", stdin=False, dry_run=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -624,6 +624,156 @@ ok("Audit fuer jeden Schritt",
 
 os.chdir(cwd)
 
+# ------------------------------------------------ der taegliche Lauf (Stufe 4)
+print("")
+print("Der taegliche Lauf -- Termine als Daten, jetzt mit Handelnden")
+import datetime  # noqa: E402
+
+UTC = datetime.timezone.utc
+USERDB = {}
+REFUSE = set()
+
+
+def iso(d):
+    return d + "T00:00:00Z" if d and "T" not in d else d
+
+
+def sweep_create_user(body):
+    USERS.append(dict(body))
+    EXISTING.add(body["username"])
+    USERDB[body["username"]] = {
+        "tenant": body.get("tenant", ""), "active": True,
+        "deactivate_at": iso(body.get("deactivate_at", "")),
+        "delete_at": iso(body.get("delete_at", "")),
+        "reason": body.get("schedule_reason", "")}
+    return 201, {"ok": True}
+
+
+def due(now_iso):
+    return [dict(username=n, tenant=u["tenant"], active=u["active"],
+                 deactivate_at=u["deactivate_at"], delete_at=u["delete_at"],
+                 reason=u["reason"])
+            for n, u in USERDB.items()
+            if (u["delete_at"] and u["delete_at"] <= now_iso)
+            or (u["deactivate_at"] and u["deactivate_at"] <= now_iso and u["active"])]
+
+
+def sweep_deactivate(username):
+    USERDB[username]["active"] = False
+    USERDB[username]["deactivate_at"] = ""
+    return 200, {"ok": True}
+
+
+def sweep_delete(username):
+    if username in REFUSE:
+        return 409, {"error": "der letzte tenant_admin"}
+    DELETED.append(username)
+    USERDB.pop(username, None)
+    return 200, {}
+
+
+a.identity_user_create = sweep_create_user
+a.identity_users_due = due
+a.identity_user_deactivate = sweep_deactivate
+a.identity_user_delete = sweep_delete
+
+t_sw = template(os.path.join(WORK, "t-sweep"),
+                mutate=lambda t: t.replace("kurs-2026-10", "kurs-sweep"))
+code, out = cli("create", target=t_sw, handout_file=os.path.join(WORK, "out", "hs.csv"))
+rec = a.load_cohort(TID, "kurs-sweep")
+ok("die Kohorte fuer den Lauf steht, Termine liegen am Benutzer",
+   code is None and rec and rec["complete"]
+   and USERDB["kurs-sweep-tn-01"]["deactivate_at"] == "2999-11-23T00:00:00Z"
+   and USERDB["kurs-sweep-tn-01"]["delete_at"] == "3000-01-22T00:00:00Z", out)
+keys = [k for _s, _a, k in a._cohort_instances(rec)]
+REMOVED_BEFORE = len(REMOVED)
+
+
+def sweep(y, m, d, **kw):
+    AUDIT.clear()
+    DOCKER.clear()
+    return a.cohort_sweep(now=datetime.datetime(y, m, d, 4, 40, tzinfo=UTC), **kw)
+
+
+def stops():
+    return [c for c in DOCKER if c[:2] == ["docker", "stop"] and "-sweep-" in c[2]]
+
+
+sw = sweep(2999, 10, 24)
+ok("am Tag `ends` selbst passiert nichts (der letzte Kurstag laeuft noch)",
+   sw == [] and not stops() and not a.load_cohort(TID, "kurs-sweep").get("ended"), sw)
+sw = sweep(2999, 10, 25)
+rec = a.load_cohort(TID, "kurs-sweep")
+ok("am Tag danach werden die Instanzen GESTOPPT -- alle drei, nichts geloescht",
+   len(stops()) == 3 and rec["stopped"] and rec["ended"] == "2999-10-24"
+   and all(k in a.load_registry()["instances"] for k in keys), (sw, DOCKER))
+ok("und das steht im Protokoll des Mandanten",
+   [x[0] for x in AUDIT if x[1]["subject"] == "kurs-sweep"] == ["cohort.end"], AUDIT)
+sw = sweep(2999, 10, 26)
+ok("ein zweiter Lauf stoppt nicht noch einmal", sw == [] and not stops(), sw)
+cli("start", target="kurs-sweep")
+sw = sweep(2999, 10, 27)
+ok("hat der Ausbilder wieder gestartet, ueberstimmt der Lauf ihn nicht",
+   sw == [] and not stops()
+   and a.load_cohort(TID, "kurs-sweep")["stopped"] is False, (sw, DOCKER))
+sw = sweep(2999, 11, 23, dry=True)
+ok("--dry-run sagt, was geschaehe, und aendert nichts",
+   len(sw) == 3 and all("would be deactivated" in t for _s, t in sw)
+   and all(u["active"] for n, u in USERDB.items()) and not AUDIT, sw)
+sw = sweep(2999, 11, 23)
+ok("am Termin werden die drei Benutzer deaktiviert",
+   len(sw) == 3 and not any(USERDB[n]["active"] for n in USERDB
+                           if n.startswith("kurs-sweep-")), sw)
+ok("das Datum ist gefeuert und geloescht, die Loeschung bleibt",
+   all(USERDB[n]["deactivate_at"] == "" and USERDB[n]["delete_at"]
+       for n in USERDB if n.startswith("kurs-sweep-")))
+ok("jeder Schritt steht im Protokoll",
+   [x[0] for x in AUDIT] == ["cohort.sweep"] * 3, AUDIT)
+USERDB["kurs-sweep-tn-02"]["active"] = True
+sw = sweep(2999, 11, 24)
+ok("wer von Hand wieder aktiviert wurde, wird morgen nicht erneut abgeschaltet",
+   sw == [] and USERDB["kurs-sweep-tn-02"]["active"], sw)
+
+sw = sweep(3000, 1, 22)
+rec = a.load_cohort(TID, "kurs-sweep")
+ok("die Loeschung wartet, solange der Platz Instanzen hat -- nichts geloescht",
+   len(sw) == 3 and not DELETED and all("waiting" in t for _s, t in sw)
+   and all(rec["seats"][x].get("waiting") for x in ("01", "02", "03")), sw)
+ok("das Warten wird EINMAL gesagt, nicht jeden Tag ins Protokoll",
+   len([x for x in AUDIT if x[0] == "cohort.sweep"]) == 3, AUDIT)
+sw = sweep(3000, 1, 23)
+ok("am naechsten Tag: noch immer keine Loeschung, kein neuer Protokolleintrag",
+   len(sw) == 3 and not DELETED and not AUDIT, (sw, AUDIT))
+
+cli("remove", target="kurs-sweep", seat="01")
+REFUSE.add("kurs-sweep-tn-02")
+cli("remove", target="kurs-sweep", seat="02")
+sw = sweep(3000, 1, 24)
+rec = a.load_cohort(TID, "kurs-sweep")
+ok("ist der Platz leer, wird der Benutzer geloescht",
+   DELETED == ["kurs-sweep-tn-01"] or "kurs-sweep-tn-01" in DELETED, (sw, DELETED))
+ok("der Platz verschwindet dabei aus der Kohorte, die anderen bleiben",
+   "01" not in rec["seats"] and "03" in rec["seats"])
+ok("verweigert die Identitaet die Loeschung, steht der Grund da -- der Benutzer bleibt",
+   "kurs-sweep-tn-02" in USERDB
+   and any("NOT deleted -- der letzte tenant_admin" in t for _s, t in sw), sw)
+ok("die Verweigerung kommt EINMAL ins Protokoll",
+   len([x for x in AUDIT if "NOT deleted" in x[1].get("detail", "")]) == 1, AUDIT)
+sw = sweep(3000, 1, 25)
+ok("am naechsten Tag wieder nur die Anzeige, kein zweiter Eintrag",
+   any("NOT deleted" in t for _s, t in sw) and not AUDIT, (sw, AUDIT))
+ok("kein Termin hat je eine Instanz oder ihren Speicher entfernt -- nur meine beiden `remove`",
+   len(REMOVED) - REMOVED_BEFORE == 2
+   and all(k in a.load_registry()["instances"] for k in keys if k.endswith("-03")))
+
+USERDB["solo"] = {"tenant": TID, "active": True, "deactivate_at": "2999-01-01T00:00:00Z",
+                  "delete_at": "", "reason": ""}
+USERDB["solo2"] = {"tenant": TID, "active": True, "deactivate_at": "",
+                   "delete_at": "2999-01-01T00:00:00Z", "reason": ""}
+sw = sweep(3000, 2, 1)
+ok("Termine auch ausserhalb einer Kohorte: der Lauf handelt (deaktivieren, loeschen)",
+   USERDB["solo"]["active"] is False and "solo2" not in USERDB, sw)
+
 # ------------------------------------------------ benannte Geheimnisse
 print("")
 print("Benannte Geheimnisse -- gespeichert, aufgelistet, nie zurueckgegeben")
@@ -657,6 +807,16 @@ ok("_install_from_dir ruft den Haken NACH save_env und VOR dem ersten Container"
 ok("ein Redeploy behaelt den Kohorten-Vermerk",
    '(inst or {}).get("cohort") or preset.get("cohort")' in APPCTL)
 ok("bin/oaap kennt `oaap cohort`", 'cohort)      exec python3 "$APP_DIR/appctl.py" cohort' in BIN)
+INSTALL_SH = open(os.path.join(HERE, "..", "install.sh"), encoding="utf-8").read()
+MIGRATE_SH = open(os.path.join(PLATFORM, "migrate.sh"), encoding="utf-8").read()
+ok("der Lauf hat einen Zeitgeber -- bei Neuinstallation UND beim Update",
+   "oaap-cohort-sweep.timer" in INSTALL_SH and "oaap-cohort-sweep.timer" in MIGRATE_SH
+   and "cohort sweep" in INSTALL_SH and "cohort sweep" in MIGRATE_SH)
+ok("der Zeitgeber holt verpasste Laeufe nach (Persistent=true)",
+   "OnCalendar=*-*-* 04:40:00" in INSTALL_SH
+   and INSTALL_SH.split("oaap-cohort-sweep.timer <<'EOF'")[1].split("EOF")[0].count("Persistent=true") == 1)
+ok("`oaap uninstall` nimmt den Zeitgeber mit",
+   "oaap-cohort-sweep" in BIN)
 ok("die Kohorten-Geheimnisse liegen im Verzeichnis, das nur der Wirt liest",
    'COHORT_SECRETS_FILE = os.path.join(DEST_SECRETS_DIR' in APPCTL)
 

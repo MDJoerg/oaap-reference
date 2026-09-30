@@ -381,6 +381,39 @@ EOF
     || say "  WARNING: the rehearsal sweep timer could not be enabled."
 fi
 
+# --- the cohort sweep timer (RFC-0046 5) ---
+# The dates of a course (instances stopped after `ends`, participants
+# deactivated and deleted on their dates). Without it a stored date is
+# only data. Idempotent, like the units above.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+  cat > /etc/systemd/system/oaap-cohort-sweep.service <<EOF
+[Unit]
+Description=OAAP cohort sweep (ends a course, deactivates and deletes participants on their dates)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py cohort sweep
+EOF
+  cat > /etc/systemd/system/oaap-cohort-sweep.timer <<'EOF'
+[Unit]
+Description=OAAP cohort sweep, daily
+
+[Timer]
+OnCalendar=*-*-* 04:40:00
+# A node that was off at 04:40 still sweeps: a date is a promise to the
+# participant (RFC-0046 5), not a hint.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-cohort-sweep.timer >/dev/null 2>&1 \
+    || say "  WARNING: the cohort sweep timer could not be enabled."
+fi
+
 # --- the instance watch timer (RFC-0038 D1/D2, RFC-0044 stage 1) ---
 # Three one-shot jobs a minute: the container facts the instance page
 # shows, the expiry of diagnosis windows, and (since oaap.net.remote-

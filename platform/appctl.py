@@ -12928,6 +12928,46 @@ def identity_user_set_password(username, password, must_change=True):
          "must_change": bool(must_change)}, _operator_name())
 
 
+def identity_users_due(now_iso):
+    """People whose date has come: [{username, tenant, active, deactivate_at,
+    delete_at, reason}] (RFC-0046 §6.3). A deactivation only counts for a
+    person who is still active."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "now = os.environ['OAAP_NOW']\n"
+        "print(json.dumps([{'username': u['username'],\n"
+        "  'tenant': m.resolve_tenant(u.get('tenant')) or '',\n"
+        "  'active': bool(u['active']),\n"
+        "  'deactivate_at': u.get('deactivate_at', ''),\n"
+        "  'delete_at': u.get('delete_at', ''),\n"
+        "  'reason': u.get('schedule_reason', '')}\n"
+        " for u in m.load_users()\n"
+        " if (u.get('delete_at') and u['delete_at'] <= now)\n"
+        " or (u.get('deactivate_at') and u['deactivate_at'] <= now\n"
+        "     and u['active'])]))\n", {"OAAP_NOW": now_iso})
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def identity_user_deactivate(username):
+    """Deactivate a person and clear the date that did it: it fired, and a
+    trainer who reactivates them by hand must not be overruled tomorrow."""
+    return _identity_user_call(
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, a['username'])\n"
+        "    if not u:\n"
+        "        body, code = {'error': 'Benutzer nicht gefunden.'}, 404\n"
+        "    else:\n"
+        "        b = {'roles': u['roles'], 'groups': u['groups'],\n"
+        "             'email': u.get('email', ''), 'active': False,\n"
+        "             'email_verified': u.get('email_verified', False),\n"
+        "             'display_name': u.get('display_name', ''),\n"
+        "             'deactivate_at': ''}\n"
+        "        res = m._update_user(a['username'], b, users,\n"
+        "                             os.environ['OAAP_U_ACTOR'], 'server_admin', '')\n"
+        "        body, code = res if isinstance(res, tuple) else (res, 200)",
+        {"username": username}, "cohort sweep")
+
+
 _PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
@@ -13910,8 +13950,152 @@ def _cohort_secret(args):
         die("usage: oaap cohort secret set|list|remove <name>")
 
 
+def _cohort_stop_containers(rec):
+    reg = load_registry()
+    for _sid, _app, key in _cohort_instances(rec):
+        for s in instance_services(reg["instances"].get(key) or {}):
+            subprocess.run(["docker", "stop", s["container"]],
+                           capture_output=True, text=True)
+
+
+def _sweep_notes(new=None):
+    """What the sweep has already said about a person it could not delete,
+    so that the log holds the reason once, not every morning."""
+    path = COHORT_DIR.rstrip("/\\") + "-sweep-notes.json"  # beside, not inside: every entry inside is a tenant
+    if new is None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(new, f)
+    return new
+
+
+def cohort_sweep(now=None, dry=False):
+    """The daily worker of RFC-0046 §5 -> [(subject, text)] of what it did.
+
+    Three things, and only these: after `ends` the instances of a cohort are
+    STOPPED (once -- a trainer who starts them again is not overruled
+    tomorrow); a person whose `deactivate_at` has come is deactivated; a
+    person whose `delete_at` has come is deleted, but only when their seat
+    holds no instance any more (otherwise the date waits and the trainer is
+    told). No date deletes an instance or its storage (RFC-0030 D4).
+    """
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    today = now.date()
+    recs = []
+    if os.path.isdir(COHORT_DIR):
+        for tid in sorted(os.listdir(COHORT_DIR)):
+            for name in sorted(os.listdir(os.path.join(COHORT_DIR, tid))):
+                rec = load_cohort(tid, name)
+                if rec:
+                    recs.append(rec)
+    out = []
+
+    def note(action, tid, subject, text, detail=""):
+        out.append((subject, ("(dry run) " if dry else "") + text))
+        if not dry:
+            audit_tenant(action, tid, subject=subject, who="cohort sweep",
+                         role="root", detail=detail or text)
+
+    for rec in recs:
+        try:
+            tpl, _tdir = _cohort_template(rec)
+        except SystemExit:
+            out.append((rec["name"], "stored template unusable -- skipped"))
+            continue
+        ends = tpl["lifetime"]["ends"]
+        if ends and cohort.parse_date(ends) < today and not rec.get("ended"):
+            if not dry:
+                if not rec.get("stopped"):
+                    _cohort_stop_containers(rec)
+                rec["stopped"] = True
+                rec["ended"] = ends
+                save_cohort(rec)
+            note("cohort.end", rec["tenant"], rec["name"],
+                 f"cohort '{rec['name']}' ended {ends}: instances stopped, "
+                 "nothing deleted")
+
+    seat_of = {}
+    for rec in recs:
+        for sid, seat in (rec.get("seats") or {}).items():
+            seat_of[seat["user"]] = (rec, sid)
+    for u in identity_users_due(now_iso):
+        name = u["username"]
+        rec, sid = seat_of.get(name, (None, None))
+        subject = f"{rec['name']}/{sid}" if rec else name
+        if u["delete_at"] and u["delete_at"] <= now_iso:
+            alive = []
+            if rec:
+                reg = load_registry()
+                alive = [k for _s, _a, k in _cohort_instances(rec, {sid})
+                         if k in reg["instances"]]
+            if alive:
+                seat = rec["seats"][sid]
+                if not seat.get("waiting") and not dry:
+                    seat["waiting"] = True
+                    save_cohort(rec)
+                    note("cohort.sweep", u["tenant"], subject,
+                         f"user {name}: deletion date {u['delete_at'][:10]} has "
+                         f"come, waiting for removal of {len(alive)} instance(s)")
+                else:
+                    out.append((subject, f"user {name}: deletion waits for "
+                                f"removal of {len(alive)} instance(s)"))
+                continue
+            if dry:
+                note("cohort.sweep", u["tenant"], subject,
+                     f"user {name} would be deleted ({u['delete_at'][:10]})")
+                continue
+            code, res = identity_user_delete(name)
+            if code == 200:
+                notes = _sweep_notes()
+                if notes.pop(name, None) is not None:
+                    _sweep_notes(notes)
+                note("cohort.sweep", u["tenant"], subject,
+                     f"user {name} deleted (date {u['delete_at'][:10]})")
+                if rec:
+                    rec["seats"].pop(sid, None)
+                    save_cohort(rec)
+            else:
+                why = res.get("error") or f"identity answered {code}"
+                notes = _sweep_notes()
+                if notes.get(name) != why:
+                    notes[name] = why
+                    _sweep_notes(notes)
+                    note("cohort.sweep", u["tenant"], subject,
+                         f"user {name} NOT deleted -- {why}")
+                else:
+                    out.append((subject, f"user {name} NOT deleted -- {why}"))
+        elif u["active"]:
+            if dry:
+                note("cohort.sweep", u["tenant"], subject,
+                     f"user {name} would be deactivated ({u['deactivate_at'][:10]})")
+                continue
+            code, res = identity_user_deactivate(name)
+            note("cohort.sweep", u["tenant"], subject,
+                 f"user {name} deactivated (date {u['deactivate_at'][:10]})"
+                 if code == 200 else
+                 f"user {name} NOT deactivated -- {res.get('error') or code}")
+    return out
+
+
+def _cohort_sweep_cmd(args):
+    done = cohort_sweep(dry=args.dry_run)
+    if not done:
+        print("No cohort date has come.")
+        return
+    for subject, text in done:
+        print(f"{subject}: {text}")
+
+
 def cmd_cohort(args):
     act = args.action
+    if act == "sweep":
+        return _cohort_sweep_cmd(args)
     if act == "create":
         return _cohort_create(args)
     if act == "add":
@@ -19701,10 +19885,10 @@ def main():
     pcoh = sub.add_parser("cohort",
                           help="a training landscape from one template "
                                "(RFC-0046): create, add, reset, list, stop, "
-                               "start, material, handout, export, remove, secret")
+                               "start, material, handout, export, remove, secret, sweep")
     pcoh.add_argument("action", choices=["create", "add", "reset", "list", "stop",
                                          "start", "material", "handout", "export",
-                                         "remove", "secret"])
+                                         "remove", "secret", "sweep"])
     pcoh.add_argument("target", nargs="?",
                       help="create: the template directory; otherwise the "
                            "cohort (material: `update`; secret: set|list|remove)")
@@ -19734,6 +19918,8 @@ def main():
                       help="install from this unverified store source")
     pcoh.add_argument("--stdin", action="store_true",
                       help="secret set: read the value from standard input")
+    pcoh.add_argument("--dry-run", action="store_true",
+                      help="sweep: say what would happen, change nothing")
     pcoh.set_defaults(fn=cmd_cohort)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])

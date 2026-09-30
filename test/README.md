@@ -51,7 +51,7 @@ python3 test/test_exposures_tunnel.py # Freigaben, echte Prozesse: aussen, innen
 python3 test/test_twin_remote_reader.py # Zwilling: entfernter Leser, nur lesen, nur die gegebenen Typen
 python3 test/test_throttle_routes.py   # Bremse je Route: Werte je Route, alle Erzeuger, Redeploy, Migration, identity (braucht flask)
 python3 test/test_user_lifetime.py    # Lebenszeit einer Person: Passwortzwang an jeder Tuer, Termine, Loeschen mit Verweigerungen, `oaap user add|delete|schedule` (braucht flask)
-python3 test/test_cohort.py                 # Kohorte: Vorlage (Geheimnis/Pfad/Rolle abgelehnt), Platz vollstaendig VOR dem ersten Start, Saat fuellt/reset ersetzt, Handout einmal+0600+nicht in der Vorlage, halbe Kohorte, add/reset/stop/material/export/remove
+python3 test/test_cohort.py                 # Kohorte: Vorlage (Geheimnis/Pfad/Rolle abgelehnt), Platz vollstaendig VOR dem ersten Start, Saat fuellt/reset ersetzt, Handout einmal+0600+nicht in der Vorlage, halbe Kohorte, add/reset/stop/material/export/remove, taeglicher Lauf (Ende stoppt, Termine deaktivieren/loeschen, Loeschung wartet auf leeren Platz)
 python3 test/test_instance_resources.py    # Ressourcen-Grenzen je Instanz: Flags in jedem docker run (auch ohne inst), keine Vorgabe, Redeploy, Werte, Summe, Gesundheitszeile, nur server_admin
 python3 test/test_status_restarting.py # oaap status: eine Neustartschleife zaehlt nicht als laufend (braucht bash)
 

@@ -410,5 +410,37 @@ ok("und verweigert einen server_admin auch dem Bediener", code == 409,
    (code, res))
 
 print("")
+print("Der taegliche Lauf -- die echten Skripte gegen die echte Identitaet")
+
+seed("lauf-a", ["user"], "t-schule", groups=["kurs-01"], email="",
+     deactivate_at="2020-01-02T00:00:00Z", delete_at="2020-03-01T00:00:00Z",
+     schedule_reason="cohort test")
+seed("lauf-b", ["user"], "t-schule",
+     deactivate_at="2999-01-01T00:00:00Z", delete_at="2999-06-01T00:00:00Z")
+seed("lauf-c", ["user"], "t-schule", active=False,
+     deactivate_at="2020-01-02T00:00:00Z", delete_at="2999-06-01T00:00:00Z")
+due = {x["username"]: x for x in appctl.identity_users_due("2020-02-01T00:00:00Z")}
+ok("faellig ist, wessen Termin gekommen ist -- und nur der",
+   "lauf-a" in due and "lauf-b" not in due, sorted(due))
+ok("eine Deaktivierung zaehlt nur fuer jemanden, der noch aktiv ist",
+   "lauf-c" not in due, sorted(due))
+ok("die Antwort nennt den Mandanten (fuers Protokoll)",
+   due["lauf-a"]["tenant"] == "t-schule", due["lauf-a"])
+code, res = appctl.identity_user_deactivate("lauf-a")
+u = users_of()["lauf-a"]
+ok("deaktivieren: aus, Datum weg, Loeschtermin und Gruppen bleiben",
+   code == 200 and u["active"] is False and u["deactivate_at"] == ""
+   and u["delete_at"] == "2020-03-01T00:00:00Z" and u["groups"] == ["kurs-01"]
+   and u["schedule_reason"] == "cohort test", (code, res, u))
+ok("das Protokoll nennt den Lauf als Handelnden",
+   any(e["action"] == "user.change" and e["subject"] == "lauf-a"
+       and e["who"] == "cohort sweep" for e in audit_lines()))
+due = {x["username"] for x in appctl.identity_users_due("2020-04-01T00:00:00Z")}
+ok("die Loeschung ist danach noch faellig, die Deaktivierung nicht",
+   "lauf-a" in due and "lauf-c" not in due, sorted(due))
+code, res = appctl.identity_user_deactivate("gibt-es-nicht")
+ok("ein unbekannter Benutzer ist ein 404", code == 404, (code, res))
+
+print("")
 print("ALLE BESTANDEN" if not fails else f"FAILED ({fails} Fehler)")
 sys.exit(1 if fails else 0)
