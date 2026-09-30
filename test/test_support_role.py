@@ -293,6 +293,9 @@ H = {"X-OAAP-Internal-Key": "test-internal-key"}
 def create(actor, name, roles, tenant=""):
     return c3.post("/internal/users", json={
         "actor": actor, "username": name, "password": "geheim12345",
+        # Diese Datei prueft Rollen, nicht den Erstanmelde-Zwang
+        # (RFC-0046 §6.2, geprueft in test_user_lifetime.py).
+        "must_change_password": False,
         "roles": roles, "groups": [], "tenant": tenant}, headers=H)
 
 

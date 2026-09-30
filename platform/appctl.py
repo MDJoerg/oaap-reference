@@ -12575,6 +12575,137 @@ def cmd_support_cleanup_note(args):
     print("  This note disappears once no account holds both.")
 
 
+# ------------------------------------------------- users, as functions
+# RFC-0046 §4 ("one implementation"): the commands below and the cohort
+# tool (`oaap cohort`, later the management API) call THESE, which call
+# identity's own functions inside its container -- the rules (who may
+# create whom, what deletion refuses) live there once. Each returns
+# (http-like status, body), the shape identity's own functions answer in.
+
+def _identity_user_call(fn, args_json, actor):
+    """Run one of identity's user functions as the node's operator.
+
+    The operator on the machine acts with node authority (as `machine
+    add` does): the boundary that matters here is the one identity's
+    functions keep for a tenant_admin, and a command line on the node is
+    not one.
+    """
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "a = json.loads(os.environ['OAAP_U_ARGS'])\n"
+        f"{fn}\n"
+        "print(json.dumps({'code': code, 'body': body}))\n",
+        {"OAAP_U_ARGS": json.dumps(args_json), "OAAP_U_ACTOR": actor})
+    res = json.loads(out.strip().splitlines()[-1])
+    return res["code"], res["body"]
+
+
+def _operator_name():
+    return os.environ.get("SUDO_USER") or "root"
+
+
+def identity_user_create(body):
+    """Create a person (or, with kind=machine, a machine) on this node.
+
+    `body` is identity's create body (username, roles, groups, tenant,
+    password, must_change_password, deactivate_at, delete_at, ...). The
+    tenant is an id or empty; the caller resolves labels. server_admin is
+    refused HERE, at this door (RFC-0046 §6.1): the node's administrators
+    are made in the portal or at setup, not by a script that also makes
+    twelve course participants.
+    """
+    if "server_admin" in (body.get("roles") or []):
+        return 403, {"error": "server_admin wird an dieser Tür nicht "
+                              "vergeben (RFC-0046 §6.1)."}
+    return _identity_user_call(
+        "with m.users_rw() as users:\n"
+        "    res = m._create_user(a, users, os.environ['OAAP_U_ACTOR'],\n"
+        "                         'server_admin', '')\n"
+        "body, code = res if isinstance(res, tuple) else (res, 200)",
+        body, _operator_name())
+
+
+def identity_user_delete(username):
+    return _identity_user_call(
+        "with m.users_rw() as users:\n"
+        "    res = m._delete_user(a['username'], users,\n"
+        "                         os.environ['OAAP_U_ACTOR'], 'server_admin', '')\n"
+        "body, code = res if isinstance(res, tuple) else (res, 200)",
+        {"username": username}, _operator_name())
+
+
+def identity_user_schedule(username, dates):
+    """Set (or, with "" values, clear) a person's two dates and the reason.
+
+    `dates` may hold deactivate_at, delete_at, schedule_reason; a key left
+    out keeps what the record has.
+    """
+    return _identity_user_call(
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, a['username'])\n"
+        "    if not u:\n"
+        "        body, code = {'error': 'Benutzer nicht gefunden.'}, 404\n"
+        "    else:\n"
+        "        b = {'roles': u['roles'], 'groups': u['groups'],\n"
+        "             'email': u.get('email', ''), 'active': u['active'],\n"
+        "             'email_verified': u.get('email_verified', False),\n"
+        "             'display_name': u.get('display_name', '')}\n"
+        "        b.update(a['dates'])\n"
+        "        res = m._update_user(a['username'], b, users,\n"
+        "                             os.environ['OAAP_U_ACTOR'], 'server_admin', '')\n"
+        "        body, code = res if isinstance(res, tuple) else (res, 200)",
+        {"username": username, "dates": dates}, _operator_name())
+
+
+def identity_user_set_password(username, password, must_change=True):
+    return _identity_user_call(
+        "from werkzeug.security import generate_password_hash\n"
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, a['username'])\n"
+        "    if not u:\n"
+        "        body, code = {'error': 'Benutzer nicht gefunden.'}, 404\n"
+        "    elif u.get('kind') == 'machine':\n"
+        "        body, code = {'error': 'Ein Maschinen-Prinzipal hat kein Passwort.'}, 400\n"
+        "    else:\n"
+        "        u['password_hash'] = generate_password_hash(a['password'])\n"
+        # invalidates every existing session for this user (same
+        # mechanism as a self-service password change, spec 2.3) -- a
+        # rescue reset should not leave an old, possibly-compromised
+        # session valid.
+        "        u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
+        "        u['must_change_password'] = bool(a['must_change'])\n"
+        "        m.save_users(users)\n"
+        "        m.audit('user.password', m.resolve_tenant(u.get('tenant')) or '',\n"
+        "                u['username'], who=os.environ['OAAP_U_ACTOR'],\n"
+        "                role='server_admin',\n"
+        "                detail='must change at next sign-in' if a['must_change'] else '')\n"
+        "        body, code = {'ok': True}, 200",
+        {"username": username, "password": password,
+         "must_change": bool(must_change)}, _operator_name())
+
+
+_PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def generate_password(length=14):
+    """A password a person can read out: no 0/O, 1/l/I."""
+    import secrets as _secrets
+    return "".join(_secrets.choice(_PASSWORD_ALPHABET) for _ in range(length))
+
+
+def _when_note(u):
+    """The dates of a user, for a list line ('' when there are none)."""
+    bits = []
+    if u.get("deactivate_at"):
+        bits.append("deactivate " + u["deactivate_at"][:10])
+    if u.get("delete_at"):
+        bits.append("delete " + u["delete_at"][:10])
+    if not bits:
+        return ""
+    return " [" + ", ".join(bits) \
+        + (f" -- {u['schedule_reason']}" if u.get("schedule_reason") else "") + "]"
+
+
 def cmd_user(args):
     if args.action == "list":
         out = _identity_exec(
@@ -12588,7 +12719,105 @@ def cmd_user(args):
             roles = ",".join(u["roles"]) or "-"
             groups = ",".join(u.get("groups") or []) or "-"
             status = "active" if u["active"] else "INACTIVE"
-            print(f"{u['username']:<20} roles={roles:<32} groups={groups:<20} {status}")
+            if u.get("must_change_password"):
+                status += " (must change password)"
+            print(f"{u['username']:<20} roles={roles:<32} groups={groups:<20} "
+                  f"{status}{_when_note(u)}")
+        return
+
+    if args.action == "add":
+        # RFC-0046 §6.1. The same rules as the portal's form, because it
+        # is the same function in identity.
+        if not args.username:
+            die("'user add' needs a username, e.g. 'oaap user add kurs-tn-01 "
+                "--generate'")
+        roles = sorted({r.strip() for r in (args.roles or "user").split(",")
+                        if r.strip()})
+        groups = sorted({g.strip().lower() for g in (args.groups or "").split(",")
+                         if g.strip()})
+        tid = (resolve_tenant(args.tenant) if args.tenant
+               else ensure_default_tenant())
+        if tid is None:
+            die(f"this node has no tenant '{args.tenant}'")
+        if args.generate and args.password_file:
+            die("--generate and --password-file exclude each other")
+        generated = ""
+        if args.generate:
+            password = generated = generate_password()
+        elif args.password_file:
+            with open(args.password_file, encoding="utf-8") as f:
+                password = f.readline().rstrip("\r\n")
+        else:
+            password = getpass.getpass("Initial password (min 8 chars, hidden): ")
+        body = {"username": args.username.strip().lower(), "roles": roles,
+                "groups": groups, "tenant": tid, "password": password,
+                "display_name": args.display_name or "",
+                "must_change_password": not args.keep_password}
+        if args.deactivate_at is not None:
+            body["deactivate_at"] = args.deactivate_at
+        if args.delete_at is not None:
+            body["delete_at"] = args.delete_at
+        if args.reason is not None:
+            body["schedule_reason"] = args.reason
+        code, res = identity_user_create(body)
+        if code != 201:
+            die(res.get("error") or f"identity answered {code}")
+        print(f"User '{body['username']}' created in tenant "
+              f"'{tenant_label(tid) or 'default'}' with roles "
+              f"{','.join(roles)}.")
+        if body["must_change_password"]:
+            print("The first sign-in has to choose a new password.")
+        if generated:
+            print("")
+            print("  Initial password (shown ONCE, stored nowhere but as a hash):")
+            print("  " + generated)
+            print("")
+        return
+
+    if args.action == "schedule":
+        if not args.username:
+            die("'user schedule' needs a username")
+        dates = {}
+        if args.clear:
+            dates = {"deactivate_at": "", "delete_at": "", "schedule_reason": ""}
+        if args.deactivate_at is not None:
+            dates["deactivate_at"] = args.deactivate_at
+        if args.delete_at is not None:
+            dates["delete_at"] = args.delete_at
+        if args.reason is not None:
+            dates["schedule_reason"] = args.reason
+        if not dates:
+            die("'user schedule' needs --deactivate-at, --delete-at or --clear")
+        code, res = identity_user_schedule(args.username, dates)
+        if code != 200:
+            die(res.get("error") or f"identity answered {code}")
+        print(f"Dates of '{args.username}' saved"
+              + (" (cleared)." if args.clear and len(dates) == 3 else "."))
+        print("A worker acts on them once a day; nothing fires from this call.")
+        return
+
+    if args.action == "delete":
+        if not args.username:
+            die("'user delete' needs a username")
+        out = _identity_exec(
+            "import json, os, app as m\n"
+            "u = m.find_user(m.load_users(), os.environ['OAAP_CLI_USERNAME'])\n"
+            "print(json.dumps(m.public_user(u) if u else None))\n",
+            {"OAAP_CLI_USERNAME": args.username})
+        u = json.loads(out.strip().splitlines()[-1])
+        if u is None:
+            die(f"no such user: {args.username}")
+        print(f"This DELETES the user '{u['username']}' "
+              f"(id {u['id']}, tenant {tenant_label(u['tenant']) or 'default'}, "
+              f"roles {','.join(u['roles'])}).")
+        print("The record is gone for good; the audit log keeps the name and the id.")
+        if not args.yes:
+            if input(f"Type the username to confirm: ").strip() != u["username"]:
+                die("not confirmed -- nothing was deleted")
+        code, res = identity_user_delete(args.username)
+        if code != 200:
+            die(res.get("error") or f"identity answered {code}")
+        print(f"User '{args.username}' deleted.")
         return
 
     if args.action == "unbind":
@@ -12672,24 +12901,14 @@ def cmd_user(args):
     password = args.password or getpass.getpass("New password (min 8 chars, hidden): ")
     if len(password) < 8:
         die("password must be at least 8 characters")
-    out = _identity_exec(
-        "import os, sys, app as m\n"
-        "from werkzeug.security import generate_password_hash\n"
-        "with m.users_rw() as users:\n"
-        " u = m.find_user(users, os.environ['OAAP_CLI_USERNAME'])\n"
-        " if not u:\n"
-        "  print('no such user: ' + os.environ['OAAP_CLI_USERNAME'], file=sys.stderr)\n"
-        "  sys.exit(1)\n"
-        " u['password_hash'] = generate_password_hash(os.environ['OAAP_CLI_PASSWORD'])\n"
-        # invalidates every existing session for this user (same
-        # mechanism as a self-service password change, spec 2.3) — a
-        # rescue reset should not leave an old, possibly-compromised
-        # session valid.
-        " u['session_epoch'] = u.get('session_epoch', 0) + 1\n"
-        " m.save_users(users)\n"
-        "print('password reset for ' + u['username'] + ' -- existing sessions were signed out')\n",
-        {"OAAP_CLI_USERNAME": args.username, "OAAP_CLI_PASSWORD": password})
-    print(out.strip())
+    code, res = identity_user_set_password(
+        args.username, password, must_change=not args.keep_password)
+    if code != 200:
+        die(res.get("error") or f"identity answered {code}")
+    print(f"password reset for {args.username} -- existing sessions were signed out")
+    if not args.keep_password:
+        print("The next sign-in has to choose a new password "
+              "(--keep-password to leave it as set).")
 
 
 # ---------------------------------------------------------------- convert
@@ -18758,7 +18977,38 @@ def main():
                     help="validity in days (1-365, default 90)")
     pk.set_defaults(fn=cmd_key)
     pu = sub.add_parser("user")
-    pu.add_argument("action", choices=["list", "password", "unbind"])
+    pu.add_argument("action", choices=["list", "add", "delete", "schedule",
+                                       "password", "unbind"])
+    pu.add_argument("--roles", default="user",
+                    help="'add': comma-separated, default 'user'; "
+                         "server_admin is refused at this door")
+    pu.add_argument("--groups", default="",
+                    help="'add': comma-separated visibility groups (RFC-0007)")
+    pu.add_argument("--display-name", dest="display_name", default="",
+                    help="'add': the name shown in the portal")
+    pu.add_argument("--tenant", default="",
+                    help="'add': tenant label or id; default is this node's "
+                         "default tenant")
+    pu.add_argument("--password-file", dest="password_file", default="",
+                    help="'add': read the initial password from this file")
+    pu.add_argument("--generate", action="store_true",
+                    help="'add': make a password and print it ONCE")
+    pu.add_argument("--keep-password", dest="keep_password", action="store_true",
+                    help="'add'/'password': do NOT force a new password at the "
+                         "first sign-in (RFC-0046 §6.2)")
+    pu.add_argument("--deactivate-at", dest="deactivate_at", default=None,
+                    help="'add'/'schedule': date (YYYY-MM-DD, UTC) from which "
+                         "the user cannot sign in; '' clears")
+    pu.add_argument("--delete-at", dest="delete_at", default=None,
+                    help="'add'/'schedule': date on which the user is deleted "
+                         "(only when nothing of theirs is left); '' clears")
+    pu.add_argument("--reason", default=None,
+                    help="'add'/'schedule': why the dates exist, e.g. "
+                         "'cohort kurs-2026-10'")
+    pu.add_argument("--clear", action="store_true",
+                    help="'schedule': remove both dates")
+    pu.add_argument("--yes", action="store_true",
+                    help="'delete': do not ask for the username again")
     pu.add_argument("--keep-active", dest="keep_active", action="store_true",
                     help="'unbind' only: break the binding without "
                          "deactivating the account (repairing a binding "

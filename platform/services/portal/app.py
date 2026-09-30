@@ -431,6 +431,7 @@ USER_EDIT_BODY = """
 <div class="pagehead">
   <h1>{{ u.username }}{% if u.display_name %} <span class="muted">({{ u.display_name }})</span>{% endif %}</h1>
   <span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span>
+  {% if u.must_change_password %}<span class="badge off">Passwort muss beim nächsten Anmelden geändert werden</span>{% endif %}
 </div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
@@ -483,6 +484,17 @@ USER_EDIT_BODY = """
     <h2>Status</h2>
     <label class="checkline"><input type="checkbox" name="active"
         {{ 'checked' if u.active }}>Benutzer ist aktiv (abwählen deaktiviert die Anmeldung sofort)</label>
+    <label>Deaktivieren am (Datum, UTC)
+      <input type="date" name="deactivate_at" value="{{ (u.deactivate_at or '')[:10] }}"></label>
+    <label>Löschen am (Datum, UTC)
+      <input type="date" name="delete_at" value="{{ (u.delete_at or '')[:10] }}"></label>
+    <label>Grund der Termine
+      <input type="text" name="schedule_reason" maxlength="80"
+             value="{{ u.schedule_reason or '' }}" placeholder="z. B. Kohorte kurs-2026-10"></label>
+    <p class="muted">Ein Lauf am Tag setzt die Termine um; leer lassen heißt
+       „kein Termin“. Gelöscht wird nur, wenn nichts von dieser Person mehr
+       da ist — sonst wartet der Termin und es wird protokolliert.
+       Für einen server_admin gibt es keine Termine.</p>
     <button>Speichern</button>
   </div>
 </form>
@@ -493,6 +505,21 @@ USER_EDIT_BODY = """
       <input type="password" name="password" minlength="8" required
              autocomplete="new-password"></label>
     <button>Passwort setzen</button>
+  </form>
+  <p class="muted">Die Person wählt beim nächsten Anmelden ein eigenes
+     Passwort — das hier kennt ja jemand anderes.</p>
+</div>
+<div class="card">
+  <h2>Benutzer löschen</h2>
+  <p class="muted">Der Datensatz verschwindet endgültig. Das Protokoll behält
+     Namen und Kennung (<code>{{ u.id }}</code>). Verweigert wird es für
+     einen server_admin, für den letzten tenant_admin und
+     solange der Benutzer einen gültigen API-Schlüssel hat.</p>
+  <form method="post" action="/users/{{ u.username }}/delete">
+    <label>Zur Bestätigung den Benutzernamen eintippen
+      <input type="text" name="confirm" autocomplete="off" required
+             placeholder="{{ u.username }}"></label>
+    <button class="secondary">Benutzer löschen</button>
   </form>
 </div>
 """
@@ -4355,6 +4382,11 @@ def users_update(username):
         "roles": request.form.getlist("roles"),
         "groups": _parse_groups(request.form.get("groups", "")),
         "active": request.form.get("active") == "on",
+        # RFC-0046 §6.3. Always sent: this form shows the stored values,
+        # and an empty field is the administrator saying "no date".
+        "deactivate_at": request.form.get("deactivate_at", "").strip(),
+        "delete_at": request.form.get("delete_at", "").strip(),
+        "schedule_reason": request.form.get("schedule_reason", "").strip(),
         "actor": caller_name(),
     }, timeout=5)
     if resp.status_code == 200:
@@ -4386,6 +4418,27 @@ def users_password(username):
     if resp.status_code == 200:
         return redirect(f"/users/{username}?msg={quote('Passwort wurde gesetzt.')}", code=303)
     return redirect(f"/users/{username}?err={quote(resp.json().get('error', 'Passwort setzen fehlgeschlagen.'))}", code=303)
+
+
+@app.post("/users/<username>/delete")
+def users_delete(username):
+    denied = require_user_admin()
+    if denied:
+        return denied
+    # Typing the name is the confirmation (RFC-0046 §10: everything that
+    # deletes says what it deletes and asks). Checked here, where the
+    # form is; identity has no notion of a confirmation and should not.
+    if request.form.get("confirm", "").strip() != username:
+        return redirect(f"/users/{username}?err=" + quote(
+            "Zur Bestätigung den Benutzernamen genau eintippen — nichts "
+            "wurde gelöscht."), code=303)
+    resp = INTERNAL.delete(f"{IDENTITY}/internal/users/{username}", json={
+        "actor": caller_name()}, timeout=5)
+    if resp.status_code == 200:
+        return redirect("/users?msg=" + quote(
+            f"Benutzer {username} wurde gelöscht."), code=303)
+    return redirect(f"/users/{username}?err=" + quote(
+        resp.json().get("error", "Löschen fehlgeschlagen.")), code=303)
 
 
 # --- the tenant page (oaap.core.tenant 2.1/1.7) ----------------------------

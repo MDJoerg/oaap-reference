@@ -86,6 +86,18 @@ ASSIGNABLE_ROLES = ("server_admin", "tenant_admin", "support", "admin",
 NODE_WIDE_ROLES = frozenset({"server_admin", "support"})
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
 
+# RFC-0046 §6 (identity 0.6): a person's lifetime on this node.
+#
+# `must_change_password`: an initial password that somebody else typed
+# (an administrator, a handout) is a password somebody else knows. While
+# the flag stands, a SESSION reaches the password page and nothing else.
+# `deactivate_at` / `delete_at`: two optional dates, acted on by a
+# worker (RFC-0046 §5), never by a request. `schedule_reason` says why
+# the dates exist ("cohort kurs-2026-10") so that the page a person
+# lands on can name it.
+SCHEDULE_REASON_MAX = 80
+PASSWORD_MIN = 8
+
 # RFC-0040: the person behind the name.
 #
 # THE IDENTITY. Every user record carries a UUID that is assigned once,
@@ -441,6 +453,12 @@ def load_users():
         # every record written before tenants existed, and it is why
         # this migration cannot break a running node.
         u.setdefault("tenant", "")
+        # RFC-0046 §6.2/§6.3. Absent reads as "no": every record written
+        # before 0.6 keeps signing in exactly as it did.
+        u.setdefault("must_change_password", False)
+        u.setdefault("deactivate_at", "")
+        u.setdefault("delete_at", "")
+        u.setdefault("schedule_reason", "")
     return users
 
 
@@ -601,7 +619,11 @@ def public_user(u):
             "roles": u["roles"], "groups": u["groups"], "active": u["active"],
             "tenant": u.get("tenant", ""), "kind": u.get("kind", "human"),
             "id": u.get("id", ""), "email": u.get("email", ""),
-            "email_verified": bool(u.get("email_verified"))}
+            "email_verified": bool(u.get("email_verified")),
+            "must_change_password": bool(u.get("must_change_password")),
+            "deactivate_at": u.get("deactivate_at", ""),
+            "delete_at": u.get("delete_at", ""),
+            "schedule_reason": u.get("schedule_reason", "")}
 
 
 def _header_value(value):
@@ -997,7 +1019,30 @@ def _by_session():
     if kid and not _terminal_key_ok(kid):
         session.clear()
         return None, "session", login_redirect()
+    # RFC-0046 §6.2: a session whose password somebody else chose reaches
+    # the password page and nothing else. Here, in the one function every
+    # session-shaped answer comes from (/verify, /auth/whoami), so that no
+    # route can forget it.
+    if user.get("must_change_password"):
+        return None, "session", _must_change_refusal()
     return user, "session", None
+
+
+def _must_change_refusal():
+    """The answer for a session that has to change its password first.
+
+    A browser NAVIGATING gets sent to the password page, with the place it
+    was going remembered -- a bare 403 there would be the first thing a
+    course participant sees after signing in. A script (a fetch, a
+    WebSocket upgrade) gets the 403 and the reason, never a redirect it
+    would follow into an HTML page and call success.
+    """
+    if is_navigation():
+        target = _return_target(_requested_uri())
+        return redirect("/auth/password" + (
+            "?next=" + quote(target, safe="") if target else ""), code=303)
+    return ("Forbidden: this account must change its password first "
+            "(open /auth/password).", 403)
 
 
 def resolve_principal(instance=""):
@@ -1123,15 +1168,18 @@ PASSWORD_PAGE = _HEAD + "<title>Passwort ändern — OAAP</title>" + _CARD_STYLE
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if done %}
   <p class="ok">Das Passwort wurde geändert.</p>
-  <p><a href="/">Zurück zum Portal</a></p>
+  <p><a href="{{ next or '/' }}">{{ 'Weiter' if next else 'Zurück zum Portal' }}</a></p>
 {% else %}
+{% if forced %}<p class="hint">Dieses Passwort hat jemand anderes vergeben.
+   Bitte wähle jetzt Dein eigenes — vorher geht es nicht weiter.</p>{% endif %}
 <form method="post" action="/auth/password">
+{% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
   <label>Aktuelles Passwort <input name="current" type="password" required autocomplete="current-password"></label>
   <label>Neues Passwort (mind. 8 Zeichen)
     <input name="new" type="password" minlength="8" required autocomplete="new-password"></label>
   <button>Passwort ändern</button>
 </form>
-<p><a href="/">Zurück zum Portal</a></p>
+{% if not forced %}<p><a href="/">Zurück zum Portal</a></p>{% endif %}
 {% endif %}
 </div></body></html>"""])
 
@@ -1452,6 +1500,12 @@ def login():
         session["user"] = u["username"]
         session["epoch"] = u.get("session_epoch", 0)
         print(f"login ok: {u['username']} from {_client_ip()}", flush=True)
+        if u.get("must_change_password"):
+            # RFC-0046 §6.2: straight to the one page this session may
+            # use, carrying the place they were going.
+            return redirect("/auth/password" + (
+                "?next=" + quote(target, safe="") if target else ""),
+                code=303)
         # Back to where they were going, or the start page (RFC-0040
         # §5). The instance always survived, because the browser stays
         # on the same hostname; the path and query did not, which is
@@ -1915,24 +1969,44 @@ def logout():
 def password_form():
     if not session_username():
         return login_redirect()
-    return render_template_string(PASSWORD_PAGE, error=None, done=False)
+    u = find_user(load_users(), session_username() or "")
+    return render_template_string(
+        PASSWORD_PAGE, error=None, done=False,
+        forced=bool(u and u.get("must_change_password")),
+        next=_return_target(request.args.get("next", "")))
 
 
 @app.post("/auth/password")
 def password_change():
-    """Self-service password change (spec 2.4)."""
+    """Self-service password change (spec 2.4).
+
+    Also the way OUT of `must_change_password` (RFC-0046 §6.2): the flag
+    is cleared here and nowhere else. A forced change must produce a
+    DIFFERENT password -- "change it to what it already is" would clear
+    the flag and leave the handout's password standing.
+    """
+    target = _return_target(request.form.get("next", ""))
     with users_rw() as users:
         u = find_user(users, session_username() or "")
         if not u or not u["active"]:
             return login_redirect()
+        forced = bool(u.get("must_change_password"))
+
+        def again(msg, status):
+            return render_template_string(
+                PASSWORD_PAGE, error=msg, done=False, forced=forced,
+                next=target), status
+
         if not check_password_hash(u["password_hash"], request.form.get("current", "")):
-            return render_template_string(
-                PASSWORD_PAGE, error="Das aktuelle Passwort stimmt nicht.", done=False), 403
+            return again("Das aktuelle Passwort stimmt nicht.", 403)
         new = request.form.get("new", "")
-        if len(new) < 8:
-            return render_template_string(
-                PASSWORD_PAGE, error="Das neue Passwort braucht mindestens 8 Zeichen.", done=False), 400
+        if len(new) < PASSWORD_MIN:
+            return again("Das neue Passwort braucht mindestens 8 Zeichen.", 400)
+        if forced and new == request.form.get("current", ""):
+            return again("Das neue Passwort muss sich vom bisherigen "
+                         "unterscheiden.", 400)
         u["password_hash"] = generate_password_hash(new)
+        u["must_change_password"] = False
         # Standard practice: a password change signs out every OTHER copy of
         # this user's cookie. Keep this browser signed in by advancing its
         # own session to match (else the request right after this one would
@@ -1941,7 +2015,13 @@ def password_change():
         session["epoch"] = u["session_epoch"]
         save_users(users)
     print(f"password changed: {u['username']} (other sessions revoked)", flush=True)
-    return render_template_string(PASSWORD_PAGE, error=None, done=True)
+    if forced:
+        audit("user.password-changed", resolve_tenant(u.get("tenant")) or "",
+              u["username"], who=u["username"], role="-",
+              detail="first-login change (must_change_password cleared)")
+        return redirect(target or "/", code=303)
+    return render_template_string(PASSWORD_PAGE, error=None, done=True,
+                                  forced=False, next="")
 
 
 @app.get("/auth/whoami")
@@ -2433,6 +2513,70 @@ def _validated_groups(raw):
     return sorted(set(groups))
 
 
+def _when(raw, label):
+    """A moment as `YYYY-MM-DDTHH:MM:SSZ` (UTC), or "" for none.
+
+    Accepts a plain date (start of that day, UTC) or a date with a time.
+    Anything else is refused rather than guessed: a date read in the wrong
+    zone or the wrong order is an account deleted a day early.
+    """
+    value = raw.strip() if isinstance(raw, str) else raw
+    if not value:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{label}: ein Datum als JJJJ-MM-TT oder "
+                         "JJJJ-MM-TTThh:mm:ssZ.")
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(value, fmt).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+    raise ValueError(f"{label}: ein Datum als JJJJ-MM-TT oder "
+                     "JJJJ-MM-TTThh:mm:ssZ (UTC).")
+
+
+def _validated_schedule(body, u_roles, was):
+    """(deactivate_at, delete_at, reason) for a create or an update.
+
+    RFC-0046 §6.3. `was` is what the record holds now (or {} on create); a
+    key ABSENT from the body keeps it -- the portal's edit form does not
+    send these fields and must not clear them by saying nothing. "" clears.
+
+    Refused, not silently fired: a moment in the past; a deletion that is
+    not after the deactivation; and any date at all on a holder of
+    server_admin (the node's last administrator cannot leave on a timer,
+    and the rule is easier to keep as "never" than as "unless").
+    """
+    now = _now_iso()
+    out = {}
+    for key, label in (("deactivate_at", "Deaktivierung"),
+                       ("delete_at", "Löschung")):
+        if key in body:
+            out[key] = _when(body[key], label)
+            # A value the record already holds is not NEW: the portal's
+            # form sends the stored dates back with every save, and a
+            # date that has since passed (the worker has not run yet, or
+            # a deletion is waiting for an empty seat) must not make an
+            # unrelated edit impossible.
+            if out[key] and out[key] <= now and out[key] != was.get(key):
+                raise ValueError(f"{label}: der Zeitpunkt liegt nicht in der "
+                                 "Zukunft.")
+        else:
+            out[key] = was.get(key, "")
+    if out["deactivate_at"] and out["delete_at"] \
+            and out["delete_at"] <= out["deactivate_at"]:
+        raise ValueError("Die Löschung muss nach der Deaktivierung liegen.")
+    reason = (body["schedule_reason"] if "schedule_reason" in body
+              else was.get("schedule_reason", ""))
+    reason = str(reason or "").strip()[:SCHEDULE_REASON_MAX]
+    if (out["deactivate_at"] or out["delete_at"]) \
+            and "server_admin" in (u_roles or []):
+        raise ValueError("Für einen server_admin gibt es keine Termine.")
+    return (out["deactivate_at"], out["delete_at"],
+            reason if (out["deactivate_at"] or out["delete_at"]) else "")
+
+
 def _actor(body_or_args):
     """The user this call is made ON BEHALF OF, from the portal.
 
@@ -2588,12 +2732,13 @@ def _create_user(body, users, actor_name, role, actor_tenant):
     # authenticates by key and cannot use the login form. Giving it an
     # unusable password instead would leave a hash nobody can explain.
     kind = "machine" if (body.get("kind") == "machine") else "human"
-    if kind == "human" and len(body.get("password") or "") < 8:
+    if kind == "human" and len(body.get("password") or "") < PASSWORD_MIN:
         return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
     try:
         roles = _validated_roles(body.get("roles"))
         groups = _validated_groups(body.get("groups"))
         email = _validated_email(body.get("email"))
+        deactivate_at, delete_at, reason = _validated_schedule(body, roles, {})
     except ValueError as e:
         return {"error": str(e)}, 400
     # Which tenant the account is created into (spec 2.2). A
@@ -2640,11 +2785,23 @@ def _create_user(body, users, actor_name, role, actor_tenant):
         "groups": groups,
         "tenant": tenant,
         "active": True,
+        # RFC-0046 §6.2: the password an administrator typed is known to
+        # somebody else, so the first sign-in has to replace it. The
+        # default is "yes"; a caller that really means an initial
+        # password to keep says so (`false`), and a machine has none.
+        "must_change_password": (kind == "human"
+                                 and body.get("must_change_password", True)
+                                 is not False),
+        "deactivate_at": deactivate_at,
+        "delete_at": delete_at,
+        "schedule_reason": reason,
     })
     save_users(users)
     audit("user.create", tenant, username, who=actor_name, role=role,
           detail=("machine, " if kind == "machine" else "")
-                 + "roles: " + ",".join(roles))
+                 + "roles: " + ",".join(roles)
+                 + (f"; deactivate {deactivate_at}" if deactivate_at else "")
+                 + (f"; delete {delete_at}" if delete_at else ""))
     return {"ok": True}, 201
 
 
@@ -2674,6 +2831,7 @@ def _update_user(username, body, users, actor_name, role, actor_tenant):
         roles = _validated_roles(body.get("roles"))
         groups = _validated_groups(body.get("groups"))
         email = _validated_email(body.get("email"))
+        deactivate_at, delete_at, reason = _validated_schedule(body, roles, u)
     except ValueError as e:
         return {"error": str(e)}, 400
     active = bool(body.get("active", True))
@@ -2690,6 +2848,9 @@ def _update_user(username, body, users, actor_name, role, actor_tenant):
     u["roles"] = roles
     u["groups"] = groups
     u["active"] = active
+    was_when = (u.get("deactivate_at", ""), u.get("delete_at", ""))
+    u["deactivate_at"], u["delete_at"] = deactivate_at, delete_at
+    u["schedule_reason"] = reason
     u["display_name"] = (body.get("display_name") or "").strip()[:DISPLAY_NAME_MAX]
     # RFC-0040 §3.2: a CHANGED address is an address nobody proved, so
     # the flag falls with it -- the caller cannot keep an old assertion
@@ -2712,6 +2873,10 @@ def _update_user(username, body, users, actor_name, role, actor_tenant):
         detail += " (was " + ",".join(was_roles) + ")"
     if was_active != active:
         detail += "; deactivated" if not active else "; reactivated"
+    if was_when != (deactivate_at, delete_at):
+        detail += (f"; deactivate_at {deactivate_at or '-'}, "
+                   f"delete_at {delete_at or '-'}"
+                   + (f" ({reason})" if reason else ""))
     if was_email != email:
         detail += "; e-mail set" if email else "; e-mail removed"
     if u["email_verified"] != was_verified:
@@ -2739,10 +2904,84 @@ def users_set_password(username):
         u = find_user(users, username)
         if not u or not may_see(role, actor_tenant, u):
             return {"error": "Benutzer nicht gefunden."}, 404
-        if len(body.get("password") or "") < 8:
+        if len(body.get("password") or "") < PASSWORD_MIN:
             return {"error": "Das Passwort braucht mindestens 8 Zeichen."}, 400
+        if u.get("kind", "human") == "machine":
+            return {"error": "Ein Maschinen-Prinzipal hat kein Passwort."}, 400
         u["password_hash"] = generate_password_hash(body["password"])
+        # RFC-0046 §6.2: a password somebody else set is one somebody
+        # else knows -- the person changes it at the next sign-in. Said
+        # `false` only by a caller that means it (an operator fixing their
+        # own account on purpose).
+        forced = body.get("must_change_password", True) is not False
+        u["must_change_password"] = forced
+        # Existing sessions of that person end with the old password.
+        u["session_epoch"] = u.get("session_epoch", 0) + 1
         save_users(users)
     audit("user.password", resolve_tenant(u.get("tenant")) or "", username,
-          who=actor_name, role=role)
+          who=actor_name, role=role,
+          detail="must change at next sign-in" if forced else "")
     return {"ok": True}
+
+
+@app.delete("/internal/users/<username>")
+def users_delete(username):
+    body = request.get_json(force=True, silent=True) or {}
+    actor_name = _actor(body) or _actor(request.args)
+    role, actor_tenant, err = authority(actor_name)
+    if not role:
+        return {"error": err or "Nicht berechtigt."}, 403
+    with users_rw() as users:
+        return _delete_user(username, users, actor_name, role, actor_tenant)
+
+
+def _delete_user(username, users, actor_name, role, actor_tenant):
+    """Remove a user record (RFC-0046 §6.4; identity 2.4 left this open).
+
+    The record goes. The audit log keeps the name and the `id` as TEXT
+    (entries already written must stay readable); apps that stored the
+    name keep a string that no longer resolves, which is what "the person
+    is gone" should look like. Sessions die by themselves -- a cookie
+    naming a user that does not exist fails `_by_session`.
+
+    Refused, each with its reason: the actor themselves (an administrator
+    who deletes their own account cannot be told what happened); a holder
+    of server_admin (RFC-0008: the node keeps its administrators); the
+    last tenant_admin of a tenant (nobody would remain to manage it); a
+    user with an API key that still works (revoke it first -- deleting the
+    principal would leave a credential naming nobody). Whether a person's
+    INSTANCES are gone is not identity's to know; the caller that owns
+    that rule (RFC-0046 §5) asks before it comes here.
+    """
+    u = find_user(users, username)
+    if not u or not may_see(role, actor_tenant, u):
+        return {"error": "Benutzer nicht gefunden."}, 404
+    if username == actor_name:
+        return {"error": "Das eigene Konto löscht man nicht selbst."}, 409
+    if "server_admin" in u["roles"]:
+        return {"error": "Ein server_admin wird nicht gelöscht — zuerst "
+                         "die Rolle abgeben."}, 409
+    if "tenant_admin" in u["roles"]:
+        mine = resolve_tenant(u.get("tenant"))
+        others = [x for x in users if x["username"] != username
+                  and "tenant_admin" in x["roles"]
+                  and resolve_tenant(x.get("tenant")) == mine]
+        if not others:
+            return {"error": "Das ist der letzte tenant_admin dieses "
+                             "Mandanten — zuerst jemand anderem die Rolle "
+                             "geben."}, 409
+    live = [k["id"] for k in load_keys()
+            if k["principal"] == username and not k["revoked"]
+            and (not k.get("expires") or k["expires"] > _now_iso())]
+    if live:
+        return {"error": "Es gibt noch gültige API-Schlüssel dieses "
+                         "Benutzers (" + ", ".join(live) + ") — zuerst "
+                         "entziehen.", "keys": live}, 409
+    users.remove(u)
+    save_users(users)
+    audit("user.delete", resolve_tenant(u.get("tenant")) or "", username,
+          who=actor_name, role=role,
+          detail=f"id {u.get('id', '')}"
+                 + (f", {u['display_name']}" if u.get("display_name") else "")
+                 + ("; machine" if u.get("kind") == "machine" else ""))
+    return {"ok": True, "id": u.get("id", "")}
