@@ -36,6 +36,7 @@ tiles yet; role `public` supported but discouraged.
 """
 
 import argparse
+import datetime
 import getpass
 import ipaddress
 import json
@@ -75,6 +76,9 @@ import idp  # noqa: E402
 # not a thing to put within reach of one that does not.
 import idp_admin  # noqa: E402
 import move  # noqa: E402
+# The cohort (RFC-0046): what a template may say and how a seat is
+# called. Pure; the acting is cmd_cohort below.
+import cohort  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -11760,6 +11764,18 @@ def _install_from_dir(pkg, args, source):
     # the manifest are re-read so 'endpoint list/allow' works offline.
     granted = (inst.get("endpoints") or []) if inst else []
 
+    # What a caller that CREATES instances in bulk knows before the first
+    # start (RFC-0046 §2/§3): its configuration and seeds land here, after
+    # the environment file and before the container, so the app finds them
+    # on its first run; the limits and the group restriction are the
+    # instance's from its first moment, not after a second recreate.
+    preset = getattr(args, "preset", None) or {}
+    hook = getattr(args, "before_start", None)
+    if hook:
+        hook(name, ident, services, m)
+    if preset.get("resources") and not (inst and inst.get("resources")):
+        ident = dict(ident, resources=preset["resources"])
+
     # per-instance storage, writable for the container user (guarantee 4);
     # every service container lands on the instance's own network (RFC-0016)
     recreate_instance_containers(name, services, m.get("storage") or [], granted,
@@ -11767,7 +11783,8 @@ def _install_from_dir(pkg, args, source):
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance
-    visibility = (inst.get("visibility") or {}) if inst else {}
+    visibility = ((inst.get("visibility") or {}) if inst
+                  else dict(preset.get("visibility") or {}))
 
     with open(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"), "w", encoding="utf-8") as f:
         f.write(caddy_site(port, m["routes"], container, primary["port"],
@@ -11903,6 +11920,13 @@ def _install_from_dir(pkg, args, source):
     # creation above (from the registry), and kept in the record here
     if inst and inst.get("resources"):
         reg["instances"][name]["resources"] = dict(inst["resources"])
+    elif preset.get("resources"):
+        reg["instances"][name]["resources"] = dict(preset["resources"])
+    # which cohort seat this instance belongs to (RFC-0046 §3): kept by a
+    # redeploy like the limits, so `oaap cohort` still finds it
+    if (inst or {}).get("cohort") or preset.get("cohort"):
+        reg["instances"][name]["cohort"] = dict(
+            (inst or {}).get("cohort") or preset["cohort"])
     # a granted non-HTTP endpoint (RFC-0015) is the operator's decision to
     # open a port — it survives redeploy like the address. The container
     # was already recreated with its publish mapping (via `granted`).
@@ -13129,6 +13153,786 @@ def cmd_user(args):
     if not args.keep_password:
         print("The next sign-in has to choose a new password "
               "(--keep-password to leave it as set).")
+
+
+# ------------------------------------------------- the cohort (RFC-0046 §2-§4)
+#
+# N seats in one tenant from one template file. Everything here is a
+# composition of things that already exist -- `identity_user_create`,
+# `_install_from_dir`, `remove_instance`, `apply_resources`'s limits --
+# so the stage-2 API (RFC-0046 §8) can call the same functions and nothing
+# is built twice. The pure part (what a template may say, how a seat is
+# called, where a seed may land) is `services/cohort.py`.
+#
+# The operator on the node acts with node authority, as `machine add` and
+# `user add` do: the rule "the tenant comes from the actor" (§4) bites in
+# stage 2, where an actor is a session or a key and not a command line.
+
+COHORT_DIR = os.path.join(DATA_DIR, "data", "cohorts")
+# Beside the destination secrets: a directory only the host reads.
+COHORT_SECRETS_FILE = os.path.join(DEST_SECRETS_DIR, "cohort-secrets.json")
+
+
+def _cohort_path(tid, name):
+    return os.path.join(COHORT_DIR, tid, name)
+
+
+def load_cohort(tid, name):
+    try:
+        with open(os.path.join(_cohort_path(tid, name), "cohort.json"),
+                  encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_cohort(rec):
+    d = _cohort_path(rec["tenant"], rec["name"])
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, "cohort.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, os.path.join(d, "cohort.json"))
+
+
+def find_cohort(name, tenant_label=""):
+    """The record of the cohort called `name` (die() when there is none).
+
+    A name is unique inside a tenant, not on the node: two tenants may
+    both run `kurs-1`, and then `--tenant` says which.
+    """
+    if not name:
+        die("this needs the cohort's name (see: oaap cohort list)")
+    want = resolve_tenant_arg(tenant_label)
+    hits = []
+    if os.path.isdir(COHORT_DIR):
+        for tid in sorted(os.listdir(COHORT_DIR)):
+            if want and tid != want:
+                continue
+            rec = load_cohort(tid, name)
+            if rec:
+                hits.append(rec)
+    if not hits:
+        die(f"no cohort '{name}' on this node (see: oaap cohort list)")
+    if len(hits) > 1:
+        die(f"more than one tenant has a cohort '{name}' -- add --tenant")
+    return hits[0]
+
+
+def _cohort_template(rec):
+    """The stored copy of the template -- what the cohort was made from,
+    whatever the trainer's file says today (RFC-0046 §2)."""
+    tdir = os.path.join(_cohort_path(rec["tenant"], rec["name"]), "template")
+    try:
+        tpl = cohort.load(tdir)
+    except cohort.TemplateError as e:
+        die("the stored template of this cohort is unusable: " + "; ".join(e.problems))
+    return tpl, tdir
+
+
+def _cohort_with_seats(tpl, rec):
+    """The template, with the seats that were added later included."""
+    tpl = dict(tpl, seat_ids=list(tpl["seat_ids"]),
+               seat_labels=list(tpl["seat_labels"]))
+    for sid, seat in (rec.get("seats") or {}).items():
+        if sid not in tpl["seat_ids"]:
+            tpl["seat_ids"].append(sid)
+            tpl["seat_labels"].append(seat.get("label") or None)
+    return tpl
+
+
+def load_cohort_secrets():
+    """{tenant-id: {name: value}} -- named secrets a template may refer to."""
+    try:
+        with open(COHORT_SECRETS_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("secrets") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cohort_secrets(secrets_):
+    os.makedirs(DEST_SECRETS_DIR, exist_ok=True)
+    os.chmod(DEST_SECRETS_DIR, 0o700)
+    tmp = COHORT_SECRETS_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"secrets": secrets_}, f, indent=2)
+    os.replace(tmp, COHORT_SECRETS_FILE)
+
+
+def _cohort_audit(action, rec, detail="", subject=""):
+    audit_tenant(action, rec["tenant"], subject=subject or rec["name"],
+                 who=_operator_name(), role="root", detail=detail)
+
+
+def _cohort_existing_users():
+    out = _identity_exec(
+        "import json, app as m\n"
+        "print(json.dumps([u['username'] for u in m.load_users()]))\n")
+    return set(json.loads(out.strip().splitlines()[-1]))
+
+
+def _cohort_source(app, confirm_source=""):
+    """Where an app of the template comes from.
+
+    A store id is resolved against the CONFIGURED sources, like the
+    portal's one-click install. A git address is taken as written: on the
+    node the operator is the authority for it, and stage 2 restricts it.
+    """
+    if app["kind"] == "git":
+        return {"kind": "git", "url": app["id"], "path": app["path"],
+                "ref": app["ref"]}
+    src, _version, store_src = _store_lookup(app["id"], app["source"])
+    if not src:
+        die(f"'{app['id']}' is not listed in any configured store source")
+    if store_src["trust"] == "unverified" and confirm_source != store_src["id"]:
+        die(f"'{store_src['name']}' is an unverified source -- repeat with "
+            f"--confirm-source {store_src['id']} if that is intended "
+            "(RFC-0012 §3)")
+    src["store_source"] = store_src["id"]
+    return src
+
+
+def _cohort_env_value(key, value, multiline):
+    """A config value as instance.env keeps it: one line. A multiline key
+    is stored `;`-separated, as the portal's textarea stores it."""
+    text = str(value).replace("\r", "")
+    if multiline:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if any(";" in l for l in lines):
+            die(f"config {key}: an entry may not contain ';' (it separates "
+                "the entries)")
+        return ";".join(lines)
+    if "\n" in text:
+        die(f"config {key}: this key takes one line")
+    return text
+
+
+def _cohort_before_start(tpl, tdir, sid, app, secrets_map):
+    """The hook `_install_from_dir` calls after the environment file and
+    before the first start: configuration, seeds and material land where
+    the app finds them on its FIRST run (RFC-0046 §2)."""
+    ctx = cohort.context(tpl, sid, app)
+
+    def hook(name, ident, services, m):
+        decl = {c["key"]: c for c in m.get("config") or []}
+        unknown = sorted(set(app["config"]) - set(decl))
+        if unknown:
+            die(f"'{app['id']}' does not declare config key(s): "
+                f"{', '.join(unknown)}")
+        env = load_env(name, ident)
+        for key, val in app["config"].items():
+            if isinstance(val, dict):
+                secret = secrets_map.get(val["secret"])
+                if secret is None:
+                    die(f"the tenant has no stored secret '{val['secret']}' "
+                        f"(oaap cohort secret set {val['secret']})")
+                env[key] = _cohort_env_value(key, secret, False)
+            else:
+                env[key] = _cohort_env_value(
+                    key, cohort.expand(val, ctx),
+                    bool(decl[key].get("multiline")))
+        save_env(name, env, ident)
+        if not (app["seed"] or app["material"]):
+            return
+        storages = {s["name"] for s in m.get("storage") or []}
+        base = os.path.join(instance_dir(name, ident), "storage")
+        # The image's own user owns what is written: the container runs
+        # as it, and a seed it cannot touch is worse than none.
+        uid = image_uid(services[0]["image"])
+        if app["seed"]:
+            if app["seed_to"] not in storages:
+                die(f"'{app['id']}' has no storage '{app['seed_to']}' for the seeds")
+            root = os.path.join(base, app["seed_to"])
+            os.makedirs(root, exist_ok=True)
+            if uid is not None:
+                os.chown(root, uid, uid)
+            for target, src_file in app["seed"].items():
+                cohort.write_seed(root, target,
+                                  cohort.read_seed(tdir, src_file, ctx), uid)
+        if app["material"]:
+            if "material" not in storages:
+                die(f"'{app['id']}' has no storage 'material'")
+            cohort.copy_material(os.path.join(tdir, app["material"]),
+                                 os.path.join(base, "material"), uid)
+    return hook
+
+
+def _cohort_resources(tpl, app):
+    """The limits of one app in the template: cohort default, app on top."""
+    merged = dict(tpl["resources"])
+    merged.update(app["resources"])
+    try:
+        return parse_resources(merged.get("memory"), merged.get("cpus"),
+                               merged.get("pids"))
+    except ValueError as e:
+        die(f"resources of '{app['name']}': {e}")
+
+
+def _cohort_capacity_note(tpl, seats):
+    """Say BEFORE the first container what the limits add up to (§7)."""
+    per_seat = 0
+    for app in tpl["apps"]:
+        limit = _cohort_resources(tpl, app).get("memory")
+        per_seat += (memory_bytes(limit) if limit else 0) \
+            * (1 if app["shared"] else seats)
+    if not per_seat:
+        return
+    total, _limited, _free = resources_sum(load_registry().get("instances"))
+    total += per_seat
+    ram = _node_ram_bytes()
+    line = (f"Limits of this cohort: {per_seat / 1024 ** 3:.1f} GB "
+            f"({seats} seat(s)); with the instances already limited "
+            f"{total / 1024 ** 3:.1f} GB")
+    if ram:
+        line += f" against {ram / 1024 ** 3:.1f} GB RAM"
+    print(line + ".")
+    if ram and total > ram:
+        print("WARNING: the limits add up to more than this machine has -- "
+              "if every seat fills its limit, the kernel ends containers.")
+
+
+def _cohort_instances(rec, sids=None):
+    """[(seat id or '', app name, registry key)] of a cohort."""
+    out = []
+    for app_name, key in sorted((rec.get("shared") or {}).items()):
+        out.append(("", app_name, key))
+    for sid, seat in sorted((rec.get("seats") or {}).items()):
+        if sids is not None and sid not in sids:
+            continue
+        for app_name, key in sorted((seat.get("instances") or {}).items()):
+            out.append((sid, app_name, key))
+    return out
+
+
+def _cohort_install(tpl, tdir, tid, rec, sid, app, src, secrets_map):
+    """Make one instance of the template unless it exists -> (key, made)."""
+    local = cohort.instance_name(tpl, app, sid)
+    reg = load_registry()
+    key, inst = find_instance(reg, tid, local)
+    if inst is not None:
+        return key, False
+    group = cohort.cohort_group(tpl) if app["shared"] else cohort.seat_group(tpl, sid)
+    preset = {"visibility": {"groups": [group]},
+              "cohort": {"name": tpl["name"], "seat": "" if app["shared"] else sid}}
+    res = _cohort_resources(tpl, app)
+    if res:
+        preset["resources"] = res
+    ns = argparse.Namespace(
+        package=source_package_arg(local, src), path=src.get("path", ""),
+        ref=src.get("ref", ""), name=local, channel=app["channel"],
+        store_source=src.get("store_source", ""), tenant=tid, confirm=False,
+        bind=[], preset=preset,
+        before_start=_cohort_before_start(tpl, tdir, sid, app, secrets_map))
+    cmd_install(ns)
+    key, inst = find_instance(load_registry(), tid, local)
+    if inst is None:
+        die(f"installing '{local}' left no instance behind")
+    return key, True
+
+
+def _cohort_address(app, key):
+    inst = load_registry()["instances"].get(key) or {}
+    hosts = instance_auto_hosts(key, inst) if inst else []
+    if not hosts:
+        return ""
+    return f"https://{hosts[0]}/" + app.get("start", "")
+
+
+def _cohort_seat(tpl, tdir, tid, rec, sid, existing_users, handout, srcs,
+                 secrets_map):
+    """Make (or finish) one seat: user, then the instances. Idempotent."""
+    user = cohort.user_name(tpl, sid)
+    seat = rec["seats"].setdefault(sid, {
+        "user": user, "group": cohort.seat_group(tpl, sid),
+        "label": cohort.seat_label(tpl, sid) or "", "instances": {}})
+    password = "(vorhanden)"
+    if user in existing_users:
+        print(f"  {user}: user exists")
+    else:
+        password = generate_password()
+        deactivate_at, delete_at = cohort.user_dates(tpl)
+        body = {"username": user, "roles": tpl["users"]["roles"],
+                "groups": sorted({cohort.seat_group(tpl, sid),
+                                  cohort.cohort_group(tpl)}),
+                "tenant": tid, "password": password,
+                "display_name": cohort.display_name(tpl, sid),
+                "must_change_password": True}
+        if deactivate_at or delete_at:
+            body.update({"deactivate_at": deactivate_at, "delete_at": delete_at,
+                         "schedule_reason": f"cohort {tpl['name']}"})
+        code, res = identity_user_create(body)
+        if code != 201:
+            die(f"user {user}: " + (res.get("error") or f"identity answered {code}"))
+        existing_users.add(user)
+        print(f"  {user}: user created")
+    address = ""
+    try:
+        for app in tpl["apps"]:
+            if app["shared"]:
+                continue
+            key, made = _cohort_install(tpl, tdir, tid, rec, sid, app,
+                                        srcs[app["name"]], secrets_map)
+            seat["instances"][app["name"]] = key
+            print(f"  {key}: {'installed' if made else 'exists'}")
+            address = address or _cohort_address(app, key)
+    finally:
+        # A password exists nowhere else: the row is written even when an
+        # install of this seat failed, so a rerun does not leave a user
+        # nobody can sign in as (the address column may then be empty).
+        if password != "(vorhanden)":
+            handout.add({"seat": sid, "username": user, "password": password,
+                         "address": address})
+        save_cohort(rec)
+    return password, address
+
+
+def _cohort_shared(tpl, tdir, tid, rec, srcs, secrets_map):
+    for app in tpl["apps"]:
+        if not app["shared"]:
+            continue
+        key, made = _cohort_install(tpl, tdir, tid, rec, "", app,
+                                    srcs[app["name"]], secrets_map)
+        rec.setdefault("shared", {})[app["name"]] = key
+        print(f"  {key}: {'installed (shared)' if made else 'exists'}")
+    save_cohort(rec)
+
+
+def _cohort_table(rec):
+    """Seat | user | instance | state | address -- the closing report."""
+    reg = load_registry()
+    rows = _cohort_instances(rec)
+    names = []
+    for _sid, _app, key in rows:
+        for s in instance_services(reg["instances"].get(key) or {}):
+            names.append(s["container"])
+    states, _ok = container_states(names)
+    print(f"{'seat':<6} {'user':<28} {'instance':<34} {'state':<10} address")
+    for sid, _app_name, key in rows:
+        inst = reg["instances"].get(key)
+        if not inst:
+            state, addr = "MISSING", ""
+        else:
+            svc = instance_services(inst)
+            st = [(states.get(s["container"]) or {}).get("state", "absent")
+                  for s in svc]
+            state = st[0] if len(set(st)) == 1 else ",".join(st)
+            hosts = instance_auto_hosts(key, inst)
+            addr = f"https://{hosts[0]}/" if hosts else ""
+        user = ((rec["seats"].get(sid) or {}).get("user", "") if sid else "(shared)")
+        print(f"{sid or '-':<6} {user:<28} {key:<34} {state:<10} {addr}")
+
+
+def _cohort_create(args):
+    if not args.target:
+        die("'cohort create' needs the template directory")
+    src_dir = os.path.abspath(args.target)
+    try:
+        tpl = cohort.load(src_dir)
+    except cohort.TemplateError as e:
+        for p in e.problems:
+            print(f"  - {p}", file=sys.stderr)
+        die("the template is not usable (see above)")
+    label = args.tenant or tpl["tenant"]
+    tid = resolve_tenant_arg(label) if label else ensure_default_tenant()
+    existing = load_cohort(tid, tpl["name"])
+    if existing and existing.get("complete"):
+        die(f"cohort '{tpl['name']}' exists (complete) -- 'add' a seat, "
+            "'reset' one, or 'remove' it")
+    if existing:
+        # A half-made cohort is finished from what it was STARTED from.
+        tpl, src_dir = _cohort_template(existing)
+    for app in tpl["apps"]:
+        _cohort_resources(tpl, app)
+    deactivate_at, delete_at = cohort.user_dates(tpl)
+    today = datetime.date.today().isoformat()
+    for label_, when in (("deactivate", deactivate_at), ("delete", delete_at)):
+        if when and when <= today:
+            die(f"the {label_} date of the users ({when}) is not in the "
+                "future -- correct lifetime in the template")
+    secrets_map = load_cohort_secrets().get(tid, {})
+    wanted = sorted({v["secret"] for a in tpl["apps"]
+                     for v in a["config"].values() if isinstance(v, dict)})
+    missing = [s for s in wanted if s not in secrets_map]
+    if missing:
+        die("the tenant has no stored secret: " + ", ".join(missing)
+            + " (oaap cohort secret set <name>)")
+    srcs = {a["name"]: _cohort_source(a, args.confirm_source) for a in tpl["apps"]}
+    out = args.handout_file or os.path.join(
+        os.getcwd(), os.path.basename(tpl["handout"] or "handout.csv"))
+    why = cohort.handout_path_refusal(out, src_dir)
+    if why:
+        die("handout: " + why)
+    _cohort_capacity_note(tpl, len(tpl["seat_ids"]))
+    if existing:
+        rec = existing
+    else:
+        rec = {"format": cohort.FORMAT, "name": tpl["name"], "tenant": tid,
+               "created": _iso_now(), "complete": False, "seats": {},
+               "shared": {}, "stopped": False, "handout": {}}
+        dest = os.path.join(_cohort_path(tid, tpl["name"]), "template")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copytree(src_dir, dest, symlinks=True,
+                        ignore=shutil.ignore_patterns(".git", ".github"))
+        tpl, src_dir = _cohort_template(dict(rec))
+        save_cohort(rec)
+    print(f"Cohort '{tpl['name']}' in tenant "
+          f"'{tenant_label(tid) or 'default'}': {len(tpl['seat_ids'])} seat(s), "
+          f"{len(tpl['apps'])} app(s).")
+    handout = cohort.Handout(out)
+    try:
+        existing_users = _cohort_existing_users()
+        _cohort_shared(tpl, src_dir, tid, rec, srcs, secrets_map)
+        for sid in tpl["seat_ids"]:
+            print(f"Seat {sid}:")
+            password, address = _cohort_seat(tpl, src_dir, tid, rec, sid,
+                                             existing_users, handout, srcs,
+                                             secrets_map)
+    finally:
+        handout.close()
+    rec["complete"] = True
+    rec["handout"] = {"issued": _iso_now(), "file": out}
+    save_cohort(rec)
+    _cohort_audit("cohort.create", rec, f"{len(tpl['seat_ids'])} seats, "
+                  f"apps {', '.join(a['name'] for a in tpl['apps'])}")
+    print("")
+    _cohort_table(rec)
+    print("")
+    print(f"Handout: {out} (0600) -- user names and initial passwords, ONE "
+          "time; the node keeps only hashes. The first sign-in has to choose "
+          "a new password.")
+
+
+def _cohort_add(args):
+    rec = find_cohort(args.target, args.tenant)
+    if not rec.get("complete"):
+        die("this cohort is not complete yet -- finish it with 'oaap cohort create'")
+    tpl, tdir = _cohort_template(rec)
+    tpl = _cohort_with_seats(tpl, rec)
+    if args.who:
+        label = args.who.strip()
+        sid = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+    elif args.seat:
+        sid, label = args.seat.strip(), None
+    else:
+        nums = [int(s) for s in tpl["seat_ids"] if s.isdigit()]
+        width = max([len(s) for s in tpl["seat_ids"] if s.isdigit()] + [2])
+        sid, label = f"{(max(nums) + 1 if nums else 1):0{width}d}", None
+    if not cohort.PART_RE.fullmatch(sid):
+        die(f"seat '{sid}': lowercase letters, digits and '-'")
+    if sid in rec["seats"] and rec["seats"][sid].get("instances"):
+        print(f"Seat {sid} exists already -- finishing what is missing.")
+    if sid not in tpl["seat_ids"]:
+        tpl["seat_ids"].append(sid)
+        tpl["seat_labels"].append(label)
+    tid = rec["tenant"]
+    secrets_map = load_cohort_secrets().get(tid, {})
+    srcs = {a["name"]: _cohort_source(a, args.confirm_source) for a in tpl["apps"]}
+    stem, ext = os.path.splitext(os.path.basename(tpl["handout"] or "handout.csv"))
+    out = args.handout_file or os.path.join(os.getcwd(), f"{stem}-{sid}{ext}")
+    why = cohort.handout_path_refusal(out, tdir)
+    if why:
+        die("handout: " + why)
+    _cohort_capacity_note(tpl, 1)
+    handout = cohort.Handout(out)
+    try:
+        print(f"Seat {sid}:")
+        _cohort_seat(tpl, tdir, tid, rec, sid, _cohort_existing_users(),
+                     handout, srcs, secrets_map)
+    finally:
+        handout.close()
+    _cohort_audit("cohort.add", rec, f"seat {sid}", subject=f"{rec['name']}/{sid}")
+    print("")
+    _cohort_table(rec)
+    print(f"\nHandout for this seat: {out} (0600).")
+
+
+def _confirm_word(word, args, what):
+    print(what)
+    if args.yes:
+        return
+    try:
+        typed = input(f"Type '{word}' to confirm: ").strip()
+    except EOFError:  # no terminal: a script must say --yes
+        typed = ""
+    if typed != word:
+        die("not confirmed -- nothing was changed")
+
+
+def _cohort_reset(args):
+    rec = find_cohort(args.target, args.tenant)
+    if not args.seat or args.seat not in (rec.get("seats") or {}):
+        die("'cohort reset' needs --seat <id> of an existing seat")
+    sid = args.seat
+    tpl, tdir = _cohort_template(rec)
+    tpl = _cohort_with_seats(tpl, rec)
+    keys = [k for s, _a, k in _cohort_instances(rec, {sid}) if s == sid]
+    if args.keep_home:
+        what = (f"Seat {sid}: the instances are rebuilt from the template "
+                "(configuration, limits, seeds that are MISSING, material); "
+                "the participant's files stay.")
+    else:
+        what = (f"Seat {sid}: this DELETES the instances {', '.join(keys)} "
+                "including everything the participant put in them, and "
+                "builds them again from the template. The user and the "
+                "password stay.")
+    _confirm_word(f"{rec['name']}-{sid}", args, what)
+    tid = rec["tenant"]
+    secrets_map = load_cohort_secrets().get(tid, {})
+    srcs = {a["name"]: _cohort_source(a, args.confirm_source)
+            for a in tpl["apps"] if not a["shared"]}
+    if not args.keep_home:
+        for key in keys:
+            reg = load_registry()
+            if key in reg["instances"]:
+                print(remove_instance(reg, key, True).capitalize() + ".")
+        rec["seats"][sid]["instances"] = {}
+    for app in tpl["apps"]:
+        if app["shared"]:
+            continue
+        local = cohort.instance_name(tpl, app, sid)
+        key, inst = find_instance(load_registry(), tid, local)
+        if inst is not None:
+            # keep-home: a redeploy from the same source; the hook fills
+            # what is missing and never overwrites (RFC-0046 §2)
+            preset = {"cohort": {"name": rec["name"], "seat": sid}}
+            ns = argparse.Namespace(
+                package=source_package_arg(local, srcs[app["name"]]),
+                path=srcs[app["name"]].get("path", ""),
+                ref=srcs[app["name"]].get("ref", ""), name=local,
+                channel=inst["channel"], store_source=srcs[app["name"]].get("store_source", ""),
+                tenant=tid, confirm=False, bind=[], preset=preset,
+                before_start=_cohort_before_start(tpl, tdir, sid, app, secrets_map))
+            cmd_install(ns)
+        else:
+            key, _made = _cohort_install(tpl, tdir, tid, rec, sid, app,
+                                         srcs[app["name"]], secrets_map)
+        rec["seats"][sid]["instances"][app["name"]] = key
+        res = _cohort_resources(tpl, app)
+        cur = (load_registry()["instances"].get(key) or {}).get("resources") or {}
+        if res != cur:
+            apply_resources(key, res, who=_operator_name(), role="root")
+        print(f"  {key}: rebuilt")
+    save_cohort(rec)
+    _cohort_audit("cohort.reset", rec,
+                  "keep-home" if args.keep_home else "home deleted",
+                  subject=f"{rec['name']}/{sid}")
+    print("")
+    _cohort_table(rec)
+
+
+def _cohort_list(args):
+    if not args.target:
+        found = []
+        if os.path.isdir(COHORT_DIR):
+            for tid in sorted(os.listdir(COHORT_DIR)):
+                for name in sorted(os.listdir(os.path.join(COHORT_DIR, tid))):
+                    rec = load_cohort(tid, name)
+                    if rec:
+                        found.append(rec)
+        if not found:
+            print("No cohorts on this node.")
+            return
+        for rec in found:
+            state = ("stopped" if rec.get("stopped")
+                     else "running" if rec.get("complete") else "INCOMPLETE")
+            print(f"{rec['name']:<24} tenant {tenant_label(rec['tenant']) or 'default':<14} "
+                  f"{len(rec['seats'])} seat(s)  {state}")
+        return
+    rec = find_cohort(args.target, args.tenant)
+    tpl, _tdir = _cohort_template(rec)
+    life = tpl["lifetime"]
+    print(f"Cohort '{rec['name']}' in tenant '{tenant_label(rec['tenant']) or 'default'}', "
+          f"created {rec['created'][:10]}"
+          + ("" if rec.get("complete") else " -- INCOMPLETE, finish with 'create'")
+          + (" -- STOPPED" if rec.get("stopped") else ""))
+    if life["ends"]:
+        d, x = cohort.user_dates(tpl)
+        print(f"Lifetime: ends {life['ends']}, users deactivated {d or '-'}, "
+              f"deleted {x or '-'}")
+    print("")
+    _cohort_table(rec)
+
+
+def _cohort_power(args, start):
+    rec = find_cohort(args.target, args.tenant)
+    reg = load_registry()
+    verb = "start" if start else "stop"
+    for _sid, _app, key in _cohort_instances(rec):
+        for s in instance_services(reg["instances"].get(key) or {}):
+            subprocess.run(["docker", verb, s["container"]],
+                           capture_output=True, text=True)
+    rec["stopped"] = not start
+    save_cohort(rec)
+    _cohort_audit(f"cohort.{verb}", rec)
+    print(f"Cohort '{rec['name']}': every instance {verb}ed. Nothing was deleted.")
+    print("")
+    _cohort_table(rec)
+
+
+def _cohort_material(args):
+    if args.target != "update" or not args.second or not args.third:
+        die("usage: oaap cohort material update <cohort> <directory>")
+    rec = find_cohort(args.second, args.tenant)
+    tpl, tdir = _cohort_template(rec)
+    new = os.path.abspath(args.third)
+    if not os.path.isdir(new) or os.path.islink(new):
+        die(f"{new} is not a directory")
+    reg = load_registry()
+    done = 0
+    for app in tpl["apps"]:
+        if not app["material"]:
+            continue
+        stored = os.path.join(tdir, app["material"])
+        shutil.rmtree(stored, ignore_errors=True)
+        shutil.copytree(new, stored, symlinks=True)
+        for sid, app_name, key in _cohort_instances(rec):
+            if app_name != app["name"]:
+                continue
+            inst = reg["instances"].get(key)
+            if not inst:
+                continue
+            uid = image_uid(instance_services(inst)[0]["image"])
+            dest = os.path.join(instance_dir(key, inst), "storage", "material")
+            cohort.copy_material(stored, dest, uid, replace=True)
+            done += 1
+    if not done:
+        die("no app of this cohort has a material directory")
+    _cohort_audit("cohort.material", rec, f"{done} instance(s)")
+    print(f"Material replaced in {done} instance(s); the participants' own "
+          "files (their home) were not touched.")
+
+
+def _cohort_handout(args):
+    rec = find_cohort(args.target, args.tenant)
+    h = rec.get("handout") or {}
+    if h.get("issued"):
+        print(f"The handout of '{rec['name']}' was written {h['issued'][:16]} "
+              f"to {h.get('file', '?')}.")
+    print("It cannot be produced again: the node keeps only password hashes, "
+          "and a second copy of the passwords would be a second place to lose.")
+    print("Per seat that lost theirs: oaap user password <user> "
+          "(the next sign-in chooses a new one).")
+    sys.exit(1)
+
+
+def _cohort_export(args):
+    rec = find_cohort(args.target, args.tenant)
+    dest = os.path.abspath(args.second or f"{rec['name']}-export")
+    if os.path.exists(dest) and os.listdir(dest):
+        die(f"{dest} exists and is not empty")
+    _tpl, tdir = _cohort_template(rec)
+    shutil.copytree(tdir, dest, symlinks=True, dirs_exist_ok=True)
+    made = {k: v for k, v in rec.items() if k != "handout"}
+    with open(os.path.join(dest, "created.json"), "w", encoding="utf-8") as f:
+        json.dump(made, f, indent=2, ensure_ascii=False)
+    _cohort_audit("cohort.export", rec)
+    print(f"Exported to {dest}: the template as the cohort was made from it, "
+          "plus created.json (seats and instances). No password is in it. "
+          "A later 'oaap cohort create' from this directory is the next run.")
+
+
+def _cohort_remove(args):
+    rec = find_cohort(args.target, args.tenant)
+    if args.seat and args.seat not in (rec.get("seats") or {}):
+        die(f"the cohort has no seat '{args.seat}'")
+    sids = {args.seat} if args.seat else set(rec.get("seats") or {})
+    items = [(s, a, k) for s, a, k in _cohort_instances(rec, sids)
+             if s or not args.seat]
+    lines = [f"This removes {len(items)} instance(s) of cohort '{rec['name']}'"
+             + (f", seat {args.seat}" if args.seat else "") + ":"]
+    lines += [f"  {k}" for _s, _a, k in items]
+    lines.append("Their storage is DELETED with them." if args.purge else
+                 "Their storage is KEPT (oaap app purge deletes it later).")
+    if args.users:
+        lines.append("The users are DELETED as well: "
+                     + ", ".join(sorted(rec["seats"][s]["user"] for s in sids)))
+    else:
+        lines.append("The users stay (their dates, if any, still apply).")
+    _confirm_word(args.seat and f"{rec['name']}-{args.seat}" or rec["name"],
+                  args, "\n".join(lines))
+    for _s, _a, key in items:
+        reg = load_registry()
+        if key in reg["instances"]:
+            print(remove_instance(reg, key, args.purge).capitalize() + ".")
+    for sid in sorted(sids):
+        if args.users:
+            code, res = identity_user_delete(rec["seats"][sid]["user"])
+            print(f"  user {rec['seats'][sid]['user']}: "
+                  + ("deleted" if code == 200 else
+                     f"NOT deleted -- {res.get('error') or code}"))
+        rec["seats"].pop(sid, None)
+    if not args.seat:
+        rec["shared"] = {}
+    _cohort_audit("cohort.remove", rec,
+                  f"{'purge' if args.purge else 'keep storage'}"
+                  f"{', users' if args.users else ''}",
+                  subject=f"{rec['name']}/{args.seat}" if args.seat else rec["name"])
+    if not args.seat and not rec["seats"]:
+        shutil.rmtree(_cohort_path(rec["tenant"], rec["name"]),
+                      ignore_errors=True)
+        print(f"Cohort '{rec['name']}' is gone. ('oaap cohort export' before "
+              "a removal keeps the template.)")
+    else:
+        save_cohort(rec)
+        print(f"Seat {args.seat} is gone." if args.seat else "Done.")
+
+
+def _cohort_secret(args):
+    what, name = args.target, args.second
+    tid = resolve_tenant_arg(args.tenant) if args.tenant else ensure_default_tenant()
+    secrets_ = load_cohort_secrets()
+    mine = secrets_.setdefault(tid, {})
+    if what == "list":
+        for n in sorted(mine):
+            print(n)
+        if not mine:
+            print("No stored secrets in this tenant.")
+        return
+    if not name or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,39}", name):
+        die("usage: oaap cohort secret set|remove <name> [--tenant L] "
+            "(name: lowercase letters, digits, . _ -)")
+    if what == "set":
+        value = (sys.stdin.readline().rstrip("\r\n") if args.stdin else
+                 getpass.getpass(f"Value of '{name}' (hidden): "))
+        if not value or "\n" in value:
+            die("the value must be one non-empty line")
+        mine[name] = value
+        save_cohort_secrets(secrets_)
+        print(f"Secret '{name}' stored for the tenant (never shown again; a "
+              "template refers to it as {secret: " + name + "}).")
+    elif what == "remove":
+        if mine.pop(name, None) is None:
+            die(f"no stored secret '{name}'")
+        save_cohort_secrets(secrets_)
+        print(f"Secret '{name}' removed.")
+    else:
+        die("usage: oaap cohort secret set|list|remove <name>")
+
+
+def cmd_cohort(args):
+    act = args.action
+    if act == "create":
+        return _cohort_create(args)
+    if act == "add":
+        return _cohort_add(args)
+    if act == "reset":
+        return _cohort_reset(args)
+    if act == "list":
+        return _cohort_list(args)
+    if act in ("stop", "start"):
+        return _cohort_power(args, act == "start")
+    if act == "material":
+        return _cohort_material(args)
+    if act == "handout":
+        return _cohort_handout(args)
+    if act == "export":
+        return _cohort_export(args)
+    if act == "remove":
+        return _cohort_remove(args)
+    if act == "secret":
+        return _cohort_secret(args)
+    die(f"unknown cohort action '{act}'")
 
 
 # ---------------------------------------------------------------- convert
@@ -18894,6 +19698,43 @@ def main():
                      help="expose: no login for visitors (braked, still expires)")
     pco.add_argument("-n", "--lines", type=int, default=30, help="log: how many calls")
     pco.set_defaults(fn=cmd_connector)
+    pcoh = sub.add_parser("cohort",
+                          help="a training landscape from one template "
+                               "(RFC-0046): create, add, reset, list, stop, "
+                               "start, material, handout, export, remove, secret")
+    pcoh.add_argument("action", choices=["create", "add", "reset", "list", "stop",
+                                         "start", "material", "handout", "export",
+                                         "remove", "secret"])
+    pcoh.add_argument("target", nargs="?",
+                      help="create: the template directory; otherwise the "
+                           "cohort (material: `update`; secret: set|list|remove)")
+    pcoh.add_argument("second", nargs="?",
+                      help="material update: the cohort; export: the target "
+                           "directory; secret: the name")
+    pcoh.add_argument("third", nargs="?", help="material update: the directory")
+    pcoh.add_argument("--tenant", default="",
+                      help="tenant label (default: the template's own, or the "
+                           "node's default tenant)")
+    pcoh.add_argument("--seat", default="", help="add/reset/remove: one seat")
+    pcoh.add_argument("--name", dest="who", default="",
+                      help="add: a named participant")
+    pcoh.add_argument("--keep-home", action="store_true",
+                      help="reset: rebuild from the template, keep the files")
+    pcoh.add_argument("--purge", action="store_true",
+                      help="remove: delete the storage with the instances")
+    pcoh.add_argument("--users", action="store_true",
+                      help="remove: delete the users as well")
+    pcoh.add_argument("--yes", action="store_true",
+                      help="carry it out after reading what is deleted")
+    pcoh.add_argument("--handout-file", default="",
+                      help="create/add: where the one-time list goes "
+                           "(default: the template's `handout` name in the "
+                           "current directory -- never inside the template)")
+    pcoh.add_argument("--confirm-source", default="",
+                      help="install from this unverified store source")
+    pcoh.add_argument("--stdin", action="store_true",
+                      help="secret set: read the value from standard input")
+    pcoh.set_defaults(fn=cmd_cohort)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])
     pk.add_argument("source", nargs="?", help="the instance that may reach the target")
