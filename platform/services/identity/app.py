@@ -1744,6 +1744,11 @@ def _token_auth(doc, client_id, client_secret, form):
 def oidc_callback():
     """Take the provider's answer and turn it into a local session."""
     started = session.pop("oidc", None) or {}
+    if not started and not request.args:
+        # The provider sends the browser here after a sign-out (this is
+        # the one address the realm already accepts for this host). There
+        # is nothing to complete -- go to the front door.
+        return redirect("/auth/login", code=303)
     if not started:
         return _idp_failed("Zu dieser Rückmeldung gibt es keinen "
                            "begonnenen Anmeldeversuch.", 400)
@@ -1794,6 +1799,14 @@ def oidc_callback():
     session["epoch"] = user.get("session_epoch", 0)
     session["idp"] = {"provider": idp.provider_key(provider),
                       "factor": idp.second_factor(claims)}
+    # What signing OUT at the provider needs. The id token is only a hint
+    # (it lets the provider skip its "really log out?" question), and it
+    # travels in the cookie, which has a hard size limit -- so a large one
+    # is left out rather than risking the whole session.
+    raw_token = str((tok or {}).get("id_token") or "")
+    session["idp_out"] = {"tenant": tid}
+    if raw_token and len(raw_token) <= IDP_HINT_MAX:
+        session["idp_out"]["hint"] = raw_token
     print(f"idp login ok: {user['username']} from {_client_ip()}", flush=True)
     return redirect(_return_target(started.get("next", "")) or "/", code=303)
 
@@ -1944,6 +1957,46 @@ def terminal_enrol():
     return render_template_string(TERMINAL_DONE, who=user["username"])
 
 
+IDP_HINT_MAX = 1800
+
+
+def _provider_logout_url(out):
+    """Where to send a browser that signed in through a provider, so the
+    provider's own session ends too. "" when there is nothing to do.
+
+    Without this, signing out only ended OUR session: the login page sent
+    the browser straight back to the provider, whose session was still
+    valid, and the person was signed in again without being asked
+    (oaapx02, 2026-10-02). Best effort -- a provider that cannot be asked
+    must not stop somebody from leaving, so every failure is "".
+
+    The return address is the callback, because that is the one address
+    the realm already knows for this host; the callback recognises a
+    return without a login attempt and goes to the login page.
+    """
+    tid = (out or {}).get("tenant") or ""
+    if not tid:
+        return ""
+    provider, _secret = tenant_provider(tid)
+    if not provider:
+        return ""
+    try:
+        doc, bad = _discovery(provider["issuer"])
+    except Exception:  # noqa: BLE001 -- leaving must never fail
+        return ""
+    if bad:
+        return ""
+    ends = idp.endpoints_of(doc)
+    if not ends["end_session"].lower().startswith(("http://", "https://")):
+        return ""
+    query = {"client_id": provider["client_id"],
+             "post_logout_redirect_uri": _oidc_redirect_uri()}
+    if out.get("hint"):
+        query["id_token_hint"] = out["hint"]
+    sep = "&" if "?" in ends["end_session"] else "?"
+    return ends["end_session"] + sep + urlencode(query)
+
+
 @app.post("/auth/logout")
 def logout():
     # A terminal has no one to log out. Offering it the button anyway
@@ -1958,7 +2011,11 @@ def logout():
     if username:
         _revoke_sessions(username)
         print(f"logout: {username}", flush=True)
+    out = session.get("idp_out") or {}
+    away = _provider_logout_url(out) if username else ""
     session.clear()
+    if away:
+        return redirect(away, code=303)
     # No return target here, deliberately (RFC-0040 §5 is about a
     # refused request, not a deliberate sign-out): somebody who signs
     # out asked to LEAVE the page they were on, and sending them back

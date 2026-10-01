@@ -468,6 +468,7 @@ class Provider(BaseHTTPRequestHandler):
                 "issuer": ISSUER,
                 "authorization_endpoint": ISSUER + "/auth",
                 "token_endpoint": ISSUER + "/token",
+                "end_session_endpoint": ISSUER + "/logout",
                 "token_endpoint_auth_methods_supported":
                     ["client_secret_basic", "client_secret_post"],
             })
@@ -745,6 +746,33 @@ c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
 last = read(ident.AUDIT_LOG).strip().splitlines()[-1]
 ok("wird einer genannt, steht er da", "otp" in last, last[-200:])
 ok("... und ohne den Vorwurf", "obwohl der Ort" not in last, last[-200:])
+
+# Abmelden beendet auch die Sitzung beim Anbieter -- sonst schickt die
+# Anmeldeseite den Browser zurueck, und er ist ohne Frage wieder drin
+# (oaapx02, 2026-10-02).
+print("\nAbmelden mit Anbieter")
+from urllib.parse import urlsplit, parse_qs                    # noqa: E402
+
+r = c.post("/auth/logout", headers={"Host": f"hbvp.{HOST}"})
+loc = r.headers.get("Location", "")
+ok("Abmelden geht zum Abmelde-Endpunkt des Anbieters",
+   r.status_code == 303 and loc.startswith(ISSUER + "/logout?"), loc[:200])
+q = parse_qs(urlsplit(loc).query)
+ok("mit der Client-Kennung", q.get("client_id") == ["oaap-node"], q)
+ok("und der Rueckkehradresse dieses Ortes (die der Anbieter kennt)",
+   q.get("post_logout_redirect_uri") == [f"http://hbvp.{HOST}/auth/oidc/callback"],
+   q.get("post_logout_redirect_uri"))
+ok("und dem id_token als Hinweis", bool(q.get("id_token_hint")), q)
+ok("die lokale Sitzung ist beendet",
+   c.get("/auth/whoami", headers={"Host": f"hbvp.{HOST}"}).status_code in (401, 302, 303),
+   c.get("/auth/whoami", headers={"Host": f"hbvp.{HOST}"}).status_code)
+r = c.get("/auth/oidc/callback", headers={"Host": f"hbvp.{HOST}"})
+ok("die Rueckkehr vom Anbieter ohne Anmeldeversuch endet an der Anmeldeseite",
+   r.status_code == 303 and r.headers.get("Location") == "/auth/login",
+   (r.status_code, r.headers.get("Location")))
+r = c.post("/auth/logout", headers={"Host": f"hbvp.{HOST}"})
+ok("ohne Sitzung bleibt es beim alten Weg",
+   r.headers.get("Location") == "/auth/login", r.headers.get("Location"))
 
 srv.shutdown()
 
