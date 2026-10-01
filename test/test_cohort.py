@@ -920,6 +920,10 @@ ok("danach ist nichts von der Rolle des Auftrags haengen geblieben",
 
 ok_, msg, _r = job("stop", {"cohort": "kurs-api"})
 ok("stop wirkt", ok_ and a.load_cohort(TID, "kurs-api")["stopped"], msg)
+ok("stop antwortet mit einem Satz, nicht mit einer Tabellenzeile", msg == "cohort 'kurs-api' stopped", msg)
+ok_, msg, _r = job("start", {"cohort": "kurs-api"})
+ok("start antwortet mit einem Satz", ok_ and msg == "cohort 'kurs-api' started", msg)
+ok_, msg, _r = job("stop", {"cohort": "kurs-api"})
 ok_, msg, _r = job("extend", {"cohort": "kurs-api", "ends": "2999-11-07"})
 ok("extend wirkt", ok_, msg)
 ok_, msg, _r = job("start", {"cohort": "gibt-es-nicht"})

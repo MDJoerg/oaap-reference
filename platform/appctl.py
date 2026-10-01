@@ -14423,8 +14423,18 @@ def cohort_job(req, rid, tid, role, actor):
         # not the caller's business
         msg = next((l for l in reversed(lines)
                     if not l.startswith(("seat ", "-", "Handout:"))), "done")
+        # the CLI ends stop/start/reset/add with a status table, whose last
+        # row says nothing about what was asked: say it in a sentence
+        name = a.get("cohort", "")
         if op == "create":
-            msg = f"cohort '{a.get('cohort', '')}' created"
+            msg = f"cohort '{name}' created"
+        elif op in ("stop", "start"):
+            msg = f"cohort '{name}' " + ("stopped" if op == "stop" else "started")
+        elif op == "reset":
+            msg = (f"seat {a.get('seat', '')} of cohort '{name}' reset "
+                   f"({'files kept' if a.get('keep_home') else 'files deleted'})")
+        elif op == "add":
+            msg = f"a seat was added to cohort '{name}'"
     else:
         msg = "; ".join(l.removeprefix("ERROR: ") for l in lines)[-1500:] or "failed"
     return ok, msg
