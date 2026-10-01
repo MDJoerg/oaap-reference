@@ -12948,6 +12948,18 @@ def identity_users_due(now_iso):
     return json.loads(out.strip().splitlines()[-1])
 
 
+def identity_user_dates(usernames):
+    """{username: (deactivate_at, delete_at)} for the people that exist."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "want = set(json.loads(os.environ['OAAP_WHO']))\n"
+        "print(json.dumps({u['username']: [u.get('deactivate_at', ''),\n"
+        "  u.get('delete_at', '')] for u in m.load_users()\n"
+        " if u['username'] in want}))\n",
+        {"OAAP_WHO": json.dumps(sorted(usernames))})
+    return {k: tuple(v) for k, v in json.loads(out.strip().splitlines()[-1]).items()}
+
+
 def identity_user_deactivate(username):
     """Deactivate a person and clear the date that did it: it fired, and a
     trainer who reactivates them by hand must not be overruled tomorrow."""
@@ -13810,6 +13822,84 @@ def _cohort_power(args, start):
     _cohort_table(rec)
 
 
+def _cohort_extend(args):
+    """Move `lifetime.ends` later (RFC-0046 5): the course overran.
+
+    The stored template gets the new date, and the dates of the people move
+    with it -- but only a date that is still the one the template computed.
+    A date a trainer set by hand for somebody stays theirs. Nothing is
+    started, nothing is reactivated: those stay the trainer's decision.
+    """
+    rec = find_cohort(args.target, args.tenant)
+    if not args.second:
+        die("usage: oaap cohort extend <cohort> <new end date, YYYY-MM-DD> [--dry-run]")
+    new_end = cohort.parse_date(args.second)
+    if new_end is None:
+        die(f"'{args.second}' is not a date (JJJJ-MM-TT)")
+    tpl, tdir = _cohort_template(rec)
+    old_end = cohort.parse_date(tpl["lifetime"]["ends"]) if tpl["lifetime"]["ends"] else None
+    if old_end is None:
+        die("this cohort has no lifetime.ends -- there is nothing to extend")
+    if new_end <= old_end:
+        die(f"the new end ({new_end}) is not later than the present one "
+            f"({old_end}); extend only moves the end out")
+    old_dates = cohort.user_dates(tpl)
+    path = os.path.join(tdir, cohort.TEMPLATE_FILE)
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    pat = re.compile(r"(?m)^(\s+ends:\s*)[\"']?\d{4}-\d{2}-\d{2}[\"']?")
+    if len(pat.findall(text)) != 1:
+        die("the stored template has no single 'ends:' line to move")
+    new_text = pat.sub(lambda m: f"{m.group(1)}{new_end.isoformat()}", text)
+    new_tpl = dict(tpl, lifetime=dict(tpl["lifetime"], ends=new_end.isoformat()))
+    new_dates = cohort.user_dates(new_tpl)
+    today = datetime.date.today().isoformat()
+    for label_, when in (("deactivate", new_dates[0]), ("delete", new_dates[1])):
+        if when and when <= today:
+            die(f"the {label_} date of the users would be {when}, not in the future")
+    users = {s["user"]: sid for sid, s in (rec.get("seats") or {}).items()}
+    have = identity_user_dates(users) if users else {}
+    plan = []
+    for name in sorted(have):
+        cur = have[name]
+        change = {}
+        for i, key in enumerate(("deactivate_at", "delete_at")):
+            if cur[i] and old_dates[i] and cur[i][:10] == old_dates[i] \
+                    and new_dates[i]:
+                change[key] = new_dates[i]
+        plan.append((name, change, [k for i, k in enumerate(("deactivate_at", "delete_at"))
+                                    if cur[i] and k not in change]))
+    verb = "would move" if args.dry_run else "moves"
+    print(f"Cohort '{rec['name']}': end {old_end} -> {new_end}")
+    for name, change, kept in plan:
+        bits = [f"{k[:-3]} {v}" for k, v in change.items()]
+        if bits:
+            print(f"  {name}: {verb} " + ", ".join(bits))
+        if kept:
+            print(f"  {name}: {', '.join(k[:-3] for k in kept)} date set by hand -- kept")
+    if args.dry_run:
+        print("(dry run) nothing changed.")
+        return
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(new_text)
+    for name, change, _kept in plan:
+        if not change:
+            continue
+        code, res = identity_user_schedule(name, dict(
+            change, schedule_reason=f"cohort {rec['name']}"))
+        if code != 200:
+            print(f"  {name}: NOT moved -- {res.get('error') or code}", file=sys.stderr)
+    was_ended = rec.pop("ended", None)
+    for seat in (rec.get("seats") or {}).values():
+        seat.pop("waiting", None)
+        seat.pop("refused", None)
+    save_cohort(rec)
+    _cohort_audit("cohort.extend", rec, detail=f"end {old_end} -> {new_end}")
+    if was_ended or rec.get("stopped"):
+        print("The cohort is stopped. Starting it again is yours: "
+              f"oaap cohort start {rec['name']}")
+
+
 def _cohort_material(args):
     if args.target != "update" or not args.second or not args.third:
         die("usage: oaap cohort material update <cohort> <directory>")
@@ -14109,6 +14199,8 @@ def cmd_cohort(args):
         return _cohort_list(args)
     if act in ("stop", "start"):
         return _cohort_power(args, act == "start")
+    if act == "extend":
+        return _cohort_extend(args)
     if act == "material":
         return _cohort_material(args)
     if act == "handout":
@@ -19888,10 +19980,10 @@ def main():
     pcoh = sub.add_parser("cohort",
                           help="a training landscape from one template "
                                "(RFC-0046): create, add, reset, list, stop, "
-                               "start, material, handout, export, remove, secret, sweep")
+                               "start, material, handout, export, remove, secret, sweep, extend")
     pcoh.add_argument("action", choices=["create", "add", "reset", "list", "stop",
                                          "start", "material", "handout", "export",
-                                         "remove", "secret", "sweep"])
+                                         "remove", "secret", "sweep", "extend"])
     pcoh.add_argument("target", nargs="?",
                       help="create: the template directory; otherwise the "
                            "cohort (material: `update`; secret: set|list|remove)")
@@ -19922,7 +20014,7 @@ def main():
     pcoh.add_argument("--stdin", action="store_true",
                       help="secret set: read the value from standard input")
     pcoh.add_argument("--dry-run", action="store_true",
-                      help="sweep: say what would happen, change nothing")
+                      help="sweep, extend: say what would happen, change nothing")
     pcoh.set_defaults(fn=cmd_cohort)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])

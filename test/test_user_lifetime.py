@@ -394,6 +394,7 @@ code, res = appctl.identity_user_schedule("gibt-es-nicht",
                                           {"delete_at": future})
 ok("ein unbekannter Benutzer ist ein 404", code == 404, (code, res))
 
+
 code, res = appctl.identity_user_set_password("cli-01", "Vom-Bediener-55")
 ok("`user password` setzt den Zwang wieder",
    code == 200 and users_of()["cli-01"]["must_change_password"], (code, res))
@@ -440,6 +441,16 @@ ok("die Loeschung ist danach noch faellig, die Deaktivierung nicht",
    "lauf-a" in due and "lauf-c" not in due, sorted(due))
 code, res = appctl.identity_user_deactivate("gibt-es-nicht")
 ok("ein unbekannter Benutzer ist ein 404", code == 404, (code, res))
+dates = appctl.identity_user_dates(["lauf-a", "lauf-b", "gibt-es-nicht"])
+ok("die Termine lesen: nur wer es gibt, mit beiden Terminen",
+   sorted(dates) == ["lauf-a", "lauf-b"]
+   and dates["lauf-b"] == ("2999-01-01T00:00:00Z", "2999-06-01T00:00:00Z"), dates)
+code, res = appctl.identity_user_schedule(
+    "lauf-b", {"deactivate_at": "2999-02-01", "delete_at": "2999-07-01",
+               "schedule_reason": "cohort test"})
+ok("verschieben: beide Termine neu, Rolle bleibt",
+   code == 200 and appctl.identity_user_dates(["lauf-b"])["lauf-b"][1][:10] == "2999-07-01"
+   and users_of()["lauf-b"]["roles"] == ["user"], (code, res))
 
 print("")
 print("ALLE BESTANDEN" if not fails else f"FAILED ({fails} Fehler)")

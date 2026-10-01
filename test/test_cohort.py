@@ -781,6 +781,76 @@ sw = sweep(3000, 2, 1)
 ok("Termine auch ausserhalb einer Kohorte: der Lauf handelt (deaktivieren, loeschen)",
    USERDB["solo"]["active"] is False and "solo2" not in USERDB, sw)
 
+# ------------------------------------------------ das Ende verschieben (extend)
+print("")
+print("Das Kursende verschieben -- die Termine ziehen mit, was von Hand gesetzt ist, bleibt")
+SCHEDULED = []
+
+
+def ext_dates(names):
+    return {n: (USERDB[n]["deactivate_at"], USERDB[n]["delete_at"])
+            for n in names if n in USERDB}
+
+
+def ext_schedule(username, dates):
+    SCHEDULED.append((username, dict(dates)))
+    for k in ("deactivate_at", "delete_at"):
+        if k in dates:
+            USERDB[username][k] = iso(dates[k])
+    return 200, {"ok": True}
+
+
+a.identity_user_dates = ext_dates
+a.identity_user_schedule = ext_schedule
+t_ex = template(os.path.join(WORK, "t-extend"),
+                mutate=lambda t: t.replace("kurs-2026-10", "kurs-ext"))
+code, out = cli("create", target=t_ex, handout_file=os.path.join(WORK, "out", "he.csv"))
+ok("die Kohorte fuer extend steht", code is None, out)
+USERDB["kurs-ext-tn-02"]["delete_at"] = "3005-05-05T00:00:00Z"   # von Hand gesetzt
+rec = a.load_cohort(TID, "kurs-ext")
+rec["ended"] = "2999-10-24"
+rec["seats"]["03"]["waiting"] = True
+a.save_cohort(rec)
+AUDIT.clear()
+
+code, out = cli("extend", target="kurs-ext", second="2999-10-20")
+ok("ein frueheres Ende wird abgelehnt (extend schiebt nur hinaus)",
+   code not in (None, 0) and "not later" in out, (code, out))
+code, out = cli("extend", target="kurs-ext", second="morgen")
+ok("kein Datum -> abgelehnt", code not in (None, 0) and "not a date" in out, out)
+code, out = cli("extend", target="kurs-ext")
+ok("ohne Datum -> Gebrauchshinweis", code not in (None, 0) and "usage" in out, out)
+
+code, out = cli("extend", target="kurs-ext", second="2999-11-07", dry_run=True)
+ok("--dry-run sagt, was geschaehe, und aendert nichts",
+   code is None and "would move" in out and not SCHEDULED
+   and "2999-10-24" in open(os.path.join(a._cohort_path(TID, "kurs-ext"),
+                                           "template", "cohort.yaml")).read(), (code, out))
+
+code, out = cli("extend", target="kurs-ext", second="2999-11-07")
+tdir_text = open(os.path.join(a._cohort_path(TID, "kurs-ext"), "template", "cohort.yaml")).read()
+rec = a.load_cohort(TID, "kurs-ext")
+ok("das gespeicherte Template traegt das neue Ende",
+   code is None and "ends: 2999-11-07" in tdir_text and "2999-10-24" not in tdir_text, (code, out))
+ok("die Termine der Benutzer ruecken um dieselben Tage (24.10. -> 07.11. = +14)",
+   USERDB["kurs-ext-tn-01"]["deactivate_at"][:10] == "2999-12-07"
+   and USERDB["kurs-ext-tn-01"]["delete_at"][:10] == "3000-02-05", USERDB["kurs-ext-tn-01"])
+ok("ein von Hand gesetzter Termin bleibt, der berechnete zieht mit",
+   USERDB["kurs-ext-tn-02"]["delete_at"][:10] == "3005-05-05"
+   and USERDB["kurs-ext-tn-02"]["deactivate_at"][:10] == "2999-12-07"
+   and "kept" in out, (USERDB["kurs-ext-tn-02"], out))
+ok("der Ende-Vermerk ist weg, damit der Lauf am neuen Ende wieder stoppt; Warten ist vergessen",
+   "ended" not in rec and "waiting" not in rec["seats"]["03"], rec)
+ok("nichts wird von selbst gestartet -- der Hinweis sagt es",
+   "oaap cohort start kurs-ext" in out, out)
+ok("das Protokoll kennt es", [x[0] for x in AUDIT] == ["cohort.extend"], AUDIT)
+sw = sweep(2999, 10, 25)
+ok("am alten Ende-Tag danach tut der Lauf nichts mehr",
+   not [x for x in sw if "ended" in x[1]], sw)
+sw = sweep(2999, 11, 8)
+ok("am Tag nach dem neuen Ende stoppt er",
+   a.load_cohort(TID, "kurs-ext")["ended"] == "2999-11-07", sw)
+
 # ------------------------------------------------ benannte Geheimnisse
 print("")
 print("Benannte Geheimnisse -- gespeichert, aufgelistet, nie zurueckgegeben")
