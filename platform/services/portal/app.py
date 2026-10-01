@@ -9080,11 +9080,21 @@ COHORT_DETAIL_BODY = """
      Benutzer deaktiviert: {{ c.deactivate }}<br>
      Benutzer gelöscht: {{ c.delete }}</p>
 </div>
+<style>
+  .seatrow td{vertical-align:top;padding:.8rem .5rem}
+  .seatform{display:flex;flex-direction:column;align-items:flex-start;gap:.45rem;min-width:13rem}
+  .seatopt{display:flex;align-items:center;gap:.5rem;white-space:nowrap;cursor:pointer}
+  .seatopt input{width:auto;margin:0;flex:none}
+  .seatconfirm{display:block}
+  .seatconfirm input{margin:.25rem 0 0;box-sizing:border-box}
+  .seatrow summary{cursor:pointer;color:var(--oaap-blue-600)}
+  .seatrow details[open] summary{margin-bottom:.6rem}
+</style>
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Platz</th><th>Benutzer</th><th>Instanzen</th><th></th></tr>
+  <tr><th>Platz</th><th>Benutzer</th><th>Instanzen</th><th>Zurücksetzen</th><th>Entfernen</th></tr>
   {% for s in c.seat_list %}
-  <tr>
+  <tr class="seatrow">
     <td>{{ s.id }}{% if s.label %} <span class="muted">{{ s.label }}</span>{% endif %}</td>
     <td>{{ s.user }}</td>
     <td>{% for i in s.instances %}
@@ -9092,15 +9102,15 @@ COHORT_DETAIL_BODY = """
       <span class="badge {{ '' if i.tone == 'ok' else 'off' }}">{{ i.label }}</span>{% if not loop.last %}<br>{% endif %}
       {% endfor %}
       {% if s.note %}<br><span class="muted">{{ s.note }}</span>{% endif %}</td>
-    <td><form method="post" action="/kohorten/{{ c.name }}/seats/{{ s.id }}/reset">
-      <label><input type="checkbox" name="keep_home" value="1" checked> Dateien behalten</label><br>
-      <label><input type="checkbox" name="sure" value="1" required> Platz {{ s.id }} zurücksetzen</label>
-      <button class="btn">Zurücksetzen</button></form>
-      <details><summary>Platz entfernen</summary>
-      <form method="post" action="/kohorten-entfernen/{{ c.name }}/{{ s.id }}">
-        <label><input type="checkbox" name="purge" value="1"> Speicher mit löschen</label><br>
-        <label><input type="checkbox" name="users" value="1"> Benutzer {{ s.user }} mit löschen</label><br>
-        <label>Zur Bestätigung eingeben: <code>{{ c.name }}-{{ s.id }}</code>
+    <td><form class="seatform" method="post" action="/kohorten/{{ c.name }}/seats/{{ s.id }}/reset">
+      <label class="seatopt"><input type="checkbox" name="keep_home" value="1" checked> Dateien behalten</label>
+      <label class="seatopt"><input type="checkbox" name="sure" value="1" required> Zurücksetzen bestätigen</label>
+      <button class="btn">Zurücksetzen</button></form></td>
+    <td><details><summary>Platz entfernen …</summary>
+      <form class="seatform" method="post" action="/kohorten-entfernen/{{ c.name }}/{{ s.id }}">
+        <label class="seatopt"><input type="checkbox" name="purge" value="1"> Speicher mit löschen</label>
+        <label class="seatopt"><input type="checkbox" name="users" value="1"> Benutzer {{ s.user }} mit löschen</label>
+        <label class="seatconfirm">Zur Bestätigung eingeben: <code>{{ c.name }}-{{ s.id }}</code>
         <input type="text" name="confirm" autocomplete="off" required></label>
         <button class="btn">Platz entfernen</button>
       </form></details></td>
