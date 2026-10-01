@@ -93,7 +93,7 @@ r = c.get("/kohorten", headers=H)
 t = r.get_data(as_text=True)
 ok("Liste: 200, eigene Kohorte, nicht die fremde",
    r.status_code == 200 and "kurs-a" in t and "fremd" not in t)
-ok("Liste nennt den Weg zum Aendern (API und CLI), aendert selbst nichts",
+ok("Liste nennt API und CLI fuer Anlegen/Entfernen, hat selbst kein Formular",
    "/api/v1/tenant/cohorts" in t and "oaap cohort" in t and t.count("<form") == 1)  # nur Abmelden
 ok("Menue zeigt Kohorten, wo es welche gibt", 'href="/kohorten"' in t)
 r = c.get("/kohorten/kurs-a", headers=H)
@@ -102,12 +102,14 @@ ok("Detail: Plaetze, Adresse, Termin, Problemhinweis",
    r.status_code == 200 and "kurs-a-01" in t and "https://ide-01.example/" in t
    and "wartet auf eine freie Instanz" in t and "abgelehnt: kein Platz" in t
    and "2027-01-22" in t, t[-900:])
-ok("Detail: kein Formular ausser Abmelden", t.count("<form") == 1)
+ok("Detail: Anhalten und Verlängern (Starten erst, wenn angehalten)",
+   'action="/kohorten/kurs-a/stop"' in t and 'action="/kohorten/kurs-a/extend"' in t
+   and "/kohorten/kurs-a/start" not in t)
 r = c.get("/kohorten/fremd", headers=H)
 ok("fremder Mandant: 404, nichts davon in der Antwort",
    r.status_code == 404 and "fremd" not in r.get_data(as_text=True).replace("Kohorten", ""))
 r = c.get("/kohorten/..%2f..", headers=H)
-ok("Pfadspiel: 404", r.status_code == 404)
+ok("Pfadspiel: abgewiesen (404 oder 405)", r.status_code in (404, 405))
 
 WHO.update(role="", roles={"user"})
 ok("ohne Verwalterrolle: 403", c.get("/kohorten", headers=H).status_code == 403
@@ -127,8 +129,83 @@ WHO.update(role="server_admin", roles={"server_admin"}, tenant="", host="t-b")
 ok("server_admin am Mandantenort sieht dessen Kohorten",
    "fremd" in c.get("/kohorten", headers=H).get_data(as_text=True))
 
-os.remove(VIEW)
+# --- Schaltflaechen: dieselbe Uebergabe wie die API ------------------------
+import management_api as mapi                                 # noqa: E402
+
+SP = tempfile.mkdtemp(prefix="oaap-cohort-spool-")
+for sub in ("queue", "claims", "jobs"):
+    os.makedirs(os.path.join(SP, sub))
+mapi.SPOOL_DIR = SP
+QUEUED = []
+def _queue(rid, name, payload, wait):
+    QUEUED.append((rid, payload))
+    open(os.path.join(SP, "queue", rid + ".json"), "w").write("{}")
+
+
+mapi.CTX["queue"] = _queue
+mapi.CTX["caller_name"] = lambda: "trainer"
 WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a", host=None)
+
+r = c.post("/kohorten/kurs-a/stop", headers=H)
+loc = r.headers.get("Location", "")
+ok("Anhalten: Auftrag in den Spool, Weiterleitung mit Auftrag",
+   r.status_code == 302 and "?job=" in loc and len(QUEUED) == 1
+   and QUEUED[0][1] == {"action": "cohort", "op": "stop", "args": {"cohort": "kurs-a"}}, (loc, QUEUED))
+rid = QUEUED[0][0]
+meta = json.load(open(os.path.join(SP, "jobs", rid, "meta.json")))
+ok("der Auftrag traegt Mandant, Rolle und Handelnden",
+   meta["tenant"] == "t-a" and meta["role"] == "tenant_admin" and meta["by"] == "trainer", meta)
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("Banner: Auftrag wartet, Seite laedt neu", "wartet auf dem Knoten" in t and "location.reload" in t)
+os.rename(os.path.join(SP, "queue", rid + ".json"), os.path.join(SP, "claims", rid + ".json"))
+ok("Banner: laeuft", "läuft auf dem Knoten" in c.get(loc, headers=H).get_data(as_text=True))
+json.dump({"id": rid, "ok": True, "message": "Cohort 'kurs-a' stopped."},
+          open(os.path.join(SP, "jobs", rid, "result.json"), "w"))
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("Banner: Ergebnis des Knotens, kein Neuladen mehr",
+   "Cohort &#39;kurs-a&#39; stopped." in t and "location.reload" not in t, t[-600:])
+json.dump({"id": rid, "ok": False, "message": "refused: nope"},
+          open(os.path.join(SP, "jobs", rid, "result.json"), "w"))
+ok("Banner: Ablehnung des Knotens wird als Fehler gezeigt",
+   'class="err">refused: nope' in c.get(loc, headers=H).get_data(as_text=True))
+WHO.update(tenant="t-c")
+os.makedirs(os.path.join(SP, "jobs", "f" * 32))
+json.dump({"id": "f" * 32, "tenant": "t-a"}, open(os.path.join(SP, "jobs", "f" * 32, "meta.json"), "w"))
+json.dump({"ok": True, "message": "GEHEIM"}, open(os.path.join(SP, "jobs", "f" * 32, "result.json"), "w"))
+WHO.update(tenant="t-a")
+WHO["host"] = None
+
+n0 = len(QUEUED)
+r = c.post("/kohorten/kurs-a/extend", headers=H, data={"ends": "2026-11-07"})
+ok("Verlaengern: Auftrag mit Datum",
+   r.status_code == 302 and QUEUED[-1][1]["args"] == {"cohort": "kurs-a", "ends": "2026-11-07", "dry_run": False}
+   and len(QUEUED) == n0 + 1, QUEUED[-1])
+n0 = len(QUEUED)
+r = c.post("/kohorten/kurs-a/extend", headers=H, data={"ends": "morgen; rm -rf"})
+ok("Verlaengern ohne gueltiges Datum: nichts im Spool, Hinweis",
+   len(QUEUED) == n0 and "err=" in r.headers["Location"])
+r = c.post("/kohorten/fremd/stop", headers=H)
+ok("fremde Kohorte anhalten: nichts im Spool", len(QUEUED) == n0 and r.status_code == 302
+   and r.headers["Location"] == "/kohorten")
+r = c.post("/kohorten/kurs-a/remove", headers=H)
+ok("entfernen gibt es hier nicht", len(QUEUED) == n0)
+r = c.post("/kohorten/kurs-a/stop", headers={**H, "Origin": "https://boese.example"})
+ok("fremde Herkunft: 403, nichts im Spool", r.status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="", roles={"user"})
+r = c.post("/kohorten/kurs-a/stop", headers=H)
+ok("ohne Verwalterrolle: 403, nichts im Spool", r.status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-b")
+r = c.get(f"/kohorten/fremd?job={'f' * 32}", headers=H)
+ok("Auftrag eines anderen Mandanten: sein Ergebnis steht nicht im Banner",
+   "GEHEIM" not in r.get_data(as_text=True))
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a", host=None)
+# eine angehaltene Kohorte bietet Starten an
+json.dump({"cohorts": {"t-a": {"kurs-a": {**C, "state": "stopped"}}}}, open(VIEW, "w"))
+t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
+ok("angehalten: Starten statt Anhalten",
+   'action="/kohorten/kurs-a/start"' in t and "/kohorten/kurs-a/stop" not in t)
+
+os.remove(VIEW)
 r = c.get("/kohorten", headers=H)
 ok("Sichtdatei fehlt: leere Seite statt Fehler",
    r.status_code == 200 and "Noch keine Kohorte" in r.get_data(as_text=True))

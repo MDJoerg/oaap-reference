@@ -200,8 +200,9 @@ def _view(tid):
     return (data.get("cohorts") or {}).get(tid) or {}
 
 
-def _submit(tid, role, op, args, rid=None, extra=None):
-    """Write the request into the spool; the worker takes it from there."""
+def enqueue(tid, role, op, args, rid=None, extra=None):
+    """Write the request into the spool; the worker takes it from there.
+    Returns the job id. The portal's own pages use this too: one way in."""
     rid = rid or uuid.uuid4().hex
     jdir = os.path.join(SPOOL_DIR, "jobs", rid)
     os.makedirs(jdir, exist_ok=True)
@@ -216,6 +217,11 @@ def _submit(tid, role, op, args, rid=None, extra=None):
     os.replace(tmp, os.path.join(jdir, "meta.json"))
     payload = {"action": "cohort", "op": op, "args": args, **(extra or {})}
     CTX["queue"](rid, "", payload, 0)
+    return rid
+
+
+def _submit(tid, role, op, args, rid=None, extra=None):
+    rid = enqueue(tid, role, op, args, rid, extra)
     return jsonify({"job": rid, "status_url": f"{PREFIX}/jobs/{rid}"}), 202
 
 

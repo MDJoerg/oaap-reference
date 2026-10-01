@@ -9027,8 +9027,8 @@ COHORT_LIST_BODY = """
 {% else %}
 <div class="card"><p class="muted">Noch keine Kohorte in diesem Mandanten.</p></div>
 {% endif %}
-<p class="muted">Diese Seite zeigt nur an. Anlegen, verlängern, anhalten und
-entfernen geht über die Verwaltungs-API
+<p class="muted">Anhalten, Starten und Verlängern gibt es auf der Seite der
+Kohorte. Anlegen und Entfernen geht über die Verwaltungs-API
 (<code>/api/v1/tenant/cohorts</code>, mit einem Schlüssel aus
 <a href="/keys">Zugänge</a>) oder auf dem Knoten mit
 <code>oaap cohort</code>.</p>
@@ -9040,6 +9040,11 @@ COHORT_DETAIL_BODY = """
   <h1>{{ c.name }}</h1>
   <span class="badge {{ '' if c.tone == 'ok' else 'off' }}">{{ c.label }}</span>
 </div>
+{% if job %}
+<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}">{{ job.text }}</p></div>
+{% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
+{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
 <div class="card">
   <p>Angelegt: {{ c.created }}<br>
      Endet: {{ c.ends }}<br>
@@ -9062,9 +9067,24 @@ COHORT_DETAIL_BODY = """
   {% endfor %}
 </table>
 </div>
-<p class="muted">Nur Ansicht. Verlängern, anhalten, Plätze zurücksetzen oder
-entfernen: Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten
-(Handout) gibt es einmalig beim Anlegen und nicht hier.</p>
+<div class="card">
+  <h2>Steuern</h2>
+  <form method="post" action="/kohorten/{{ c.name }}/{{ 'start' if c.stopped else 'stop' }}" style="display:inline">
+    <button class="btn">{{ 'Starten' if c.stopped else 'Anhalten' }}</button>
+  </form>
+  <form method="post" action="/kohorten/{{ c.name }}/extend" style="display:inline;margin-left:1rem">
+    <label>Verlängern bis <input type="date" name="ends" required></label>
+    <button class="btn">Verlängern</button>
+  </form>
+  <p class="muted">Anhalten stoppt die Instanzen; Daten und Benutzer bleiben.
+  Verlängern verschiebt nur nach hinten; Termine, die aus dem Ende berechnet
+  sind, ziehen mit, von Hand gesetzte bleiben. Es startet nichts und
+  aktiviert niemanden. Der Auftrag läuft auf dem Knoten und kann etwas
+  dauern.</p>
+</div>
+<p class="muted">Plätze zurücksetzen oder entfernen und neue Kohorten anlegen:
+Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten (Handout)
+gibt es einmalig beim Anlegen und nicht hier.</p>
 """
 
 
@@ -9078,9 +9098,31 @@ def cohorts_page():
                 rows=cohort_view.rows(_cohort_view(tid)))
 
 
+def _cohort_job_note(tid, role, rid):
+    """The banner for ?job=<id>: what became of the request this page sent."""
+    if not management_api.JOB_RE.match(rid or ""):
+        return None
+    meta = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "meta.json"))
+    if not management_api._may_see(meta, tid, role):
+        return None
+    st = management_api.job_status(management_api.SPOOL_DIR, rid)
+    if st is None:
+        return None
+    if st != "done":
+        return {"done": False, "failed": False,
+                "text": "Der Auftrag " + ("läuft" if st == "running" else "wartet")
+                        + " auf dem Knoten — diese Seite lädt sich neu."}
+    res = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "result.json")) or {}
+    good = bool(res.get("ok"))
+    return {"done": True, "failed": not good,
+            "text": (res.get("message") or ("Erledigt." if good else "Fehlgeschlagen."))}
+
+
 @app.get("/kohorten/<name>")
 def cohorts_detail(name):
-    tid, _role = _cohort_scope()
+    tid, role = _cohort_scope()
     if tid is None:
         return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
                 "tenant_admin."), 403
@@ -9088,5 +9130,31 @@ def cohorts_detail(name):
     if not c:
         return page(COHORT_LIST_BODY, "Kohorten", "cohorts", status=404,
                     rows=cohort_view.rows(_cohort_view(tid)))
-    return page(COHORT_DETAIL_BODY, c["name"], "cohorts",
-                c=cohort_view.detail(c))
+    d = cohort_view.detail(c)
+    d["stopped"] = c.get("state") == "stopped"
+    return page(COHORT_DETAIL_BODY, c["name"], "cohorts", c=d,
+                job=_cohort_job_note(tid, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/kohorten/<name>/<verb>")
+def cohorts_act(name, verb):
+    """Stop, start or extend from the page -- the same hand-over as the API.
+    The host re-checks everything; this only decides who may ask."""
+    tid, role = _cohort_scope()
+    if tid is None:
+        return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
+                "tenant_admin."), 403
+    origin = request.headers.get("Origin", "")
+    if origin and origin.split("://", 1)[-1] != request.host:
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if verb not in ("stop", "start", "extend") or name not in _cohort_view(tid):
+        return redirect("/kohorten")
+    args = {"cohort": name}
+    if verb == "extend":
+        ends = request.form.get("ends", "")
+        if not management_api.DATE_RE.match(ends):
+            return redirect(f"/kohorten/{name}?err=" + quote("Bitte ein Datum wählen."))
+        args.update(ends=ends, dry_run=False)
+    rid = management_api.enqueue(tid, role, verb, args)
+    return redirect(f"/kohorten/{name}?job={rid}")
