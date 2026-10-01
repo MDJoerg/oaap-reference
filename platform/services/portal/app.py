@@ -25,6 +25,7 @@ from flask import (Flask, g, redirect, render_template_string, request,
                    send_file)
 from markupsafe import Markup
 
+import cohort_view
 import fleet_view
 # place.py sits BESIDE this file in the image (the build context is
 # services/, see docker-compose.yml) and one level up in the
@@ -308,6 +309,7 @@ LAYOUT = STYLE + """
     {% if can_store %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
     {% if can_twin %}<a href="/zwilling" class="{{ 'active' if active == 'twin' }}">Zwilling</a>{% endif %}
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
+    {% if has_cohorts %}<a href="/kohorten" class="{{ 'active' if active == 'cohorts' }}">Kohorten</a>{% endif %}
     {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
@@ -3428,6 +3430,16 @@ def read_audit(tenant=None, limit=200):
     return list(reversed(out[-limit:]))
 
 
+def _has_cohorts():
+    """Whether the Cohorts menu entry shows: only for someone who may see
+    cohorts AND only where one exists -- a node that never made a cohort
+    shows no new word (the same rule as everything tenant-shaped here)."""
+    if not (caller_roles() & {"server_admin", "tenant_admin"}):
+        return False
+    tid, _role = _cohort_scope()
+    return bool(_cohort_view(tid)) if tid is not None else False
+
+
 def page(body_template, title, active, status=200, **ctx):
     body = render_template_string(body_template, **ctx)
     roles = request.headers.get("X-OAAP-Roles", "")
@@ -3460,6 +3472,7 @@ def page(body_template, title, active, status=200, **ctx):
         # (oaap.core.portal 2.6). Two rights, therefore two flags.
         can_store=bool(caller & {"server_admin", "tenant_admin"}),
         show_tenant=multi,
+        has_cohorts=_has_cohorts(),
         can_health=bool(caller & {"server_admin", "support"}),
         # The twin browser (RFC-0031 Bauplan Schritt 5): every tenant
         # role sees it ("user sieht"); a server_admin with no tenant
@@ -8961,3 +8974,119 @@ def twin_type_new_create():
                    object_types=twin_view.object_types(types),
                    value_types=TWIN_VALUE_TYPES, error=r.text or f"HTTP {r.status_code}")
     return redirect("/zwilling?msg=" + quote(f"Typ '{body['group_key']}' angelegt."), code=303)
+
+
+# ---------------------------------------------------------------------------
+# Cohorts (RFC-0046 stage 3, first form): a read-only view on the file the
+# management API reads, cohort-view.json. Same doors as the API's GET calls:
+# the tenant comes from the caller's own record, a host narrows it, only a
+# server_admin may be tenant-less. Changing anything stays with the API and
+# `oaap cohort`; the page says so.
+COHORT_VIEW_FILE = "/apps-registry/cohort-view.json"
+
+
+def _cohort_scope():
+    """(tenant_id, role) this caller looks at, or (None, "") for no right."""
+    role, mine = caller_scope()
+    if role not in ("server_admin", "tenant_admin"):
+        return None, ""
+    host_tid = host_tenant_scope(request.host)[0]
+    if role == "tenant_admin":
+        if not mine or (host_tid and host_tid != mine):
+            return None, role
+        return mine, role
+    return (host_tid or mine), role
+
+
+def _cohort_view(tid):
+    try:
+        with open(COHORT_VIEW_FILE, encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+    return (data.get("cohorts") or {}).get(tid) or {}
+
+
+COHORT_LIST_BODY = """
+<div class="pagehead"><h1>Kohorten</h1></div>
+{% if rows %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+  <tr><th>Name</th><th>Zustand</th><th>Plätze</th><th>Endet</th><th></th></tr>
+  {% for r in rows %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/kohorten/{{ r.name }}">{{ r.name }}</a></td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' }}">{{ r.label }}</span></td>
+    <td>{{ r.seats }}{% if r.problem_seats %} <span class="muted">({{ r.problem_seats }} mit Problem)</span>{% endif %}</td>
+    <td>{{ r.ends }}</td>
+    <td><a class="rowaction" href="/kohorten/{{ r.name }}">Ansehen</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% else %}
+<div class="card"><p class="muted">Noch keine Kohorte in diesem Mandanten.</p></div>
+{% endif %}
+<p class="muted">Diese Seite zeigt nur an. Anlegen, verlängern, anhalten und
+entfernen geht über die Verwaltungs-API
+(<code>/api/v1/tenant/cohorts</code>, mit einem Schlüssel aus
+<a href="/keys">Zugänge</a>) oder auf dem Knoten mit
+<code>oaap cohort</code>.</p>
+"""
+
+COHORT_DETAIL_BODY = """
+<a class="back" href="/kohorten">← Zurück zur Liste</a>
+<div class="pagehead">
+  <h1>{{ c.name }}</h1>
+  <span class="badge {{ '' if c.tone == 'ok' else 'off' }}">{{ c.label }}</span>
+</div>
+<div class="card">
+  <p>Angelegt: {{ c.created }}<br>
+     Endet: {{ c.ends }}<br>
+     Benutzer deaktiviert: {{ c.deactivate }}<br>
+     Benutzer gelöscht: {{ c.delete }}</p>
+</div>
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<table>
+  <tr><th>Platz</th><th>Benutzer</th><th>Instanzen</th></tr>
+  {% for s in c.seat_list %}
+  <tr>
+    <td>{{ s.id }}{% if s.label %} <span class="muted">{{ s.label }}</span>{% endif %}</td>
+    <td>{{ s.user }}</td>
+    <td>{% for i in s.instances %}
+      {% if i.address %}<a href="{{ i.address }}" target="_blank" rel="noopener">{{ i.app }}</a>{% else %}{{ i.app }}{% endif %}
+      <span class="badge {{ '' if i.tone == 'ok' else 'off' }}">{{ i.label }}</span>{% if not loop.last %}<br>{% endif %}
+      {% endfor %}
+      {% if s.note %}<br><span class="muted">{{ s.note }}</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+<p class="muted">Nur Ansicht. Verlängern, anhalten, Plätze zurücksetzen oder
+entfernen: Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten
+(Handout) gibt es einmalig beim Anlegen und nicht hier.</p>
+"""
+
+
+@app.get("/kohorten")
+def cohorts_page():
+    tid, _role = _cohort_scope()
+    if tid is None:
+        return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
+                "tenant_admin."), 403
+    return page(COHORT_LIST_BODY, "Kohorten", "cohorts",
+                rows=cohort_view.rows(_cohort_view(tid)))
+
+
+@app.get("/kohorten/<name>")
+def cohorts_detail(name):
+    tid, _role = _cohort_scope()
+    if tid is None:
+        return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
+                "tenant_admin."), 403
+    c = _cohort_view(tid).get(name)
+    if not c:
+        return page(COHORT_LIST_BODY, "Kohorten", "cohorts", status=404,
+                    rows=cohort_view.rows(_cohort_view(tid)))
+    return page(COHORT_DETAIL_BODY, c["name"], "cohorts",
+                c=cohort_view.detail(c))
