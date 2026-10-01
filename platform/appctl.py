@@ -79,6 +79,9 @@ import move  # noqa: E402
 # The cohort (RFC-0046): what a template may say and how a seat is
 # called. Pure; the acting is cmd_cohort below.
 import cohort  # noqa: E402
+# Node metrics (RFC-0051): the sampler and the tiered store. Pure; the
+# acting is cmd_metrics.
+import metrics  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -4993,6 +4996,52 @@ def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
                             "provider half, which is the address of the "
                             "node that moved (RFC-0041 K6)")
     return count, ""
+
+
+METRICS_DIR = os.path.join(DATA_DIR, "data", "metrics")
+
+
+def _fmt_at(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+
+
+def cmd_metrics(args):
+    """`oaap metrics sample|show [--window 4h|24h|1w|1m]` (RFC-0051).
+
+    `sample` is the host job the minutely timer runs. It never fails the
+    unit it shares with the state index: a sampler that cannot read
+    something says so on stderr and exits 0, because losing one minute of
+    a chart is cheaper than a container-state view that stops refreshing.
+    `show` is the same data the health page will draw, as text.
+    """
+    if args.action == "sample":
+        try:
+            metrics.take_sample(METRICS_DIR, DATA_DIR)
+        except Exception as exc:  # noqa: BLE001 -- see the docstring
+            print(f"metrics: sample skipped ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+        return
+    key = args.window or "24h"
+    if key not in metrics.WINDOWS:
+        die(f"window: one of {', '.join(metrics.WINDOWS)}")
+    w = metrics.window(METRICS_DIR, key)
+    if not w["since"]:
+        print("No samples yet. The host job runs every minute "
+              "(oaap-instance-watch.timer); try again in a few minutes.")
+        return
+    print(f"Window {key}, from tier '{w['tier']}' "
+          f"({w['step'] // 60} min per point), data since "
+          f"{_fmt_at(w['since'])}:")
+    names = {"cpu": "CPU", "mem": "Arbeitsspeicher", "disk": "Platte"}
+    for s in metrics.SERIES:
+        pts = w["series"][s]
+        if not pts:
+            print(f"  {names[s]:<16} (no data)")
+            continue
+        mean = sum(p[1] for p in pts) / len(pts)
+        print(f"  {names[s]:<16} now {pts[-1][1]:5.1f} %   mean {mean:5.1f} %   "
+              f"min {min(p[2] for p in pts):5.1f} %   "
+              f"max {max(p[3] for p in pts):5.1f} %   ({len(pts)} points)")
 
 
 def tenant_holdings(tid):
@@ -20924,6 +20973,12 @@ def main():
                       help="why a dangerous combination is wanted; goes into "
                            "this tenant's log")
     pten.set_defaults(fn=cmd_tenant)
+    pmet = sub.add_parser("metrics", help="node history of CPU, memory and "
+                                          "disk (RFC-0051)")
+    pmet.add_argument("action", choices=["sample", "show"])
+    pmet.add_argument("--window", default=None,
+                      help="for 'show': 4h, 24h (default), 1w or 1m")
+    pmet.set_defaults(fn=cmd_metrics)
     pep = sub.add_parser("endpoint", help="non-HTTP endpoints (RFC-0015)")
     pep.add_argument("action", choices=["list", "allow", "deny"])
     pep.add_argument("name", help="instance name")
@@ -21233,7 +21288,8 @@ def main():
                  # renaming change the node and need root like everything
                  # else that does.
                  or (args.cmd == "tenant"
-                     and args.action in ("list", "show", "check", "log")))
+                     and args.action in ("list", "show", "check", "log"))
+                 or (args.cmd == "metrics" and args.action == "show"))
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:
