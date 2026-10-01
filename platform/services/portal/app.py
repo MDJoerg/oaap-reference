@@ -9279,7 +9279,7 @@ COHORT_NEW_BODY = """
     <tr><td><code>resources</code></td><td><code>memory</code>, <code>cpus</code>, <code>pids</code> je Instanz. Der Knoten hat nur so viel; viele Plätze brauchen Platz.</td></tr>
     <tr><td><code>apps</code></td><td>Mindestens eine. <code>id</code>: eine App aus dem Store des Knotens; <code>name</code>: Teil des Instanznamens;
       <code>config</code>: Einstellungen der App (keine Zugangsdaten — Felder wie <code>…KEY</code>, <code>…TOKEN</code> werden abgelehnt);
-      <code>seed</code>: Datei im Home ← Datei im ZIP (<code>{name}</code>, <code>{nn}</code>, <code>{user}</code> werden ersetzt);
+      <code>seed</code>: Datei im Home ← Datei im ZIP (darin werden <code>{name}</code> = Kohorte, <code>{nn}</code> = Platz und <code>{user}</code> = Benutzername ersetzt);
       <code>material</code>: Ordner im ZIP; <code>start</code>: Anhang der Adresse.</td></tr>
     <tr><td><code>users</code></td><td><code>prefix</code> (Standard <code>tn</code>), <code>display_name</code> (<code>{nn}</code> = Platznummer).</td></tr>
   </table>

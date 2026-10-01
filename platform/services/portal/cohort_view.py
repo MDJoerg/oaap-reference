@@ -142,7 +142,8 @@ apps:
     config:                 # Einstellungen der App (hier: nur die Zeitzone)
       TZ: Europe/Berlin     # Zugangsdaten gehören NICHT hierher
     seed:                   # Dateien, die jeder Platz beim ersten Start im Home bekommt
-      willkommen.md: seeds/willkommen.md   # Ziel im Home: Quelle im ZIP
+      willkommen.md: seeds/willkommen.md   # Ziel im Home: Quelle im ZIP.
+                                           # In der Datei: {{name}} = Kohorte, {{nn}} = Platz, {{user}} = Benutzer
     material: material/     # Ordner im ZIP, den jeder Platz mitbekommt (Kursunterlagen)
 users:
   prefix: tn                # Benutzername: beispiel-kurs-tn-01
@@ -152,9 +153,9 @@ handout: handout.csv        # die Zugangsdaten; gibt es nur einmal, direkt nach 
 
 EXAMPLE_FILES = {
     "seeds/willkommen.md": (
-        "# Willkommen, {name}!\n\n"
-        "Das ist Dein Platz {nn} im Kurs. Diese Datei liegt in Deinem Home -- "
-        "Du kannst sie ändern oder löschen.\n"),
+        "# Willkommen im Kurs {name}!\n\n"
+        "Dein Platz ist {nn}, Dein Benutzername {user}. Diese Datei liegt in "
+        "Deinem Home -- Du kannst sie ändern oder löschen.\n"),
     "material/uebung1.md": (
         "# Übung 1\n\nHier stehen die Kursunterlagen. Der Ordner `material/` "
         "der Vorlage liegt bei jedem Teilnehmer.\n"),
