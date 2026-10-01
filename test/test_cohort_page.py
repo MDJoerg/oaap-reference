@@ -339,6 +339,37 @@ ok("Zuruecksetzen ohne Verwalterrolle: 403",
    c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"sure": "1"}).status_code == 403)
 WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
 
+# --- einen Platz entfernen --------------------------------------------------
+t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
+ok("Platz: Entfernen mit dem Wort '<Kohorte>-<Platz>', beide Haken aus",
+   'action="/kohorten-entfernen/kurs-a/02"' in t and "<code>kurs-a-02</code>" in t)
+n0 = len(QUEUED)
+r = c.post("/kohorten-entfernen/kurs-a/02", headers=H, data={"confirm": "kurs-a", "purge": "1"})
+ok("nur der Kohortenname statt '<Kohorte>-<Platz>': Hinweis, nichts im Spool",
+   len(QUEUED) == n0 and "err=" in r.headers["Location"])
+r = c.post("/kohorten-entfernen/kurs-a/02", headers={**H, "Sec-Fetch-Site": "cross-site"},
+           data={"confirm": "kurs-a-02"})
+ok("Platz entfernen von einer fremden Seite: 403", r.status_code == 403 and len(QUEUED) == n0)
+for path in ("/kohorten-entfernen/kurs-a/99", "/kohorten-entfernen/fremd/01",
+             "/kohorten-entfernen/kurs-a/..", "/kohorten-entfernen/kurs-a/01;rm"):
+    c.post(path, headers=H, data={"confirm": "kurs-a-99"})
+ok("unbekannter Platz oder fremde Kohorte: nichts im Spool", len(QUEUED) == n0)
+WHO.update(role="", roles={"user"})
+ok("Platz entfernen ohne Verwalterrolle: 403",
+   c.post("/kohorten-entfernen/kurs-a/02", headers=H, data={"confirm": "kurs-a-02"}).status_code == 403
+   and len(QUEUED) == n0)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
+r = c.post("/kohorten-entfernen/kurs-a/02", headers=H, data={"confirm": "kurs-a-02"})
+ok("Platz entfernen: Auftrag remove-seat; der Host bekommt den Kohortennamen als Pruefwort",
+   r.status_code == 302 and r.headers["Location"].startswith("/kohorten/kurs-a?job=")
+   and QUEUED[-1][1] == {"action": "cohort", "op": "remove-seat", "args": {
+       "cohort": "kurs-a", "confirm": "kurs-a", "seat": "02", "purge": False, "users": False}},
+   QUEUED[-1])
+r = c.post("/kohorten-entfernen/kurs-a/02", headers=H,
+           data={"confirm": "kurs-a-02", "purge": "1", "users": "1"})
+ok("Platz entfernen mit beiden Haken", QUEUED[-1][1]["args"]["purge"] is True
+   and QUEUED[-1][1]["args"]["users"] is True)
+
 # --- Entfernen --------------------------------------------------------------
 t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
 ok("Detail: Entfernen mit Namenseingabe; Speicher und Benutzer NICHT vorgewaehlt",

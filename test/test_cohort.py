@@ -1004,6 +1004,23 @@ ok("die Handout-Notiz kommt ins Protokoll -- verschluesselt oder nicht, nie das 
 old = os.path.join(a.JOBS_DIR, "%032x" % 1)
 os.utime(old, (1, 1))
 a._prune_jobs()
+seats_ = sorted(a.load_cohort(TID, "kurs-api")["seats"])
+ok_, msg, _r = job("remove-seat", {"cohort": "kurs-api", "seat": seats_[0], "confirm": "falsch"})
+ok("einen Platz entfernen ohne passende Bestaetigung: abgelehnt, Platz bleibt",
+   not ok_ and seats_[0] in a.load_cohort(TID, "kurs-api")["seats"], msg)
+ok_, msg, _r = job("remove-seat", {"cohort": "kurs-api", "seat": seats_[0], "confirm": "kurs-api"})
+ok("einen Platz entfernen: ein Satz, der Platz ist weg, die anderen bleiben",
+   ok_ and msg == f"seat {seats_[0]} of cohort 'kurs-api' removed"
+   and seats_[0] not in a.load_cohort(TID, "kurs-api")["seats"]
+   and seats_[1] in a.load_cohort(TID, "kurs-api")["seats"], msg)
+_del = a.identity_user_delete
+a.identity_user_delete = lambda u: (409, {"error": "last tenant admin"})
+ok_, msg, _r = job("remove-seat", {"cohort": "kurs-api", "seat": seats_[1], "confirm": "kurs-api",
+                                   "users": True})
+a.identity_user_delete = _del
+ok("ein Benutzer, den Identity nicht loescht, geht in der Meldung nicht unter",
+   ok_ and "NOT deleted" in msg and "last tenant admin" in msg, msg)
+AUDIT.clear()
 ok("ein Auftrag nach 24 Stunden: Verzeichnis samt Handout weg",
    not os.path.exists(old))
 ok("ein juengerer bleibt", os.path.isdir(os.path.join(a.JOBS_DIR, "%032x" % 2)))
