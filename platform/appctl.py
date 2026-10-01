@@ -9324,6 +9324,7 @@ def state_view_write(reg=None):
         # Container names and statuses -- nothing the app wrote, nothing
         # anybody's own. Same class as apps/artifacts.json.
         os.chmod(STATE_VIEW, 0o644)
+        cohort_view_write()
         return True
     except OSError as e:
         print(f"WARNING: could not write {STATE_VIEW}: {e}", flush=True)
@@ -12844,7 +12845,17 @@ def _identity_user_call(fn, args_json, actor):
     return res["code"], res["body"]
 
 
+# Set by the deploy worker for the length of ONE cohort job
+# (oaap.core.management): who is acting through the API, and whether that
+# is a tenant's trainer (store ids of trusted sources only) or the node's
+# operator. Single-threaded worker, reset in a finally -- never left set.
+COHORT_ACTOR = None        # (username, role) or None for the CLI
+COHORT_RESTRICTED = False
+
+
 def _operator_name():
+    if COHORT_ACTOR:
+        return COHORT_ACTOR[0]
     return os.environ.get("SUDO_USER") or "root"
 
 
@@ -13314,7 +13325,9 @@ def save_cohort_secrets(secrets_):
 
 def _cohort_audit(action, rec, detail="", subject=""):
     audit_tenant(action, rec["tenant"], subject=subject or rec["name"],
-                 who=_operator_name(), role="root", detail=detail)
+                 who=_operator_name(),
+                 role=COHORT_ACTOR[1] if COHORT_ACTOR else "root",
+                 detail=detail)
 
 
 def _cohort_existing_users():
@@ -13331,6 +13344,14 @@ def _cohort_source(app, confirm_source=""):
     portal's one-click install. A git address is taken as written: on the
     node the operator is the authority for it, and stage 2 restricts it.
     """
+    if COHORT_RESTRICTED:
+        # oaap.core.management 2.5: a tenant's trainer names apps of the
+        # node's configured, trusted sources -- never a git address, and
+        # never a confirmation of an unverified source.
+        confirm_source = ""
+        if app["kind"] == "git":
+            die(f"'{app['id']}' is a git address -- a tenant's templates "
+                "may only name apps from the node's store sources")
     if app["kind"] == "git":
         return {"kind": "git", "url": app["id"], "path": app["path"],
                 "ref": app["ref"]}
@@ -14183,6 +14204,216 @@ def _cohort_sweep_cmd(args):
         return
     for subject, text in done:
         print(f"{subject}: {text}")
+
+
+COHORT_VIEW = os.path.join(APPS_DIR, "cohort-view.json")
+JOBS_DIR = os.path.join(SPOOL_DIR, "jobs")
+JOB_KEEP_SECONDS = 24 * 3600
+JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+TEMPLATE_MAX_ENTRIES = 5000
+TEMPLATE_MAX_BYTES = 512 * 1024 * 1024
+
+
+def cohort_describe(rec, states=None):
+    """One cohort as the API shows it (oaap.core.management 2.2)."""
+    reg = load_registry()
+    try:
+        tpl, _tdir = _cohort_template(rec)
+        life = tpl["lifetime"]
+        d, x = cohort.user_dates(tpl)
+        lifetime = {"ends": life["ends"], "deactivate_at": d, "delete_at": x}
+        apps = {a["name"]: a for a in tpl["apps"]}
+    except SystemExit:
+        lifetime, apps = {}, {}
+    if states is None:
+        names = []
+        for _sid, _app, key in _cohort_instances(rec):
+            for s in instance_services(reg["instances"].get(key) or {}):
+                names.append(s["container"])
+        states, _ok = container_states(names)
+    seats = []
+    for sid, seat in sorted((rec.get("seats") or {}).items()):
+        items = []
+        for app_name, key in sorted((seat.get("instances") or {}).items()):
+            inst = reg["instances"].get(key)
+            if not inst:
+                items.append({"app": app_name, "key": key, "state": "missing",
+                              "address": ""})
+                continue
+            st = sorted({(states.get(s["container"]) or {}).get("state", "absent")
+                         for s in instance_services(inst)})
+            hosts = instance_auto_hosts(key, inst)
+            items.append({"app": app_name, "key": key,
+                          "state": ",".join(st),
+                          "address": (f"https://{hosts[0]}/"
+                                      + (apps.get(app_name) or {}).get("start", ""))
+                          if hosts else ""})
+        seats.append({"id": sid, "user": seat.get("user", ""),
+                      "label": seat.get("label", ""), "instances": items,
+                      "waiting": bool(seat.get("waiting")),
+                      "refused": seat.get("refused", "")})
+    state = ("stopped" if rec.get("stopped")
+             else "running" if rec.get("complete") else "incomplete")
+    return {"name": rec["name"], "created": rec.get("created", ""),
+            "state": state, "ended": rec.get("ended", ""),
+            "lifetime": lifetime, "seats": seats}
+
+
+def cohort_view_write():
+    """Every cohort, per tenant id, where the portal reads (RFC-0046 stage 2).
+
+    The portal's GET calls answer from this file, so they never wait behind
+    a create that takes minutes. Refreshed by the instance-state timer and
+    after every worker action, like the state view next to it.
+    """
+    try:
+        out = {}
+        if os.path.isdir(COHORT_DIR):
+            for tid in sorted(os.listdir(COHORT_DIR)):
+                tdir = os.path.join(COHORT_DIR, tid)
+                if not os.path.isdir(tdir):
+                    continue
+                for name in sorted(os.listdir(tdir)):
+                    rec = load_cohort(tid, name)
+                    if rec:
+                        out.setdefault(tid, {})[name] = cohort_describe(rec)
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = COHORT_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "written": _iso_now(), "cohorts": out}, f)
+        os.replace(tmp, COHORT_VIEW)
+        os.chmod(COHORT_VIEW, 0o644)   # names, states, user names -- no secret
+        return True
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as e:
+        print(f"WARNING: could not write {COHORT_VIEW}: {e}", flush=True)
+        return False
+
+
+def template_tree_refusal(path):
+    """Why an unpacked template may not be used ('' when it may).
+
+    The portal checked the archive before unpacking; the spool is data,
+    not trust, so the host checks the tree again (management 2.4).
+    """
+    if not os.path.isdir(path) or os.path.islink(path):
+        return "the template is not a directory"
+    count, total = 0, 0
+    for base, dirs, files in os.walk(path, followlinks=False):
+        for n in dirs + files:
+            p = os.path.join(base, n)
+            count += 1
+            if os.path.islink(p):
+                return f"{os.path.relpath(p, path)}: a link"
+            if os.path.isfile(p):
+                st = os.stat(p)
+                if st.st_nlink > 1:
+                    return f"{os.path.relpath(p, path)}: a hard link"
+                total += st.st_size
+            elif not os.path.isdir(p):
+                return f"{os.path.relpath(p, path)}: not a plain file"
+        if count > TEMPLATE_MAX_ENTRIES or total > TEMPLATE_MAX_BYTES:
+            return "the template is too large"
+    return ""
+
+
+def cohort_job(req, rid, tid, role, actor):
+    """Run one cohort operation for the API -> (ok, message).
+
+    `tid`, `role` and `actor` come from the actor's own record (the worker
+    derives them), never from the request. A tenant_admin acts in `tid`
+    and nowhere else; a server_admin may name another tenant by label.
+    """
+    global COHORT_ACTOR, COHORT_RESTRICTED
+    import argparse as _argparse
+    import contextlib
+    import io
+    op = str(req.get("op") or "")
+    a = req.get("args") or {}
+    if role not in ("tenant_admin", "server_admin"):
+        return False, "cohort operations need the role tenant_admin or server_admin"
+    if role == "server_admin" and a.get("tenant"):
+        try:
+            tid = resolve_tenant_arg(str(a["tenant"]))
+        except SystemExit:
+            return False, f"no tenant '{a['tenant']}' on this node"
+    label = tenant_label(tid) if tid else ""
+    if not label:
+        return False, "this actor has no tenant to act in"
+    if op == "handout-note":
+        # The portal tells the host a handout was fetched; the host owns
+        # the tenant audit log (management 2.7). No password is named.
+        audit_tenant("cohort.handout", tid, subject=str(a.get("cohort") or ""),
+                     who=actor, role=role,
+                     detail=f"job {str(a.get('job') or '')[:32]}, "
+                            f"{'encrypted' if a.get('encrypted') else 'unencrypted'}")
+        return True, "recorded"
+    if not JOB_ID_RE.match(str(rid or "")):
+        return False, "malformed job id"
+    jdir = os.path.join(JOBS_DIR, rid)
+    os.makedirs(jdir, exist_ok=True)
+    handout = os.path.join(jdir, "handout.csv")
+    name = str(a.get("cohort") or "")
+    ns = _argparse.Namespace(
+        action="", target=name or None, second=None, third=None, tenant=label,
+        seat=str(a.get("seat") or ""), who=str(a.get("name") or ""),
+        keep_home=bool(a.get("keep_home")), purge=bool(a.get("purge")),
+        users=bool(a.get("users")), yes=True, handout_file="",
+        confirm_source="", stdin=False, dry_run=bool(a.get("dry_run")))
+    try:
+        if op == "create":
+            tdir = os.path.join(jdir, "template")
+            why = template_tree_refusal(tdir)
+            if why:
+                return False, f"template refused: {why}"
+            ns.target, ns.handout_file = tdir, handout
+            fn = _cohort_create
+        else:
+            rec = load_cohort(tid, name) if name else None
+            if not rec:
+                return False, f"no cohort '{name}' in this tenant"
+            if op in ("remove", "remove-seat") and a.get("confirm") != name:
+                return False, "confirmation did not match the cohort name"
+            if op in ("remove-seat", "reset") and ns.seat not in (rec.get("seats") or {}):
+                return False, f"the cohort has no seat '{ns.seat}'"
+            if op == "remove-seat" and not ns.seat:
+                return False, "remove-seat needs a seat"
+            if op == "extend":
+                ns.second = str(a.get("ends") or "")
+            ns.handout_file = handout
+            fn = {"stop": lambda n: _cohort_power(n, False),
+                  "start": lambda n: _cohort_power(n, True),
+                  "extend": _cohort_extend, "add": _cohort_add,
+                  "reset": _cohort_reset, "remove": _cohort_remove,
+                  "remove-seat": _cohort_remove}.get(op)
+            if fn is None:
+                return False, f"unknown cohort operation '{op}'"
+    except SystemExit:
+        return False, "the request could not be read"
+    COHORT_ACTOR = (actor, role)
+    COHORT_RESTRICTED = role != "server_admin"
+    buf = io.StringIO()
+    ok = False
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            fn(ns)
+        ok = True
+    except SystemExit:
+        pass
+    except subprocess.CalledProcessError as e:
+        buf.write(((e.stderr or str(e)).strip()) + "\n")
+    except Exception as e:      # a failed job must never kill the worker
+        buf.write(f"{type(e).__name__}: {e}\n")
+    finally:
+        COHORT_ACTOR, COHORT_RESTRICTED = None, False
+        if op == "create":
+            shutil.rmtree(os.path.join(jdir, "template"), ignore_errors=True)
+    lines = [l.strip() for l in buf.getvalue().splitlines() if l.strip()]
+    if ok:
+        msg = next((l for l in reversed(lines)
+                    if not l.startswith(("seat ", "-"))), "done")
+    else:
+        msg = "; ".join(l.removeprefix("ERROR: ") for l in lines)[-1500:] or "failed"
+    return ok, msg
 
 
 def cmd_cohort(args):
@@ -16861,6 +17092,35 @@ def reap_stale_claims(results):
         print(f"deploy {req.get('instance', '')}: FAILED — {TIMED_OUT}")
 
 
+def _prune_jobs():
+    """Remove cohort job records after 24 h; a handout is overwritten first."""
+    if not os.path.isdir(JOBS_DIR):
+        return
+    now = time.time()
+    for n in os.listdir(JOBS_DIR):
+        d = os.path.join(JOBS_DIR, n)
+        try:
+            if not os.path.isdir(d) or now - os.path.getmtime(d) <= JOB_KEEP_SECONDS:
+                continue
+            shred_file(os.path.join(d, "handout.csv"))
+            shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def shred_file(path):
+    """Overwrite a file with zeros, then remove it (best effort)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r+b") as f:
+            f.write(bytes(size))
+            f.flush()
+            os.fsync(f.fileno())
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def cmd_process_deploys(_args):
     """Run queued deploy requests (invoked by the oaap-deployd path unit)."""
     global DEADLINE
@@ -16881,6 +17141,7 @@ def cmd_process_deploys(_args):
         if now - os.path.getmtime(p) > 3600:
             os.remove(p)
     reap_stale_claims(results)
+    _prune_jobs()
 
     handled = 0
     for req_file in sorted(os.listdir(queue)):
@@ -18351,6 +18612,29 @@ def cmd_process_deploys(_args):
                     msg = str(e)
                 except subprocess.CalledProcessError as e:
                     msg = (e.stderr or str(e)).strip().splitlines()[-1]
+        elif action == "cohort":
+            # oaap.core.management: a cohort operation for a tenant's
+            # trainer. Who and where come from the ACTOR's record (above),
+            # never from the request; the job directory is the portal's
+            # hand-over and is named by the request id alone.
+            ok, msg = cohort_job(req, rid, act_tenant, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                _h = os.path.join(_jd, "handout.csv")
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now(),
+                               "handout": os.path.isfile(_h)
+                               and os.path.getsize(_h) > 0}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("cohort." + str((req.get("op") or "?")),
+                             act_tenant or ensure_default_tenant(),
+                             subject=str((req.get("args") or {}).get("cohort") or ""),
+                             result="denied", who=actor or "api",
+                             role=act_role or "-", detail=msg)
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -18410,7 +18694,7 @@ def cmd_process_deploys(_args):
                "diagnose-open": "portal", "diagnose-close": "portal",
                "diagnose-logs": "portal", "restart": "portal",
                "config": "portal", "token": "portal", "resources": "portal",
-               "address": "portal", "throttle": "portal",
+               "address": "portal", "throttle": "portal", "cohort": "api",
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
                "destination": "portal", "exposure": "portal",

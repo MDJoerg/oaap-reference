@@ -876,6 +876,134 @@ if _real_fchown:
 else:
     del os.fchown
 
+# ------------------------------------------------ Auftraege der Verwaltungs-API
+print("")
+print("Die Verwaltungs-API auf dem Knoten -- cohort_job, mit Handelndem und Grenzen")
+import shutil  # noqa: E402
+
+a.JOBS_DIR = os.path.join(WORK, "jobs")
+a._operator_name = lambda: a.COHORT_ACTOR[0] if a.COHORT_ACTOR else "tester"
+LABEL = a.tenant_label(TID)
+RID = [0]
+
+
+def job(op, args=None, role="tenant_admin", tid=None, actor="trainer", tpl_dir=None):
+    RID[0] += 1
+    rid = "%032x" % RID[0]
+    if tpl_dir:
+        shutil.copytree(tpl_dir, os.path.join(a.JOBS_DIR, rid, "template"))
+    AUDIT.clear()
+    ok_, msg = a.cohort_job({"op": op, "args": args or {}}, rid, TID if tid is None else tid,
+                            role, actor)
+    return ok_, msg, rid
+
+
+ok("der Knoten-Mandant hat eine Bezeichnung (Voraussetzung)", bool(LABEL), LABEL)
+t_api = template(os.path.join(WORK, "t-api"), mutate=lambda t: t.replace("kurs-2026-10", "kurs-api"))
+good, msg, rid = job("create", tpl_dir=t_api)
+rec = a.load_cohort(TID, "kurs-api")
+ok("ein tenant_admin legt aus der hochgeladenen Vorlage eine Kohorte an",
+   good and rec and rec["complete"], msg)
+hf = os.path.join(a.JOBS_DIR, rid, "handout.csv")
+ok("das Handout liegt im Auftragsverzeichnis, 0600, mit den Passwoertern",
+   os.path.isfile(hf) and len(open(hf).read().splitlines()) == 4
+   and (os.name == "nt" or stat.S_IMODE(os.stat(hf).st_mode) == 0o600))
+ok("die hochgeladene Kopie der Vorlage ist danach weg",
+   not os.path.exists(os.path.join(a.JOBS_DIR, rid, "template")))
+ok("das Protokoll nennt den HANDELNDEN und seine Rolle -- nicht den Betreiber",
+   any(x[0] == "cohort.create" and x[1]["who"] == "trainer" and x[1]["role"] == "tenant_admin"
+       for x in AUDIT), AUDIT)
+ok("danach ist nichts von der Rolle des Auftrags haengen geblieben",
+   a.COHORT_ACTOR is None and a.COHORT_RESTRICTED is False)
+
+ok_, msg, _r = job("stop", {"cohort": "kurs-api"})
+ok("stop wirkt", ok_ and a.load_cohort(TID, "kurs-api")["stopped"], msg)
+ok_, msg, _r = job("extend", {"cohort": "kurs-api", "ends": "2999-11-07"})
+ok("extend wirkt", ok_, msg)
+ok_, msg, _r = job("start", {"cohort": "gibt-es-nicht"})
+ok("eine unbekannte Kohorte wird abgelehnt", not ok_ and "no cohort" in msg, msg)
+ok_, msg, _r = job("remove", {"cohort": "kurs-api", "confirm": "falsch"})
+ok("Entfernen ohne passende Bestaetigung: der Host lehnt selbst ab",
+   not ok_ and "confirmation" in msg and a.load_cohort(TID, "kurs-api"), msg)
+ok_, msg, _r = job("stop", {"cohort": "kurs-api"}, role="user")
+ok("ohne Rolle: abgelehnt", not ok_ and "role" in msg, msg)
+ok_, msg, _r = job("stop", {"cohort": "kurs-api"}, tid="t-gibt-es-nicht")
+ok("ein Handelnder ohne Mandanten: abgelehnt, nichts bewegt", not ok_, msg)
+ok_, msg, _r = job("reset", {"cohort": "kurs-api", "seat": "99"})
+ok("ein Platz, den es nicht gibt: abgelehnt", not ok_ and "no seat" in msg, msg)
+
+print("")
+print("Was ein Ausbilder nennen darf -- und der Betreiber")
+git_app = """  - git: https://forge.example/apps.git
+    name: wiki
+"""
+t_git = template(os.path.join(WORK, "t-git"), extra_app=git_app,
+                 mutate=lambda t: t.replace("kurs-2026-10", "kurs-git"))
+INSTALLS_BEFORE = len(INSTALLS)
+ok_, msg, _r = job("create", tpl_dir=t_git)
+ok("eine Git-Adresse als App: fuer den tenant_admin abgelehnt, nichts angelegt",
+   not ok_ and "git address" in msg and not a.load_cohort(TID, "kurs-git")
+   and len(INSTALLS) == INSTALLS_BEFORE, msg)
+ok_, msg, _r = job("create", role="server_admin", tpl_dir=t_git)
+ok("derselbe Auftrag fuer den server_admin: er hat die Freiheit der Kommandozeile",
+   ok_ and a.load_cohort(TID, "kurs-git"), msg)
+shutil.rmtree(a._cohort_path(TID, "kurs-git"), ignore_errors=True)
+
+real_lookup = a._store_lookup
+a._store_lookup = lambda app_id, source_id="", prefer="": (
+    {"kind": "git", "url": "https://x/y", "path": "apps/" + app_id, "ref": ""},
+    "0.1", {"id": "wild", "name": "Wild", "trust": "unverified"})
+t_unv = template(os.path.join(WORK, "t-unv"), mutate=lambda t: t.replace("kurs-2026-10", "kurs-unv"))
+ok_, msg, _r = job("create", tpl_dir=t_unv)
+ok("eine App aus einer UNGEPRUEFTEN Quelle: der Ausbilder kann sie nicht bestaetigen",
+   not ok_ and "unverified" in msg and not a.load_cohort(TID, "kurs-unv"), msg)
+a._store_lookup = real_lookup
+
+print("")
+print("Die Vorlage vom Netz -- der Host prueft den Baum noch einmal")
+bad_tree = template(os.path.join(WORK, "t-link"), mutate=lambda t: t.replace("kurs-2026-10", "kurs-link"))
+try:
+    os.symlink("/etc/passwd", os.path.join(bad_tree, "seeds", "pw"))
+    linked = True
+except (OSError, NotImplementedError, AttributeError):
+    linked = False
+if linked:
+    ok_, msg, _r = job("create", tpl_dir=bad_tree)
+    ok("ein Link im Baum: abgelehnt", not ok_ and "link" in msg and not a.load_cohort(TID, "kurs-link"), msg)
+else:
+    print("SKIP  ein Link im Baum (kein Symlink auf diesem System)")
+ok("template_tree_refusal: ein Verzeichnis ohne Links ist in Ordnung",
+   a.template_tree_refusal(t_api) == "")
+
+print("")
+print("Die Sicht fuer das Portal, die Notiz, das Aufraeumen")
+a.COHORT_VIEW = os.path.join(WORK, "cohort-view.json")
+a.APPS_DIR = WORK
+a.state_view_write = lambda *x, **k: None
+ok("cohort_view_write schreibt die Kohorten je Mandant", a.cohort_view_write())
+view = json.load(open(a.COHORT_VIEW))["cohorts"]
+c_api = view[TID]["kurs-api"]
+ok("die Sicht nennt Plaetze, Benutzer, Zustand und Ende",
+   [x["id"] for x in c_api["seats"]] == ["01", "02", "03"]
+   and c_api["state"] == "stopped" and c_api["lifetime"]["ends"] == "2999-11-07"
+   and c_api["seats"][0]["user"] == "kurs-api-tn-01", c_api)
+ok("die Sicht enthaelt kein Passwort", "Geheim" not in open(a.COHORT_VIEW).read()
+   and all("password" not in json.dumps(x) for x in view[TID].values()))
+AUDIT.clear()
+ok_, msg = a.cohort_job({"op": "handout-note", "args": {"cohort": "kurs-api", "job": "j" * 32,
+                                                        "encrypted": True}},
+                        "c" * 32, TID, "tenant_admin", "trainer")
+ok("die Handout-Notiz kommt ins Protokoll -- verschluesselt oder nicht, nie das Passwort",
+   ok_ and AUDIT and AUDIT[0][0] == "cohort.handout" and "encrypted" in AUDIT[0][1]["detail"], AUDIT)
+old = os.path.join(a.JOBS_DIR, "%032x" % 1)
+os.utime(old, (1, 1))
+a._prune_jobs()
+ok("ein Auftrag nach 24 Stunden: Verzeichnis samt Handout weg",
+   not os.path.exists(old))
+ok("ein juengerer bleibt", os.path.isdir(os.path.join(a.JOBS_DIR, "%032x" % 2)))
+ok_, msg, _r = job("remove", {"cohort": "kurs-api", "confirm": "kurs-api", "purge": True, "users": True})
+ok("Entfernen mit Bestaetigung wirkt", ok_ and not a.load_cohort(TID, "kurs-api"), msg)
+
 # ------------------------------------------------ benannte Geheimnisse
 print("")
 print("Benannte Geheimnisse -- gespeichert, aufgelistet, nie zurueckgegeben")

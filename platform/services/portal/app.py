@@ -8369,6 +8369,17 @@ def _queue_with_id(rid, name, payload, wait_seconds):
 
 
 # ---------------------------------------------------------------------------
+# The management API (oaap.core.management 0.1): the cohort commands for a
+# tenant's own trainer. The module does the doors and the hand-over; the
+# host-side worker (appctl.cohort_job) does the work and re-checks it.
+import management_api  # noqa: E402
+
+management_api.init(
+    app, caller_name, caller_roles, caller_scope,
+    lambda host: host_tenant_scope(host)[0], _queue_with_id)
+
+
+# ---------------------------------------------------------------------------
 # First-run wizard
 
 @app.get("/setup")
