@@ -493,11 +493,26 @@ class Handout:
 
     def __init__(self, path):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self._hand_to_caller(fd)
         self.path = path
         self._f = os.fdopen(fd, "w", encoding="utf-8", newline="")
         self._w = csv.writer(self._f)
         self._w.writerow(HANDOUT_HEAD)
         self._f.flush()
+
+    @staticmethod
+    def _hand_to_caller(fd):
+        """Under `sudo` the file belongs to the person who typed it.
+
+        The list is for the trainer, who must be able to read and delete it
+        without becoming root; the mode stays 0600. Best effort: where there
+        is no sudo, or no `fchown`, the file is simply the caller's own.
+        """
+        try:
+            uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+            os.fchown(fd, uid, gid)
+        except (KeyError, ValueError, AttributeError, OSError):
+            pass
 
     def add(self, row):
         self._w.writerow([row.get(k, "") for k in HANDOUT_HEAD])

@@ -851,6 +851,31 @@ sw = sweep(2999, 11, 8)
 ok("am Tag nach dem neuen Ende stoppt er",
    a.load_cohort(TID, "kurs-ext")["ended"] == "2999-11-07", sw)
 
+# ------------------------------------------------ Handout unter sudo
+print("")
+print("Das Handout gehoert dem, der sudo getippt hat")
+CHOWNED = []
+_real_fchown = getattr(os, "fchown", None)
+os.fchown = lambda fd, u, g: CHOWNED.append((u, g))
+_env = dict(os.environ)
+os.environ["SUDO_UID"], os.environ["SUDO_GID"] = "1001", "1002"
+hp = os.path.join(WORK, "out", "sudo.csv")
+h = a.cohort.Handout(hp)
+h.close()
+ok("unter sudo wird die Datei dem Aufrufer uebergeben", CHOWNED == [(1001, 1002)], CHOWNED)
+CHOWNED.clear()
+del os.environ["SUDO_UID"], os.environ["SUDO_GID"]
+a.cohort.Handout(os.path.join(WORK, "out", "plain.csv")).close()
+ok("ohne sudo bleibt sie unberuehrt", CHOWNED == [], CHOWNED)
+os.environ["SUDO_UID"], os.environ["SUDO_GID"] = "kaputt", "1"
+a.cohort.Handout(os.path.join(WORK, "out", "bad.csv")).close()
+ok("ein unlesbarer sudo-Wert stoppt den Lauf nicht", CHOWNED == [], CHOWNED)
+os.environ.clear(); os.environ.update(_env)
+if _real_fchown:
+    os.fchown = _real_fchown
+else:
+    del os.fchown
+
 # ------------------------------------------------ benannte Geheimnisse
 print("")
 print("Benannte Geheimnisse -- gespeichert, aufgelistet, nie zurueckgegeben")
