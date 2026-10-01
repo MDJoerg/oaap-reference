@@ -339,6 +339,52 @@ ok("Zuruecksetzen ohne Verwalterrolle: 403",
    c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"sure": "1"}).status_code == 403)
 WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
 
+# --- Entfernen --------------------------------------------------------------
+t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
+ok("Detail: Entfernen mit Namenseingabe; Speicher und Benutzer NICHT vorgewaehlt",
+   'action="/kohorten-entfernen/kurs-a"' in t and 'name="confirm"' in t and 'required' in t
+   and 'name="purge" value="1" checked' not in t and 'name="users" value="1" checked' not in t)
+n0 = len(QUEUED)
+r = c.post("/kohorten-entfernen/kurs-a", headers=H, data={"confirm": "falsch", "purge": "1"})
+ok("falscher Name: Hinweis, nichts im Spool", len(QUEUED) == n0 and "err=" in r.headers["Location"])
+r = c.post("/kohorten-entfernen/kurs-a", headers=H, data={})
+ok("ohne Name: nichts im Spool", len(QUEUED) == n0)
+r = c.post("/kohorten-entfernen/kurs-a", headers={**H, "Sec-Fetch-Site": "cross-site"},
+           data={"confirm": "kurs-a"})
+ok("von einer fremden Seite: 403, nichts im Spool", r.status_code == 403 and len(QUEUED) == n0)
+c.post("/kohorten-entfernen/fremd", headers=H, data={"confirm": "fremd"})
+c.post("/kohorten-entfernen/..", headers=H, data={"confirm": ".."})
+ok("fremde oder unbekannte Kohorte: nichts im Spool", len(QUEUED) == n0)
+WHO.update(role="", roles={"user"})
+ok("ohne Verwalterrolle: 403, nichts im Spool",
+   c.post("/kohorten-entfernen/kurs-a", headers=H, data={"confirm": "kurs-a"}).status_code == 403
+   and len(QUEUED) == n0)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
+r = c.post("/kohorten-entfernen/kurs-a", headers=H, data={"confirm": " kurs-a "})
+loc = r.headers.get("Location", "")
+ok("Entfernen ohne Haken: Auftrag remove, Speicher und Benutzer bleiben",
+   r.status_code == 302 and loc.startswith("/kohorten?job=") and QUEUED[-1][1] == {
+       "action": "cohort", "op": "remove",
+       "args": {"cohort": "kurs-a", "confirm": "kurs-a", "seat": "", "purge": False, "users": False}},
+   QUEUED[-1])
+r = c.post("/kohorten-entfernen/kurs-a", headers=H,
+           data={"confirm": "kurs-a", "purge": "1", "users": "1"})
+ok("Entfernen mit beiden Haken", QUEUED[-1][1]["args"]["purge"] is True
+   and QUEUED[-1][1]["args"]["users"] is True)
+rid = loc.split("job=")[-1]
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("die Liste zeigt den Auftrag (wartet)", "wartet auf dem Knoten" in t)
+os.rename(os.path.join(SP, "queue", rid + ".json"), os.path.join(SP, "claims", rid + ".json"))
+json.dump({"id": rid, "ok": True, "cohort": "kurs-a",
+           "message": "Cohort 'kurs-a' is gone."}, open(os.path.join(SP, "jobs", rid, "result.json"), "w"))
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("fertig: Meldung des Knotens, KEIN Link zu der entfernten Kohorte",
+   "is gone" in t and 'href="/kohorten/kurs-a"' not in t.split("<table")[0], t[-700:])
+json.dump({"id": rid, "ok": False, "message": "users: NOT deleted -- last admin"},
+          open(os.path.join(SP, "jobs", rid, "result.json"), "w"))
+ok("Ablehnung des Knotens wird als Fehler gezeigt",
+   'class="err" style="white-space:pre-wrap">users: NOT deleted' in c.get(loc, headers=H).get_data(as_text=True))
+
 os.remove(VIEW)
 r = c.get("/kohorten", headers=H)
 ok("Sichtdatei fehlt: leere Seite statt Fehler",

@@ -9010,6 +9010,7 @@ def _cohort_view(tid):
 COHORT_LIST_BODY = """
 <div class="pagehead"><h1>Kohorten</h1>
   <span><a class="btn" href="/kohorten-anlegen">Kohorte anlegen</a></span></div>
+{{ BANNER }}
 {% if rows %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
@@ -9029,7 +9030,7 @@ COHORT_LIST_BODY = """
 <div class="card"><p class="muted">Noch keine Kohorte in diesem Mandanten.</p></div>
 {% endif %}
 <p class="muted">Anlegen geht hier; Anhalten, Starten, Verlängern und das
-Zurücksetzen eines Platzes auf der Seite der Kohorte. Entfernen geht über die Verwaltungs-API
+Zurücksetzen eines Platzes und das Entfernen auf der Seite der Kohorte. Einen einzelnen Platz entfernen geht über die Verwaltungs-API
 (<code>/api/v1/tenant/cohorts</code>, mit einem Schlüssel aus
 <a href="/keys">Zugänge</a>) oder auf dem Knoten mit
 <code>oaap cohort</code>.</p>
@@ -9038,7 +9039,7 @@ Zurücksetzen eines Platzes auf der Seite der Kohorte. Entfernen geht über die 
 COHORT_BANNER = """
 {% if job %}
 <div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p>
-{% if job.cohort and job.done and not job.failed %}<p><a class="btn" href="/kohorten/{{ job.cohort }}">Zur Kohorte</a></p>{% endif %}
+{% if job.link and job.cohort and job.done and not job.failed %}<p><a class="btn" href="/kohorten/{{ job.cohort }}">Zur Kohorte</a></p>{% endif %}
 {% if job.handout %}
 <form method="post" action="/kohorten-handout/{{ job.id }}">
   <h3>Zugangsdaten (Handout)</h3>
@@ -9103,10 +9104,25 @@ COHORT_DETAIL_BODY = """
   aktiviert niemanden. Der Auftrag läuft auf dem Knoten und kann etwas
   dauern.</p>
 </div>
+<div class="card">
+  <h2>Kohorte entfernen</h2>
+  <form method="post" action="/kohorten-entfernen/{{ c.name }}">
+    <p>Entfernt <strong>alle Instanzen</strong> der Kohorte. Das lässt sich nicht
+    rückgängig machen.</p>
+    <p><label><input type="checkbox" name="purge" value="1"> Den Speicher der Instanzen
+    mit löschen (alles, was die Teilnehmer abgelegt haben). Ohne Haken bleibt er
+    liegen; ihn später zu löschen kann nur der Betreiber des Knotens.</label></p>
+    <p><label><input type="checkbox" name="users" value="1"> Die Benutzer der Plätze mit
+    löschen. Ohne Haken bleiben sie bestehen; ihre Termine gelten weiter.</label></p>
+    <p><label>Zur Bestätigung den Namen der Kohorte eingeben
+    <input type="text" name="confirm" autocomplete="off" required placeholder="{{ c.name }}"></label>
+    <button class="btn">Kohorte entfernen</button></p>
+  </form>
+</div>
 <p class="muted">Zurücksetzen baut die Instanzen eines Platzes aus der Vorlage
 neu auf; Benutzer und Passwort bleiben. Ohne „Dateien behalten“ wird
 <strong>alles gelöscht, was der Teilnehmer in den Instanzen abgelegt hat</strong>.
-Entfernen: Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten (Handout)
+Einen einzelnen Platz entfernen: Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten (Handout)
 gibt es einmalig beim Anlegen und nicht hier.</p>
 """
 
@@ -9118,7 +9134,9 @@ def cohorts_page():
         return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
                 "tenant_admin."), 403
     return page(COHORT_LIST_BODY, "Kohorten", "cohorts",
-                rows=cohort_view.rows(_cohort_view(tid)))
+                rows=cohort_view.rows(_cohort_view(tid)),
+                job=_cohort_job_note(tid, _role, request.args.get("job", "")),
+                error=request.args.get("err"))
 
 
 def _same_origin():
@@ -9152,6 +9170,7 @@ def _cohort_job_note(tid, role, rid):
     mine = role == "server_admin" or meta.get("by") == caller_name()
     hand = os.path.join(management_api.SPOOL_DIR, "jobs", rid, "handout.csv")
     return {"done": True, "failed": not good, "id": rid,
+            "link": meta.get("op") != "remove",
             "cohort": (res.get("cohort") or meta.get("cohort") or "") if good else "",
             "handout": bool(good and mine and meta.get("op") == "create"
                             and os.path.isfile(hand)),
@@ -9305,3 +9324,27 @@ def cohorts_seat_reset(name, sid):
 
 COHORT_DETAIL_BODY = COHORT_DETAIL_BODY.replace("{{ BANNER }}", COHORT_BANNER)
 COHORT_NEW_BODY = COHORT_NEW_BODY.replace("{{ BANNER }}", COHORT_BANNER)
+
+
+@app.post("/kohorten-entfernen/<name>")
+def cohorts_remove_page(name):
+    """Remove a whole cohort: the API's removal, with the API's own check --
+    the cohort's name typed out. The host asks again and does the work."""
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if name not in _cohort_view(tid):
+        return redirect("/kohorten")
+    if request.form.get("confirm", "").strip() != name:
+        return redirect(f"/kohorten/{name}?err=" + quote(
+            "Der eingegebene Name passt nicht zur Kohorte; nichts wurde entfernt."))
+    rid = management_api.enqueue(tid, role, "remove", {
+        "cohort": name, "confirm": name, "seat": "",
+        "purge": request.form.get("purge") == "1",
+        "users": request.form.get("users") == "1"})
+    return redirect(f"/kohorten?job={rid}")
+
+
+COHORT_LIST_BODY = COHORT_LIST_BODY.replace("{{ BANNER }}", COHORT_BANNER)
