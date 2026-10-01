@@ -339,6 +339,53 @@ ok("Zuruecksetzen ohne Verwalterrolle: 403",
    c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"sure": "1"}).status_code == 403)
 WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
 
+# --- einen Platz hinzufuegen ------------------------------------------------
+t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
+ok("Detail: Formular zum Hinzufuegen, Name optional",
+   'action="/kohorten/kurs-a/seats"' in t and 'name="name"' in t and 'maxlength="80"' in t)
+n0 = len(QUEUED)
+r = c.post("/kohorten/kurs-a/seats", headers=H, data={"name": "  Berta Test "})
+loc = r.headers.get("Location", "")
+ok("Platz hinzufuegen: Auftrag add mit Namen, zurueck auf die Kohortenseite",
+   r.status_code == 302 and loc.startswith("/kohorten/kurs-a?job=") and QUEUED[-1][1] == {
+       "action": "cohort", "op": "add", "args": {"cohort": "kurs-a", "name": "Berta Test"}}, (loc, QUEUED[-1]))
+r = c.post("/kohorten/kurs-a/seats", headers=H, data={})
+ok("Platz hinzufuegen ohne Namen: Auftrag mit leerem Namen", QUEUED[-1][1]["args"] == {
+    "cohort": "kurs-a", "name": ""})
+n0 = len(QUEUED)
+r = c.post("/kohorten/kurs-a/seats", headers=H, data={"name": "x" * 81})
+ok("zu langer Name: Hinweis, nichts im Spool", len(QUEUED) == n0 and "err=" in r.headers["Location"])
+c.post("/kohorten/fremd/seats", headers=H, data={"name": "x"})
+ok("fremde Kohorte: nichts im Spool", len(QUEUED) == n0)
+r = c.post("/kohorten/kurs-a/seats", headers={**H, "Sec-Fetch-Site": "cross-site"}, data={"name": "x"})
+ok("Hinzufuegen von einer fremden Seite: 403", r.status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="", roles={"user"})
+ok("Hinzufuegen ohne Verwalterrolle: 403",
+   c.post("/kohorten/kurs-a/seats", headers=H, data={"name": "x"}).status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
+# der Auftrag ist fertig -> das Handout des neuen Platzes steht auf der Kohortenseite
+r = c.post("/kohorten/kurs-a/seats", headers=H, data={"name": "Berta"})
+loc = r.headers["Location"]
+rid = loc.split("job=")[-1]
+jdir = os.path.join(SP, "jobs", rid)
+os.rename(os.path.join(SP, "queue", rid + ".json"), os.path.join(SP, "claims", rid + ".json"))
+open(os.path.join(jdir, "handout.csv"), "wb").write(b"seat,username,password\nberta,kurs-a-tn-berta,pw-123\n")
+json.dump({"id": rid, "ok": True, "cohort": "kurs-a", "message": "seat berta added to cohort 'kurs-a'"},
+          open(os.path.join(jdir, "result.json"), "w"))
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("fertig: Meldung und Handout-Formular auf der Kohortenseite",
+   "seat berta added" in t and f'action="/kohorten-handout/{rid}"' in t)
+r = c.post(f"/kohorten-handout/{rid}", headers=H, data={"password": "kurz"})
+ok("zu kurzes Passwort: zurueck auf die Kohortenseite, Handout bleibt",
+   r.headers["Location"].startswith(f"/kohorten/kurs-a?job={rid}&err=")
+   and os.path.isfile(os.path.join(jdir, "handout.csv")), r.headers.get("Location"))
+r = c.post(f"/kohorten-handout/{rid}", headers=H, data={"password": "langes-passwort"})
+ok("Handout des neuen Platzes: verschluesseltes ZIP, Datei vernichtet",
+   r.status_code == 200 and zipfile.ZipFile(io.BytesIO(r.data)).infolist()[0].flag_bits & 1
+   and not os.path.exists(os.path.join(jdir, "handout.csv")))
+ok("danach kein Handout-Formular mehr",
+   "/kohorten-handout/" not in c.get(loc, headers=H).get_data(as_text=True))
+
 # --- einen Platz entfernen --------------------------------------------------
 t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
 ok("Platz: Entfernen mit dem Wort '<Kohorte>-<Platz>', beide Haken aus",

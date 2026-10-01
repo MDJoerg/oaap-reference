@@ -1021,6 +1021,28 @@ a.identity_user_delete = _del
 ok("ein Benutzer, den Identity nicht loescht, geht in der Meldung nicht unter",
    ok_ and "NOT deleted" in msg and "last tenant admin" in msg, msg)
 AUDIT.clear()
+USERS.clear()
+ok_, msg, rid_ = job("add", {"cohort": "kurs-api", "name": "Berta Test"})
+hf_ = os.path.join(a.JOBS_DIR, rid_, "handout.csv")
+ok("Platz hinzufuegen: ein Satz mit der Platznummer, Benutzer und Platz da",
+   ok_ and msg == "seat berta-test added to cohort 'kurs-api'"
+   and "berta-test" in a.load_cohort(TID, "kurs-api")["seats"]
+   and any(u["username"].endswith("-berta-test") for u in USERS), msg)
+rows_ = list(csv.DictReader(open(hf_, encoding="utf-8")))
+ok("Platz hinzufuegen: das Handout liegt im Auftragsverzeichnis, eine Zeile, 0600",
+   len(rows_) == 1 and rows_[0]["seat"] == "berta-test"
+   and (os.name == "nt" or stat.S_IMODE(os.stat(hf_).st_mode) == 0o600), rows_)
+ok("Platz hinzufuegen: das Protokoll nennt den Handelnden",
+   any(x[0] == "cohort.add" and x[1]["who"] == "trainer" and x[1]["role"] == "tenant_admin"
+       for x in AUDIT), AUDIT)
+ok_, msg, _r = job("add", {"cohort": "kurs-api"})
+ok("Platz hinzufuegen ohne Namen: die naechste Nummer", ok_ and msg.startswith("seat ")
+   and msg.endswith("added to cohort 'kurs-api'"), msg)
+ok_, msg, _r = job("add", {"cohort": "kurs-api", "name": "!!!"})
+ok("Platz hinzufuegen mit unbrauchbarem Namen: abgelehnt", not ok_, msg)
+ok_, msg, _r = job("add", {"cohort": "kurs-api"}, role="user")
+ok("Platz hinzufuegen ohne Rolle: abgelehnt", not ok_ and "role" in msg, msg)
+AUDIT.clear()
 ok("ein Auftrag nach 24 Stunden: Verzeichnis samt Handout weg",
    not os.path.exists(old))
 ok("ein juengerer bleibt", os.path.isdir(os.path.join(a.JOBS_DIR, "%032x" % 2)))

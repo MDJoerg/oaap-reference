@@ -9041,7 +9041,7 @@ COHORT_LIST_BODY = """
 <div class="card"><p class="muted">Noch keine Kohorte in diesem Mandanten.</p></div>
 {% endif %}
 <p class="muted">Anlegen geht hier; Anhalten, Starten, Verlängern und das
-Zurücksetzen und Entfernen (der Kohorte oder eines Platzes) auf der Seite der Kohorte. Plätze hinzufügen geht über die Verwaltungs-API
+Zurücksetzen und Entfernen (der Kohorte oder eines Platzes) auf der Seite der Kohorte. Neue Kohorten legst Du hier an, Plätze fügst Du auf der Seite der Kohorte hinzu. Weiteres geht über die Verwaltungs-API
 (<code>/api/v1/tenant/cohorts</code>, mit einem Schlüssel aus
 <a href="/keys">Zugänge</a>) oder auf dem Knoten mit
 <code>oaap cohort</code>.</p>
@@ -9124,6 +9124,16 @@ COHORT_DETAIL_BODY = """
   dauern.</p>
 </div>
 <div class="card">
+  <h2>Platz hinzufügen</h2>
+  <form method="post" action="/kohorten/{{ c.name }}/seats">
+    <p>Legt einen weiteren Platz an: einen Benutzer und die Instanzen der Vorlage.
+    Die Zugangsdaten gibt es danach einmalig, wie beim Anlegen.</p>
+    <label>Name des Teilnehmers (optional; ohne Namen wird die nächste Nummer genommen)
+    <input type="text" name="name" maxlength="80" autocomplete="off"></label>
+    <button class="btn">Platz hinzufügen</button>
+  </form>
+</div>
+<div class="card">
   <h2>Kohorte entfernen</h2>
   <form method="post" action="/kohorten-entfernen/{{ c.name }}">
     <p>Entfernt <strong>alle Instanzen</strong> der Kohorte. Das lässt sich nicht
@@ -9191,7 +9201,7 @@ def _cohort_job_note(tid, role, rid):
     return {"done": True, "failed": not good, "id": rid,
             "link": meta.get("op") != "remove",
             "cohort": (res.get("cohort") or meta.get("cohort") or "") if good else "",
-            "handout": bool(good and mine and meta.get("op") == "create"
+            "handout": bool(good and mine and meta.get("op") in ("create", "add")
                             and os.path.isfile(hand)),
             "text": (res.get("message") or ("Erledigt." if good else "Fehlgeschlagen."))}
 
@@ -9306,7 +9316,8 @@ def cohorts_handout(rid):
     if role != "server_admin" and meta.get("by") != caller_name():
         return ("Zugriff verweigert: nur wer den Auftrag gestartet hat, holt das "
                 "Handout."), 403
-    back = f"/kohorten-anlegen?job={rid}"
+    back = (f"/kohorten/{meta.get('cohort', '')}?job={rid}" if meta.get("op") == "add"
+            else f"/kohorten-anlegen?job={rid}")
     password = request.form.get("password", "")
     if password and len(password) < management_api.MIN_PASSWORD:
         return redirect(back + "&err=" + quote(
@@ -9364,6 +9375,23 @@ def cohorts_remove_page(name):
         "purge": request.form.get("purge") == "1",
         "users": request.form.get("users") == "1"})
     return redirect(f"/kohorten?job={rid}")
+
+
+@app.post("/kohorten/<name>/seats")
+def cohorts_seat_add(name):
+    """Add one seat -- the API's call, through the same spool."""
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if name not in _cohort_view(tid):
+        return redirect("/kohorten")
+    who = request.form.get("name", "").strip()
+    if len(who) > 80:
+        return redirect(f"/kohorten/{name}?err=" + quote("Der Name ist zu lang (höchstens 80 Zeichen)."))
+    rid = management_api.enqueue(tid, role, "add", {"cohort": name, "name": who})
+    return redirect(f"/kohorten/{name}?job={rid}")
 
 
 @app.post("/kohorten-entfernen/<name>/<sid>")

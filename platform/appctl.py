@@ -14488,7 +14488,10 @@ def cohort_job(req, rid, tid, role, actor):
             msg = (f"seat {a.get('seat', '')} of cohort '{name}' reset "
                    f"({'files kept' if a.get('keep_home') else 'files deleted'})")
         elif op == "add":
-            msg = f"a seat was added to cohort '{name}'"
+            made = next((m.group(1) for m in (re.match(r"Seat (\S+):$", l) for l in lines)
+                         if m), "")
+            msg = (f"seat {made} added to cohort '{name}'" if made
+                   else f"a seat was added to cohort '{name}'")
         elif op == "remove-seat":
             msg = f"seat {a.get('seat', '')} of cohort '{name}' removed"
         if op in ("remove", "remove-seat"):
