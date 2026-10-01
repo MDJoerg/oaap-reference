@@ -18,11 +18,19 @@ services:
         max-file: "3"
     ports:
       - "${OAAP_HTTP_PORT}:80"
-      # TLS for registered external hostnames (RFC-0005 level 3);
-      # unused (and firewalled) until 'oaap external set' is run
+      # TLS for registered external hostnames (RFC-0005 level 3).
+      # Always published; nothing answers for a name until
+      # 'oaap external set' registers it. (No host firewall exists.)
       - "443:443"
-      # RFC-0005 level 1: one gateway listener port per app instance
-      - "8100-8199:8100-8199"
+      # RFC-0005 level 1: one gateway listener port per app instance.
+      # OAAP_APP_PORT_BIND is unset on a plain node (all interfaces, as
+      # always) and 127.0.0.1 on a node with the 'gateway-only' profile:
+      # the listeners stay, but are no longer reachable from the network.
+      # A bind address rather than an overlay file on purpose: every
+      # compose call reads .env, so update.sh, migrate.sh and the CLI
+      # agree without each one naming a file set (the broker overlay
+      # needed exactly that and had to be repaired once).
+      - "${OAAP_APP_PORT_BIND:-0.0.0.0}:8100-8199:8100-8199"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./apps-caddy:/etc/caddy/apps:ro

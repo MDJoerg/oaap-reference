@@ -5337,6 +5337,11 @@ PROFILES = {
               "a platform service. The raw device port (no identity, RFC-"
               "0015) is only published when the node ALSO carries "
               "'exposed' — see _broker_compose_files below.",
+    "gateway-only": "gateway-only node — the per-instance LAN ports "
+                    "8100-8199 are no longer reachable from the network; "
+                    "apps are reached only through the gateway on 80/443 "
+                    "by name (RFC-0005 level 3). For nodes with a public "
+                    "address. Only the gateway's published ports change.",
     "remote-access": "remote-access node — carries WireGuard peer "
                      "access of oaap.net.remote-access 0.4 (RFC-0044 D4): "
                      "a person may be given a peer into one instance "
@@ -5376,6 +5381,38 @@ def save_profiles(profiles):
 
 def has_profile(name):
     return name in load_profiles()
+
+
+def _set_platform_env(key, value):
+    """Set (or, with value None, drop) one line of the platform .env."""
+    path = os.path.join(APP_DIR, ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    lines = [l for l in lines if not l.startswith(key + "=")]
+    if value is not None:
+        lines.append(f"{key}={value}")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def apply_gateway_only(on):
+    """Make the published LAN ports match the 'gateway-only' profile.
+
+    Writes the bind address, then recreates ONLY the gateway so Docker
+    republishes the range. Open streams on the gateway are dropped once.
+    Returns True when the gateway was recreated.
+    """
+    _set_platform_env("OAAP_APP_PORT_BIND", "127.0.0.1" if on else None)
+    try:
+        _compose("up", "-d", "--no-deps", "gateway")
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
 
 
 def _broker_compose_files():
@@ -5428,6 +5465,16 @@ def cmd_node(args):
                   "source it is given — not only from the configured store\n"
                   "sources. That is the point of the profile, and it is a bad\n"
                   "trade on a machine holding customer data.")
+        if profile == "gateway-only":
+            if apply_gateway_only(True):
+                print("The gateway was recreated: ports 8100-8199 now answer "
+                      "on 127.0.0.1 only. Reach apps by name (80/443).\n"
+                      "Check from OUTSIDE the node, not from the node itself.")
+            else:
+                print("WARNING: could not recreate the gateway — the profile "
+                      "is saved and .env is set; run 'docker compose "
+                      "--project-directory <app dir> --project-name oaap up "
+                      "-d --no-deps gateway'. Until then the ports stay open.")
         if profile == "store":
             # Unlike dev/exposed, this profile has nothing to check at
             # request time -- either the container is up or it is not.
@@ -5516,6 +5563,13 @@ def cmd_node(args):
                     "them first: 'oaap app access close <id>'.")
         save_profiles([p for p in profiles if p != profile])
         print(f"Node profile '{profile}' removed.")
+        if profile == "gateway-only":
+            if apply_gateway_only(False):
+                print("The gateway was recreated: ports 8100-8199 answer on "
+                      "all interfaces again.")
+            else:
+                print("WARNING: could not recreate the gateway — run "
+                      "'docker compose ... up -d --no-deps gateway'.")
         if profile == "store":
             try:
                 _compose("stop", "store", "twin")
@@ -14435,6 +14489,14 @@ def cohort_job(req, rid, tid, role, actor):
                    f"({'files kept' if a.get('keep_home') else 'files deleted'})")
         elif op == "add":
             msg = f"a seat was added to cohort '{name}'"
+        elif op == "remove-seat":
+            msg = f"seat {a.get('seat', '')} of cohort '{name}' removed"
+        if op in ("remove", "remove-seat"):
+            # a user the identity service would not delete is no success to
+            # hide behind the closing line
+            warn = [l for l in lines if "NOT deleted" in l]
+            if warn:
+                msg += "\n" + "\n".join(warn)
     else:
         msg = "; ".join(l.removeprefix("ERROR: ") for l in lines)[-1500:] or "failed"
     return ok, msg

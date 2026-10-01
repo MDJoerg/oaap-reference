@@ -3693,6 +3693,9 @@ PROFILE_LABELS = {
               "oaap.events.broker (RFC-0032 D2), unabhängig von 'store'. "
               "Der rohe Geräte-Port wird nur zusätzlich mit 'exposed' "
               "veröffentlicht.",
+    "gateway-only": "Nur-Gateway-Knoten — die Instanz-Ports 8100-8199 sind "
+                    "von außen nicht erreichbar; Apps nur über Namen am "
+                    "Gateway (80/443).",
     "remote-access": "Fernzugang-Knoten — trägt den WireGuard-Zugang von "
                      "oaap.net.remote-access 0.3 (RFC-0044 D4). Startet "
                      "einen echten Dienst auf dem Knoten, keinen "
@@ -3920,6 +3923,14 @@ def _looks_like_lan(host):
 
 
 def _tile_url(name, inst, host, ext, on_lan):
+    # A gateway-only node does not answer on the instance port from the
+    # network at all, so a name wins even on the LAN when there is one.
+    if on_lan and "gateway-only" in node_profiles():
+        if inst.get("address"):
+            return f"https://{inst['address']}/"
+        auto = instance_auto_host(name, inst)
+        if auto:
+            return f"https://{auto}/"
     if on_lan:
         return f"http://{host}:{inst['port']}/"
     # entered from outside: prefer the instance's own public hostname
@@ -9030,7 +9041,7 @@ COHORT_LIST_BODY = """
 <div class="card"><p class="muted">Noch keine Kohorte in diesem Mandanten.</p></div>
 {% endif %}
 <p class="muted">Anlegen geht hier; Anhalten, Starten, Verlängern und das
-Zurücksetzen eines Platzes und das Entfernen auf der Seite der Kohorte. Einen einzelnen Platz entfernen geht über die Verwaltungs-API
+Zurücksetzen und Entfernen (der Kohorte oder eines Platzes) auf der Seite der Kohorte. Plätze hinzufügen geht über die Verwaltungs-API
 (<code>/api/v1/tenant/cohorts</code>, mit einem Schlüssel aus
 <a href="/keys">Zugänge</a>) oder auf dem Knoten mit
 <code>oaap cohort</code>.</p>
@@ -9084,7 +9095,15 @@ COHORT_DETAIL_BODY = """
     <td><form method="post" action="/kohorten/{{ c.name }}/seats/{{ s.id }}/reset">
       <label><input type="checkbox" name="keep_home" value="1" checked> Dateien behalten</label><br>
       <label><input type="checkbox" name="sure" value="1" required> Platz {{ s.id }} zurücksetzen</label>
-      <button class="btn">Zurücksetzen</button></form></td>
+      <button class="btn">Zurücksetzen</button></form>
+      <details><summary>Platz entfernen</summary>
+      <form method="post" action="/kohorten-entfernen/{{ c.name }}/{{ s.id }}">
+        <label><input type="checkbox" name="purge" value="1"> Speicher mit löschen</label><br>
+        <label><input type="checkbox" name="users" value="1"> Benutzer {{ s.user }} mit löschen</label><br>
+        <label>Zur Bestätigung eingeben: <code>{{ c.name }}-{{ s.id }}</code>
+        <input type="text" name="confirm" autocomplete="off" required></label>
+        <button class="btn">Platz entfernen</button>
+      </form></details></td>
   </tr>
   {% endfor %}
 </table>
@@ -9122,7 +9141,7 @@ COHORT_DETAIL_BODY = """
 <p class="muted">Zurücksetzen baut die Instanzen eines Platzes aus der Vorlage
 neu auf; Benutzer und Passwort bleiben. Ohne „Dateien behalten“ wird
 <strong>alles gelöscht, was der Teilnehmer in den Instanzen abgelegt hat</strong>.
-Einen einzelnen Platz entfernen: Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten (Handout)
+Einen Platz entfernst Du in seiner Zeile, mit denselben zwei Haken wie die ganze Kohorte (beide aus). Die Zugangsdaten (Handout)
 gibt es einmalig beim Anlegen und nicht hier.</p>
 """
 
@@ -9345,6 +9364,28 @@ def cohorts_remove_page(name):
         "purge": request.form.get("purge") == "1",
         "users": request.form.get("users") == "1"})
     return redirect(f"/kohorten?job={rid}")
+
+
+@app.post("/kohorten-entfernen/<name>/<sid>")
+def cohorts_remove_seat_page(name, sid):
+    """Remove one seat. The word to type is '<cohort>-<seat>' (the CLI's own);
+    the host is given the cohort's name as the API's check wants it."""
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    c = _cohort_view(tid).get(name)
+    if not c or sid not in [x.get("id") for x in c.get("seats") or []]:
+        return redirect("/kohorten")
+    if request.form.get("confirm", "").strip() != f"{name}-{sid}":
+        return redirect(f"/kohorten/{name}?err=" + quote(
+            f"Der eingegebene Text passt nicht zu '{name}-{sid}'; nichts wurde entfernt."))
+    rid = management_api.enqueue(tid, role, "remove-seat", {
+        "cohort": name, "confirm": name, "seat": sid,
+        "purge": request.form.get("purge") == "1",
+        "users": request.form.get("users") == "1"})
+    return redirect(f"/kohorten/{name}?job={rid}")
 
 
 COHORT_LIST_BODY = COHORT_LIST_BODY.replace("{{ BANNER }}", COHORT_BANNER)
