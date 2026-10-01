@@ -3431,13 +3431,13 @@ def read_audit(tenant=None, limit=200):
 
 
 def _has_cohorts():
-    """Whether the Cohorts menu entry shows: only for someone who may see
-    cohorts AND only where one exists -- a node that never made a cohort
-    shows no new word (the same rule as everything tenant-shaped here)."""
+    """Whether the Cohorts menu entry shows: for everyone who may use the
+    page. Not only where a cohort exists -- the FIRST one is made from this
+    very page, and an entry that appears only after it would hide the way
+    to it (found by Jörg, 2026-10-01, before the first hands-on test)."""
     if not (caller_roles() & {"server_admin", "tenant_admin"}):
         return False
-    tid, _role = _cohort_scope()
-    return bool(_cohort_view(tid)) if tid is not None else False
+    return _cohort_scope()[0] is not None
 
 
 def page(body_template, title, active, status=200, **ctx):
@@ -9250,18 +9250,50 @@ COHORT_NEW_BODY = """
 <div class="pagehead"><h1>Kohorte anlegen</h1></div>
 {{ BANNER }}
 <div class="card">
+  <h2>So legst Du eine Kohorte an</h2>
+  <ol>
+    <li><strong>Beispiel laden:</strong> <a class="btn" href="/kohorten-beispiel.zip">beispiel-kohorte.zip herunterladen</a>
+      — eine fertige, lauffähige Vorlage (drei Plätze, eine Code-Server-Instanz je Platz, Kursunterlagen, eine Willkommensdatei).</li>
+    <li><strong>Entpacken</strong> und die Datei <code>cohort.yaml</code> in einem Texteditor öffnen. Jede Zeile ist erklärt.</li>
+    <li><strong>Anpassen:</strong> mindestens <code>name</code>, <code>seats</code> (oder eine Liste <code>participants</code>) und
+      <code>lifetime.ends</code> (letzter Kurstag). Dateien unter <code>seeds/</code> landen im Home jedes Platzes,
+      der Ordner <code>material/</code> bekommt jeder Platz als Kursunterlagen. Beide kannst Du ändern, ergänzen oder weglassen
+      (dann die Zeilen <code>seed</code> / <code>material</code> entfernen).</li>
+    <li><strong>Wieder zippen:</strong> alle Dateien markieren und als ZIP packen — oder den ganzen Ordner; wichtig ist nur,
+      dass <code>cohort.yaml</code> direkt oben liegt, nicht in einem zweiten Unterordner.</li>
+    <li><strong>Hochladen</strong> (unten). Das Anlegen läuft auf dem Knoten und dauert je nach Plätzen Sekunden bis Minuten;
+      die Seite zeigt, wie weit es ist.</li>
+    <li><strong>Zugangsdaten holen:</strong> sobald es fertig ist, erscheint ein Feld „Handout“. Das Handout gibt es
+      <strong>genau einmal</strong>; wähle ein Passwort (mindestens 8 Zeichen) und gib es dem Empfänger auf einem anderen Weg.
+      Die Teilnehmer müssen bei der ersten Anmeldung ein neues Passwort setzen.</li>
+  </ol>
+  <details><summary>Was darf in der Vorlage stehen?</summary>
+  <table>
+    <tr><th>Schlüssel</th><th>Bedeutung</th></tr>
+    <tr><td><code>name</code></td><td>Kleinbuchstaben, Ziffern, „-“, höchstens 24 Zeichen. Steht vor allen Benutzern und Instanzen
+      (<code>beispiel-kurs-tn-01</code>, <code>beispiel-kurs-ide-01</code>).</td></tr>
+    <tr><td><code>seats</code> / <code>participants</code></td><td>Anzahl der Plätze (1–99) oder eine Liste von Namen.</td></tr>
+    <tr><td><code>lifetime</code></td><td><code>ends</code>: letzter Kurstag, am Tag danach werden die Instanzen angehalten.
+      <code>deactivate_users_after</code> / <code>delete_users_after</code> (z. B. <code>30d</code>, <code>12w</code>): wann die Benutzer
+      gesperrt und gelöscht werden, gerechnet ab <code>ends</code>.</td></tr>
+    <tr><td><code>resources</code></td><td><code>memory</code>, <code>cpus</code>, <code>pids</code> je Instanz. Der Knoten hat nur so viel; viele Plätze brauchen Platz.</td></tr>
+    <tr><td><code>apps</code></td><td>Mindestens eine. <code>id</code>: eine App aus dem Store des Knotens; <code>name</code>: Teil des Instanznamens;
+      <code>config</code>: Einstellungen der App (keine Zugangsdaten — Felder wie <code>…KEY</code>, <code>…TOKEN</code> werden abgelehnt);
+      <code>seed</code>: Datei im Home ← Datei im ZIP (<code>{name}</code>, <code>{nn}</code>, <code>{user}</code> werden ersetzt);
+      <code>material</code>: Ordner im ZIP; <code>start</code>: Anhang der Adresse.</td></tr>
+    <tr><td><code>users</code></td><td><code>prefix</code> (Standard <code>tn</code>), <code>display_name</code> (<code>{nn}</code> = Platznummer).</td></tr>
+  </table>
+  <p class="muted">Als Verwalter eines Mandanten nimmst Du Apps aus den Quellen des Knotens, die nicht „ungeprüft“ sind;
+  eine eigene Git-Adresse und benannte Geheimnisse (<code>{secret: …}</code>) gibt es hier nicht — die legt der Betreiber an.
+  Alle Fehler einer Vorlage auf einmal meldet der Knoten nach dem Hochladen.</p>
+  </details>
+</div>
+<div class="card">
+  <h2>Vorlage hochladen</h2>
   <form method="post" action="/kohorten-anlegen" enctype="multipart/form-data">
-    <p>Die Vorlage ist ein Ordner mit einer <code>cohort.yaml</code> an der
-    Wurzel (Name, Plätze, Apps, Laufzeit, Grenzen), als <strong>ZIP</strong>.
-    Das Anlegen läuft auf dem Knoten und kann Minuten dauern; die Seite zeigt,
-    wie weit es ist. Danach gibt es einmalig die Zugangsdaten für alle Plätze.</p>
     <label>Vorlage (ZIP, bis 256 MiB) <input type="file" name="archive" accept=".zip,application/zip" required></label>
     <button class="btn">Kohorte anlegen</button>
   </form>
-  <p class="muted">Als Trainer eines Mandanten kannst Du Apps aus den
-  eingerichteten Quellen des Knotens nehmen, die nicht „ungeprüft“ sind;
-  eine eigene Git-Adresse gibt es hier nicht. Benannte Geheimnisse
-  (<code>{secret: …}</code>) legt der Betreiber an.</p>
 </div>
 """
 
@@ -9269,6 +9301,19 @@ COHORT_NEW_BODY = """
 def _cohort_denied():
     return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
             "tenant_admin."), 403
+
+
+@app.get("/kohorten-beispiel.zip")
+def cohorts_example():
+    """The example template, built here so that it is never out of step
+    with what the portal accepts (its `ends` is four weeks from today)."""
+    tid, _role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    return app.response_class(
+        cohort_view.example_zip(), mimetype="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="beispiel-kohorte.zip"',
+                 "Cache-Control": "no-store"})
 
 
 @app.get("/kohorten-anlegen")

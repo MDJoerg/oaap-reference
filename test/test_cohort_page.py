@@ -117,9 +117,23 @@ ok("ohne Verwalterrolle: 403", c.get("/kohorten", headers=H).status_code == 403
 
 WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-c")
 r = c.get("/kohorten", headers=H)
-ok("Mandant ohne Kohorte: leere Seite, ohne Menueeintrag",
+ok("Mandant ohne Kohorte: leere Seite, MIT Menueeintrag und dem Weg zur ersten",
    r.status_code == 200 and "Noch keine Kohorte" in r.get_data(as_text=True)
-   and 'href="/kohorten"' not in r.get_data(as_text=True))
+   and 'href="/kohorten"' in r.get_data(as_text=True)
+   and 'href="/kohorten-anlegen"' in r.get_data(as_text=True))
+def menu_for(role, roles, tenant):
+    WHO.update(role=role, roles=roles, tenant=tenant)
+    with portal.app.test_request_context("/kohorten", headers=H):
+        return portal._has_cohorts()
+
+
+ok("Menue-Regel: ein Verwalter sieht den Eintrag auch ohne Kohorte",
+   menu_for("tenant_admin", {"tenant_admin"}, "t-c") is True)
+ok("Menue-Regel: ein Benutzer ohne Verwalterrolle sieht ihn NICHT",
+   menu_for("", {"user"}, "t-c") is False)
+ok("Menue-Regel: ein tenant_admin ohne Mandanten sieht ihn nicht",
+   menu_for("tenant_admin", {"tenant_admin"}, "") is False)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-c")
 
 WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a", host="t-b")
 ok("Host eines anderen Mandanten: 403 fuer den tenant_admin",
@@ -128,6 +142,41 @@ ok("Host eines anderen Mandanten: 403 fuer den tenant_admin",
 WHO.update(role="server_admin", roles={"server_admin"}, tenant="", host="t-b")
 ok("server_admin am Mandantenort sieht dessen Kohorten",
    "fremd" in c.get("/kohorten", headers=H).get_data(as_text=True))
+
+# --- Beispiel und Anleitung --------------------------------------------------
+import io as _io                                              # noqa: E402
+import zipfile as _zf                                         # noqa: E402
+import management_api as _mapi                                # noqa: E402
+import cohort as _cohort                                      # noqa: E402
+
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a", host=None)
+r = c.get("/kohorten-anlegen", headers=H)
+t = r.get_data(as_text=True)
+ok("Anlegen-Seite: Anleitung in Schritten, Beispiel zum Laden, Feldtabelle",
+   r.status_code == 200 and 'href="/kohorten-beispiel.zip"' in t and "So legst Du eine Kohorte an" in t
+   and "Zugangsdaten holen" in t and "Was darf in der Vorlage stehen?" in t, t[:300])
+r = c.get("/kohorten-beispiel.zip", headers=H)
+ok("Beispiel: ein ZIP zum Herunterladen", r.status_code == 200 and r.mimetype == "application/zip"
+   and "beispiel-kohorte.zip" in r.headers.get("Content-Disposition", ""))
+names = _zf.ZipFile(_io.BytesIO(r.data)).namelist()
+ok("Beispiel: cohort.yaml an der Wurzel, Seeds und Material dabei",
+   "cohort.yaml" in names and "seeds/willkommen.md" in names and "material/uebung1.md" in names, names)
+ok("Beispiel: besteht die Archivpruefung des Portals", _mapi.archive_problem(r.data) == ("", ""))
+_d = tempfile.mkdtemp(prefix="oaap-example-")
+_mapi.extract_archive(r.data, _d)
+_t = _cohort.load(_d)           # die echte Vorlagenpruefung des Knotens
+ok("Beispiel: besteht die Vorlagenpruefung des Knotens (drei Plaetze, eine App, Seed, Material)",
+   _t["seat_ids"] == ["01", "02", "03"] and [a["name"] for a in _t["apps"]] == ["ide"]
+   and _t["apps"][0]["seed"] and _t["apps"][0]["material"] == "material", _t)
+ok("Beispiel: das Ende liegt in der Zukunft", _t["lifetime"]["ends"] > date.today().isoformat(), _t["lifetime"])
+ok("Beispiel: kein Geheimnis in der Vorlage",
+   "secret" not in open(os.path.join(_d, "cohort.yaml"), encoding="utf-8").read().lower().replace("geheimnis", ""))
+from datetime import date as _date                            # noqa: E402
+ok("Beispiel: an einem anderen Tag ein anderes Ende (immer vier Wochen voraus)",
+   "2030-02-05" in cv.example_files(_date(2030, 1, 8))["cohort.yaml"])
+WHO.update(role="", roles={"user"})
+ok("Beispiel ohne Verwalterrolle: 403", c.get("/kohorten-beispiel.zip", headers=H).status_code == 403)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
 
 # --- Schaltflaechen: dieselbe Uebergabe wie die API ------------------------
 import management_api as mapi                                 # noqa: E402

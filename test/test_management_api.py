@@ -297,5 +297,40 @@ r = c.post(f"{API}/jobs/{jid3}/handout", headers=H)
 ok("ein Auftrag, der noch laeuft: 409", r.status_code == 409)
 
 print("")
+print("Ein Ordner im ZIP (so packt der Explorer): genau eine Ebene, nur mit cohort.yaml darin")
+
+
+def zip_of(files):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w") as z:
+        for n, d in files.items():
+            z.writestr(n, d)
+    return b.getvalue()
+
+
+W = zip_of({"kurs/": "", "kurs/cohort.yaml": "x: 1\n", "kurs/seeds/a.md": "a"})
+ok("ein Wurzelordner um alles: angenommen", m.archive_problem(W) == ("", ""), m.archive_problem(W))
+dd = tempfile.mkdtemp()
+m.extract_archive(W, dd)
+ok("... und ohne den Ordner entpackt (cohort.yaml an der Wurzel, Unterordner bleiben)",
+   os.path.isfile(os.path.join(dd, "cohort.yaml")) and os.path.isfile(os.path.join(dd, "seeds", "a.md"))
+   and not os.path.exists(os.path.join(dd, "kurs")))
+W2 = zip_of({"kurs/cohort.yaml": "x", "__MACOSX/kurs/._cohort.yaml": "junk"})
+dd2 = tempfile.mkdtemp()
+m.extract_archive(W2, dd2)
+ok("macOS-Beiwerk neben dem Ordner stoert nicht und wird nicht entpackt",
+   m.archive_problem(W2) == ("", "") and os.path.isfile(os.path.join(dd2, "cohort.yaml"))
+   and not os.path.exists(os.path.join(dd2, "__MACOSX")))
+ok("zwei Ordner auf der Wurzel: abgelehnt (es wird nicht gesucht)",
+   m.archive_problem(zip_of({"a/cohort.yaml": "x", "b/x.txt": "x"}))[0] == "bad")
+ok("zwei Ebenen tief: abgelehnt", m.archive_problem(zip_of({"a/b/cohort.yaml": "x"}))[0] == "bad")
+ok("cohort.yaml neben einer Datei auf der Wurzel und im Ordner: die Wurzel gilt",
+   m.archive_problem(zip_of({"cohort.yaml": "x", "k/cohort.yaml": "y"})) == ("", ""))
+ok("ein Wurzelordner, der aus dem Ziel hinaus will: weiter abgelehnt",
+   m.archive_problem(zip_of({"kurs/cohort.yaml": "x", "kurs/../../boese": "x"}))[0] == "bad")
+ok("die Fehlermeldung nennt beide Wege (Inhalt oder Ordner mit cohort.yaml darin)",
+   "CONTENTS" in m.archive_problem(zip_of({"a.txt": "x"}))[1])
+
+print("")
 print("ALLE BESTANDEN" if not fails else f"FAILED ({fails} Fehler)")
 sys.exit(1 if fails else 0)

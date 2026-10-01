@@ -44,6 +44,20 @@ CTX = {}          # filled by init(): the portal's own helpers
 
 # ------------------------------------------------------------ pure parts
 
+def _wrapper(names):
+    """The one folder a ZIP made by 'send folder to ZIP' (Windows, macOS) puts
+    around everything -> 'folder/', or '' when there is none or it is not
+    the only one. Exactly one level, and only when `cohort.yaml` is directly
+    inside it: a template is never searched for."""
+    if "cohort.yaml" in names:
+        return ""
+    tops = {n.split("/", 1)[0] for n in names if n and not n.startswith("__MACOSX/")}
+    if len(tops) != 1:
+        return ""
+    top = tops.pop()
+    return top + "/" if f"{top}/cohort.yaml" in names else ""
+
+
 def archive_problem(data):
     """Why an uploaded template archive may not be used ('' when it may).
 
@@ -79,8 +93,10 @@ def archive_problem(data):
         if total > MAX_UNPACKED:
             return "too_large", "more than 512 MiB when unpacked"
         names.add(n)
-    if "cohort.yaml" not in names:
-        return "bad", "cohort.yaml is missing at the root of the archive"
+    if "cohort.yaml" not in names and f"{_wrapper(names)}cohort.yaml" not in names:
+        return "bad", ("cohort.yaml is missing at the root of the archive "
+                       "(zip the CONTENTS of the folder, or the folder itself "
+                       "with cohort.yaml directly inside)")
     return "", ""
 
 
@@ -89,8 +105,16 @@ def extract_archive(data, dest):
     zf = zipfile.ZipFile(io.BytesIO(data))
     base = os.path.realpath(dest)
     os.makedirs(base, exist_ok=True)
+    strip = _wrapper({i.filename for i in zf.infolist()})
     for i in zf.infolist():
-        target = os.path.realpath(os.path.join(base, i.filename))
+        name = i.filename
+        if strip:
+            if not name.startswith(strip):
+                continue                       # e.g. __MACOSX/ noise beside the folder
+            name = name[len(strip):]
+            if not name:
+                continue                       # the wrapper folder itself
+        target = os.path.realpath(os.path.join(base, name))
         if target != base and not target.startswith(base + os.sep):
             raise ValueError("entry leaves the target")     # belt and braces
         if i.is_dir():

@@ -1,12 +1,14 @@
-"""Die Kohorten-Seite (oaap.core.portal 0.3.17): was sie zeigt, als reine Regeln.
+"""Die Kohorten-Seite (oaap.core.portal): was sie zeigt, als reine Regeln.
 
-Die Seite ist **nur lesend** (RFC-0046 Stufe 3, erste Fassung): sie liest
-dieselbe Datei wie die Verwaltungs-API (`cohort-view.json`, vom Host
-geschrieben) und ändert nichts. Wer etwas ändern will, nimmt die API oder
-`oaap cohort`; die Seite sagt, wie. Ohne Flask und ohne Anfrage, wie
-`relay_view.py`, damit man sie ohne Portal prüfen kann.
+Gelesen wird dieselbe Datei wie in der Verwaltungs-API (`cohort-view.json`,
+vom Host geschrieben); geändert wird über die Aufträge der API. Hier steht
+nur, wie etwas angezeigt wird -- und die Beispielvorlage zum Herunterladen.
+Ohne Flask und ohne Anfrage, wie `relay_view.py`, damit man sie ohne Portal
+prüfen kann.
 """
-from datetime import date
+import io
+import zipfile
+from datetime import date, timedelta
 
 STATE_LABEL = {
     "running": ("Läuft", "ok"),
@@ -113,3 +115,65 @@ def detail(c, today=None):
                       "note": note})
     base["seat_list"] = seats
     return base
+
+
+# --------------------------------------------------------- the example template
+
+EXAMPLE_NAME = "beispiel-kurs"
+
+EXAMPLE_YAML = """\
+# Vorlage für eine Kohorte (OAAP). Jede Zeile ist erklärt -- ändere, was Du brauchst.
+# Diese Datei muss `cohort.yaml` heißen und im ZIP ganz oben liegen.
+oaap_cohort: "0.1"          # Format der Vorlage; nicht ändern
+name: beispiel-kurs         # Kleinbuchstaben, Ziffern, "-", höchstens 24 Zeichen.
+                            # Der Name steht vor allen Benutzern und Instanzen.
+seats: 3                    # Anzahl der Plätze (1 bis 99). Oder statt dessen eine Liste:
+                            #   participants: ["Anna Beispiel", "Ben Test"]
+lifetime:
+  ends: {ends}        # letzter Kurstag (JJJJ-MM-TT); am Tag danach werden die Instanzen angehalten
+  deactivate_users_after: 30d   # optional: Benutzer sind 30 Tage nach `ends` gesperrt
+  delete_users_after: 90d       # optional: ... und nach 90 Tagen gelöscht (muss später liegen)
+resources:                  # je Instanz
+  memory: 1g
+  cpus: 1
+apps:
+  - id: code-server         # eine App aus dem Store des Knotens
+    name: ide               # wird der Teil im Instanznamen: beispiel-kurs-ide-01
+    config:                 # Einstellungen der App (hier: nur die Zeitzone)
+      TZ: Europe/Berlin     # Zugangsdaten gehören NICHT hierher
+    seed:                   # Dateien, die jeder Platz beim ersten Start im Home bekommt
+      willkommen.md: seeds/willkommen.md   # Ziel im Home: Quelle im ZIP
+    material: material/     # Ordner im ZIP, den jeder Platz mitbekommt (Kursunterlagen)
+users:
+  prefix: tn                # Benutzername: beispiel-kurs-tn-01
+  display_name: "Teilnehmer {{nn}}"   # {{nn}} = Platznummer
+handout: handout.csv        # die Zugangsdaten; gibt es nur einmal, direkt nach dem Anlegen
+"""
+
+EXAMPLE_FILES = {
+    "seeds/willkommen.md": (
+        "# Willkommen, {name}!\n\n"
+        "Das ist Dein Platz {nn} im Kurs. Diese Datei liegt in Deinem Home -- "
+        "Du kannst sie ändern oder löschen.\n"),
+    "material/uebung1.md": (
+        "# Übung 1\n\nHier stehen die Kursunterlagen. Der Ordner `material/` "
+        "der Vorlage liegt bei jedem Teilnehmer.\n"),
+}
+
+
+def example_files(today=None):
+    """The example as {path: text}; `ends` is four weeks from today so that
+    the template is always one that may be used."""
+    ends = ((today or date.today()) + timedelta(days=28)).isoformat()
+    out = {"cohort.yaml": EXAMPLE_YAML.format(ends=ends)}
+    out.update(EXAMPLE_FILES)
+    return out
+
+
+def example_zip(today=None):
+    """The example as a ZIP, `cohort.yaml` at its root."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for path, text in example_files(today).items():
+            z.writestr(path, text.encode("utf-8"))
+    return buf.getvalue()
