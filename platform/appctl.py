@@ -2435,6 +2435,89 @@ def find_instance(reg, tenant, name):
     return "", None
 
 
+def resolve_instance_ref(reg, ref, tenant_label=""):
+    """(key, error) for whatever a person typed to mean an instance (I-12).
+
+    The portal shows NAMES; the registry is keyed by `<slug>-<name>`. A
+    command line that only took keys sent people to read the registry for
+    something the page had just told them. Accepted, in this order:
+
+      1. the key itself -- unchanged, so every existing call and script
+         means what it meant;
+      2. `<label>/<name>`, or `<name>` with `tenant_label` (`--tenant`);
+      3. a bare name that exactly ONE instance on the node has.
+
+    Never a guess: a name two tenants share is refused with both keys
+    named. The key is looked up in the CURRENT registry each time, so a
+    script written before a tenant rename still works by name.
+    """
+    ref = (ref or "").strip()
+    insts = reg.get("instances") or {}
+    label = (tenant_label or "").strip().lower()
+    if not label and "/" in ref:
+        label, ref = [x.strip() for x in ref.split("/", 1)]
+        label = label.lower()
+        if not ref or "/" in ref:
+            return "", "an instance is written <tenant>/<name>"
+    if label:
+        tid, _t = tenant_by_label(label)
+        if not tid:
+            return "", f"no tenant with the label '{label}'"
+        key, inst = find_instance(reg, tid, ref)
+        if not key and ref in insts and (
+                resolve_tenant(insts[ref].get("tenant")) or "") == tid:
+            return ref, ""
+        if key:
+            return key, ""
+        names = sorted(instance_name(k, i) for k, i in insts.items()
+                       if (resolve_tenant(i.get("tenant")) or "") == tid)
+        return "", (f"tenant '{label}' has no instance named '{ref}'"
+                    + (f" -- it has: {', '.join(names)}" if names
+                       else " -- it has no instances"))
+    if ref in insts:
+        return ref, ""
+    hits = sorted(k for k, i in insts.items() if instance_name(k, i) == ref)
+    if len(hits) == 1:
+        return hits[0], ""
+    if len(hits) > 1:
+        return "", (f"'{ref}' is the name of more than one instance "
+                    f"({', '.join(hits)}) -- write <tenant>/{ref} or add "
+                    f"--tenant <tenant>")
+    return "", f"no instance named '{ref}'"
+
+
+# Every `oaap app <verb> <instance>` that takes an instance as its first
+# argument. `access`, `grant` and `token` are left out on purpose: their
+# first argument is sometimes an access id or a token, and a resolver
+# that guessed which would be a second opinion about what was typed.
+INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
+                  "diagnose", "endpoint", "tile", "resources", "config",
+                  "address", "throttle", "artifact", "promote", "rehearse",
+                  "rehearsal")
+
+
+def resolve_instance_args(args):
+    """Rewrite `args.name` to the registry key before the verb runs.
+
+    A name that does not resolve is left alone for the verb to refuse in
+    its own words -- except that a refusal that names a tenant or an
+    ambiguity is more useful than "no instance", so those stop here.
+    `purge` is not in the list: it takes the name of an instance that is
+    already GONE, which no registry lookup can find.
+    """
+    if getattr(args, "cmd", "") not in INSTANCE_VERBS:
+        return
+    ref = getattr(args, "name", "") or ""
+    if not ref:
+        return
+    tenant = getattr(args, "instance_tenant", "") or ""
+    key, err = resolve_instance_ref(load_registry(), ref, tenant)
+    if key:
+        args.name = key
+    elif tenant or "/" in ref or "more than one" in err:
+        die(err)
+
+
 # Which tenant the DATA under an instance directory belonged to
 # (oaap.core.tenant 1.4). Not mounted into any container: only
 # `<instance-dir>/storage/<name>` is, so an app can neither read nor
@@ -15817,6 +15900,17 @@ def cmd_promote(args):
         die("name the production instance with --to "
             f"(a name ending in '-test' is shortened automatically, "
             f"'{local}' is not)")
+    slug = tenant_slug(resolve_tenant((reg["instances"].get(args.name) or {})
+                                      .get("tenant")))
+    if (slug and args.to and target.startswith(slug + "-")
+            and not getattr(args, "keep_name", False)):
+        # I-12: --to is a NAME inside the tenant, the first argument is a
+        # KEY. Writing both as keys made `sgl-sgl-hvp` without a word.
+        # A name that really begins with the label stays possible.
+        die(f"--to takes the name INSIDE the tenant, and '{target}' would "
+            f"become the instance '{slug}-{target}' on this node. Did you "
+            f"mean '--to {target[len(slug) + 1:]}'? If '{target}' really is "
+            "the name you want, repeat with --keep-name")
     try:
         _path, m, notes = promotion_review(reg, args.name, target)
     except PromotionRefused as e:
@@ -20985,6 +21079,13 @@ def main():
     pg.add_argument("--port", type=int, default=80,
                     help="target platform's HTTP port (default 80)")
     pg.set_defaults(fn=cmd_edge)
+    for verb in INSTANCE_VERBS:
+        sub.choices[verb].add_argument(
+            "--tenant", dest="instance_tenant", default="",
+            help="tenant label: read the instance as a NAME inside this "
+                 "tenant (also: <tenant>/<name>)")
+    sub.choices["promote"].add_argument("--keep-name", action="store_true",
+                    help="--to really starts with the tenant's label")
     args = p.parse_args()
     # 'convert' works on files the caller owns; 'node show' only prints
     # what 'oaap status' prints anyway — everything else changes the node.
@@ -21008,6 +21109,7 @@ def main():
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:
+        resolve_instance_args(args)
         args.fn(args)
     except subprocess.CalledProcessError as e:
         die(f"command failed: {' '.join(e.cmd)}\n{e.stderr}")
