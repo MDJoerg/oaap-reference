@@ -1856,7 +1856,8 @@ def _idp_principal(tid, provider, claims):
             return u, ""
         roles, groups = idp.first_login_grant(policy, claims)
         username = idp.local_username(
-            claims, [x.get("username", "") for x in users])
+            claims, [x.get("username", "") for x in users],
+            prefix=idp.tenant_name_prefix(tenant_rec))
         if not username:
             return None, "Für dieses Konto war kein freier Name zu finden."
         record = {

@@ -672,8 +672,28 @@ def has_local_password(user):
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
 
 
-def local_username(claims, taken, fallback="user"):
+def tenant_name_prefix(tenant_rec):
+    """`<label>.` for a tenant that is not the node's own, else "" (I-9).
+
+    Usernames are unique across the WHOLE node, and the provider's
+    suggestion (`max`) is the same word in every customer's realm. Without
+    a prefix the second `max` became `max-2` -- a name nobody chose, and a
+    way for customer B to learn that customer A has a `max`. The label
+    cannot contain a dot, so `sgl.max` can never be another tenant's
+    plain suggestion. The default tenant keeps plain names, and so does
+    every account that already exists.
+    """
+    label = str((tenant_rec or {}).get("label") or "").strip().lower()
+    return "" if not label or label == "default" else label + "."
+
+
+def local_username(claims, taken, fallback="user", prefix=""):
     """A local name for a person a provider just introduced.
+
+    With `prefix` (the tenant's, see tenant_name_prefix) the name is
+    `<prefix><suggestion>`, the suggestion shortened to fit the limit.
+    A label is only a label (RFC-0040): after a tenant rename the old
+    prefix stays on the names it was given.
 
     The provider SUGGESTS a name; it never dictates one. A suggestion
     that is already taken gets a number, because the alternative --
@@ -699,6 +719,10 @@ def local_username(claims, taken, fallback="user"):
         wish = (fallback + "-" + sub)[:40] if sub else fallback
         if not USERNAME_RE.match(wish):
             wish = "user-neu"
+    if prefix:
+        wish = prefix + wish[:max(2, 40 - len(prefix))]
+        if not USERNAME_RE.match(wish):
+            wish = prefix + "user-neu"
     if wish not in taken:
         return wish
     for n in range(2, 1000):

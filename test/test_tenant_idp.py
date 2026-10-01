@@ -658,7 +658,7 @@ ok("nach dem Loesen der Bindung entsteht ein NEUER Satz, kein Rueckweg "
    "in den alten", len(after) == 3, [x["username"] for x in after])
 ok("der geloeste Satz bleibt deaktiviert und ungebunden",
    any(not x.get("active") and not x.get("idp")
-       and x.get("username") == "mueller-2" for x in after),
+       and x.get("username") == "hbvp.mueller" for x in after),
    [(x["username"], x.get("active"), bool(x.get("idp"))) for x in after])
 ok("der Befehl an der Maschine sagt genau das",
    "a NEW account" in APPCTL_SRC and "matching by name" in APPCTL_SRC)
@@ -667,7 +667,7 @@ ok("und er deaktiviert einen Satz ohne lokales Passwort",
 
 # Und das lokale Formular bleibt fuer den Anbieter-Satz verschlossen.
 r = c.post("/auth/login",
-           data={"username": "mueller-2", "password": ""},
+           data={"username": "hbvp.mueller", "password": ""},
            headers={"Host": f"hbvp.{HOST}"})
 ok("das lokale Anmeldeformular laesst diesen Satz nicht herein",
    r.status_code == 401, r.status_code)
