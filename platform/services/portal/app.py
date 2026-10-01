@@ -38,6 +38,7 @@ import place  # noqa: E402
 import idp  # noqa: E402
 import relay_view
 import twin_view
+import metrics_view
 
 IDENTITY = "http://identity:8000"
 TWIN = "http://twin:8000"
@@ -862,6 +863,7 @@ HEALTH_BODY = """
 <h1>Gesundheit</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{{ mx_style }}{{ mx }}
 <div class="card">
   <h2>Knoten</h2>
   <table>
@@ -5237,6 +5239,19 @@ def _instance_probe(name, inst):
     return state, label, detail
 
 
+# Read-only view of what the host's sampler keeps (RFC-0051): the portal
+# draws it and never writes it.
+METRICS_DIR = os.environ.get("OAAP_METRICS_DIR", "/metrics")
+
+
+@app.get("/health/verlauf")
+def health_verlauf():
+    """Just the history block, for the window buttons (RFC-0051 6)."""
+    if not caller_roles() & {"server_admin", "support"}:
+        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder support.", 403
+    return metrics_view.block(METRICS_DIR, request.args.get("w", ""))
+
+
 @app.get("/health")
 def health():
     if not caller_roles() & {"server_admin", "support"}:
@@ -5263,6 +5278,9 @@ def health():
             "state": state, "label": label, "detail": detail,
         })
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
+                mx=Markup(metrics_view.block(METRICS_DIR,
+                                             request.args.get("w", ""))),
+                mx_style=Markup(metrics_view.STYLE),
                 core=core, apps=apps, ext=external_access(),
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
                 deploys=recent_deploys(), bk=backup_state(), cx=connect_view(),

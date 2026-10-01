@@ -144,6 +144,9 @@ services:
       # connectors, offers (oaap.net.connector 2.7). Its own directory,
       # never the one with the keys next to it.
       - "${OAAP_DATA_DIR}/data/connect/state:/connect-state:ro"
+      # read-only: the history the host's sampler keeps (RFC-0051) -- the
+      # portal draws the health page's charts from it and never writes it
+      - "${OAAP_DATA_DIR}/data/metrics:/metrics:ro"
 
   # The tunnel (oaap.net.connector 0.1, RFC-0033 stage 2). One service,
   # two roles, decided by what the operator configured: OUTER when this

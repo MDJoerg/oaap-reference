@@ -291,6 +291,37 @@ def take_sample(directory, data_path, now=None, proc="/proc",
 
 # --- reading the store --------------------------------------------------
 
+def _entries(directory, idx, now):
+    """A tier's entries INCLUDING what has not been rolled up into it yet.
+
+    The files only hold closed intervals, so a node updated an hour ago
+    would show an empty day, week and month although it has an hour of
+    data. The tail is derived from the tier above on the fly -- computed,
+    never written (writing is `rollup`'s job and waits for the interval
+    to close), so the open interval's mean is a partial one.
+    """
+    name, step, _keep = TIERS[idx]
+    stored = _read(directory, name)
+    if idx == 0:
+        return stored
+    last = stored[-1]["t"] if stored else -1
+    buckets = {}
+    for e in _entries(directory, idx - 1, now):
+        b = e["t"] - e["t"] % step
+        if b > last:
+            buckets.setdefault(b, []).append(e)
+    derived = []
+    for b in sorted(buckets):
+        entry = {"t": b}
+        for s in SERIES:
+            agg = _aggregate(buckets[b], s)
+            if agg:
+                entry[s] = agg
+        if len(entry) > 1:
+            derived.append(entry)
+    return stored + derived
+
+
 def window(directory, key, now=None):
     """One window as the charts need it:
 
@@ -303,7 +334,9 @@ def window(directory, key, now=None):
     tier, span = WINDOWS[key]
     step = _tier(tier)[1]
     now = int(time.time() if now is None else now)
-    entries = [e for e in _read(directory, tier) if e["t"] >= now - span]
+    idx = [t[0] for t in TIERS].index(tier)
+    entries = [e for e in _entries(directory, idx, now)
+               if e["t"] >= now - span]
     series = {}
     for s in SERIES:
         pts = []
