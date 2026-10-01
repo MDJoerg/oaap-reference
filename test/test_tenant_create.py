@@ -229,6 +229,75 @@ ok("der Sprung von einem auf zwei wird angesagt",
 ok("und sagt zugleich, dass sich für den bestehenden nichts ändert",
    "Nothing about the existing tenant changes" in res2["message"], str(res2))
 
+print("\n=== I-8: die Adresse antwortet nach dem Anlegen, ohne `external set` ===")
+# Ein Knoten mit externem Namen. Beide Türen müssen die Sites schreiben
+# UND das Gateway neu laden -- der Test fragt die erzeugte Site, nicht
+# den Aufruf (ein Köder: ein Weg, der nur reloadet, schriebe nichts).
+os.makedirs(m2.APPS_DIR, exist_ok=True)
+os.makedirs(m2.CADDY_APPS_DIR, exist_ok=True)
+with open(m2.EXTERNAL_FILE, "w", encoding="utf-8") as f:
+    json.dump({"host": "knoten.example.org"}, f)
+reloads = []
+m2.reload_gateway = lambda: reloads.append(1)
+
+
+def site_text():
+    p = os.path.join(m2.CADDY_APPS_DIR, "external.caddy")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m2.cmd_tenant(Args(action="create", name="cli-kunde"))
+ok("CLI: die erzeugte Site nennt den neuen Mandanten",
+   "cli-kunde.knoten.example.org" in site_text(), site_text()[:300])
+ok("CLI: das Gateway wurde neu geladen", len(reloads) == 1, str(reloads))
+ok("CLI: die Ausgabe sagt, wo und wann die Adresse antwortet",
+   "https://cli-kunde.knoten.example.org/" in buf.getvalue()
+   and "few seconds" in buf.getvalue(), buf.getvalue()[-300:])
+
+res = None
+with open(os.path.join(q2, "x2.json"), "w", encoding="utf-8") as f:
+    json.dump({"id": "x2", "instance": "", "action": "tenant",
+               "op": "create", "label": "portal-kunde", "by": "joerg"}, f)
+m2.cmd_process_deploys(None)
+with open(os.path.join(m2.SPOOL_DIR, "results", "x2.json"), encoding="utf-8") as f:
+    res = json.load(f)
+ok("Portal: der Mandant ist angelegt", res["ok"], str(res))
+ok("Portal: die erzeugte Site nennt ihn",
+   "portal-kunde.knoten.example.org" in site_text())
+ok("Portal: das Gateway wurde ein zweites Mal geladen", len(reloads) == 2, str(reloads))
+ok("Portal: die Antwort nennt die Adresse",
+   "https://portal-kunde.knoten.example.org/" in res["message"], str(res))
+
+
+def boom():
+    raise RuntimeError("caddy down")
+
+
+m2.reload_gateway = boom
+with open(os.path.join(q2, "x3.json"), "w", encoding="utf-8") as f:
+    json.dump({"id": "x3", "instance": "", "action": "tenant",
+               "op": "create", "label": "fehl-kunde", "by": "joerg"}, f)
+m2.cmd_process_deploys(None)
+with open(os.path.join(m2.SPOOL_DIR, "results", "x3.json"), encoding="utf-8") as f:
+    res3 = json.load(f)
+ok("ein Fehler beim Neuladen macht den Mandanten nicht ungeschehen",
+   res3["ok"] and "fehl-kunde" in [t["label"] for t in m2.load_tenants().values()],
+   str(res3))
+ok("und die Antwort sagt in einem Satz, was zu tun ist",
+   "external set knoten.example.org" in res3["message"], str(res3))
+
+os.remove(m2.EXTERNAL_FILE)
+m2.reload_gateway = lambda: reloads.append(1)
+n = len(reloads)
+ok("ohne externen Namen gibt es nichts zu veröffentlichen und nichts zu laden",
+   m2.publish_tenant_place("x") == "" and len(reloads) == n)
+
 print(f"\n{ok_n} bestanden, {fail_n} fehlgeschlagen")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fail_n else "FEHLGESCHLAGEN")
 sys.exit(1 if fail_n else 0)

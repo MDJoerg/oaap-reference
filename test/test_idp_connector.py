@@ -522,7 +522,16 @@ STATE["realms"].clear()
 STATE["clients"].clear()
 STATE["writes"] = 0
 STATE["methods"] = []
-provision()
+import contextlib as _cl, io as _io
+_buf = _io.StringIO()
+with _cl.redirect_stdout(_buf):
+    provision()
+_out = _buf.getvalue()
+# I-16: seit 0.1.125 steht nur https im Client; der alte Schlusssatz
+# ("Both schemes ...") behauptete das Gegenteil.
+ok("die Ausgabe ohne --plain-callback sagt nicht 'Both schemes'",
+   "Both schemes" not in _out and "VISITOR'S BROWSER" not in _out, _out[-400:])
+ok("sie sagt weiter 'https only'", "https only" in _out)
 
 ok("der Realm heisst wie der Mandant", "hbvp" in STATE["realms"],
    list(STATE["realms"]))

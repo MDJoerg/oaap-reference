@@ -4096,9 +4096,9 @@ def cmd_idp(args):
         print("  secret       fetched from the provider and held 0600 on "
               "this node")
         print("")
-        print("The redirect URIs above are registered at the client. Both")
-        print("schemes, because the one that counts is the one the")
-        print("VISITOR'S BROWSER uses, not the one inside the container.")
+        print("The redirect URIs above are registered at the client.")
+        if plain:
+            print("Both schemes, on the operator's word (--plain-callback).")
         print("")
         pol = idp.policy_of(t)
         print(f"A first login through it means '{pol['first_login']}'"
@@ -4944,6 +4944,9 @@ def cmd_tenant(args):
         print("changes it while the old one keeps working for a while.")
         print("")
         print(zone_probe(label))
+        placed = publish_tenant_place(label)
+        if placed:
+            print(placed)
         if len(tenants) == 2:
             print("")
             print("This node now has more than one tenant, so tenants become")
@@ -8061,6 +8064,31 @@ def write_internal_health_caddy():
               "\thandle {", "\t\trespond 403", "\t}", "}"]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def publish_tenant_place(label):
+    """Make a freshly created tenant's address answer (I-8).
+
+    `tenant create` wrote the record and stopped; the gateway knew nothing
+    of `<label>.<node host>` until somebody ran `external set` or an
+    update, and the visitor got a TLS error. Both doors (CLI and portal
+    spool) call this AFTER the record and its log line are written, so a
+    failure here can never undo the tenant: it returns one sentence that
+    says what to do instead. A node without an external name has no
+    address to publish and says nothing.
+    """
+    host = load_external()
+    if not host:
+        return ""
+    try:
+        refresh_generated_sites()
+        reload_gateway()
+    except Exception as exc:  # noqa: BLE001 -- the tenant stays, whatever this says
+        return (f"The tenant exists, but its address was not published "
+                f"({type(exc).__name__}). Run `sudo oaap external set {host}` "
+                f"to publish it.")
+    return (f"Its address https://{label}.{host}/ is being published; the "
+            "certificate takes a few seconds.")
 
 
 def refresh_generated_sites():
@@ -18033,6 +18061,9 @@ def cmd_process_deploys(_args):
                 # portal that creates the record silently would be a
                 # different act wearing the same name.
                 msg = f"tenant '{label}' created. " + zone_probe(label)
+                placed = publish_tenant_place(label)
+                if placed:
+                    msg += " " + placed
                 if had == 1:
                     msg += (" This node now has more than one tenant, so "
                             "tenants become visible: every caller sees their "
