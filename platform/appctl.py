@@ -4995,16 +4995,144 @@ def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
     return count, ""
 
 
+def tenant_holdings(tid):
+    """What still hangs off this tenant -- one sentence per kind, [] when
+    nothing does (I-27).
+
+    Every store that keys on a tenant is asked, and a store that cannot be
+    read is a holding too: "empty" is a claim about records somebody
+    looked at (see `_read_identity_users`). The logo is the one thing that
+    does not count -- it is the tenant's own face, set with `tenant face`
+    and removed with it.
+    """
+    t = load_tenants().get(tid) or {}
+    held = []
+    insts = tenant_instances(load_registry(), tid)
+    if insts:
+        held.append(f"{len(insts)} app instance(s): "
+                    + ", ".join(sorted(instance_name(k, i)
+                                       for k, i in insts.items())))
+    kept = [k for k in (load_registry().get("retained") or {})
+            if k.split("|", 1)[0] == tid]
+    if kept:
+        held.append(f"data left behind by {len(kept)} removed instance(s) "
+                    "(`oaap app remove` without --purge keeps it)")
+    users = _read_identity_users()
+    if users is None:
+        held.append("the user store could not be read, so users were not "
+                    "counted -- run it as root")
+    else:
+        n = sum(1 for u in users if resolve_tenant(u.get("tenant")) == tid)
+        if n:
+            held.append(f"{n} user account(s)")
+    if idp.provider_of(t):
+        held.append("an identity provider "
+                    f"({(t.get('idp') or {}).get('issuer', '?')}) -- "
+                    f"`oaap tenant idp {t.get('label')} --clear-idp` detaches it")
+    cdir = os.path.join(COHORT_DIR, tid)
+    if os.path.isdir(cdir) and os.listdir(cdir):
+        held.append(f"{len(os.listdir(cdir))} cohort(s)")
+    logo = ((t.get("theme") or {}).get("logo") or "").strip().lower()
+    fdir = files_tenant_dir(tid)
+    if os.path.isdir(fdir):
+        shas = {fn for _r, _d, fns in os.walk(fdir) for fn in fns}
+        if shas - {logo}:
+            held.append(f"{len(shas - {logo})} stored file(s)")
+    if (load_destinations().get(tid) or {}):
+        held.append(f"{len(load_destinations()[tid])} destination(s)")
+    live = [r for r in load_access().values()
+            if r.get("tenant") == tid and access_alive(r)]
+    if live:
+        held.append(f"{len(live)} open remote access(es)")
+    return held
+
+
+def _tenant_remove(args, tenants):
+    """`oaap tenant remove <label> [--yes]` -- only a tenant with nothing in it.
+
+    A tenant with content is an export-then-destroy operation and not this
+    verb: it names what is in the way and changes nothing. What it takes
+    away is exactly what `tenant create` and `tenant face` put there --
+    the record, its address, its logo, its log of permits.
+    """
+    label = (args.name or "").strip().lower()
+    if not label:
+        die("name the tenant: oaap tenant remove <label>")
+    tid, _found = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the current label '{label}'")
+    t = tenants[tid]
+    if t.get("label") == DEFAULT_TENANT_LABEL:
+        die("the default tenant belongs to this node itself and cannot be "
+            "removed")
+    held = tenant_holdings(tid)
+    if held:
+        print(f"Tenant '{label}' is not empty, so it is not removed:")
+        for h in held:
+            print(f"  - {h}")
+        print("")
+        print("Nothing was changed. This verb only removes a tenant that "
+              "holds nothing;")
+        print("a tenant with content is archived first (`oaap backup`) and "
+              "emptied on purpose.")
+        sys.exit(1)
+    host = load_external()
+    print(f"Removing tenant '{label}'. It is empty. This takes away:")
+    print("  - the tenant record, its logo and its creation permits")
+    if host:
+        print(f"  - its address https://{label}.{host}/")
+    aliases = former_labels(t)
+    if aliases:
+        print(f"  - the former label(s) still answering: {', '.join(aliases)}")
+    print("")
+    print("What stays: its entries in the audit log, which nothing rewrites.")
+    if not args.yes:
+        print("")
+        die("nothing was changed -- repeat with --yes to remove it")
+    ex = load_backup_exclusions()
+    if ex.pop(tid, None) is not None:
+        save_backup_exclusions(ex)
+    dests = load_destinations()
+    if dests.pop(tid, None) is not None:
+        save_destinations(dests)
+    grants = load_grants()
+    for gid in [g for g, v in grants.items()
+                if (v.get("payload") or {}).get("tenant") == tid]:
+        grants.pop(gid)
+    save_grants(grants)
+    held_idp = load_idp_secrets()
+    if held_idp.pop(tid, None) is not None:
+        save_idp_secrets(held_idp)
+    for d in (os.path.join(COHORT_DIR, tid), files_tenant_dir(tid)):
+        shutil.rmtree(d, ignore_errors=True)
+    tenants.pop(tid, None)
+    save_tenants(tenants)
+    audit_tenant("tenant.remove", tid, label,
+                 who=os.environ.get("SUDO_USER") or getpass.getuser(),
+                 detail="empty tenant removed")
+    refresh_place_assets()
+    refresh_generated_sites()
+    reload_gateway()
+    print("")
+    print(f"Tenant '{label}' removed.")
+    if single_tenant():
+        print("This node has one tenant again, so tenants are invisible "
+              "again.")
+
+
 def cmd_tenant(args):
     """This node's tenants (spec 2.1/2.2).
 
-    Deleting a tenant is deliberately absent: a tenant holds users,
-    instances and their data, so removing it is an export-then-destroy
-    operation and gets its own round.
+    `remove` takes away only a tenant that holds nothing (I-27). A tenant
+    with users, instances or data is an export-then-destroy operation and
+    stays out of reach of this verb.
     """
     tenants = load_tenants()
     if not tenants:
         die("this node has no tenant store yet -- run `oaap update`")
+
+    if args.action == "remove":
+        return _tenant_remove(args, tenants)
 
     if args.action == "adopt":
         return _tenant_adopt(args)
@@ -20715,7 +20843,7 @@ def main():
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
-                               "rename", "face", "idp", "policy", "adopt"])
+                               "rename", "face", "idp", "policy", "adopt", "remove"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "
