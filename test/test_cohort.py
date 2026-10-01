@@ -904,6 +904,8 @@ good, msg, rid = job("create", tpl_dir=t_api)
 rec = a.load_cohort(TID, "kurs-api")
 ok("ein tenant_admin legt aus der hochgeladenen Vorlage eine Kohorte an",
    good and rec and rec["complete"], msg)
+ok("die Antwort ist ein Satz ueber die Kohorte -- kein Pfad auf dem Knoten",
+   msg == "cohort 'kurs-api' created" and "handout.csv" not in msg, msg)
 hf = os.path.join(a.JOBS_DIR, rid, "handout.csv")
 ok("das Handout liegt im Auftragsverzeichnis, 0600, mit den Passwoertern",
    os.path.isfile(hf) and len(open(hf).read().splitlines()) == 4

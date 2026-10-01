@@ -12662,7 +12662,10 @@ def cmd_machine(args):
         die("a machine principal may not hold server_admin (RFC-0027 D2)")
     groups = sorted({g.strip().lower() for g in (args.groups or "").split(",")
                      if g.strip()})
-    tid = resolve_tenant(args.tenant or "") if args.tenant else ensure_default_tenant()
+    # the help says "label or id" -- both must work (measured 2026-10-01:
+    # a label was refused)
+    tid = ((resolve_tenant(args.tenant) or tenant_by_label(args.tenant)[0])
+           if args.tenant else ensure_default_tenant())
     if tid is None:
         die(f"this node has no tenant '{args.tenant}'")
     out = _identity_exec(
@@ -14328,7 +14331,9 @@ def cohort_job(req, rid, tid, role, actor):
     import contextlib
     import io
     op = str(req.get("op") or "")
-    a = req.get("args") or {}
+    a = req.get("args")
+    if not isinstance(a, dict):
+        a = req["args"] = {}
     if role not in ("tenant_admin", "server_admin"):
         return False, "cohort operations need the role tenant_admin or server_admin"
     if role == "server_admin" and a.get("tenant"):
@@ -14366,6 +14371,10 @@ def cohort_job(req, rid, tid, role, actor):
             if why:
                 return False, f"template refused: {why}"
             ns.target, ns.handout_file = tdir, handout
+            try:
+                a["cohort"] = cohort.load(tdir)["name"]   # the worker files the job under it
+            except cohort.TemplateError:
+                pass                                       # _cohort_create names every problem
             fn = _cohort_create
         else:
             rec = load_cohort(tid, name) if name else None
@@ -14409,8 +14418,13 @@ def cohort_job(req, rid, tid, role, actor):
             shutil.rmtree(os.path.join(jdir, "template"), ignore_errors=True)
     lines = [l.strip() for l in buf.getvalue().splitlines() if l.strip()]
     if ok:
+        # the CLI's closing line, but never the node's file path: the
+        # handout is fetched through the API, and a path on the node is
+        # not the caller's business
         msg = next((l for l in reversed(lines)
-                    if not l.startswith(("seat ", "-"))), "done")
+                    if not l.startswith(("seat ", "-", "Handout:"))), "done")
+        if op == "create":
+            msg = f"cohort '{a.get('cohort', '')}' created"
     else:
         msg = "; ".join(l.removeprefix("ERROR: ") for l in lines)[-1500:] or "failed"
     return ok, msg
@@ -18624,6 +18638,7 @@ def cmd_process_deploys(_args):
                 with open(os.path.join(_jd, "result.json.tmp"), "w",
                           encoding="utf-8") as f:
                     json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "cohort": str((req.get("args") or {}).get("cohort") or ""),
                                "message": msg, "finished": _iso_now(),
                                "handout": os.path.isfile(_h)
                                and os.path.getsize(_h) > 0}, f)

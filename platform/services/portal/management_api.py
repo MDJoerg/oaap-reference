@@ -389,6 +389,7 @@ def jobs_show(rid):
            "created": meta.get("created", ""), "cohort": meta.get("cohort", "")}
     if status == "done":
         res = read_json(os.path.join(SPOOL_DIR, "jobs", rid, "result.json")) or {}
+        out["cohort"] = out["cohort"] or res.get("cohort", "")
         out.update(ok=bool(res.get("ok")), message=res.get("message", ""),
                    finished=res.get("finished", ""),
                    handout=os.path.isfile(
