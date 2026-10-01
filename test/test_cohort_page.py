@@ -206,6 +206,139 @@ t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
 ok("angehalten: Starten statt Anhalten",
    'action="/kohorten/kurs-a/start"' in t and "/kohorten/kurs-a/stop" not in t)
 
+# --- Anlegen, Handout, Zuruecksetzen ---------------------------------------
+import io                                                     # noqa: E402
+import zipfile                                                # noqa: E402
+
+json.dump({"cohorts": {"t-a": {"kurs-a": C}}}, open(VIEW, "w"))
+
+
+def zipbytes(files):
+    b = io.BytesIO()
+    with zipfile.ZipFile(b, "w") as z:
+        for n, d in files.items():
+            z.writestr(n, d)
+    return b.getvalue()
+
+
+GOOD = zipbytes({"cohort.yaml": "oaap_cohort: '0.1'\nname: neu\n"})
+r = c.get("/kohorten-anlegen", headers=H)
+t = r.get_data(as_text=True)
+ok("Anlegen-Seite: Formular mit Datei, ohne Git-Adresse",
+   r.status_code == 200 and 'type="file"' in t and 'enctype="multipart/form-data"' in t
+   and 'name="git"' not in t)
+n0 = len(QUEUED)
+r = c.post("/kohorten-anlegen", headers=H, data={"archive": (io.BytesIO(GOOD), "v.zip")},
+           content_type="multipart/form-data")
+loc = r.headers.get("Location", "")
+rid = loc.split("job=")[-1]
+ok("Anlegen: Vorlage entpackt, Auftrag create mit Mandant und Rolle",
+   r.status_code == 302 and len(QUEUED) == n0 + 1 and QUEUED[-1][1]["op"] == "create"
+   and os.path.isfile(os.path.join(SP, "jobs", rid, "template", "cohort.yaml"))
+   and json.load(open(os.path.join(SP, "jobs", rid, "meta.json")))["tenant"] == "t-a", (loc, QUEUED[-1]))
+n0 = len(QUEUED)
+for label, data in (("kein ZIP", b"nur text"),
+                    ("Pfad nach oben", zipbytes({"cohort.yaml": "x", "../boese": "x"})),
+                    ("ohne cohort.yaml", zipbytes({"a.txt": "x"}))):
+    r = c.post("/kohorten-anlegen", headers=H, data={"archive": (io.BytesIO(data), "v.zip")},
+               content_type="multipart/form-data")
+    ok(f"Anlegen mit schlechtem Archiv ({label}): Hinweis, nichts im Spool",
+       r.status_code == 302 and "err=" in r.headers["Location"] and len(QUEUED) == n0,
+       r.headers.get("Location"))
+r = c.post("/kohorten-anlegen", headers=H, data={}, content_type="multipart/form-data")
+ok("Anlegen ohne Datei: Hinweis", r.status_code == 302 and "err=" in r.headers["Location"])
+r = c.post("/kohorten-anlegen", headers={**H, "Sec-Fetch-Site": "cross-site"},
+           data={"archive": (io.BytesIO(GOOD), "v.zip")}, content_type="multipart/form-data")
+ok("Anlegen von einer fremden Seite: 403, nichts im Spool", r.status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="", roles={"user"})
+r = c.post("/kohorten-anlegen", headers=H, data={"archive": (io.BytesIO(GOOD), "v.zip")},
+           content_type="multipart/form-data")
+ok("Anlegen ohne Verwalterrolle: 403", r.status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
+
+# der Auftrag ist fertig -> Banner mit Link und Handout
+jdir = os.path.join(SP, "jobs", rid)
+os.rename(os.path.join(SP, "queue", rid + ".json"), os.path.join(SP, "claims", rid + ".json"))
+CSV = b"user,password\nneu-tn-01,geheim-123\n"
+open(os.path.join(jdir, "handout.csv"), "wb").write(CSV)
+json.dump({"id": rid, "ok": True, "cohort": "neu", "message": "cohort 'neu' created"},
+          open(os.path.join(jdir, "result.json"), "w"))
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("fertiger Auftrag: Link zur Kohorte und Handout-Formular",
+   'href="/kohorten/neu"' in t and f'action="/kohorten-handout/{rid}"' in t and 'type="password"' in t)
+mapi.CTX["caller_name"] = lambda: "kollege"
+portal.caller_name = lambda: "kollege"
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("ein Kollege sieht das Handout-Formular nicht",
+   "/kohorten-handout/" not in t and 'href="/kohorten/neu"' in t)
+r = c.post(f"/kohorten-handout/{rid}", headers=H, data={})
+ok("ein Kollege bekommt das Handout nicht: 403, Datei bleibt",
+   r.status_code == 403 and os.path.isfile(os.path.join(jdir, "handout.csv")))
+portal.caller_name = lambda: "trainer"
+mapi.CTX["caller_name"] = lambda: "trainer"
+t = c.get(loc, headers=H).get_data(as_text=True)
+ok("der Starter sieht das Handout-Formular", f'action="/kohorten-handout/{rid}"' in t)
+r = c.post(f"/kohorten-handout/{rid}", headers=H, data={"password": "kurz"})
+ok("zu kurzes Passwort: Hinweis, Handout NICHT verbraucht",
+   r.status_code == 302 and "err=" in r.headers["Location"]
+   and os.path.isfile(os.path.join(jdir, "handout.csv")))
+r = c.post(f"/kohorten-handout/{rid}", headers={**H, "Origin": "https://boese.example"},
+           data={"password": "langes-passwort"})
+ok("Handout von einer fremden Seite: 403, Datei bleibt",
+   r.status_code == 403 and os.path.isfile(os.path.join(jdir, "handout.csv")))
+nq = len(QUEUED)
+r = c.post(f"/kohorten-handout/{rid}", headers=H, data={"password": "langes-passwort"})
+ok("Handout mit Passwort: ZIP, Datei vernichtet, Vermerk im Spool",
+   r.status_code == 200 and r.mimetype == "application/zip" and "X-OAAP-Handout" not in r.headers
+   and not os.path.exists(os.path.join(jdir, "handout.csv"))
+   and QUEUED[-1][1]["op"] == "handout-note" and len(QUEUED) == nq + 1)
+ok("das ZIP ist wirklich verschluesselt",
+   zipfile.ZipFile(io.BytesIO(r.data)).infolist()[0].flag_bits & 1 == 1)
+r = c.post(f"/kohorten-handout/{rid}", headers=H, data={"password": "langes-passwort"})
+ok("zweiter Abruf: nichts mehr, mit Hinweis", r.status_code == 302 and "err=" in r.headers["Location"])
+ok("danach zeigt der Banner kein Handout mehr",
+   "/kohorten-handout/" not in c.get(loc, headers=H).get_data(as_text=True))
+rid2 = "c" * 32
+os.makedirs(os.path.join(SP, "jobs", rid2))
+json.dump({"id": rid2, "op": "create", "by": "trainer", "tenant": "t-a", "cohort": "x"},
+          open(os.path.join(SP, "jobs", rid2, "meta.json"), "w"))
+json.dump({"id": rid2, "ok": True, "cohort": "x", "message": "ok"},
+          open(os.path.join(SP, "jobs", rid2, "result.json"), "w"))
+open(os.path.join(SP, "jobs", rid2, "handout.csv"), "wb").write(CSV)
+r = c.post(f"/kohorten-handout/{rid2}", headers=H, data={})
+ok("ohne Passwort: offenes ZIP, als unencrypted gekennzeichnet",
+   r.status_code == 200 and r.headers.get("X-OAAP-Handout") == "unencrypted"
+   and zipfile.ZipFile(io.BytesIO(r.data)).read("handout.csv") == CSV)
+
+# Zuruecksetzen
+t = c.get("/kohorten/kurs-a", headers=H).get_data(as_text=True)
+ok("Platz: Zuruecksetzen mit Bestaetigung, Dateien behalten vorgewaehlt",
+   'action="/kohorten/kurs-a/seats/02/reset"' in t and 'name="keep_home" value="1" checked' in t
+   and 'name="sure" value="1" required' in t)
+n0 = len(QUEUED)
+r = c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"keep_home": "1"})
+ok("Zuruecksetzen ohne Bestaetigung: nichts im Spool, Hinweis",
+   len(QUEUED) == n0 and "err=" in r.headers["Location"])
+r = c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"sure": "1", "keep_home": "1"})
+ok("Zuruecksetzen, Dateien behalten", r.status_code == 302 and QUEUED[-1][1] == {
+    "action": "cohort", "op": "reset",
+    "args": {"cohort": "kurs-a", "seat": "02", "keep_home": True}}, QUEUED[-1])
+r = c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"sure": "1"})
+ok("Zuruecksetzen ohne 'Dateien behalten': keep_home falsch",
+   QUEUED[-1][1]["args"]["keep_home"] is False)
+n0 = len(QUEUED)
+for sid in ("99", "..", "01;rm"):
+    c.post(f"/kohorten/kurs-a/seats/{sid}/reset", headers=H, data={"sure": "1"})
+c.post("/kohorten/fremd/seats/01/reset", headers=H, data={"sure": "1"})
+ok("unbekannter Platz oder fremde Kohorte: nichts im Spool", len(QUEUED) == n0)
+r = c.post("/kohorten/kurs-a/seats/02/reset", headers={**H, "Sec-Fetch-Site": "cross-site"},
+           data={"sure": "1"})
+ok("Zuruecksetzen von einer fremden Seite: 403", r.status_code == 403 and len(QUEUED) == n0)
+WHO.update(role="", roles={"user"})
+ok("Zuruecksetzen ohne Verwalterrolle: 403",
+   c.post("/kohorten/kurs-a/seats/02/reset", headers=H, data={"sure": "1"}).status_code == 403)
+WHO.update(role="tenant_admin", roles={"tenant_admin"}, tenant="t-a")
+
 os.remove(VIEW)
 r = c.get("/kohorten", headers=H)
 ok("Sichtdatei fehlt: leere Seite statt Fehler",

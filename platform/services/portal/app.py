@@ -9008,7 +9008,8 @@ def _cohort_view(tid):
 
 
 COHORT_LIST_BODY = """
-<div class="pagehead"><h1>Kohorten</h1></div>
+<div class="pagehead"><h1>Kohorten</h1>
+  <span><a class="btn" href="/kohorten-anlegen">Kohorte anlegen</a></span></div>
 {% if rows %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
@@ -9027,11 +9028,31 @@ COHORT_LIST_BODY = """
 {% else %}
 <div class="card"><p class="muted">Noch keine Kohorte in diesem Mandanten.</p></div>
 {% endif %}
-<p class="muted">Anhalten, Starten und Verlängern gibt es auf der Seite der
-Kohorte. Anlegen und Entfernen geht über die Verwaltungs-API
+<p class="muted">Anlegen geht hier; Anhalten, Starten, Verlängern und das
+Zurücksetzen eines Platzes auf der Seite der Kohorte. Entfernen geht über die Verwaltungs-API
 (<code>/api/v1/tenant/cohorts</code>, mit einem Schlüssel aus
 <a href="/keys">Zugänge</a>) oder auf dem Knoten mit
 <code>oaap cohort</code>.</p>
+"""
+
+COHORT_BANNER = """
+{% if job %}
+<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p>
+{% if job.cohort and job.done and not job.failed %}<p><a class="btn" href="/kohorten/{{ job.cohort }}">Zur Kohorte</a></p>{% endif %}
+{% if job.handout %}
+<form method="post" action="/kohorten-handout/{{ job.id }}">
+  <h3>Zugangsdaten (Handout)</h3>
+  <p class="muted">Die Zugangsdaten gibt es <strong>genau einmal</strong>. Mit einem
+  Passwort (mindestens 8 Zeichen) wird das ZIP verschlüsselt; gib es dem
+  Empfänger auf einem anderen Weg. Ohne Passwort ist die Datei offen.</p>
+  <label>Passwort für das ZIP (optional) <input type="password" name="password" autocomplete="new-password"></label>
+  <button class="btn">Handout herunterladen</button>
+</form>
+{% endif %}
+</div>
+{% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
+{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
 """
 
 COHORT_DETAIL_BODY = """
@@ -9040,11 +9061,7 @@ COHORT_DETAIL_BODY = """
   <h1>{{ c.name }}</h1>
   <span class="badge {{ '' if c.tone == 'ok' else 'off' }}">{{ c.label }}</span>
 </div>
-{% if job %}
-<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p></div>
-{% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
-{% endif %}
-{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{{ BANNER }}
 <div class="card">
   <p>Angelegt: {{ c.created }}<br>
      Endet: {{ c.ends }}<br>
@@ -9053,7 +9070,7 @@ COHORT_DETAIL_BODY = """
 </div>
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Platz</th><th>Benutzer</th><th>Instanzen</th></tr>
+  <tr><th>Platz</th><th>Benutzer</th><th>Instanzen</th><th></th></tr>
   {% for s in c.seat_list %}
   <tr>
     <td>{{ s.id }}{% if s.label %} <span class="muted">{{ s.label }}</span>{% endif %}</td>
@@ -9063,6 +9080,10 @@ COHORT_DETAIL_BODY = """
       <span class="badge {{ '' if i.tone == 'ok' else 'off' }}">{{ i.label }}</span>{% if not loop.last %}<br>{% endif %}
       {% endfor %}
       {% if s.note %}<br><span class="muted">{{ s.note }}</span>{% endif %}</td>
+    <td><form method="post" action="/kohorten/{{ c.name }}/seats/{{ s.id }}/reset">
+      <label><input type="checkbox" name="keep_home" value="1" checked> Dateien behalten</label><br>
+      <label><input type="checkbox" name="sure" value="1" required> Platz {{ s.id }} zurücksetzen</label>
+      <button class="btn">Zurücksetzen</button></form></td>
   </tr>
   {% endfor %}
 </table>
@@ -9082,8 +9103,10 @@ COHORT_DETAIL_BODY = """
   aktiviert niemanden. Der Auftrag läuft auf dem Knoten und kann etwas
   dauern.</p>
 </div>
-<p class="muted">Plätze zurücksetzen oder entfernen und neue Kohorten anlegen:
-Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten (Handout)
+<p class="muted">Zurücksetzen baut die Instanzen eines Platzes aus der Vorlage
+neu auf; Benutzer und Passwort bleiben. Ohne „Dateien behalten“ wird
+<strong>alles gelöscht, was der Teilnehmer in den Instanzen abgelegt hat</strong>.
+Entfernen: Verwaltungs-API oder <code>oaap cohort</code>. Die Zugangsdaten (Handout)
 gibt es einmalig beim Anlegen und nicht hier.</p>
 """
 
@@ -9096,6 +9119,16 @@ def cohorts_page():
                 "tenant_admin."), 403
     return page(COHORT_LIST_BODY, "Kohorten", "cohorts",
                 rows=cohort_view.rows(_cohort_view(tid)))
+
+
+def _same_origin():
+    """A form post from this portal's own pages only. A browser sends Origin
+    (and Sec-Fetch-Site) on a cross-site post; a call that carries neither
+    is not a page of another site."""
+    origin = request.headers.get("Origin", "")
+    if origin and origin.split("://", 1)[-1] != request.host:
+        return False
+    return request.headers.get("Sec-Fetch-Site", "same-origin") in ("same-origin", "none")
 
 
 def _cohort_job_note(tid, role, rid):
@@ -9116,7 +9149,12 @@ def _cohort_job_note(tid, role, rid):
     res = management_api.read_json(
         os.path.join(management_api.SPOOL_DIR, "jobs", rid, "result.json")) or {}
     good = bool(res.get("ok"))
-    return {"done": True, "failed": not good,
+    mine = role == "server_admin" or meta.get("by") == caller_name()
+    hand = os.path.join(management_api.SPOOL_DIR, "jobs", rid, "handout.csv")
+    return {"done": True, "failed": not good, "id": rid,
+            "cohort": (res.get("cohort") or meta.get("cohort") or "") if good else "",
+            "handout": bool(good and mine and meta.get("op") == "create"
+                            and os.path.isfile(hand)),
             "text": (res.get("message") or ("Erledigt." if good else "Fehlgeschlagen."))}
 
 
@@ -9132,7 +9170,7 @@ def cohorts_detail(name):
                     rows=cohort_view.rows(_cohort_view(tid)))
     d = cohort_view.detail(c)
     d["stopped"] = c.get("state") == "stopped"
-    return page(COHORT_DETAIL_BODY, c["name"], "cohorts", c=d,
+    return page(COHORT_DETAIL_BODY, c["name"], "cohorts", c=d, BANNER=COHORT_BANNER,
                 job=_cohort_job_note(tid, role, request.args.get("job", "")),
                 error=request.args.get("err"))
 
@@ -9145,8 +9183,7 @@ def cohorts_act(name, verb):
     if tid is None:
         return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
                 "tenant_admin."), 403
-    origin = request.headers.get("Origin", "")
-    if origin and origin.split("://", 1)[-1] != request.host:
+    if not _same_origin():
         return "Zugriff verweigert: fremde Herkunft.", 403
     if verb not in ("stop", "start", "extend") or name not in _cohort_view(tid):
         return redirect("/kohorten")
@@ -9158,3 +9195,113 @@ def cohorts_act(name, verb):
         args.update(ends=ends, dry_run=False)
     rid = management_api.enqueue(tid, role, verb, args)
     return redirect(f"/kohorten/{name}?job={rid}")
+
+
+COHORT_NEW_BODY = """
+<a class="back" href="/kohorten">← Zurück zur Liste</a>
+<div class="pagehead"><h1>Kohorte anlegen</h1></div>
+{{ BANNER }}
+<div class="card">
+  <form method="post" action="/kohorten-anlegen" enctype="multipart/form-data">
+    <p>Die Vorlage ist ein Ordner mit einer <code>cohort.yaml</code> an der
+    Wurzel (Name, Plätze, Apps, Laufzeit, Grenzen), als <strong>ZIP</strong>.
+    Das Anlegen läuft auf dem Knoten und kann Minuten dauern; die Seite zeigt,
+    wie weit es ist. Danach gibt es einmalig die Zugangsdaten für alle Plätze.</p>
+    <label>Vorlage (ZIP, bis 256 MiB) <input type="file" name="archive" accept=".zip,application/zip" required></label>
+    <button class="btn">Kohorte anlegen</button>
+  </form>
+  <p class="muted">Als Trainer eines Mandanten kannst Du Apps aus den
+  eingerichteten Quellen des Knotens nehmen, die nicht „ungeprüft“ sind;
+  eine eigene Git-Adresse gibt es hier nicht. Benannte Geheimnisse
+  (<code>{secret: …}</code>) legt der Betreiber an.</p>
+</div>
+"""
+
+
+def _cohort_denied():
+    return ("Zugriff verweigert: erfordert die Rolle server_admin oder "
+            "tenant_admin."), 403
+
+
+@app.get("/kohorten-anlegen")
+def cohorts_new():
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    return page(COHORT_NEW_BODY, "Kohorte anlegen", "cohorts", BANNER=COHORT_BANNER,
+                job=_cohort_job_note(tid, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/kohorten-anlegen")
+def cohorts_create_page():
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if request.content_length and request.content_length > management_api.MAX_UPLOAD + 65536:
+        return redirect("/kohorten-anlegen?err=" + quote("Die Datei ist größer als 256 MiB."))
+    f = request.files.get("archive")
+    if f is None:
+        return redirect("/kohorten-anlegen?err=" + quote("Bitte eine ZIP-Datei wählen."))
+    rid, bad = management_api.start_create(f.read(), tid, role)
+    if bad:
+        return redirect("/kohorten-anlegen?err=" + quote(bad[1]))
+    return redirect(f"/kohorten-anlegen?job={rid}")
+
+
+@app.post("/kohorten-handout/<rid>")
+def cohorts_handout(rid):
+    """The one-time handout as a ZIP, for the person who started the job."""
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if not management_api.JOB_RE.match(rid):
+        return redirect("/kohorten")
+    meta = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "meta.json"))
+    if not management_api._may_see(meta, tid, role):
+        return redirect("/kohorten")
+    if role != "server_admin" and meta.get("by") != caller_name():
+        return ("Zugriff verweigert: nur wer den Auftrag gestartet hat, holt das "
+                "Handout."), 403
+    back = f"/kohorten-anlegen?job={rid}"
+    password = request.form.get("password", "")
+    if password and len(password) < management_api.MIN_PASSWORD:
+        return redirect(back + "&err=" + quote(
+            f"Das Passwort braucht mindestens {management_api.MIN_PASSWORD} Zeichen."))
+    if management_api.job_status(management_api.SPOOL_DIR, rid) != "done":
+        return redirect(back)
+    got = management_api.claim_handout(rid, meta.get("cohort", ""), password)
+    if got is None:
+        return redirect(back + "&err=" + quote(
+            "Das Handout wurde schon geholt oder es gab keins."))
+    blob, encrypted = got
+    headers = {"Content-Disposition": f'attachment; filename="handout-{rid[:8]}.zip"',
+               "Cache-Control": "no-store"}
+    if not encrypted:
+        headers["X-OAAP-Handout"] = "unencrypted"
+    return app.response_class(blob, mimetype="application/zip", headers=headers)
+
+
+@app.post("/kohorten/<name>/seats/<sid>/reset")
+def cohorts_seat_reset(name, sid):
+    tid, role = _cohort_scope()
+    if tid is None:
+        return _cohort_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    c = _cohort_view(tid).get(name)
+    if not c or sid not in [x.get("id") for x in c.get("seats") or []]:
+        return redirect("/kohorten")
+    if request.form.get("sure") != "1":
+        return redirect(f"/kohorten/{name}?err=" + quote("Bitte das Zurücksetzen bestätigen."))
+    rid = management_api.enqueue(tid, role, "reset", {
+        "cohort": name, "seat": sid, "keep_home": request.form.get("keep_home") == "1"})
+    return redirect(f"/kohorten/{name}?job={rid}")
+
+COHORT_DETAIL_BODY = COHORT_DETAIL_BODY.replace("{{ BANNER }}", COHORT_BANNER)
+COHORT_NEW_BODY = COHORT_NEW_BODY.replace("{{ BANNER }}", COHORT_BANNER)

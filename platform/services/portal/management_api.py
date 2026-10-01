@@ -255,6 +255,26 @@ def cohorts_show(name):
     return jsonify(c)
 
 
+def start_create(data, tid, role):
+    """Check a template archive, unpack it into a new job, queue the create.
+    -> (job id, None) or (None, (status, text)). The page and the API share
+    this: one way in."""
+    if len(data) > MAX_UPLOAD:
+        return None, (413, "the archive is larger than 256 MiB")
+    kind, why = archive_problem(data)
+    if kind == "too_large":
+        return None, (413, why)
+    if kind:
+        return None, (400, why)
+    rid = uuid.uuid4().hex
+    jdir = os.path.join(SPOOL_DIR, "jobs", rid)
+    try:
+        extract_archive(data, os.path.join(jdir, "template"))
+    except (ValueError, OSError, zipfile.BadZipFile) as e:
+        return None, (400, f"the archive could not be unpacked: {e}")
+    return enqueue(tid, role, "create", {}, rid=rid), None
+
+
 @bp.post(PREFIX + "/cohorts")
 def cohorts_create():
     tid, role, bad = gate(write=True)
@@ -265,19 +285,10 @@ def cohorts_create():
                         "(Content-Type: application/zip)")
     if request.content_length and request.content_length > MAX_UPLOAD:
         return err(413, "the archive is larger than 256 MiB")
-    data = request.get_data()
-    kind, why = archive_problem(data)
-    if kind == "too_large":
-        return err(413, why)
-    if kind:
-        return err(400, why)
-    rid = uuid.uuid4().hex
-    jdir = os.path.join(SPOOL_DIR, "jobs", rid)
-    try:
-        extract_archive(data, os.path.join(jdir, "template"))
-    except (ValueError, OSError, zipfile.BadZipFile) as e:
-        return err(400, f"the archive could not be unpacked: {e}")
-    return _submit(tid, role, "create", {}, rid=rid)
+    rid, bad = start_create(request.get_data(), tid, role)
+    if bad:
+        return err(*bad)
+    return jsonify({"job": rid, "status_url": f"{PREFIX}/jobs/{rid}"}), 202
 
 
 @bp.post(PREFIX + "/cohorts/<name>/<verb>")
@@ -424,13 +435,28 @@ def jobs_handout(rid):
         return err(400, f"the password needs at least {MIN_PASSWORD} characters")
     if job_status(SPOOL_DIR, rid) != "done":
         return err(409, "the job is not finished")
+    got = claim_handout(rid, meta.get("cohort", ""), password)
+    if got is None:
+        return err(410, "the handout was fetched already, or there never was one")
+    blob, encrypted = got
+    headers = {"Content-Disposition": f'attachment; filename="handout-{rid[:8]}.zip"',
+               "Cache-Control": "no-store"}
+    if not encrypted:
+        headers["X-OAAP-Handout"] = "unencrypted"
+    return Response(blob, mimetype="application/zip", headers=headers)
+
+
+def claim_handout(rid, cohort, password):
+    """Take the one-time handout of a finished job -> (zip bytes, encrypted)
+    or None when it is gone. The rename is atomic: exactly one caller wins,
+    then the CSV is shredded and the fetch is noted in the audit log."""
     jdir = os.path.join(SPOOL_DIR, "jobs", rid)
     src = os.path.join(jdir, "handout.csv")
     claimed = os.path.join(jdir, f"handout.claimed.{uuid.uuid4().hex[:8]}")
     try:
-        os.rename(src, claimed)             # atomic: exactly one caller wins
+        os.rename(src, claimed)
     except OSError:
-        return err(410, "the handout was fetched already, or there never was one")
+        return None
     try:
         with open(claimed, "rb") as f:
             raw = f.read()
@@ -439,13 +465,8 @@ def jobs_handout(rid):
         shred(claimed)
     CTX["queue"](uuid.uuid4().hex, "", {
         "action": "cohort", "op": "handout-note",
-        "args": {"cohort": meta.get("cohort", ""), "job": rid,
-                 "encrypted": encrypted}}, 0)
-    headers = {"Content-Disposition": f'attachment; filename="handout-{rid[:8]}.zip"',
-               "Cache-Control": "no-store"}
-    if not encrypted:
-        headers["X-OAAP-Handout"] = "unencrypted"
-    return Response(blob, mimetype="application/zip", headers=headers)
+        "args": {"cohort": cohort, "job": rid, "encrypted": encrypted}}, 0)
+    return blob, encrypted
 
 
 def init(app, caller_name, caller_roles, caller_scope, host_tenant, queue):
