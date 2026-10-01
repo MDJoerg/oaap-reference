@@ -166,8 +166,9 @@ ok("Banner: Ergebnis des Knotens, kein Neuladen mehr",
    "Cohort &#39;kurs-a&#39; stopped." in t and "location.reload" not in t, t[-600:])
 json.dump({"id": rid, "ok": False, "message": "refused: nope"},
           open(os.path.join(SP, "jobs", rid, "result.json"), "w"))
+ok("Banner: Mehrzeiliges bleibt mehrzeilig (pre-wrap)", "white-space:pre-wrap" in c.get(loc, headers=H).get_data(as_text=True))
 ok("Banner: Ablehnung des Knotens wird als Fehler gezeigt",
-   'class="err">refused: nope' in c.get(loc, headers=H).get_data(as_text=True))
+   '>refused: nope<' in c.get(loc, headers=H).get_data(as_text=True))
 WHO.update(tenant="t-c")
 os.makedirs(os.path.join(SP, "jobs", "f" * 32))
 json.dump({"id": "f" * 32, "tenant": "t-a"}, open(os.path.join(SP, "jobs", "f" * 32, "meta.json"), "w"))

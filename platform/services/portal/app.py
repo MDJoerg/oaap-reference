@@ -9041,7 +9041,7 @@ COHORT_DETAIL_BODY = """
   <span class="badge {{ '' if c.tone == 'ok' else 'off' }}">{{ c.label }}</span>
 </div>
 {% if job %}
-<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}">{{ job.text }}</p></div>
+<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p></div>
 {% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
 {% endif %}
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
