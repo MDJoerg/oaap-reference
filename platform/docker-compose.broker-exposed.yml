@@ -5,15 +5,17 @@
 # _broker_compose_files() layers this file on top with '-f' instead of
 # adding a second entry to docker-compose.yml's own 'profiles:' list.
 #
-# Publishes the raw MQTT port (1883) to the host, for devices that
-# cannot speak HTTP and carry no identity (RFC-0015 Stage 1) -- gated
-# the same way any other non-HTTP endpoint that bypasses the gateway is
-# gated, reusing 'exposed' rather than inventing a second grant
-# mechanism for this one platform service. The WebSocket listener
+# Publishes the broker's TLS port (8883) to the host (RFC-0054): every
+# client presents a key (RFC-0027) and the line is encrypted -- gated the
+# same way any other non-HTTP endpoint that bypasses the gateway is gated,
+# reusing 'exposed' rather than inventing a second grant mechanism for
+# this one platform service. The PLAIN port (1883) is NOT here any more: it
+# is the profile 'broker-plain', bound to the LAN address only
+# (docker-compose.broker-plain.yml). The WebSocket listener
 # (9001, browsers through the gateway) is never published here or
 # anywhere else -- it stays reachable only from the gateway container,
 # over the compose network, exactly like 'twin'.
 services:
   broker:
     ports:
-      - "1883:1883"
+      - "8883:8883"

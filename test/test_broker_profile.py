@@ -94,8 +94,9 @@ ok("adding 'exposed' republishes the port when 'broker' is already held",
 ok("remove-profile 'broker' stops the service",
    'if profile == "broker":' in remove_half
    and '_compose("stop", "broker"' in remove_half)
-ok("removing 'exposed' republishes broker WITHOUT the port",
-   'if profile == "exposed" and has_profile("broker"):' in remove_half)
+ok("removing 'exposed' (or 'broker-plain') republishes broker WITHOUT the port",
+   'if profile in ("exposed", "broker-plain") and has_profile("broker"):' in remove_half
+   and "_apply_broker_ports()" in remove_half)
 
 # appctl.py must still be syntactically whole after all the edits above.
 ast.parse(appctl_src)
@@ -117,8 +118,9 @@ ok("it publishes NO port of its own -- the raw device port is additive",
 
 overlay_src = read(PLATFORM_DIR, "docker-compose.broker-exposed.yml")
 ok("the overlay targets the 'broker' service", "broker:" in overlay_src)
-ok("the overlay publishes 1883, and only 1883",
-   '"1883:1883"' in overlay_src)
+ok("the overlay publishes the TLS port 8883, and only that (RFC-0054)",
+   [l.strip() for l in overlay_src.splitlines() if l.strip().startswith('- "')]
+   == ['- "8883:8883"'])
 
 
 print("")

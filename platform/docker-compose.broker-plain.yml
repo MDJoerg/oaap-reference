@@ -1,0 +1,15 @@
+# Overlay for the 'broker' service (RFC-0054 section 3), applied ONLY when
+# the node carries BOTH 'broker' AND 'broker-plain' (appctl.py
+# _broker_compose_files(), migrate.sh's broker block, update.sh).
+#
+# Publishes the broker's PLAIN MQTT port (1883, no TLS) on the node's
+# private LAN address ONLY -- never on all interfaces. The address is the
+# one 'oaap node add-profile broker-plain' found (the default route's
+# private address) and `oaap broker sync` keeps current. '${VAR:?...}' makes
+# Compose REFUSE to start the service when the variable is missing, instead
+# of falling back to a bare '1883:1883' on every interface: for a port that
+# carries keys in the clear, failing is the safe way to be wrong.
+services:
+  broker:
+    ports:
+      - "${BROKER_PLAIN_BIND:?the broker-plain profile sets BROKER_PLAIN_BIND in .env}:1883:1883"

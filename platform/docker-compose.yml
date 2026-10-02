@@ -305,10 +305,24 @@ services:
     volumes:
       - ./services/broker/mosquitto.conf.template:/mosquitto-template/mosquitto.conf.template:ro
       - "${OAAP_DATA_DIR}/data/broker:/mosquitto/data"
+      # The TLS certificate and key (RFC-0054 stage 3), COPIED here by
+      # `oaap broker sync` -- Caddy's own files are root-only and the
+      # broker runs as uid 1000. Read-only; the broker never writes it.
+      - "${OAAP_DATA_DIR}/data/broker-certs:/mosquitto/certs:ro"
     command:
       - /bin/sh
       - -c
-      - sed "s/__INTERNAL_API_KEY__/$$INTERNAL_API_KEY/g" /mosquitto-template/mosquitto.conf.template > /tmp/mosquitto.conf && exec /usr/sbin/mosquitto -c /tmp/mosquitto.conf
+      # The TLS listener (8883) exists only when a certificate is in
+      # place -- Mosquitto refuses to start on a listener whose files are
+      # missing, and a node with no certificate yet must still have its
+      # broker. Last in the file on purpose: certfile/keyfile/tls_version
+      # belong to the listener named just above them.
+      - |
+        sed "s/__INTERNAL_API_KEY__/$$INTERNAL_API_KEY/g" /mosquitto-template/mosquitto.conf.template > /tmp/mosquitto.conf
+        if [ -r /mosquitto/certs/server.crt ] && [ -r /mosquitto/certs/server.key ]; then
+          printf '\nlistener 8883\ncertfile /mosquitto/certs/server.crt\nkeyfile /mosquitto/certs/server.key\ntls_version tlsv1.2\n' >> /tmp/mosquitto.conf
+        fi
+        exec /usr/sbin/mosquitto -c /tmp/mosquitto.conf
 
   # The outbox relay (oaap.data.twin 0.3, RFC-0032 build order step 2) --
   # the 'twin' image with a different command (services/twin/relay.py).

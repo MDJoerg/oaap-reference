@@ -191,9 +191,13 @@ fi
 # nothing about them. Found while building the event relay, 2026-09-12,
 # before any node held both profiles. Same file set, here too.
 COMPOSE_FILES=()
-if [[ " ${PROFILE_ARGS[*]-} " == *" broker "* && " ${PROFILE_ARGS[*]-} " == *" exposed "* ]]; then
-  COMPOSE_FILES=(-f "$APP_DIR/docker-compose.yml"
-                 -f "$APP_DIR/docker-compose.broker-exposed.yml")
+if [[ " ${PROFILE_ARGS[*]-} " == *" broker "* ]] \
+   && [[ " ${PROFILE_ARGS[*]-} " == *" exposed "* || " ${PROFILE_ARGS[*]-} " == *" broker-plain "* ]]; then
+  COMPOSE_FILES=(-f "$APP_DIR/docker-compose.yml")
+  [[ " ${PROFILE_ARGS[*]-} " == *" exposed "* ]] \
+    && COMPOSE_FILES+=(-f "$APP_DIR/docker-compose.broker-exposed.yml")
+  [[ " ${PROFILE_ARGS[*]-} " == *" broker-plain "* ]] \
+    && COMPOSE_FILES+=(-f "$APP_DIR/docker-compose.broker-plain.yml")
 fi
 
 say "Building core service images (the running services stay up) ..."

@@ -214,8 +214,11 @@ ok("add-profile broker startet broker UND relay",
 ok("remove-profile broker stoppt broker UND relay",
    '_compose("stop", "broker", "relay")' in remove_half)
 exp_add = add_half.split('if profile == "exposed" and has_profile("broker"):', 1)[1]
+ports_fn = appctl_src.split("def _apply_broker_ports():", 1)[1].split("\ndef ", 1)[0]
 ok("'exposed' an-/abschalten zieht nur den Broker neu hoch, nicht das Relais",
-   '"up", "-d", "broker")' in exp_add and "relay" not in exp_add.split("except", 1)[0])
+   "_apply_broker_ports()" in exp_add.split("if profile ==", 1)[0]
+   and '"up", "-d",' in ports_fn and '"broker")' in ports_fn
+   and "relay" not in ports_fn)
 
 # ---------------------------------------------------- migrate/install/update
 print("\n=== migrate.sh / install.sh / update.sh ===")
@@ -237,9 +240,10 @@ ok("install.sh erzeugt BROKER_RELAY_KEY und schreibt ihn in .env",
    'BROKER_RELAY_KEY="$(gen_secret)"' in install
    and "BROKER_RELAY_KEY=$BROKER_RELAY_KEY" in install)
 update = read(PLATFORM, "update.sh")
-ok("update.sh: das Overlay nur bei 'broker' UND 'exposed'",
-   re.search(r'" broker ".*&&.*" exposed "', update) is not None
-   and "docker-compose.broker-exposed.yml" in update)
+ok("update.sh: die Overlays nur bei 'broker' UND 'exposed' bzw. 'broker-plain'",
+   '" broker "' in update and '" exposed "' in update and '" broker-plain "' in update
+   and "docker-compose.broker-exposed.yml" in update
+   and "docker-compose.broker-plain.yml" in update)
 build_part = update.split("build --quiet", 1)[0].splitlines()[-1]
 ok("update.sh: 'build' bekommt dieselben Dateien", '"${COMPOSE_FILES[@]}"' in build_part, build_part)
 restart = update[update.find('say "Restarting core services ..."'):][:220]

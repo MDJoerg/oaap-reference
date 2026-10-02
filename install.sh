@@ -828,6 +828,9 @@ ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py access sweep
 # The leading '-' lets this fail without stopping the jobs above: a chart
 # losing a minute must never cost the portal its container-state view.
 ExecStart=-$PYTHON3 $OAAP_DATA_DIR/app/appctl.py metrics sample
+# The broker's certificate and its plain-port address (RFC-0054): a
+# comparison and nothing else on a node without the 'broker' profile.
+ExecStart=-$PYTHON3 $OAAP_DATA_DIR/app/appctl.py broker sync
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]

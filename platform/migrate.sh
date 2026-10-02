@@ -443,6 +443,9 @@ ExecStart=$PYTHON3 $APP_DIR/appctl.py access sweep
 # The leading '-' lets this fail without stopping the jobs above: a chart
 # losing a minute must never cost the portal its container-state view.
 ExecStart=-$PYTHON3 $APP_DIR/appctl.py metrics sample
+# The broker's certificate and its plain-port address (RFC-0054): a
+# comparison and nothing else on a node without the 'broker' profile.
+ExecStart=-$PYTHON3 $APP_DIR/appctl.py broker sync
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]
@@ -546,6 +549,9 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
   BROKER_FILES=(-f "$APP_DIR/docker-compose.yml")
   if grep -q '"exposed"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
     BROKER_FILES+=(-f "$APP_DIR/docker-compose.broker-exposed.yml")
+  fi
+  if grep -q '"broker-plain"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+    BROKER_FILES+=(-f "$APP_DIR/docker-compose.broker-plain.yml")
   fi
   if [ -z "$(docker ps -q -f name=^oaap-broker-1$ -f status=running)" ]; then
     say ""

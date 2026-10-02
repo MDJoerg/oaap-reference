@@ -84,6 +84,9 @@ import cohort  # noqa: E402
 import metrics  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
+# The broker's certificate (RFC-0054 stage 3): copied from the gateway or
+# issued by this node's own CA; the acting is cmd_broker.
+import broker_certs  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -5005,6 +5008,12 @@ METRICS_DIR = os.path.join(DATA_DIR, "data", "metrics")
 # portal mounts METRICS_DIR read-only for the charts, and a secret in a
 # directory a container can read is a secret a container can read.
 METRICS_SENDER_DIR = os.path.join(DATA_DIR, "data", "metrics-sender")
+# The broker's certificate pair (mounted read-only INTO the broker), the
+# node CA's private key (mounted nowhere), and the gateway's own storage
+# (RFC-0054 stage 3).
+BROKER_CERT_DIR = os.path.join(DATA_DIR, "data", "broker-certs")
+BROKER_CA_DIR = os.path.join(DATA_DIR, "data", "broker-ca")
+CADDY_DATA_DIR = os.path.join(DATA_DIR, "data", "gateway", "caddy-data")
 
 
 def _fmt_at(t):
@@ -5721,9 +5730,16 @@ PROFILES = {
               "oaap.events.broker 0.1 (RFC-0032 D2), independent of "
               "'store': a back-office tenant has a twin but no reason to "
               "run a broker. Like 'store' this actually starts and stops "
-              "a platform service. The raw device port (no identity, RFC-"
-              "0015) is only published when the node ALSO carries "
-              "'exposed' — see _broker_compose_files below.",
+              "a platform service. The TLS port (8883) is published to "
+              "the host only when the node ALSO carries 'exposed' "
+              "(RFC-0015, RFC-0054); the plain port only with "
+              "'broker-plain' — see _broker_compose_files below.",
+    "broker-plain": "plain MQTT on the intranet — publishes the broker's "
+                    "port 1883 (NO TLS: a key sent there can be read by "
+                    "anyone on the network) on this node's private LAN "
+                    "address only, for devices that cannot speak TLS "
+                    "(RFC-0054 §3). Needs 'broker'; refused on a node "
+                    "with no private address. Off by default.",
     "gateway-only": "gateway-only node — the per-instance LAN ports "
                     "8100-8199 are no longer reachable from the network; "
                     "apps are reached only through the gateway on 80/443 "
@@ -5787,6 +5803,18 @@ def _set_platform_env(key, value):
     os.replace(tmp, path)
 
 
+def _read_platform_env(key):
+    """One value of the platform .env, or None."""
+    try:
+        with open(os.path.join(APP_DIR, ".env"), encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                if line.startswith(key + "="):
+                    return line[len(key) + 1:]
+    except OSError:
+        pass
+    return None
+
+
 def apply_gateway_only(on):
     """Make the published LAN ports match the 'gateway-only' profile.
 
@@ -5805,8 +5833,9 @@ def apply_gateway_only(on):
 def _broker_compose_files():
     """Which compose file(s) 'docker compose ... broker' should use.
 
-    The raw MQTT port (1883, no identity — RFC-0015) is only published
-    to the host when this node ALSO carries 'exposed'. Compose's own
+    The TLS port (8883) is only published to the host when this node
+    ALSO carries 'exposed' (RFC-0015), and the plain port (1883) only
+    with 'broker-plain', bound to the LAN address (RFC-0054 §2-3). Compose's own
     'profiles:' key ORs profiles together (any one of a service's
     profiles being active is enough to start it) and cannot express
     "start with 'broker', but only publish a port with 'exposed' too" —
@@ -5816,7 +5845,132 @@ def _broker_compose_files():
     files = ["-f", os.path.join(APP_DIR, "docker-compose.yml")]
     if has_profile("exposed"):
         files += ["-f", os.path.join(APP_DIR, "docker-compose.broker-exposed.yml")]
+    if has_profile("broker-plain"):
+        files += ["-f", os.path.join(APP_DIR, "docker-compose.broker-plain.yml")]
     return files
+
+
+def lan_address():
+    """This node's private IPv4 address -- the one its default route uses --
+    or None when that is not a private one (a server with only a public
+    address). The test is the routing table's answer, not a guess from
+    a host name: a UDP socket "connected" to a far address sends nothing
+    and still says which local address it would send from."""
+    import ipaddress
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        addr = s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    return addr if ip.is_private and not ip.is_loopback else None
+
+
+def _apply_broker_ports():
+    """Recreate the broker with whatever ports its profiles now publish."""
+    try:
+        _compose(*_broker_compose_files(), "--profile", "broker", "up", "-d",
+                 "broker")
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+def broker_sync(announce=False):
+    """Make the broker's certificate and its plain-port bind current
+    (RFC-0054 stage 3). Returns the certificate result, or None when this
+    node has no broker. Never raises: the unit it runs in shares its job
+    with the state index and the sampler.
+
+    A renewed certificate reaches the broker with SIGHUP; the very first
+    one needs a restart (a listener cannot be added by a reload) -- both
+    measured on oaap-test.
+    """
+    if not has_profile("broker"):
+        return None
+    import socket
+    res = None
+    try:
+        host, _edge = load_external_conf()
+        res = broker_certs.sync(BROKER_CERT_DIR, BROKER_CA_DIR, CADDY_DATA_DIR,
+                                socket.gethostname(), host, lan_address())
+        if res["action"] != "unchanged":
+            running = bool(run(["docker", "ps", "-q", "-f",
+                                "name=^oaap-broker-1$", "-f", "status=running"]
+                               ).stdout.strip())
+            how = "not running"
+            if running:
+                if res["first"]:
+                    run(["docker", "restart", "oaap-broker-1"])
+                    how = "restarted (first certificate: the TLS listener starts)"
+                else:
+                    run(["docker", "kill", "-s", "HUP", "oaap-broker-1"])
+                    how = "reloaded (SIGHUP, no restart)"
+            print(f"broker: certificate {res['action']} ({res['source']}, "
+                  f"{res['days']} days left); broker {how}")
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        print(f"broker: certificate sync skipped ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+    try:
+        if has_profile("broker-plain"):
+            now_addr = lan_address()
+            env = _read_platform_env("BROKER_PLAIN_BIND")
+            if now_addr and env != now_addr:
+                _set_platform_env("BROKER_PLAIN_BIND", now_addr)
+                ok = _apply_broker_ports()
+                print(f"broker: the LAN address changed ({env} -> {now_addr}); "
+                      "plain port " + ("republished" if ok else "NOT republished"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"broker: plain-port check skipped ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+    return res
+
+
+def cmd_broker(args):
+    """`oaap broker sync|show|ca` (RFC-0054 stage 3)."""
+    if args.action == "sync":
+        broker_sync()
+        return
+    if args.action == "ca":
+        ca = os.path.join(BROKER_CA_DIR, "ca.crt")
+        if not os.path.isfile(ca):
+            print("This node has no CA of its own: its broker certificate "
+                  "comes from the gateway (a public authority), so a client "
+                  "needs no CA file.", file=sys.stderr)
+            sys.exit(1)
+        with open(ca, encoding="utf-8") as f:
+            sys.stdout.write(f.read())
+        return
+    if not has_profile("broker"):
+        print("This node has no 'broker' profile.")
+        return
+    state = broker_certs._state(BROKER_CERT_DIR)
+    crt = os.path.join(BROKER_CERT_DIR, broker_certs.CERT)
+    if not os.path.isfile(crt):
+        print("TLS: no certificate yet (oaap broker sync makes one).")
+    else:
+        print(f"TLS: certificate from "
+              f"{'the gateway' if state.get('source') == 'caddy' else 'this node' + chr(39) + 's own CA'}, "
+              f"{broker_certs.days_left(crt)} days left")
+        print("  names: " + ", ".join(broker_certs.names_of(crt)))
+        if state.get("source") == "local":
+            print("  clients verify with this CA:  oaap broker ca > ca.crt")
+    print("  TLS port 8883 on the host: "
+          + ("published (profile 'exposed')" if has_profile("exposed")
+             else "not published (needs the profile 'exposed')"))
+    if has_profile("broker-plain"):
+        print(f"  PLAIN port 1883: published on "
+              f"{_read_platform_env('BROKER_PLAIN_BIND') or '?'} only -- keys "
+              "cross the LAN in the clear")
+    else:
+        print("  plain port 1883: not published (profile 'broker-plain')")
 
 
 def cmd_node(args):
@@ -5835,6 +5989,9 @@ def cmd_node(args):
             print(f"  {p}: {PROFILES[p]}")
         if not profiles:
             print("  This node behaves like a plain production node.")
+        if "broker-plain" in profiles:
+            print("\n  NOTE: this node accepts MQTT keys IN THE CLEAR on its "
+                  f"LAN (port 1883, bound to {lan_address() or '?'}).")
         print("\nAvailable: " + ", ".join(sorted(PROFILES)))
         return
     profile = (args.profile or "").strip().lower()
@@ -5845,6 +6002,16 @@ def cmd_node(args):
         if profile in profiles:
             print(f"Node already has profile '{profile}'.")
             return
+        if profile == "broker-plain":
+            # "Intranet only" is enforced HERE, by the node, not left to
+            # the operator's firewall (RFC-0054 §3).
+            if not has_profile("broker"):
+                die("'broker-plain' needs the 'broker' profile first: "
+                    "oaap node add-profile broker")
+            if not lan_address():
+                die("this node has no private (LAN) address, so plain MQTT "
+                    "would be published on a public one -- refused. Use the "
+                    "TLS port (8883) here.")
         save_profiles(profiles + [profile])
         print(f"Node profile '{profile}' added: {PROFILES[profile]}")
         if profile == "dev":
@@ -5895,24 +6062,34 @@ def cmd_node(args):
                 print("The MQTT broker and the event relay are starting "
                       "('docker compose ... --profile broker up -d broker "
                       "relay')."
-                      + (" The raw device port (1883) is published — this "
+                      + (" The TLS port (8883) is published — this "
                          "node also carries 'exposed'."
                          if has_profile("exposed") else
-                         " The raw device port stays closed until this "
+                         " The TLS port stays closed to the host until this "
                          "node also carries 'exposed'."))
+                broker_sync(announce=True)
             except (subprocess.CalledProcessError, OSError) as e:
                 err = (getattr(e, "stderr", "") or "").strip().splitlines()
                 print("WARNING: could not start the 'broker' service"
                       + (f": {err[-1]}" if err else f": {e}") + ".")
         if profile == "exposed" and has_profile("broker"):
-            # The broker is already running without the raw port; bring
-            # it back up with the overlay so the port gets published.
-            try:
-                _compose(*_broker_compose_files(), "--profile", "broker",
-                          "up", "-d", "broker")
-                print("The broker's raw device port (1883) is now published.")
-            except (subprocess.CalledProcessError, OSError):
-                print("WARNING: could not republish the broker's raw port "
+            # The broker is already running without the port; bring it
+            # back up with the overlay so the port gets published.
+            if _apply_broker_ports():
+                print("The broker's TLS port (8883) is now published.")
+            else:
+                print("WARNING: could not republish the broker's port "
+                      "— check 'docker ps' / 'docker compose ... up -d broker'.")
+        if profile == "broker-plain":
+            addr = lan_address()
+            _set_platform_env("BROKER_PLAIN_BIND", addr)
+            if _apply_broker_ports():
+                print(f"Plain MQTT (1883) is now published on {addr} ONLY. "
+                      "A key sent there crosses the network in the clear: "
+                      "use it for devices that cannot speak TLS, on a "
+                      "network you trust.")
+            else:
+                print("WARNING: could not republish the broker's plain port "
                       "— check 'docker ps' / 'docker compose ... up -d broker'.")
         if profile == "remote-access":
             # Unlike 'store'/'broker', nothing host-wide starts here
@@ -5934,6 +6111,9 @@ def cmd_node(args):
     else:
         if profile not in profiles:
             die(f"node does not have profile '{profile}'")
+        if profile == "broker" and has_profile("broker-plain"):
+            die("cannot remove profile 'broker' while 'broker-plain' is "
+                "held -- remove 'broker-plain' first.")
         if profile == "store":
             existing = store_schemas()
             if existing:
@@ -5977,17 +6157,18 @@ def cmd_node(args):
             except (subprocess.CalledProcessError, OSError):
                 print("WARNING: could not stop the 'broker'/'relay' "
                       "containers — check 'docker ps'.")
-        if profile == "exposed" and has_profile("broker"):
-            # 'exposed' is already gone from the saved profiles above, so
-            # _broker_compose_files() now resolves to the base file only
+        if profile in ("exposed", "broker-plain") and has_profile("broker"):
+            # The profile is already gone from the saved ones above, so
+            # _broker_compose_files() now resolves without its overlay
             # -- re-up recreates the container without the published port.
-            try:
-                _compose(*_broker_compose_files(), "--profile", "broker",
-                          "up", "-d", "broker")
-                print("The broker's raw device port (1883) is no longer "
-                      "published.")
-            except (subprocess.CalledProcessError, OSError):
-                print("WARNING: could not unpublish the broker's raw port "
+            if profile == "broker-plain":
+                _set_platform_env("BROKER_PLAIN_BIND", None)
+            if _apply_broker_ports():
+                print("The broker's " + ("TLS port (8883)" if profile == "exposed"
+                                         else "plain port (1883)")
+                      + " is no longer published.")
+            else:
+                print("WARNING: could not unpublish the broker's port "
                       "— check 'docker ps' / 'docker compose ... up -d broker'.")
         if profile == "remote-access":
             print("Removed. No instance had an open WireGuard access, so "
@@ -21166,6 +21347,10 @@ def main():
                       help="why a dangerous combination is wanted; goes into "
                            "this tenant's log")
     pten.set_defaults(fn=cmd_tenant)
+    pbk = sub.add_parser("broker", help="the MQTT broker's certificate "
+                                        "(RFC-0054)")
+    pbk.add_argument("action", choices=["sync", "show", "ca"])
+    pbk.set_defaults(fn=cmd_broker)
     pmet = sub.add_parser("metrics", help="node history of CPU, memory and "
                                           "disk (RFC-0051)")
     pmet.add_argument("action", choices=["sample", "show", "queue",
