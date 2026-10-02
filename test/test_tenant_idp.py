@@ -774,6 +774,66 @@ r = c.post("/auth/logout", headers={"Host": f"hbvp.{HOST}"})
 ok("ohne Sitzung bleibt es beim alten Weg",
    r.headers.get("Location") == "/auth/login", r.headers.get("Location"))
 
+
+print("\nDie Anmeldung von der Adresse einer INSTANZ aus (Joergs Befund 2026-10-02)")
+# Wer eine Instanz-Adresse oeffnet und keine Sitzung hat, wurde bisher auf die
+# Anmeldeseite der PLATTFORM geschickt -- ein Formular fuer Plattform-Benutzer,
+# auch wenn der Mandant der Instanz einen eigenen Anmeldedienst hat und der
+# Mensch gar kein Plattform-Benutzer ist. Jetzt: gleich zum Anbieter (der
+# Realm kennt nur die Adresse des Mandanten-ORTES, dort wird gestartet), und
+# danach zurueck an die Adresse der Instanz.
+FWD = {"X-Forwarded-Proto": "https"}
+r = c.get("/verify?roles=user&tenant=" + hbvp,
+          headers={"Host": f"app.hbvp.{HOST}", "X-Forwarded-Uri": "/liste?x=1", **FWD})
+ok("das Gateway-Urteil gibt den Mandanten der Instanz an die Anmeldeseite weiter",
+   r.status_code == 303 and "tenant=" + hbvp in r.headers.get("Location", "")
+   and "next=%2Fliste%3Fx%3D1" in r.headers.get("Location", ""), r.headers.get("Location"))
+r = c.get("/auth/login?next=%2Fliste&tenant=" + hbvp,
+          headers={"Host": f"app.hbvp.{HOST}", **FWD})
+loc = r.headers.get("Location", "")
+ok("Instanz mit Anbieter: die Anmeldeseite leitet GLEICH zum Anbieter-Start am Ort des Mandanten",
+   r.status_code == 303 and loc.startswith(f"https://hbvp.{HOST}/auth/oidc/start?"), (r.status_code, loc))
+ok("... mit Rueckkehr an die Instanz-Adresse und dem Ziel",
+   f"back=app.hbvp.{HOST}" in loc and "next=%2Fliste" in loc, loc)
+r = c.get("/auth/login?tenant=" + hbvp, headers={"Host": f"app.{HOST}", **FWD})
+ok("auch bei einer Instanz-Adresse ohne Mandanten-Teil (<instanz>.<knoten>)",
+   r.status_code == 303 and r.headers.get("Location", "").startswith(f"https://hbvp.{HOST}/auth/oidc/start"),
+   (r.status_code, r.headers.get("Location")))
+for label, host, query in (
+        ("am Ort des Mandanten selbst (dort gehoert die Plattform-Anmeldung hin)", f"hbvp.{HOST}", "?tenant=" + hbvp),
+        ("Instanz eines Mandanten OHNE Anbieter", f"app.cls.{HOST}", "?tenant=" + cls_id),
+        ("Instanz des Standard-Mandanten ohne Anbieter", f"app.{HOST}", "?tenant=" + default_id),
+        ("ein unbekannter Mandant im Parameter", f"app.{HOST}", "?tenant=gibt-es-nicht"),
+        ("ohne Mandant im Parameter", f"app.{HOST}", ""),
+        ("ein LAN-Name (kein externer Name)", "10.10.10.96", "?tenant=" + hbvp)):
+    r = c.get("/auth/login" + query, headers={"Host": host, **FWD})
+    ok(f"keine Weiterleitung: {label}", r.status_code == 200, (r.status_code, r.headers.get("Location")))
+r = c.get("/auth/login?tenant=" + hbvp, headers={"Host": HOST, **FWD})
+ok("an der Wurzel (dem Ort des Standard-Mandanten) bleibt die Seite", r.status_code == 200, r.status_code)
+
+# Zurueck an die Instanz -- aber nur dorthin, wo die Sitzung auch gilt.
+def finish(back, nxt="/liste"):
+    r1 = c.get(f"/auth/oidc/start?next={nxt}&back={back}", headers={"Host": f"hbvp.{HOST}", **FWD})
+    pr = dict(p.split("=", 1) for p in r1.headers["Location"].split("?", 1)[1].split("&"))
+    CLAIMS.clear()
+    CLAIMS.update({"iss": ISSUER, "aud": "oaap-node", "sub": "S-BACK", "nonce": unquote(pr["nonce"]),
+                   "exp": int(time.time()) + 300, "preferred_username": "rueck", "email": "r@example.org",
+                   "email_verified": True, "name": "Rita Rueck"})
+    return c.get(f"/auth/oidc/callback?code=X&state={pr['state']}", headers={"Host": f"hbvp.{HOST}", **FWD})
+
+
+r = finish(f"app.hbvp.{HOST}")
+ok("nach der Anmeldung geht es an die Instanz-Adresse zurueck, mit dem Ziel",
+   r.status_code == 303 and r.headers.get("Location") == f"https://app.hbvp.{HOST}/liste",
+   (r.status_code, r.headers.get("Location")))
+r = finish("boese.example.com")
+ok("Koeder: eine fremde Adresse als Rueckkehr wird NICHT angesprungen (nur lokal)",
+   r.status_code == 303 and r.headers.get("Location") == "/liste", r.headers.get("Location"))
+r = finish(f"boese.example.com.{HOST}.evil.org")
+ok("... auch keine, die nur WIE die eigene aussieht", r.headers.get("Location") == "/liste", r.headers.get("Location"))
+r = finish(f"hbvp.{HOST}")
+ok("Rueckkehr an den Ort selbst: ein lokaler Pfad", r.headers.get("Location") == "/liste", r.headers.get("Location"))
+
 srv.shutdown()
 
 # ---------------------------------------------------------------------------

@@ -1952,8 +1952,17 @@ FACE_BODY = """
 </div>
 
 <div class="card">
+  <h2>Vorschau</h2>
+  <p class="muted">Zeigt, was Du gerade eingibst &mdash; <strong>ohne zu
+     speichern</strong>. Gerechnet wird auf dem Server mit derselben
+     Rechnung wie auf der Seite selbst (Lesbarkeit der Schrift, Abdunkeln
+     von Text); ein Nachbau im Browser w&uuml;rde etwas anderes zeigen.</p>
+  <div id="face-preview">{{ preview|safe }}</div>
+</div>
+
+<div class="card">
   <h2>Aendern</h2>
-  <form method="post" action="/tenant/face" enctype="multipart/form-data">
+  <form id="face-form" method="post" action="/tenant/face" enctype="multipart/form-data">
     {% if label_param %}<input type="hidden" name="tenant" value="{{ t.label }}">{% endif %}
     <div class="cfgfield">
       <label for="f-title">Oeffentlicher Titel</label>
@@ -1970,6 +1979,10 @@ FACE_BODY = """
       <input id="f-primary" type="text" name="color_primary"
              pattern="#[0-9a-fA-F]{6}" placeholder="#1f4e79"
              value="{{ theme.color_primary or '' }}" autocomplete="off">
+      <input id="p-primary" class="pick" type="color" hidden
+             value="{{ theme.color_primary or plat_primary }}"
+             aria-label="Hauptfarbe wählen">
+      <button type="button" class="reset" data-for="primary" hidden>Zurücksetzen</button>
     </div>
     <div class="cfgfield">
       <label for="f-accent">Akzentfarbe</label>
@@ -1978,6 +1991,10 @@ FACE_BODY = """
       <input id="f-accent" type="text" name="color_accent"
              pattern="#[0-9a-fA-F]{6}" placeholder="#e07b00"
              value="{{ theme.color_accent or '' }}" autocomplete="off">
+      <input id="p-accent" class="pick" type="color" hidden
+             value="{{ theme.color_accent or plat_accent }}"
+             aria-label="Akzentfarbe wählen">
+      <button type="button" class="reset" data-for="accent" hidden>Zurücksetzen</button>
     </div>
     <div class="cfgfield">
       <label for="f-logo">Logo</label>
@@ -2001,6 +2018,95 @@ FACE_BODY = """
     </div>
   </form>
 </div>
+<style>
+  .facepv{border:1px solid var(--oaap-border);border-radius:.5rem;overflow:hidden;
+          max-width:34rem;background:#fff}
+  .facepv .pvhead{display:flex;align-items:center;gap:.6rem;padding:.6rem .9rem;
+          background:var(--oaap-blue-900);color:var(--oaap-header-text)}
+  .facepv .pvmark{display:inline-flex;align-items:center;min-width:1.4rem}
+  .facepv .pvmark img{max-height:1.8rem;max-width:6rem}
+  .facepv .pvaddr{margin-left:auto;font-size:.8rem;opacity:.8}
+  .facepv .pvbody{padding:.8rem .9rem}
+  .facepv .pvtext{color:var(--oaap-ink);margin:0 0 .6rem}
+  .facepv .pvbtn{display:inline-block;padding:.35rem .8rem;border-radius:.3rem;
+          background:var(--oaap-blue-600);color:var(--oaap-accent-text)}
+  .facepv .pvpale{display:inline-block;margin-left:.6rem;padding:.2rem .5rem;
+          border-radius:.3rem;background:var(--oaap-blue-100);color:var(--oaap-blue-700)}
+  .cfgfield .pick{width:2.6rem;height:2rem;padding:0;vertical-align:middle;margin-left:.4rem}
+  .cfgfield .reset{margin-left:.4rem}
+</style>
+<script>
+(function () {
+  var form = document.getElementById("face-form"),
+      box = document.getElementById("face-preview");
+  if (!form || !box || !window.fetch) { return; }
+  var logoUrl = null, timer = null;
+  var HEX = /^#[0-9a-fA-F]{6}$/;
+  function field(id) { return document.getElementById(id); }
+  var pairs = [["primary", "{{ plat_primary }}"], ["accent", "{{ plat_accent }}"]];
+  function go() {
+    var q = new URLSearchParams({
+      title: field("f-title").value,
+      color_primary: field("f-primary").value,
+      color_accent: field("f-accent").value
+    });
+    var t = form.querySelector('input[name="tenant"]');
+    if (t) { q.set("tenant", t.value); }
+    var c = form.querySelector('input[name="clear_logo"]');
+    if (c && c.checked) { q.set("clear_logo", "1"); }
+    fetch("/tenant/face/preview?" + q.toString(), {credentials: "same-origin"})
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (h) {
+        if (h === null) { return; }
+        box.innerHTML = h;
+        if (logoUrl) {
+          var m = box.querySelector(".pvmark");
+          if (m) { m.innerHTML = ""; var i = new Image(); i.src = logoUrl; i.alt = ""; m.appendChild(i); }
+        }
+      });
+  }
+  function soon() { clearTimeout(timer); timer = setTimeout(go, 150); }
+  pairs.forEach(function (p) {
+    var text = field("f-" + p[0]), pick = field("p-" + p[0]);
+    pick.hidden = false;
+    form.querySelector('.reset[data-for="' + p[0] + '"]').hidden = false;
+    pick.addEventListener("input", function () { text.value = pick.value; soon(); });
+    text.addEventListener("input", function () {
+      if (HEX.test(text.value)) { pick.value = text.value.toLowerCase(); }
+      soon();
+    });
+    form.querySelector('.reset[data-for="' + p[0] + '"]').addEventListener("click", function () {
+      text.value = ""; pick.value = p[1]; soon();
+    });
+  });
+  field("f-title").addEventListener("input", soon);
+  field("f-logo").addEventListener("change", function () {
+    if (logoUrl) { URL.revokeObjectURL(logoUrl); logoUrl = null; }
+    var f = this.files && this.files[0];
+    if (f) { logoUrl = URL.createObjectURL(f); }
+    soon();
+  });
+  var cl = form.querySelector('input[name="clear_logo"]');
+  if (cl) { cl.addEventListener("change", soon); }
+})();
+</script>
+"""
+
+# The fragment the preview asks for -- the same variables the real pages
+# use (place.theme_inline), put on one element.
+FACE_PREVIEW = """
+<div class="facepv" style="{{ inline }}">
+  <div class="pvhead">
+    <span class="pvmark">{% if logo_url %}<img src="{{ logo_url }}" alt="">{% else %}&#9670;{% endif %}</span>
+    <strong>{{ title }}</strong>
+    <span class="pvaddr">{{ address }}</span>
+  </div>
+  <div class="pvbody">
+    <p class="pvtext">So liest sich ein Absatz auf der Seite dieses Mandanten.</p>
+    <span class="pvbtn">Schaltfläche</span><span class="pvpale">Hervorhebung</span>
+  </div>
+</div>
+{% if problem %}<p class="err" style="margin:.5rem 0 0">{{ problem }}</p>{% endif %}
 """
 
 INSTANCES_LIST_BODY = """
@@ -4792,7 +4898,7 @@ FACE_WAIT_SECONDS = 20     # a small JSON file, one small picture, no docker
 
 
 def _face_target():
-    """(tenant_id, tenant_record, named_explicitly) or a refusal redirect.
+    """(tenant_id, tenant_record, None) or (None, None, refusal redirect).
 
     A tenant_admin dresses their OWN place and may not name another;
     only a server_admin may, and then it has to be a tenant this node
@@ -4821,7 +4927,11 @@ def _face_target():
             "/tenant?err=1&msg=" + quote(
                 "Der Standard-Mandant ist dieser Knoten selbst — sein "
                 "Gesicht IST das der Plattform."), code=303)
-    return tid, t, bool(want)
+    # The third item is the REFUSAL slot both callers test (`if refusal:
+    # return refusal`); it used to carry "was a tenant named", which is true
+    # exactly when a server_admin names one -- and the route then returned
+    # True instead of a page.
+    return tid, t, None
 
 
 @app.get("/tenant/face")
@@ -4839,6 +4949,9 @@ def tenant_face_form():
     return page(FACE_BODY, "Gesicht", "tenant",
                 t={"label": t.get("label", "?"), "name": t.get("name") or ""},
                 face=face, theme=theme,
+                plat_primary=place.PLATFORM_PRIMARY,
+                plat_accent=place.PLATFORM_ACCENT,
+                preview=_face_preview(t, {}, host),
                 set_primary=bool(theme.get("color_primary")),
                 set_accent=bool(theme.get("color_accent")),
                 address=f"{t.get('label', '')}.{host}" if host else "",
@@ -4846,6 +4959,54 @@ def tenant_face_form():
                 label_param=bool(request.args.get("tenant")),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
+
+
+def _face_preview(t, given, host):
+    """The preview fragment for a tenant and what is being typed.
+
+    `given` holds only what the form has now (title, two colours, whether
+    the logo is to go); nothing is read from the request here and nothing
+    is written anywhere. A value that would be refused on saving is shown
+    with the platform's own value and the refusal beside it.
+    """
+    saved = dict(t.get("theme") or {})
+    if given:
+        problem = place.theme_refusal(given.get("title", ""),
+                                      given.get("color_primary", ""),
+                                      given.get("color_accent", ""))
+        saved["title"] = given.get("title", "")
+        saved["color_primary"] = given.get("color_primary", "")
+        saved["color_accent"] = given.get("color_accent", "")
+        if given.get("clear_logo"):
+            saved.pop("logo", None)
+            saved.pop("logo_type", None)
+    else:
+        problem = ""
+    face = place.theme_of(dict(t, theme=saved), t.get("label", ""), host)
+    return render_template_string(
+        FACE_PREVIEW, inline=place.theme_inline(face), title=face["title"],
+        address=face["address"], logo_url=face["logo_url"], problem=problem)
+
+
+@app.get("/tenant/face/preview")
+def tenant_face_preview():
+    """What the form would look like if it were saved. Changes nothing.
+
+    The same rights as saving: `require_user_admin` and `_face_target`,
+    so a tenant administrator never gets a look at another tenant's
+    face by naming it.
+    """
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, t, refusal = _face_target()
+    if refusal:
+        return refusal
+    given = {"title": request.args.get("title", ""),
+             "color_primary": request.args.get("color_primary", ""),
+             "color_accent": request.args.get("color_accent", ""),
+             "clear_logo": bool(request.args.get("clear_logo"))}
+    return _face_preview(t, given, external_host())
 
 
 @app.post("/tenant/face")
@@ -4871,10 +5032,17 @@ def tenant_face_post():
                         + ("" if ok else "&err=1"), code=303)
 
     rid = _uuid.uuid4().hex
-    payload = {"action": "tenant-face", "tenant": tid,
+    payload = {"action": "tenant-face",
                "title": request.form.get("title", ""),
                "color_primary": request.form.get("color_primary", ""),
                "color_accent": request.form.get("color_accent", "")}
+    if request.form.get("tenant"):
+        # Only a tenant the caller NAMED travels in the request (a
+        # server_admin choosing one). Otherwise the worker takes the
+        # tenant from the caller's own account, as every other action
+        # does -- sending one's own tenant every time made a
+        # tenant_admin look like somebody naming a stranger (I-32).
+        payload["tenant"] = tid
     if request.form.get("clear_logo"):
         payload["clear_logo"] = True
     upload = request.files.get("logo")

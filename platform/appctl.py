@@ -18764,7 +18764,11 @@ def cmd_process_deploys(_args):
             except OSError:
                 pass
             if not ok:
-                audit_tenant("tenant.face", tid or ensure_default_tenant(),
+                # In the REQUESTER's tenant, so that the administrator
+                # who was refused finds the entry (I-32); the default
+                # tenant only when the requester has none.
+                audit_tenant("tenant.face", audit_tenant_id
+                             or ensure_default_tenant(),
                              name, "denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
         elif action == "source":

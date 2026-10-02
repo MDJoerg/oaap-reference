@@ -203,7 +203,9 @@ def face_target(role, own_tenant, wanted=""):
     if role not in ("server_admin", "tenant_admin"):
         return "", ("changing a tenant's face requires tenant_admin or "
                     "server_admin (oaap.core.tenant 2.3)")
-    if wanted and role != "server_admin":
+    if wanted and role != "server_admin" and wanted != own_tenant:
+        # naming one's OWN tenant is not naming another (I-32: the portal
+        # used to send it every time, and was refused for it)
         return "", "a tenant administers only its own place"
     tid = wanted if (role == "server_admin" and wanted) else (own_tenant or "")
     if not tid:
@@ -352,9 +354,20 @@ def theme_style(theme):
     """
     if not theme or not theme.get("themed"):
         return ""
+    return "<style>:root{" + theme_inline(theme) + "}</style>"
+
+
+def theme_inline(theme):
+    """The variable assignments of `theme_style`, without the wrapper.
+
+    The preview in the portal puts these on ONE element
+    (`style="..."`), so a colour the tenant has only typed -- not saved --
+    is shown through exactly the arithmetic the real page uses. A second
+    version of it in JavaScript would show something else the day one of
+    the two changed (I-31).
+    """
     v = theme_vars(theme)
     return (
-        "<style>:root{"
         f"--oaap-blue-900:{v['header_bg']};"
         f"--oaap-blue-950:{v['header_bg_deep']};"
         f"--oaap-header-text:{v['header_text']};"
@@ -363,7 +376,6 @@ def theme_style(theme):
         f"--oaap-blue-100:{v['accent_pale']};"
         f"--oaap-accent-text:{v['accent_text']};"
         f"--oaap-ink:{v['ink']};"
-        "}</style>"
     )
 
 

@@ -769,9 +769,87 @@ def login_redirect():
     where they were going (RFC-0040 §5).
     """
     target = _return_target(_requested_uri())
-    if not target or target == "/":
-        return redirect("/auth/login", code=303)
-    return redirect("/auth/login?next=" + quote(target, safe=""), code=303)
+    query = []
+    if target and target != "/":
+        query.append("next=" + quote(target, safe=""))
+    # On the gateway's call the instance's tenant is a parameter (it is
+    # what /verify checks the session against). Passing it on is what lets
+    # the login page know WHOSE instance the visitor was going to -- the
+    # host alone cannot say: `<instance>.<node>` names no tenant.
+    tenant = request.args.get("tenant", "") if request.path == "/verify" else ""
+    if tenant:
+        query.append("tenant=" + quote(tenant, safe=""))
+    return redirect("/auth/login" + ("?" + "&".join(query) if query else ""),
+                    code=303)
+
+
+def _forwarded_scheme():
+    return (request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+            or request.scheme)
+
+
+def _forwarded_host():
+    return (request.headers.get("X-Forwarded-Host", "").split(",")[0].strip()
+            or request.host).split(":")[0].lower()
+
+
+def _return_host(raw):
+    """A host the visitor may be sent back to after a login elsewhere, or "".
+
+    Only this node's own external name and the names under it -- the very
+    set the session cookie is valid for (DomainAwareSessionInterface), so
+    a login completed at the tenant's place is also a login at the
+    instance. Anything else would be an open redirect after sign-in,
+    where a phishing page does its best work.
+    """
+    ext = _external_host()
+    h = str(raw or "").strip().lower()
+    if not ext or not h or not re.fullmatch(r"[a-z0-9.-]{1,253}", h):
+        return ""
+    return h if (h == ext or h.endswith("." + ext)) else ""
+
+
+def login_handoff(target):
+    """Where this login belongs, if not here: an absolute URL, or "".
+
+    A visitor who opens an INSTANCE's address and has no session is sent
+    here by the gateway. If the instance's tenant has its own identity
+    provider, the platform's login form is the wrong first page: the
+    person is not a platform user, and the form is a dead end (RFC-0041).
+    The way in is the provider -- but the realm accepts the return
+    address of the tenant's PLACE only (`<label>.<node>`, or the node's
+    own name for the default tenant), so the sign-in is started there and
+    the visitor comes back to the instance's address. The session cookie
+    covers both (same external domain).
+
+    Empty -- keep the page as it is -- when this host IS a place already
+    (the form, with the provider button and the platform login, belongs
+    there), when there is no external name, when the host is not under
+    it (a LAN name), or when the tenant has no working provider.
+    """
+    ext = _external_host()
+    host = _forwarded_host()
+    if not ext or not host.endswith("." + ext):
+        return ""
+    tenants = known_tenants()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    dflt = default_tenant_id()
+    tid_here, _resolved = place.host_place(host, ext, tenants, dflt, now)
+    if tid_here is not None:
+        return ""
+    ref = (request.args.get("tenant") or "").strip()
+    if ref not in tenants:
+        return ""
+    provider, secret = tenant_provider(ref)
+    if not provider or not secret:
+        return ""
+    label = (tenants[ref].get("label") or "").strip().lower()
+    place_host = ext if ref == dflt else f"{label}.{ext}"
+    if place_host == host or not label:
+        return ""
+    return (f"{_forwarded_scheme()}://{place_host}/auth/oidc/start?"
+            + urlencode({"next": target, "back": host} if target
+                        else {"back": host}))
 
 
 def other_active_server_admin_exists(users, username):
@@ -1554,6 +1632,9 @@ def verify():
 
 @app.get("/auth/login")
 def login_form():
+    away = login_handoff(_return_target(request.args.get("next", "")))
+    if away:
+        return redirect(away, code=303)
     return render_template_string(
         LOGIN_PAGE, error=None, has_users=bool(load_users()),
         provider=login_provider_label(),
@@ -1802,6 +1883,7 @@ def oidc_start():
     session["oidc"] = {"state": state, "nonce": nonce, "verifier": verifier,
                        "tenant": tid, "issuer": provider["issuer"],
                        "redirect_uri": redirect_uri,
+                       "back": _return_host(request.args.get("back", "")),
                        "next": _return_target(request.args.get("next", ""))}
     query = urlencode({"response_type": "code", "scope": "openid profile email",
                        "client_id": provider["client_id"],
@@ -1904,7 +1986,13 @@ def oidc_callback():
     if raw_token and len(raw_token) <= IDP_HINT_MAX:
         session["idp_out"]["hint"] = raw_token
     print(f"idp login ok: {user['username']} from {_client_ip()}", flush=True)
-    return redirect(_return_target(started.get("next", "")) or "/", code=303)
+    path = _return_target(started.get("next", "")) or "/"
+    back = _return_host(started.get("back", ""))
+    if back and back != _forwarded_host():
+        # Started from an instance's address, finished at the tenant's
+        # place: the cookie is already valid under the whole domain.
+        return redirect(f"{_forwarded_scheme()}://{back}{path}", code=303)
+    return redirect(path, code=303)
 
 
 def _idp_principal(tid, provider, claims):
