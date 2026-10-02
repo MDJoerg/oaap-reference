@@ -50,6 +50,10 @@ if os.path.isfile(os.path.join(_SIBLING, "place.py")):
     sys.path.insert(0, _SIBLING)
 import place  # noqa: E402
 import idp  # noqa: E402
+# Who may touch which MQTT topic (RFC-0054 stage 2): the pure rules
+# behind /mqtt-auth/aclcheck. In services/ beside place.py and idp.py (the
+# image is built from there), so a test can reach them without Flask.
+import mqtt_acl  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -142,6 +146,19 @@ KEY_DEFAULT_DAYS, KEY_MAX_DAYS = 90, 365
 # at issue, and filtered again at use, because a role can be added to a
 # principal after its key was written.
 KEY_FORBIDDEN_ROLES = frozenset({"server_admin"})
+# RFC-0054: two kinds of key that belong to the OPERATOR, not to a tenant
+# and not to a person -- a node key and an operator key. They exist for
+# the MQTT broker and for nothing else: `_by_key` refuses them on every
+# HTTP path (no principal, no roles, no session), `/mqtt-auth/getuser`
+# is the only door that accepts them.
+BROKER_KINDS = mqtt_acl.BROKER_KINDS
+# The root of the metrics branch (RFC-0052 2): nobody but the matching
+# node key writes under it. A setting of the node that carries the
+# broker; an invalid value falls back to the default rather than to
+# "no protection".
+METRICS_ROOT = (os.environ.get("OAAP_METRICS_ROOT") or "").strip()
+if not mqtt_acl.valid_root(METRICS_ROOT):
+    METRICS_ROOT = mqtt_acl.DEFAULT_ROOT
 # RFC-0028: a terminal session. A browser cannot put an Authorization
 # header on an ordinary navigation, so a kiosk cannot present a key the
 # way a script does -- it needs a cookie. Enrolment exchanges the key
@@ -827,6 +844,7 @@ def load_keys():
         k.setdefault("revoked", False)
         k.setdefault("last_used", "")
         k.setdefault("terminal", False)
+        k.setdefault("kind", "tenant")
     return keys
 
 
@@ -843,7 +861,12 @@ def public_key(k):
             "last_used": k.get("last_used", ""),
             "created_by": k.get("created_by", ""),
             "terminal": bool(k.get("terminal")),
-            "revoked": bool(k.get("revoked"))}
+            "revoked": bool(k.get("revoked")),
+            # RFC-0054: nothing secret here -- the node name and the
+            # grants are what the operator needs to see to know what a
+            # key may do.
+            "kind": k.get("kind") or "tenant", "node": k.get("node", ""),
+            "grants": k.get("grants") or []}
 
 
 def issue_key(users, principal, roles, instance, label, days, created_by,
@@ -902,6 +925,63 @@ def issue_key(users, principal, roles, instance, label, days, created_by,
     return rec, f"oaapk_{kid}_{secret}"
 
 
+def issue_broker_key(kind, name, node, grants, label, days, created_by):
+    """Mint a node key or an operator key (RFC-0054). Returns (record,
+    secret); the secret is shown once, like every key's.
+
+    These belong to no tenant and to no person: there is no principal to
+    look up, no role to hold. `principal` carries `<kind>:<name>` only so
+    that lists and the audit log can name the key -- a colon no username
+    can contain, so it can never be mistaken for one.
+    """
+    if kind not in BROKER_KINDS:
+        raise ValueError("kind: node or operator")
+    name = (name or "").strip()
+    if not mqtt_acl.NAME_RE.match(name):
+        raise ValueError("name: 2-40 characters, lower-case letters, "
+                         "digits, '.', '_', '-'")
+    rec_node, rec_grants = "", []
+    if kind == "node":
+        node = (node or "").strip()
+        if not mqtt_acl.NODE_RE.match(node):
+            raise ValueError("node: the node's name on the wire, 2-40 "
+                             "characters, lower-case letters, digits, '-'")
+        if grants:
+            raise ValueError("a node key has no grants of its own: it may "
+                             f"publish under {METRICS_ROOT}/{node}/ and "
+                             "nothing else")
+        rec_node = node
+    else:
+        if node:
+            raise ValueError("--node belongs to a node key")
+        rec_grants = mqtt_acl.parse_grants(grants)
+    if days is None or days == "":
+        days = KEY_DEFAULT_DAYS
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        raise ValueError("Gueltigkeit in Tagen muss eine Zahl sein.")
+    if not 1 <= days <= KEY_MAX_DAYS:
+        raise ValueError(f"Gueltigkeit: 1 bis {KEY_MAX_DAYS} Tage "
+                         "(RFC-0027 D3 -- 'nie' gibt es nicht).")
+    keys = load_keys()
+    while True:
+        kid = secrets.token_hex(4)
+        if not any(k["id"] == kid for k in keys):
+            break
+    secret = secrets.token_urlsafe(32)
+    rec = {"id": kid, "principal": f"{kind}:{name}", "tenant": "",
+           "roles": [], "instance": "", "label": (label or "").strip(),
+           "kind": kind, "node": rec_node, "grants": rec_grants,
+           "hash": generate_password_hash(secret),
+           "created": _now_iso(), "expires": _in_days_iso(days),
+           "last_used": "", "created_by": created_by, "revoked": False,
+           "terminal": False}
+    keys.append(rec)
+    _save(KEYS_FILE, keys)
+    return rec, f"oaapk_{kid}_{secret}"
+
+
 def revoke_key(kid):
     """Immediate, by the same reasoning that produced session_epoch: a
     credential you cannot withdraw within seconds is one you do not
@@ -946,8 +1026,14 @@ def _key_refusal(code, detail, status=401):
                                  + '", error_description="' + detail + '"'})
 
 
-def _by_key(token, instance):
-    """Method `key` (RFC-0027 3.2): which principal is this bearer?"""
+def _by_key(token, instance, mqtt=False):
+    """Method `key` (RFC-0027 3.2): which principal is this bearer?
+
+    `mqtt=True` only from the broker's login check. A node key or an
+    operator key (RFC-0054) is valid THERE and nowhere else: on every
+    HTTP path it is refused like a key limited to another instance, so
+    that a credential made for a broker can never open a page.
+    """
     m = KEY_TOKEN_RE.fullmatch(token)
     if not m:
         return None, "key", _key_refusal("invalid_token",
@@ -971,6 +1057,16 @@ def _by_key(token, instance):
     if rec.get("expires") and rec["expires"] <= _now_iso():
         return None, "key", _key_refusal(
             "invalid_token", "the key expired on " + rec["expires"][:10])
+    if rec.get("kind") in BROKER_KINDS:
+        if not mqtt:
+            return None, "key", _key_refusal(
+                "insufficient_scope",
+                "this key is for the MQTT broker only", 403)
+        for b in brakes:
+            _login_succeeded(b)
+        _touch_key(kid)
+        return ({"username": rec["principal"], "roles": [],
+                 "kind": rec["kind"]}, "key", None)
     # Instance scoping (RFC-0027 D5). Fail CLOSED where the gateway did
     # not say which instance this is: a site generated before this
     # version passes no `instance`, and a scoped key must refuse there
@@ -2415,7 +2511,7 @@ def mqtt_auth_getuser():
     m = KEY_TOKEN_RE.fullmatch(token)
     if not m or body.get("username", "") != m.group(1):
         return {"Ok": False, "Error": "invalid credentials"}, 200
-    user, _method, err = _by_key(token, instance=None)
+    user, _method, err = _by_key(token, instance=None, mqtt=True)
     if err or not user:
         return {"Ok": False, "Error": "invalid credentials"}, 200
     return {"Ok": True, "Error": ""}, 200
@@ -2445,9 +2541,12 @@ def mqtt_auth_aclcheck():
                 if k["id"] == kid and not k["revoked"]), None)
     if not rec:
         return {"Ok": False, "Error": "unknown key"}, 200
-    if _topic_allowed(body.get("topic", ""), rec.get("tenant", "")):
-        return {"Ok": True, "Error": ""}, 200
-    return {"Ok": False, "Error": "topic outside this principal's tenant"}, 200
+    if rec.get("expires") and rec["expires"] <= _now_iso():
+        return {"Ok": False, "Error": "the key expired"}, 200
+    allowed, why = mqtt_acl.decide(rec, body.get("topic", ""),
+                                   body.get("acc"), METRICS_ROOT,
+                                   _topic_allowed)
+    return {"Ok": allowed, "Error": "" if allowed else why}, 200
 
 
 @app.get("/internal/status")
@@ -2657,6 +2756,10 @@ def _key_visible(role, actor_tenant, actor_name, k):
     """
     if role == "server_admin":
         return True
+    if k.get("kind") in BROKER_KINDS:
+        # RFC-0054: a node key or an operator key belongs to the
+        # operator. No tenant sees it, whatever tenant "" resolves to.
+        return False
     if role == "tenant_admin":
         return resolve_tenant(k.get("tenant")) == actor_tenant
     return k.get("principal") == actor_name

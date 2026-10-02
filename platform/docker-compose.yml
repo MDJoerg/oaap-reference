@@ -89,6 +89,10 @@ services:
       # principal 'oaap.relay'). Held by identity and 'relay' only --
       # never by the broker, which only asks identity, nor by 'twin'.
       BROKER_RELAY_KEY: "${BROKER_RELAY_KEY:-}"
+      # The root of the metrics branch (RFC-0052 2, RFC-0054 6): nobody
+      # but the matching node key writes under it. Unset means the
+      # default, 'oaap-node'.
+      OAAP_METRICS_ROOT: "${OAAP_METRICS_ROOT:-}"
     volumes:
       - "${OAAP_DATA_DIR}/data/identity:/data"
       # read-only: external.json — the session cookie must span the

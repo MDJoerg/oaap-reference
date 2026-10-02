@@ -13090,9 +13090,15 @@ def _identity_exec(script, env=None):
 
 def _key_row(k):
     scope = k.get("instance") or "all instances"
+    roles = ",".join(k["roles"])
+    if k.get("kind") in ("node", "operator"):
+        # RFC-0054: made for the MQTT broker, no roles, no instance.
+        roles = "(MQTT broker)"
+        scope = (f"node {k.get('node')}" if k["kind"] == "node"
+                 else f"{len(k.get('grants') or [])} grant(s)")
     used = (k.get("last_used") or "")[:10] or "never used"
     state = "REVOKED" if k.get("revoked") else f"until {k['expires'][:10]}"
-    return (f"{k['id']:<10} {k['principal']:<22} {','.join(k['roles']):<24} "
+    return (f"{k['id']:<10} {k['principal']:<22} {roles:<24} "
             f"{scope:<20} {state:<18} {used}")
 
 
@@ -13167,6 +13173,67 @@ def cmd_machine(args):
     print(f"  sudo oaap key issue {name}")
 
 
+def _key_issue_broker(args):
+    """`oaap key issue NAME --kind node --node N` / `--kind operator
+    --grant 'home/#:readwrite'` (RFC-0054). For the MQTT broker only."""
+    if not args.name:
+        die("'key issue --kind ...' needs a name for the key, e.g. "
+            "'oaap key issue oaapx02 --kind node --node oaapx02'")
+    grants = []
+    for g in args.grant or []:
+        f, sep, a = g.rpartition(":")
+        if not sep:
+            die(f"--grant FILTER:ACCESS (read, write or readwrite), "
+                f"not {g!r}")
+        grants.append({"filter": f, "access": a})
+    days = args.days if args.days != 90 or args.kind == "tenant" else 365
+    out = _identity_exec(
+        "import json, os, sys, app as m\n"
+        "try:\n"
+        "    rec, secret = m.issue_broker_key(os.environ['OAAP_K_KIND'],\n"
+        "        os.environ['OAAP_K_NAME'], os.environ['OAAP_K_NODE'],\n"
+        "        json.loads(os.environ['OAAP_K_GRANTS']),\n"
+        "        os.environ['OAAP_K_LABEL'], int(os.environ['OAAP_K_DAYS']),\n"
+        "        'root')\n"
+        "except ValueError as e:\n"
+        "    print(str(e), file=sys.stderr); sys.exit(1)\n"
+        "print(json.dumps({'key': m.public_key(rec), 'secret': secret,\n"
+        "                  'root': m.METRICS_ROOT}))\n",
+        {"OAAP_K_KIND": args.kind, "OAAP_K_NAME": args.name,
+         "OAAP_K_NODE": args.node or "",
+         "OAAP_K_GRANTS": json.dumps(grants),
+         "OAAP_K_LABEL": args.label or "", "OAAP_K_DAYS": str(days)})
+    res = json.loads(out)
+    rec, secret = res["key"], res["secret"]
+    audit_tenant("key.issue", "", subject=rec["principal"],
+                 detail=f"key {rec['id']}, MQTT {rec['kind']}"
+                        + (f", node {rec['node']}" if rec["node"] else "")
+                        + ("".join(f", {g['access']} {g['filter']}"
+                                   for g in rec["grants"])),
+                 who=os.environ.get("SUDO_USER") or "root")
+    print("")
+    if rec["kind"] == "node":
+        print(f"Node key {rec['id']} '{args.name}': may publish under "
+              f"{res['root']}/{rec['node']}/ and nothing else; it cannot "
+              f"subscribe. Valid until {rec['expires'][:10]}.")
+    else:
+        print(f"Operator key {rec['id']} '{args.name}', valid until "
+              f"{rec['expires'][:10]}:")
+        for g in rec["grants"]:
+            print(f"  {g['access']:<10} {g['filter']}")
+    print("It opens the MQTT broker and nothing else: no page, no API.")
+    print(f"MQTT user name:  {rec['id']}")
+    print("MQTT password:   (the key below -- shown only now)")
+    print("")
+    print(f"  {secret}")
+    print("")
+    if rec["kind"] == "node":
+        print("On the node that sends:  oaap metrics sender set --url "
+              f"mqtts://BROKER --user {rec['id']}")
+        print("                         (the key goes in on standard "
+              "input, not on the line)")
+
+
 def cmd_key(args):
     """API keys (RFC-0027). The secret is printed once and never again."""
     if args.action == "list":
@@ -13202,6 +13269,8 @@ def cmd_key(args):
         return
 
     # issue
+    if getattr(args, "kind", "tenant") in ("node", "operator"):
+        return _key_issue_broker(args)
     if not args.name:
         die("'key issue' needs a principal, e.g. 'oaap key issue terminal-3'")
     roles = sorted({r.strip() for r in (args.roles or "user").split(",")
@@ -21195,7 +21264,17 @@ def main():
                     help="limit the key to one instance (recommended)")
     pk.add_argument("--label", default="", help="what this key is for")
     pk.add_argument("--days", type=int, default=90,
-                    help="validity in days (1-365, default 90)")
+                    help="validity in days (1-365, default 90; 365 for "
+                         "--kind node/operator)")
+    pk.add_argument("--kind", choices=["tenant", "node", "operator"],
+                    default="tenant",
+                    help="'node' or 'operator' make a key for the MQTT "
+                         "broker only (RFC-0054); NAME is then just a name")
+    pk.add_argument("--node", default=None,
+                    help="for --kind node: the node's name on the wire")
+    pk.add_argument("--grant", action="append", default=None,
+                    help="for --kind operator: FILTER:ACCESS, e.g. "
+                         "'home/#:readwrite' (repeatable)")
     pk.set_defaults(fn=cmd_key)
     pu = sub.add_parser("user")
     pu.add_argument("action", choices=["list", "add", "delete", "schedule",
