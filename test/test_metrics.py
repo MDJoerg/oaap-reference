@@ -153,6 +153,62 @@ ok("die Luecke bleibt eine Luecke (nichts erfunden)", not gap, gap[:3])
 ok("`since` nennt den ersten Zeitpunkt, den es gibt",
    w["1m"]["since"] is not None and w["1m"]["since"] >= END - 31 * 86400)
 
+print("\n=== die Warteschlange nach aussen (RFC-0051 5) ===")
+q = m.queue_status(STORE)
+ok("jede Messung steht in der Warteschlange, durchnummeriert und lueckenlos",
+   q["pending"] > 0 and q["next"] == q["pending"] + 1 + q["lost"] + q["acked"],
+   q)
+pend = m.queue_pending(STORE)
+ok("die Nummern steigen um eins", all(b["q"] == a["q"] + 1 for a, b in zip(pend, pend[1:])))
+ok("die Warteschlange bleibt in ihren Grenzen (Alter und Groesse)",
+   q["bytes"] <= m.QUEUE_MAX_BYTES and all(e["t"] >= END - m.QUEUE_MAX_AGE for e in pend),
+   q)
+ok("... und was aelter als 7 Tage war, ist als verloren GEZAEHLT, nicht verschwiegen",
+   q["lost"] > 0, q)
+n0 = len(pend)
+first = pend[0]["q"]
+deleted = m.queue_ack(STORE, first + 9)
+ok("bestaetigt = geloescht: zehn Zeilen weg, Rest bleibt",
+   deleted == 10 and len(m.queue_pending(STORE)) == n0 - 10
+   and m.queue_pending(STORE)[0]["q"] == first + 10, deleted)
+ok("... und die Datei enthaelt sie auch wirklich nicht mehr",
+   first not in [e["q"] for e in m._qread(STORE)])
+ok("eine alte Bestaetigung geht nicht rueckwaerts", m.queue_ack(STORE, first) == 0
+   and m.queue_status(STORE)["acked"] == first + 9)
+lost0 = m.queue_status(STORE)["lost"]
+nxt = m.queue_status(STORE)["next"]
+dropped = m.queue_purge(STORE)
+q2 = m.queue_status(STORE)
+ok("Leeren loescht alles", q2["pending"] == 0 and dropped == n0 - 10
+   and not os.path.exists(os.path.join(STORE, m.QUEUE_FILE)), q2)
+ok("... zaehlt es als `purged`, nicht als `lost`",
+   q2["purged"] == n0 - 10 and q2["lost"] == lost0, q2)
+ok("... und die Nummerierung geht weiter (nie dieselbe Nummer zweimal)",
+   q2["next"] == nxt and q2["acked"] == nxt - 1, q2)
+proc(total + 6000, idle + 4800, 1000, 600)
+m.take_sample(STORE, DATA, now=END + 120, proc=PROC, sleep=lambda s: None)
+ok("die naechste Messung bekommt die naechste Nummer",
+   [e["q"] for e in m.queue_pending(STORE)] == [nxt])
+os.remove(os.path.join(STORE, m.QUEUE_STATE))
+m.queue_add(STORE, {"t": END + 180, "cpu": 1.0})
+ok("ein verlorener Zustand startet die Nummern nicht neu",
+   m.queue_pending(STORE)[-1]["q"] == nxt + 1, m.queue_pending(STORE))
+small = tempfile.mkdtemp(prefix="oaap-metrics-q-")
+old_max = m.QUEUE_MAX_BYTES
+m.QUEUE_MAX_BYTES = 2000
+for i in range(200):
+    m.queue_add(small, {"t": END + i * 60, "cpu": 1.0, "mem": 2.0, "disk": 3.0})
+qs = m.queue_status(small)
+ok("zu gross: die aeltesten fallen weg, die neuesten bleiben",
+   qs["bytes"] <= 2000 and qs["lost"] > 0
+   and m.queue_pending(small)[-1]["q"] == 200, qs)
+ok("... die Rechnung geht auf (wartend + verloren = gemessen)",
+   qs["pending"] + qs["lost"] == 200, qs)
+m.QUEUE_MAX_BYTES = old_max
+with open(os.path.join(small, m.QUEUE_FILE), "a") as f:
+    f.write("{kaputt\n")
+ok("eine beschaedigte Zeile macht sie nicht unlesbar", len(m.queue_pending(small)) == qs["pending"])
+
 print("\n=== was schiefgehen darf ===")
 good = len(m._read(STORE, "raw"))
 with open(m._path(STORE, "raw"), "a") as f:
@@ -208,6 +264,20 @@ ok("show nennt Fenster, Stufe und alle drei Reihen",
 ok("... mit Mittel, Minimum und Maximum", "mean" in out and "max" in out, out)
 out, code = run("show", "7d")
 ok("ein unbekanntes Fenster wird abgelehnt", code != 0, out)
+out, code = run("queue")
+ok("queue zeigt Stand, Verluste und dass noch nichts sendet",
+   code == 0 and "waiting" in out and "lost" in out and "later RFC" in out, out)
+a.METRICS_DIR = tempfile.mkdtemp(prefix="oaap-metrics-leer3-")
+m.queue_add(a.METRICS_DIR, {"t": END, "cpu": 1.0})
+a.cmd_metrics.__globals__["metrics"] = m
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    a.cmd_metrics(argparse.Namespace(action="queue-purge", window=None, yes=False))
+ok("queue-purge ohne --yes loescht nichts und sagt, was es taete",
+   m.queue_status(a.METRICS_DIR)["pending"] == 1 and "--yes" in buf.getvalue(), buf.getvalue())
+with contextlib.redirect_stdout(buf):
+    a.cmd_metrics(argparse.Namespace(action="queue-purge", window=None, yes=True))
+ok("queue-purge --yes loescht", m.queue_status(a.METRICS_DIR)["pending"] == 0)
 a.METRICS_DIR = tempfile.mkdtemp(prefix="oaap-metrics-leer2-")
 out, code = run("show")
 ok("ohne Messwerte sagt show es und bricht nicht", "No samples yet" in out, out)

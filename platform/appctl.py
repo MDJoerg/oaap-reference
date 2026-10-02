@@ -5006,7 +5006,8 @@ def _fmt_at(t):
 
 
 def cmd_metrics(args):
-    """`oaap metrics sample|show [--window 4h|24h|1w|1m]` (RFC-0051).
+    """`oaap metrics sample|show [--window 4h|24h|1w|1m]|queue|queue-purge
+    [--yes]` (RFC-0051).
 
     `sample` is the host job the minutely timer runs. It never fails the
     unit it shares with the state index: a sampler that cannot read
@@ -5020,6 +5021,26 @@ def cmd_metrics(args):
         except Exception as exc:  # noqa: BLE001 -- see the docstring
             print(f"metrics: sample skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
+        return
+    if args.action == "queue":
+        st = metrics.queue_status(METRICS_DIR)
+        print(f"Outbound queue: {st['pending']} waiting, {st['bytes']} bytes"
+              + (f", oldest {_fmt_at(st['oldest'])}" if st["oldest"] else ""))
+        print(f"  numbers: next {st['next'] or 1}, delivered up to "
+              f"{st['acked']}")
+        print(f"  lost (aged or too big, never delivered): {st['lost']}; "
+              f"purged by hand: {st['purged']}")
+        print("  Nothing sends it yet (RFC-0051, the sender is a later RFC).")
+        return
+    if args.action == "queue-purge":
+        n = metrics.queue_status(METRICS_DIR)["pending"]
+        if not args.yes:
+            print(f"This deletes the {n} queued samples that have not been "
+                  "delivered. The history shown on the health page is not "
+                  "touched. Run again with --yes to do it.")
+            return
+        metrics.queue_purge(METRICS_DIR)
+        print(f"Outbound queue emptied ({n} samples deleted).")
         return
     key = args.window or "24h"
     if key not in metrics.WINDOWS:
@@ -20975,7 +20996,10 @@ def main():
     pten.set_defaults(fn=cmd_tenant)
     pmet = sub.add_parser("metrics", help="node history of CPU, memory and "
                                           "disk (RFC-0051)")
-    pmet.add_argument("action", choices=["sample", "show"])
+    pmet.add_argument("action", choices=["sample", "show", "queue",
+                                         "queue-purge"])
+    pmet.add_argument("--yes", action="store_true",
+                      help="for 'queue-purge': really delete")
     pmet.add_argument("--window", default=None,
                       help="for 'show': 4h, 24h (default), 1w or 1m")
     pmet.set_defaults(fn=cmd_metrics)
@@ -21289,7 +21313,8 @@ def main():
                  # else that does.
                  or (args.cmd == "tenant"
                      and args.action in ("list", "show", "check", "log"))
-                 or (args.cmd == "metrics" and args.action == "show"))
+                 or (args.cmd == "metrics"
+                     and args.action in ("show", "queue")))
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:

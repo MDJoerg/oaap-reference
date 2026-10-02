@@ -54,6 +54,13 @@ TRIM_EVERY = 3600
 
 FORMAT_VERSION = 1
 
+# The outbound queue (RFC-0051 5). Bounded by age and by size: an unreachable
+# broker loses the oldest data, never the node's health.
+QUEUE_FILE = "outbox.jsonl"
+QUEUE_STATE = "outbox.json"
+QUEUE_MAX_AGE = 7 * 86400
+QUEUE_MAX_BYTES = 2_000_000
+
 
 def _tier(name):
     for t in TIERS:
@@ -273,6 +280,7 @@ def take_sample(directory, data_path, now=None, proc="/proc",
             entry[s] = round(v, 2)
     if len(entry) > 1:
         _append(directory, "raw", [entry])
+        queue_add(directory, entry)
     # The per-minute work is one appended line and one tiny state file.
     # Rolling up reads whole tier files, so it waits until an interval of
     # the first rolled tier has actually closed; trimming rewrites, so it
@@ -283,6 +291,7 @@ def take_sample(directory, data_path, now=None, proc="/proc",
         last["rolled"] = now // ROLLUP_EVERY
     if now // TRIM_EVERY != last.get("trimmed", -1):
         trim(directory, now)
+        queue_trim(directory, now)
         last["trimmed"] = now // TRIM_EVERY
     last.update({"cpu": list(cur) if cur else None, "at": now, "t": t})
     _save_last(directory, last)
@@ -350,7 +359,169 @@ def window(directory, key, now=None):
             "since": entries[0]["t"] if entries else None, "series": series}
 
 
-# --- the message (RFC-0051 3), for the queue that comes later -----------
+# --- the outbound queue (RFC-0051 5, writing only) ----------------------
+#
+# One line per sample, each with a running number `q`. The sender that
+# comes later reads from its last acknowledged number, publishes, and only
+# then calls `queue_ack` -- which is also how delivered data is deleted.
+# The state file keeps the counters that a deleted line can no longer
+# prove: the next number, the acknowledged one, and what was lost or
+# discarded. A loss is counted and shown, never hidden.
+
+def _qstate(directory):
+    try:
+        with open(os.path.join(directory, QUEUE_STATE), encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    return {k: d[k] if isinstance(d.get(k), int) and d[k] >= 0 else 0
+            for k in ("next", "acked", "lost", "purged")}
+
+
+def _qsave(directory, st):
+    os.makedirs(directory, exist_ok=True)
+    tmp = os.path.join(directory, QUEUE_STATE + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, os.path.join(directory, QUEUE_STATE))
+
+
+def _qread(directory):
+    """The queued entries, oldest first; a damaged line is skipped."""
+    out = []
+    try:
+        with open(os.path.join(directory, QUEUE_FILE), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(e, dict) and isinstance(e.get("q"), int)
+                        and isinstance(e.get("t"), int)):
+                    out.append(e)
+    except OSError:
+        return []
+    return out
+
+
+def _qwrite(directory, entries):
+    """Replace the queue file by `entries` (an empty list removes it)."""
+    path = os.path.join(directory, QUEUE_FILE)
+    if not entries:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, separators=(",", ":")) + "\n")
+    os.replace(tmp, path)
+
+
+def queue_add(directory, entry):
+    """Append one sample, numbered. Returns its number."""
+    st = _qstate(directory)
+    if not st["next"]:
+        # a lost state file must not restart the numbering under a sender
+        # that already acknowledged higher numbers
+        tail = _qread(directory)
+        st["next"] = (tail[-1]["q"] + 1) if tail else 1
+    q = st["next"]
+    st["next"] = q + 1
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, QUEUE_FILE), "a", encoding="utf-8") as f:
+        f.write(json.dumps(dict(entry, q=q), separators=(",", ":")) + "\n")
+    _qsave(directory, st)
+    try:
+        too_big = os.path.getsize(os.path.join(directory, QUEUE_FILE)) > QUEUE_MAX_BYTES
+    except OSError:
+        too_big = False
+    if too_big:
+        queue_trim(directory, entry["t"])
+    return q
+
+
+def queue_trim(directory, now):
+    """Enforce the bounds: age first, then size (down to 80 %, so the next
+    sample does not trim again). What is dropped unacknowledged is counted
+    in `lost`; what was acknowledged is simply gone."""
+    entries = _qread(directory)
+    if not entries:
+        return 0
+    st = _qstate(directory)
+    kept = [e for e in entries if e["t"] >= now - QUEUE_MAX_AGE]
+    size = sum(len(json.dumps(e, separators=(",", ":"))) + 1 for e in kept)
+    while kept and size > QUEUE_MAX_BYTES:
+        drop = max(1, len(kept) // 5)
+        size -= sum(len(json.dumps(e, separators=(",", ":"))) + 1
+                    for e in kept[:drop])
+        kept = kept[drop:]
+    dropped = len(entries) - len(kept)
+    if not dropped:
+        return 0
+    gone = entries[:dropped]
+    st["lost"] += sum(1 for e in gone if e["q"] > st["acked"])
+    _qwrite(directory, kept)
+    _qsave(directory, st)
+    return dropped
+
+
+def queue_pending(directory, limit=None):
+    """What has not been acknowledged yet, oldest first."""
+    acked = _qstate(directory)["acked"]
+    out = [e for e in _qread(directory) if e["q"] > acked]
+    return out[:limit] if limit else out
+
+
+def queue_ack(directory, upto):
+    """The sender has delivered everything up to number `upto`: advance the
+    mark and DELETE those lines. Never moves backwards. Returns how many
+    lines were deleted."""
+    st = _qstate(directory)
+    if upto <= st["acked"]:
+        return 0
+    st["acked"] = min(upto, max(st["next"] - 1, 0))
+    entries = _qread(directory)
+    kept = [e for e in entries if e["q"] > st["acked"]]
+    _qwrite(directory, kept)
+    _qsave(directory, st)
+    return len(entries) - len(kept)
+
+
+def queue_purge(directory):
+    """Delete everything in the queue, delivered or not. The numbering
+    goes on (a sender must never see a number twice); the discarded
+    lines are counted as `purged`, not as `lost`. Returns the count."""
+    entries = _qread(directory)
+    st = _qstate(directory)
+    if not st["next"] and entries:
+        st["next"] = entries[-1]["q"] + 1
+    st["purged"] += sum(1 for e in entries if e["q"] > st["acked"])
+    st["acked"] = max(st["next"] - 1, st["acked"])
+    _qwrite(directory, [])
+    _qsave(directory, st)
+    return len(entries)
+
+
+def queue_status(directory):
+    st = _qstate(directory)
+    entries = _qread(directory)
+    pend = [e for e in entries if e["q"] > st["acked"]]
+    path = os.path.join(directory, QUEUE_FILE)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    return {"pending": len(pend), "oldest": pend[0]["t"] if pend else None,
+            "bytes": size, "next": st["next"], "acked": st["acked"],
+            "lost": st["lost"], "purged": st["purged"]}
+
+
+# --- the message (RFC-0051 3), for the queue ---------------------------------
 
 def sample_lines(node, entry):
     """One message per series of a sample, in the one fixed format."""
