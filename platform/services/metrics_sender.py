@@ -40,6 +40,7 @@ BACKOFF_STEP = 60
 BACKOFF_MAX = 15 * 60
 ACK_EVERY = 200             # entries; the queue file is rewritten by an ack
 STATE_FILE = metrics.SENDER_STATE_FILE
+CA_FILE = "ca.crt"
 INFO_FILE = metrics.SENDER_INFO_FILE
 CONFIG_FILE = "sender.json"
 SECRET_FILE = "sender.secret"
@@ -174,15 +175,21 @@ def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
            "node": normalise_node(node or default_node or "node"),
            "root": validate_root(root or DEFAULT_ROOT),
            "allow_plain": bool(allow_plain)}
-    if ca:
-        if not os.path.isfile(ca):
-            raise ConfigError(f"--ca: no such file: {ca}")
-        cfg["ca"] = os.path.abspath(ca)
+    if ca and not os.path.isfile(ca):
+        raise ConfigError(f"--ca: no such file: {ca}")
     os.makedirs(cfg_dir, exist_ok=True)
     try:
         os.chmod(cfg_dir, 0o700)
     except OSError:
         pass
+    if ca:
+        # a COPY: the file the operator named may live in /tmp, which a
+        # reboot empties (measured on a Raspberry Pi, RFC-0054 stage 5)
+        keep = _path(cfg_dir, CA_FILE)
+        if not (os.path.exists(keep) and os.path.samefile(ca, keep)):
+            with open(ca, "rb") as src, open(keep, "wb") as dst:
+                dst.write(src.read())
+        cfg["ca"] = keep
     _write_private(_path(cfg_dir, SECRET_FILE), secret + "\n")
     _write_private(_path(cfg_dir, CONFIG_FILE), json.dumps(cfg, indent=2) + "\n")
     return cfg
@@ -199,6 +206,16 @@ def write_info(metrics_dir, cfg):
         json.dump({"host": host, "port": port, "node": cfg["node"],
                    "root": cfg["root"]}, f)
     os.replace(tmp, _path(metrics_dir, INFO_FILE))
+
+
+def reset_state(metrics_dir):
+    """A new target starts clean: the failures and the wait of the OLD one
+    say nothing about it (measured: a corrected key waited out the old
+    back-off)."""
+    try:
+        os.remove(_path(metrics_dir, STATE_FILE))
+    except OSError:
+        pass
 
 
 def remove_config(cfg_dir, metrics_dir):

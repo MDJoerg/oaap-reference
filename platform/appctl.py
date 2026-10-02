@@ -5051,6 +5051,7 @@ def _metrics_sender(args):
         except metrics_sender.ConfigError as exc:
             die(str(exc))
         metrics_sender.write_info(METRICS_DIR, cfg)
+        metrics_sender.reset_state(METRICS_DIR)
         print(f"Sender set: {cfg['url']} as {cfg['user']} (secret stored, "
               "not shown).")
         print(f"  Topic: {cfg['root']}/{cfg['node']}/metrics/<series>")

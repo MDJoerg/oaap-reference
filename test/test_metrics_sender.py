@@ -474,6 +474,23 @@ ok("ein Lauf stellt eine fehlende Notiz wieder her (handgemachte Konfiguration)"
 cli("remove", yes=True)
 ok("remove nimmt die Notiz mit", not os.path.exists(os.path.join(mdir, m.SENDER_INFO_FILE)))
 
+print("\n=== die CA wird kopiert, ein neues Ziel beginnt sauber (Stufe 5, am Pi gemessen) ===")
+src = os.path.join(tempfile.mkdtemp(prefix="oaap-ca-"), "ca.crt")
+open(src, "w").write("CERT")
+out, code = cli("set", "pw\n", url="mqtts://h:8883", user="u", ca=src)
+cfg2 = json.load(open(os.path.join(cdir, "sender.json")))
+ok("sender.json zeigt auf eine Kopie im Senderverzeichnis, nicht auf die Quelle",
+   cfg2["ca"] == os.path.join(cdir, "ca.crt") and cfg2["ca"] != os.path.abspath(src), cfg2)
+os.remove(src)
+ok("die Kopie ueberlebt das Loeschen der Quelle (/tmp wird beim Neustart geleert)",
+   open(cfg2["ca"]).read() == "CERT")
+out, code = cli("set", "pw\n", url="mqtts://h:8883", user="u", ca=cfg2["ca"])
+ok("erneutes Setzen mit der eigenen Kopie schlaegt nicht fehl", code == 0 and "Sender set" in out, out)
+a.metrics_sender._save_state(mdir, {"err": "alt", "fails": 3, "next_try": 9999999999})
+cli("set", "pw\n", url="mqtts://h:8883", user="u2")
+ok("ein neues Ziel loescht Fehlerzaehler und Wartezeit des alten",
+   a.metrics_sender.load_state(mdir) == {}, a.metrics_sender.load_state(mdir))
+
 print("\n=== der minuetliche Lauf ===")
 cfg_for(cdir, srv.port)
 a.metrics_sender.run = lambda *x, **k: (_ for _ in ()).throw(RuntimeError("kaputt"))
