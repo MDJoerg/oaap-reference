@@ -216,7 +216,7 @@ old_rec, old_tok = m.issue_key(m.load_users(), "sensor-1", ["user"], "", "Sensor
 nrec, ntok = m.issue_broker_key("node", "oaapx02", "oaapx02", None, "RFC-0052 sender", 365, "root")
 orec, otok = m.issue_broker_key("operator", "haus", None,
                                 [{"filter": "home/#", "access": "readwrite"},
-                                 {"filter": "oaap-node/#", "access": "readwrite"}],
+                                 {"filter": "oaap-node/#", "access": "read"}],
                                 "Smarthome", 365, "root")
 
 print("-- Ausstellen")
@@ -421,6 +421,87 @@ ok("das Image enthaelt mqtt_acl.py (sonst Neustartschleife, CURRENT_STATE 132)",
 dc = open(os.path.join(PLATFORM, "docker-compose.yml"), encoding="utf-8").read()
 ok("Compose reicht die Wurzel an identity durch",
    'OAAP_METRICS_ROOT: "${OAAP_METRICS_ROOT:-}"' in dc)
+
+print("\n=== Stufe 4: Schluessel aus dem Portal (POST /internal/keys/broker) ===")
+for raw, why in (([{"filter": "oaap-node/#", "access": "write"}], "Schreiben im Metrik-Zweig"),
+                 ([{"filter": "oaap-node/x/y", "access": "readwrite"}], "Lesen+Schreiben darunter"),
+                 ([{"filter": "oaap-node/+/metrics/#", "access": "write"}], "mit Platzhalter darunter")):
+    try:
+        acl.parse_grants(raw, "oaap-node")
+        ok(f"{why} wird beim Ausstellen abgelehnt", False)
+    except ValueError as e:
+        ok(f"{why} wird beim Ausstellen abgelehnt", "metrics branch" in str(e), e)
+ok("Lesen im Metrik-Zweig bleibt erlaubt",
+   acl.parse_grants([{"filter": "oaap-node/#", "access": "read"}], "oaap-node")
+   == [{"filter": "oaap-node/#", "access": "read"}])
+ok("ein Nachbarname ist kein Metrik-Zweig",
+   acl.parse_grants([{"filter": "oaap-nodes/#", "access": "write"}], "oaap-node")
+   == [{"filter": "oaap-nodes/#", "access": "write"}])
+
+
+def broker_post(actor, **body):
+    return client.post("/internal/keys/broker", json={"actor": actor, **body}, headers=HDR)
+
+
+def keys_now():
+    return len(m.load_keys())
+
+
+before = keys_now()
+r = broker_post("joerg", kind="node", name="pi-ein", node="pi-ein", label="Stufe 4", days=30)
+j = r.get_json()
+ok("ein server_admin stellt einen Knotenschluessel aus (201, Geheimnis in der Antwort)",
+   r.status_code == 201 and j["secret"].startswith("oaapk_") and j["key"]["kind"] == "node"
+   and j["root"] == "oaap-node", (r.status_code, j))
+ok("... er steht in der Schluesselliste von identity und meldet sich am Broker an",
+   any(k["id"] == j["key"]["id"] for k in m.load_keys()) and login(j["secret"]))
+r2 = broker_post("joerg", kind="operator", name="haus-2", label="x", days=30,
+                 grants=[{"filter": "home/#", "access": "readwrite"},
+                         {"filter": "oaap-node/#", "access": "read"}])
+ok("ein Betreiberschluessel mit Rechten (auch Lesen des Metrik-Zweigs)",
+   r2.status_code == 201 and len(r2.get_json()["key"]["grants"]) == 2, r2.get_json())
+n_ok = keys_now()
+ok("zwei Schluessel mehr", n_ok == before + 2)
+for who, body, code, why in (
+        ("cls_admin", dict(kind="node", name="x1", node="x1"), 403, "tenant_admin"),
+        ("sensor-1", dict(kind="node", name="x2", node="x2"), 403, "ein Benutzer ohne Verwaltungsrolle"),
+        ("niemand", dict(kind="node", name="x3", node="x3"), 403, "ein unbekannter Akteur"),
+        ("", dict(kind="node", name="x4", node="x4"), 403, "ohne Akteur"),
+        ("joerg", dict(kind="node", name="X!", node="x5"), 400, "schlechter Name"),
+        ("joerg", dict(kind="node", name="x6", node="x6", grants=[{"filter": "a", "access": "read"}]), 201,
+         "Rechte an einem Knotenschluessel werden ignoriert (nur Betreiber haben welche)"),
+        ("joerg", dict(kind="operator", name="op1", grants=[{"filter": "oaap-node/#", "access": "write"}]), 400,
+         "Schreiben im Metrik-Zweig"),
+        ("joerg", dict(kind="operator", name="op2", grants=[{"filter": "oaap/#", "access": "read"}]), 400,
+         "Filter in den Mandantenbaeumen"),
+        ("joerg", dict(kind="operator", name="op3", grants=[]), 400, "keine Rechte"),
+        ("joerg", dict(kind="gast", name="op4"), 400, "falsche Art")):
+    n0 = keys_now()
+    rr = broker_post(who, **body)
+    made = keys_now() - n0
+    ok(f"{why}: {code}" + ("" if code == 201 else " und nichts ausgestellt"),
+       rr.status_code == code and made == (1 if code == 201 else 0), (rr.status_code, rr.get_json()))
+ok("die Meldung von identity steht in der Antwort",
+   "metrics branch" in broker_post("joerg", kind="operator", name="op5",
+                                   grants=[{"filter": "oaap-node/#", "access": "write"}]).get_json()["error"])
+
+lst = client.get("/internal/keys?actor=cls_admin", headers=HDR).get_json()["keys"]
+ok("ein tenant_admin sieht keinen Broker-Schluessel", not any(k["kind"] != "tenant" for k in lst), lst)
+lst = client.get("/internal/keys?actor=joerg", headers=HDR).get_json()["keys"]
+ok("der server_admin sieht beide Arten, mit Art, Knoten und Rechten",
+   any(k["kind"] == "node" and k["node"] == "pi-ein" for k in lst)
+   and any(k["kind"] == "operator" and len(k["grants"]) == 2 for k in lst))
+audit = open(m.AUDIT_LOG, encoding="utf-8").read()
+ok("das Pruefprotokoll nennt Art und Rechte, nie das Geheimnis",
+   "MQTT operator" in audit and "readwrite home/#" in audit
+   and j["secret"].split("_", 2)[2] not in audit and r2.get_json()["secret"].split("_", 2)[2] not in audit)
+ok("ein Tenant-Admin kann ihn auch nicht entziehen",
+   client.post(f"/internal/keys/{j['key']['id']}/revoke", json={"actor": "cls_admin"}, headers=HDR).status_code == 403)
+ok("der server_admin kann ihn entziehen, und der Broker lehnt ihn danach ab",
+   client.post(f"/internal/keys/{j['key']['id']}/revoke", json={"actor": "joerg"}, headers=HDR).status_code == 200
+   and not login(j["secret"]))
+ok("broker-info nennt die Wurzel",
+   client.get("/internal/broker-info", headers=HDR).get_json() == {"root": "oaap-node"})
 
 print(f"\n{'OK' if not fails else 'FEHLER'}: {fails} Fehler")
 sys.exit(1 if fails else 0)

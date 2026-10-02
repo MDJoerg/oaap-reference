@@ -600,15 +600,21 @@ KEYS_LIST_BODY = """
 {% if keys %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Kennung</th><th>Prinzipal</th><th>Wofür</th><th>Rollen</th>
+  <tr><th>Kennung</th><th>Art</th><th>Prinzipal</th><th>Wofür</th><th>Rollen</th>
       <th>Gilt für</th><th>Gültig bis</th><th>Zuletzt benutzt</th><th></th></tr>
   {% for k in keys %}
+  {% set kind = k.kind or "tenant" %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/keys/{{ k.id }}"><code>{{ k.id }}</code></a></td>
-    <td>{{ k.principal }}</td>
+    <td>{% if kind == "node" %}<span class="badge">Knoten</span>
+        {% elif kind == "operator" %}<span class="badge">Betreiber</span>
+        {% else %}Mandant{% endif %}</td>
+    <td>{{ k.principal if kind == "tenant" else "–" }}</td>
     <td class="muted">{{ k.label or "–" }}</td>
-    <td>{{ k.roles|join(", ") }}</td>
-    <td class="muted">{{ k.instance or "alle Instanzen" }}{% if k.terminal %}
+    <td>{{ k.roles|join(", ") if kind == "tenant" else "–" }}</td>
+    <td class="muted">{% if kind == "node" %}schreibt <code>{{ root or "oaap-node" }}/{{ k.node }}/#</code>
+        {% elif kind == "operator" %}{{ k.grants|length }} Recht{{ "" if k.grants|length == 1 else "e" }} am Broker
+        {% else %}{{ k.instance or "alle Instanzen" }}{% endif %}{% if k.terminal %}
         <span class="badge">Terminal</span>{% endif %}</td>
     <td>{% if k.revoked %}<span class="badge off">entzogen</span>
         {% elif k.expired %}<span class="badge off">abgelaufen</span>
@@ -635,6 +641,11 @@ mit ihm geschah, bleibt nachlesbar. Entziehen wirkt sofort.</p>
 KEY_NEW_BODY = """
 <a class="back" href="/keys">← Zurück zur Liste</a>
 <h1>Schlüssel ausstellen</h1>
+{% if is_server_admin %}
+<p class="muted">Wofür: <strong>Zugang zur Plattform</strong> (diese Seite) ·
+  <a href="/keys/new?kind=node">Knoten (Metriken senden)</a> ·
+  <a href="/keys/new?kind=operator">Betreiber (MQTT-Rechte)</a></p>
+{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if not principals %}
@@ -698,6 +709,68 @@ Leser oder eine Automatisierung.</p></div>
 {% endif %}
 """
 
+# Floorplan "Dialogseite" (design guidelines 6.2). RFC-0054 stage 4: a key
+# for the MQTT broker. The rules are identity's; this page names them and
+# decides none of them.
+KEY_BROKER_NEW_BODY = """
+<a class="back" href="/keys">← Zurück zur Liste</a>
+<h1>{{ "Knotenschlüssel" if kind == "node" else "Betreiberschlüssel" }} ausstellen</h1>
+<p class="muted">Wofür:
+  <a href="/keys/new">Zugang zur Plattform</a> ·
+  {% if kind == "node" %}<strong>Knoten (Metriken senden)</strong>{% else %}<a href="/keys/new?kind=node">Knoten (Metriken senden)</a>{% endif %} ·
+  {% if kind == "operator" %}<strong>Betreiber (MQTT-Rechte)</strong>{% else %}<a href="/keys/new?kind=operator">Betreiber (MQTT-Rechte)</a>{% endif %}</p>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<form method="post" action="/keys/create-broker">
+  <input type="hidden" name="kind" value="{{ kind }}">
+  <div class="card">
+    <h2>Wer</h2>
+    <label>Name des Schlüssels <input type="text" name="name" value="{{ form.name }}"
+           pattern="[a-z0-9][a-z0-9._-]{1,39}" required
+           placeholder="{{ 'z. B. oaapx02' if kind == 'node' else 'z. B. haus' }}"></label>
+    {% if kind == "node" %}
+    <label>Name des Knotens im Broker <input type="text" name="node" value="{{ form.node }}"
+           pattern="[a-z0-9][a-z0-9-]{1,39}" required placeholder="z. B. oaapx02"></label>
+    <p class="muted">Der Schlüssel darf nur unter
+       <code>{{ root }}/&lt;Knotenname&gt;/</code> schreiben und nichts lesen.
+       Ein zweiter Knoten kann ihn nicht unter seinem Namen benutzen — der
+       Broker lehnt das Veröffentlichen ab.</p>
+    {% endif %}
+    <label>Wofür ist er <input type="text" name="label" value="{{ form.label }}"
+           placeholder="z. B. Metriken von oaapx02"></label>
+    <label>Gültig für (Tage, 1–365)
+      <input type="number" name="days" min="1" max="365" value="{{ form.days }}"></label>
+    <p class="muted">„Nie ablaufen" gibt es nicht.</p>
+  </div>
+  {% if kind == "operator" %}
+  <div class="card">
+    <h2>Rechte</h2>
+    <table>
+      <tr><th>Themenfilter</th><th>Recht</th></tr>
+      {% for g in form.grants %}
+      <tr><td><input type="text" name="filter" value="{{ g.filter }}"
+                     placeholder="z. B. home/#"></td>
+          <td><select name="access">
+            {% for v, t in [("read", "lesen"), ("write", "schreiben"), ("readwrite", "lesen und schreiben")] %}
+            <option value="{{ v }}" {{ 'selected' if v == g.access }}>{{ t }}</option>
+            {% endfor %}</select></td></tr>
+      {% endfor %}
+    </table>
+    <p><button name="more" value="1" formnovalidate>Weitere Zeile</button></p>
+    <p class="muted">Eine Zeile ohne Filter wird ignoriert. Ein Filter darf
+       <code>+</code> und <code>#</code> enthalten (<code>#</code> nur am
+       Ende). Nicht erlaubt: alles, was in die Bäume der Mandanten
+       (<code>oaap/…</code>) reicht, und <strong>Schreiben</strong> im
+       Metrik-Zweig <code>{{ root }}/…</code> — den beschreibt nur der Knoten
+       selbst. Lesen dort ist erlaubt. Die Regeln prüft die Plattform beim
+       Ausstellen; diese Seite zeigt nur ihre Antwort.</p>
+  </div>
+  {% endif %}
+  <div class="card"><button>Schlüssel ausstellen</button>
+    <p class="muted">Rechte lassen sich später nicht ändern: ein anderes Recht
+       ist ein neuer Schlüssel, der alte wird entzogen.</p></div>
+</form>
+"""
+
 # Floorplan "Objektseite" (design guidelines 6.2).
 KEY_DETAIL_BODY = """
 <a class="back" href="/keys">← Zurück zur Liste</a>
@@ -710,10 +783,29 @@ KEY_DETAIL_BODY = """
 <div class="card">
   <h2>Was er ist</h2>
   <table>
+    {% if (k.kind or "tenant") == "tenant" %}
     <tr><td>Prinzipal</td><td><strong>{{ k.principal }}</strong></td></tr>
     <tr><td>Wofür</td><td>{{ k.label or "–" }}</td></tr>
     <tr><td>Rollen</td><td>{{ k.roles|join(", ") }}</td></tr>
     <tr><td>Gilt für</td><td>{{ k.instance or "alle Instanzen dieses Mandanten" }}</td></tr>
+    {% else %}
+    <tr><td>Art</td><td><strong>{{ "Knoten" if k.kind == "node" else "Betreiber" }}</strong>
+        — {{ k.principal.split(":", 1)[1] }}; nur für den MQTT-Broker, keine Seite, keine API</td></tr>
+    <tr><td>Wofür</td><td>{{ k.label or "–" }}</td></tr>
+    {% if k.kind == "node" %}
+    <tr><td>Darf</td><td>schreiben unter <code>{{ root or "oaap-node" }}/{{ k.node }}/#</code>,
+        nichts lesen</td></tr>
+    {% else %}
+    <tr><td>Darf</td><td>
+      <table>
+        <tr><th>Themenfilter</th><th>Recht</th></tr>
+        {% for g in k.grants %}
+        <tr><td><code>{{ g.filter }}</code></td>
+            <td>{{ {"read": "lesen", "write": "schreiben", "readwrite": "lesen und schreiben"}[g.access] }}</td></tr>
+        {% endfor %}
+      </table></td></tr>
+    {% endif %}
+    {% endif %}
     <tr><td>Ausgestellt</td><td>{{ k.created[:10] }} von {{ k.created_by }}</td></tr>
     <tr><td>Gültig bis</td><td>{{ k.expires[:10] }}</td></tr>
     <tr><td>Zuletzt benutzt</td>
@@ -842,15 +934,38 @@ KEY_SHOWN_BODY = """
      Maschine nicht.</p>
   <p><code style="display:block;word-break:break-all;padding:.7rem;
      font-size:1.05rem">{{ secret }}</code></p>
+  {% if (k.kind or "tenant") == "tenant" %}
   <p class="muted">Verwendung: als Kopfzeile
      <code>Authorization: Bearer &lt;Geheimnis&gt;</code></p>
+  {% else %}
+  <p class="muted">Verwendung am MQTT-Broker: Benutzername
+     <code>{{ k.id }}</code>, Passwort ist das Geheimnis, Verbindung nur
+     über TLS (Port 8883; der Knoten braucht dafür das Profil
+     <code>exposed</code>).</p>
+  {% if k.kind == "node" %}
+  <p class="muted">Auf dem sendenden Knoten (das Geheimnis über die
+     Standardeingabe, nie in die Zeile):</p>
+  <p><code style="display:block;padding:.5rem">oaap metrics sender set --url mqtts://&lt;broker&gt;:8883 --user {{ k.id }} --ca ca.crt</code></p>
+  <p class="muted">Die <code>ca.crt</code> holt man auf dem Broker-Knoten mit
+     <code>oaap broker ca</code>.</p>
+  {% endif %}
+  {% endif %}
 </div>
 <div class="card">
   <h2>Was ausgestellt wurde</h2>
   <table>
+    {% if (k.kind or "tenant") == "tenant" %}
     <tr><td>Prinzipal</td><td><strong>{{ k.principal }}</strong></td></tr>
     <tr><td>Rollen</td><td>{{ k.roles|join(", ") }}</td></tr>
     <tr><td>Gilt für</td><td>{{ k.instance or "alle Instanzen dieses Mandanten" }}</td></tr>
+    {% elif k.kind == "node" %}
+    <tr><td>Knoten</td><td><strong>{{ k.node }}</strong> — schreibt unter
+        <code>{{ root or "oaap-node" }}/{{ k.node }}/#</code>, liest nichts</td></tr>
+    {% else %}
+    <tr><td>Betreiber</td><td><strong>{{ k.principal.split(":", 1)[1] }}</strong>
+        — {% for g in k.grants %}<code>{{ g.filter }}</code>
+        ({{ {"read": "lesen", "write": "schreiben", "readwrite": "lesen und schreiben"}[g.access] }}){{ ", " if not loop.last }}{% endfor %}</td></tr>
+    {% endif %}
     <tr><td>Gültig bis</td><td>{{ k.expires[:10] }}</td></tr>
   </table>
   <p class="muted">Verloren? Stelle einen neuen aus und entziehe diesen —
@@ -4109,6 +4224,26 @@ def _key_form(**over):
     return form
 
 
+def is_server_admin():
+    return "server_admin" in caller_roles()
+
+
+def broker_root():
+    """The metrics root, as identity has it (its setting, not ours)."""
+    try:
+        r = INTERNAL.get(f"{IDENTITY}/internal/broker-info", timeout=5)
+        return (r.json() or {}).get("root") or "oaap-node"
+    except Exception:
+        return "oaap-node"
+
+
+def _broker_form(**over):
+    form = {"name": "", "node": "", "label": "", "days": 365,
+            "grants": [{"filter": "", "access": "read"} for _ in range(3)]}
+    form.update(over)
+    return form
+
+
 def identity_keys():
     """The keys this caller may see -- identity decides, not the portal.
 
@@ -4136,6 +4271,8 @@ def keys_list():
         k["expired"] = bool(k.get("expires")) and k["expires"] <= now
     keys.sort(key=lambda k: (k["revoked"] or k["expired"], k["principal"]))
     return page(KEYS_LIST_BODY, "Zugänge", "keys", keys=keys,
+                root=broker_root() if any((k.get("kind") or "tenant")
+                                          != "tenant" for k in keys) else "",
                 scope_note=(tenant_name(mine) if role == "tenant_admin"
                             and multi_tenant() else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
@@ -4151,9 +4288,14 @@ def keys_new():
     # simply matches no <option> and the field falls back to "keine
     # Begrenzung", so nothing needs validating on the way in; identity
     # decides for real at creation time regardless.
+    kind = request.args.get("kind", "")
+    if kind in ("node", "operator") and is_server_admin():
+        return page(KEY_BROKER_NEW_BODY, "Schlüssel ausstellen", "keys",
+                    kind=kind, root=broker_root(), form=_broker_form(),
+                    error=None)
     return page(KEY_NEW_BODY, "Schlüssel ausstellen", "keys",
                 principals=identity_users(), all_roles=_key_role_choices(),
-                instances=_instance_choices(),
+                instances=_instance_choices(), is_server_admin=is_server_admin(),
                 form=_key_form(instance=request.args.get("instance", "")),
                 msg=request.args.get("msg"), error=None)
 
@@ -4186,6 +4328,51 @@ def keys_create():
                                               "Ausstellen fehlgeschlagen."))
 
 
+@app.post("/keys/create-broker")
+def keys_create_broker():
+    """A node key or an operator key (RFC-0054 stage 4). Identity decides
+    and says why; this route only carries the form there and back."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not is_server_admin():
+        return ("Zugriff verweigert: Knoten- und Betreiberschlüssel stellt "
+                "nur ein server_admin aus."), 403
+    kind = request.form.get("kind", "")
+    if kind not in ("node", "operator"):
+        return "Unbekannte Art.", 400
+    rows = [{"filter": f.strip(), "access": a}
+            for f, a in zip(request.form.getlist("filter"),
+                            request.form.getlist("access"))]
+    form = _broker_form(name=request.form.get("name", "").strip(),
+                        node=request.form.get("node", "").strip(),
+                        label=request.form.get("label", "").strip(),
+                        days=request.form.get("days", "365"))
+    filled = [g for g in rows if g["filter"]]
+    if request.form.get("more"):
+        form["grants"] = rows + [{"filter": "", "access": "read"}]
+        return page(KEY_BROKER_NEW_BODY, "Schlüssel ausstellen", "keys",
+                    kind=kind, root=broker_root(), form=form, error=None)
+    form["grants"] = filled + [{"filter": "", "access": "read"}] * max(
+        0, 3 - len(filled))
+    resp = INTERNAL.post(f"{IDENTITY}/internal/keys/broker",
+                         json={"kind": kind, "name": form["name"],
+                               "node": form["node"], "label": form["label"],
+                               "days": form["days"], "grants": filled,
+                               "actor": caller_name()}, timeout=5)
+    if resp.status_code == 201:
+        body = resp.json()
+        # Once, from this response, never in a URL (as for every key).
+        return page(KEY_SHOWN_BODY, "Schlüssel ausgestellt", "keys",
+                    k=body["key"], secret=body["secret"],
+                    root=body.get("root", ""))
+    return page(KEY_BROKER_NEW_BODY, "Schlüssel ausstellen", "keys",
+                status=resp.status_code, kind=kind, root=broker_root(),
+                form=form,
+                error=(resp.json() or {}).get("error",
+                                              "Ausstellen fehlgeschlagen."))
+
+
 def _find_key(kid):
     """One key from the list identity says this caller may see.
 
@@ -4211,7 +4398,8 @@ def keys_detail(kid):
         return redirect("/keys?err=" + quote(
             "Diesen Schlüssel gibt es hier nicht."), code=303)
     return page(KEY_DETAIL_BODY, "Schlüssel " + kid, "keys", k=k,
-                error=request.args.get("err"))
+                root=broker_root() if (k.get("kind") or "tenant") != "tenant"
+                else "", error=request.args.get("err"))
 
 
 @app.post("/keys/<kid>/revoke")

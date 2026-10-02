@@ -280,5 +280,75 @@ ok("und jedes Geraet bekommt seinen eigenen",
    "/internal/keys" in create)
 
 print("")
+print("Schluessel fuer den MQTT-Broker (RFC-0054 Stufe 4)")
+
+NODE = dict(KEY, id="n0de0001", principal="node:oaapx02", tenant="", roles=[], instance="",
+            label="Metriken", kind="node", node="oaapx02", grants=[])
+OP = dict(KEY, id="0p000001", principal="operator:haus", tenant="", roles=[], instance="",
+          label="Smarthome", kind="operator", node="",
+          grants=[{"filter": "home/#", "access": "readwrite"}, {"filter": "oaap-node/#", "access": "read"}])
+html = liste.render(keys=[KEY, NODE, OP], scope_note="", msg=None, error=None, root="oaap-node")
+ok("die Liste nennt die Art: Mandant, Knoten, Betreiber",
+   "Mandant" in html and "Knoten" in html and "Betreiber" in html)
+ok("ein Knotenschluessel zeigt das Thema, das er beschreiben darf", "oaap-node/oaapx02/#" in html)
+ok("ein Betreiberschluessel zeigt, wie viele Rechte er hat", "2 Rechte" in html)
+ok("ein alter Schluessel ohne Art-Feld wird als Mandantenschluessel gezeigt",
+   "terminal-3" in html and "cls-viewer" in html)
+
+detail = ENV.from_string(template("KEY_DETAIL_BODY"))
+h = detail.render(k=OP, error=None, root="oaap-node")
+ok("das Detail eines Betreiberschluessels zeigt die Rechte-Tabelle",
+   "home/#" in h and "lesen und schreiben" in h and "oaap-node/#" in h and "lesen" in h)
+h = detail.render(k=NODE, error=None, root="oaap-node")
+ok("das Detail eines Knotenschluessels sagt: schreiben unter dem Namen, nichts lesen",
+   "oaap-node/oaapx02/#" in h and "nichts lesen" in h)
+ok("Entziehen liegt auch hier hinter der Bestaetigung",
+   'name="confirm"' in h and "/keys/n0de0001/revoke" in h)
+h = detail.render(k=KEY, error=None, root="")
+ok("das Detail eines Mandantenschluessels ist unveraendert", "Prinzipal" in h and "Rollen" in h)
+
+shown = ENV.from_string(template("KEY_SHOWN_BODY"))
+SECRET = "oaapk_n0de0001_GEHEIMNISXYZ"
+h = shown.render(k=NODE, secret=SECRET, root="oaap-node")
+ok("die Geheimnis-Seite eines Knotens nennt Benutzername, Geheimnis und den fertigen Befehl",
+   "n0de0001" in h and SECRET in h and "oaap metrics sender set" in h and "oaap broker ca" in h)
+ok("... und das Geheimnis steht NICHT im Befehl", h.count(SECRET) == 1)
+h = shown.render(k=OP, secret="oaapk_0p000001_ANDERES", root="oaap-node")
+ok("die eines Betreibers nennt Benutzername und die Rechte, keinen sender-Befehl",
+   "n0de0001" not in h and "0p000001" in h and "home/#" in h and "oaap metrics sender" not in h)
+h = shown.render(k=KEY, secret=SECRET, root="")
+ok("die eines Mandantenschluessels bleibt beim HTTP-Hinweis", "Authorization: Bearer" in h)
+
+neu = ENV.from_string(template("KEY_NEW_BODY"))
+base = dict(principals=[{"username": "u1", "kind": "machine", "roles": ["user"]}], all_roles=["user"],
+            instances=[], form={"principal": "", "roles": ["user"], "instance": "", "label": "", "days": 90},
+            msg=None, error=None)
+ok("ein server_admin bekommt die Wahl 'Knoten' und 'Betreiber' angeboten",
+   "kind=node" in neu.render(is_server_admin=True, **base) and "kind=operator" in neu.render(is_server_admin=True, **base))
+ok("ein tenant_admin bekommt sie NICHT angeboten",
+   "kind=node" not in neu.render(is_server_admin=False, **base) and "kind=operator" not in neu.render(is_server_admin=False, **base))
+
+bneu = ENV.from_string(template("KEY_BROKER_NEW_BODY"))
+form = {"name": "haus", "node": "", "label": "", "days": 365,
+        "grants": [{"filter": "home/#", "access": "write"}, {"filter": "", "access": "read"}]}
+h = bneu.render(kind="operator", root="oaap-node", form=form, error="'x' reaches the metrics branch")
+ok("der Rechte-Editor zeigt je Zeile Filter und Recht und behaelt den Inhalt",
+   h.count('name="filter"') == 2 and 'value="home/#"' in h and "schreiben" in h)
+ok("er sagt die Regeln, die identity prueft, und zeigt deren Antwort",
+   "oaap/" in h and "Metrik-Zweig" in h and "metrics branch" in h)
+ok("eine Zeile mehr gibt es ohne Skript (Knopf 'more')", 'name="more"' in h and "<script" not in h)
+h = bneu.render(kind="node", root="oaap-node", form=dict(form, node="oaapx02"), error=None)
+ok("das Knotenformular nennt das eine Recht mit der eingestellten Wurzel",
+   "oaap-node/&lt;Knotenname&gt;/" in h and 'name="filter"' not in h and 'name="node"' in h)
+
+src = SRC[SRC.index("def keys_create_broker():"):]
+src = src[:src.index("\n@app.", 1)]
+ok("die Route verlangt server_admin, bevor sie identity fragt",
+   src.index("is_server_admin()") < src.index("INTERNAL.post"))
+ok("das Geheimnis geht nie in eine Adresse", "redirect(" not in src)
+ok("das Portal prueft die Regeln nicht selbst, es zeigt identitys Antwort",
+   "parse_grants" not in src and '.get("error"' in src)
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

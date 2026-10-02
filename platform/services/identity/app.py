@@ -954,7 +954,7 @@ def issue_broker_key(kind, name, node, grants, label, days, created_by):
     else:
         if node:
             raise ValueError("--node belongs to a node key")
-        rec_grants = mqtt_acl.parse_grants(grants)
+        rec_grants = mqtt_acl.parse_grants(grants, METRICS_ROOT)
     if days is None or days == "":
         days = KEY_DEFAULT_DAYS
     try:
@@ -2818,6 +2818,42 @@ def keys_create():
                  + (f", instance {rec['instance']}" if rec["instance"] else "")
                  + f", expires {rec['expires'][:10]}")
     return {"ok": True, "key": public_key(rec), "secret": secret}, 201
+
+
+@app.get("/internal/broker-info")
+def broker_info():
+    """What the portal must say about the broker's keys, and nothing
+    more: the metrics root, which is identity's setting (RFC-0054 s.6)."""
+    return {"root": METRICS_ROOT}
+
+
+@app.post("/internal/keys/broker")
+def keys_create_broker():
+    """Issue a node key or an operator key (RFC-0054 stage 4). The same
+    function the CLI calls, so one set of rules; the secret is in this
+    response and nowhere else."""
+    body = request.get_json(force=True, silent=True) or {}
+    actor_name = _actor(body)
+    role, _tenant, err = authority(actor_name)
+    if role != "server_admin":
+        # a tenant_admin has no business here, and is told so plainly
+        return {"error": "Knoten- und Betreiberschluessel stellt nur ein "
+                         "server_admin aus."}, 403
+    try:
+        rec, secret = issue_broker_key(
+            body.get("kind"), body.get("name"), body.get("node"),
+            body.get("grants") if body.get("kind") == "operator" else None,
+            body.get("label"), body.get("days"), actor_name)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    audit("key.issue", "", rec["principal"], who=actor_name, role=role,
+          detail=f"key {rec['id']}, MQTT {rec['kind']}"
+                 + (f", node {rec['node']}" if rec["node"] else "")
+                 + "".join(f", {g['access']} {g['filter']}"
+                           for g in rec["grants"])
+                 + f", expires {rec['expires'][:10]}")
+    return {"ok": True, "key": public_key(rec), "secret": secret,
+            "root": METRICS_ROOT}, 201
 
 
 @app.post("/internal/keys/<kid>/revoke")

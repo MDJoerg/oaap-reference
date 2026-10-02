@@ -124,9 +124,13 @@ def covers(grant, requested):
         i += 1
 
 
-def parse_grants(raw):
+def parse_grants(raw, root=None):
     """Validate the grants of an operator key. Returns the clean list;
-    raises ValueError with a sentence an operator can act on."""
+    raises ValueError with a sentence an operator can act on.
+
+    `root` is the metrics root. A grant that WRITES where only the node
+    itself may (`decide` ignores it for everybody else) is refused here,
+    so that a key never says something the broker will not do."""
     if not isinstance(raw, list) or not raw:
         raise ValueError("an operator key needs at least one grant")
     if len(raw) > MAX_GRANTS:
@@ -151,6 +155,11 @@ def parse_grants(raw):
                 f"{f!r} reaches the tenant trees ('oaap/...'). Operator "
                 "grants live outside them: start with a name of your own, "
                 "e.g. 'home/#'")
+        if root and a in ("write", "readwrite") and overlaps(f"{root}/#", f):
+            raise ValueError(
+                f"{f!r} reaches the metrics branch '{root}/...', which only "
+                "the node itself may write. Grant 'read' there, or choose "
+                "another tree")
         out.append({"filter": f, "access": a})
     return out
 
