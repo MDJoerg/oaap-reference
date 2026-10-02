@@ -57,6 +57,11 @@ FORMAT_VERSION = 1
 # The outbound queue (RFC-0051 5). Bounded by age and by size: an unreachable
 # broker loses the oldest data, never the node's health.
 QUEUE_FILE = "outbox.jsonl"
+# What the sender (RFC-0052) leaves in this directory for the health page:
+# the run state, and a non-secret note that a sender is configured at all
+# (its real configuration and its secret live elsewhere).
+SENDER_STATE_FILE = "sender-state.json"
+SENDER_INFO_FILE = "sender-info.json"
 QUEUE_STATE = "outbox.json"
 QUEUE_MAX_AGE = 7 * 86400
 QUEUE_MAX_BYTES = 2_000_000

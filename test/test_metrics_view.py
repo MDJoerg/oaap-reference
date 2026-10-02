@@ -120,6 +120,51 @@ ok("wenig Daten: der Text sagt, seit wann es welche gibt",
    "Daten seit" in h, re.findall(r'class="muted">[^<]*', h)[-1:])
 ok("... ein voller Verlauf sagt das nicht", "Daten seit" not in html["4h"])
 
+print("\n=== die Zeile zum Sender (RFC-0052) ===")
+import json                                                     # noqa: E402
+
+h0 = v.block(STORE, "24h", now=END)
+ok("ohne eingerichteten Sender steht keine Zeile da", "Senden an" not in h0)
+INFO = {"host": "mqtt.example.org", "port": 8883, "node": "oaapx02", "root": "oaap-node"}
+
+
+def put(name, obj):
+    with open(os.path.join(STORE, name), "w") as f:
+        json.dump(obj, f)
+
+
+put(m.SENDER_INFO_FILE, INFO)
+h = v.block(STORE, "24h", now=END)
+ok("eingerichtet, noch nichts gesendet: die Zeile sagt es", "Senden an" in h
+   and "mqtt.example.org" in h and "noch nichts gesendet" in h, re.findall(r"vl-send.*", h))
+put(m.SENDER_STATE_FILE, {"ok_at": END - 130 * 60, "fails": 0, "err": "", "sent_total": 9})
+h = v.block(STORE, "24h", now=END)
+ok("Erfolg: ok, zuletzt vor 2 Std. 10 Min.", 'class="ok">ok</span>' in h
+   and "zuletzt vor 2 Std. 10 Min." in h, re.findall(r"vl-send.*", h))
+ok("... mit der Zahl der Wartenden", " wartend" in h)
+put(m.SENDER_STATE_FILE, {"ok_at": END - 600, "err": "cannot connect <b>x</b>",
+                          "err_at": END - 300, "fails": 3, "kind": "network"})
+h = v.block(STORE, "24h", now=END)
+ok("Fehler: sagt seit wann, wann zuletzt Erfolg war und was los ist",
+   "nicht erreichbar" in h and "seit 5 Min." in h and "letzter Erfolg vor 10 Min." in h
+   and "cannot connect" in h, re.findall(r"vl-send.*", h))
+ok("... der Fehlertext ist maskiert (kein eingeschleustes Markup)",
+   "<b>x</b>" not in h and "&lt;b&gt;" in h)
+ok("kein Verlust, kein Satz darueber", "gingen verloren" not in h)
+for i in range(3):
+    m.queue_add(STORE, {"t": END - 9 * 86400 + i * 60, "cpu": 1.0})
+m.queue_trim(STORE, END)
+h = v.block(STORE, "24h", now=END)
+ok("ein Verlust steht in Worten da, nicht nur als Zahl",
+   "Messwerte gingen verloren" in h and "zu voll oder zu alt" in h,
+   re.findall(r"vl-send.*", h))
+ok("die Zeile liegt im Block (er wird als Ganzes ausgetauscht)",
+   h.index("vl-send") < h.rindex("</div>"))
+os.remove(os.path.join(STORE, m.SENDER_STATE_FILE))
+os.remove(os.path.join(STORE, m.SENDER_INFO_FILE))
+ok("ein Block ohne Daten bleibt ein Satz (die Zeile kommt nicht dazu)",
+   "Senden an" not in v.block(tempfile.mkdtemp(prefix="oaap-mv-leer-"), "24h", now=END))
+
 print("\n=== Kleinigkeiten ===")
 ok("Zeit relativ, ohne Zeitzone zu raten",
    v._ago(130 * 60) == "2 Std. 10 Min." and v._ago(90_000) == "1 Tg. 1 Std."

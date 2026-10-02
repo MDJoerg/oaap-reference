@@ -39,7 +39,8 @@ KEEPALIVE = 30
 BACKOFF_STEP = 60
 BACKOFF_MAX = 15 * 60
 ACK_EVERY = 200             # entries; the queue file is rewritten by an ack
-STATE_FILE = "sender-state.json"
+STATE_FILE = metrics.SENDER_STATE_FILE
+INFO_FILE = metrics.SENDER_INFO_FILE
 CONFIG_FILE = "sender.json"
 SECRET_FILE = "sender.secret"
 
@@ -187,11 +188,24 @@ def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
     return cfg
 
 
+def write_info(metrics_dir, cfg):
+    """The one non-secret fact the health page needs: that a sender exists,
+    and where it sends. The portal mounts `metrics_dir` read-only; the
+    configuration and the secret are not there."""
+    scheme, host, port = parse_url(cfg["url"])
+    os.makedirs(metrics_dir, exist_ok=True)
+    tmp = _path(metrics_dir, INFO_FILE + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"host": host, "port": port, "node": cfg["node"],
+                   "root": cfg["root"]}, f)
+    os.replace(tmp, _path(metrics_dir, INFO_FILE))
+
+
 def remove_config(cfg_dir, metrics_dir):
     """Delete configuration, secret and state. The queue stays."""
     gone = False
     for d, name in ((cfg_dir, CONFIG_FILE), (cfg_dir, SECRET_FILE),
-                    (metrics_dir, STATE_FILE)):
+                    (metrics_dir, STATE_FILE), (metrics_dir, INFO_FILE)):
         try:
             os.remove(_path(d, name))
             gone = True
@@ -395,6 +409,11 @@ def run(metrics_dir, cfg_dir, now=None, client_factory=Client):
     cfg = load_config(cfg_dir)
     if not cfg:
         return {"status": "unconfigured", "sent": 0}
+    if not os.path.exists(_path(metrics_dir, INFO_FILE)):
+        try:
+            write_info(metrics_dir, cfg)        # a hand-made configuration
+        except (OSError, ConfigError):
+            pass
     st = load_state(metrics_dir)
     if st.get("next_try", 0) > now:
         return {"status": "backoff", "sent": 0}

@@ -453,6 +453,27 @@ ok("remove --yes loescht Konfiguration, Passwort und Zustand; die Warteschlange 
 fill(mdir, 1)
 ok("... und sie fuellt sich weiter", len(m.queue_pending(mdir)) == 1)
 
+print("\n=== die Notiz fuer die Gesundheitsseite ===")
+mdir, cdir = fresh()
+srv = Broker({"cli": "cli-pw"})
+a.METRICS_DIR = mdir
+a.METRICS_SENDER_DIR = cdir
+cli("set", stdin="cli-pw\n", url=f"mqtt://127.0.0.1:{srv.port}", user="cli",
+    node="cli-node", allow_plain=True)
+info = json.load(open(os.path.join(mdir, m.SENDER_INFO_FILE)))
+ok("set legt eine Notiz ins Metrik-Verzeichnis: Ziel, Knoten, Wurzel",
+   info == {"host": "127.0.0.1", "port": srv.port, "node": "cli-node", "root": "oaap-node"}, info)
+ok("... und KEIN Passwort, kein Konto, keine Konfiguration dort",
+   "cli-pw" not in json.dumps(info) and "cli" not in info.values()
+   and not os.path.exists(os.path.join(mdir, s.CONFIG_FILE))
+   and not os.path.exists(os.path.join(mdir, s.SECRET_FILE)))
+os.remove(os.path.join(mdir, m.SENDER_INFO_FILE))
+s.run(mdir, cdir, now=BASE)
+ok("ein Lauf stellt eine fehlende Notiz wieder her (handgemachte Konfiguration)",
+   os.path.exists(os.path.join(mdir, m.SENDER_INFO_FILE)))
+cli("remove", yes=True)
+ok("remove nimmt die Notiz mit", not os.path.exists(os.path.join(mdir, m.SENDER_INFO_FILE)))
+
 print("\n=== der minuetliche Lauf ===")
 cfg_for(cdir, srv.port)
 a.metrics_sender.run = lambda *x, **k: (_ for _ in ()).throw(RuntimeError("kaputt"))

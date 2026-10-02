@@ -13,6 +13,8 @@ bleibt sichtbar. Eine Luecke in den Daten ist eine Luecke im Bild: die
 Linie reisst ab, sie wird nicht ueberbrueckt.
 """
 import html
+import json
+import os
 
 import metrics
 
@@ -93,6 +95,47 @@ def chart(title, points, now, span, step):
     return "".join(parts)
 
 
+def _json(directory, name):
+    try:
+        with open(os.path.join(directory, name), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def sender_line(directory, now):
+    """One line on how the sender (RFC-0052) is doing, or "" when none is
+    configured. A loss is said in words, not only as a number: it is the
+    one thing on this line somebody has to act on."""
+    info = _json(directory, metrics.SENDER_INFO_FILE)
+    if not info:
+        return ""
+    st = _json(directory, metrics.SENDER_STATE_FILE) or {}
+    q = metrics.queue_status(directory)
+    where = html.escape(str(info.get("host", "?")))
+    waiting = f"{q['pending']} wartend"
+    ok_at = st.get("ok_at")
+    if st.get("err"):
+        since = st.get("err_at")
+        head = (f'<span class="err">nicht erreichbar oder abgelehnt</span>'
+                + (f" seit {_ago(now - since)}" if isinstance(since, int) else ""))
+        tail = [waiting, html.escape(str(st["err"])[:200])]
+        if isinstance(ok_at, int):
+            tail.insert(1, f"letzter Erfolg vor {_ago(now - ok_at)}")
+    elif isinstance(ok_at, int):
+        head = '<span class="ok">ok</span>, ' + f"zuletzt vor {_ago(now - ok_at)}"
+        tail = [waiting]
+    else:
+        head = "noch nichts gesendet"
+        tail = [waiting]
+    if q["lost"]:
+        tail.append(f'<span class="err">{q["lost"]} Messwerte gingen verloren '
+                    "(die Warteschlange war zu voll oder zu alt)</span>")
+    return (f'<p class="vl-send">Senden an <strong>{where}</strong>: {head} · '
+            + " · ".join(tail) + "</p>")
+
+
 def block(directory, key=DEFAULT, now=None):
     """Der ganze Block „Verlauf" als HTML-Text (alles Eingesetzte ist
     entweder eine Zahl oder durch html.escape gelaufen)."""
@@ -126,7 +169,8 @@ def block(directory, key=DEFAULT, now=None):
             "bis Maximum.")
     if w["since"] > now - span + 2 * w["step"]:
         note = f"Daten seit {_ago(now - w['since'])}. " + note
-    out.append(f'<p class="muted">{html.escape(note)}</p></div>')
+    out.append(f'<p class="muted">{html.escape(note)}</p>')
+    out.append(sender_line(directory, now) + "</div>")
     return "".join(out)
 
 
@@ -149,6 +193,7 @@ STYLE = """
            stroke-linejoin:round}
   .vl-band{fill:var(--oaap-blue-600);opacity:.18;stroke:none}
   .vl-dot{fill:var(--oaap-blue-600)}
+  .vl-send{margin:.4rem 0 0;font-size:.9rem}
 </style>
 <script>
   // Ohne Skript sind die Knoepfe gewoehnliche Links. Mit Skript wird nur

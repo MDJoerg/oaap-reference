@@ -5041,6 +5041,7 @@ def _metrics_sender(args):
                 default_node=socket.gethostname())
         except metrics_sender.ConfigError as exc:
             die(str(exc))
+        metrics_sender.write_info(METRICS_DIR, cfg)
         print(f"Sender set: {cfg['url']} as {cfg['user']} (secret stored, "
               "not shown).")
         print(f"  Topic: {cfg['root']}/{cfg['node']}/metrics/<series>")
