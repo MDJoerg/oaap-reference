@@ -82,6 +82,8 @@ import cohort  # noqa: E402
 # Node metrics (RFC-0051): the sampler and the tiered store. Pure; the
 # acting is cmd_metrics.
 import metrics  # noqa: E402
+# ... and the sender that forwards its outbound queue (RFC-0052).
+import metrics_sender  # noqa: E402
 
 DATA_DIR = os.environ.get("OAAP_DATA_DIR", "/var/lib/oaap")
 APP_DIR = os.path.join(DATA_DIR, "app")            # platform installation
@@ -4999,15 +5001,99 @@ def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
 
 
 METRICS_DIR = os.path.join(DATA_DIR, "data", "metrics")
+# The sender's target and secret live in a directory of their own: the
+# portal mounts METRICS_DIR read-only for the charts, and a secret in a
+# directory a container can read is a secret a container can read.
+METRICS_SENDER_DIR = os.path.join(DATA_DIR, "data", "metrics-sender")
 
 
 def _fmt_at(t):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
 
 
+def _print_sender_state(cfg, st):
+    print(f"  Sender: {cfg['url']} as {cfg['user']}, node {cfg['node']}")
+    if st.get("ok_at"):
+        print(f"    last success: {_fmt_at(st['ok_at'])}; sent so far: "
+              f"{st.get('sent_total', 0)}")
+    if st.get("err"):
+        print(f"    last error: {st['err']} ({_fmt_at(st['err_at'])}); "
+              f"{st.get('fails', 0)} in a row; next try "
+              f"{_fmt_at(st.get('next_try', 0))}")
+    elif not st.get("ok_at"):
+        print("    nothing sent yet")
+
+
+def _metrics_sender(args):
+    """`oaap metrics sender set|show|test|remove` (RFC-0052)."""
+    import socket
+    act = args.sender_action or "show"
+    d = METRICS_SENDER_DIR
+    if act == "set":
+        if not args.url or not args.user:
+            die("sender set needs --url and --user (the secret is read from "
+                "standard input)")
+        secret = sys.stdin.readline().strip()
+        try:
+            cfg = metrics_sender.configure(
+                d, args.url, args.user, secret, node=args.node, root=args.root,
+                ca=args.ca, allow_plain=args.allow_plain,
+                default_node=socket.gethostname())
+        except metrics_sender.ConfigError as exc:
+            die(str(exc))
+        print(f"Sender set: {cfg['url']} as {cfg['user']} (secret stored, "
+              "not shown).")
+        print(f"  Topic: {cfg['root']}/{cfg['node']}/metrics/<series>")
+        if cfg["url"].startswith("mqtt://"):
+            print("  Plain mqtt:// -- the password crosses the network in "
+                  "the clear; allowed for a private address only.")
+        print("  It sends once a minute with the sampler; "
+              "'oaap metrics sender test' checks the login now.")
+        return
+    cfg = metrics_sender.load_config(d)
+    if act == "remove":
+        if not args.yes:
+            print("This deletes the sender's target, its secret and its "
+                  "state. The queue stays. Run again with --yes to do it.")
+            return
+        print("Sender removed." if metrics_sender.remove_config(d, METRICS_DIR)
+              else "No sender configured.")
+        return
+    if not cfg:
+        print("No sender configured. Set one with: oaap metrics sender set "
+              "--url mqtts://host --user NAME   (secret on standard input)")
+        return
+    if act == "test":
+        good, text = metrics_sender.test(d)
+        print(("OK: " if good else "FAILED: ") + text)
+        if not good:
+            sys.exit(1)
+        return
+    print(f"Sender: {cfg['url']} as {cfg['user']}")
+    print(f"  node: {cfg['node']}   topic: {cfg['root']}/{cfg['node']}"
+          "/metrics/<series>")
+    print("  secret: " + ("set" if metrics_sender.load_secret(d)
+                          else "MISSING (set the sender again)"))
+    if cfg.get("allow_plain"):
+        print("  plain mqtt allowed (private address)")
+    if cfg.get("ca"):
+        print(f"  CA file: {cfg['ca']}")
+    st = metrics_sender.load_state(METRICS_DIR)
+    if st.get("ok_at"):
+        print(f"  last success: {_fmt_at(st['ok_at'])}; sent so far: "
+              f"{st.get('sent_total', 0)}")
+    if st.get("err"):
+        print(f"  last error: {st['err']} ({_fmt_at(st['err_at'])}); "
+              f"{st.get('fails', 0)} in a row; next try "
+              f"{_fmt_at(st.get('next_try', 0))}")
+    if not st.get("ok_at") and not st.get("err"):
+        print("  nothing sent yet")
+    print(f"  waiting: {metrics.queue_status(METRICS_DIR)['pending']}")
+
+
 def cmd_metrics(args):
     """`oaap metrics sample|show [--window 4h|24h|1w|1m]|queue|queue-purge
-    [--yes]` (RFC-0051).
+    [--yes]|sender set|show|test|remove` (RFC-0051, RFC-0052).
 
     `sample` is the host job the minutely timer runs. It never fails the
     unit it shares with the state index: a sampler that cannot read
@@ -5021,7 +5107,16 @@ def cmd_metrics(args):
         except Exception as exc:  # noqa: BLE001 -- see the docstring
             print(f"metrics: sample skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
+        # The sender is a step of the same job and is held to the same
+        # rule: whatever it meets, the unit does not fail (RFC-0052 5).
+        try:
+            metrics_sender.run(METRICS_DIR, METRICS_SENDER_DIR)
+        except Exception as exc:  # noqa: BLE001
+            print(f"metrics: sender skipped ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
         return
+    if args.action == "sender":
+        return _metrics_sender(args)
     if args.action == "queue":
         st = metrics.queue_status(METRICS_DIR)
         print(f"Outbound queue: {st['pending']} waiting, {st['bytes']} bytes"
@@ -5030,7 +5125,14 @@ def cmd_metrics(args):
               f"{st['acked']}")
         print(f"  lost (aged or too big, never delivered): {st['lost']}; "
               f"purged by hand: {st['purged']}")
-        print("  Nothing sends it yet (RFC-0051, the sender is a later RFC).")
+        cfg = metrics_sender.load_config(METRICS_SENDER_DIR)
+        if not cfg and os.path.isdir(METRICS_SENDER_DIR) \
+                and not os.access(METRICS_SENDER_DIR, os.R_OK):
+            print("  Sender: (configured; needs root to read)")
+        elif not cfg:
+            print("  No sender configured (oaap metrics sender set, RFC-0052).")
+        else:
+            _print_sender_state(cfg, metrics_sender.load_state(METRICS_DIR))
         return
     if args.action == "queue-purge":
         n = metrics.queue_status(METRICS_DIR)["pending"]
@@ -20997,7 +21099,23 @@ def main():
     pmet = sub.add_parser("metrics", help="node history of CPU, memory and "
                                           "disk (RFC-0051)")
     pmet.add_argument("action", choices=["sample", "show", "queue",
-                                         "queue-purge"])
+                                         "queue-purge", "sender"])
+    pmet.add_argument("sender_action", nargs="?", default=None,
+                      choices=["set", "show", "test", "remove"],
+                      help="for 'sender'")
+    pmet.add_argument("--url", default=None,
+                      help="for 'sender set': mqtts://host[:port]")
+    pmet.add_argument("--user", default=None, help="for 'sender set'")
+    pmet.add_argument("--node", default=None,
+                      help="for 'sender set': this node's name on the wire "
+                           "(default: the host name)")
+    pmet.add_argument("--root", default=None,
+                      help="for 'sender set': topic root (default oaap-node)")
+    pmet.add_argument("--ca", default=None,
+                      help="for 'sender set': a private CA file")
+    pmet.add_argument("--allow-plain", action="store_true",
+                      help="for 'sender set': allow mqtt:// to a private "
+                           "address")
     pmet.add_argument("--yes", action="store_true",
                       help="for 'queue-purge': really delete")
     pmet.add_argument("--window", default=None,

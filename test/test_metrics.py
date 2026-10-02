@@ -265,8 +265,8 @@ ok("... mit Mittel, Minimum und Maximum", "mean" in out and "max" in out, out)
 out, code = run("show", "7d")
 ok("ein unbekanntes Fenster wird abgelehnt", code != 0, out)
 out, code = run("queue")
-ok("queue zeigt Stand, Verluste und dass noch nichts sendet",
-   code == 0 and "waiting" in out and "lost" in out and "later RFC" in out, out)
+ok("queue zeigt Stand, Verluste und dass kein Sender eingerichtet ist",
+   code == 0 and "waiting" in out and "lost" in out and "No sender configured" in out, out)
 a.METRICS_DIR = tempfile.mkdtemp(prefix="oaap-metrics-leer3-")
 m.queue_add(a.METRICS_DIR, {"t": END, "cpu": 1.0})
 a.cmd_metrics.__globals__["metrics"] = m
