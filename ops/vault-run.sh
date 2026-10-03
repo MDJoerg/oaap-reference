@@ -199,7 +199,7 @@ step open ok "mounted on $MNT"
 # generations and the vault record are the same for both ways in.
 INBOX_ROOT="${OAAP_INBOX:-/var/lib/oaap-vault/inbox}"
 INBOX_DONE=()
-PULLED=0; PULL_FAIL=0; SOURCES=0
+PULLED=0; PULL_FAIL=0; SOURCES=0; NODES=()
 pull_once() {   # $1 node, $2 = remote-dir override or "", rest = extra args
   local node="$1" rd="$2"; shift 2
   local args=(--node "$node" --to "$MNT" "$@")
@@ -211,6 +211,7 @@ for c in "$PULL_CONF_DIR"/*.conf; do
   [ -e "$c" ] || continue
   ( . "$c"; [ "${VAULT:-0}" = 1 ] ) || continue
   SOURCES=$((SOURCES + 1))
+  NODES+=("$( . "$c"; echo "$NODE")")
   node="$( . "$c"; echo "$NODE")"
   inbox="$( . "$c"; echo "${INBOX:-0}")"; SOURCE_AGE="$( . "$c"; echo "${SOURCE_AGE:-0}")"
   common="$( . "$c"; a=(--daily "$DAILY" --weekly "$WEEKLY" --monthly "$MONTHLY"); printf '%s\n' "${a[@]}")"
@@ -266,6 +267,11 @@ case "$MODE" in luks) SFX="" ;; *) SFX=".age" ;; esac
 BAD=0; CHECKED=0
 for ddir in "$MNT"/*/daily; do
   [ -d "$ddir" ] || continue
+  # Only sources this run is configured for. A directory left by a source
+  # that was removed (or whose first pull never finished) is not this
+  # run's business and must not turn every later night red (measured:
+  # an aborted first pull left an empty big/daily).
+  [[ " ${NODES[*]} " == *" $(basename "$(dirname "$ddir")") "* ]] || continue
   node="$(basename "$(dirname "$ddir")")"
   if [ "$SCRUB" -eq 1 ]; then mapfile -t files < <(ls -1 "$MNT/$node"/{daily,weekly,monthly}/oaap-backup-*.tar.gz$SFX 2>/dev/null)
   else mapfile -t files < <(ls -1t "$ddir"/oaap-backup-*.tar.gz$SFX 2>/dev/null | head -1); fi
@@ -300,6 +306,11 @@ PROOF="$PROOF_OK"
 install -d -m 0700 "$STATE/sources"
 for ddir in "$MNT"/*/daily; do
   [ -d "$ddir" ] || continue
+  # Only sources this run is configured for. A directory left by a source
+  # that was removed (or whose first pull never finished) is not this
+  # run's business and must not turn every later night red (measured:
+  # an aborted first pull left an empty big/daily).
+  [[ " ${NODES[*]} " == *" $(basename "$(dirname "$ddir")") "* ]] || continue
   node="$(basename "$(dirname "$ddir")")"
   newest="$(ls -1t "$ddir"/oaap-backup-*.tar.gz$SFX 2>/dev/null | head -1)"
   [ -n "$newest" ] || continue
