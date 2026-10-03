@@ -68,6 +68,8 @@ import place  # noqa: E402  (after the path insert, necessarily)
 # identity performs the login, this file configures it, and one file
 # holds the judgement both of them need.
 import idp  # noqa: E402
+# The tenant build profile (RFC-0055): the pure half of a build.
+import tenant_build  # noqa: E402
 # And the admin path of K3 (RFC-0041 step 4): OAAP creates the realm
 # and the client itself. Beside idp.py on purpose -- the portal wizard
 # of RFC-0041 6 is the second door, and when it comes it imports this
@@ -5303,6 +5305,592 @@ def _tenant_remove(args, tenants):
               "again.")
 
 
+# --- the tenant build profile (RFC-0055) -------------------------------
+#
+# services/tenant_build.py is the pure half: the profile, the state file,
+# the order of steps, what continue and roll back mean. This is the half
+# that touches the node, and it touches it through ONE door per step -- the
+# verb an operator would have typed, called through main() the way a test
+# calls it. A second implementation of "create a tenant" or "provision a
+# realm" inside a build would be a second set of rules, and this codebase
+# has paid for that before (0.1.115, 0.1.120).
+#
+BUILD_DIR = os.path.join(DATA_DIR, "data", "tenant-builds")
+PROFILE_DIR = os.path.join(DATA_DIR, "profiles")
+
+
+def _run_verb(argv):
+    """Run one oaap verb in this process -> (exit code, its output).
+
+    Through main(): the same parser, the same root check, the same refusals
+    as on the machine. `die()` exits, so the call is fenced.
+    """
+    import contextlib
+    import io
+    old = sys.argv
+    sys.argv = ["oaap-app"] + [str(a) for a in argv]
+    buf, code = io.StringIO(), 0
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            main()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (
+            0 if exc.code is None else 1)
+    finally:
+        sys.argv = old
+    return code, buf.getvalue()
+
+
+def _brief(text, n=2):
+    """The last n useful lines of a verb's output as one sentence. A line
+    that mentions a secret or a token is dropped: a build's note is read in
+    a page and kept in a file."""
+    keep = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        low = ln.lower()
+        if ln and "secret" not in low and "token" not in low \
+                and "password" not in low:
+            keep.append(ln)
+    return " ".join(keep[-n:])[:240]
+
+
+def _https_status(url):
+    """The status code of one GET, redirects NOT followed, certificate
+    checked. 0 when nothing answered."""
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(url, timeout=8) as r:
+            return r.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception:  # noqa: BLE001 -- "nothing answered" is the answer
+        return 0
+
+
+class _BuildDrivers:
+    """What each step type does, reads and undoes on THIS node."""
+
+    def __init__(self, label, who="root", role="root", probe=None,
+                 sleep=None, purge=False):
+        self.label = label
+        self.who, self.role = who, role
+        # A rollback keeps an instance's data unless the operator said, in
+        # words, that the data this build's instance collected may go too.
+        self.purge = purge
+        self.probe = probe or _https_status
+        self.sleep = sleep or time.sleep
+
+    # the engine's three calls ------------------------------------------
+    def check(self, typ, a, ctx):
+        return getattr(self, "_check_" + typ.replace(".", "_"))(a, ctx)
+
+    def do(self, typ, a, ctx):
+        return getattr(self, "_do_" + typ.replace(".", "_"))(a, ctx)
+
+    def undo(self, typ, a, made, ctx):
+        fn = getattr(self, "_undo_" + typ.replace(".", "_"), None)
+        if not fn:
+            return False, f"'{typ}' has nothing to undo"
+        return fn(a, made[0], ctx)
+
+    def audit(self, event, step, result, detail=""):
+        """Into the node's default tenant log and, once it exists, the new
+        tenant's own: the customer reads what was done in their name."""
+        tid, _t = tenant_by_label(self.label, include_former=False)
+        subject = f"{self.label}/{step}" if step else self.label
+        for where in {default_tenant_id(), tid or ""}:
+            if where:
+                audit_tenant(event, where, subject=subject, result=result,
+                             who=self.who, role=self.role, detail=detail)
+
+    # helpers -------------------------------------------------------------
+    def _tenant(self):
+        return tenant_by_label(self.label, include_former=False)
+
+    def _verb(self, argv, ok_note):
+        code, out = _run_verb(argv)
+        if code != 0:
+            return False, _brief(out, 3) or f"the verb stopped with {code}"
+        return True, ok_note
+
+    def claim(self, typ, a, ctx):
+        """What of a PRESENT result an interrupted step of this build
+        provably made. Only asked after a break inside that very step; a
+        tenant made by this build holds nothing that was not put there by
+        it, so what its steps find is theirs."""
+        tid, _t = self._tenant()
+        if not tid:
+            return []
+        if typ == "tenant.create":
+            return [f"tenant:{tid}"]
+        if typ == "idp.provision":
+            return [f"provider:{tid}"]
+        if typ == "app.install":
+            key = self._instance_key(a["name"])
+            return [f"instance:{key}"] if key else []
+        return []
+
+    # tenant.create -------------------------------------------------------
+    def _check_tenant_create(self, a, ctx):
+        tid, t = self._tenant()
+        if not t:
+            return ABSENT_, "no tenant with this label yet"
+        made = [m for r in ctx["state"]["steps"] for m in r.get("made") or []]
+        if f"tenant:{tid}" in made or (t.get("created") or "") >= ctx["started"]:
+            return PRESENT_, "the tenant exists"
+        return CONFLICT_, (f"a tenant '{self.label}' already exists and was "
+                           "not made by this build; it is not touched")
+
+    def _do_tenant_create(self, a, ctx):
+        argv = ["tenant", "create", a["label"].strip().lower()]
+        if a.get("title"):
+            argv += ["--name", a["title"]]
+        ok, note = self._verb(argv, "the tenant was created")
+        tid, _t = self._tenant()
+        return ok, note, ([f"tenant:{tid}"] if ok and tid else [])
+
+    def _undo_tenant_create(self, a, item, ctx):
+        if not self._tenant()[1]:
+            return True, "the tenant was already gone"
+        return self._verb(["tenant", "remove", self.label, "--yes"],
+                          "the (empty) tenant was removed")
+
+    # address.ensure / address.wait ----------------------------------------
+    def _check_address_ensure(self, a, ctx):
+        host = load_external()
+        if not host:
+            return PRESENT_, ("this node has no external name; there is no "
+                              "address to publish")
+        try:
+            with open(os.path.join(CADDY_APPS_DIR, "external.caddy"),
+                      encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return ABSENT_, "no generated gateway site yet"
+        if f"{self.label}.{host}" in text:
+            return PRESENT_, f"the gateway answers for {self.label}.{host}"
+        return ABSENT_, f"the gateway sites do not name {self.label}.{host}"
+
+    def _do_address_ensure(self, a, ctx):
+        placed = publish_tenant_place(self.label)
+        return ("not published" not in placed), (placed or "nothing to publish"), []
+
+    def _probe_url(self):
+        host = load_external()
+        return f"https://{self.label}.{host}/" if host else ""
+
+    def _check_address_wait(self, a, ctx):
+        url = self._probe_url()
+        if not url:
+            return PRESENT_, "this node has no external name; nothing to probe"
+        code = self.probe(url)
+        if code in (200, 302, 303):
+            return PRESENT_, f"{url} answers {code}"
+        return ABSENT_, f"{url} answers {code or 'nothing'}"
+
+    def _do_address_wait(self, a, ctx):
+        limit = int(a.get("timeout") or 120)
+        waited = 0
+        while True:
+            verdict, note = self._check_address_wait(a, ctx)
+            if verdict == PRESENT_:
+                return True, note, []
+            if waited >= limit:
+                return False, f"after {limit} s: {note}", []
+            self.sleep(5)
+            waited += 5
+
+    # idp.provision -------------------------------------------------------
+    def _check_idp_provision(self, a, ctx):
+        tid, t = self._tenant()
+        if not t:
+            return ABSENT_, "there is no tenant yet"
+        prov = idp.provider_of(t)
+        if not prov:
+            return ABSENT_, "the tenant has no identity provider yet"
+        if prov.get("connector") and prov["connector"] != a["connector"]:
+            return CONFLICT_, (f"the tenant already signs in through "
+                               f"'{prov['connector']}', not '{a['connector']}'")
+        return PRESENT_, (f"the tenant signs in through {prov['issuer']}")
+
+    def _do_idp_provision(self, a, ctx):
+        argv = ["idp", "provision", a["connector"], "--tenant", self.label]
+        if a.get("idp_label"):
+            argv += ["--idp-label", a["idp_label"]]
+        ok, note = self._verb(argv, "the realm and the client were set up")
+        tid, _t = self._tenant()
+        return ok, note, ([f"provider:{tid}"] if ok and tid else [])
+
+    def _undo_idp_provision(self, a, item, ctx):
+        tid, t = self._tenant()
+        if not t or not idp.provider_of(t):
+            return True, "the provider was already detached"
+        ok, note = self._verb(["tenant", "idp", self.label, "--clear-idp"],
+                              "the provider was detached from the tenant; "
+                              "the realm and every person in it stay")
+        return ok, note
+
+    # tenant.policy -------------------------------------------------------
+    def _check_tenant_policy(self, a, ctx):
+        tid, t = self._tenant()
+        if not t:
+            return ABSENT_, "there is no tenant yet"
+        if not t.get("idp_policy"):
+            return ABSENT_, "no first-login policy has been written down"
+        pol = idp.policy_of(t)
+        if "first_login" in a and pol["first_login"] != a["first_login"]:
+            return ABSENT_, f"first login is '{pol['first_login']}'"
+        if "default_role" in a and pol["default_role"] != a["default_role"]:
+            return ABSENT_, f"the default role is '{pol['default_role']}'"
+        if "self_registration" in a and \
+                pol["self_registration"] != (a["self_registration"] == "on"):
+            return ABSENT_, "self-registration differs from the wish"
+        return PRESENT_, "the first-login policy is as wished"
+
+    def _do_tenant_policy(self, a, ctx):
+        argv = ["tenant", "policy", self.label]
+        for key, flag in (("first_login", "--first-login"),
+                          ("default_role", "--default-role"),
+                          ("self_registration", "--self-registration")):
+            if key in a:
+                argv += [flag, a[key]]
+        ok, note = self._verb(argv, "the first-login policy was set")
+        return ok, note, []
+
+    # tenant.face ---------------------------------------------------------
+    def _check_tenant_face(self, a, ctx):
+        tid, t = self._tenant()
+        if not t:
+            return ABSENT_, "there is no tenant yet"
+        theme = t.get("theme") or {}
+        for key in ("title", "color_primary", "color_accent"):
+            if key in a and (theme.get(key) or "") != a[key]:
+                return ABSENT_, f"the face has a different {key.replace('_', ' ')}"
+        return PRESENT_, "the face is as wished"
+
+    def _do_tenant_face(self, a, ctx):
+        argv = ["tenant", "face", self.label]
+        for key, flag in (("title", "--title"),
+                          ("color_primary", "--color-primary"),
+                          ("color_accent", "--color-accent")):
+            if key in a:
+                argv += [flag, a[key]]
+        if len(argv) == 3:
+            return True, "no face was asked for", []
+        ok, note = self._verb(argv, "the tenant's face was set")
+        return ok, note, []
+
+    # app.install ---------------------------------------------------------
+    def _instance_key(self, name):
+        tid, _t = self._tenant()
+        if not tid:
+            return ""
+        for k, i in tenant_instances(load_registry(), tid).items():
+            if instance_name(k, i) == name:
+                return k
+        return ""
+
+    def _check_app_install(self, a, ctx):
+        key = self._instance_key(a["name"])
+        if key:
+            return PRESENT_, f"the instance '{a['name']}' exists in this tenant"
+        return ABSENT_, f"no instance '{a['name']}' in this tenant yet"
+
+    def _do_app_install(self, a, ctx):
+        argv = ["install", a["source"], "--tenant", self.label,
+                "--name", a["name"], "--channel", a.get("channel") or "production"]
+        if a.get("path"):
+            argv += ["--path", a["path"]]
+        if a.get("ref"):
+            argv += ["--ref", a["ref"]]
+        ok, note = self._verb(argv, f"'{a['name']}' was installed")
+        key = self._instance_key(a["name"])
+        return ok, note, ([f"instance:{key}"] if ok and key else [])
+
+    def _undo_app_install(self, a, item, ctx):
+        key = item.split(":", 1)[1]
+        tid, _t = self._tenant()
+        if not tid or key not in tenant_instances(load_registry(), tid):
+            return True, "the instance was already gone"
+        if self.purge:
+            return self._verb(["remove", key, "--purge"],
+                              "the instance and its data were removed")
+        return self._verb(["remove", key],
+                          "the instance was removed; its data is kept "
+                          "(no --purge), and it keeps the tenant from "
+                          "being removed")
+
+    # manual --------------------------------------------------------------
+    def _check_manual(self, a, ctx):
+        when = a["done_when"]
+        if when == "confirmed":
+            if (ctx.get("step") or {}).get("confirmed"):
+                return PRESENT_, "a human confirmed it"
+            return ABSENT_, "waiting for a human to confirm"
+        tid, _t = self._tenant()
+        users = _read_identity_users()
+        if users is None:
+            return ABSENT_, "the user store cannot be read (run as root)"
+        mine = [u for u in users if tid and resolve_tenant(u.get("tenant")) == tid]
+        if when == "user.exists":
+            return ((PRESENT_, f"{len(mine)} account(s) in this tenant")
+                    if mine else (ABSENT_, "no account in this tenant yet"))
+        admins = [u for u in mine if "tenant_admin" in (u.get("roles") or [])]
+        return ((PRESENT_, "an account holds tenant_admin") if admins
+                else (ABSENT_, "no account holds tenant_admin yet"))
+
+    # backup.check ---------------------------------------------------------
+    def _check_backup_check(self, a, ctx):
+        tid, _t = self._tenant()
+        if not tid:
+            return ABSENT_, "there is no tenant yet"
+        ex = excluded_tenants().get(tid)
+        if ex:
+            return CONFLICT_, ("the tenant is EXCLUDED from the node backup: "
+                               + str(ex.get("reason", "?")))
+        return PRESENT_, "the tenant is in the node backup"
+
+    def _do_backup_check(self, a, ctx):
+        return False, ("the tenant is not in the node backup and a build "
+                       "cannot change that"), []
+
+
+PRESENT_, ABSENT_, CONFLICT_ = (tenant_build.PRESENT, tenant_build.ABSENT,
+                                tenant_build.CONFLICT)
+
+
+def _build_actor():
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+def tenant_build_profile_path(pid):
+    if not tenant_build.ID_RE.match(str(pid or "")):
+        raise tenant_build.Refusal(f"'{pid}' is not a profile name")
+    return os.path.join(PROFILE_DIR, pid + ".json")
+
+
+def tenant_build_profiles():
+    """[(id, title, problem or '')] for every file in the profile folder."""
+    out = []
+    try:
+        names = sorted(os.listdir(PROFILE_DIR))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        try:
+            doc, _d = tenant_build.read_profile_file(
+                os.path.join(PROFILE_DIR, n))
+            out.append((n[:-5], doc.get("title", ""), ""))
+        except tenant_build.Refusal as exc:
+            out.append((n[:-5], "", str(exc)))
+    return out
+
+
+def tenant_build_start(pid, given, who, role, dry_run=False, drivers=None):
+    """Start a build -> the state document (or the plan for a dry run).
+
+    server_admin or the machine's root only, judged HERE and not by the
+    caller: this function is the one door the CLI, the portal action and
+    the API all go through.
+    """
+    if role not in ("root", "server_admin"):
+        raise tenant_build.Refusal("building a tenant needs server_admin")
+    profile, digest = tenant_build.read_profile_file(
+        tenant_build_profile_path(pid))
+    # Named before the label is judged: "taken" would be true of the very
+    # tenant the unfinished build made, and "continue it" is the better answer.
+    held = tenant_build.open_build_for(
+        BUILD_DIR, str(given.get("label") or "").strip().lower())
+    if held and not dry_run:
+        raise tenant_build.Refusal(
+            f"build {held['id']} for '{held['label']}' is not finished "
+            f"({held['state']}); continue it or roll it back first")
+    values, problems = tenant_build.param_values(
+        profile, given,
+        label_check=lambda lb: tenant_label_error(lb, "create"))
+    if problems:
+        raise tenant_build.Refusal("; ".join(problems))
+    label = values["label"].strip().lower()
+    values["label"] = label
+    # every step is rendered once now: a refusal in step nine is found
+    # before step one creates anything
+    steps = tenant_build.plan(profile, values)
+    if dry_run:
+        return {"plan": steps, "profile": profile["id"], "label": label}
+    state = tenant_build.new_state(profile, digest, values, who)
+    tenant_build.save_state(BUILD_DIR, state)
+    return _build_drive(state, profile, who, role, drivers)
+
+
+def _build_drive(state, profile, who, role, drivers=None):
+    drivers = drivers or _BuildDrivers(state["label"], who, role)
+    with tenant_build.RunLock(BUILD_DIR, state["id"]):
+        return tenant_build.run(state, profile, drivers, BUILD_DIR)
+
+
+def _build_load(bid, who, role):
+    if role not in ("root", "server_admin"):
+        raise tenant_build.Refusal("building a tenant needs server_admin")
+    state = tenant_build.load_state(BUILD_DIR, bid)
+    profile, digest = tenant_build.read_profile_file(
+        tenant_build_profile_path(state["profile"]))
+    return state, profile, digest
+
+
+def tenant_build_continue(bid, who, role, drivers=None, purge=False):
+    state, profile, digest = _build_load(bid, who, role)
+    if state["state"] in ("done", "rolled-back"):
+        raise tenant_build.Refusal(f"build {bid} is {state['state']}")
+    if digest != state["digest"]:
+        raise tenant_build.Refusal(
+            "the profile file changed since this build started (its digest "
+            "differs); start a new build instead of continuing this one")
+    if state.get("rolling_back"):
+        return _build_rollback_drive(state, profile, who, role, drivers, purge)
+    return _build_drive(state, profile, who, role, drivers)
+
+
+def tenant_build_confirm(bid, step, who, role, drivers=None):
+    state, profile, digest = _build_load(bid, who, role)
+    tenant_build.confirm(state, step, BUILD_DIR)
+    return _build_drive(state, profile, who, role, drivers)
+
+
+def _build_rollback_drive(state, profile, who, role, drivers=None,
+                          purge=False):
+    drivers = drivers or _BuildDrivers(state["label"], who, role, purge=purge)
+    with tenant_build.RunLock(BUILD_DIR, state["id"]):
+        return tenant_build.rollback(state, profile, drivers, BUILD_DIR)
+
+
+def tenant_build_rollback(bid, who, role, drivers=None, purge=False):
+    state, profile, _digest = _build_load(bid, who, role)
+    if state["state"] == "rolled-back":
+        raise tenant_build.Refusal(f"build {bid} is already rolled back")
+    return _build_rollback_drive(state, profile, who, role, drivers, purge)
+
+
+def _print_build(state, as_json=False):
+    if as_json:
+        print(json.dumps(state, indent=1, sort_keys=True))
+        return
+    print(f"Build {state['id']}  profile {state['profile']}  "
+          f"tenant '{state['label']}'  -> {state['state'].upper()}")
+    for r in state["steps"]:
+        print(f"  {r['state']:<8} {r['id']:<14} {r['type']:<16} {r['note']}")
+    if state["state"] == "waiting":
+        print(f"Waiting for a human. Do it, then: sudo oaap tenant build "
+              f"continue {state['id']}  (or `confirm {state['id']} --step "
+              "<step>` for a step that waits for a confirmation)")
+    elif state["state"] == "failed":
+        print(f"Fix the cause, then: sudo oaap tenant build continue "
+              f"{state['id']}  (or `rollback {state['id']}` to undo what "
+              "this build made)")
+
+
+def _tenant_build_cli(args):
+    sub = (args.name or "").strip().lower()
+    arg = args.target
+    who = _build_actor()
+    as_json = bool(getattr(args, "as_json", False))
+    given = {}
+    for item in getattr(args, "param", None) or []:
+        k, eq, v = item.partition("=")
+        if not eq:
+            die(f"--param wants key=value, not '{item}'")
+        given[k.strip()] = v
+    try:
+        if sub == "profiles":
+            rows = tenant_build_profiles()
+            if not rows:
+                print(f"No profiles in {PROFILE_DIR}.")
+            for pid, title, problem in rows:
+                print(f"  {pid:<24} {title}" + (f"  REFUSED: {problem}"
+                                                  if problem else ""))
+            return
+        if sub == "start":
+            if not arg:
+                die("which profile? oaap tenant build start <profile> "
+                    "--param label=<kürzel> --param title=\"…\"")
+            got = tenant_build_start(arg, given, who, "root",
+                                     dry_run=args.dry_run)
+            if args.dry_run:
+                if as_json:
+                    print(json.dumps(got, indent=1))
+                else:
+                    print(f"Dry run: profile {got['profile']} for "
+                          f"'{got['label']}' would do, in this order:")
+                    for sid, typ, a in got["plan"]:
+                        print(f"  {sid:<14} {typ:<16} "
+                              + json.dumps(a, ensure_ascii=False))
+                    print("Nothing was changed.")
+                return
+            _print_build(got, as_json)
+            if got["state"] == "failed":
+                sys.exit(1)
+            return
+        if sub == "show" or sub == "list":
+            if arg:
+                _print_build(tenant_build.load_state(BUILD_DIR, arg), as_json)
+            else:
+                rows = tenant_build.list_states(BUILD_DIR)
+                if as_json:
+                    print(json.dumps(rows, indent=1))
+                for st in ([] if as_json else rows):
+                    print(f"  {st['id']:<44} {st['state']:<11} {st['profile']}")
+                if not rows and not as_json:
+                    print("No builds yet.")
+            return
+        if sub in ("continue", "confirm", "rollback"):
+            if not arg:
+                die(f"which build? oaap tenant build {sub} <build id>")
+            if sub == "continue":
+                got = tenant_build_continue(
+                    arg, who, "root", purge=bool(args.purge_instances))
+            elif sub == "confirm":
+                if not args.step:
+                    die("which step? oaap tenant build confirm <id> --step <id>")
+                got = tenant_build_confirm(arg, args.step, who, "root")
+            else:
+                if not args.yes:
+                    state = tenant_build.load_state(BUILD_DIR, arg)
+                    made = [(r["id"], m) for r in state["steps"]
+                            for m in r.get("made") or []]
+                    print(f"Rolling back {arg} would undo, in this order:")
+                    for sid, m in reversed(made):
+                        print(f"  {sid}: {m}")
+                    if not made:
+                        print("  (this build made nothing)")
+                    print("The realm and every person in it stay. A tenant "
+                          "that holds anything is not removed.")
+                    if any(m.startswith("instance:") for _s, m in made):
+                        print("The data of the instance(s) above is KEPT "
+                              "(and then keeps the tenant from being "
+                              "removed). To delete that data too, say so: "
+                              "--purge-instances")
+                    print("Nothing was changed. Add --yes to do it.")
+                    return
+                got = tenant_build_rollback(
+                    arg, who, "root", purge=bool(args.purge_instances))
+            _print_build(got, as_json)
+            if got["state"] == "failed":
+                sys.exit(1)
+            return
+    except tenant_build.Refusal as exc:
+        die(str(exc))
+    die("oaap tenant build profiles | start <profile> | show [<id>] | "
+        "continue <id> | confirm <id> --step <id> | rollback <id> [--yes]")
+
+
 def cmd_tenant(args):
     """This node's tenants (spec 2.1/2.2).
 
@@ -5313,6 +5901,9 @@ def cmd_tenant(args):
     tenants = load_tenants()
     if not tenants:
         die("this node has no tenant store yet -- run `oaap update`")
+
+    if args.action == "build":
+        return _tenant_build_cli(args)
 
     if args.action == "remove":
         return _tenant_remove(args, tenants)
@@ -21271,7 +21862,8 @@ def main():
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
-                               "rename", "face", "idp", "policy", "adopt", "remove"])
+                               "rename", "face", "idp", "policy", "adopt", "remove",
+                               "build"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "
@@ -21327,6 +21919,19 @@ def main():
     pten.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="for 'adopt': say what would happen, write "
                            "nothing")
+    # The build profile (RFC-0055): `tenant build start|show|continue|...`
+    pten.add_argument("--param", action="append", default=[],
+                      metavar="KEY=VALUE",
+                      help="for 'build start': a parameter of the profile "
+                           "-- repeatable")
+    pten.add_argument("--purge-instances", dest="purge_instances",
+                      action="store_true",
+                      help="for 'build rollback': delete the data of the "
+                           "instances this build installed, too")
+    pten.add_argument("--step", default=None,
+                      help="for 'build confirm': the waiting step")
+    pten.add_argument("--json", dest="as_json", action="store_true",
+                      help="for 'build': the state as JSON")
     pten.add_argument("--clear-idp", dest="clear_idp", action="store_true",
                       help="detach the provider; the users' bindings stay")
     # What a FIRST login becomes (K4). Only server_admin gets here at
