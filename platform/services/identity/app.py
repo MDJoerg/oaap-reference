@@ -2052,6 +2052,7 @@ def _idp_principal(tid, provider, claims):
             audit("user.idp-login", tid, u["username"], who=u["username"],
                   role="-", detail=f"{pkey} · {factor or 'kein Faktor genannt'}"
                   + (" · Profil aktualisiert" if changed else ""))
+            _authz_sync_login(tid, u.get("id", ""), u["username"], claims)
             return u, ""
         roles, groups = idp.first_login_grant(policy, claims)
         username = idp.local_username(
@@ -2082,6 +2083,7 @@ def _idp_principal(tid, provider, claims):
                  f"Rollen: {','.join(roles) or '-'} · "
                  f"Gruppen: {','.join(groups) or '-'} · "
                  f"{factor or 'kein Faktor genannt'}")
+    _authz_sync_login(tid, record["id"], username, claims)
     return record, ""
 
 
@@ -3293,7 +3295,6 @@ AUTHZ_SCOPE = "oaap.authz"           # must agree with appctl.AUTHZ_KEY_SCOPE
 def load_authz():
     state = _load(AUTHZ_FILE, None) or {}
     base = authz.empty_state()
-    base["instances"] = {}
     for k, v in base.items():
         state.setdefault(k, v)
     return state
@@ -3633,3 +3634,89 @@ def authz_effective():
     resp = {"user": uid, "app": inst["app"], "tenant": inst["tenant"],
             "grants": grants, "fresh_for": authz.FRESH_FOR}
     return resp
+
+
+def _authz_sync_login(tid, user_id, username, claims):
+    """At EVERY login through a provider: the person's mapped groups
+    become (or stop being) assignments (RFC-0045 section 5.2).
+
+    Never refuses a login: rights bookkeeping must not lock a person out
+    of the place they are allowed to be in. A failure is reported and the
+    next login tries again. What it never does is read a group as a
+    platform role -- it cannot, this function has no way to name one.
+    """
+    try:
+        groups = idp.realm_groups(claims)
+        with authz_rw() as st:
+            added, ended = authz.sync_login(st, tid, user_id, groups)
+            if added or ended:
+                save_authz(st)
+                names = {cid: c["name"]
+                         for cid, c in st["collections"].items()}
+        if added or ended:
+            audit("authz.idp-sync", tid, username, who=username, role="-",
+                  detail="; ".join(
+                      [f"gegeben: {names.get(cid, cid)} (Gruppe {g})"
+                       for cid, g in added]
+                      + [f"beendet: {names.get(cid, cid)} (Gruppe {g})"
+                         for cid, g in ended]))
+    except Exception as e:                       # noqa: BLE001
+        print(f"WARNING: authorization sync at login failed for "
+              f"{username}: {e}", flush=True)
+
+
+@app.get("/internal/authz/mappings")
+def authz_mappings_list():
+    role, tenant, _u, bad = _authz_actor(request.args)
+    if bad:
+        return bad
+    st = load_authz()
+    names = {cid: c["name"] for cid, c in st["collections"].items()}
+    return {"mappings": [dict(m, collection_name=names.get(m["collection"], ""))
+                         for m in st["mappings"].values()
+                         if m["tenant"] == tenant]}
+
+
+@app.post("/internal/authz/mappings")
+def authz_mappings_create():
+    body = request.get_json(force=True, silent=True) or {}
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        by_name = {c["name"]: c["id"] for c in st["collections"].values()
+                   if c["tenant"] == tenant}
+        coll = body.get("collection")
+        coll = coll if coll in st["collections"] else by_name.get(coll, coll)
+        try:
+            mid = authz.add_mapping(st, tenant, str(body.get("group") or ""),
+                                    coll, who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 400
+        save_authz(st)
+        m = st["mappings"][mid]
+        cname = st["collections"][m["collection"]]["name"]
+    _authz_audit("authz.mapping-add", tenant, m["group"], actor["username"],
+                 role, f"Gruppe '{m['group']}' gibt '{cname}' "
+                       "(bei jeder Anmeldung neu gelesen)")
+    return {"ok": True, "mapping": m}, 201
+
+
+@app.delete("/internal/authz/mappings/<mid>")
+def authz_mappings_remove(mid):
+    body = request.get_json(force=True, silent=True) or {}
+    body = dict(request.args.to_dict(), **body)
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        try:
+            m = dict(st["mappings"].get(mid) or {})
+            n = authz.remove_mapping(st, tenant, mid, who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 404
+        save_authz(st)
+    _authz_audit("authz.mapping-remove", tenant, m.get("group", ""),
+                 actor["username"], role,
+                 f"{n} Zuordnung(en) beendet")
+    return {"ok": True, "ended": n}

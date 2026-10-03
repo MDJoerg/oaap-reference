@@ -299,6 +299,104 @@ refuses("eine unsaubere Erklaerung wird nicht registriert",
         lambda: az.register(copy.deepcopy(S), "x", "1", {"objects": 5}),
         "not sound")
 
+print("Die Gruppen des Anbieters (RFC-0045 Abschnitt 5)")
+DG = {
+    "objects": [
+        {"key": "news", "title": "News", "activities": ["read", "publish"],
+         "fields": [{"key": "area", "values": ["news", "sponsoring"]}]},
+        {"key": "team", "title": "Mannschaft", "activities": ["read"],
+         "fields": [{"key": "team", "context": "Mannschaft"}]},
+    ],
+    "role_templates": [
+        {"key": "leser", "title": "Leser", "grants": [
+            {"object": "news", "activities": ["read"]}]},
+        {"key": "obmann", "title": "Obmann", "may_grant": ["leser"],
+         "grants": [{"object": "news", "activities": ["read", "publish"]}]},
+        {"key": "trainer", "title": "Trainer", "grants": [
+            {"object": "team", "activities": ["read"], "team": "$context"}]},
+    ],
+}
+G = az.empty_state()
+az.register(G, "portal", "1", DG)
+r_leser = az.create_role(G, "T1", "portal", "leser", "Leser")
+r_obmann = az.create_role(G, "T1", "portal", "obmann", "Obmann")
+r_trainer = az.create_role(G, "T1", "portal", "trainer", "Trainer")
+c_leser = az.create_collection(G, "T1", "Lesende", [r_leser])
+c_obmann = az.create_collection(G, "T1", "Obleute", [r_obmann])
+c_trainer = az.create_collection(G, "T1", "Trainerteam", [r_trainer])
+ok("der Pfad wird ohne fuehrenden Schraegstrich verglichen",
+   az.group_path("/Verein/Hallenwart") == "Verein/Hallenwart")
+refuses("ein Gruppenname mit Steuerzeichen",
+        lambda: az.add_mapping(G, "T1", "a" + chr(1), c_leser), "path")
+refuses("eine leere Gruppe", lambda: az.add_mapping(G, "T1", "/", c_leser),
+        "path")
+refuses("KOEDER: eine Sammlung, die einen Kontext braucht, kann keine Gruppe geben",
+        lambda: az.add_mapping(G, "T1", "Trainer", c_trainer), "context")
+refuses("KOEDER: eine Sammlung mit may_grant kann keine Gruppe geben",
+        lambda: az.add_mapping(G, "T1", "Obleute", c_obmann), "may_grant")
+refuses("eine Sammlung eines anderen Mandanten",
+        lambda: az.add_mapping(G, "T2", "Lesende", c_leser), "no such")
+m1 = az.add_mapping(G, "T1", "/Verein/Hallenwart", c_leser, who="chef")
+ok("eine gueltige Abbildung", G["mappings"][m1]["group"] == "Verein/Hallenwart")
+refuses("dieselbe Abbildung noch einmal",
+        lambda: az.add_mapping(G, "T1", "Verein/Hallenwart", c_leser),
+        "already")
+
+added, ended = az.sync_login(G, "T1", "u-hans", ["Verein/Hallenwart", "Egal"])
+ok("wer in der Gruppe ist, bekommt die Sammlung", len(added) == 1 and not ended,
+   (added, ended))
+g = az.effective(G, "T1", "portal", "u-hans", today)
+ok("... und die App sieht das Recht", az.may(g, "news.read"))
+a = next(x for x in G["assignments"].values() if x["subject"] == "u-hans")
+ok("die Zuordnung sagt, woher sie kommt (idp, Gruppe)",
+   a["source"] == "idp" and a["via"] == "Verein/Hallenwart"
+   and a["granted_by"] == "idp:Verein/Hallenwart", a)
+added, ended = az.sync_login(G, "T1", "u-hans", ["Verein/Hallenwart"])
+ok("noch eine Anmeldung aendert nichts (idempotent)",
+   not added and not ended and sum(
+       1 for x in G["assignments"].values() if x["subject"] == "u-hans") == 1)
+added, ended = az.sync_login(G, "T1", "u-gast", ["Nicht/Abgebildet"])
+ok("KOEDER: eine Gruppe, die niemand abgebildet hat, gibt nichts",
+   not added and az.effective(G, "T1", "portal", "u-gast", today) == [])
+try:
+    added, ended = az.sync_login(G, "T2", "u-hans", ["Verein/Hallenwart"])
+except az.AuthzError:
+    added = None        # ein Absturz ist kein "gibt nichts" -- FAIL, nicht Abbruch
+ok("KOEDER: dieselbe Gruppe in einem ANDEREN Mandanten gibt dort nichts",
+   added == [], added)
+az.assign(G, "T1", c_leser, "u-ina", {}, granted_by="chef")
+az.sync_login(G, "T1", "u-ina", [])
+ok("ein von Hand gegebenes Recht bleibt, auch ohne Gruppe",
+   az.may(az.effective(G, "T1", "portal", "u-ina", today), "news.read"))
+added, ended = az.sync_login(G, "T1", "u-hans", ["Verein/Platzwart"])
+ok("KOEDER: Gruppe umbenannt oder verlassen -> das Recht ist beim naechsten Login weg",
+   len(ended) == 1 and az.effective(G, "T1", "portal", "u-hans", today) == [])
+ok("... die Zuordnung bleibt als beendet stehen, geloescht wird nichts",
+   a["id"] in G["assignments"] and a["ended"]
+   and a["ended_by"].startswith("login"))
+added, ended = az.sync_login(G, "T1", "u-hans", ["Verein/Hallenwart"])
+ok("kommt die Person zurueck, kommt das Recht zurueck (neue Zuordnung)",
+   len(added) == 1 and az.may(az.effective(G, "T1", "portal", "u-hans",
+                                           today), "news.read"))
+az.sync_login(G, "T1", "u-hans", None)
+ok("kein groups-Anspruch im Token heisst: keine Gruppen, das Recht faellt",
+   az.effective(G, "T1", "portal", "u-hans", today) == [])
+az.sync_login(G, "T1", "u-hans", ["Verein/Hallenwart"])
+az.sync_login(G, "T1", "u-hanna", ["Verein/Hallenwart"])
+n = az.remove_mapping(G, "T1", m1, who="chef")
+ok("eine entfernte Abbildung beendet sofort, was sie gegeben hat",
+   n == 2 and az.effective(G, "T1", "portal", "u-hans", today) == []
+   and az.effective(G, "T1", "portal", "u-hanna", today) == [], n)
+ok("... das von Hand gegebene Recht bleibt auch dann",
+   az.may(az.effective(G, "T1", "portal", "u-ina", today), "news.read"))
+refuses("eine Abbildung eines anderen Mandanten kann man nicht entfernen",
+        lambda: az.remove_mapping(G, "T2", m1), "no such mapping")
+m2 = az.add_mapping(G, "T1", "Verein/Hallenwart", c_leser)
+az.sync_login(G, "T1", "u-hans", ["Verein/Hallenwart"])
+G["collections"][c_leser]["roles"].append(r_trainer)
+az.sync_login(G, "T1", "u-hans", ["Verein/Hallenwart"])
+ok("eine Sammlung, die nachtraeglich einen Kontext braeuchte, wird nicht mehr gegeben",
+   az.effective(G, "T1", "portal", "u-hans", today) == [])
 print("")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fails else f"{fails} FEHLER")
 sys.exit(1 if fails else 0)

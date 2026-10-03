@@ -329,6 +329,109 @@ ok("Ben darf nun nicht mehr aufstellen (nur noch lesen)",
        eff("u-vp-ben", key_vp).get_json()["grants"]
        if x["object"] == "team"))
 
+print("Die Gruppen des Anbieters (RFC-0045 Abschnitt 5)")
+PROVIDER = {"kind": "oidc", "issuer": "https://kc.example/realms/vp",
+            "client_id": "oaap-x", "connector": "kc", "space": "vp"}
+tj = json.load(open(m.TENANTS_FILE, encoding="utf-8"))
+tj["tenants"]["t-vp"]["idp"] = dict(PROVIDER)
+json.dump(tj, open(m.TENANTS_FILE, "w", encoding="utf-8"))
+r = post("/internal/authz/mappings", {"group": "Verein/Hallenwart",
+                                      "collection": "Trainerteam"}, "vp_chef")
+ok("KOEDER: eine Sammlung mit Kontext kann keine Gruppe geben (400)",
+   r.status_code == 400 and "context" in r.get_json()["error"], r.get_json())
+r = post("/internal/authz/roles", {"app": "vereinsportal",
+                                   "template": "bereich", "name": "News lesen",
+                                   "values": {"area": ["sponsoring"]}}, "vp_chef")
+r = post("/internal/authz/collections", {"name": "Hallenwarte",
+                                         "roles": ["News lesen"]}, "vp_chef")
+coll_hw = r.get_json()["collection"]
+r = post("/internal/authz/mappings", {"group": "/Verein/Hallenwart",
+                                      "collection": "Hallenwarte"}, "ben")
+ok("ein einfacher Benutzer darf nichts abbilden", r.status_code == 403)
+r = post("/internal/authz/mappings", {"group": "/Verein/Hallenwart",
+                                      "collection": "Hallenwarte"}, "vp_chef")
+ok("der Mandantenverwalter bildet die Gruppe ab", r.status_code == 201
+   and r.get_json()["mapping"]["group"] == "Verein/Hallenwart", r.get_json())
+mapping = r.get_json()["mapping"]
+r = c.get("/internal/authz/mappings?actor=sgl_chef", headers=H)
+ok("der andere Mandant sieht die Abbildung nicht",
+   r.get_json()["mappings"] == [], r.get_json())
+r = post("/internal/authz/mappings/" + mapping["id"], {}, "sgl_chef",
+         method="delete")
+ok("... und kann sie nicht entfernen", r.status_code == 404)
+
+
+def login(sub, groups):
+    claims = {"sub": sub, "preferred_username": sub, "email": sub + "@x.example",
+              "email_verified": True, "name": sub.title()}
+    if groups is not None:
+        claims["groups"] = groups
+    u, bad = m._idp_principal("t-vp", PROVIDER, claims)
+    return u, bad
+
+
+u1, bad = login("hanna", ["/Verein/Hallenwart", "/Egal"])
+ok("die erste Anmeldung ueber den Anbieter gelingt", u1 and not bad, bad)
+rec, key_vp2 = m.issue_key(m.load_users(), "instance:vp-prod", ["user"],
+                           "oaap.authz", "authz", 90, "root")
+
+
+def grants_of(uid):
+    return eff(uid, key_vp2).get_json()["grants"]
+
+
+ok("schon beim ERSTEN Login gilt die Gruppe: die App sieht das Recht",
+   any(x["object"] == "news" and x["fields"] == {"area": ["sponsoring"]}
+       for x in grants_of(u1["id"])), grants_of(u1["id"]))
+roles_first = list(u1["roles"])
+u1b, _ = login("hanna", ["/Verein/Hallenwart"])
+ok("zweiter Login mit derselben Gruppe: eine Zuordnung, nicht zwei",
+   sum(1 for a in m.load_authz()["assignments"].values()
+       if a["subject"] == u1["id"] and not a["ended"]) == 1)
+u1c, _ = login("hanna", ["/Andere"])
+ok("KOEDER: Gruppe verlassen -> beim naechsten Login ist das Recht weg",
+   grants_of(u1["id"]) == [])
+ok("PLATTFORMROLLEN bleiben, wie die Richtlinie sie gab -- keine Gruppe aendert sie",
+   list(u1c["roles"]) == roles_first
+   and "tenant_admin" not in u1c["roles"]
+   and "server_admin" not in u1c["roles"], (roles_first, u1c["roles"]))
+u1d, _ = login("hanna", None)
+ok("ein Token ohne groups-Anspruch gibt kein Recht",
+   grants_of(u1["id"]) == [])
+login("hanna", ["/Verein/Hallenwart"])
+ok("KOEDER: ein Benutzer, der sich Gruppennamen ausdenkt, die niemand abbildete, bekommt nichts",
+   grants_of(login("mallory", ["/Verein/Hallenwart2", "tenant_admin",
+                               "server_admin", "/tenant_admin"])[0]["id"])
+   == [])
+um, _ = login("mallory", ["tenant_admin", "server_admin"])
+ok("... und seine Plattformrollen sind nicht die Namen der Gruppen",
+   "tenant_admin" not in um["roles"] and "server_admin" not in um["roles"],
+   um["roles"])
+acts = [e["action"] for e in audit_lines()]
+ok("im Protokoll: Abbildung und Abgleich beim Login",
+   "authz.mapping-add" in acts and "authz.idp-sync" in acts, acts)
+ok("der Abgleich steht im Protokoll des Mandanten vp",
+   all(e["tenant"] == "t-vp" for e in audit_lines()
+       if e["action"] == "authz.idp-sync"))
+
+real_sync = m.authz.sync_login
+
+
+def boom(*a, **k):
+    raise RuntimeError("Platte voll")
+
+
+m.authz.sync_login = boom
+uu, bad = login("hanna", ["/Verein/Hallenwart"])
+m.authz.sync_login = real_sync
+ok("ein Fehler beim Abgleich sperrt die Anmeldung NICHT aus", uu and not bad,
+   bad)
+
+r = post("/internal/authz/mappings/" + mapping["id"], {}, "vp_chef",
+         method="delete")
+ok("die Abbildung entfernen beendet sofort, was sie gab", r.status_code == 200
+   and r.get_json()["ended"] >= 1 and grants_of(u1["id"]) == [], r.get_json())
+
 print("")
 print("ALLE PRUEFUNGEN BESTANDEN" if not fails else f"{fails} FEHLER")
 sys.exit(1 if fails else 0)

@@ -45,7 +45,7 @@ class AuthzError(ValueError):
 
 def empty_state():
     return {"declarations": {}, "roles": {}, "collections": {},
-            "assignments": {}}
+            "assignments": {}, "instances": {}, "mappings": {}}
 
 
 def new_id():
@@ -464,7 +464,7 @@ def collection_contexts(state, collection):
 
 
 def assign(state, tenant, collection_id, subject, context=None,
-           valid_from=None, valid_to=None, granted_by=""):
+           valid_from=None, valid_to=None, granted_by="", source="", via=""):
     """Create an assignment. `granted_by` is whoever the caller authenticated
     as -- the caller of THIS function passes it, never the request body."""
     c = state["collections"].get(collection_id)
@@ -496,7 +496,8 @@ def assign(state, tenant, collection_id, subject, context=None,
         "subject": subject.strip(), "context": ctx,
         "valid_from": vf.isoformat() if vf else "",
         "valid_to": vt.isoformat() if vt else "",
-        "granted_by": granted_by, "granted_at": now_iso(), "ended": ""}
+        "granted_by": granted_by, "granted_at": now_iso(), "ended": "",
+        "source": source, "via": via}
     return aid
 
 
@@ -612,3 +613,125 @@ def may_any(grants, permission):
     return any(g.get("object") == ob and act in g.get("activities", ())
                and all(len(v) > 0 for v in (g.get("fields") or {}).values())
                for g in grants or ())
+
+
+# ---------------------------------------------------------------------------
+# The provider's groups (RFC-0045 section 5, stage 3)
+#
+# The provider says WHO a person is, OAAP says what they may do. A group
+# of the tenant's realm can stand for a role collection through a mapping
+# the tenant writes; a group nobody mapped grants nothing. Evaluated at
+# EVERY login, so that leaving the group takes the right away at the next
+# sign-in -- weaker than "the next request", and said so wherever it is
+# shown.
+#
+# What a group can never be: a platform role (nothing in this file knows
+# one), a context (a group says "is a trainer", not "of team mB" -- so a
+# collection that needs a context cannot be mapped), a way to hand rights
+# on (a collection with `may_grant` cannot be mapped either: a delegation
+# chain must not start in somebody else's console).
+
+GROUP_PATH_RE = re.compile(r"^[^\x00-\x1f/][^\x00-\x1f]{0,127}$")
+
+
+def group_path(raw):
+    """The form a group is compared in: the realm's path without the
+    leading slash, exactly as `idp.realm_groups` hands it over."""
+    return str(raw or "").strip().lstrip("/")
+
+
+def collection_blockers(state, collection):
+    """Why a collection cannot be given by a group, or ''."""
+    need = collection_contexts(state, collection)
+    if need:
+        return ("it needs a context ("
+                + ", ".join(sorted({fk for (_a, _t, _o, fk) in need}))
+                + "): a group says 'is a trainer', not 'of which team'")
+    for rid in collection["roles"]:
+        r = state["roles"][rid]
+        tpl = _template(_decl(state, r["app"]), r["template"])
+        if tpl.get("may_grant"):
+            return (f"the role '{r['name']}' may hand rights on "
+                    "(may_grant): a delegation chain must not start in the "
+                    "provider's console")
+    return ""
+
+
+def add_mapping(state, tenant, group, collection_id, who=""):
+    grp = group_path(group)
+    if not GROUP_PATH_RE.match(grp):
+        raise AuthzError("a group is named by its path in the realm, "
+                         "e.g. 'Verein/Hallenwart'")
+    c = state["collections"].get(collection_id)
+    if not c or c["tenant"] != tenant:
+        raise AuthzError("this tenant has no such collection")
+    why = collection_blockers(state, c)
+    if why:
+        raise AuthzError(f"the collection '{c['name']}' cannot be given by "
+                         f"a group: {why}")
+    if any(m["tenant"] == tenant and m["group"] == grp
+           and m["collection"] == collection_id
+           for m in state["mappings"].values()):
+        raise AuthzError("this group already gives this collection")
+    mid = new_id()
+    state["mappings"][mid] = {"id": mid, "tenant": tenant, "group": grp,
+                              "collection": collection_id,
+                              "created": now_iso(), "by": who}
+    return mid
+
+
+def remove_mapping(state, tenant, mapping_id, who=""):
+    """Remove a mapping AND end what it gave, at once.
+
+    The people it reached keep nothing: a rule that is gone must not leave
+    its results standing until each person happens to sign in again.
+    Returns the number of assignments ended.
+    """
+    m = state["mappings"].get(mapping_id)
+    if not m or m["tenant"] != tenant:
+        raise AuthzError("this tenant has no such mapping")
+    del state["mappings"][mapping_id]
+    n = 0
+    for a in state["assignments"].values():
+        if (a["tenant"] == tenant and a.get("source") == "idp"
+                and a.get("via") == m["group"]
+                and a["collection"] == m["collection"] and not a["ended"]):
+            a["ended"] = now_iso()
+            a["ended_by"] = "mapping removed" + (f" by {who}" if who else "")
+            n += 1
+    return n
+
+
+def sync_login(state, tenant, user_id, groups):
+    """Bring a person's provider-given assignments in line with the groups
+    the provider asserts NOW. (added, ended) as lists of (collection, group).
+
+    Touches only assignments this function made (`source == 'idp'`); a
+    right somebody gave by hand stays as it is. A collection that has meanwhile
+    become unmappable is ended, not given. No `groups` claim at all (a client
+    without the mapper) is "no groups": the rights drop, they do not stay.
+    """
+    held = {group_path(g) for g in groups or ()}
+    wanted = {}
+    for m in state["mappings"].values():
+        if m["tenant"] != tenant or m["group"] not in held:
+            continue
+        c = state["collections"].get(m["collection"])
+        if not c or c["tenant"] != tenant or collection_blockers(state, c):
+            continue
+        wanted.setdefault(m["collection"], m["group"])
+    live = {a["collection"]: a for a in state["assignments"].values()
+            if a["tenant"] == tenant and a["subject"] == user_id
+            and a.get("source") == "idp" and not a["ended"]}
+    added, ended = [], []
+    for cid, grp in sorted(wanted.items()):
+        if cid not in live:
+            assign(state, tenant, cid, user_id, {}, granted_by="idp:" + grp,
+                   source="idp", via=grp)
+            added.append((cid, grp))
+    for cid, a in sorted(live.items()):
+        if cid not in wanted:
+            a["ended"] = now_iso()
+            a["ended_by"] = "login: group no longer asserted"
+            ended.append((cid, a.get("via", "")))
+    return added, ended

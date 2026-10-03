@@ -134,6 +134,8 @@ CONNECTOR_KINDS = {
                 "/admin/realms/{space}/groups/{uuid}/role-mappings/clients/"
                 "{client}",
             "client_roles": "/admin/realms/{space}/clients/{client}/roles",
+            "client_mappers":
+                "/admin/realms/{space}/clients/{uuid}/protocol-mappers/models",
             "realm_roles": "/admin/realms/{space}/roles",
             "realm_role_composites":
                 "/admin/realms/{space}/roles/{alias}/composites",
@@ -147,6 +149,17 @@ CONNECTOR_KINDS = {
         # 403 everywhere else -- except that an EXISTING realm role that
         # is a composite over `realm-admin` can still be assigned, which
         # is why `escalation_roles` refuses before anything is written.
+        # RFC-0045 stage 3: the token carries the groups of the person --
+        # but ONLY through a mapper on the client, and the client OAAP
+        # makes had none (measured 2026-10-03: no `groups` claim reached
+        # OAAP at all). The claim holds the group PATH, never an id: the
+        # product's own mapper offers nothing else (measured), which is why
+        # a mapping is by path and a renamed group stops granting.
+        "group_claim": {
+            "mapper": "oidc-group-membership-mapper",
+            "name": "oaap-groups",
+            "claim": "groups",
+        },
         "admin_group": {
             "name": "oaap-verwalter",
             "roles_client": "realm-management",
@@ -600,6 +613,11 @@ def provision_plan(kind, space, client_id):
          "path": p("client", uuid="<id>"),
          "why": "add this node's redirect URI to a client that was already "
                 "there -- and nothing else about it is touched"},
+        {"verb": "client", "method": "POST", "when": "different",
+         "writes": True, "path": p("client_mappers", uuid="<id>"),
+         "why": "add the group claim to a client that was already there, "
+                "if it has none -- the token then carries the person's "
+                "groups, which a tenant may map to roles (RFC-0045 5)"},
         {"verb": "client", "method": "GET", "when": "always", "writes": False,
          "path": p("client_secret", uuid="<id>"),
          "why": "fetch the client secret, the one value OAAP keeps"},
@@ -788,6 +806,30 @@ def _keycloak_space_body(space, title=""):
     }
 
 
+def _keycloak_group_mapper():
+    """The mapper that puts the person's groups into the token as full
+    paths (`/Verein/Hallenwart`). Read by `idp.realm_groups`, used only
+    to look a group up in a tenant's own mapping (RFC-0045 section 5)."""
+    g = CONNECTOR_KINDS["keycloak"]["group_claim"]
+    return {"name": g["name"], "protocol": "openid-connect",
+            "protocolMapper": g["mapper"],
+            "config": {"claim.name": g["claim"], "full.path": "true",
+                       "id.token.claim": "true", "access.token.claim": "true",
+                       "userinfo.token.claim": "true"}}
+
+
+def has_group_mapper(kind, client_doc):
+    """Whether a client already carries a mapper that puts the groups in
+    the token under the claim OAAP reads -- by what it DOES, not by its name,
+    so a mapper somebody made by hand counts."""
+    g = connector_of(kind).get("group_claim") or {}
+    for mp in (client_doc or {}).get("protocolMappers") or ():
+        cfg = mp.get("config") or {}
+        if mp.get("protocolMapper") == g.get("mapper")                 and cfg.get("claim.name") == g.get("claim")                 and str(cfg.get("id.token.claim", "")).lower() == "true":
+            return True
+    return False
+
+
 def _keycloak_client_body(client_id, redirect_uris, name=""):
     """The client OAAP presents itself as at Keycloak.
 
@@ -814,6 +856,7 @@ def _keycloak_client_body(client_id, redirect_uris, name=""):
         "serviceAccountsEnabled": False,
         "redirectUris": list(redirect_uris or []),
         "webOrigins": [],
+        "protocolMappers": [_keycloak_group_mapper()],
     }
 
 
@@ -1674,6 +1717,37 @@ class Admin:
                    + ", ".join(absent))
         return True, ""
 
+    def add_group_mapper(self, space, uuid, client_doc):
+        """(ok, sentence). Add the group claim to a client that was found.
+
+        Only when it is missing, and only this one mapper: the same posture
+        as the redirect URI -- extended, never replaced, nothing else about
+        the client touched (K3.3).
+        """
+        if has_group_mapper(self.kind, client_doc):
+            return True, ""
+        status, _doc, err = self._call(
+            "POST", self._path("client_mappers", space=space, uuid=uuid),
+            body=_keycloak_group_mapper())
+        if err:
+            return False, err
+        if status == 403:
+            return False, self._not_ours(space, "give a client a mapper")
+        if status == 409:
+            # A mapper of that NAME is there and was judged above not to
+            # put the groups in the token under the claim OAAP reads. Saying
+            # "fine" here would be a login that never carries a group.
+            return False, ("this client already has a mapper named '"
+                           + _keycloak_group_mapper()["name"] + "' that does "
+                           "not put the groups into the token as 'groups' "
+                           "(or not into the ID token) -- OAAP does not "
+                           "change somebody else's mapper; fix or remove it "
+                           "in the product and run this again")
+        if status not in (201, 204):
+            return False, f"adding the group claim answered {status}"
+        self._note("added the group claim to the existing client")
+        return True, ""
+
     def client_secret(self, space, uuid):
         """(secret, error)."""
         status, doc, err = self._call(
@@ -2101,6 +2175,9 @@ class Admin:
                                    "found again -- refusing to guess")
         else:
             ok, msg = self.add_redirects(space, uuid, doc, redirect_uris)
+            if not ok:
+                return False, {}, msg
+            ok, msg = self.add_group_mapper(space, uuid, doc)
             if not ok:
                 return False, {}, msg
         secret, err = self.client_secret(space, uuid)
