@@ -77,6 +77,19 @@
 		reverse_proxy portal:8000
 	}
 
+	# The prospect's request form (RFC-0055 stage 4): an invitation link is
+	# the only proof, validated by the portal -- no session, no identity
+	# headers. The page produces a REQUEST that a signed-in server_admin
+	# decides on; nothing is built from it.
+	handle /anfrage {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
+		reverse_proxy portal:8000
+	}
+
 	# Fleet status (RFC-0021): read-only status document, authorized by
 	# a revocable fleet key, validated by the portal — no session, no
 	# identity headers.

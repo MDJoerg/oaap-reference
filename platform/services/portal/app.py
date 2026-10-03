@@ -17,12 +17,12 @@ resources.
 import json
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
-from flask import (Flask, g, redirect, render_template_string, request,
-                   send_file)
+from flask import (Flask, g, make_response, redirect, render_template_string,
+                   request, send_file)
 from markupsafe import Markup
 
 import build_view
@@ -9940,6 +9940,7 @@ BUILD_BANNER = """
 BUILD_LIST_BODY = """
 <div class="pagehead"><h1>Aufbau</h1></div>
 """ + BUILD_BANNER + """
+<p><a class="btn" href="/aufbau/anfragen">Einladungen und Anträge{% if pending %} ({{ pending }} offen){% endif %}</a></p>
 <div class="card">
 <h2>Profile</h2>
 {% if profiles %}
@@ -10125,6 +10126,7 @@ def build_page():
     view = _build_view()
     return page(BUILD_LIST_BODY, "Aufbau", "build",
                 rows=build_view.rows(view), profiles=build_view.profiles(view),
+                pending=build_view.pending_count(_request_view()),
                 job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
                 error=request.args.get("err"))
 
@@ -10216,3 +10218,326 @@ def build_act_page(bid, verb):
         args["purge_instances"] = False
     rid = management_api.enqueue(sc[0], sc[1], verb, args, action="tenant-build")
     return redirect(f"/aufbau/{bid}?job={rid}")
+
+
+# ---------------------------------------------------------------------------
+# Invitations and requests (RFC-0055 stage 4, oaap.core.portal 2.10).
+#
+# Two sides. The operator creates an INVITATION (a link, once usable, with an
+# expiry, tied to one profile) and later decides on REQUESTS; both are
+# buttons that queue what the host judges again (`tenant-request`). The
+# prospect has ONE public page, `/anfrage?t=<link>`: the link is the only
+# proof, nothing is built from it, and what it produces is a request that a
+# signed-in server_admin approves. The portal writes only into the spool.
+
+REQUEST_VIEW_FILE = "/apps-registry/request-view.json"
+PUBLIC_SUBMIT_BODY_MAX = 8192
+PUBLIC_SUBMIT_WINDOW = 60.0      # seconds
+PUBLIC_SUBMIT_MAX = 10           # accepted submissions per window, per worker process
+# The link is a QUERY value on purpose: the gateway's access log strips the
+# query of every request (see `_log_filter`) and would keep a path. The
+# portal runs several worker processes, so the brake and the "already sent"
+# memory are per process; the host spends a link with its first request, so
+# neither is what keeps a link single-use.
+PUBLIC_LINK_MEMORY = 900.0       # a link that was just sent is not sent twice
+_public_sent = {}                # sha256(link) -> time of the last queueing
+_public_log = []                 # times of the last queued submissions
+
+
+def _request_view():
+    try:
+        with open(REQUEST_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _link_base():
+    """Scheme and host of the page the operator is on -- the link is for
+    the same address."""
+    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+    return f"{'https' if scheme == 'https' else 'http'}://{request.host}"
+
+
+PUBLIC_REQUEST_PAGE = STYLE + """
+<!doctype html><html lang="de"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<link rel="icon" href=\"""" + FAVICON + """\">
+<title>Mandant beantragen — OAAP</title>
+<body style="display:grid;place-items:center;min-height:100vh">
+<main style="width:min(30rem,94vw);margin:0">
+  <div class="card">
+  <h1>Mandant beantragen</h1>
+  {% if state == 'dead' %}
+    <p class="err">Dieser Link gilt nicht (mehr).</p>
+    <p class="muted">Bitte wenden Sie sich an die Person, die Ihnen den Link gegeben hat.</p>
+  {% elif state == 'sent' %}
+    <p class="ok">Ihre Angaben sind abgeschickt.</p>
+    <p>Ein Mensch prüft sie und meldet sich unter der angegebenen Adresse. Der Link ist damit
+    verbraucht. Eine automatische Bestätigung per E-Mail gibt es nicht.</p>
+  {% else %}
+    <p class="muted">Sie wurden eingeladen, einen eigenen Bereich (Mandanten) auf dieser Plattform
+    zu beantragen. Nichts wird sofort eingerichtet: ein Mensch prüft Ihren Antrag zuerst.</p>
+    {% if error %}<p class="err">{{ error }}</p>{% endif %}
+    <form method="post" action="/anfrage?t={{ token }}" autocomplete="off">
+      {% for f in fields %}
+      <p>
+      {% if f.kind == 'color' %}
+        <label>{{ f.label }}
+          <input type="color" name="{{ f.name }}" value="{{ values.get(f.name) or f.default or '#2563eb' }}"></label>
+        <label class="seatopt"><input type="checkbox" name="{{ f.name }}__none" value="1"
+          {% if values.get(f.name ~ '__none') or (not values.get(f.name) and not f.default and not f.required) %}checked{% endif %}>
+          keine Farbe</label>
+      {% else %}
+        <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
+          <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
+            {% if f.required %}required{% endif %}
+            {% if f.kind == 'label' %}maxlength="31" pattern="[a-z0-9][a-z0-9-]*"{% else %}maxlength="{{ f.max or 120 }}"{% endif %}></label>
+        {% if f.kind == 'label' %}<span class="muted">Kleinbuchstaben, Ziffern und „-“. Das Kürzel wird Teil der
+          Internetadressen Ihres Bereichs und ist damit <strong>öffentlich</strong>; wählen Sie eines,
+          das nichts Vertrauliches verrät.</span>{% endif %}
+      {% endif %}
+      </p>
+      {% endfor %}
+      <p><label>E-Mail-Adresse, unter der wir Sie erreichen <span class="muted">(Pflicht)</span>
+        <input type="email" name="contact" value="{{ values.get('contact', '') }}" required maxlength="160"></label>
+      <span class="muted">Nur dafür gespeichert, Ihnen zu antworten; sie wird {{ keep }} Tage nach der
+      Entscheidung gelöscht.</span></p>
+      <button class="btn">Antrag abschicken</button>
+    </form>
+  {% endif %}
+  </div>
+</main></body></html>
+"""
+
+
+def _public_gone():
+    """The one answer for a link that does not apply: dead, unknown, used,
+    revoked and expired are not told apart to a stranger."""
+    resp = make_response(render_template_string(
+        PUBLIC_REQUEST_PAGE, state="dead", token="", fields=[], values={},
+        keep=30, error=None), 404)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _public_form(token, prof, values=None, error=None, status=200):
+    resp = make_response(render_template_string(
+        PUBLIC_REQUEST_PAGE, state="form", token=token,
+        fields=build_view.fields(prof), values=values or {}, keep=30,
+        error=error), status)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _public_ready(token):
+    """(profile, None) when this link is live at this address, else (None,
+    the answer)."""
+    if host_tenant_scope(request.host)[0]:
+        return None, _public_gone()          # not at a tenant's place
+    pid = build_view.token_profile(_request_view(), token)
+    prof = build_view.find_profile(_build_view(), pid) if pid else None
+    if prof is None:
+        return None, _public_gone()
+    return prof, None
+
+
+@app.get("/anfrage")
+def public_request_page():
+    token = request.args.get("t", "")
+    prof, gone = _public_ready(token)
+    return gone if gone else _public_form(token, prof)
+
+
+@app.post("/anfrage")
+def public_request_submit():
+    token = request.args.get("t", "")
+    prof, gone = _public_ready(token)
+    if gone:
+        return gone
+    if (request.content_length or 0) > PUBLIC_SUBMIT_BODY_MAX:
+        return "Anfrage zu groß.", 413
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    params, contact, errors = build_view.public_params(prof, request.form)
+    if errors:
+        return _public_form(token, prof, dict(request.form), " ".join(errors), 400)
+    now = _time.monotonic()
+    _public_log[:] = [t for t in _public_log if now - t < PUBLIC_SUBMIT_WINDOW]
+    h = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    for k in [k for k, t in _public_sent.items() if now - t > PUBLIC_LINK_MEMORY]:
+        del _public_sent[k]
+    if len(_public_log) >= PUBLIC_SUBMIT_MAX:
+        return _public_form(token, prof, dict(request.form),
+                            "Gerade sind zu viele Anträge unterwegs. Bitte in einer "
+                            "Minute noch einmal versuchen.", 429)
+    if h not in _public_sent:
+        # once per link and quarter hour: a second press changes nothing on
+        # the host either (the link is spent by the first request)
+        _public_sent[h] = now
+        _public_log.append(now)
+        management_api.enqueue("", "", "submit",
+                               {"token": token, "params": params,
+                                "contact": contact},
+                               action="tenant-request-submit")
+    resp = make_response(render_template_string(
+        PUBLIC_REQUEST_PAGE, state="sent", token="", fields=[], values={},
+        keep=30, error=None), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ---- the operator's side
+
+REQUEST_LIST_BODY = """
+<a class="back" href="/aufbau">← Zurück zu Aufbau</a>
+<div class="pagehead"><h1>Einladungen und Anträge</h1></div>
+""" + BUILD_BANNER + """
+{% if new_link %}
+<div class="card warn">
+  <h2>Der Einladungslink</h2>
+  <p><strong>Er wird nur dieses eine Mal angezeigt.</strong> Der Knoten speichert davon nur eine
+  Prüfsumme; später kann man ihn nicht wieder ansehen, nur eine neue Einladung ausstellen.</p>
+  <p><code style="display:block;padding:.7rem;word-break:break-all">{{ new_link }}</code></p>
+  <p class="muted">Gültig bis {{ new_until }}, einmal benutzbar. Weitergabe nur an die eine Person, in einem
+  Kanal, den nur ihr beide lest. Ein Antrag daraus legt nichts an: er wartet hier auf deine Freigabe.</p>
+</div>
+{% endif %}
+<div class="card" style="overflow-x:auto">
+  <h2>Anträge {% if pending %}<span class="badge todo">{{ pending }} offen</span>{% endif %}</h2>
+  {% if requests %}
+  <table>
+    <tr><th>Mandant</th><th>Angaben</th><th>Kontakt</th><th>Zustand</th><th></th></tr>
+    {% for r in requests %}
+    <tr>
+      <td><strong>{{ r.label }}</strong><br><span class="muted">{{ r.profile }} · {{ r.created }}</span>
+        {% if r.note %}<br><span class="muted">Einladung: {{ r.note }}</span>{% endif %}</td>
+      <td>{% for k, v in r.params %}<span class="muted">{{ k }}:</span> {{ v }}<br>{% endfor %}</td>
+      <td>{{ r.contact or '—' }}</td>
+      <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span>
+        {% if r.decided %}<br><span class="muted">{{ r.decided }} · {{ r.by }}</span>{% endif %}
+        {% if r.reason %}<br><span class="muted">{{ r.reason }}</span>{% endif %}
+        {% if r.build %}<br><a href="/aufbau/{{ r.build }}">zum Aufbau</a>{% endif %}</td>
+      <td>{% if r.raw == 'pending' %}
+        <form method="post" action="/aufbau/anfragen/{{ r.id }}/freigeben" style="display:inline">
+          <button class="btn">Freigeben und aufbauen</button></form>
+        <form method="post" action="/aufbau/anfragen/{{ r.id }}/ablehnen" style="margin-top:.4rem">
+          <input type="text" name="reason" placeholder="Grund (optional)" maxlength="200">
+          <button class="btn" style="background:#b91c1c">Ablehnen</button></form>
+        {% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Freigeben startet den Aufbau mit <strong>deiner</strong> Anmeldung, wie unter
+  „Aufbau starten“. Beim Ablehnen wird die E-Mail-Adresse sofort gelöscht.</p>
+  {% else %}<p class="muted">Noch kein Antrag.</p>{% endif %}
+</div>
+<div class="card">
+  <h2>Neue Einladung</h2>
+  {% if profiles %}
+  <form method="post" action="/aufbau/anfragen/einladen">
+    <label>Profil
+      <select name="profil">{% for p in profiles %}{% if not p.problem %}
+        <option value="{{ p.id }}">{{ p.id }}{% if p.title %} — {{ p.title }}{% endif %}</option>{% endif %}{% endfor %}
+      </select></label>
+    <label>Für wen (nur zu deiner Erinnerung)
+      <input type="text" name="note" maxlength="80" autocomplete="off"></label>
+    <label>Gültig (Tage) <input type="number" name="days" value="14" min="1" max="60"></label>
+    <p class="muted">Der Interessent füllt <strong>alle Parameter des Profils</strong> aus, dazu seine
+    E-Mail-Adresse. Wer nur einen Teil fragen soll, braucht ein eigenes, schmaleres Profil.</p>
+    <button class="btn">Einladung erzeugen</button>
+  </form>
+  {% else %}<p class="muted">Es gibt kein gültiges Profil, für das man einladen könnte.</p>{% endif %}
+</div>
+<div class="card" style="overflow-x:auto">
+  <h2>Einladungen</h2>
+  {% if invites %}
+  <table>
+    <tr><th>Einladung</th><th>Profil</th><th>Zustand</th><th>Gültig bis</th><th></th></tr>
+    {% for i in invites %}
+    <tr>
+      <td>{% if i.note %}{{ i.note }}{% else %}<span class="muted">ohne Notiz</span>{% endif %}<br>
+        <span class="muted">{{ i.created }} · {{ i.by }}</span></td>
+      <td>{{ i.profile }}</td>
+      <td><span class="badge {{ '' if i.tone == 'ok' else 'off' if i.tone == 'off' else 'todo' }}">{{ i.state }}</span></td>
+      <td>{{ i.expires }}</td>
+      <td>{% if i.raw == 'open' %}
+        <form method="post" action="/aufbau/anfragen/{{ i.id }}/widerrufen" style="display:inline">
+          <button class="btn" style="background:#b91c1c">Widerrufen</button></form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Noch keine Einladung.</p>{% endif %}
+</div>
+"""
+
+
+def _request_page(sc, status=200, **extra):
+    view, rv = _build_view(), _request_view()
+    ctx = dict(requests=build_view.request_rows(rv), invites=build_view.invite_rows(rv),
+               pending=build_view.pending_count(rv),
+               profiles=build_view.profiles(view),
+               job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
+               error=request.args.get("err"), new_link=None, new_until="")
+    ctx.update(extra)
+    return page(REQUEST_LIST_BODY, "Einladungen und Anträge", "build", status=status, **ctx)
+
+
+@app.get("/aufbau/anfragen")
+def request_list_page():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    return _request_page(sc)
+
+
+@app.post("/aufbau/anfragen/einladen")
+def invite_create_page():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    pid = request.form.get("profil", "")
+    if build_view.find_profile(_build_view(), pid) is None:
+        return _request_page(sc, 404, error="Dieses Profil gibt es nicht.")
+    try:
+        days = int(request.form.get("days") or 14)
+    except ValueError:
+        return _request_page(sc, 400, error="Die Gültigkeit muss eine Zahl in Tagen sein.")
+    if not 1 <= days <= 60:
+        return _request_page(sc, 400, error="Eine Einladung gilt 1 bis 60 Tage.")
+    token = secrets.token_urlsafe(32)
+    note = " ".join(request.form.get("note", "").split())[:80]
+    management_api.enqueue(sc[0], sc[1], "invite",
+                           {"profile": pid, "token": token, "note": note, "days": days},
+                           action="tenant-request")
+    until = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d")
+    resp = make_response(_request_page(sc, new_link=f"{_link_base()}/anfrage?t={token}",
+                                       new_until=until))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.post("/aufbau/anfragen/<rid>/<verb>")
+def request_act_page(rid, verb):
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    item = build_view.find_item(_request_view(), rid)
+    kind = {"widerrufen": "inv", "freigeben": "req", "ablehnen": "req"}.get(verb)
+    if item is None or kind is None or not rid.startswith(kind + "-"):
+        return redirect("/aufbau/anfragen")
+    if item.get("state") != ("open" if verb == "widerrufen" else "pending"):
+        return redirect("/aufbau/anfragen?err=" + quote(
+            "Das ist schon entschieden oder nicht mehr offen."))
+    op = {"widerrufen": "revoke", "freigeben": "approve", "ablehnen": "reject"}[verb]
+    args = {"id": rid}
+    if verb == "ablehnen":
+        args["reason"] = " ".join(request.form.get("reason", "").split())[:200]
+    job = management_api.enqueue(sc[0], sc[1], op, args, action="tenant-request")
+    return redirect(f"/aufbau/anfragen?job={job}")

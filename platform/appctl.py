@@ -70,6 +70,8 @@ import place  # noqa: E402  (after the path insert, necessarily)
 import idp  # noqa: E402
 # The tenant build profile (RFC-0055): the pure half of a build.
 import tenant_build  # noqa: E402
+# Invitations and requests in front of a build (RFC-0055 stage 4).
+import tenant_request  # noqa: E402
 # And the admin path of K3 (RFC-0041 step 4): OAAP creates the realm
 # and the client itself. Beside idp.py on purpose -- the portal wizard
 # of RFC-0041 6 is the second door, and when it comes it imports this
@@ -137,8 +139,10 @@ SPOOL_CLAIMS = os.path.join(SPOOL_DIR, "claims")
 # first-run wizard's profile ('node') the setup token. Every other
 # action comes from a signed-in session and must name an active user
 # (cmd_process_deploys).
+# "tenant-request-submit" is the prospect's form (RFC-0055 stage 4): its
+# proof is the invitation link, checked here against the stored hash.
 SPOOL_ACTIONS_WITHOUT_ACTOR = frozenset({"redeploy", "announce", "artifact",
-                                         "node"})
+                                         "node", "tenant-request-submit"})
 # How long one deploy request may take before it is called off. A build
 # that hangs used to block every later deployment for every instance,
 # with nothing anywhere saying so (RFC-0024). A recorded failure is
@@ -4227,13 +4231,13 @@ def cmd_idp(args):
     if action == "export":
         return _idp_export(args, name, c)
 
+    if action == "admin-group":
+        return _idp_admin_group(args, name, c)
+
     die(f"unknown action '{action}'")
 
 
 def _connector_instance(kind):
-    if action == "admin-group":
-        return _idp_admin_group(args, name, c)
-
     """(instance name, record, error) -- the instance that serves this
     connector's product on THIS node.
 
@@ -4592,10 +4596,6 @@ def _idp_settings(args, name, c):
         print("and it is the reason self-registration is safe here.")
 
 
-def _print_idp(label, t):
-    """What this tenant's way in looks like right now.
-
-    One printer for both `tenant idp` and `tenant policy` with no
 def _idp_admin_group(args, name, c):
     """`oaap idp admin-group <connector> --tenant <label>` (RFC-0056).
 
@@ -4664,6 +4664,10 @@ def _idp_admin_group(args, name, c):
     print("sees and changes people and groups of THIS space and nothing else.")
 
 
+def _print_idp(label, t):
+    """What this tenant's way in looks like right now.
+
+    One printer for both `tenant idp` and `tenant policy` with no
     arguments, because they are two halves of one answer and an
     operator asking either of them wants to see both.
     """
@@ -5808,7 +5812,8 @@ def job_result_fill(req, rid, ok, msg):
     build routes with a request that named nobody; the cohort routes had the
     same gap.
     """
-    if str(req.get("action") or "") not in ("cohort", "tenant-build"):
+    if str(req.get("action") or "") not in (
+            "cohort", "tenant-build", "tenant-request", "tenant-request-submit"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
         return
@@ -5860,6 +5865,124 @@ def tenant_build_job(req, role, actor):
     tail = f" -- {bad['id']}: {bad['note']}" if bad else ""
     return (state["state"] != "failed",
             f"build {state['id']} is {state['state']}{tail}", state["id"])
+
+
+REQUEST_DIR = os.path.join(DATA_DIR, "data", "tenant-requests")
+REQUEST_VIEW = os.path.join(APPS_DIR, "request-view.json")
+
+
+def _utcnow():
+    # a function of its own: the worker has a local `datetime` of its own
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def tenant_request_view_write():
+    """Invitations (no links, only whether one is live) and requests, where
+    the portal reads (RFC-0055 stage 4). A request holds the applicant's
+    e-mail address, which is why decided requests are pruned here too."""
+    try:
+        now = _utcnow()
+        tenant_request.prune(REQUEST_DIR, now)
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = REQUEST_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(tenant_request.view(REQUEST_DIR, now), f)
+        os.replace(tmp, REQUEST_VIEW)
+        os.chmod(REQUEST_VIEW, 0o644)
+        return True
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"WARNING: could not write {REQUEST_VIEW}: {e}", flush=True)
+        return False
+
+
+def _request_label_check(label):
+    """Why a label may not be asked for, or "": free on the node, no open
+    build, no other request waiting for it."""
+    err = tenant_label_error(label, "create")
+    if err:
+        return err
+    if tenant_build.open_build_for(BUILD_DIR, label):
+        return f"a build for '{label}' is not finished"
+    if tenant_request.pending_label_taken(REQUEST_DIR, label):
+        return f"a request for '{label}' is already waiting"
+    return ""
+
+
+def tenant_request_submit(a, now):
+    """The prospect's form arrives: judged here, on the host, whatever the
+    portal checked. The link is the only proof, and it names the profile --
+    the form cannot pick another one."""
+    token = str(a.get("token") or "")
+    inv = tenant_request.find_by_token(REQUEST_DIR, token, now)
+    if not inv:
+        raise tenant_request.Refusal("this invitation does not (or no longer) apply")
+    profile, _digest = tenant_build.read_profile_file(
+        tenant_build_profile_path(inv["profile"]))
+    given = a.get("params")
+    if not isinstance(given, dict) or any(
+            not isinstance(k, str) or not isinstance(v, str)
+            for k, v in given.items()):
+        raise tenant_request.Refusal("'params' must be an object of text values")
+    values, problems = tenant_build.param_values(
+        profile, given, label_check=_request_label_check)
+    if problems:
+        raise tenant_request.Refusal("; ".join(problems))
+    values = {k: v for k, v in values.items() if v is not None}
+    values["label"] = values["label"].strip().lower()
+    req = tenant_request.submit(REQUEST_DIR, token, values,
+                                a.get("contact"), now)
+    return f"request {req['id']} for '{req['label']}' is waiting for a decision", req["id"]
+
+
+def tenant_request_job(req, role, actor):
+    """One operation on invitations and requests for the portal action ->
+    (ok, sentence, subject). Role and actor come from the actor's own record
+    (the worker derives them); the spool is data, not trust."""
+    op = str(req.get("op") or "")
+    a = req.get("args")
+    a = a if isinstance(a, dict) else {}
+    rid = str(a.get("id") or "")
+    if role != "server_admin":
+        return False, "invitations and requests need server_admin", rid
+    now = _utcnow()
+    try:
+        if op == "invite":
+            # the portal made the token and showed it once; only its hash
+            # is kept. The profile must exist and be sound.
+            pid = str(a.get("profile") or "")
+            tenant_build.read_profile_file(tenant_build_profile_path(pid))
+            inv = tenant_request.create_invite(
+                REQUEST_DIR, str(a.get("token") or ""), pid, a.get("note"),
+                a.get("days"), actor, now)
+            return True, (f"invitation {inv['id']} for profile '{pid}' is open "
+                          f"until {inv['expires'][:10]}"), inv["id"]
+        if op == "revoke":
+            tenant_request.revoke_invite(REQUEST_DIR, rid, now)
+            return True, f"invitation {rid} is revoked", rid
+        if op == "reject":
+            tenant_request.reject(REQUEST_DIR, rid, actor, a.get("reason"), now)
+            return True, f"request {rid} is rejected", rid
+        if op == "approve":
+            cur = tenant_request.get(REQUEST_DIR, rid)
+            if not cur or not rid.startswith("req-"):
+                raise tenant_request.Refusal("this request does not exist")
+            if cur.get("state") != "pending":
+                raise tenant_request.Refusal("this request is already decided")
+            # the build starts with the APPROVER's own role; a refusal here
+            # (label taken meanwhile, profile gone) leaves the request waiting
+            state = tenant_build_start(
+                cur["profile"],
+                {k: str(v) for k, v in (cur.get("params") or {}).items()},
+                actor, role)
+            tenant_request.approve(REQUEST_DIR, rid, actor, state["id"], now)
+            bad = next((r for r in state["steps"] if r["state"] == "failed"), None)
+            tail = f" -- {bad['id']}: {bad['note']}" if bad else ""
+            return (state["state"] != "failed",
+                    f"request {rid} is approved; build {state['id']} is "
+                    f"{state['state']}{tail}", state["id"])
+        return False, f"unknown request operation '{op}'", rid
+    except (tenant_request.Refusal, tenant_build.Refusal) as exc:
+        return False, str(exc), rid
 
 
 def _build_actor():
@@ -9049,6 +9172,13 @@ def _portal_site_body():
     lines += strip_identity()
     lines.append("\t\treverse_proxy portal:8000")
     lines.append("\t}")
+    # the prospect's request form (RFC-0055 stage 4): an invitation link,
+    # validated by the portal, is the only proof. The base Caddyfile's
+    # route alone would be the /platform/* mistake again.
+    lines.append("\thandle /anfrage {")
+    lines += strip_identity()
+    lines.append("\t\treverse_proxy portal:8000")
+    lines.append("\t}")
     # fleet status (RFC-0021): read-only, guarded by a fleet key the
     # portal validates — no session, no identity headers
     lines.append("\thandle /fleet/* {")
@@ -10761,6 +10891,7 @@ def state_view_write(reg=None):
         os.chmod(STATE_VIEW, 0o644)
         cohort_view_write()
         tenant_build_view_write()
+        tenant_request_view_write()
         return True
     except OSError as e:
         print(f"WARNING: could not write {STATE_VIEW}: {e}", flush=True)
@@ -20216,6 +20347,41 @@ def cmd_process_deploys(_args):
                                          or _bid or ""),
                              result="denied", who=actor or "api",
                              role=act_role or "-", detail=msg)
+        elif action in ("tenant-request", "tenant-request-submit"):
+            # RFC-0055 stage 4. "tenant-request" is the operator's side
+            # (invite, revoke, approve, reject): role and actor come from
+            # the ACTOR's record, and approving starts a build with THAT
+            # role. "tenant-request-submit" is the prospect's form: it names
+            # nobody and carries the invitation link as its only proof,
+            # which is judged here against the stored hash.
+            try:
+                if action == "tenant-request-submit":
+                    msg, _subject = tenant_request_submit(
+                        (req.get("args") if isinstance(req.get("args"), dict) else {}),
+                        _utcnow())
+                    ok = True
+                else:
+                    ok, msg, _subject = tenant_request_job(req, act_role, actor)
+            except (tenant_request.Refusal, tenant_build.Refusal) as exc:
+                ok, msg, _subject = False, str(exc), ""
+            tenant_request_view_write()
+            tenant_build_view_write()
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "subject": _subject, "message": msg,
+                               "build": (_subject if str(_subject).startswith("b-")
+                                         else ""),
+                               "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("tenant.request.denied", ensure_default_tenant(),
+                             subject=str(_subject or ""), result="denied",
+                             who=actor or "invitation", role=act_role or "-",
+                             detail=msg)
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -20283,6 +20449,8 @@ def cmd_process_deploys(_args):
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
+               "tenant-request": "portal",
+               "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
                    action, "deploy-hook")

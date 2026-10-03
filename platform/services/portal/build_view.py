@@ -173,3 +173,100 @@ def detail(build):
             "rollbackable": build.get("state") != "rolled-back",
             "made_instances": made_instances,
             "running": build.get("state") == "running"}
+
+
+# ------------------------------------------- invitations and requests (stage 4)
+#
+# The prospect's form and the operator's list of requests (RFC-0055 §13). The
+# portal reads `request-view.json` (written by the host) and writes nothing:
+# every button queues a request the host judges again.
+
+import hashlib
+
+INVITE_STATE = {"open": ("Offen", "todo"), "used": ("Benutzt", "ok"),
+                "revoked": ("Widerrufen", "off"), "expired": ("Abgelaufen", "off")}
+REQUEST_STATE = {"pending": ("Wartet auf Entscheidung", "todo"),
+                 "approved": ("Freigegeben", "ok"),
+                 "rejected": ("Abgelehnt", "off")}
+ITEM_RE = re.compile(r"^(inv|req)-[0-9a-f]{12}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
+MAIL_RE = re.compile(r"^[^@\s<>\"',;]{1,64}@[^@\s<>\"',;]{1,120}\.[^@\s<>\"',;]{2,}$")
+LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+FIELD_MAX = 300
+
+
+def token_profile(request_view, token):
+    """Das Profil, zu dem dieser Link gehört, oder None, wenn er nicht (mehr)
+    offen ist. Verglichen wird der Hash; den Link selbst hat nur der, dem
+    man ihn gegeben hat."""
+    if not TOKEN_RE.match(str(token or "")):
+        return None
+    h = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+    return ((request_view or {}).get("live") or {}).get(h)
+
+
+def invite_rows(request_view):
+    out = []
+    for i in (request_view or {}).get("invites") or []:
+        label, tone = INVITE_STATE.get(i.get("state"), (i.get("state", "?"), "off"))
+        out.append({"id": i.get("id", ""), "profile": i.get("profile", ""),
+                    "note": i.get("note", ""), "state": label, "tone": tone,
+                    "raw": i.get("state", ""), "created": _when(i.get("created")),
+                    "expires": _when(i.get("expires"))[:10], "by": i.get("by", "")})
+    return out
+
+
+def request_rows(request_view):
+    out = []
+    for r in (request_view or {}).get("requests") or []:
+        label, tone = REQUEST_STATE.get(r.get("state"), (r.get("state", "?"), "off"))
+        out.append({"id": r.get("id", ""), "profile": r.get("profile", ""),
+                    "label": r.get("label", ""), "note": r.get("note", ""),
+                    "params": list((r.get("params") or {}).items()),
+                    "contact": r.get("contact", ""), "state": label, "tone": tone,
+                    "raw": r.get("state", ""), "created": _when(r.get("created")),
+                    "decided": _when(r.get("decided")), "by": r.get("by", ""),
+                    "build": r.get("build", ""), "reason": r.get("reason", "")})
+    return out
+
+
+def find_item(request_view, rid):
+    if not ITEM_RE.match(str(rid or "")):
+        return None
+    for key in ("invites", "requests"):
+        for x in (request_view or {}).get(key) or []:
+            if x.get("id") == rid:
+                return x
+    return None
+
+
+def pending_count(request_view):
+    return sum(1 for r in (request_view or {}).get("requests") or []
+               if r.get("state") == "pending")
+
+
+def public_params(profile, form):
+    """Formular des Interessenten -> (Parameter, Kontakt, Fehler).
+
+    Strenger als der Betreiber-Assistent, weil hier niemand angemeldet ist:
+    jedes Feld ist auf FIELD_MAX Zeichen gekappt, das Kürzel hat sein Format
+    schon hier, die Adresse sieht aus wie eine Adresse. Der Host urteilt noch
+    einmal (und kennt, was nur er weiß: ob das Kürzel frei ist)."""
+    params, missing = start_params(profile, form)
+    errors = []
+    if missing:
+        errors.append("Bitte ausfüllen: " + ", ".join(missing))
+    for k, v in list(params.items()):
+        if len(v) > FIELD_MAX:
+            errors.append(f"'{k}' ist zu lang")
+    for f in fields(profile):
+        v = params.get(f["name"])
+        if f["kind"] == "label" and v is not None:
+            params[f["name"]] = v = v.lower()
+            if not LABEL_RE.match(v):
+                errors.append("Das Kürzel darf nur Kleinbuchstaben, Ziffern und „-“ "
+                              "enthalten (höchstens 31 Zeichen).")
+    contact = str(form.get("contact", "") or "").strip()
+    if not MAIL_RE.match(contact) or len(contact) > 160:
+        errors.append("Bitte eine E-Mail-Adresse angeben, unter der wir Sie erreichen.")
+    return params, contact, errors
