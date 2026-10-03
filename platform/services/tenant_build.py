@@ -403,6 +403,18 @@ class RunLock:
 # ctx = {"label", "started", "state", "values"}; `audit(event, step, result,
 # detail)` is optional and is where a build leaves its trace.
 
+def _save(root, state, drivers):
+    """Save, then tell the driver (the portal reads a view of every build
+    and must see each step as it finishes, not only the end)."""
+    save_state(root, state)
+    fn = getattr(drivers, "saved", None)
+    if fn:
+        try:
+            fn(state)
+        except Exception:  # noqa: BLE001 -- a view never undoes a step
+            pass
+
+
 def _audit(drivers, event, step, result, detail=""):
     fn = getattr(drivers, "audit", None)
     if fn:
@@ -440,7 +452,7 @@ def run(state, profile, drivers, root, now=iso_now):
     ctx = {"label": state["label"], "started": state["created"],
            "state": state, "values": values}
     state["state"] = "running"
-    save_state(root, state)
+    _save(root, state, drivers)
     for rec in state["steps"]:
         step = steps[rec["id"]]
         typ = rec["type"]
@@ -457,7 +469,7 @@ def run(state, profile, drivers, root, now=iso_now):
             continue
         was_running = rec["state"] == "running"
         rec["state"], rec["started"] = "running", now()
-        save_state(root, state)
+        _save(root, state, drivers)
         res, bad = _safe(drivers.check, typ, args, ctx)
         if res is None:
             return _stop(state, rec, "failed", bad, root, drivers, now)
@@ -477,7 +489,7 @@ def run(state, profile, drivers, root, now=iso_now):
                 if got:
                     rec["made"] = list(rec.get("made") or []) + [
                         g for g in got if g not in (rec.get("made") or [])]
-                    save_state(root, state)
+                    _save(root, state, drivers)
             _finish(state, rec, "already in place: " + _sentence(note), root,
                     drivers, now)
             continue
@@ -492,7 +504,7 @@ def run(state, profile, drivers, root, now=iso_now):
         # a step that made something and then failed its check still has
         # something a rollback must find.
         rec["made"] = list(rec.get("made") or []) + list(made or [])
-        save_state(root, state)
+        _save(root, state, drivers)
         if not ok:
             return _stop(state, rec, "failed", _sentence(note), root,
                          drivers, now)
@@ -507,14 +519,14 @@ def run(state, profile, drivers, root, now=iso_now):
         _finish(state, rec, _sentence(note) or _sentence(after), root,
                 drivers, now)
     state["state"] = "done"
-    save_state(root, state)
+    _save(root, state, drivers)
     _audit(drivers, "tenant.build.done", "", "ok", state["id"])
     return state
 
 
 def _finish(state, rec, note, root, drivers, now):
     rec["state"], rec["note"], rec["finished"] = "done", note, now()
-    save_state(root, state)
+    _save(root, state, drivers)
     _audit(drivers, "tenant.build.step", rec["id"], "ok", note)
 
 
@@ -522,7 +534,7 @@ def _stop(state, rec, kind, note, root, drivers, now):
     rec["state"], rec["note"] = kind, _sentence(note)
     rec["finished"] = now() if kind == "failed" else ""
     state["state"] = "waiting" if kind == "waiting" else "failed"
-    save_state(root, state)
+    _save(root, state, drivers)
     _audit(drivers, "tenant.build.step", rec["id"], kind, rec["note"])
     return state
 
@@ -555,7 +567,7 @@ def rollback(state, profile, drivers, root, now=iso_now):
            "state": state, "values": values}
     state["rolling_back"] = True
     state["state"] = "running"
-    save_state(root, state)
+    _save(root, state, drivers)
     for rec in reversed(state["steps"]):
         if not rec.get("made"):
             continue
@@ -570,12 +582,12 @@ def rollback(state, profile, drivers, root, now=iso_now):
                              "rollback stopped: "
                              + _sentence(bad or res[1]), root, drivers, now)
             rec["made"].remove(item)
-            save_state(root, state)
+            _save(root, state, drivers)
             _audit(drivers, "tenant.build.rollback", rec["id"], "ok",
                    _sentence(res[1]))
         rec["state"], rec["note"] = "pending", "rolled back"
-        save_state(root, state)
+        _save(root, state, drivers)
     state["state"] = "rolled-back"
     state.pop("rolling_back", None)
-    save_state(root, state)
+    _save(root, state, drivers)
     return state

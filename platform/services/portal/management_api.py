@@ -24,8 +24,10 @@ from datetime import datetime, timezone
 from flask import Blueprint, Response, jsonify, request
 
 PREFIX = "/api/v1/tenant"
+OPERATOR = "/api/v1/operator"
 SPOOL_DIR = "/deploy-spool"
 VIEW = "/apps-registry/cohort-view.json"
+BUILD_VIEW = "/apps-registry/build-view.json"
 
 MAX_UPLOAD = 256 * 1024 * 1024
 MAX_UNPACKED = 512 * 1024 * 1024
@@ -36,6 +38,8 @@ JOB_KEEP_SECONDS = 24 * 3600
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 SEAT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 JOB_RE = re.compile(r"^[0-9a-f]{32}$")
+BUILD_RE = re.compile(r"^b-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
+PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 bp = Blueprint("management", __name__)
@@ -224,7 +228,7 @@ def _view(tid):
     return (data.get("cohorts") or {}).get(tid) or {}
 
 
-def enqueue(tid, role, op, args, rid=None, extra=None):
+def enqueue(tid, role, op, args, rid=None, extra=None, action="cohort"):
     """Write the request into the spool; the worker takes it from there.
     Returns the job id. The portal's own pages use this too: one way in."""
     rid = rid or uuid.uuid4().hex
@@ -239,7 +243,7 @@ def enqueue(tid, role, op, args, rid=None, extra=None):
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(meta, f)
     os.replace(tmp, os.path.join(jdir, "meta.json"))
-    payload = {"action": "cohort", "op": op, "args": args, **(extra or {})}
+    payload = {"action": action, "op": op, "args": args, **(extra or {})}
     CTX["queue"](rid, "", payload, 0)
     return rid
 
@@ -404,6 +408,118 @@ def seats_remove(name, sid):
     return _removal(name, sid)
 
 
+# ------------------------------------------------- tenant builds (RFC-0055)
+#
+# The operator's door onto the same core `oaap tenant build` uses. It does
+# what the cohort routes do and no more: decide who may ask, hand a request
+# to the host-side worker, answer GETs from a view file the host writes. The
+# worker re-checks the role from the actor's own record -- the spool is data.
+
+def op_gate(write=False):
+    """-> (tenant_id, role, None) or (None, None, error response).
+
+    server_admin only, and only at the node's own address: a tenant's place
+    is not where a node is administered."""
+    tid, role, bad = gate(write)
+    if bad:
+        return None, None, bad
+    if role != "server_admin":
+        return None, None, err(403, "this needs the role server_admin")
+    if CTX["host_tenant"](request.host):
+        return None, None, err(404, "no such place")
+    return tid, role, None
+
+
+def _build_view():
+    return read_json(BUILD_VIEW) or {}
+
+
+def _build_row(st):
+    return {k: st.get(k, "") for k in
+            ("id", "profile", "label", "state", "created", "by")}
+
+
+def _build_submit(tid, role, op, args):
+    rid = enqueue(tid, role, op, args, action="tenant-build")
+    return jsonify({"job": rid, "status_url": f"{PREFIX}/jobs/{rid}"}), 202
+
+
+@bp.get(OPERATOR + "/tenant-profiles")
+def build_profiles():
+    tid, role, bad = op_gate()
+    if bad:
+        return bad
+    return jsonify({"profiles": _build_view().get("profiles") or []})
+
+
+@bp.get(OPERATOR + "/tenant-builds")
+def build_list():
+    tid, role, bad = op_gate()
+    if bad:
+        return bad
+    return jsonify({"builds": [_build_row(b) for b in
+                               _build_view().get("builds") or []]})
+
+
+@bp.get(OPERATOR + "/tenant-builds/<bid>")
+def build_show(bid):
+    tid, role, bad = op_gate()
+    if bad:
+        return bad
+    if not BUILD_RE.match(bid):
+        return err(404, "no such build")
+    for b in _build_view().get("builds") or []:
+        if b.get("id") == bid:
+            return jsonify(b)
+    return err(404, "no such build")
+
+
+@bp.post(OPERATOR + "/tenant-builds")
+def build_start():
+    tid, role, bad = op_gate(write=True)
+    if bad:
+        return bad
+    body, bad = _json_body()
+    if bad:
+        return bad
+    prof = body.get("profile")
+    params = body.get("params")
+    if not isinstance(prof, str) or not PROFILE_RE.match(prof):
+        return err(400, "'profile' names a profile (a short lowercase word)")
+    if not isinstance(params, dict) or not all(
+            isinstance(k, str) and isinstance(v, (str, int))
+            and not isinstance(v, bool) for k, v in params.items()):
+        return err(400, "'params' is an object of text values")
+    return _build_submit(tid, role, "start",
+                         {"profile": prof,
+                          "params": {k: str(v) for k, v in params.items()}})
+
+
+@bp.post(OPERATOR + "/tenant-builds/<bid>/<verb>")
+def build_verb(bid, verb):
+    tid, role, bad = op_gate(write=True)
+    if bad:
+        return bad
+    if verb not in ("continue", "confirm", "rollback"):
+        return err(404, "no such operation")
+    if not BUILD_RE.match(bid):
+        return err(404, "no such build")
+    if not any(b.get("id") == bid for b in _build_view().get("builds") or []):
+        return err(404, "no such build")
+    body, bad = _json_body()
+    if bad:
+        return bad
+    args = {"build": bid}
+    if verb == "confirm":
+        step = body.get("step")
+        if not isinstance(step, str) or not PROFILE_RE.match(step):
+            return err(400, "'step' names the waiting step")
+        args["step"] = step
+    if verb in ("continue", "rollback"):
+        args["purge_instances"] = body.get("purge_instances") is True
+    return _build_submit(tid, role, verb, args)
+
+
 # ------------------------------------------------------------ jobs
 
 def _job(rid):
@@ -431,6 +547,8 @@ def jobs_show(rid):
     if status == "done":
         res = read_json(os.path.join(SPOOL_DIR, "jobs", rid, "result.json")) or {}
         out["cohort"] = out["cohort"] or res.get("cohort", "")
+        if res.get("build"):
+            out["build"] = res["build"]
         out.update(ok=bool(res.get("ok")), message=res.get("message", ""),
                    finished=res.get("finished", ""),
                    handout=os.path.isfile(

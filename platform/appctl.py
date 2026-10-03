@@ -5400,6 +5400,9 @@ class _BuildDrivers:
             return False, f"'{typ}' has nothing to undo"
         return fn(a, made[0], ctx)
 
+    def saved(self, state):
+        tenant_build_view_write()
+
     def audit(self, event, step, result, detail=""):
         """Into the node's default tenant log and, once it exists, the new
         tenant's own: the customer reads what was done in their name."""
@@ -5664,6 +5667,110 @@ class _BuildDrivers:
 
 PRESENT_, ABSENT_, CONFLICT_ = (tenant_build.PRESENT, tenant_build.ABSENT,
                                 tenant_build.CONFLICT)
+
+
+BUILD_VIEW = os.path.join(APPS_DIR, "build-view.json")
+BUILD_VIEW_KEEP = 50
+
+
+def tenant_build_view_write():
+    """Every profile and the latest builds, where the portal reads (RFC-0055
+    stage 2). The API's GET calls answer from this file, so they never wait
+    behind a build that takes minutes. A state document holds no secret by
+    rule (the engine never puts one there), which is what lets this file be
+    world-readable on the host like the cohort view beside it."""
+    try:
+        states = sorted(tenant_build.list_states(BUILD_DIR),
+                        key=lambda st: st.get("created", ""), reverse=True)
+        profiles = []
+        for pid, title, problem in tenant_build_profiles():
+            row = {"id": pid, "title": title, "problem": problem}
+            if not problem:
+                doc, _d = tenant_build.read_profile_file(
+                    tenant_build_profile_path(pid))
+                row["params"] = doc.get("params") or {}
+                row["steps"] = [{"id": s_["id"], "type": s_["type"]}
+                                for s_ in doc["steps"]]
+            profiles.append(row)
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = BUILD_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "written": _iso_now(),
+                       "profiles": profiles,
+                       "builds": states[:BUILD_VIEW_KEEP]}, f)
+        os.replace(tmp, BUILD_VIEW)
+        os.chmod(BUILD_VIEW, 0o644)
+        return True
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as e:
+        print(f"WARNING: could not write {BUILD_VIEW}: {e}", flush=True)
+        return False
+
+
+def job_result_fill(req, rid, ok, msg):
+    """Give a job of the management API an answer when the branch that
+    should have written one was never reached.
+
+    The API reads a job's status from `jobs/<id>/result.json`: queued while
+    the request is in the queue, running while it is claimed, done when the
+    file exists. A request the worker refuses BEFORE its branch (no signed-in
+    active user behind it, a tenant the actor may not touch) wrote only the
+    classic results file, so its job was neither queued nor running nor done:
+    the caller polling it got "no such job" for ever. Found while testing the
+    build routes with a request that named nobody; the cohort routes had the
+    same gap.
+    """
+    if str(req.get("action") or "") not in ("cohort", "tenant-build"):
+        return
+    if not JOB_ID_RE.match(str(rid or "")):
+        return
+    jd = os.path.join(JOBS_DIR, rid)
+    done = os.path.join(jd, "result.json")
+    if not os.path.isdir(jd) or os.path.isfile(done):
+        return
+    with open(done + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "op": req.get("op", ""), "ok": bool(ok),
+                   "message": msg, "finished": _iso_now()}, f)
+    os.replace(done + ".tmp", done)
+
+
+def tenant_build_job(req, role, actor):
+    """One build operation for the portal action and the API -> (ok,
+    sentence, build id). `role` and `actor` come from the ACTOR's own record
+    (the worker derives them), never from the request: the spool is data,
+    not trust. The same core as the CLI; this only unpacks a request."""
+    op = str(req.get("op") or "")
+    a = req.get("args")
+    a = a if isinstance(a, dict) else {}
+    bid = str(a.get("build") or "")
+    if role != "server_admin":
+        return False, "building a tenant needs server_admin", bid
+    purge = bool(a.get("purge_instances"))
+    try:
+        if op == "start":
+            params = a.get("params")
+            if not isinstance(params, dict) or any(
+                    not isinstance(k, str) or not isinstance(v, (str, int))
+                    for k, v in params.items()):
+                raise tenant_build.Refusal("'params' must be an object of "
+                                           "text values")
+            state = tenant_build_start(
+                str(a.get("profile") or ""),
+                {k: str(v) for k, v in params.items()}, actor, role)
+        elif op == "continue":
+            state = tenant_build_continue(bid, actor, role, purge=purge)
+        elif op == "confirm":
+            state = tenant_build_confirm(bid, str(a.get("step") or ""),
+                                         actor, role)
+        elif op == "rollback":
+            state = tenant_build_rollback(bid, actor, role, purge=purge)
+        else:
+            return False, f"unknown build operation '{op}'", bid
+    except tenant_build.Refusal as exc:
+        return False, str(exc), bid
+    bad = next((r for r in state["steps"] if r["state"] == "failed"), None)
+    tail = f" -- {bad['id']}: {bad['note']}" if bad else ""
+    return (state["state"] != "failed",
+            f"build {state['id']} is {state['state']}{tail}", state["id"])
 
 
 def _build_actor():
@@ -10564,6 +10671,7 @@ def state_view_write(reg=None):
         # anybody's own. Same class as apps/artifacts.json.
         os.chmod(STATE_VIEW, 0o644)
         cohort_view_write()
+        tenant_build_view_write()
         return True
     except OSError as e:
         print(f"WARNING: could not write {STATE_VIEW}: {e}", flush=True)
@@ -19997,6 +20105,28 @@ def cmd_process_deploys(_args):
                              subject=str((req.get("args") or {}).get("cohort") or ""),
                              result="denied", who=actor or "api",
                              role=act_role or "-", detail=msg)
+        elif action == "tenant-build":
+            # RFC-0055 stage 2: a tenant build from the portal or the
+            # operator API -- the very core `oaap tenant build` uses. Who
+            # and in which role come from the ACTOR's record (above); a
+            # request cannot name its own role. The result file is the job
+            # status the API reads; the build's own state is in the view.
+            ok, msg, _bid = tenant_build_job(req, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "build": _bid, "message": msg,
+                               "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("tenant.build.denied", ensure_default_tenant(),
+                             subject=str((req.get("args") or {}).get("profile")
+                                         or _bid or ""),
+                             result="denied", who=actor or "api",
+                             role=act_role or "-", detail=msg)
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -20090,6 +20220,7 @@ def cmd_process_deploys(_args):
                 # confirmed something they did not.
                 record["confirmed_by"] = req.get("by", "?")
         audit_deploy(record)
+        job_result_fill(req, rid, ok, msg)
         # ... and one line in the tenant's own audit log for the actions
         # that change who owns or reaches what (spec 1.7). Written HERE,
         # at the one point every worker action passes through, so a new
