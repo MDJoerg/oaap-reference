@@ -10033,6 +10033,24 @@ BUILD_DETAIL_BODY = """
   {% endif %}
   <p class="muted">„Weiter prüfen“ liest den Knoten neu und geht weiter, wenn es erledigt ist.</p>
 </div>
+{% elif b.rolling_back and b.failed %}
+<div class="card warn">
+  <h2>Der Rückbau ist stehengeblieben</h2>
+  <p><strong>{{ b.failed.type }}</strong> ({{ b.failed.id }}): {{ b.failed.note }}</p>
+  <p>Meist heißt das: der Mandant <strong>enthält noch etwas</strong> (Benutzerkonten,
+  Daten einer entfernten Instanz). OAAP entfernt einen Mandanten mit Inhalt nie von selbst.
+  Alles andere ist schon zurückgebaut.</p>
+  <ol class="muted">
+    <li>Konten des Mandanten unter <a href="/users">Benutzer</a> entfernen. Das <strong>letzte
+      <code>tenant_admin</code></strong>-Konto eines Mandanten lässt sich nicht löschen (die Plattform
+      lässt nie einen Mandanten ohne Verwalter zurück): dem Konto <strong>zuerst die Rolle
+      <code>tenant_admin</code> nehmen</strong>, dann löschen. Geht es um die Daten einer Instanz,
+      unten „Zurückbauen“ mit dem Haken für die Daten.</li>
+    <li>Dann hier <strong>Rückbau fortsetzen</strong>.</li>
+  </ol>
+  <form method="post" action="/aufbau/{{ b.id }}/continue">
+    <button class="btn">Rückbau fortsetzen</button></form>
+</div>
 {% elif b.failed %}
 <div class="card warn">
   <h2>Ein Schritt ist fehlgeschlagen</h2>
@@ -10075,7 +10093,7 @@ BUILD_DETAIL_BODY = """
     {% if b.made_instances %}
     <label class="seatopt"><input type="checkbox" name="purge_instances" value="1">
       Auch die <strong>Daten der Instanzen</strong> löschen, die dieser Aufbau angelegt hat (nicht umkehrbar).
-      Ohne Haken bleiben sie erhalten und halten den Mandanten fest.</label>
+      Ohne Haken lehnt der Rückbau ab: erhaltene Daten würden den Mandanten festhalten.</label>
     {% endif %}
     <label>Zur Bestätigung das Kürzel eintippen: <code>{{ b.label }}</code>
       <input type="text" name="confirm" autocomplete="off" required></label>

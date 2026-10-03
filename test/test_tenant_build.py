@@ -322,6 +322,22 @@ node.refuse_undo.clear()
 st = tb.rollback(st, prof, node, root)
 ok("a later rollback finishes what is left", st["state"] == "rolled-back", st)
 
+root, prof, st, node = fresh()
+st = tb.run(st, prof, node, root)
+node.rollback_refusal = lambda state: "would stop half way"
+node.calls.clear()
+try:
+    tb.rollback(st, prof, node, root)
+    refused = False
+except tb.Refusal as exc:
+    refused = "half way" in str(exc)
+ok("a rollback the driver knows would stop half way is refused BEFORE anything "
+   "is undone", refused and not [c for c in node.calls if c[0] == "undo"]
+   and st["state"] == "done" and not st.get("rolling_back"), st["state"])
+node.rollback_refusal = lambda state: ""
+st = tb.rollback(st, prof, node, root)
+ok("...and goes ahead when the driver has no objection", st["state"] == "rolled-back")
+
 print("=== one build per label; a stale lock does not lock for ever ===")
 root, prof, st, node = fresh()
 tb.save_state(root, st)
@@ -560,6 +576,18 @@ ok("a provider of a tenant that is gone undoes cleanly",
    drv.undo("idp.provision", {}, ["provider:x"], {})[0])
 ok("an instance of a tenant that is gone undoes cleanly",
    drv.undo("app.install", {}, ["instance:vnogone-web"], {})[0])
+print("=== a rollback that would stop half way is refused up front ===")
+state_both = {"steps": [{"made": ["tenant:t1"]}, {"made": ["instance:vx-web"]}]}
+state_inst = {"steps": [{"made": []}, {"made": ["instance:vx-web"]}]}
+state_ten = {"steps": [{"made": ["tenant:t1"]}, {"made": []}]}
+d_no, d_yes = m._BuildDrivers("vx"), m._BuildDrivers("vx", purge=True)
+ok("tenant + instance without the consent to delete data: refused, the "
+   "instance is named", "vx-web" in d_no.rollback_refusal(state_both)
+   and "--purge-instances" in d_no.rollback_refusal(state_both))
+ok("...with the consent it goes ahead", d_yes.rollback_refusal(state_both) == "")
+ok("an instance alone (the tenant stays) or a tenant alone: no objection",
+   d_no.rollback_refusal(state_inst) == "" and d_no.rollback_refusal(state_ten) == "")
+
 print("=== rollback keeps an instance's data unless told otherwise ===")
 seen = []
 orig_run, orig_inst = m._run_verb, m.tenant_instances

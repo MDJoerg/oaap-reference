@@ -282,6 +282,23 @@ ok("ein zurueckgebauter Aufbau bietet kein Zurueckbauen mehr", "Zurückbauen" no
 ok("eine unbekannte Kennung: 404", c.get("/aufbau/b-20250101t000000-x", headers=H).status_code == 404
    and c.get("/aufbau/nope", headers=H).status_code == 404)
 
+B_STUCK = {**B_FAIL, "id": "b-20261003t100400-vstuck", "label": "vstuck",
+           "rolling_back": True,
+           "steps": [{"id": "tenant", "type": "tenant.create", "state": "failed",
+                      "note": "rollback stopped: - 1 user account(s)",
+                      "made": ["tenant:t9"]}]}
+json.dump({"schema": "0.1", **VIEW, "builds": VIEW["builds"] + [B_STUCK]}, open(VF, "w"))
+t = c.get("/aufbau/" + B_STUCK["id"], headers=H).get_data(as_text=True)
+ok("ein stehengebliebener RUECKBAU wird so genannt, nicht als Fehlschlag eines Schritts",
+   "Der Rückbau ist stehengeblieben" in t and "Ein Schritt ist fehlgeschlagen" not in t
+   and "enthält noch etwas" in t and "Rückbau fortsetzen" in t, t[:600])
+ok("...mit dem Grund des Knotens und dem Weg (Konten entfernen, dann fortsetzen)",
+   "1 user account(s)" in t and "letzte" in t and "zuerst die Rolle" in t)
+r = c.post(f"/aufbau/{B_STUCK['id']}/continue", headers=H)
+ok("'Rückbau fortsetzen' stellt die Anfrage 'continue' ohne Datenloeschung",
+   QUEUED[-1]["op"] == "continue" and QUEUED[-1]["args"]["purge_instances"] is False)
+json.dump({"schema": "0.1", **VIEW}, open(VF, "w"))
+
 print("=== Fortsetzen, Bestaetigen, Zurueckbauen ===")
 bid = B_WAIT["id"]
 r = c.post(f"/aufbau/{bid}/continue", headers=H)

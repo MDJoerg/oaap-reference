@@ -578,6 +578,16 @@ def rollback(state, profile, drivers, root, now=iso_now):
     values = state["params"]
     ctx = {"label": state["label"], "started": state["created"],
            "state": state, "values": values}
+    # A rollback that is certain to stop half way is refused BEFORE it
+    # starts: a half-undone build is a worse place to be than the one the
+    # operator asked to leave (found on a real node: the instance went, its
+    # data stayed, the tenant could not follow, and the checkbox that would
+    # have deleted the data no longer had an instance to act on).
+    ask = getattr(drivers, "rollback_refusal", None)
+    if ask and not state.get("rolling_back"):
+        why = ask(state)
+        if why:
+            raise Refusal(why)
     state["rolling_back"] = True
     state["state"] = "running"
     _save(root, state, drivers)

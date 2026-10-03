@@ -5440,6 +5440,24 @@ class _BuildDrivers:
             return [f"instance:{key}"] if key else []
         return []
 
+    def rollback_refusal(self, state):
+        """Why this rollback would stop half way, or "". An instance's data
+        is kept by a plain `app remove`, and kept data holds its tenant; so
+        undoing the instances AND the tenant is only possible when the
+        operator has said the data may go."""
+        made = [m for r in state["steps"] for m in r.get("made") or []]
+        if (not self.purge and any(m.startswith("tenant:") for m in made)
+                and any(m.startswith("instance:") for m in made)):
+            names = ", ".join(sorted(m.split(":", 1)[1] for m in made
+                                     if m.startswith("instance:")))
+            return (f"this build made the tenant AND instance(s) ({names}); "
+                    "undoing the instance keeps its data, and kept data holds "
+                    "the tenant, so the rollback would stop half way. Say that "
+                    "the data of those instances may be deleted too "
+                    "(--purge-instances / the box on the page), or remove the "
+                    "instance(s) and their data yourself first")
+        return ""
+
     # tenant.create -------------------------------------------------------
     def _check_tenant_create(self, a, ctx):
         tid, t = self._tenant()
