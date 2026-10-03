@@ -7,7 +7,7 @@
 set -euo pipefail
 
 NODE=""; HOST=""; USER_="oaap-admin"; KEY=""; TO="/mnt/backup"; AT="04:30"
-DAILY=7; WEEKLY=4; MONTHLY=6; REMOVE=0; LOCAL=0
+DAILY=7; WEEKLY=4; MONTHLY=6; REMOVE=0; LOCAL=0; VAULT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -23,7 +23,11 @@ while [ $# -gt 0 ]; do
     # This machine is its own source (see backup-pull.sh --local). For
     # the node that fetches for everyone and has nobody to fetch it.
     --local) LOCAL=1; shift ;;
-    *) echo "Usage: install-backup-pull.sh --node N (--host H --key K | --local) [--to DIR] [--at HH:MM] [--remove]" >&2; exit 2 ;;
+    # RFC-0053 stage 0: TO is a vault that is CLOSED between runs. The
+    # timer then runs oaap-vault-run (open, pull, read back, close) instead
+    # of the plain pull, and "is TO mounted now?" is the wrong question.
+    --vault) VAULT=1; shift ;;
+    *) echo "Usage: install-backup-pull.sh --node N (--host H --key K | --local) [--to DIR] [--at HH:MM] [--vault] [--remove]" >&2; exit 2 ;;
   esac
 done
 
@@ -36,6 +40,12 @@ if [ "$REMOVE" -eq 1 ]; then
   rm -f "/etc/systemd/system/oaap-backup-pull@$NODE.timer.d/when.conf"
   rmdir "/etc/systemd/system/oaap-backup-pull@$NODE.timer.d" 2>/dev/null || true
   rm -f "/etc/oaap-backup-pull/$NODE.conf"
+  # The vault timer belongs to no single source: it goes when the last
+  # source that writes to a vault goes.
+  if ! grep -ls '^VAULT=1' /etc/oaap-backup-pull/*.conf >/dev/null 2>&1; then
+    systemctl disable --now oaap-vault-run.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/oaap-vault-run.{service,timer}
+  fi
   systemctl daemon-reload
   echo "Pull for $NODE removed. Archives under $TO/$NODE were kept."
   exit 0
@@ -54,10 +64,22 @@ case "$AT" in [0-9][0-9]:[0-9][0-9]) ;; *) echo "ERROR: --at wants HH:MM." >&2; 
 # The target must be a mount point NOW, or the very first run would
 # write onto the local disk -- checked here so the mistake is caught
 # while somebody is watching, not at 04:30.
-mountpoint -q "$TO" || {
-  echo "ERROR: $TO is not a mount point. Mount the off-site storage first" >&2
-  echo "       (a permanent entry in /etc/fstab, not a hand-made mount)." >&2
-  exit 1; }
+if [ "$VAULT" -eq 1 ]; then
+  # A vault is closed between runs, so TO is NOT a mount point now -- and
+  # must not be one by fstab either: a vault in fstab is a vault that is
+  # open whenever the machine is on. What has to exist is the vault.
+  ls /etc/oaap-vault/*.conf >/dev/null 2>&1 || {
+    echo "ERROR: no vault is set up. Run ops/vault-setup.sh first." >&2; exit 1; }
+  command -v cryptsetup >/dev/null 2>&1 || { echo "ERROR: cryptsetup is not installed (apt install cryptsetup)." >&2; exit 1; }
+  if mountpoint -q "$TO"; then
+    echo "NOTE: $TO is mounted right now -- left alone; the run will refuse to open a vault over it."
+  fi
+else
+  mountpoint -q "$TO" || {
+    echo "ERROR: $TO is not a mount point. Mount the off-site storage first" >&2
+    echo "       (a permanent entry in /etc/fstab, not a hand-made mount)." >&2
+    exit 1; }
+fi
 
 install -d -m 0700 /etc/oaap-backup-pull
 cat > "/etc/oaap-backup-pull/$NODE.conf" <<EOF
@@ -68,6 +90,7 @@ USER=$USER_
 KEY=$KEY
 TO=$TO
 LOCAL=$LOCAL
+VAULT=$VAULT
 DAILY=$DAILY
 WEEKLY=$WEEKLY
 MONTHLY=$MONTHLY
@@ -75,6 +98,51 @@ EOF
 chmod 600 "/etc/oaap-backup-pull/$NODE.conf"
 
 install -m 0700 "$HERE/backup-pull.sh" /usr/local/bin/oaap-backup-pull
+
+if [ "$VAULT" -eq 1 ]; then
+  install -m 0700 "$HERE/vault-run.sh" /usr/local/bin/oaap-vault-run
+  install -m 0700 "$HERE/vault-status.sh" /usr/local/bin/oaap-vault-status
+  cat > /etc/systemd/system/oaap-vault-run.service <<EOF
+[Unit]
+Description=OAAP vault run (open, pull, read back, close)
+Documentation=file://$HERE/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oaap-vault-run
+# systemd stops the whole group; the run closes the vault on SIGTERM.
+TimeoutStartSec=3h
+TimeoutStopSec=5min
+EOF
+  cat > /etc/systemd/system/oaap-vault-run.timer <<EOF
+[Unit]
+Description=OAAP vault run at $AT
+
+[Timer]
+OnCalendar=*-*-* $AT:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now oaap-vault-run.timer
+  echo ""
+  echo "Vault run installed on $(hostname):"
+  echo "  source: $NODE ($USER_@$HOST:/var/backups/oaap)"
+  echo "  when:   every day at $AT; the vault is open for the minutes of the run only"
+  echo "  state:  /var/lib/oaap-vault/last-run.json, history runs.jsonl, per vault: oaap-vault-status"
+  echo "  keep:   $DAILY/$WEEKLY/$MONTHLY per vault"
+  echo ""
+  systemctl list-timers oaap-vault-run.timer --no-pager || true
+  echo ""
+  echo "On $NODE, the key must be limited by ops/backup-serve.sh (see README)."
+  echo "Run it once now with:  sudo systemctl start oaap-vault-run"
+  exit 0
+fi
 
 # A template unit (@) so a second source node is one more timer, not a
 # second copy of everything.

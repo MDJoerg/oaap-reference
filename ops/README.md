@@ -174,3 +174,48 @@ Instanzen, alte Passwörter, byte-gleiche Nutzdaten. Dabei kam heraus,
 dass das Mandanten-Protokoll nie im Archiv war. Genau dafür macht man
 das; kein Test, der nur das Archiv anschaut, hätte es gefunden. Der
 nächste Probelauf gehört in den Kalender, nicht in die Absicht.
+
+## Der Tresor (RFC-0053, Stufe 0 — Probelauf)
+
+Ein **Tresor** ist eine Wechselplatte am abholenden Knoten, die nur für die
+Minuten eines Laufs offen ist. Das hier ist der Skript-Probelauf; was echte
+Nächte übersteht, kommt in die Spezifikation (Stufe 1), nicht umgekehrt.
+
+```text
+  vault-setup.sh    eine Platte einrichten (einmal je Platte)
+  vault-run.sh      ein Lauf: Platte erkennen → öffnen → holen → ZURÜCKLESEN → schließen → Standby
+  vault-status.sh   „Wechsel fällig“, „fehlt“, Alter der Quellen (misst, statt zu glauben)
+  vault-restore.sh  die Wiederherstellungsprobe: mit dem PAPIER, nicht mit der Schlüsseldatei
+  backup-receive.sh / backup-push.sh   der Schiebe-Modus (RFC-0053 §3.5): nur anlegen, begrenzter Posteingang
+```
+
+**Drei Wege je Platte** (beim Einrichten gewählt, danach fest). Jeder Weg sagt
+von sich, was er beweist — und der Lauf schreibt genau diesen Satz ins Protokoll:
+
+| Weg | Platte | Archiv | Der Lauf beweist | Er beweist NICHT |
+| --- | --- | --- | --- | --- |
+| `luks` | LUKS2, ext4 darin | im Klartext | zurückgelesen: die Datei auf der Platte hat die Prüfsumme, die die Quelle genannt hat | — |
+| `luks+age` | LUKS2, ext4 darin | `age`-verschlüsselt | Prüfsumme des Klartexts stimmte **vor** dem Verschlüsseln; der Geheimtext wurde unversehrt zurückgelesen | dass er sich entschlüsseln lässt (der Schlüssel liegt auf Papier) |
+| `age` | ext4, offen | `age`-verschlüsselt | wie `luks+age` | wie `luks+age`; **ein Finder sieht Dateinamen, Zeiten, Größen, `status.json` und die Klartext-Prüfsumme** |
+
+```sh
+# einmal je Platte (löscht sie!). Das Papier-Geheimnis wird erzeugt, EINMAL gezeigt, und seine
+# Wiedereingabe wird verlangt; bei den age-Wegen ist der private Schlüssel danach nirgends mehr auf dem Knoten.
+sudo bash ops/vault-setup.sh --device /dev/sdX --name tresor-a --mode luks --yes-erase
+# Zeitplan: wie der normale Abholer, aber mit --vault (die Platte hängt NICHT in der fstab)
+sudo bash ops/install-backup-pull.sh --node oaap-bernd --host 10.10.10.95 --user oaap-admin \
+     --key ~/.ssh/oaap_backup_pull --to /mnt/vault --vault --at 04:30
+sudo systemctl start oaap-vault-run && oaap-vault-status
+```
+
+Regeln, die der Lauf hält (alle mit einem Köder gemessen, siehe
+`program/messungen/backup-tresor-stufe0-2026-10-03.md`): ein fehlgeschlagener
+Schritt lässt den Tresor **geschlossen**; zwei eingesteckte Tresore → der Lauf
+weigert sich; eine hart abgebrochene Sitzung (SIGKILL) lässt ihn offen, der
+**nächste** Lauf schließt ihn zuerst und sagt es; bei SIGTERM schließt er selbst.
+
+*English summary:* a vault is a removable disk on the pulling node that is open
+only for the minutes of a run; stage 0 is the script trial run of RFC-0053. Three
+per-disk modes (`luks`, `luks+age`, `age`), each stating what it can prove. The run
+reads the archive back after writing it (cache dropped first) and always leaves the
+vault closed. Push mode is a create-only forced command into a bounded inbox.

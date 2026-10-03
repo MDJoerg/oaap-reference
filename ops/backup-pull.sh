@@ -18,6 +18,10 @@ set -uo pipefail
 NODE=""; HOST=""; USER_="oaap-admin"; KEY=""; TO="/mnt/backup"
 DAILY=7; WEEKLY=4; MONTHLY=6; REMOTE_DIR="/var/backups/oaap"
 LOCAL=0
+# RFC-0053 stage 0 (vault modes luks+age / age): encrypt each archive for
+# a public key before it is written to TO. Only the PUBLIC half is ever
+# here; the private key is on paper (ops/vault-setup.sh).
+AGE=""; STAGING="/var/lib/oaap-vault/staging"; SFX=""; SRC_AGE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -29,6 +33,12 @@ while [ $# -gt 0 ]; do
     --daily) DAILY="$2"; shift 2 ;;
     --weekly) WEEKLY="$2"; shift 2 ;;
     --monthly) MONTHLY="$2"; shift 2 ;;
+    --age-recipient) AGE="$2"; shift 2 ;;
+    --staging) STAGING="$2"; shift 2 ;;
+    # The SOURCE already encrypted (push mode, RFC-0053 3.5): archives there
+    # end in .age and their checksum is the ciphertext's. Nothing is
+    # encrypted here, and the clear checksum is only what the source said.
+    --source-age) SRC_AGE=1; shift ;;
     # THIS machine is the source. For the node that does the fetching
     # and has nobody to fetch it: it already has the off-site share
     # mounted, so it needs no second node, only the same generations.
@@ -36,6 +46,17 @@ while [ $# -gt 0 ]; do
     *) echo "Usage: backup-pull.sh --node NAME (--host H --key K | --local) [--to DIR] [--user U] [--daily 7] [--weekly 4] [--monthly 6]" >&2; exit 2 ;;
   esac
 done
+SRC_SFX=""
+if [ "$SRC_AGE" -eq 1 ]; then
+  SRC_SFX=".age"
+  [ -z "$AGE" ] || { echo "ERROR: --source-age and --age-recipient exclude each other." >&2; exit 2; }
+  SFX=".age"
+fi
+if [ -n "$AGE" ]; then
+  [ -r "$AGE" ] || { echo "ERROR: cannot read the age recipient file $AGE." >&2; exit 2; }
+  command -v age >/dev/null 2>&1 || { echo "ERROR: age is not installed (apt install age)." >&2; exit 2; }
+  SFX=".age"
+fi
 if [ "$LOCAL" -eq 1 ]; then
   NODE="${NODE:-$(hostname)}"; HOST="${HOST:-$(hostname)}"
 else
@@ -45,7 +66,7 @@ fi
 
 DEST="$TO/$NODE"
 STATE="$DEST/status.json"
-LOG="/var/log/oaap-backup-pull.log"
+LOG="${OAAP_PULL_LOG:-/var/log/oaap-backup-pull.log}"
 exec > >(tee -a "$LOG") 2>&1
 chmod 600 "$LOG" 2>/dev/null || true
 
@@ -70,10 +91,11 @@ write_state() {
   "fetched": "$FETCHED",
   "bytes": $BYTES,
   "checksum_verified": "$VERIFIED",
+  "encrypted_by_puller": "$([ -n "$AGE" ] && echo age || echo no)",
   "generations": {
-    "daily": $(ls -1 "$DEST/daily"/*.tar.gz 2>/dev/null | wc -l),
-    "weekly": $(ls -1 "$DEST/weekly"/*.tar.gz 2>/dev/null | wc -l),
-    "monthly": $(ls -1 "$DEST/monthly"/*.tar.gz 2>/dev/null | wc -l)
+    "daily": $(ls -1 "$DEST/daily"/*.tar.gz$SFX 2>/dev/null | wc -l),
+    "weekly": $(ls -1 "$DEST/weekly"/*.tar.gz$SFX 2>/dev/null | wc -l),
+    "monthly": $(ls -1 "$DEST/monthly"/*.tar.gz$SFX 2>/dev/null | wc -l)
   },
   "keep": {"daily": $DAILY, "weekly": $WEEKLY, "monthly": $MONTHLY},
   "free_bytes": $(df -PB1 "$TO" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
@@ -88,8 +110,8 @@ EOF
   # it. The file on the backup target stays the authoritative one; this
   # is the same record, put where a page can reach it without mounting
   # the backup share into a web container.
-  local reg=/var/lib/oaap/apps/backup-pulls
-  if [ -d /var/lib/oaap/apps ]; then
+  local reg="${OAAP_PULL_REGISTRY:-/var/lib/oaap/apps/backup-pulls}"
+  if [ -d "$(dirname "$reg")" ]; then
     mkdir -p "$reg" && chmod 755 "$reg"
     cp "$STATE" "$reg/$NODE.json" 2>/dev/null && chmod 644 "$reg/$NODE.json"
   fi
@@ -108,8 +130,8 @@ SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=20
 # checksum check and the generations. Two code paths would be two
 # retention policies within a month.
 src_list() {
-  if [ "$LOCAL" -eq 1 ]; then ls -1t "$REMOTE_DIR"/oaap-backup-*.tar.gz 2>/dev/null
-  else "${SSH[@]}" "ls -1t $REMOTE_DIR/oaap-backup-*.tar.gz 2>/dev/null"; fi
+  if [ "$LOCAL" -eq 1 ]; then ls -1t "$REMOTE_DIR"/oaap-backup-*.tar.gz$SRC_SFX 2>/dev/null
+  else "${SSH[@]}" "ls -1t $REMOTE_DIR/oaap-backup-*.tar.gz$SRC_SFX 2>/dev/null"; fi
 }
 src_checksum() {   # $1 = the archive's path at the source
   if [ "$LOCAL" -eq 1 ]; then cat "$1.sha256" 2>/dev/null
@@ -147,6 +169,8 @@ if [ -z "$newest" ]; then
   echo "ERROR: $MESSAGE" >&2; exit 1
 fi
 base="$(basename "$newest")"
+fn="$base$SFX"          # the name on the target: .age if the puller encrypts
+[ "$SRC_AGE" -eq 1 ] && fn="$base"   # the source already named it .age
 echo "-- newest on $NODE: $base"
 
 # rsync has to exist on BOTH sides. Without this the failure arrives as
@@ -165,40 +189,66 @@ if [ "$LOCAL" -eq 0 ] && ! "${SSH[@]}" "rsync --version" >/dev/null 2>&1; then
   echo "   that rsync is installed there."
 fi
 
-if [ -f "$DEST/daily/$base" ]; then
+if [ -f "$DEST/daily/$fn" ]; then
   RESULT="ok"; FETCHED=""; VERIFIED="already here"
-  BYTES=$(stat -c %s "$DEST/daily/$base")
+  BYTES=$(stat -c %s "$DEST/daily/$fn")
   MESSAGE="nothing new -- $base was already fetched"
   echo "$MESSAGE"
 else
   # --partial + a temporary name: an interrupted transfer must never
   # leave something under the final name that looks like a backup.
+  # With age the clear copy lands in STAGING on the puller's own disk,
+  # never on the vault, and is removed again below.
+  if [ -n "$AGE" ]; then
+    install -d -m 0700 "$STAGING"; PART="$STAGING/$base.part"
+  else
+    PART="$DEST/daily/.$base.part"
+  fi
   echo "-- fetching --"
-  if ! src_fetch "$newest" "$DEST/daily/.$base.part"; then
-    MESSAGE="transfer failed"
-    echo "ERROR: $MESSAGE" >&2; rm -f "$DEST/daily/.$base.part"; exit 1
+  if ! src_fetch "$newest" "$PART"; then
+    MESSAGE="transfer failed (free on $TO: $(df -PB1 "$TO" 2>/dev/null | awk 'NR==2{print int($4/1048576)}') MB)"
+    echo "ERROR: $MESSAGE" >&2; rm -f "$PART"; exit 1
   fi
 
   # Verified against the checksum the SOURCE recorded, not one computed
   # here from the file we just received -- that would only prove the
   # file is a copy of itself.
   want="$(src_checksum "$newest" | cut -d' ' -f1 || true)"
-  got="$(sha256sum "$DEST/daily/.$base.part" | cut -d' ' -f1)"
+  got="$(sha256sum "$PART" | cut -d' ' -f1)"
   if [ -z "$want" ]; then
     VERIFIED="no checksum at the source"
     echo "WARNING: the source recorded no checksum for $base"
   elif [ "$want" != "$got" ]; then
     MESSAGE="checksum mismatch for $base -- the copy was discarded"
-    echo "ERROR: $MESSAGE" >&2; rm -f "$DEST/daily/.$base.part"; exit 1
+    echo "ERROR: $MESSAGE" >&2; rm -f "$PART"; exit 1
   else
     VERIFIED="yes"
   fi
-  mv "$DEST/daily/.$base.part" "$DEST/daily/$base"
-  printf '%s  %s\n' "$got" "$base" > "$DEST/daily/$base.sha256"
-  chmod 600 "$DEST/daily/$base" "$DEST/daily/$base.sha256"
-  FETCHED="$base"
-  BYTES=$(stat -c %s "$DEST/daily/$base")
-  echo "-- fetched $base ($((BYTES / 1024 / 1024)) MB), checksum: $VERIFIED"
+  if [ -n "$AGE" ]; then
+    # The checksum of the CIPHERTEXT is taken from the stream that goes
+    # into the file, so the read-back after the run compares what was
+    # written with what the disk now holds. The clear checksum was
+    # verified one step earlier: that is all an age mode can prove, the
+    # private key being on paper (RFC-0053 3.1).
+    age -R "$AGE" < "$PART" | tee "$DEST/daily/.$fn.part" | sha256sum | cut -d' ' -f1 > "$STAGING/$base.ctsum"
+    if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+      MESSAGE="age encryption failed for $base"
+      echo "ERROR: $MESSAGE" >&2; rm -f "$PART" "$STAGING/$base.ctsum" "$DEST/daily/.$fn.part"; exit 1
+    fi
+    clear_sum="$got"           # kept beside the ciphertext: the restore drill checks the clear bytes against it
+    got="$(cat "$STAGING/$base.ctsum")"
+    rm -f "$PART" "$STAGING/$base.ctsum"
+    [ "$VERIFIED" = "yes" ] && VERIFIED="yes (clear, before encrypting)"
+  fi
+  [ "$SRC_AGE" -eq 1 ] && [ "$VERIFIED" = "yes" ] && VERIFIED="yes (ciphertext; the clear checksum is the source's word)"
+  mv "$DEST/daily/.$fn.part" "$DEST/daily/$fn"
+  printf '%s  %s\n' "$got" "$fn" > "$DEST/daily/$fn.sha256"
+  [ -z "${clear_sum:-}" ] || printf '%s  %s\n' "$clear_sum" "$base" > "$DEST/daily/$fn.clear.sha256"
+  chmod 600 "$DEST/daily/$fn" "$DEST/daily/$fn.sha256"
+  [ ! -e "$DEST/daily/$fn.clear.sha256" ] || chmod 600 "$DEST/daily/$fn.clear.sha256"
+  FETCHED="$fn"
+  BYTES=$(stat -c %s "$DEST/daily/$fn")
+  echo "-- fetched $fn ($((BYTES / 1024 / 1024)) MB), checksum: $VERIFIED"
 fi
 
 # Generations. The archive names itself after the moment it was made
@@ -212,13 +262,14 @@ if [ -n "$day" ]; then
   dom="$(date -d "$day" +%d 2>/dev/null || echo 00)"
   link_into() {
     local gen="$1"
-    [ -f "$DEST/$gen/$base" ] && return 0
+    [ -f "$DEST/$gen/$fn" ] && return 0
     # A hard link: the same bytes counted once. On a filesystem that
     # refuses them (some CIFS shares do), fall back to a real copy
     # rather than silently keeping no generation at all.
-    ln "$DEST/daily/$base" "$DEST/$gen/$base" 2>/dev/null \
-      || cp -p "$DEST/daily/$base" "$DEST/$gen/$base"
-    cp -p "$DEST/daily/$base.sha256" "$DEST/$gen/$base.sha256" 2>/dev/null || true
+    ln "$DEST/daily/$fn" "$DEST/$gen/$fn" 2>/dev/null \
+      || cp -p "$DEST/daily/$fn" "$DEST/$gen/$fn"
+    cp -p "$DEST/daily/$fn.sha256" "$DEST/$gen/$fn.sha256" 2>/dev/null || true
+    cp -p "$DEST/daily/$fn.clear.sha256" "$DEST/$gen/$fn.clear.sha256" 2>/dev/null || true
     echo "-- kept as $gen generation"
   }
   [ "$dow" = "7" ] && link_into weekly
@@ -228,10 +279,10 @@ fi
 prune() {
   local gen="$1" keep="$2"
   [ "$keep" -gt 0 ] || return 0
-  ls -1t "$DEST/$gen"/oaap-backup-*.tar.gz 2>/dev/null | tail -n +$((keep + 1)) |
+  ls -1t "$DEST/$gen"/oaap-backup-*.tar.gz$SFX 2>/dev/null | tail -n +$((keep + 1)) |
     while read -r old; do
       echo "-- pruning $gen/$(basename "$old")"
-      rm -f "$old" "$old.sha256"
+      rm -f "$old" "$old.sha256" "$old.clear.sha256"
     done
 }
 prune daily "$DAILY"
@@ -241,7 +292,7 @@ prune monthly "$MONTHLY"
 RESULT="ok"
 [ -n "$FETCHED" ] && MESSAGE="$FETCHED, $((BYTES / 1024 / 1024)) MB, checksum $VERIFIED"
 echo "OK: $MESSAGE"
-echo "   daily=$(ls -1 "$DEST/daily"/*.tar.gz 2>/dev/null | wc -l)" \
-     "weekly=$(ls -1 "$DEST/weekly"/*.tar.gz 2>/dev/null | wc -l)" \
-     "monthly=$(ls -1 "$DEST/monthly"/*.tar.gz 2>/dev/null | wc -l)"
+echo "   daily=$(ls -1 "$DEST/daily"/*.tar.gz$SFX 2>/dev/null | wc -l)" \
+     "weekly=$(ls -1 "$DEST/weekly"/*.tar.gz$SFX 2>/dev/null | wc -l)" \
+     "monthly=$(ls -1 "$DEST/monthly"/*.tar.gz$SFX 2>/dev/null | wc -l)"
 exit 0
