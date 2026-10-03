@@ -3931,6 +3931,11 @@ PROFILE_LABELS = {
               "oaap.events.broker (RFC-0032 D2), unabhängig von 'store'. "
               "Der rohe Geräte-Port wird nur zusätzlich mit 'exposed' "
               "veröffentlicht.",
+    "broker-plain": "Klartext-MQTT im Intranet — veröffentlicht Port 1883 "
+                    "des Brokers (OHNE TLS: ein dort gesendeter Schlüssel "
+                    "ist für jeden im Netz lesbar) nur auf der privaten "
+                    "LAN-Adresse dieses Knotens, für Geräte, die kein TLS "
+                    "sprechen (RFC-0054 §3). Braucht 'broker'. Ab Werk aus.",
     "gateway-only": "Nur-Gateway-Knoten — die Instanz-Ports 8100-8199 sind "
                     "von außen nicht erreichbar; Apps nur über Namen am "
                     "Gateway (80/443).",
