@@ -35,7 +35,9 @@ COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 BUILD_ID_RE = re.compile(r"^b-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
 TEMPLATE_RE = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 
-PARAM_KINDS = ("label", "text", "color", "connector", "word")
+PARAM_KINDS = ("label", "text", "color", "connector", "word", "bool")
+TRUE_WORDS = ("true", "1", "yes", "on")
+FALSE_WORDS = ("false", "0", "no", "off", "")
 
 # step type -> (required keys, optional keys). A key outside both is a
 # refusal: a profile cannot smuggle an argument the verb never promised.
@@ -47,11 +49,16 @@ STEP_TYPES = {
     "tenant.policy":  ((), ("first_login", "default_role",
                             "self_registration")),
     "tenant.face":    ((), ("title", "color_primary", "color_accent")),
-    "app.install":    (("source", "name"), ("channel", "path", "ref")),
+    # Exactly one of `source` (a path or URL, for a profile the operator wrote
+    # on the node) and `app` (an id in a configured store source, the only
+    # form an UPLOADED profile may use -- see upload_problems).
+    "app.install":    (("name",), ("source", "app", "source_id", "channel",
+                                   "path", "ref")),
     "manual":         (("text", "done_when"), ()),
     "backup.check":   ((), ()),
 }
-COMMON_KEYS = ("id", "type", "label_text")
+# `when` names a bool parameter: the step is skipped unless it is true.
+COMMON_KEYS = ("id", "type", "label_text", "when")
 DONE_WHEN = ("user.exists", "role.tenant_admin", "confirmed")
 
 STEP_STATES = ("pending", "running", "done", "failed", "waiting", "skipped")
@@ -75,6 +82,29 @@ class Refusal(Exception):
 
 def digest_of(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def upload_problems(doc, known_apps=None):
+    """Extra reasons a profile may not be UPLOADED through the portal.
+
+    A profile written on the node by the operator may name any package
+    source; one that arrives through a web page names apps of the configured
+    catalogue only -- a catalogue entry is something a server_admin chose to
+    trust, a path or URL typed into an upload is not. `known_apps` (ids) is
+    checked when given."""
+    out = []
+    for i, st in enumerate((doc or {}).get("steps") or []):
+        if isinstance(st, dict) and st.get("type") == "app.install":
+            sid = st.get("id", i + 1)
+            if "source" in st or "path" in st or "ref" in st:
+                out.append(f"step '{sid}': an uploaded profile names an app of "
+                           "the catalogue ('app'), not a 'source', 'path' or 'ref'")
+            app = st.get("app")
+            if isinstance(app, str) and not TEMPLATE_RE.search(app) \
+                    and known_apps is not None and app not in known_apps:
+                out.append(f"step '{sid}': '{app}' is not in any configured "
+                           "store source")
+    return out
 
 
 def read_profile_file(path):
@@ -166,6 +196,16 @@ def profile_problems(doc):
                     out.append(f"{where} ('{sid}'): timeout is 1 to 900 seconds")
             elif v is not None:
                 out.append(f"{where} ('{sid}'): '{k}' must be text")
+        if "when" in st:
+            w = st["when"]
+            if not isinstance(w, str) or w not in params \
+                    or (params[w] or {}).get("kind") != "bool":
+                out.append(f"{where} ('{sid}'): 'when' must name a parameter "
+                           "of kind bool")
+        if typ == "app.install":
+            if ("source" in st) == ("app" in st):
+                out.append(f"{where} ('{sid}'): app.install needs exactly one "
+                           "of 'source' and 'app'")
         if typ == "manual" and st.get("done_when") not in DONE_WHEN:
             out.append(f"{where} ('{sid}'): done_when is one of "
                        + ", ".join(DONE_WHEN))
@@ -194,6 +234,15 @@ def param_values(profile, given, label_check=None):
             continue
         else:
             val = None
+        if spec.get("kind") == "bool":
+            word = str(val).strip().lower() if val is not None else ""
+            if word in TRUE_WORDS:
+                values[name] = "true"
+            elif word in FALSE_WORDS:
+                values[name] = "false"
+            else:
+                problems.append(f"parameter '{name}': is not yes or no")
+            continue
         if val is None:
             values[name] = None
             continue
@@ -236,7 +285,7 @@ def render_step(step, values):
     """
     out = {}
     for k, v in step.items():
-        if k in ("id", "type", "label_text"):
+        if k in ("id", "type", "label_text", "when"):
             continue
         if isinstance(v, str):
             whole = TEMPLATE_RE.fullmatch(v)
@@ -262,7 +311,13 @@ def render_step(step, values):
 def plan(profile, values):
     """[(id, type, rendered args)] -- what a build would do, nothing done."""
     return [(s["id"], s["type"], render_step(s, values))
-            for s in profile["steps"]]
+            for s in profile["steps"] if step_active(s, values)]
+
+
+def step_active(step, values):
+    """False for a step whose `when` parameter is not true."""
+    w = step.get("when")
+    return w is None or values.get(w) == "true"
 
 
 # ------------------------------------------------------------- the state
@@ -469,6 +524,13 @@ def run(state, profile, drivers, root, now=iso_now):
     for rec in state["steps"]:
         step = steps[rec["id"]]
         typ = rec["type"]
+        if not step_active(step, values):
+            # not asked for: decided before the step is even rendered, so a
+            # parameter only that step needs cannot fail the build
+            if rec["state"] != "skipped":
+                rec["state"], rec["note"] = "skipped", "not asked for"
+                _save(root, state, drivers)
+            continue
         args, bad = _safe(render_step, step, values)
         if args is None:
             return _stop(state, rec, "failed", bad, root, drivers, now)

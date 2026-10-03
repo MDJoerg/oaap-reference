@@ -9951,7 +9951,10 @@ BUILD_LIST_BODY = """
     <td><strong>{{ p.id }}</strong>{% if p.title %}<br><span class="muted">{{ p.title }}</span>{% endif %}</td>
     <td>{{ p.steps }}</td>
     <td>{% if p.problem %}<span class="err">abgelehnt: {{ p.problem }}</span>
-        {% else %}<a class="btn" href="/aufbau/neu?profil={{ p.id }}">Aufbau starten</a>{% endif %}</td>
+        {% else %}<a class="btn" href="/aufbau/neu?profil={{ p.id }}">Aufbau starten</a>
+        <a class="rowaction" href="/aufbau/profile/{{ p.id }}.json">Herunterladen</a>{% endif %}
+        <form method="post" action="/aufbau/profile/{{ p.id }}/loeschen" style="display:inline">
+          <button class="rowaction" style="background:none;border:0;cursor:pointer;color:#b91c1c">Löschen</button></form></td>
   </tr>
   {% endfor %}
 </table>
@@ -9960,6 +9963,19 @@ BUILD_LIST_BODY = """
 Datei in <code>/var/lib/oaap/profiles/</code>; wie sie aussieht, steht in der
 Anleitung „Einen Mandanten aus einem Profil aufbauen“.</p>
 {% endif %}
+</div>
+<div class="card">
+<h2>Profil hochladen</h2>
+<form method="post" action="/aufbau/profile/hochladen" enctype="multipart/form-data">
+  <label>Profildatei (JSON, höchstens 64 KB)
+    <input type="file" name="datei" accept=".json,application/json" required></label>
+  <button class="btn">Hochladen</button>
+  <a class="rowaction" href="/aufbau/vorlage.json">Vorlage herunterladen</a>
+</form>
+<p class="muted">Der Knoten prüft die Datei vollständig, bevor er sie ablegt. Eine App darf darin nur
+mit ihrer ID aus einer eingerichteten Katalogquelle stehen, nie mit einem Pfad. Eine Datei mit gleicher
+<code>id</code> ersetzt das vorhandene Profil; Aufbauten, die schon laufen, arbeiten mit der Datei weiter,
+mit der sie begonnen haben.</p>
 </div>
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <h2>Aufbauten</h2>
@@ -10002,6 +10018,10 @@ BUILD_NEW_BODY = """
       <label class="seatopt"><input type="checkbox" name="{{ f.name }}__none" value="1"
         {% if values.get(f.name ~ '__none') or (not values.get(f.name) and not f.default and not f.required) %}checked{% endif %}>
         keine Farbe (es gilt die der Plattform)</label>
+    {% elif f.kind == 'bool' %}
+      <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="1"
+        {% if (values and values.get(f.name)) or (not values and f.default) %}checked{% endif %}>
+        {{ f.label }}</label>
     {% else %}
       <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
         <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
@@ -10021,7 +10041,7 @@ BUILD_NEW_BODY = """
 <div class="card">
   <h2>Was geschieht</h2>
   <ol>
-    {% for s in plan %}<li>{{ s.text }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}
+    {% for s in plan %}<li>{{ s.text }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}{% if s.when %} <span class="badge off">nur mit „{{ s.when }}“</span>{% endif %}
       <span class="muted">({{ s.id }})</span></li>{% endfor %}
   </ol>
   <p class="muted">Der Aufbau hält an, wo ein Mensch etwas tun muss (zum Beispiel den ersten Verwalter im
@@ -10290,6 +10310,10 @@ PUBLIC_REQUEST_PAGE = STYLE + """
         <label class="seatopt"><input type="checkbox" name="{{ f.name }}__none" value="1"
           {% if values.get(f.name ~ '__none') or (not values.get(f.name) and not f.default and not f.required) %}checked{% endif %}>
           keine Farbe</label>
+      {% elif f.kind == 'bool' %}
+        <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="1"
+          {% if (values and values.get(f.name)) or (not values and f.default) %}checked{% endif %}>
+          {{ f.label }}</label>
       {% else %}
         <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
           <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
@@ -10541,3 +10565,70 @@ def request_act_page(rid, verb):
         args["reason"] = " ".join(request.form.get("reason", "").split())[:200]
     job = management_api.enqueue(sc[0], sc[1], op, args, action="tenant-request")
     return redirect(f"/aufbau/anfragen?job={job}")
+
+
+# ---- profiles in and out (RFC-0055 §14, oaap.core.portal 2.11)
+#
+# Download is a read of the view the host wrote. Upload and delete write
+# nothing here: the file's text travels in a request (action `tenant-profile`)
+# and the host judges it whole before one byte is stored.
+
+@app.get("/aufbau/vorlage.json")
+def build_template_download():
+    if _build_scope() is None:
+        return _build_denied()
+    return _json_download(build_view.template_text(), "profil-vorlage.json")
+
+
+def _json_download(text, filename):
+    resp = make_response(text)
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/aufbau/profile/<name>.json")
+def build_profile_download(name):
+    if _build_scope() is None:
+        return _build_denied()
+    text = build_view.profile_text(_build_view(), name) \
+        if build_view.PROFILE_RE.match(name) else None
+    if text is None:
+        return "Dieses Profil gibt es nicht (oder der Knoten hat es abgelehnt).", 404
+    return _json_download(text, name + ".json")
+
+
+@app.post("/aufbau/profile/hochladen")
+def build_profile_upload():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if (request.content_length or 0) > build_view.PROFILE_FILE_MAX + 4096:
+        return redirect("/aufbau?err=" + quote(
+            f"Die Datei ist größer als {build_view.PROFILE_FILE_MAX // 1024} KB."))
+    f = request.files.get("datei")
+    raw = f.read(build_view.PROFILE_FILE_MAX + 1) if f else None
+    text, problem = build_view.upload_text(raw)
+    if problem:
+        return redirect("/aufbau?err=" + quote(problem))
+    rid = management_api.enqueue(sc[0], sc[1], "put", {"content": text},
+                                 action="tenant-profile")
+    return redirect(f"/aufbau?job={rid}")
+
+
+@app.post("/aufbau/profile/<pid>/loeschen")
+def build_profile_delete(pid):
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    known = any(p.get("id") == pid for p in (_build_view().get("profiles") or []))
+    if not build_view.PROFILE_RE.match(pid) or not known:
+        return redirect("/aufbau?err=" + quote("Dieses Profil gibt es nicht."))
+    rid = management_api.enqueue(sc[0], sc[1], "delete", {"id": pid},
+                                 action="tenant-profile")
+    return redirect(f"/aufbau?job={rid}")

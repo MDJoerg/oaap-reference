@@ -6,6 +6,7 @@ wie ein Aufbau dargestellt wird und wie aus einem Formular die Parameter
 eines Aufbaus werden -- ohne Flask und ohne Anfrage, damit man es ohne Portal
 prüfen kann (wie `cohort_view.py`).
 """
+import json
 import re
 
 BUILD_STATE = {
@@ -114,10 +115,14 @@ def fields(profile):
 def plan(profile):
     """Die Schritte in Klartext; ein Menschenschritt ist gekennzeichnet."""
     out = []
+    params = profile.get("params") or {}
     for s in profile.get("steps") or []:
         typ = s.get("type", "")
+        when = s.get("when") or ""
+        ask = (params.get(when) or {}).get("label") or when
         out.append({"id": s.get("id", ""), "text": STEP_TYPE.get(typ, typ),
-                    "human": typ == "manual"})
+                    "human": typ == "manual",
+                    "when": (ask if isinstance(ask, str) else when)})
     return out
 
 
@@ -130,6 +135,10 @@ def start_params(profile, form):
     """
     params, missing = {}, []
     for f in fields(profile):
+        if f["kind"] == "bool":
+            # an unticked box is not sent by a browser: say "no" explicitly
+            params[f["name"]] = "true" if form.get(f["name"]) else "false"
+            continue
         raw = str(form.get(f["name"], "") or "").strip()
         if f["kind"] == "color" and form.get(f["name"] + "__none"):
             raw = ""
@@ -149,7 +158,7 @@ def detail(build):
     waiting = failed = None
     for r in build.get("steps") or []:
         st = r.get("state", "pending")
-        done += st == "done"
+        done += st in ("done", "skipped")
         row = {"id": r.get("id", ""), "type": STEP_TYPE.get(r.get("type"),
                                                             r.get("type", "")),
                "state": STEP_STATE.get(st, st), "raw": st,
@@ -270,3 +279,68 @@ def public_params(profile, form):
     if not MAIL_RE.match(contact) or len(contact) > 160:
         errors.append("Bitte eine E-Mail-Adresse angeben, unter der wir Sie erreichen.")
     return params, contact, errors
+
+
+# ------------------------------------------- profiles in and out (RFC-0055 §14)
+
+PROFILE_FILE_MAX = 64 * 1024
+
+TEMPLATE = {
+    "profile": "oaap.tenant-profile/1",
+    "id": "verein-vorlage",
+    "title": "Verein mit Webseite (Vorlage)",
+    "description": (
+        "Vorlage. 'id' ist der Dateiname des Profils auf dem Knoten. 'params' sind die "
+        "Angaben, die beim Start (und im Einladungsformular) gefragt werden: kind ist "
+        "label, text, color, word, connector oder bool (Haken). Ein Schritt mit "
+        "'when': '<bool-Parameter>' läuft nur, wenn der Haken gesetzt ist. "
+        "Schrittarten: tenant.create, address.ensure, address.wait, idp.provision, "
+        "tenant.policy, tenant.face, app.install, manual, backup.check. app.install "
+        "nennt in einem hochgeladenen Profil eine App des Katalogs ('app'), nie einen "
+        "Pfad; ersetze 'webseite' durch eine ID aus deinem Katalog. Platzhalter wie "
+        "{label} setzt der Knoten ein, er wertet sie nie als Befehl aus."),
+    "params": {
+        "label": {"kind": "label", "required": True, "label": "Kürzel des Mandanten"},
+        "title": {"kind": "text", "required": True, "max": 60, "label": "Name des Kunden"},
+        "color": {"kind": "color", "default": None, "label": "Hauptfarbe"},
+        "with_web": {"kind": "bool", "default": True, "label": "Mit Webseite"},
+    },
+    "steps": [
+        {"id": "tenant", "type": "tenant.create", "label": "{label}", "title": "{title}"},
+        {"id": "face", "type": "tenant.face", "title": "{title}",
+         "color_primary": "{color}"},
+        {"id": "web", "type": "app.install", "app": "webseite",
+         "name": "{label}-webseite", "when": "with_web"},
+        {"id": "admin", "type": "manual", "done_when": "role.tenant_admin",
+         "text": "Ersten Verwalter im Anmeldedienst des Kunden anlegen, "
+                 "dann im Portal die Rolle tenant_admin vergeben."},
+        {"id": "backup", "type": "backup.check"},
+    ],
+}
+
+
+def template_text():
+    return json.dumps(TEMPLATE, indent=2, ensure_ascii=False) + "\n"
+
+
+def profile_text(view, pid):
+    """The profile as the node holds it, for "Herunterladen", or None."""
+    p = find_profile(view, pid)
+    if p is None or not isinstance(p.get("doc"), dict):
+        return None
+    return json.dumps(p["doc"], indent=2, ensure_ascii=False) + "\n"
+
+
+def upload_text(raw):
+    """Bytes of an uploaded file -> (text, problem). Only what the portal can
+    judge without the node: size, encoding, JSON. The host judges the rest."""
+    if raw is None or len(raw) == 0:
+        return None, "Bitte eine Datei auswählen."
+    if len(raw) > PROFILE_FILE_MAX:
+        return None, f"Die Datei ist größer als {PROFILE_FILE_MAX // 1024} KB."
+    try:
+        text = raw.decode("utf-8-sig")
+        json.loads(text)
+    except (UnicodeDecodeError, ValueError):
+        return None, "Die Datei ist kein gültiges JSON (UTF-8)."
+    return text, None

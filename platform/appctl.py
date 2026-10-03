@@ -5705,6 +5705,8 @@ class _BuildDrivers:
         return ABSENT_, f"no instance '{a['name']}' in this tenant yet"
 
     def _do_app_install(self, a, ctx):
+        if a.get("app"):
+            return self._install_from_catalogue(a)
         argv = ["install", a["source"], "--tenant", self.label,
                 "--name", a["name"], "--channel", a.get("channel") or "production"]
         if a.get("path"):
@@ -5712,6 +5714,40 @@ class _BuildDrivers:
         if a.get("ref"):
             argv += ["--ref", a["ref"]]
         ok, note = self._verb(argv, f"'{a['name']}' was installed")
+        key = self._instance_key(a["name"])
+        return ok, note, ([f"instance:{key}"] if ok and key else [])
+
+    def _install_from_catalogue(self, a):
+        """`app`: an id in a CONFIGURED store source, resolved here on the
+        host exactly as the store's one-click install resolves it. A source
+        that needs a human's confirmation (unverified) is never installed
+        from by a profile: nobody is there to confirm."""
+        import contextlib
+        import io
+        src, _version, store = _store_lookup(a["app"], a.get("source_id") or "")
+        if not src:
+            return False, (f"'{a['app']}' is not listed in any configured "
+                           "store source"), []
+        if store.get("trust") == "unverified":
+            return False, (f"'{store.get('name', store['id'])}' is an "
+                           "unverified source; a profile does not install from "
+                           "it -- install the app from the store page, where "
+                           "it can be confirmed"), []
+        ns = argparse.Namespace(
+            package=src["url"], path=src.get("path", ""), ref=src.get("ref", ""),
+            name=a["name"], channel=a.get("channel") or "production",
+            store_source=store["id"], tenant=self.label)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                cmd_install(ns)
+            ok, note = True, f"'{a['name']}' was installed from '{store['id']}'"
+        except SystemExit:
+            out = buf.getvalue().strip()
+            ok, note = False, (_brief(out, 3) if out else "install failed")
+        except subprocess.CalledProcessError as exc:
+            ok, note = False, ((exc.stderr or "").strip().splitlines() or
+                               [str(exc)])[-1]
         key = self._instance_key(a["name"])
         return ok, note, ([f"instance:{key}"] if ok and key else [])
 
@@ -5787,8 +5823,11 @@ def tenant_build_view_write():
                 doc, _d = tenant_build.read_profile_file(
                     tenant_build_profile_path(pid))
                 row["params"] = doc.get("params") or {}
-                row["steps"] = [{"id": s_["id"], "type": s_["type"]}
+                row["steps"] = [{"id": s_["id"], "type": s_["type"],
+                                 "when": s_.get("when", "")}
                                 for s_ in doc["steps"]]
+                row["description"] = str(doc.get("description") or "")[:500]
+                row["doc"] = doc          # what "Herunterladen" hands out
             profiles.append(row)
         os.makedirs(APPS_DIR, exist_ok=True)
         tmp = BUILD_VIEW + ".tmp"
@@ -5818,7 +5857,8 @@ def job_result_fill(req, rid, ok, msg):
     same gap.
     """
     if str(req.get("action") or "") not in (
-            "cohort", "tenant-build", "tenant-request", "tenant-request-submit"):
+            "cohort", "tenant-build", "tenant-request", "tenant-request-submit",
+            "tenant-profile"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
         return
@@ -5870,6 +5910,96 @@ def tenant_build_job(req, role, actor):
     tail = f" -- {bad['id']}: {bad['note']}" if bad else ""
     return (state["state"] != "failed",
             f"build {state['id']} is {state['state']}{tail}", state["id"])
+
+
+def _catalogue_app_ids():
+    """The app ids of every enabled store source -> set, or None when no
+    source could be read (then an upload cannot be checked and is refused)."""
+    ids, seen_any = set(), False
+    for src in [x for x in load_sources()[0] if x.get("enabled", True)]:
+        data = fetch_store_list(src["url"])
+        if not data:
+            continue
+        seen_any = True
+        for app_ in data.get("apps", []):
+            if (app_.get("package") or {}).get("git") and app_.get("id"):
+                ids.add(app_["id"])
+    return ids if seen_any else None
+
+
+def tenant_profile_job(req, role, actor):
+    """Put a profile on the node or take one away -> (ok, sentence, id).
+
+    The request carries the file's TEXT; the host judges it whole (the same
+    check a profile written on the node passes, plus the upload rules) before
+    anything is written. The spool is data, not trust."""
+    op = str(req.get("op") or "")
+    a = req.get("args")
+    a = a if isinstance(a, dict) else {}
+    if role != "server_admin":
+        return False, "profiles are managed by server_admin", ""
+    try:
+        if op == "put":
+            raw = a.get("content")
+            if not isinstance(raw, str):
+                raise tenant_build.Refusal("the profile text is missing")
+            data = raw.encode("utf-8")
+            if len(data) > tenant_build.MAX_PROFILE_BYTES:
+                raise tenant_build.Refusal(
+                    f"the profile is larger than "
+                    f"{tenant_build.MAX_PROFILE_BYTES // 1024} KB")
+            try:
+                doc = json.loads(raw)
+            except ValueError:
+                raise tenant_build.Refusal("the file is not valid JSON")
+            problems = tenant_build.profile_problems(doc)
+            if problems:
+                raise tenant_build.Refusal(
+                    "the profile is refused: " + "; ".join(problems[:5])
+                    + (f" (and {len(problems) - 5} more)" if len(problems) > 5
+                       else ""))
+            uses_catalogue = any(s_.get("type") == "app.install"
+                                 for s_ in doc["steps"])
+            known = _catalogue_app_ids() if uses_catalogue else set()
+            if uses_catalogue and known is None:
+                raise tenant_build.Refusal(
+                    "no store source could be read, so the apps named in the "
+                    "profile cannot be checked; try again when the catalogue "
+                    "is reachable")
+            problems = tenant_build.upload_problems(doc, known)
+            if problems:
+                raise tenant_build.Refusal("the profile is refused: "
+                                           + "; ".join(problems[:5]))
+            pid = doc["id"]
+            path = tenant_build_profile_path(pid)
+            existed = os.path.isfile(path)
+            os.makedirs(PROFILE_DIR, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+            return True, (f"profile '{pid}' was "
+                          + ("replaced; builds already started keep working "
+                             "with the file they began with" if existed
+                             else "added")), pid
+        if op == "delete":
+            pid = str(a.get("id") or "")
+            path = tenant_build_profile_path(pid)
+            if not os.path.isfile(path):
+                raise tenant_build.Refusal(f"there is no profile '{pid}'")
+            held = [st for st in tenant_build.list_states(BUILD_DIR)
+                    if st.get("profile") == pid and st.get("state") in
+                    tenant_build.OPEN_STATES]
+            if held:
+                raise tenant_build.Refusal(
+                    f"build {held[0]['id']} still uses this profile "
+                    f"({held[0]['state']}); finish or roll it back first")
+            os.remove(path)
+            return True, f"profile '{pid}' was deleted", pid
+    except tenant_build.Refusal as exc:
+        return False, str(exc), str(a.get("id") or "")
+    return False, f"unknown profile operation '{op}'", ""
 
 
 REQUEST_DIR = os.path.join(DATA_DIR, "data", "tenant-requests")
@@ -7680,6 +7810,7 @@ def validate_manifest(m):
             errs.append("health.path: required, must start with /")
         errs.extend(validate_destination_needs(m))
     errs.extend(validate_data_model_sections(m))
+    errs.extend(validate_authorization_section(m))
     if errs:
         die("manifest invalid:\n  - " + "\n  - ".join(errs))
 
@@ -7748,6 +7879,16 @@ def normalized_dest_needs(m):
     return out
 
 
+def validate_authorization_section(m):
+    """The optional 'authorization' section (manifest 0.6,
+    oaap.core.authorization 0.1 section 2.1). Pure. Absent means nothing
+    to check; present means the semantic rules of the capability -- the
+    JSON schema only knows the shape."""
+    if "authorization" not in m:
+        return []
+    return authorization.validate_declaration(m.get("authorization"))
+
+
 def validate_data_model_sections(m):
     """Structural checks for 'data_model'/'contributes'/'consumes'
     (manifest 0.3, RFC-0031 §5, oaap.data.model 0.1 §2.2). Pure — no
@@ -7810,7 +7951,6 @@ def declaration_text(contributes, consumes):
         if not words:
             return ""
         if len(words) == 1:
-    errs.extend(validate_authorization_section(m))
             return words[0]
         return ", ".join(words[:-1]) + " and " + words[-1]
 
@@ -7879,16 +8019,6 @@ def bind_candidates(word, type_index):
     case-insensitive alias match is a candidate; zero or more than one
     is what the caller turns into a refusal.
     """
-def validate_authorization_section(m):
-    """The optional 'authorization' section (manifest 0.6,
-    oaap.core.authorization 0.1 section 2.1). Pure. Absent means nothing
-    to check; present means the semantic rules of the capability -- the
-    JSON schema only knows the shape."""
-    if "authorization" not in m:
-        return []
-    return authorization.validate_declaration(m.get("authorization"))
-
-
     word_l = word.strip().lower()
     for t in type_index:
         if t["key"].lower() == word_l:
@@ -8490,6 +8620,115 @@ def _twin_issue_instance_key(name, tenant_id):
     return json.loads(out)
 
 
+# ----------------------- business authorization (oaap.core.authorization 0.1)
+# What a person may DO inside an app (RFC-0045 stages 1+2). The state lives
+# in identity; this file only hands it a declaration at install, mints the
+# instance's key, and gives the operator a CLI over the same routes the
+# portal will use -- one set of rules, not a second copy of them here.
+#
+# The scope names the capability, never an app: an app id has no dot, so
+# 'oaap.authz' can never collide with one (same reasoning as TWIN_KEY_SCOPE).
+# It must always agree with identity's AUTHZ_SCOPE.
+AUTHZ_KEY_SCOPE = "oaap.authz"
+
+
+def _authz_call(method, path, body=None):
+    """Call one authorization route INSIDE the identity container.
+
+    Through the Flask test client with the platform's own internal key:
+    the host is the operator, the route is the same one the portal uses,
+    and the audit entry is written by the route, not by a copy of it.
+    Returns (status, parsed body).
+    """
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "c = m.app.test_client()\n"
+        "h = {m.INTERNAL_HEADER: m.INTERNAL_KEY}\n"
+        "b = json.loads(os.environ['OAAP_A_BODY'])\n"
+        "r = getattr(c, os.environ['OAAP_A_METHOD'].lower())("
+        "os.environ['OAAP_A_PATH'], headers=h, json=b)\n"
+        "print(json.dumps({'status': r.status_code, 'body': r.get_json()}))\n",
+        {"OAAP_A_METHOD": method, "OAAP_A_PATH": path,
+         "OAAP_A_BODY": json.dumps(body or {})})
+    doc = json.loads(out)
+    return doc["status"], doc["body"]
+
+
+def _authz_impact_lines(removed, impact):
+    lines = [f"  removed: {len(removed)} promise(s), among them: "
+             + ", ".join(removed[:6]) + (" ..." if len(removed) > 6 else "")]
+    for tid, row in sorted((impact or {}).items()):
+        label = (load_tenants().get(tid) or {}).get("label", tid)
+        lines.append(f"  tenant '{label}': role(s) "
+                     + ", ".join(row["roles"])
+                     + f" -- {row['assignments']} assignment(s) lose something")
+    if not impact:
+        lines.append("  no role of any tenant is built on it yet")
+    return lines
+
+
+def _authz_register_declaration(app_id, version, declaration, confirm=False):
+    """Hand a package's declaration to identity, BEFORE anything is built.
+
+    A destructive change is not written unless the operator confirmed it;
+    the install stops here and says whose roles would lose something
+    (oaap.core.authorization 2.2). `declaration=None` withdraws one: a
+    package that had a section and no longer does has removed everything
+    it declared, and that is the same kind of change.
+    """
+    status, doc = _authz_call("POST", "/internal/authz/register", {
+        "app": app_id, "version": version, "declaration": declaration,
+        "confirm": bool(confirm)})
+    if status == 409:
+        print(f"This version of '{app_id}' REMOVES something its earlier "
+              "version declared for business authorization:")
+        for line in _authz_impact_lines(doc.get("removed") or [],
+                                        doc.get("impact")):
+            print(line)
+        die("nothing was changed. Install again with "
+            "--confirm-authorization to accept it (oaap.core.authorization "
+            "2.2).")
+    if status != 200:
+        die("the authorization declaration was refused: "
+            + str((doc or {}).get("error") or status))
+    return doc
+
+
+def _authz_issue_instance_key(name, tenant_id, app_id):
+    """The key an instance presents to `/authz/effective`; returns the token.
+
+    The machine principal `instance:<name>` is the one the twin key already
+    uses (created if absent); the key is scoped to AUTHZ_KEY_SCOPE, so it
+    opens nothing else and nothing else's key opens this. Identity is told
+    which app and which tenant the instance is -- `effective` answers from
+    that record, never from what the app says.
+    """
+    principal = f"instance:{name}"
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_T_INST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
+        "    'oaap.core.authorization (RFC-0045)', m.KEY_MAX_DAYS, 'root')\n"
+        "with m.authz_rw() as st:\n"
+        "    st['instances'][os.environ['OAAP_T_INST']] = {\n"
+        "        'app': os.environ['OAAP_T_APP'], 'tenant': os.environ['OAAP_T_TENANT']}\n"
+        "    m.save_authz(st)\n"
+        "print(json.dumps(secret))\n",
+        {"OAAP_T_NAME": principal, "OAAP_T_INST": name,
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": AUTHZ_KEY_SCOPE,
+         "OAAP_T_APP": app_id})
+    return json.loads(out)
+
+
 # ------------------------------- remote twin readers (oaap.data.twin 0.4)
 # A reader on ANOTHER node, reached through a tunnel (RFC-0033 §6, D10;
 # oaap.data.twin 2.14). Measured before this existed: the tunnel carried
@@ -8620,115 +8859,6 @@ def cmd_data_twin(args):
         for label, r in sorted(readers.items()):
             print(f"  {TWIN_REMOTE_PREFIX}{label:<20} tenant {tenant_label(r['tenant']) or 'default'}"
                   f"  reads {','.join(r.get('reads') or [])}  key {r.get('key', '?')} "
-# ----------------------- business authorization (oaap.core.authorization 0.1)
-# What a person may DO inside an app (RFC-0045 stages 1+2). The state lives
-# in identity; this file only hands it a declaration at install, mints the
-# instance's key, and gives the operator a CLI over the same routes the
-# portal will use -- one set of rules, not a second copy of them here.
-#
-# The scope names the capability, never an app: an app id has no dot, so
-# 'oaap.authz' can never collide with one (same reasoning as TWIN_KEY_SCOPE).
-# It must always agree with identity's AUTHZ_SCOPE.
-AUTHZ_KEY_SCOPE = "oaap.authz"
-
-
-def _authz_call(method, path, body=None):
-    """Call one authorization route INSIDE the identity container.
-
-    Through the Flask test client with the platform's own internal key:
-    the host is the operator, the route is the same one the portal uses,
-    and the audit entry is written by the route, not by a copy of it.
-    Returns (status, parsed body).
-    """
-    out = _identity_exec(
-        "import json, os, app as m\n"
-        "c = m.app.test_client()\n"
-        "h = {m.INTERNAL_HEADER: m.INTERNAL_KEY}\n"
-        "b = json.loads(os.environ['OAAP_A_BODY'])\n"
-        "r = getattr(c, os.environ['OAAP_A_METHOD'].lower())("
-        "os.environ['OAAP_A_PATH'], headers=h, json=b)\n"
-        "print(json.dumps({'status': r.status_code, 'body': r.get_json()}))\n",
-        {"OAAP_A_METHOD": method, "OAAP_A_PATH": path,
-         "OAAP_A_BODY": json.dumps(body or {})})
-    doc = json.loads(out)
-    return doc["status"], doc["body"]
-
-
-def _authz_impact_lines(removed, impact):
-    lines = [f"  removed: {len(removed)} promise(s), among them: "
-             + ", ".join(removed[:6]) + (" ..." if len(removed) > 6 else "")]
-    for tid, row in sorted((impact or {}).items()):
-        label = (load_tenants().get(tid) or {}).get("label", tid)
-        lines.append(f"  tenant '{label}': role(s) "
-                     + ", ".join(row["roles"])
-                     + f" -- {row['assignments']} assignment(s) lose something")
-    if not impact:
-        lines.append("  no role of any tenant is built on it yet")
-    return lines
-
-
-def _authz_register_declaration(app_id, version, declaration, confirm=False):
-    """Hand a package's declaration to identity, BEFORE anything is built.
-
-    A destructive change is not written unless the operator confirmed it;
-    the install stops here and says whose roles would lose something
-    (oaap.core.authorization 2.2). `declaration=None` withdraws one: a
-    package that had a section and no longer does has removed everything
-    it declared, and that is the same kind of change.
-    """
-    status, doc = _authz_call("POST", "/internal/authz/register", {
-        "app": app_id, "version": version, "declaration": declaration,
-        "confirm": bool(confirm)})
-    if status == 409:
-        print(f"This version of '{app_id}' REMOVES something its earlier "
-              "version declared for business authorization:")
-        for line in _authz_impact_lines(doc.get("removed") or [],
-                                        doc.get("impact")):
-            print(line)
-        die("nothing was changed. Install again with "
-            "--confirm-authorization to accept it (oaap.core.authorization "
-            "2.2).")
-    if status != 200:
-        die("the authorization declaration was refused: "
-            + str((doc or {}).get("error") or status))
-    return doc
-
-
-def _authz_issue_instance_key(name, tenant_id, app_id):
-    """The key an instance presents to `/authz/effective`; returns the token.
-
-    The machine principal `instance:<name>` is the one the twin key already
-    uses (created if absent); the key is scoped to AUTHZ_KEY_SCOPE, so it
-    opens nothing else and nothing else's key opens this. Identity is told
-    which app and which tenant the instance is -- `effective` answers from
-    that record, never from what the app says.
-    """
-    principal = f"instance:{name}"
-    out = _identity_exec(
-        "import json, os, app as m\n"
-        "with m.users_rw() as users:\n"
-        "    name = os.environ['OAAP_T_NAME']\n"
-        "    if not m.find_user(users, name):\n"
-        "        users.append({'username': name,\n"
-        "                      'display_name': os.environ['OAAP_T_INST'],\n"
-        "                      'password_hash': '', 'kind': 'machine',\n"
-        "                      'roles': ['user'], 'groups': [],\n"
-        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
-        "                      'active': True})\n"
-        "        m.save_users(users)\n"
-        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
-        "    'oaap.core.authorization (RFC-0045)', m.KEY_MAX_DAYS, 'root')\n"
-        "with m.authz_rw() as st:\n"
-        "    st['instances'][os.environ['OAAP_T_INST']] = {\n"
-        "        'app': os.environ['OAAP_T_APP'], 'tenant': os.environ['OAAP_T_TENANT']}\n"
-        "    m.save_authz(st)\n"
-        "print(json.dumps(secret))\n",
-        {"OAAP_T_NAME": principal, "OAAP_T_INST": name,
-         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": AUTHZ_KEY_SCOPE,
-         "OAAP_T_APP": app_id})
-    return json.loads(out)
-
-
                   f"until {r.get('expires', '?')}")
         return
     label = args.arg1 or die(f"'data twin {args.action}' needs a reader label")
@@ -9911,6 +10041,7 @@ def reload_gateway():
 # start_instance_container so the container shape stays identical.
 
 RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
+                "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_URL",
                 "OAAP_INSTANCE_NAMES"}  # platform-owned, never operator-editable
 
 
@@ -10041,7 +10172,6 @@ RESOURCE_CPUS_MIN, RESOURCE_CPUS_MAX = 0.1, 256.0
 
 def memory_bytes(text):
     """`3g` / `512m` -> bytes; ValueError for anything else.
-                "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_URL",
 
     Only m and g: docker also takes b and k, and a memory limit of "512"
     (bytes, to docker) is a typo that would OOM-kill the app at start.
@@ -13286,6 +13416,34 @@ def _install_from_dir(pkg, args, source):
     # computed once, regardless of whether either section is present,
     # so it is ready the moment either block below needs it.
     twin_tenant = tenant_for_new_instance(inst, permit={"tenant": chosen_tenant})
+    # oaap.core.authorization (RFC-0045 stage 1): the declaration is
+    # registered HERE, before any image exists, so a destructive change
+    # that nobody confirmed leaves nothing built. A rehearsal never
+    # registers: it shares the production app id and must not move what
+    # the production tenant's roles are built on.
+    authz_decl = m.get("authorization")
+    if not is_artefact and not rehearsal:
+        if authz_decl is not None:
+            _authz_register_declaration(
+                app["id"], app["version"], authz_decl,
+                confirm=getattr(args, "confirm_authorization", False))
+            print("NOTE: this app declares business authorization "
+                  "(oaap.core.authorization 0.1) -- a tenant builds roles "
+                  "from it with `oaap authz`.")
+        elif os.path.isfile(os.path.join(DATA_DIR, "data", "identity",
+                                         "authorization.json")):
+            try:
+                with open(os.path.join(DATA_DIR, "data", "identity",
+                                       "authorization.json"),
+                          encoding="utf-8") as _f:
+                    _had = app["id"] in (json.load(_f).get("declarations")
+                                         or {})
+            except (OSError, ValueError):
+                _had = False
+            if _had:
+                _authz_register_declaration(
+                    app["id"], app["version"], None,
+                    confirm=getattr(args, "confirm_authorization", False))
     if dm_section or contributes or consumes:
         text = declaration_text(contributes, consumes)
         if text:
@@ -13416,34 +13574,6 @@ def _install_from_dir(pkg, args, source):
     # oaap.data.twin (RFC-0031 Schritt 3, E1): the machine-principal key
     # this instance presents to '/twin/*'. Minted ONCE, like the secret
     # above -- a redeploy must not silently rotate a credential the app
-    # oaap.core.authorization (RFC-0045 stage 1): the declaration is
-    # registered HERE, before any image exists, so a destructive change
-    # that nobody confirmed leaves nothing built. A rehearsal never
-    # registers: it shares the production app id and must not move what
-    # the production tenant's roles are built on.
-    authz_decl = m.get("authorization")
-    if not is_artefact and not rehearsal:
-        if authz_decl is not None:
-            _authz_register_declaration(
-                app["id"], app["version"], authz_decl,
-                confirm=getattr(args, "confirm_authorization", False))
-            print("NOTE: this app declares business authorization "
-                  "(oaap.core.authorization 0.1) -- a tenant builds roles "
-                  "from it with `oaap authz`.")
-        elif os.path.isfile(os.path.join(DATA_DIR, "data", "identity",
-                                         "authorization.json")):
-            try:
-                with open(os.path.join(DATA_DIR, "data", "identity",
-                                       "authorization.json"),
-                          encoding="utf-8") as _f:
-                    _had = app["id"] in (json.load(_f).get("declarations")
-                                         or {})
-            except (OSError, ValueError):
-                _had = False
-            if _had:
-                _authz_register_declaration(
-                    app["id"], app["version"], None,
-                    confirm=getattr(args, "confirm_authorization", False))
     # may have stored, and reissuing it on every install would make
     # every earlier key an orphan nobody revoked. NOT for a rehearsal,
     # for the same reason its schema is not provisioned above: RFC-0030
@@ -13453,6 +13583,15 @@ def _install_from_dir(pkg, args, source):
         env["OAAP_TWIN_URL"] = f"http://{GATEWAY_CONTAINER}/twin"
         print(f"Issued a machine-principal API key for '{name}' (RFC-0031 "
               "E1) -- OAAP_PLATFORM_KEY/OAAP_TWIN_URL are in its environment.")
+    # oaap.core.authorization: the key this instance presents to
+    # '/authz/effective'. Minted once, like the twin's, and never for a
+    # rehearsal (it would read the PRODUCTION tenant's grants).
+    if authz_decl is not None and not is_artefact and not rehearsal             and "OAAP_AUTHZ_KEY" not in env:
+        env["OAAP_AUTHZ_KEY"] = _authz_issue_instance_key(
+            name, twin_tenant, app["id"])
+        env["OAAP_AUTHZ_URL"] = f"http://{GATEWAY_CONTAINER}/authz"
+        print(f"Issued an authorization key for '{name}' (RFC-0045) -- "
+              "OAAP_AUTHZ_KEY/OAAP_AUTHZ_URL are in its environment.")
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     # RFC-0043: the instance's own names, canonical first, so the app
@@ -13583,15 +13722,6 @@ def _install_from_dir(pkg, args, source):
         # declared config keys (labels + secret flags) so the CLI and the
         # portal can offer them for editing without the manifest at hand
         "config": [{"key": c["key"], "label": c.get("label", ""),
-    # oaap.core.authorization: the key this instance presents to
-    # '/authz/effective'. Minted once, like the twin's, and never for a
-    # rehearsal (it would read the PRODUCTION tenant's grants).
-    if authz_decl is not None and not is_artefact and not rehearsal             and "OAAP_AUTHZ_KEY" not in env:
-        env["OAAP_AUTHZ_KEY"] = _authz_issue_instance_key(
-            name, twin_tenant, app["id"])
-        env["OAAP_AUTHZ_URL"] = f"http://{GATEWAY_CONTAINER}/authz"
-        print(f"Issued an authorization key for '{name}' (RFC-0045) -- "
-              "OAAP_AUTHZ_KEY/OAAP_AUTHZ_URL are in its environment.")
                     "secret": bool(c.get("secret")),
                     "multiline": bool(c.get("multiline")),
                     # spec 2.8: only a key whose value THIS app defines
@@ -14366,6 +14496,168 @@ def _key_row(k):
             f"{scope:<20} {state:<18} {used}")
 
 
+def _kv_args(pairs, what):
+    """['field=a,b', ...] -> {'field': ['a', 'b']}; dies on a malformed pair."""
+    out = {}
+    for pair in pairs or []:
+        k, sep, v = pair.partition("=")
+        if not (k.strip() and sep and v.strip()):
+            die(f"{what} wants FIELD=VALUE[,VALUE], got '{pair}'")
+        out[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
+    return out
+
+
+def cmd_authz(args):
+    """Business authorization from the host (oaap.core.authorization 0.1).
+
+    The same routes the portal will use, called as the host operator --
+    never a second implementation of the rules. A tenant is always named:
+    a grant belongs to exactly one.
+    """
+    verb = args.verb
+    label = (args.tenant or "").strip().lower()
+    if not label:
+        die(f"which tenant? `oaap authz {verb} --tenant hbvp`")
+    tid, _t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the label '{label}'")
+    who = {"actor": "root", "operator": True, "tenant": tid}
+    q = "actor=root&operator=1&tenant=" + tid
+
+    def show(status, doc):
+        if status >= 300:
+            die(str((doc or {}).get("error") or f"answered {status}"))
+        return doc
+
+    if verb == "declarations":
+        doc = show(*_authz_call("GET", "/internal/authz/declarations?" + q))
+        if not doc["declarations"]:
+            print("No app has registered an authorization declaration.")
+        for d in doc["declarations"]:
+            decl = d["declaration"]
+            print(f"{d['app']} v{d['version']}: "
+                  f"{len(decl.get('objects') or [])} object(s), "
+                  f"{len(decl.get('role_templates') or [])} template(s), "
+                  f"{d['roles']} role(s) in '{label}'")
+            for t in decl.get("role_templates") or []:
+                print(f"    template {t['key']:<14} {t['title']}")
+        return
+    if verb == "roles":
+        doc = show(*_authz_call("GET", "/internal/authz/roles?" + q))
+        for r in doc["roles"]:
+            vals = "; ".join(f"{k}={','.join(v)}"
+                             for k, v in (r.get("values") or {}).items())
+            print(f"{r['id'][:8]}  {r['name']:<28} {r['app']}/{r['template']}"
+                  + (f"  [{vals}]" if vals else ""))
+        if not doc["roles"]:
+            print("No roles yet.")
+        return
+    if verb == "role-add":
+        if not (args.app and args.template and args.item_name):
+            die("role-add needs --app, --template and --name")
+        doc = show(*_authz_call("POST", "/internal/authz/roles", dict(
+            who, app=args.app, template=args.template, name=args.item_name,
+            values=_kv_args(args.value, "--value"))))
+        print(f"Role '{doc['role']['name']}' ({doc['role']['id'][:8]}) "
+              f"created in '{label}'.")
+        return
+    if verb == "collections":
+        doc = show(*_authz_call("GET", "/internal/authz/collections?" + q))
+        for c in doc["collections"]:
+            print(f"{c['id'][:8]}  {c['name']:<28} {len(c['roles'])} role(s)")
+        if not doc["collections"]:
+            print("No collections yet.")
+        return
+    if verb == "collection-add":
+        if not (args.item_name and args.role):
+            die("collection-add needs --name and at least one --role")
+        doc = show(*_authz_call("POST", "/internal/authz/collections", dict(
+            who, name=args.item_name, roles=args.role)))
+        print(f"Collection '{doc['collection']['name']}' created in "
+              f"'{label}'.")
+        return
+    if verb == "mappings":
+        doc = show(*_authz_call("GET", "/internal/authz/mappings?" + q))
+        for mp in doc["mappings"]:
+            print(f"{mp['id'][:8]}  group {mp['group']:<30} -> "
+                  f"{mp['collection_name']}")
+        if not doc["mappings"]:
+            print("No group gives anything yet. A group of the realm is "
+                  "read at every sign-in and only if it is mapped.")
+        return
+    if verb == "map-add":
+        if not (args.group and args.collection):
+            die("map-add needs --group (its path in the realm, e.g. "
+                "Verein/Hallenwart) and --collection")
+        doc = show(*_authz_call("POST", "/internal/authz/mappings", dict(
+            who, group=args.group, collection=args.collection)))
+        print(f"Group '{doc['mapping']['group']}' now gives "
+              f"'{args.collection}' in '{label}' -- read again at every "
+              "sign-in through the provider.")
+        return
+    if verb == "map-remove":
+        target = args.name
+        if not target:
+            die("map-remove needs the mapping id (first column of "
+                "`oaap authz mappings`)")
+        full = next((mp["id"] for mp in show(*_authz_call(
+            "GET", "/internal/authz/mappings?" + q))["mappings"]
+            if mp["id"].startswith(target)), "")
+        if not full:
+            die(f"no mapping '{target}' in '{label}'")
+        doc = show(*_authz_call("DELETE", f"/internal/authz/mappings/"
+                                          f"{full}?" + q, who))
+        print(f"Mapping removed; {doc['ended']} assignment(s) it gave "
+              "ended at once.")
+        return
+    users = _read_identity_users() or []
+    ids = {u.get("username"): u.get("id") for u in users
+           if resolve_tenant(u.get("tenant")) == tid}
+    if verb == "assignments":
+        doc = show(*_authz_call("GET", "/internal/authz/assignments?" + q))
+        names = {v: k for k, v in ids.items()}
+        for a in doc["assignments"]:
+            state = "ENDED" if a["ended"] else (
+                f"{a['valid_from'] or '-'} .. {a['valid_to'] or '-'}")
+            print(f"{a['id'][:8]}  {names.get(a['subject'], a['subject'][:8]):<18} "
+                  f"{a['context']}  {state}  by {a['granted_by']}")
+        if not doc["assignments"]:
+            print("No assignments yet.")
+        return
+    if verb == "assign":
+        if not (args.collection and args.user):
+            die("assign needs --collection and --user")
+        uid = ids.get(args.user)
+        if not uid:
+            if _read_identity_users() is None:
+                die("cannot read the user store here (run with sudo)")
+            die(f"'{args.user}' is not a user of tenant '{label}'")
+        doc = show(*_authz_call("POST", "/internal/authz/assignments", dict(
+            who, collection=args.collection, user=uid,
+            context={k: v for k, v in _kv_args(args.context,
+                                               "--context").items()},
+            valid_from=args.valid_from, valid_to=args.valid_to)))
+        print(f"'{args.user}' now holds '{args.collection}' in '{label}' "
+              f"(assignment {doc['assignment']['id'][:8]}).")
+        return
+    if verb == "revoke":
+        target = args.name
+        if not target:
+            die("revoke needs the assignment id (the first column of "
+                "`oaap authz assignments`)")
+        full = next((a["id"] for a in show(*_authz_call(
+            "GET", "/internal/authz/assignments?" + q))["assignments"]
+            if a["id"].startswith(target)), "")
+        if not full:
+            die(f"no assignment '{target}' in '{label}'")
+        doc = show(*_authz_call("DELETE", f"/internal/authz/assignments/"
+                                          f"{full}?" + q, who))
+        print("Assignment ended." if doc.get("ended")
+              else "It had ended already.")
+        return
+    die(f"unknown verb '{verb}'")
+
+
 def cmd_machine(args):
     """Machine principals (RFC-0027 3.1) -- users that cannot log in.
 
@@ -14496,134 +14788,6 @@ def _key_issue_broker(args):
               f"mqtts://BROKER --user {rec['id']}")
         print("                         (the key goes in on standard "
               "input, not on the line)")
-def _kv_args(pairs, what):
-    """['field=a,b', ...] -> {'field': ['a', 'b']}; dies on a malformed pair."""
-    out = {}
-    for pair in pairs or []:
-        k, sep, v = pair.partition("=")
-        if not (k.strip() and sep and v.strip()):
-            die(f"{what} wants FIELD=VALUE[,VALUE], got '{pair}'")
-        out[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
-    return out
-
-
-def cmd_authz(args):
-    """Business authorization from the host (oaap.core.authorization 0.1).
-
-    The same routes the portal will use, called as the host operator --
-    never a second implementation of the rules. A tenant is always named:
-    a grant belongs to exactly one.
-    """
-    verb = args.verb
-    label = (args.tenant or "").strip().lower()
-    if not label:
-        die(f"which tenant? `oaap authz {verb} --tenant hbvp`")
-    tid, _t = tenant_by_label(label, include_former=False)
-    if not tid:
-        die(f"no tenant with the label '{label}'")
-    who = {"actor": "root", "operator": True, "tenant": tid}
-    q = "actor=root&operator=1&tenant=" + tid
-
-    def show(status, doc):
-        if status >= 300:
-            die(str((doc or {}).get("error") or f"answered {status}"))
-        return doc
-
-    if verb == "declarations":
-        doc = show(*_authz_call("GET", "/internal/authz/declarations?" + q))
-        if not doc["declarations"]:
-            print("No app has registered an authorization declaration.")
-        for d in doc["declarations"]:
-            decl = d["declaration"]
-            print(f"{d['app']} v{d['version']}: "
-                  f"{len(decl.get('objects') or [])} object(s), "
-                  f"{len(decl.get('role_templates') or [])} template(s), "
-                  f"{d['roles']} role(s) in '{label}'")
-            for t in decl.get("role_templates") or []:
-                print(f"    template {t['key']:<14} {t['title']}")
-        return
-    if verb == "roles":
-        doc = show(*_authz_call("GET", "/internal/authz/roles?" + q))
-        for r in doc["roles"]:
-            vals = "; ".join(f"{k}={','.join(v)}"
-                             for k, v in (r.get("values") or {}).items())
-            print(f"{r['id'][:8]}  {r['name']:<28} {r['app']}/{r['template']}"
-                  + (f"  [{vals}]" if vals else ""))
-        if not doc["roles"]:
-            print("No roles yet.")
-        return
-    if verb == "role-add":
-        if not (args.app and args.template and args.item_name):
-            die("role-add needs --app, --template and --name")
-        doc = show(*_authz_call("POST", "/internal/authz/roles", dict(
-            who, app=args.app, template=args.template, name=args.item_name,
-            values=_kv_args(args.value, "--value"))))
-        print(f"Role '{doc['role']['name']}' ({doc['role']['id'][:8]}) "
-              f"created in '{label}'.")
-        return
-    if verb == "collections":
-        doc = show(*_authz_call("GET", "/internal/authz/collections?" + q))
-        for c in doc["collections"]:
-            print(f"{c['id'][:8]}  {c['name']:<28} {len(c['roles'])} role(s)")
-        if not doc["collections"]:
-            print("No collections yet.")
-        return
-    if verb == "collection-add":
-        if not (args.item_name and args.role):
-            die("collection-add needs --name and at least one --role")
-        doc = show(*_authz_call("POST", "/internal/authz/collections", dict(
-            who, name=args.item_name, roles=args.role)))
-        print(f"Collection '{doc['collection']['name']}' created in "
-              f"'{label}'.")
-        return
-    users = _read_identity_users() or []
-    ids = {u.get("username"): u.get("id") for u in users
-           if resolve_tenant(u.get("tenant")) == tid}
-    if verb == "assignments":
-        doc = show(*_authz_call("GET", "/internal/authz/assignments?" + q))
-        names = {v: k for k, v in ids.items()}
-        for a in doc["assignments"]:
-            state = "ENDED" if a["ended"] else (
-                f"{a['valid_from'] or '-'} .. {a['valid_to'] or '-'}")
-            print(f"{a['id'][:8]}  {names.get(a['subject'], a['subject'][:8]):<18} "
-                  f"{a['context']}  {state}  by {a['granted_by']}")
-        if not doc["assignments"]:
-            print("No assignments yet.")
-        return
-    if verb == "assign":
-        if not (args.collection and args.user):
-            die("assign needs --collection and --user")
-        uid = ids.get(args.user)
-        if not uid:
-            if _read_identity_users() is None:
-                die("cannot read the user store here (run with sudo)")
-            die(f"'{args.user}' is not a user of tenant '{label}'")
-        doc = show(*_authz_call("POST", "/internal/authz/assignments", dict(
-            who, collection=args.collection, user=uid,
-            context={k: v for k, v in _kv_args(args.context,
-                                               "--context").items()},
-            valid_from=args.valid_from, valid_to=args.valid_to)))
-        print(f"'{args.user}' now holds '{args.collection}' in '{label}' "
-              f"(assignment {doc['assignment']['id'][:8]}).")
-        return
-    if verb == "revoke":
-        target = args.name
-        if not target:
-            die("revoke needs the assignment id (the first column of "
-                "`oaap authz assignments`)")
-        full = next((a["id"] for a in show(*_authz_call(
-            "GET", "/internal/authz/assignments?" + q))["assignments"]
-            if a["id"].startswith(target)), "")
-        if not full:
-            die(f"no assignment '{target}' in '{label}'")
-        doc = show(*_authz_call("DELETE", f"/internal/authz/assignments/"
-                                          f"{full}?" + q, who))
-        print("Assignment ended." if doc.get("ended")
-              else "It had ended already.")
-        return
-    die(f"unknown verb '{verb}'")
-
-
 
 
 def cmd_key(args):
@@ -18248,6 +18412,9 @@ def _scrub_rehearsal_env(key, ident, secret_keys, handover_fields=()):
     what to fill in rather than left to discover it from a crash loop.
     """
     platform_owned = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
+                      # oaap.core.authorization: a live credential for the
+                      # PRODUCTION tenant's grants, dropped like the twin's
+                      "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_URL",
                       # RFC-0043: a rehearsal has its own names; the
                       # install below computes them afresh
                       "OAAP_INSTANCE_NAMES"}
@@ -18378,9 +18545,6 @@ def cmd_rehearse(args):
 #
 # So the host writes a VIEW beside the registry, the same shape as
 # `apps/artifacts.json` (0.1.76) and `apps/backup-schedule.json`
-                      # oaap.core.authorization: a live credential for the
-                      # PRODUCTION tenant's grants, dropped like the twin's
-                      "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_URL",
 # (0.1.79): a file the portal reads, and an action the host checks
 # again for itself, because the spool is data and not trust.
 #
@@ -20676,6 +20840,25 @@ def cmd_process_deploys(_args):
                              subject=str(_subject or ""), result="denied",
                              who=actor or "invitation", role=act_role or "-",
                              detail=msg)
+        elif action == "tenant-profile":
+            # RFC-0055 §14: a profile is put on the node, or taken away, from
+            # the portal. Role and actor come from the ACTOR's record; the
+            # text is judged whole here before one byte is written.
+            ok, msg, _pid = tenant_profile_job(req, act_role, actor)
+            tenant_build_view_write()
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "subject": _pid, "message": msg,
+                               "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            audit_tenant("tenant.profile." + str(req.get("op") or "?"),
+                         ensure_default_tenant(), subject=str(_pid or ""),
+                         result="ok" if ok else "denied", who=actor or "api",
+                         role=act_role or "-", detail=msg)
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -20743,7 +20926,7 @@ def cmd_process_deploys(_args):
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
-               "tenant-request": "portal",
+               "tenant-request": "portal", "tenant-profile": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -22206,6 +22389,11 @@ def main():
                     help="resolve a 'contributes'/'consumes' entry the "
                          "registry could not match on its own (oaap.data."
                          "model 0.1 §2.4) — repeatable")
+    pi.add_argument("--confirm-authorization", dest="confirm_authorization",
+                    action="store_true",
+                    help="accept a version that REMOVES something it had "
+                         "declared for business authorization "
+                         "(oaap.core.authorization 2.2)")
     pi.set_defaults(fn=cmd_install)
     pl = sub.add_parser("list")
     pl.set_defaults(fn=cmd_list)
@@ -22355,11 +22543,6 @@ def main():
     pmi = sub.add_parser("migrate-instance-dirs",
                          help="move instance data under its tenant (RFC-0026)")
     pmi.set_defaults(fn=cmd_migrate_instance_dirs)
-    pi.add_argument("--confirm-authorization", dest="confirm_authorization",
-                    action="store_true",
-                    help="accept a version that REMOVES something it had "
-                         "declared for business authorization "
-                         "(oaap.core.authorization 2.2)")
     pmx = sub.add_parser("artifact-index",
                          help="internal: list retained packages where the "
                               "portal can read them (oaap.apps.runtime 2.14)")
@@ -22725,6 +22908,35 @@ def main():
                      help="one public route (its declared path, e.g. /vote): "
                           "override the instance value for this route only")
     pth.set_defaults(fn=cmd_throttle)
+    pz = sub.add_parser("authz", help="business authorization -- roles, "
+                        "collections, assignments (oaap.core.authorization)")
+    pz.add_argument("verb", choices=["declarations", "roles", "role-add",
+                                     "collections", "collection-add",
+                                     "assignments", "assign", "revoke",
+                                     "mappings", "map-add", "map-remove"])
+    pz.add_argument("name", nargs="?", help="for 'revoke' / 'map-remove': the "
+                    "id (or its first characters)")
+    pz.add_argument("--group", default=None, help="for map-add: the group's "
+                    "path in the realm, e.g. Verein/Hallenwart")
+    pz.add_argument("--tenant", default=None, help="the tenant's label")
+    pz.add_argument("--app", default=None)
+    pz.add_argument("--template", default=None)
+    pz.add_argument("--name", dest="item_name", default=None,
+                    help="the role's or collection's name")
+    pz.add_argument("--value", action="append", default=[],
+                    metavar="FIELD=ID[,ID]",
+                    help="for role-add: fill a $value field (ids, not labels)")
+    pz.add_argument("--role", action="append", default=[],
+                    help="for collection-add: a role name or id, repeatable")
+    pz.add_argument("--collection", default=None)
+    pz.add_argument("--user", default=None, help="a user NAME of the tenant "
+                    "(stored by id, RFC-0040)")
+    pz.add_argument("--context", action="append", default=[],
+                    metavar="FIELD=TWIN-ID",
+                    help="for assign: fill a $context field")
+    pz.add_argument("--from", dest="valid_from", default=None, metavar="DATE")
+    pz.add_argument("--to", dest="valid_to", default=None, metavar="DATE")
+    pz.set_defaults(fn=cmd_authz)
     pm = sub.add_parser("machine", help="machine principals (RFC-0027) -- "
                         "accounts that authenticate by key, never by password")
     pm.add_argument("action", choices=["add", "list"])
@@ -22874,32 +23086,6 @@ def main():
     pb.add_argument("--tenant", default="",
                     help="create: archive ONE tenant instead of the node "
                          "(RFC-0029 D5). Such an archive is not restorable "
-    pz = sub.add_parser("authz", help="business authorization -- roles, "
-                        "collections, assignments (oaap.core.authorization)")
-    pz.add_argument("verb", choices=["declarations", "roles", "role-add",
-                                     "collections", "collection-add",
-                                     "assignments", "assign", "revoke"])
-    pz.add_argument("name", nargs="?", help="for 'revoke': the assignment id "
-                    "(or its first characters)")
-    pz.add_argument("--tenant", default=None, help="the tenant's label")
-    pz.add_argument("--app", default=None)
-    pz.add_argument("--template", default=None)
-    pz.add_argument("--name", dest="item_name", default=None,
-                    help="the role's or collection's name")
-    pz.add_argument("--value", action="append", default=[],
-                    metavar="FIELD=ID[,ID]",
-                    help="for role-add: fill a $value field (ids, not labels)")
-    pz.add_argument("--role", action="append", default=[],
-                    help="for collection-add: a role name or id, repeatable")
-    pz.add_argument("--collection", default=None)
-    pz.add_argument("--user", default=None, help="a user NAME of the tenant "
-                    "(stored by id, RFC-0040)")
-    pz.add_argument("--context", action="append", default=[],
-                    metavar="FIELD=TWIN-ID",
-                    help="for assign: fill a $context field")
-    pz.add_argument("--from", dest="valid_from", default=None, metavar="DATE")
-    pz.add_argument("--to", dest="valid_to", default=None, metavar="DATE")
-    pz.set_defaults(fn=cmd_authz)
                          "by the installer — see the note it prints")
     pb.add_argument("--reason", default="",
                     help="exclude: why, in words the customer can read — it "

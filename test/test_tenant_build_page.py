@@ -154,7 +154,9 @@ ok("der Betreiber am Knoten sieht Profile und Aufbauten",
 ok("der Menuepunkt Aufbau steht da", 'href="/aufbau"' in t)
 ok("ein abgelehntes Profil zeigt den Grund und keinen Knopf",
    "abgelehnt: unknown step type" in t and t.count("Aufbau starten") == 1, t.count("Aufbau starten"))
-ok("die Liste hat kein Formular (nur Abmelden)", t.count("<form") == 1)
+ok("die Liste hat Formulare nur fuer Profile (hochladen, loeschen je Profil) und die Abmeldung",
+   t.count("<form") == 1 + 1 + 2 and t.count('action="/aufbau/profile/') == 3
+   and 'action="/aufbau/neu"' not in t, t.count("<form"))
 for who, role, roles in (("Verwalter", "tenant_admin", {"tenant_admin"}),
                          ("Mitglied", "", {"user"})):
     WHO.update(role=role, roles=roles, tenant="t-a")
