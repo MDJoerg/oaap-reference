@@ -25,6 +25,7 @@ from flask import (Flask, g, redirect, render_template_string, request,
                    send_file)
 from markupsafe import Markup
 
+import build_view
 import cohort_view
 import fleet_view
 # place.py sits BESIDE this file in the image (the build context is
@@ -311,6 +312,7 @@ LAYOUT = STYLE + """
     {% if can_twin %}<a href="/zwilling" class="{{ 'active' if active == 'twin' }}">Zwilling</a>{% endif %}
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
     {% if has_cohorts %}<a href="/kohorten" class="{{ 'active' if active == 'cohorts' }}">Kohorten</a>{% endif %}
+    {% if can_build %}<a href="/aufbau" class="{{ 'active' if active == 'build' }}">Aufbau</a>{% endif %}
     {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
@@ -3696,6 +3698,9 @@ def page(body_template, title, active, status=200, **ctx):
         can_store=bool(caller & {"server_admin", "tenant_admin"}),
         show_tenant=multi,
         has_cohorts=_has_cohorts(),
+        # The tenant build pages (RFC-0055 stage 3): an operator at the
+        # node's own address, nobody else, nowhere else.
+        can_build=_can_build(),
         can_health=bool(caller & {"server_admin", "support"}),
         # The twin browser (RFC-0031 Bauplan Schritt 5): every tenant
         # role sees it ("user sieht"); a server_admin with no tenant
@@ -9846,3 +9851,338 @@ def cohorts_remove_seat_page(name, sid):
 
 
 COHORT_LIST_BODY = COHORT_LIST_BODY.replace("{{ BANNER }}", COHORT_BANNER)
+
+
+# ---------------------------------------------------------------------------
+# Tenant builds -- the wizard (RFC-0055 stage 3, oaap.core.portal 2.9)
+#
+# The pages read the view the host writes (build-view.json) and write
+# nothing themselves: every button queues the request the operator API
+# queues (`management_api.enqueue`, action `tenant-build`), and the host
+# re-checks it from the actor's own record. So a page can never be a second,
+# weaker door than the API -- it is the same door with a form in front.
+# Operator only, and only at the node's own address.
+BUILD_VIEW_FILE = "/apps-registry/build-view.json"
+
+
+def _build_scope():
+    """(tenant_id, role) of an operator at the node's own address, else None."""
+    role, mine = caller_scope()
+    if role != "server_admin" or host_tenant_scope(request.host)[0]:
+        return None
+    return mine, role
+
+
+def _can_build():
+    return _build_scope() is not None
+
+
+def _build_view():
+    try:
+        with open(BUILD_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _build_denied():
+    """403 for anyone who is not an operator; 404 at a tenant's place, where
+    the pages do not exist (a node is not administered from a customer's)."""
+    if caller_scope()[0] == "server_admin":
+        return "Hier gibt es diese Seite nicht.", 404
+    return "Zugriff verweigert: erfordert die Rolle server_admin.", 403
+
+
+def _build_job_note(tid, role, rid):
+    """The banner for ?job=<id>: what became of the request a page sent."""
+    if not management_api.JOB_RE.match(rid or ""):
+        return None
+    meta = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "meta.json"))
+    if not management_api._may_see(meta, tid, role):
+        return None
+    st = management_api.job_status(management_api.SPOOL_DIR, rid)
+    if st is None:
+        return None
+    if st != "done":
+        return {"done": False, "failed": False,
+                "text": "Der Auftrag " + ("läuft" if st == "running" else "wartet")
+                        + " auf dem Knoten — diese Seite lädt sich neu."}
+    res = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "result.json")) or {}
+    good = bool(res.get("ok"))
+    return {"done": True, "failed": not good, "build": res.get("build", ""),
+            "text": res.get("message") or ("Erledigt." if good else "Fehlgeschlagen.")}
+
+
+BUILD_BANNER = """
+{% if job %}
+<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p>
+{% if job.build and job.done %}<p><a class="btn" href="/aufbau/{{ job.build }}">Zum Aufbau</a></p>{% endif %}
+</div>
+{% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
+{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+"""
+
+BUILD_LIST_BODY = """
+<div class="pagehead"><h1>Aufbau</h1></div>
+""" + BUILD_BANNER + """
+<div class="card">
+<h2>Profile</h2>
+{% if profiles %}
+<table>
+  <tr><th>Profil</th><th>Schritte</th><th></th></tr>
+  {% for p in profiles %}
+  <tr>
+    <td><strong>{{ p.id }}</strong>{% if p.title %}<br><span class="muted">{{ p.title }}</span>{% endif %}</td>
+    <td>{{ p.steps }}</td>
+    <td>{% if p.problem %}<span class="err">abgelehnt: {{ p.problem }}</span>
+        {% else %}<a class="btn" href="/aufbau/neu?profil={{ p.id }}">Aufbau starten</a>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">Auf diesem Knoten liegt noch kein Profil. Ein Profil ist eine
+Datei in <code>/var/lib/oaap/profiles/</code>; wie sie aussieht, steht in der
+Anleitung „Einen Mandanten aus einem Profil aufbauen“.</p>
+{% endif %}
+</div>
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Aufbauten</h2>
+{% if rows %}
+<table>
+  <tr><th>Mandant</th><th>Profil</th><th>Zustand</th><th>Gestartet</th><th></th></tr>
+  {% for r in rows %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/aufbau/{{ r.id }}">{{ r.label }}</a></td>
+    <td>{{ r.profile }}</td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span></td>
+    <td>{{ r.created }}<br><span class="muted">{{ r.by }}</span></td>
+    <td><a class="rowaction" href="/aufbau/{{ r.id }}">Ansehen</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">Noch kein Aufbau.</p>{% endif %}
+</div>
+<p class="muted">Anhalten gibt es nicht: ein Aufbau läuft bis zu einem Wartepunkt oder
+bis zu einem Fehler. Dieselbe Mechanik steht in der Verwaltungs-API
+(<code>/api/v1/operator/tenant-builds</code>, nur mit einer Anmeldung als
+Mensch) und auf dem Knoten als <code>oaap tenant build</code> bereit.</p>
+"""
+
+BUILD_NEW_BODY = """
+<a class="back" href="/aufbau">← Zurück zur Liste</a>
+<div class="pagehead"><h1>Aufbau starten</h1>
+  <span class="badge off">{{ profile.id }}</span></div>
+""" + BUILD_BANNER + """
+{% if profile.title %}<p class="muted">{{ profile.title }}</p>{% endif %}
+<div class="card">
+  <h2>Angaben</h2>
+  <form method="post" action="/aufbau/neu">
+    <input type="hidden" name="profil" value="{{ profile.id }}">
+    {% for f in fields %}
+    <p>
+    {% if f.kind == 'color' %}
+      <label>{{ f.label }}
+        <input type="color" name="{{ f.name }}" value="{{ values.get(f.name) or f.default or '#2563eb' }}"></label>
+      <label class="seatopt"><input type="checkbox" name="{{ f.name }}__none" value="1"
+        {% if values.get(f.name ~ '__none') or (not values.get(f.name) and not f.default and not f.required) %}checked{% endif %}>
+        keine Farbe (es gilt die der Plattform)</label>
+    {% else %}
+      <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
+        <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
+          {% if f.required %}required{% endif %}
+          {% if f.kind == 'label' %}maxlength="31" pattern="[a-z0-9][a-z0-9-]*" autocomplete="off"{% endif %}
+          {% if f.max %}maxlength="{{ f.max }}"{% endif %}></label>
+      {% if f.kind == 'label' %}<span class="muted">Kleinbuchstaben, Ziffern und „-“. Das Kürzel ist
+        <strong>öffentlich</strong>: es wird Teil der Adressen des Mandanten und steht damit in den
+        öffentlichen Zertifikatsprotokollen. Bei einem vertraulichen Kunden ein Kürzel wählen, das nichts über ihn sagt.</span>{% endif %}
+      {% if f.kind == 'text' and f.default %}<span class="muted">Voreinstellung: {{ f.default }}</span>{% endif %}
+    {% endif %}
+    </p>
+    {% endfor %}
+    <button class="btn">Aufbau starten</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Was geschieht</h2>
+  <ol>
+    {% for s in plan %}<li>{{ s.text }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}
+      <span class="muted">({{ s.id }})</span></li>{% endfor %}
+  </ol>
+  <p class="muted">Der Aufbau hält an, wo ein Mensch etwas tun muss (zum Beispiel den ersten Verwalter im
+  Anmeldedienst des Kunden anlegen — das tut OAAP nie selbst), und geht danach weiter. Scheitert ein Schritt, wird
+  er fortgesetzt, nicht wiederholt.</p>
+</div>
+"""
+
+BUILD_DETAIL_BODY = """
+<a class="back" href="/aufbau">← Zurück zur Liste</a>
+""" + BUILD_BANNER + """
+{% if b.waiting %}
+<div class="card warn">
+  <h2>Hier ist ein Mensch gefragt</h2>
+  <p>{{ b.waiting.text }}</p>
+  <form method="post" action="/aufbau/{{ b.id }}/continue" style="display:inline">
+    <button class="btn">Weiter prüfen</button></form>
+  {% if b.waiting.confirmable %}
+  <form method="post" action="/aufbau/{{ b.id }}/confirm" style="display:inline">
+    <input type="hidden" name="step" value="{{ b.waiting.id }}">
+    <button class="btn">Bestätigt</button></form>
+  {% endif %}
+  <p class="muted">„Weiter prüfen“ liest den Knoten neu und geht weiter, wenn es erledigt ist.</p>
+</div>
+{% elif b.failed %}
+<div class="card warn">
+  <h2>Ein Schritt ist fehlgeschlagen</h2>
+  <p><strong>{{ b.failed.type }}</strong> ({{ b.failed.id }}): {{ b.failed.note }}</p>
+  <form method="post" action="/aufbau/{{ b.id }}/continue">
+    <button class="btn">Fortsetzen</button></form>
+  <p class="muted">Erst die Ursache beheben. Fertige Schritte werden nur neu gelesen, nicht wiederholt.</p>
+</div>
+{% endif %}
+<div class="objhead">
+  <div class="titleline">
+    <h1>{{ b.label }}</h1>
+    <span class="badge {{ '' if b.tone == 'ok' else 'off' if b.tone == 'off' else 'todo' }}">{{ b.state }}</span>
+  </div>
+  <p class="sub">Profil <code>{{ b.profile }}</code> · gestartet {{ b.created }} von {{ b.by }}</p>
+  <div class="facts">
+    <div><span class="k">Fortschritt</span><span class="v">{{ b.progress }} Schritten erledigt</span></div>
+    <div><span class="k">Kennung</span><span class="v"><code>{{ b.id }}</code></span></div>
+  </div>
+</div>
+<div class="card" style="overflow-x:auto">
+  <h2>Schritte</h2>
+  <table>
+    <tr><th>Schritt</th><th>Zustand</th><th>Hinweis</th></tr>
+    {% for s in b.steps %}
+    <tr>
+      <td>{{ s.type }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}<br><span class="muted">{{ s.id }}</span></td>
+      <td><span class="badge {{ '' if s.raw == 'done' else 'todo' if s.raw in ('failed','waiting','running') else 'off' }}">{{ s.state }}</span></td>
+      <td>{{ s.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% if b.rollbackable %}
+<div class="card" style="border-color:#fca5a5">
+  <h2>Zurückbauen</h2>
+  <p>Baut nur zurück, <strong>was dieser Aufbau selbst angelegt hat</strong>, in umgekehrter Reihenfolge.
+  Der Anmeldedienst des Kunden (Realm) und jede Person darin bleiben. Ein Mandant mit Inhalt wird nicht entfernt.</p>
+  <form method="post" action="/aufbau/{{ b.id }}/rollback">
+    {% if b.made_instances %}
+    <label class="seatopt"><input type="checkbox" name="purge_instances" value="1">
+      Auch die <strong>Daten der Instanzen</strong> löschen, die dieser Aufbau angelegt hat (nicht umkehrbar).
+      Ohne Haken bleiben sie erhalten und halten den Mandanten fest.</label>
+    {% endif %}
+    <label>Zur Bestätigung das Kürzel eintippen: <code>{{ b.label }}</code>
+      <input type="text" name="confirm" autocomplete="off" required></label>
+    <button class="btn" style="background:#b91c1c">Zurückbauen</button>
+  </form>
+</div>
+{% endif %}
+{% if b.running %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
+"""
+
+
+@app.get("/aufbau")
+def build_page():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    view = _build_view()
+    return page(BUILD_LIST_BODY, "Aufbau", "build",
+                rows=build_view.rows(view), profiles=build_view.profiles(view),
+                job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+def _build_new(pid, values=None, error=None, status=200):
+    view = _build_view()
+    prof = build_view.find_profile(view, pid)
+    if prof is None:
+        return page(BUILD_LIST_BODY, "Aufbau", "build", status=404,
+                    rows=build_view.rows(view), profiles=build_view.profiles(view),
+                    job=None, error="Dieses Profil gibt es nicht (oder der Knoten hat es abgelehnt).")
+    return page(BUILD_NEW_BODY, "Aufbau starten", "build", status=status,
+                profile=prof, fields=build_view.fields(prof),
+                plan=build_view.plan(prof), values=values or {}, job=None,
+                error=error)
+
+
+@app.get("/aufbau/neu")
+def build_new_page():
+    if _build_scope() is None:
+        return _build_denied()
+    return _build_new(request.args.get("profil", ""))
+
+
+@app.post("/aufbau/neu")
+def build_start_page():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    pid = request.form.get("profil", "")
+    prof = build_view.find_profile(_build_view(), pid)
+    if prof is None:
+        return _build_new(pid)
+    params, missing = build_view.start_params(prof, request.form)
+    if missing:
+        return _build_new(pid, dict(request.form),
+                          "Bitte ausfüllen: " + ", ".join(missing), status=400)
+    rid = management_api.enqueue(sc[0], sc[1], "start",
+                                 {"profile": pid, "params": params},
+                                 action="tenant-build")
+    return redirect(f"/aufbau?job={rid}")
+
+
+@app.get("/aufbau/<bid>")
+def build_detail_page(bid):
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    view = _build_view()
+    b = build_view.find_build(view, bid)
+    if b is None:
+        return page(BUILD_LIST_BODY, "Aufbau", "build", status=404,
+                    rows=build_view.rows(view), profiles=build_view.profiles(view),
+                    job=None, error="Diesen Aufbau gibt es nicht.")
+    return page(BUILD_DETAIL_BODY, b.get("label", "Aufbau"), "build",
+                b=build_view.detail(b), job=_build_job_note(
+                    sc[0], sc[1], request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/aufbau/<bid>/<verb>")
+def build_act_page(bid, verb):
+    """Continue, confirm or roll back from the page: the API's hand-over."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    b = build_view.find_build(_build_view(), bid)
+    if b is None or verb not in ("continue", "confirm", "rollback"):
+        return redirect("/aufbau")
+    args = {"build": bid}
+    if verb == "confirm":
+        step = request.form.get("step", "")
+        waiting = build_view.detail(b)["waiting"]
+        if not waiting or waiting["id"] != step or not waiting["confirmable"]:
+            return redirect(f"/aufbau/{bid}?err=" + quote(
+                "Dieser Schritt wartet nicht auf eine Bestätigung."))
+        args["step"] = step
+    if verb == "rollback":
+        if request.form.get("confirm", "").strip() != b.get("label"):
+            return redirect(f"/aufbau/{bid}?err=" + quote(
+                f"Der eingegebene Text passt nicht zu '{b.get('label')}'; "
+                "nichts wurde zurückgebaut."))
+        args["purge_instances"] = request.form.get("purge_instances") == "1"
+    if verb == "continue":
+        args["purge_instances"] = False
+    rid = management_api.enqueue(sc[0], sc[1], verb, args, action="tenant-build")
+    return redirect(f"/aufbau/{bid}?job={rid}")

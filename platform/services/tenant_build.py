@@ -272,15 +272,28 @@ def new_build_id(label, now=None):
     return f"b-{t}-{label}"
 
 
+def _new_step(s, values):
+    rec = {"id": s["id"], "type": s["type"], "state": "pending",
+           "note": "", "started": "", "finished": "", "made": []}
+    if s["type"] == "manual":
+        # What a person is asked to do and what ends the wait, kept WITH the
+        # step: a page shows it without the profile file (which may have
+        # changed since), and a waiting step is then a complete question.
+        try:
+            rec["text"] = _sentence(render_step(s, values).get("text", ""))
+        except Refusal:
+            rec["text"] = _sentence(s.get("text", ""))
+        rec["done_when"] = s.get("done_when", "")
+    return rec
+
+
 def new_state(profile, digest, values, by, now=None):
     label = values["label"].strip().lower()
     return {
         "id": new_build_id(label, now), "profile": profile["id"],
         "digest": digest, "label": label, "params": dict(values),
         "by": by, "created": iso_now(), "state": "running",
-        "steps": [{"id": s["id"], "type": s["type"], "state": "pending",
-                   "note": "", "started": "", "finished": "", "made": []}
-                  for s in profile["steps"]],
+        "steps": [_new_step(s, values) for s in profile["steps"]],
     }
 
 
