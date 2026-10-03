@@ -1812,6 +1812,15 @@ TENANT_BODY = """
   {% for line in me.idp.drift %}
   <p class="muted"><strong>Unterschied:</strong> {{ line }}</p>
   {% endfor %}
+  {% if me.idp.console_url %}
+  <p><a class="btn" href="{{ me.idp.console_url }}" rel="noopener">Benutzer im
+     Anmeldedienst verwalten</a></p>
+  <p class="muted">Dort melden Sie sich mit Ihrem Konto im Anmeldedienst an,
+     nicht mit dem Konto dieser Plattform. Sehen und ändern können Sie
+     Personen und Gruppen, wenn Sie in der Gruppe <code>oaap-verwalter</code>
+     dieses Anmeldedienstes sind — die Plattform legt diese Gruppe an, aber
+     keine Person.</p>
+  {% endif %}
   <p class="muted">Diese Einstellungen ändert nur der Betreiber dieses
      Knotens, nicht der Mandant. Der Grund steht im Protokoll unten: Auf
      dieser Maschine liegen mehrere Kunden, und wer sich selbst eine Tür
@@ -1826,7 +1835,8 @@ TENANT_BODY = """
   {% for t in tenants %}
   <tr><td><code>{{ t.label }}</code></td><td>{{ t.name }}</td>
       <td>{{ t.users }}</td><td>{{ t.instances }}</td>
-      <td>{{ t.idp.where }}</td>
+      <td>{{ t.idp.where }}{% if t.idp.console_url %}
+        · <a href="{{ t.idp.console_url }}" rel="noopener">Benutzer</a>{% endif %}</td>
       <td class="muted">{{ t.idp.first_login }}</td>
       <td class="muted">{{ t.created }}</td>
       <td>{% if not t.is_default %}<a class="rowaction"
@@ -4895,6 +4905,8 @@ def _idp_view(t):
         "realm_read": (policy["realm"] or {}).get("read", "")[:16],
         "realm_space": (policy["realm"] or {}).get("space", ""),
         "drift": idp.drift_lines(policy),
+        # RFC-0056: the way to the people of this tenant's own realm.
+        "console_url": idp.realm_console_url(provider),
     }
 
 

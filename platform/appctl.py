@@ -4231,6 +4231,9 @@ def cmd_idp(args):
 
 
 def _connector_instance(kind):
+    if action == "admin-group":
+        return _idp_admin_group(args, name, c)
+
     """(instance name, record, error) -- the instance that serves this
     connector's product on THIS node.
 
@@ -4593,6 +4596,74 @@ def _print_idp(label, t):
     """What this tenant's way in looks like right now.
 
     One printer for both `tenant idp` and `tenant policy` with no
+def _idp_admin_group(args, name, c):
+    """`oaap idp admin-group <connector> --tenant <label>` (RFC-0056).
+
+    Prepares the group the tenant's own administrator belongs in. A
+    group, never a person: the connector says `users` is `never`. The
+    run refuses before it writes when the space holds a role that would
+    make the group a way to a wider door.
+    """
+    kind = c["kind"]
+    bad = idp_admin.admin_group_refusal(kind)
+    if bad:
+        die(bad)
+    label = (args.tenant or "").strip().lower()
+    if not label:
+        die(f"which tenant? `oaap idp admin-group {name} --tenant hbvp`")
+    tid, t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the label '{label}'")
+    provider = idp.provider_of(t)
+    space = (args.space or (provider or {}).get("space")
+             or (idp.policy_of(t)["realm"] or {}).get("space")
+             or idp_admin.space_for(label)).strip().lower()
+    decl = idp_admin.connector_of(kind)
+    g = idp_admin.admin_group_of(kind)
+    plan = idp_admin.admin_group_plan(kind, space)
+    bad = idp_admin.plan_refusal(plan)
+    if bad:
+        die(bad)
+    print(f"'{label}' -> {decl['space_word']} '{space}' at {c['base_url']}")
+    print(f"group '{g['name']}' with: {', '.join(g['roles'])}")
+    print("")
+    print("What this may call, in order:")
+    for line in idp_admin.plan_lines(plan):
+        print(line)
+    print("")
+    if args.dry_run:
+        print("Nothing was called: --dry-run.")
+        return
+    admin = idp_admin.Admin(kind, c["base_url"], c["auth"], c["admin_id"],
+                            c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    ok, got, msg = admin.admin_group(
+        space, accept_version=(args.accept_version
+                               or c.get("accept_version", "")))
+    for line in admin.trace:
+        print("  " + line)
+    if not ok:
+        print("")
+        for line in textwrap.wrap(msg, 68):
+            print(line)
+        if got:
+            for line in idp_admin.admin_group_words(kind, got):
+                print("  " + line)
+        sys.exit(1)
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+    audit_tenant("tenant.idp-admin-group", tid, g["name"], who=who,
+                 role="root",
+                 detail=f"gruppe '{g['name']}' im Realm '{space}': "
+                        + ", ".join(got["roles"]))
+    print("")
+    for line in idp_admin.admin_group_words(kind, got):
+        print("  " + line)
+    print("")
+    print("OAAP created no person. Put the customer's administrator into")
+    print(f"this group in the {decl['space_word']}'s own console; he then")
+    print("sees and changes people and groups of THIS space and nothing else.")
+
+
     arguments, because they are two halves of one answer and an
     operator asking either of them wants to see both.
     """
@@ -21937,7 +22008,7 @@ def main():
                                       "(RFC-0041 K3)")
     pidp.add_argument("action",
                       choices=["list", "add", "remove", "check", "provision",
-                               "settings", "export"])
+                               "settings", "export", "admin-group"])
     pidp.add_argument("name", nargs="?", help="the connector's short name")
     pidp.add_argument("--kind", dest="idp_kind_admin", default="keycloak",
                       choices=list(idp_admin.connector_kinds()),

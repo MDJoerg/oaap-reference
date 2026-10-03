@@ -126,6 +126,32 @@ CONNECTOR_KINDS = {
             "required_action":
                 "/admin/realms/{space}/authentication/required-actions/"
                 "{alias}",
+            # The administrator group (RFC-0056). `{alias}` carries the
+            # name of a realm role, `{client}` the uuid of the client
+            # whose roles are meant.
+            "groups": "/admin/realms/{space}/groups",
+            "group_client_roles":
+                "/admin/realms/{space}/groups/{uuid}/role-mappings/clients/"
+                "{client}",
+            "client_roles": "/admin/realms/{space}/clients/{client}/roles",
+            "realm_roles": "/admin/realms/{space}/roles",
+            "realm_role_composites":
+                "/admin/realms/{space}/roles/{alias}/composites",
+        },
+        # RFC-0056: the narrow door for the customer's own
+        # administrator. A GROUP that carries these roles of
+        # `roles_client` and nothing else -- not a user, because
+        # `never` below says OAAP creates no people. Measured on
+        # 2026-10-03 against 26.7.4 (program/messungen/
+        # keycloak-verwalter-messung.py): enough for people and groups,
+        # 403 everywhere else -- except that an EXISTING realm role that
+        # is a composite over `realm-admin` can still be assigned, which
+        # is why `escalation_roles` refuses before anything is written.
+        "admin_group": {
+            "name": "oaap-verwalter",
+            "roles_client": "realm-management",
+            "roles": ("manage-users", "view-users", "query-users",
+                      "query-groups"),
         },
         # K7's two switches in this product's own words. `where` names
         # the document that holds the switch -- at Keycloak they live
@@ -183,7 +209,7 @@ CONNECTOR_KINDS = {
             "people_key": "users",
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
-                  "export"),
+                  "export", "admin_group"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
@@ -200,7 +226,7 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
-OPTIONAL_VERBS = ("settings", "export")
+OPTIONAL_VERBS = ("settings", "export", "admin_group")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -257,7 +283,8 @@ def verb_refusal(kind, verb):
     return f"'{verb}' is not something a connector does"
 
 
-def path_of(kind, name, space="", uuid="", alias="", query=None):
+def path_of(kind, name, space="", uuid="", alias="", query=None,
+            client=""):
     """One of this connector's addresses, filled in.
 
     Both the plan and the run come through here. A plan that printed
@@ -268,7 +295,7 @@ def path_of(kind, name, space="", uuid="", alias="", query=None):
     tpl = ((c.get("paths") or {}).get(name) or "")
     if not tpl:
         return ""
-    path = tpl.format(space=space, uuid=uuid, alias=alias)
+    path = tpl.format(space=space, uuid=uuid, alias=alias, client=client)
     if query:
         path += "?" + urllib.parse.urlencode(query)
     return path
@@ -1296,6 +1323,123 @@ def missing_redirects(client_doc, wanted):
 # ---------------------------------------------------------------------------
 # The one thing here that speaks to a network
 
+# ---------------------------------------------------------------------------
+# The administrator group (RFC-0056)
+#
+# A group, not a user: `never` says OAAP creates no people. The group
+# carries four roles of the product's own management client and the
+# customer puts its administrator into it. What OAAP owns here is the
+# GROUP and the refusal that keeps it honest.
+
+def admin_group_of(kind):
+    """The declaration of the administrator group, or {}."""
+    return dict(connector_of(kind).get("admin_group") or {})
+
+
+def admin_group_refusal(kind):
+    """Why this connector has no administrator group."""
+    bad = verb_refusal(kind, "admin_group")
+    if bad:
+        return bad
+    g = admin_group_of(kind)
+    if not (g.get("name") and g.get("roles_client") and g.get("roles")):
+        return (f"the connector '{kind}' declares 'admin_group' and does "
+                "not say which group or which roles")
+    return ""
+
+
+def admin_group_plan(kind, space):
+    """Every call preparing the administrator group, in order.
+
+    The roles that could make the group a way to a wider door are read
+    BEFORE the first write -- the plan says so by its order, and a test
+    can hold it to that without a server.
+    """
+    if kind_refusal(kind) or verb_refusal(kind, "admin_group"):
+        return []
+    c = connector_of(kind)
+    g = admin_group_of(kind)
+    word = c["space_word"]
+
+    def p(name, **kw):
+        return path_of(kind, name, space=space, **kw)
+
+    return [
+        {"verb": "version", "method": "GET", "when": "always",
+         "writes": False, "path": c["version_path"],
+         "why": f"which {c['product']} is this? checked against the pinned "
+                f"{c['pinned']} BEFORE anything is created"},
+        {"verb": "space", "method": "GET", "when": "always",
+         "writes": False, "path": p("space"),
+         "why": f"the {word} must exist -- this step makes none"},
+        {"verb": "admin_group", "method": "GET", "when": "always",
+         "writes": False, "path": p("clients",
+                                    query={"clientId": g["roles_client"]}),
+         "why": f"find the client '{g['roles_client']}' that owns the roles"},
+        {"verb": "admin_group", "method": "GET", "when": "always",
+         "writes": False, "path": p("realm_roles"),
+         "why": "read every role of the space that is a composite, and "
+                "refuse if one of them reaches the management roles"},
+        {"verb": "admin_group", "method": "GET", "when": "always",
+         "writes": False,
+         "path": p("groups", query={"search": g["name"], "exact": "true"}),
+         "why": f"is there already a group '{g['name']}'?"},
+        {"verb": "admin_group", "method": "POST", "when": "absent",
+         "writes": True, "path": p("groups"),
+         "why": f"create the group '{g['name']}' -- a group, never a person"},
+        {"verb": "admin_group", "method": "GET", "when": "always",
+         "writes": False, "path": p("client_roles", client="<client>"),
+         "why": "read those roles, to name the four"},
+        {"verb": "admin_group", "method": "GET", "when": "always",
+         "writes": False,
+         "path": p("group_client_roles", uuid="<group>", client="<client>"),
+         "why": "what does the group hold already?"},
+        {"verb": "admin_group", "method": "POST", "when": "different",
+         "writes": True,
+         "path": p("group_client_roles", uuid="<group>", client="<client>"),
+         "why": "add the roles it lacks -- nothing it holds is taken away"},
+        {"verb": "admin_group", "method": "GET", "when": "always",
+         "writes": False,
+         "path": p("group_client_roles", uuid="<group>", client="<client>"),
+         "why": "read it back: what the group holds NOW is what is reported"},
+    ]
+
+
+def role_reaches(name, composites_of, management_id, seen=None):
+    """Whether a realm role leads, through composites, to a management role.
+
+    `composites_of(name)` returns the composite documents of a realm
+    role. A client role of the management client is a hit; a realm role
+    inside is followed. `seen` ends a role that contains itself.
+    """
+    seen = set() if seen is None else seen
+    if name in seen:
+        return False
+    seen.add(name)
+    for item in composites_of(name) or ():
+        if not isinstance(item, dict):
+            continue
+        if item.get("clientRole"):
+            if item.get("containerId") == management_id:
+                return True
+        elif role_reaches(item.get("name", ""), composites_of,
+                          management_id, seen):
+            return True
+    return False
+
+
+def admin_group_words(kind, result):
+    """What the administrator group looks like after the run."""
+    g = admin_group_of(kind)
+    out = [f"group '{result.get('group', g.get('name', ''))}' holds: "
+           + (", ".join(result.get("roles") or []) or "(nothing)")]
+    if result.get("extra"):
+        out.append("it ALSO holds roles OAAP did not put there: "
+                   + ", ".join(result["extra"])
+                   + " -- left as found, never removed")
+    return out
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """An admin call is never followed anywhere.
 
@@ -1407,8 +1551,9 @@ class Admin:
                         f"is not a {self.decl['product']}")
         return version_said(self.kind, doc), ""
 
-    def _path(self, name, space="", uuid="", query=None):
-        return path_of(self.kind, name, space=space, uuid=uuid, query=query)
+    def _path(self, name, space="", uuid="", query=None, client=""):
+        return path_of(self.kind, name, space=space, uuid=uuid, query=query,
+                       client=client)
 
     def _not_ours(self, space, doing):
         """The sentence for a 403, wherever it arrives.
@@ -1711,6 +1856,195 @@ class Admin:
         return True, after, (f"the {self.decl['space_word']} '{space}' "
                              "answered, and that answer is what OAAP "
                              "writes down")
+
+    # -- the administrator group (RFC-0056) -------------------------
+    def _read_list(self, path, doing):
+        """(list, error)."""
+        status, doc, err = self._call("GET", path)
+        if err:
+            return [], err
+        if status == 403:
+            return [], self._not_ours(self._space_now, doing)
+        if status != 200 or not isinstance(doc, list):
+            return [], f"{doing} answered {status}"
+        return doc, ""
+
+    def escalation_roles(self, space, management_id):
+        """(names, error). Realm roles that lead to a management role.
+
+        Measured on 2026-10-03: whoever may manage people may ASSIGN a
+        realm role that is a composite over `realm-admin` -- he cannot
+        create one, so the hole exists only where somebody made it.
+        OAAP makes no realm roles; this finds the ones that are there.
+        """
+        self._space_now = space
+        roles, err = self._read_list(self._path("realm_roles", space=space),
+                                     "listing the roles")
+        if err:
+            return [], err
+        problem = []
+
+        def composites_of(name):
+            path = path_of(self.kind, "realm_role_composites", space=space,
+                           alias=urllib.parse.quote(name, safe=""))
+            got, e = self._read_list(path, f"reading the composites of "
+                                           f"'{name}'")
+            if e:
+                problem.append(e)
+            return got
+
+        names = [r.get("name", "") for r in roles
+                 if isinstance(r, dict) and r.get("composite")]
+        bad = [n for n in names if role_reaches(n, composites_of,
+                                                management_id)]
+        if problem:
+            return [], problem[0]
+        return sorted(bad), ""
+
+    def _find_group(self, space, name):
+        """(id, error)."""
+        groups, err = self._read_list(
+            self._path("groups", space=space,
+                       query={"search": name, "exact": "true"}),
+            "looking for the group")
+        if err:
+            return "", err
+        return next((x.get("id") for x in groups
+                     if isinstance(x, dict) and x.get("name") == name
+                     and x.get("path", "/" + name) == "/" + name), ""), ""
+
+    def admin_group(self, space, accept_version=""):
+        """Prepare the administrator group. (ok, result, sentence).
+
+        Order is the rule: version, the space, then the READ that can
+        refuse, and only after it the first write. Adds, never removes,
+        creates no person.
+        """
+        self._space_now = space
+        bad = admin_group_refusal(self.kind)
+        if bad:
+            return False, {}, bad
+        plan = admin_group_plan(self.kind, space)
+        bad = plan_refusal(plan)
+        if bad:
+            return False, {}, bad
+        bad = space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        g = admin_group_of(self.kind)
+        ok, msg = self.login()
+        if not ok:
+            return False, {}, msg
+        said, err = self.version()
+        if err:
+            return False, {}, err
+        how, bad = version_check(self.kind, said, accept_version)
+        if bad:
+            return False, {}, bad
+        seen = said or (accept_version or "").strip()
+        self._note(f"{self.decl['product']} "
+                   + version_words(how, seen, self.kind))
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        if not exists:
+            return False, {}, (
+                f"there is no {self.decl['space_word']} '{space}' at "
+                f"{self.base}; `oaap idp provision` makes it, and this step "
+                "does not")
+        # The client that owns the roles comes first: the refusal needs
+        # its id.
+        mgmt, _doc, err = self.find_client(space, g["roles_client"])
+        if err:
+            return False, {}, err
+        if not mgmt:
+            return False, {}, (f"the client '{g['roles_client']}' is not in "
+                               f"the {self.decl['space_word']} '{space}' -- "
+                               "this is not a space that was made the "
+                               "ordinary way")
+        risky, err = self.escalation_roles(space, mgmt)
+        if err:
+            return False, {}, err
+        if risky:
+            return False, {}, (
+                "refused, nothing was written: the role(s) "
+                + ", ".join(f"'{n}'" for n in risky)
+                + f" in the {self.decl['space_word']} '{space}' lead to the "
+                "management roles, and whoever may manage people may hand "
+                "such a role to anyone -- including himself. Remove or "
+                "empty them in the product first (RFC-0056 section 2.1)")
+        gid, err = self._find_group(space, g["name"])
+        if err:
+            return False, {}, err
+        if gid:
+            self._note(f"the group '{g['name']}' was already there")
+        else:
+            status, _doc, err = self._call(
+                "POST", self._path("groups", space=space),
+                body={"name": g["name"]})
+            if err:
+                return False, {}, err
+            if status == 403:
+                return False, {}, self._not_ours(space, "create a group")
+            if status not in (201, 204, 409):
+                return False, {}, f"creating the group answered {status}"
+            gid, err = self._find_group(space, g["name"])
+            if err:
+                return False, {}, err
+            if not gid:
+                return False, {}, ("the group was created and cannot be "
+                                   "found again -- refusing to guess")
+            self._note(f"created the group '{g['name']}'")
+        roles, err = self._read_list(
+            self._path("client_roles", space=space, client=mgmt),
+            "reading the management roles")
+        if err:
+            return False, {}, err
+        by_name = {r.get("name"): r for r in roles if isinstance(r, dict)}
+        absent = [n for n in g["roles"] if n not in by_name]
+        if absent:
+            return False, {}, ("this product has no role "
+                               + ", ".join(f"'{n}'" for n in absent)
+                               + " -- this build was measured against "
+                               + self.decl["pinned"])
+        rpath = self._path("group_client_roles", space=space, uuid=gid,
+                           client=mgmt)
+        held, err = self._read_list(rpath, "reading the group's roles")
+        if err:
+            return False, {}, err
+        have = {r.get("name") for r in held if isinstance(r, dict)}
+        lack = [by_name[n] for n in g["roles"] if n not in have]
+        if lack:
+            status, _doc, err = self._call("POST", rpath, body=[
+                {"id": r.get("id"), "name": r.get("name")} for r in lack])
+            if err:
+                return False, {}, err
+            if status == 403:
+                return False, {}, self._not_ours(space,
+                                                 "give a group its roles")
+            if status not in (200, 204):
+                return False, {}, (f"giving the group its roles answered "
+                                   f"{status}")
+            self._note("gave the group: "
+                       + ", ".join(r["name"] for r in lack))
+        after, err = self._read_list(rpath, "reading the group back")
+        if err:
+            return False, {}, err
+        names = sorted(r.get("name") for r in after if isinstance(r, dict))
+        missing = [n for n in g["roles"] if n not in names]
+        result = {
+            "group": g["name"], "group_id": gid, "roles": names,
+            "extra": [n for n in names if n not in g["roles"]],
+            "version": seen, "version_how": how, "space": space,
+        }
+        if missing:
+            return False, result, ("the group was asked for "
+                                   + ", ".join(missing)
+                                   + " and the " + self.decl["space_word"]
+                                   + " says it does not hold it")
+        return True, result, (f"the group '{g['name']}' in '{space}' holds "
+                              "the four roles; OAAP creates nobody to put "
+                              "in it")
 
     # -- the whole of it --------------------------------------------
     def provision(self, space, client_id, redirect_uris, title="",

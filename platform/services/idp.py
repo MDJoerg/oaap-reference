@@ -173,6 +173,28 @@ def provider_refusal(kind, issuer, client_id, client_secret):
     return ""
 
 
+_REALM_ISSUER_RE = re.compile(r"^(https?://[^/?#]+(?:/[^/?#]+)*)/realms/([^/?#]+)/?$")
+
+
+def realm_console_url(provider):
+    """Where the tenant's administrator manages people, or "" (RFC-0056).
+
+    Only for a space a CONNECTOR made (`connector` is set) at a product
+    whose issuer looks like `<base>/realms/<space>` -- the address is
+    built from the provider object, never typed by a person, and a
+    provider somebody entered by hand gets no link: OAAP does not know
+    what is behind such an address, and the group the link is meant for
+    (RFC-0056) was never prepared there.
+    """
+    p = provider or {}
+    if not p.get("connector"):
+        return ""
+    hit = _REALM_ISSUER_RE.match((p.get("issuer") or "").strip())
+    if not hit:
+        return ""
+    return f"{hit.group(1)}/admin/{hit.group(2)}/console/"
+
+
 def provider_of(tenant):
     """The tenant's provider object, normalised, or {} when it has none.
 
