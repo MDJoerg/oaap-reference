@@ -173,6 +173,22 @@
 		reverse_proxy twin:8000
 	}
 
+	# Business authorization (oaap.core.authorization 0.1, RFC-0045): an
+	# app asks what a person may do inside ITS OWN objects. Not a
+	# forward_auth route: identity authenticates the bearer key itself,
+	# trusts no header, and answers only to a key made for exactly this
+	# (scope oaap.authz, must agree with appctl.AUTHZ_KEY_SCOPE and
+	# identity's AUTHZ_SCOPE). The identity headers are stripped like on
+	# the login routes, so nothing a caller sends can pose as the gateway.
+	handle /authz/* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
+		reverse_proxy identity:8000
+	}
+
 	# The MQTT broker's WebSocket listener (oaap.events.broker 0.1,
 	# RFC-0032 D2) -- browsers only, reached through the gateway, never
 	# published directly (docker-compose.yml). Gates establishing the

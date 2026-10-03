@@ -54,6 +54,8 @@ import idp  # noqa: E402
 # behind /mqtt-auth/aclcheck. In services/ beside place.py and idp.py (the
 # image is built from there), so a test can reach them without Flask.
 import mqtt_acl  # noqa: E402
+# Business authorization (RFC-0045): the pure half, beside idp.py.
+import authorization as authz  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -3270,3 +3272,364 @@ def _delete_user(username, users, actor_name, role, actor_tenant):
                  + (f", {u['display_name']}" if u.get("display_name") else "")
                  + ("; machine" if u.get("kind") == "machine" else ""))
     return {"ok": True, "id": u.get("id", "")}
+
+
+# ---------------------------------------------------------------------------
+# BUSINESS AUTHORIZATION (oaap.core.authorization 0.1, RFC-0045 stages 1+2)
+#
+# What a person may DO inside an app -- never what may enter the node.
+# The pure half (declaration check, comparison, resolution) is
+# authorization.py; this is the half that holds the state, checks who
+# asks, and writes the tenant log.
+#
+# One file, one lock, like the user file. Reads are lock-free because
+# the save swaps the file in whole.
+
+AUTHZ_FILE = os.path.join(DATA_DIR, "authorization.json")
+AUTHZ_LOCK_FILE = os.path.join(DATA_DIR, "authorization.lock")
+AUTHZ_SCOPE = "oaap.authz"           # must agree with appctl.AUTHZ_KEY_SCOPE
+
+
+def load_authz():
+    state = _load(AUTHZ_FILE, None) or {}
+    base = authz.empty_state()
+    base["instances"] = {}
+    for k, v in base.items():
+        state.setdefault(k, v)
+    return state
+
+
+def save_authz(state):
+    """Only ever called inside authz_rw()."""
+    _save(AUTHZ_FILE, state)
+
+
+@contextlib.contextmanager
+def authz_rw():
+    """The authorization state, open for change: lock, load, hand over."""
+    try:
+        import fcntl
+    except ImportError:
+        yield load_authz()
+        return
+    fd = os.open(AUTHZ_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield load_authz()
+    finally:
+        os.close(fd)
+
+
+def _authz_actor(body_or_args):
+    """(role, tenant, actor record, error response or None).
+
+    The tenant of a tenant_admin is the one on their OWN record; a
+    server_admin names the tenant, and only a server_admin may. Business
+    grants belong to a tenant and nothing here can cross it.
+    """
+    name = _actor(body_or_args)
+    if not name:
+        return "", "", None, ({"error": "actor fehlt."}, 400)
+    if (name == "root" and str(body_or_args.get("operator")).lower()
+            in ("1", "true") and not find_user(load_users(), "root")):
+        # The host operator (`oaap authz ...`): the internal key that got
+        # this far is the host's own credential. Acts as server_admin, so
+        # the tenant must be named like for any server_admin; a real
+        # account called "root" turns this door off rather than sharing it.
+        tid = _tenant_by_ref(str(body_or_args.get("tenant") or "").strip())
+        if not tid:
+            return "", "", None, ({"error": "Welcher Mandant? 'tenant' "
+                                            "nennen."}, 400)
+        return "server_admin", tid, {"username": "root", "id": ""}, None
+    role, tenant, err = authority(name)
+    if not role:
+        return "", "", None, ({"error": err or "Nicht berechtigt."}, 403)
+    if role == "server_admin":
+        # Named, never assumed: a grant belongs to ONE tenant, and an
+        # operator who forgot to say which must not land in their own.
+        ref = str(body_or_args.get("tenant") or "").strip()
+        tid = _tenant_by_ref(ref) if ref else ""
+        if not tid:
+            return "", "", None, ({"error": "Welcher Mandant? 'tenant' "
+                                            "nennen."}, 400)
+        tenant = tid
+    if not tenant:
+        return "", "", None, ({"error": err or "Kein Mandant."}, 403)
+    return role, tenant, find_user(load_users(), name), None
+
+
+def _tenant_by_ref(ref):
+    """A tenant id from an id or a label, or ''."""
+    tenants = known_tenants()
+    if ref in tenants:
+        return ref
+    for tid, t in tenants.items():
+        if (t.get("label") or "").lower() == ref.lower():
+            return tid
+    return ""
+
+
+def _authz_audit(action, tenant, subject, actor, role, detail=""):
+    audit(action, tenant, subject, who=actor, role=role, detail=detail)
+
+
+@app.post("/internal/authz/register")
+def authz_register():
+    """The host registers a package's declaration at install (spec 2.2).
+
+    No actor: this is the operator's install path. A destructive change
+    answers 409 with the impact UNLESS `confirm` is true -- the caller
+    shows it first.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    app_id = str(body.get("app") or "").strip()
+    with authz_rw() as st:
+        try:
+            if body.get("declaration") is None:
+                kind, removed, impact = authz.withdraw(
+                    st, app_id, confirm=bool(body.get("confirm")))
+            else:
+                kind, removed, impact = authz.register(
+                    st, app_id, body.get("version"), body["declaration"],
+                    confirm=bool(body.get("confirm")))
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 400
+        if kind == "destructive" and not body.get("confirm"):
+            return {"ok": False, "kind": kind, "removed": removed,
+                    "impact": impact}, 409
+        save_authz(st)
+    for tid, row in impact.items():
+        _authz_audit("authz.register", tid, app_id, "root", "root",
+                     f"{kind}: {len(removed)} entfernt; Rollen: "
+                     + ", ".join(row["roles"])
+                     + f"; Zuordnungen: {row['assignments']}")
+    if not impact:
+        audit("authz.register", "", app_id, who="root", role="root",
+              detail=f"{kind} v{body.get('version', '')}")
+    return {"ok": True, "kind": kind, "removed": removed, "impact": impact}
+
+
+@app.post("/internal/authz/instance")
+def authz_instance():
+    """The host says which app an instance is, when it mints its key.
+
+    `effective` answers for ONE app and one tenant; both come from here,
+    never from the request of the app that asks.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    name = str(body.get("instance") or "").strip()
+    tid = resolve_tenant(body.get("tenant"))
+    app_id = str(body.get("app") or "").strip()
+    if not (name and app_id and tid):
+        return {"error": "instance, app und tenant werden gebraucht."}, 400
+    with authz_rw() as st:
+        st["instances"][name] = {"app": app_id, "tenant": tid}
+        save_authz(st)
+    return {"ok": True}
+
+
+@app.get("/internal/authz/declarations")
+def authz_declarations():
+    role, tenant, _u, bad = _authz_actor(request.args)
+    if bad:
+        return bad
+    st = load_authz()
+    out = []
+    for app_id, d in sorted(st["declarations"].items()):
+        out.append({"app": app_id, "version": d["version"],
+                    "declaration": d["declaration"],
+                    "roles": sum(1 for r in st["roles"].values()
+                                 if r["tenant"] == tenant
+                                 and r["app"] == app_id)})
+    return {"declarations": out, "tenant": tenant}
+
+
+def _public_role(st, r):
+    return dict(r, collections=[c["name"] for c in st["collections"].values()
+                                if r["id"] in c["roles"]])
+
+
+@app.get("/internal/authz/roles")
+def authz_roles_list():
+    role, tenant, _u, bad = _authz_actor(request.args)
+    if bad:
+        return bad
+    st = load_authz()
+    return {"roles": [_public_role(st, r) for r in st["roles"].values()
+                      if r["tenant"] == tenant]}
+
+
+@app.post("/internal/authz/roles")
+def authz_roles_create():
+    body = request.get_json(force=True, silent=True) or {}
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        try:
+            rid = authz.create_role(
+                st, tenant, str(body.get("app") or ""),
+                str(body.get("template") or ""), str(body.get("name") or ""),
+                body.get("values") or {}, who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 400
+        save_authz(st)
+        r = st["roles"][rid]
+    _authz_audit("authz.role-create", tenant, r["name"], actor["username"],
+                 role, f"{r['app']}/{r['template']} {r['values']}")
+    return {"ok": True, "role": r}, 201
+
+
+@app.get("/internal/authz/collections")
+def authz_collections_list():
+    role, tenant, _u, bad = _authz_actor(request.args)
+    if bad:
+        return bad
+    st = load_authz()
+    return {"collections": [c for c in st["collections"].values()
+                            if c["tenant"] == tenant]}
+
+
+@app.post("/internal/authz/collections")
+def authz_collections_create():
+    body = request.get_json(force=True, silent=True) or {}
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        # a role may be named by id or by its (tenant-unique) name
+        wanted = []
+        by_name = {r["name"]: r["id"] for r in st["roles"].values()
+                   if r["tenant"] == tenant}
+        for ref in body.get("roles") or []:
+            wanted.append(ref if ref in st["roles"] else by_name.get(ref, ref))
+        try:
+            cid = authz.create_collection(
+                st, tenant, str(body.get("name") or ""), wanted,
+                who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 400
+        save_authz(st)
+        c = st["collections"][cid]
+    _authz_audit("authz.collection-create", tenant, c["name"],
+                 actor["username"], role,
+                 "Rollen: " + ", ".join(st["roles"][r]["name"]
+                                        for r in c["roles"]))
+    return {"ok": True, "collection": c}, 201
+
+
+@app.get("/internal/authz/assignments")
+def authz_assignments_list():
+    role, tenant, _u, bad = _authz_actor(request.args)
+    if bad:
+        return bad
+    st = load_authz()
+    who = request.args.get("user", "")
+    return {"assignments": [a for a in st["assignments"].values()
+                            if a["tenant"] == tenant
+                            and (not who or a["subject"] == who)]}
+
+
+@app.post("/internal/authz/assignments")
+def authz_assignments_create():
+    body = request.get_json(force=True, silent=True) or {}
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    subject = str(body.get("user") or "").strip()
+    target = next((u for u in load_users() if u.get("id") == subject), None)
+    if not target or resolve_tenant(target.get("tenant")) != tenant:
+        return {"error": "Diese Benutzer-ID gibt es in diesem Mandanten "
+                         "nicht."}, 404
+    with authz_rw() as st:
+        coll = body.get("collection")
+        by_name = {c["name"]: c["id"] for c in st["collections"].values()
+                   if c["tenant"] == tenant}
+        coll = coll if coll in st["collections"] else by_name.get(coll, coll)
+        try:
+            # granted_by is the AUTHENTICATED actor, whatever the body says
+            aid = authz.assign(
+                st, tenant, coll, subject, body.get("context") or {},
+                body.get("valid_from"), body.get("valid_to"),
+                granted_by=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 400
+        st["assignments"][aid]["granted_by_id"] = actor.get("id", "")
+        save_authz(st)
+        a = st["assignments"][aid]
+        cname = st["collections"][a["collection"]]["name"]
+    _authz_audit("authz.assign", tenant, target["username"],
+                 actor["username"], role,
+                 f"{cname}; Kontext {a['context']}; "
+                 f"{a['valid_from'] or '-'} bis {a['valid_to'] or '-'}")
+    return {"ok": True, "assignment": a}, 201
+
+
+@app.delete("/internal/authz/assignments/<aid>")
+def authz_assignments_revoke(aid):
+    body = request.get_json(force=True, silent=True) or {}
+    body = dict(request.args.to_dict(), **body)
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        try:
+            changed = authz.revoke(st, tenant, aid, who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 404
+        save_authz(st)
+        a = st["assignments"][aid]
+    if changed:
+        _authz_audit("authz.revoke", tenant, a["subject"], actor["username"],
+                     role, f"Zuordnung {aid[:8]}")
+    return {"ok": True, "ended": changed}
+
+
+@app.get("/authz/effective")
+def authz_effective():
+    """What the asking app's own objects allow a person NOW (spec 2.4).
+
+    Authenticated HERE, not by the gateway: the route trusts no header,
+    only a bearer key issued for scope `oaap.authz` to an instance
+    principal. The app and the tenant come from what the host recorded
+    when it minted that key, never from the request.
+    """
+    if request.headers.get("Authorization", "")[:7].lower() != "bearer ":
+        # An API route: no key is a 401, not a redirect to a login page
+        # that a script would follow and call success.
+        return {"error": "Ein Schluessel (Bereich " + AUTHZ_SCOPE
+                + ") wird gebraucht."}, 401
+    user, method, refusal = resolve_principal(AUTHZ_SCOPE)
+    if refusal is not None:
+        return refusal
+    if method != "key" or user.get("kind") != "machine" \
+            or not str(user.get("username", "")).startswith("instance:"):
+        return {"error": "Nur eine App-Instanz mit ihrem Schluessel fragt "
+                         "das."}, 403
+    # `_by_key` lets an UNSCOPED key through for any instance (that is
+    # what unscoped means). Here that is not good enough: this route
+    # answers only to a key made for exactly this purpose.
+    tok = request.headers.get("Authorization", "")[7:].strip()
+    hit = KEY_TOKEN_RE.fullmatch(tok)
+    krec = next((k for k in load_keys() if hit and k["id"] == hit.group(1)),
+                None)
+    if not krec or krec.get("instance") != AUTHZ_SCOPE:
+        return {"error": "Dieser Schluessel ist nicht fuer Fachrechte "
+                         "ausgestellt (Bereich " + AUTHZ_SCOPE + ")."}, 403
+    st = load_authz()
+    inst = st["instances"].get(user["username"].split(":", 1)[1])
+    if not inst:
+        return {"error": "Diese Instanz ist fuer Fachrechte nicht "
+                         "eingetragen."}, 403
+    if resolve_tenant(user.get("tenant")) != inst["tenant"]:
+        return {"error": "Der Schluessel gehoert zu einem anderen "
+                         "Mandanten als die Instanz."}, 403
+    uid = (request.args.get("user") or "").strip()
+    target = next((u for u in load_users() if u.get("id") == uid), None)
+    if not target or resolve_tenant(target.get("tenant")) != inst["tenant"]:
+        # not "an empty list": a person of another tenant is unknown here
+        return {"error": "unknown user"}, 404
+    grants = authz.effective(st, inst["tenant"], inst["app"], uid)
+    resp = {"user": uid, "app": inst["app"], "tenant": inst["tenant"],
+            "grants": grants, "fresh_for": authz.FRESH_FOR}
+    return resp

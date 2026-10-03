@@ -130,10 +130,14 @@ stripped = [l.strip().removeprefix("request_header -")
 # der Person, nie eine Sitzung, wie die anderen beiden. Neun seit 0.1.186:
 # /anfrage, das Formular des Interessenten (RFC-0055 Stufe 4) -- der
 # Einladungslink ist der einzige Beweis, die Seite erzeugt nur einen
-# Antrag. Die Zahl steht
+# Antrag. Zehn seit den Fachrechten (oaap.core.authorization 0.1,
+# RFC-0045): /authz/*, ueber die eine App-Instanz fragt, was eine Person in
+# IHREN Objekten darf. Kein forward_auth: Identity prueft den Schluessel
+# selbst (nur Bereich oaap.authz) und vertraut keiner Kopfzeile -- deshalb
+# werden alle fuenf gestrippt. Die Zahl steht
 # hier, damit eine weitere Route diesen Test anfassen muss -- und dabei
 # jede Stelle mit allen fuenf Kopfzeilen.
-PUBLIC_ROUTES = 9
+PUBLIC_ROUTES = 10
 ok(f"der feste Caddyfile strippt an {PUBLIC_ROUTES} Stellen",
    len(stripped) == PUBLIC_ROUTES * len(appctl.IDENTITY_HEADERS),
    f"{len(stripped)} Zeilen: {sorted(set(stripped))}")
