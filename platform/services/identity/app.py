@@ -28,7 +28,7 @@ from urllib.parse import quote, urlencode
 
 from datetime import datetime, timezone
 
-from flask import (Flask, make_response, redirect, render_template_string,
+from flask import (Flask, g, make_response, redirect, render_template_string,
                    request, session)
 from flask.sessions import SecureCookieSessionInterface
 from markupsafe import Markup
@@ -3328,6 +3328,12 @@ def _authz_actor(body_or_args):
     server_admin names the tenant, and only a server_admin may. Business
     grants belong to a tenant and nothing here can cross it.
     """
+    door = g.get("authz_admin")
+    if door:
+        # Through the admin door (spec 2.10) the key is authenticated and the
+        # person verified already; the tenant is the KEY'S, whatever this
+        # request says, and a server_admin does not choose another one.
+        return door["role"], door["tenant"], door["person"], None
     name = _actor(body_or_args)
     if not name:
         return "", "", None, ({"error": "actor fehlt."}, 400)
@@ -3371,6 +3377,11 @@ def _tenant_by_ref(ref):
 
 
 def _authz_audit(action, tenant, subject, actor, role, detail=""):
+    door = g.get("authz_admin")
+    if door:
+        # the person is the actor; the log also says which tool they used
+        detail = (detail + "; " if detail else "") \
+            + "ueber App-Instanz " + door["instance"]
     audit(action, tenant, subject, who=actor, role=role, detail=detail)
 
 
@@ -3423,8 +3434,14 @@ def authz_instance():
     app_id = str(body.get("app") or "").strip()
     if not (name and app_id and tid):
         return {"error": "instance, app und tenant werden gebraucht."}, 400
+    rec = {"app": app_id, "tenant": tid}
+    if body.get("administer") is True:
+        # the admin door opens for this instance (spec 2.10); anything else
+        # CLOSES it again -- a redeploy without the manifest key must not
+        # leave the door standing
+        rec["administer"] = True
     with authz_rw() as st:
-        st["instances"][name] = {"app": app_id, "tenant": tid}
+        st["instances"][name] = rec
         save_authz(st)
     return {"ok": True}
 
@@ -3584,6 +3601,233 @@ def authz_assignments_revoke(aid):
         _authz_audit("authz.revoke", tenant, a["subject"], actor["username"],
                      role, f"Zuordnung {aid[:8]}")
     return {"ok": True, "ended": changed}
+
+
+@app.post("/internal/authz/roles/<rid>/retire")
+def authz_role_retire(rid):
+    body = request.get_json(force=True, silent=True) or {}
+    body = dict(request.args.to_dict(), **body)
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        rid = rid if rid in st["roles"] else next(
+            (r["id"] for r in st["roles"].values()
+             if r["tenant"] == tenant and r["name"] == rid), rid)
+        r0 = st["roles"].get(rid)
+        if not r0 or r0["tenant"] != tenant:
+            return {"error": "Dieser Mandant hat keine solche "
+                             "Rolle."}, 404
+        try:
+            changed = authz.retire_role(st, tenant, rid,
+                                        who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 409
+        if changed:
+            save_authz(st)
+    if changed:
+        _authz_audit("authz.role-retire", tenant, r0["name"],
+                     actor["username"], role, "")
+    return {"ok": True, "changed": changed}
+
+
+@app.post("/internal/authz/collections/<cid>/retire")
+def authz_collection_retire(cid):
+    body = request.get_json(force=True, silent=True) or {}
+    body = dict(request.args.to_dict(), **body)
+    role, tenant, actor, bad = _authz_actor(body)
+    if bad:
+        return bad
+    with authz_rw() as st:
+        cid = cid if cid in st["collections"] else next(
+            (c["id"] for c in st["collections"].values()
+             if c["tenant"] == tenant and c["name"] == cid), cid)
+        c0 = st["collections"].get(cid)
+        if not c0 or c0["tenant"] != tenant:
+            return {"error": "Dieser Mandant hat keine solche "
+                             "Sammlung."}, 404
+        try:
+            changed = authz.retire_collection(st, tenant, cid,
+                                              who=actor["username"])
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 409
+        if changed:
+            save_authz(st)
+    if changed:
+        _authz_audit("authz.collection-retire", tenant, c0["name"],
+                     actor["username"], role, "")
+    return {"ok": True, "changed": changed}
+
+
+# ----------------------------------------------- the admin door (spec 2.10)
+# RFC-0045 A7. Until this existed no app could administer: the whole
+# administration API opened only to the host's internal key. This is ONE more
+# door, for an instance the operator confirmed as a tenant administrator's
+# tool. It authenticates a key of its own scope, takes the TENANT from what the
+# host recorded for that instance, and verifies the PERSON itself -- the
+# handlers behind it are the same functions the host's door uses.
+
+AUTHZ_ADMIN_SCOPE = "oaap.authz.admin"   # must agree with appctl
+
+
+def _authz_admin_door():
+    """Authenticate one admin call. None when it may go on (and the caller is
+    then in `g.authz_admin`), else the response to send."""
+    if request.headers.get("Authorization", "")[:7].lower() != "bearer ":
+        return {"error": "Ein Schluessel (Bereich " + AUTHZ_ADMIN_SCOPE
+                + ") wird gebraucht."}, 401
+    user, method, refusal = resolve_principal(AUTHZ_ADMIN_SCOPE)
+    if refusal is not None:
+        return refusal
+    if method != "key" or user.get("kind") != "machine" \
+            or not str(user.get("username", "")).startswith("instance:"):
+        return {"error": "Nur eine App-Instanz mit ihrem Schluessel kommt "
+                         "hier hinein."}, 403
+    # An unscoped key passes `_by_key` for any scope; this door answers only
+    # to a key made for exactly this purpose.
+    tok = request.headers.get("Authorization", "")[7:].strip()
+    hit = KEY_TOKEN_RE.fullmatch(tok)
+    krec = next((k for k in load_keys() if hit and k["id"] == hit.group(1)),
+                None)
+    if not krec or krec.get("instance") != AUTHZ_ADMIN_SCOPE:
+        return {"error": "Dieser Schluessel ist nicht fuer die Verwaltung "
+                         "ausgestellt (Bereich " + AUTHZ_ADMIN_SCOPE
+                + ")."}, 403
+    name = user["username"].split(":", 1)[1]
+    inst = load_authz()["instances"].get(name)
+    if not inst or not inst.get("administer"):
+        return {"error": "Diese Instanz ist nicht zur Verwaltung "
+                         "freigegeben."}, 403
+    if resolve_tenant(user.get("tenant")) != inst["tenant"]:
+        return {"error": "Der Schluessel gehoert zu einem anderen "
+                         "Mandanten als die Instanz."}, 403
+    body = request.get_json(force=True, silent=True) or {}
+    uid = str(request.args.get("on_behalf_of")
+              or (body.get("on_behalf_of") if isinstance(body, dict) else "")
+              or "").strip()
+    if not uid:
+        return {"error": "on_behalf_of (die Benutzer-ID) wird "
+                         "gebraucht."}, 400
+    person = next((u for u in load_users() if u.get("id") == uid), None)
+    if (not person or person.get("kind", "human") == "machine"
+            or not person.get("active", True)):
+        return {"error": "Diese Person ist hier nicht berechtigt."}, 403
+    role, ptenant, _err = authority(person["username"])
+    if not (role == "server_admin"
+            or (role == "tenant_admin" and ptenant == inst["tenant"])):
+        return {"error": "Diese Person ist hier nicht berechtigt."}, 403
+    g.authz_admin = {"role": role, "tenant": inst["tenant"],
+                     "person": person, "instance": name}
+    return None
+
+
+def authz_admin_users():
+    door = g.get("authz_admin")
+    if not door:
+        return {"error": "nicht ueber die Verwaltungs-Tuer"}, 403
+    out = [{"id": u["id"], "username": u.get("username", ""),
+            "display_name": u.get("display_name", ""),
+            "active": u.get("active", True)}
+           for u in load_users()
+           if u.get("id") and u.get("kind", "human") != "machine"
+           and resolve_tenant(u.get("tenant")) == door["tenant"]]
+    return {"users": sorted(out, key=lambda u: u["username"].lower())}
+
+
+def authz_admin_effective():
+    door = g.get("authz_admin")
+    if not door:
+        return {"error": "nicht ueber die Verwaltungs-Tuer"}, 403
+    tenant = door["tenant"]
+    uid = (request.args.get("user") or "").strip()
+    target = next((u for u in load_users() if u.get("id") == uid), None)
+    if not target or resolve_tenant(target.get("tenant")) != tenant:
+        return {"error": "unknown user"}, 404
+    st = load_authz()
+    today = datetime.now(timezone.utc).date()
+    apps = sorted({i["app"] for i in st["instances"].values()
+                   if i["tenant"] == tenant and i["app"] in st["declarations"]})
+    rows = []
+    for a in st["assignments"].values():
+        if a["tenant"] != tenant or a["subject"] != uid:
+            continue
+        c = st["collections"].get(a["collection"]) or {}
+        rows.append(dict(
+            a, collection_name=c.get("name", ""),
+            roles=[(st["roles"].get(r) or {}).get("name", "")
+                   for r in c.get("roles", [])],
+            live=authz._live(a, today)))
+    rows.sort(key=lambda a: a["granted_at"], reverse=True)
+    return {"user": uid, "username": target.get("username", ""),
+            "apps": [{"app": a, "grants": authz.effective(st, tenant, a, uid)}
+                     for a in apps],
+            "assignments": rows}
+
+
+def authz_admin_log():
+    door = g.get("authz_admin")
+    if not door:
+        return {"error": "nicht ueber die Verwaltungs-Tuer"}, 403
+    rows = []
+    try:
+        with open(AUDIT_LOG, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if (e.get("tenant") == door["tenant"]
+                        and str(e.get("action", "")).startswith("authz.")):
+                    rows.append(e)
+    except OSError:
+        pass
+    return {"log": rows[-200:][::-1]}
+
+
+_AUTHZ_ADMIN_ONE = {
+    ("GET", "declarations"): "authz_declarations",
+    ("GET", "roles"): "authz_roles_list",
+    ("POST", "roles"): "authz_roles_create",
+    ("GET", "collections"): "authz_collections_list",
+    ("POST", "collections"): "authz_collections_create",
+    ("GET", "assignments"): "authz_assignments_list",
+    ("POST", "assignments"): "authz_assignments_create",
+    ("GET", "mappings"): "authz_mappings_list",
+    ("POST", "mappings"): "authz_mappings_create",
+    ("GET", "users"): "authz_admin_users",
+    ("GET", "effective"): "authz_admin_effective",
+    ("GET", "log"): "authz_admin_log",
+}
+_AUTHZ_ADMIN_ID = {
+    ("DELETE", "assignments", ""): "authz_assignments_revoke",
+    ("DELETE", "mappings", ""): "authz_mappings_remove",
+    ("POST", "roles", "retire"): "authz_role_retire",
+    ("POST", "collections", "retire"): "authz_collection_retire",
+}
+
+
+@app.route("/authz/admin/<path:rest>", methods=["GET", "POST", "DELETE"])
+def authz_admin_door(rest):
+    """The one route of the admin door; the table above is the whole list.
+
+    Anything not in it -- `register`, `instance`, a key, a user -- is a 404
+    here, not a refusal: through this door those do not exist.
+    """
+    bad = _authz_admin_door()
+    if bad is not None:
+        return bad
+    parts = rest.strip("/").split("/")
+    fn = None
+    if len(parts) == 1:
+        fn = _AUTHZ_ADMIN_ONE.get((request.method, parts[0]))
+        args = ()
+    elif len(parts) in (2, 3) and parts[1]:
+        fn = _AUTHZ_ADMIN_ID.get((request.method, parts[0],
+                                  parts[2] if len(parts) == 3 else ""))
+        args = (parts[1],)
+    if not fn:
+        return {"error": "Das gibt es an dieser Tuer nicht."}, 404
+    return globals()[fn](*args)
 
 
 @app.get("/authz/effective")

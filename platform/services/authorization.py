@@ -79,8 +79,10 @@ def validate_declaration(decl):
         return ["authorization: an object with 'objects' and "
                 "'role_templates' expected"]
     for k in decl:
-        if k not in ("objects", "role_templates"):
+        if k not in ("objects", "role_templates", "administer"):
             errs.append(f"authorization: unknown key '{k}'")
+    if "administer" in decl and not isinstance(decl["administer"], bool):
+        errs.append("authorization.administer: true or false expected")
     objects = decl.get("objects", [])
     templates = decl.get("role_templates", [])
     if not isinstance(objects, list):
@@ -398,9 +400,12 @@ def create_role(state, tenant, app, template, name, values=None, who=""):
     tpl = _template(decl, template)
     if not NAME_RE.match(name or ""):
         raise AuthzError("a role needs a name of up to 80 characters")
-    if any(r["tenant"] == tenant and r["name"] == name
-           for r in state["roles"].values()):
-        raise AuthzError(f"this tenant has a role '{name}' already")
+    same = next((r for r in state["roles"].values()
+                 if r["tenant"] == tenant and r["name"] == name), None)
+    if same:
+        raise AuthzError(f"this tenant has a role '{name}' already"
+                         + (" (retired -- its name stays taken, pick "
+                            "another)" if same.get("retired") else ""))
     values = values or {}
     need = {fk: vs for (_o, fk), vs in value_fields(decl, tpl).items()}
     for fk in values:
@@ -427,14 +432,20 @@ def create_collection(state, tenant, name, role_ids, who=""):
         raise AuthzError("a collection needs a name of up to 80 characters")
     if not role_ids:
         raise AuthzError("a collection needs at least one role")
-    if any(c["tenant"] == tenant and c["name"] == name
-           for c in state["collections"].values()):
-        raise AuthzError(f"this tenant has a collection '{name}' already")
+    same = next((c for c in state["collections"].values()
+                 if c["tenant"] == tenant and c["name"] == name), None)
+    if same:
+        raise AuthzError(f"this tenant has a collection '{name}' already"
+                         + (" (retired -- its name stays taken, pick "
+                            "another)" if same.get("retired") else ""))
     for rid in role_ids:
         r = state["roles"].get(rid)
         if not r or r["tenant"] != tenant:
             raise AuthzError("a role of the collection is not known to "
                              "this tenant")
+        if r.get("retired"):
+            raise AuthzError(f"the role '{r['name']}' is retired and cannot "
+                             "join a new collection")
     cid = new_id()
     state["collections"][cid] = {"id": cid, "tenant": tenant, "name": name,
                                  "roles": list(dict.fromkeys(role_ids)),
@@ -470,6 +481,9 @@ def assign(state, tenant, collection_id, subject, context=None,
     c = state["collections"].get(collection_id)
     if not c or c["tenant"] != tenant:
         raise AuthzError("this tenant has no such collection")
+    if c.get("retired"):
+        raise AuthzError(f"the collection '{c['name']}' is retired and "
+                         "cannot be assigned")
     if not (isinstance(subject, str) and subject.strip()):
         raise AuthzError("an assignment names a user id")
     need = collection_contexts(state, c)
@@ -499,6 +513,52 @@ def assign(state, tenant, collection_id, subject, context=None,
         "granted_by": granted_by, "granted_at": now_iso(), "ended": "",
         "source": source, "via": via}
     return aid
+
+
+def retire_role(state, tenant, role_id, who=""):
+    """Mark a role retired (spec 2.6). Nothing is deleted. True if it
+    changed, False if it was retired already; refuses while a collection that
+    is still in use holds it -- the order is collection first, then roles."""
+    r = state["roles"].get(role_id)
+    if not r or r["tenant"] != tenant:
+        raise AuthzError("this tenant has no such role")
+    if r.get("retired"):
+        return False
+    holders = sorted(c["name"] for c in state["collections"].values()
+                     if c["tenant"] == tenant and role_id in c["roles"]
+                     and not c.get("retired"))
+    if holders:
+        raise AuthzError(f"the role '{r['name']}' is in the collection(s) "
+                         + ", ".join(holders) + ": retire those first")
+    r["retired"] = {"at": now_iso(), "by": who}
+    return True
+
+
+def retire_collection(state, tenant, collection_id, who="", today=None):
+    """Mark a collection retired (spec 2.6). Refuses while a live assignment
+    or a mapping stands on it, and says which."""
+    c = state["collections"].get(collection_id)
+    if not c or c["tenant"] != tenant:
+        raise AuthzError("this tenant has no such collection")
+    if c.get("retired"):
+        return False
+    today = today or datetime.now(timezone.utc).date()
+    live = [a for a in state["assignments"].values()
+            if a["tenant"] == tenant and a["collection"] == collection_id
+            and not a.get("ended")
+            and not (a.get("valid_to")
+                     and today > date.fromisoformat(a["valid_to"]))]
+    if live:
+        raise AuthzError(f"the collection '{c['name']}' still has "
+                         f"{len(live)} live assignment(s): end them first")
+    maps = sorted(m["group"] for m in state["mappings"].values()
+                  if m["tenant"] == tenant and m["collection"] == collection_id)
+    if maps:
+        raise AuthzError(f"the collection '{c['name']}' is still given by "
+                         "the group(s) " + ", ".join(maps)
+                         + ": remove those mappings first")
+    c["retired"] = {"at": now_iso(), "by": who}
+    return True
 
 
 def revoke(state, tenant, assignment_id, who=""):
@@ -665,6 +725,9 @@ def add_mapping(state, tenant, group, collection_id, who=""):
     c = state["collections"].get(collection_id)
     if not c or c["tenant"] != tenant:
         raise AuthzError("this tenant has no such collection")
+    if c.get("retired"):
+        raise AuthzError(f"the collection '{c['name']}' is retired and "
+                         "cannot be mapped")
     why = collection_blockers(state, c)
     if why:
         raise AuthzError(f"the collection '{c['name']}' cannot be given by "

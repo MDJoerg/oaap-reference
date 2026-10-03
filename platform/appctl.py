@@ -8630,6 +8630,9 @@ def _twin_issue_instance_key(name, tenant_id):
 # 'oaap.authz' can never collide with one (same reasoning as TWIN_KEY_SCOPE).
 # It must always agree with identity's AUTHZ_SCOPE.
 AUTHZ_KEY_SCOPE = "oaap.authz"
+# 0.3 (RFC-0045 A7): the key of an instance the operator made a tenant
+# administrator's tool. Must always agree with identity's AUTHZ_ADMIN_SCOPE.
+AUTHZ_ADMIN_KEY_SCOPE = "oaap.authz.admin"
 
 
 def _authz_call(method, path, body=None):
@@ -8694,8 +8697,10 @@ def _authz_register_declaration(app_id, version, declaration, confirm=False):
     return doc
 
 
-def _authz_issue_instance_key(name, tenant_id, app_id):
-    """The key an instance presents to `/authz/effective`; returns the token.
+def _authz_issue_instance_key(name, tenant_id, app_id,
+                              scope=AUTHZ_KEY_SCOPE):
+    """The key an instance presents to `/authz/effective` (or, with the
+    admin scope, to `/authz/admin/*`); returns the token.
 
     The machine principal `instance:<name>` is the one the twin key already
     uses (created if absent); the key is scoped to AUTHZ_KEY_SCOPE, so it
@@ -8719,14 +8724,95 @@ def _authz_issue_instance_key(name, tenant_id, app_id):
         "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
         "    'oaap.core.authorization (RFC-0045)', m.KEY_MAX_DAYS, 'root')\n"
         "with m.authz_rw() as st:\n"
-        "    st['instances'][os.environ['OAAP_T_INST']] = {\n"
-        "        'app': os.environ['OAAP_T_APP'], 'tenant': os.environ['OAAP_T_TENANT']}\n"
+        "    old = st['instances'].get(os.environ['OAAP_T_INST']) or {}\n"
+        "    st['instances'][os.environ['OAAP_T_INST']] = dict(\n"
+        "        old, app=os.environ['OAAP_T_APP'],\n"
+        "        tenant=os.environ['OAAP_T_TENANT'])\n"
         "    m.save_authz(st)\n"
         "print(json.dumps(secret))\n",
         {"OAAP_T_NAME": principal, "OAAP_T_INST": name,
-         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": AUTHZ_KEY_SCOPE,
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": scope,
          "OAAP_T_APP": app_id})
     return json.loads(out)
+
+
+def authz_split_section(section):
+    """(declaration or None, administer) from a manifest's `authorization`.
+
+    `administer` is not part of the declaration (spec 2.1): an app that only
+    administers declares nothing, and registers nothing. A section without
+    the key is returned as it is (an empty one still registers an empty
+    declaration, as in 0.1)."""
+    if not isinstance(section, dict) or "administer" not in section:
+        return section, False
+    decl = {k: v for k, v in section.items() if k != "administer"}
+    return (decl or None), section.get("administer") is True
+
+
+def authz_admin_refusal(app_id, administer, door_open, confirmed):
+    """Why an install must stop before it builds anything, or ''.
+
+    The key is a tenant administrator's tool (spec 2.10); the operator
+    says yes once. An instance whose door is already open is a redeploy,
+    which does not ask again."""
+    if not administer or door_open or confirmed:
+        return ""
+    return (f"'{app_id}' asks to ADMINISTER the business authorization of "
+            "its tenant (authorization.administer: true). Its key can create "
+            "roles and collections, give and end assignments and map groups "
+            "-- for ONE tenant, in the name of the tenant administrator who "
+            "uses it. It can never name a platform role, create or change a "
+            "user, register a declaration or reach another tenant. Whoever "
+            "holds the container holds that power over grants. Nothing was "
+            "built. Install again with --confirm-administer to accept "
+            "(oaap.core.authorization 2.10).")
+
+
+AUTHZ_STATE_FILE = os.path.join(DATA_DIR, "data", "identity",
+                                "authorization.json")
+
+
+def _authz_instance_record(name):
+    """What identity recorded for an instance, or {}. Read from the file --
+    the same way the install already asks whether an app had a declaration."""
+    try:
+        with open(AUTHZ_STATE_FILE, encoding="utf-8") as f:
+            return (json.load(f).get("instances") or {}).get(name) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _authz_admin_open(name):
+    return bool(_authz_instance_record(name).get("administer"))
+
+
+def _authz_set_administer(name, tenant_id, app_id, on):
+    """Open (or close) the admin door for one instance (spec 2.10). The
+    route replaces the record, so it is called AFTER any key was minted."""
+    status, doc = _authz_call("POST", "/internal/authz/instance", {
+        "instance": name, "tenant": tenant_id, "app": app_id,
+        "administer": bool(on)})
+    if status != 200:
+        die("the administration door could not be set: "
+            + str((doc or {}).get("error") or status))
+
+
+def _authz_close_admin_door(name):
+    """At removal: an instance that is gone must not keep a door open.
+    Best effort -- identity may be down; the key then opens nothing as long
+    as the record says nothing, and the next `oaap update` does not reopen it."""
+    rec = _authz_instance_record(name)
+    if not rec.get("administer"):
+        return
+    try:
+        _authz_set_administer(name, rec.get("tenant", ""), rec.get("app", ""),
+                              False)
+        print(f"Closed the administration door of '{name}' "
+              "(oaap.core.authorization 2.10).")
+    except (Exception, SystemExit) as e:        # noqa: BLE001
+        print(f"WARNING: could not close the administration door of "
+              f"'{name}': {e}. Remove its record by hand or run "
+              "`oaap authz` against identity once it is up.")
 
 
 # ------------------------------- remote twin readers (oaap.data.twin 0.4)
@@ -10041,7 +10127,7 @@ def reload_gateway():
 # start_instance_container so the container shape stays identical.
 
 RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
-                "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_URL",
+                "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_ADMIN_KEY", "OAAP_AUTHZ_URL",
                 "OAAP_INSTANCE_NAMES"}  # platform-owned, never operator-editable
 
 
@@ -13421,7 +13507,13 @@ def _install_from_dir(pkg, args, source):
     # that nobody confirmed leaves nothing built. A rehearsal never
     # registers: it shares the production app id and must not move what
     # the production tenant's roles are built on.
-    authz_decl = m.get("authorization")
+    authz_decl, authz_admin = authz_split_section(m.get("authorization"))
+    if not is_artefact and not rehearsal:
+        why = authz_admin_refusal(
+            app["id"], authz_admin, _authz_admin_open(name),
+            getattr(args, "confirm_administer", False))
+        if why:
+            die(why)
     if not is_artefact and not rehearsal:
         if authz_decl is not None:
             _authz_register_declaration(
@@ -13592,6 +13684,23 @@ def _install_from_dir(pkg, args, source):
         env["OAAP_AUTHZ_URL"] = f"http://{GATEWAY_CONTAINER}/authz"
         print(f"Issued an authorization key for '{name}' (RFC-0045) -- "
               "OAAP_AUTHZ_KEY/OAAP_AUTHZ_URL are in its environment.")
+    # 0.3: the key of a tenant administrator's tool, minted once like the
+    # others, and the door opened (or closed again) for the instance. Never
+    # for a rehearsal: it would administer the PRODUCTION tenant.
+    if authz_admin and not is_artefact and not rehearsal:
+        if "OAAP_AUTHZ_ADMIN_KEY" not in env:
+            env["OAAP_AUTHZ_ADMIN_KEY"] = _authz_issue_instance_key(
+                name, twin_tenant, app["id"], AUTHZ_ADMIN_KEY_SCOPE)
+            env["OAAP_AUTHZ_URL"] = f"http://{GATEWAY_CONTAINER}/authz"
+            print(f"Issued an ADMINISTRATION key for '{name}' (RFC-0045 A7) "
+                  "-- OAAP_AUTHZ_ADMIN_KEY/OAAP_AUTHZ_URL are in its "
+                  "environment.")
+        _authz_set_administer(name, twin_tenant, app["id"], True)
+    elif not is_artefact and not rehearsal and _authz_admin_open(name):
+        # a redeploy without the manifest key closes the door again
+        _authz_set_administer(name, twin_tenant, app["id"], False)
+        env.pop("OAAP_AUTHZ_ADMIN_KEY", None)
+        print(f"'{name}' no longer asks to administer: its door is closed.")
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     # RFC-0043: the instance's own names, canonical first, so the app
@@ -13886,6 +13995,7 @@ def remove_instance(reg, name, purge):
     reload_gateway()
     drop_token(name, "instance removed")
     grants_drop_for(name, "instance removed")
+    _authz_close_admin_door(name)
     tid = resolve_tenant(inst.get("tenant")) or ""
     local = instance_name(name, inst)
     kept = reg.setdefault("retained", {})
@@ -14548,7 +14658,8 @@ def cmd_authz(args):
             vals = "; ".join(f"{k}={','.join(v)}"
                              for k, v in (r.get("values") or {}).items())
             print(f"{r['id'][:8]}  {r['name']:<28} {r['app']}/{r['template']}"
-                  + (f"  [{vals}]" if vals else ""))
+                  + (f"  [{vals}]" if vals else "")
+                  + ("  (retired)" if r.get("retired") else ""))
         if not doc["roles"]:
             print("No roles yet.")
         return
@@ -14564,7 +14675,8 @@ def cmd_authz(args):
     if verb == "collections":
         doc = show(*_authz_call("GET", "/internal/authz/collections?" + q))
         for c in doc["collections"]:
-            print(f"{c['id'][:8]}  {c['name']:<28} {len(c['roles'])} role(s)")
+            print(f"{c['id'][:8]}  {c['name']:<28} {len(c['roles'])} role(s)"
+                  + ("  (retired)" if c.get("retired") else ""))
         if not doc["collections"]:
             print("No collections yet.")
         return
@@ -14575,6 +14687,22 @@ def cmd_authz(args):
             who, name=args.item_name, roles=args.role)))
         print(f"Collection '{doc['collection']['name']}' created in "
               f"'{label}'.")
+        return
+    if verb in ("role-retire", "collection-retire"):
+        kind = "roles" if verb == "role-retire" else "collections"
+        target = args.name or args.item_name
+        if not target:
+            die(f"{verb} needs the name or the id (first column of "
+                f"`oaap authz {kind}`)")
+        rows = show(*_authz_call("GET", f"/internal/authz/{kind}?" + q))[kind]
+        hit = [r for r in rows if r["name"] == target
+               or r["id"].startswith(target)]
+        if len(hit) != 1:
+            die(f"'{target}' names {len(hit)} of the {kind} of '{label}'")
+        doc = show(*_authz_call("POST", f"/internal/authz/{kind}/"
+                                        f"{hit[0]['id']}/retire", who))
+        print(f"'{hit[0]['name']}' retired." if doc["changed"]
+              else f"'{hit[0]['name']}' was retired already.")
         return
     if verb == "mappings":
         doc = show(*_authz_call("GET", "/internal/authz/mappings?" + q))
@@ -18414,7 +18542,8 @@ def _scrub_rehearsal_env(key, ident, secret_keys, handover_fields=()):
     platform_owned = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                       # oaap.core.authorization: a live credential for the
                       # PRODUCTION tenant's grants, dropped like the twin's
-                      "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_URL",
+                      "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_ADMIN_KEY",
+                      "OAAP_AUTHZ_URL",
                       # RFC-0043: a rehearsal has its own names; the
                       # install below computes them afresh
                       "OAAP_INSTANCE_NAMES"}
@@ -22389,6 +22518,13 @@ def main():
                     help="resolve a 'contributes'/'consumes' entry the "
                          "registry could not match on its own (oaap.data."
                          "model 0.1 §2.4) — repeatable")
+    pi.add_argument("--confirm-administer", dest="confirm_administer",
+                    action="store_true",
+                    help="accept an app that asks to ADMINISTER the business "
+                         "authorization of its tenant: it gets a key that "
+                         "can create roles, collections, assignments and "
+                         "mappings for that tenant (oaap.core.authorization "
+                         "2.10)")
     pi.add_argument("--confirm-authorization", dest="confirm_authorization",
                     action="store_true",
                     help="accept a version that REMOVES something it had "
@@ -22913,9 +23049,11 @@ def main():
     pz.add_argument("verb", choices=["declarations", "roles", "role-add",
                                      "collections", "collection-add",
                                      "assignments", "assign", "revoke",
-                                     "mappings", "map-add", "map-remove"])
-    pz.add_argument("name", nargs="?", help="for 'revoke' / 'map-remove': the "
-                    "id (or its first characters)")
+                                     "mappings", "map-add", "map-remove",
+                                     "role-retire", "collection-retire"])
+    pz.add_argument("name", nargs="?", help="for 'revoke' / 'map-remove' / "
+                    "'role-retire' / 'collection-retire': the id (or its first "
+                    "characters; a name for the last two)")
     pz.add_argument("--group", default=None, help="for map-add: the group's "
                     "path in the realm, e.g. Verein/Hallenwart")
     pz.add_argument("--tenant", default=None, help="the tenant's label")

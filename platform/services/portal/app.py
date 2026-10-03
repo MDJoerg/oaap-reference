@@ -1784,6 +1784,18 @@ TENANT_BODY = """
   {% endif %}
   <p><a class="btn" href="/tenant/face">Das Gesicht aendern</a></p>
 </div>
+{% if me.rights_url %}
+<div class="card">
+  <h2>Rollen und Rechte</h2>
+  <p>Wer darf was in den Apps dieses Mandanten: Rollen, Sammlungen,
+     Zuordnungen und Gruppen des Anmeldedienstes.</p>
+  <p><a class="btn" href="{{ me.rights_url }}" rel="noopener">Rollen &amp; Rechte
+     öffnen</a></p>
+  <p class="muted">Der Link gibt kein Recht: die App fragt bei jedem Aufruf
+     den Identity-Dienst, und der prüft, ob Sie Administrator dieses
+     Mandanten sind.</p>
+</div>
+{% endif %}
 <div class="card">
   <h2>Der Weg herein</h2>
   {% if me.idp.issuer %}
@@ -4864,7 +4876,8 @@ def tenant_page():
     n_users, n_inst = counts(mine)
     me = {"label": t.get("label", "?"), "name": t.get("name") or t.get("label", "?"),
           "created": t.get("created", "?"), "users": n_users,
-          "instances": n_inst, "idp": _idp_view(t)}
+          "instances": n_inst, "idp": _idp_view(t),
+          "rights_url": _rights_app_url(mine)}
     # The tenant is taken from the caller's own record, so the log they
     # get is theirs by construction — there is no parameter to tamper
     # with and therefore no other tenant's log to ask for.
@@ -4873,6 +4886,25 @@ def tenant_page():
                 entries=read_audit(mine),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
+
+
+RIGHTS_APP_ID = "rollen-rechte"
+
+
+def _rights_app_url(tid):
+    """Where a tenant's "Rollen & Rechte" app lives, or '' if it has none.
+
+    RFC-0045 A7: the portal only LINKS to the administration app; it
+    shows no rights of its own. The link is no permission -- the app asks
+    identity, which checks the person on every call."""
+    host = request.host.split(":")[0]
+    ext = external_host()
+    on_lan = not ext or _looks_like_lan(host)
+    for name, inst in sorted(load_instances().items()):
+        if (inst.get("app_id") == RIGHTS_APP_ID
+                and (resolve_tenant(inst.get("tenant")) or "") == (tid or "")):
+            return _tile_url(name, inst, host, ext, on_lan)
+    return ""
 
 
 def _idp_view(t):
