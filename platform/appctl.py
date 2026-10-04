@@ -19353,6 +19353,10 @@ def catalog_view_write():
     action), so a freshly released package appears within minutes; a
     catalog that cannot be read is written as an error the page shows.
     """
+    # Staged copies are pruned when the next one is staged -- which may
+    # never come, and a package can be 256 MB. Left behind by the last
+    # install, removed source or not, they go here, with the timer.
+    catalog_source.prune(CATALOG_STAGE)
     try:
         sources = [s for s in load_sources()[0]
                    if catalog_source.is_catalog_url(s.get("url"))]

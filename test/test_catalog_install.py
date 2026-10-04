@@ -337,6 +337,15 @@ ok("... und das Portal bekommt einen Fehler statt einer alten Liste",
 reset_sources()
 a.catalog_view_write()
 ok("ohne Quelle wird der Schnappschuss entfernt", not os.path.exists(snap_path))
+old = os.path.join(a.CATALOG_STAGE, "pkg-uralt.zip")
+young = os.path.join(a.CATALOG_STAGE, "pkg-jung.zip")
+for f_ in (old, young):
+    open(f_, "wb").write(b"x")
+os.utime(old, (1, 1))
+a.catalog_view_write()
+ok("liegengebliebene Kopien im Staging-Verzeichnis (aelter als eine Stunde) werden "
+   "mit der Zustandsaktualisierung entfernt, junge bleiben",
+   not os.path.exists(old) and os.path.exists(young))
 
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)
