@@ -5678,8 +5678,10 @@ def health():
         core.append(relay)
 
     apps = []
-    for name, inst in sorted(load_instances().items()):
-        state, label, detail = _instance_probe(name, inst)
+    insts = sorted(load_instances().items())
+    probed = fleet_view.probe_all(insts, _instance_probe)
+    for name, inst in insts:
+        state, label, detail = probed[name]
         channel = inst.get("channel", "production")
         apps.append({
             "name": inst.get("app_name", name), "instance": name,
@@ -5830,8 +5832,10 @@ def fleet_status():
     # all instances hang off it (schema 0.3). Empty on a LAN-only node;
     # then instance rows carry no automatic name at all.
     ext = external_host()
-    for name, inst in sorted(load_instances().items()):
-        state, _label, _detail = _instance_probe(name, inst)
+    insts = sorted(load_instances().items())
+    probed = fleet_view.probe_all(insts, _instance_probe)
+    for name, inst in insts:
+        state, _label, _detail = probed[name]
         instances.append(fleet_view.instance_row(name, inst, state, ext))
         if _pending_envelope(name):
             pending.append(name)

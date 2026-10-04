@@ -12,6 +12,7 @@ values, no source URLs (a source URL has already leaked a PAT once).
 """
 import hashlib
 import hmac
+from concurrent.futures import ThreadPoolExecutor, wait
 
 SCHEMA = "oaap.fleet.status/0.3"
 
@@ -194,3 +195,48 @@ def build_document(node, version, profiles, now_iso, core, instances,
     if public_ip:
         doc["public_ip"] = public_ip
     return doc
+
+
+# --- probing every instance at once -------------------------------------
+#
+# The health page and the fleet document both ask each instance "are you
+# alive?". Asked one after the other, one sick app that takes two seconds
+# to time out makes EVERY answer two seconds slower -- on a node with
+# twenty apps that is how a single overloaded container turned into a
+# slow portal (oaapx01, 04.10.2026: /fleet/status 1.9 s, 0.1 s once the
+# app was fixed). Asked together, the answer takes as long as the slowest
+# single probe, and never longer than the budget.
+PROBE_WORKERS = 8
+PROBE_BUDGET = 4.0          # seconds for the whole round, however many apps
+
+
+def probe_all(items, probe, budget=PROBE_BUDGET, workers=PROBE_WORKERS):
+    """{name: (state, label, detail)} for [(name, inst), ...].
+
+    `probe(name, inst)` is the single probe. A probe that raises, or that
+    has not answered when the budget is spent, becomes an `err` row for
+    ITS instance and costs the others nothing. The rows come back for
+    every name asked about, in the order asked.
+    """
+    items = list(items)
+    if not items:
+        return {}
+    pool = ThreadPoolExecutor(max_workers=max(1, min(workers, len(items))))
+    try:
+        futures = {name: pool.submit(probe, name, inst) for name, inst in items}
+        wait(list(futures.values()), timeout=budget)
+        out = {}
+        for name, _inst in items:
+            f = futures[name]
+            if not f.done():
+                out[name] = ("err", "Antwortet nicht rechtzeitig",
+                             f"keine Antwort in {budget:g} s")
+                continue
+            try:
+                out[name] = f.result()
+            except Exception as exc:                        # noqa: BLE001
+                out[name] = ("err", "Nicht erreichbar", type(exc).__name__)
+        return out
+    finally:
+        # Do not wait for a straggler: its own request timeout ends it.
+        pool.shutdown(wait=False, cancel_futures=True)
