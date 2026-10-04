@@ -186,7 +186,8 @@ ok("es gibt die Teilroute fuer die Knoepfe, mit derselben Rollenpruefung",
 df = open(os.path.join(HERE, "..", "platform", "services", "portal",
                        "Dockerfile"), encoding="utf-8").read()
 ok("das Image enthaelt beide Dateien (sonst Neustartschleife, CURRENT_STATE 132)",
-   "COPY metrics.py ." in df and "portal/metrics_view.py" in df)
+   "COPY metrics.py ." in df and "COPY traffic.py ." in df
+   and "portal/metrics_view.py" in df)
 dc = open(os.path.join(HERE, "..", "platform", "docker-compose.yml"),
           encoding="utf-8").read()
 ok("das Portal liest das Verzeichnis nur lesend",

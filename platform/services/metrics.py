@@ -28,7 +28,14 @@ import json
 import os
 import time
 
-SERIES = ("cpu", "mem", "disk")
+import traffic
+
+SERIES = ("cpu", "mem", "disk", "req", "lat", "tx", "rx", "conn", "ctop")
+
+# What a series is counted in. cpu, mem and disk are percent of the whole;
+# the traffic series (RFC-0051 stage 3, see traffic.py) are not.
+UNITS = {"cpu": "%", "mem": "%", "disk": "%", "req": "/min", "lat": "ms",
+         "tx": "B/s", "rx": "B/s", "conn": "", "ctop": "% Kern"}
 
 # (name, seconds per interval, how long it is kept)
 TIERS = (
@@ -253,7 +260,7 @@ def _save_last(directory, d):
 
 
 def take_sample(directory, data_path, now=None, proc="/proc",
-                sleep=time.sleep):
+                sleep=time.sleep, log_path=None, containers=None):
     """Read the host once and file the sample. Returns the entry, or None
     when this minute already has one (the job may fire twice).
 
@@ -283,6 +290,13 @@ def take_sample(directory, data_path, now=None, proc="/proc",
                  ("disk", read_disk_percent(data_path))):
         if v is not None:
             entry[s] = round(v, 2)
+    # Traffic (RFC-0051 stage 3). A reading that fails leaves its series
+    # out of this minute; it never costs the CPU line above.
+    try:
+        entry.update(traffic.measure(directory, now, proc, log_path,
+                                     containers))
+    except Exception:                                      # noqa: BLE001
+        pass
     if len(entry) > 1:
         _append(directory, "raw", [entry])
         queue_add(directory, entry)

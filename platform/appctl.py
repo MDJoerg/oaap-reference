@@ -89,6 +89,7 @@ import cohort  # noqa: E402
 # Node metrics (RFC-0051): the sampler and the tiered store. Pure; the
 # acting is cmd_metrics.
 import metrics  # noqa: E402
+import traffic  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
 # The broker's certificate (RFC-0054 stage 3): copied from the gateway or
@@ -5196,7 +5197,10 @@ def cmd_metrics(args):
     """
     if args.action == "sample":
         try:
-            metrics.take_sample(METRICS_DIR, DATA_DIR)
+            metrics.take_sample(
+                METRICS_DIR, DATA_DIR,
+                log_path=os.path.join(GATEWAY_LOG_DIR, "external-access.log"),
+                containers=traffic.docker_stats)
         except Exception as exc:  # noqa: BLE001 -- see the docstring
             print(f"metrics: sample skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
@@ -5248,16 +5252,32 @@ def cmd_metrics(args):
     print(f"Window {key}, from tier '{w['tier']}' "
           f"({w['step'] // 60} min per point), data since "
           f"{_fmt_at(w['since'])}:")
-    names = {"cpu": "CPU", "mem": "Arbeitsspeicher", "disk": "Platte"}
+    names = {"cpu": "CPU", "mem": "Arbeitsspeicher", "disk": "Platte",
+             "req": "Anfragen", "lat": "Dauer (Mittel)", "tx": "Netz raus",
+             "rx": "Netz rein", "conn": "TCP-Verbind.",
+             "ctop": "Container-Spitze"}
     for s in metrics.SERIES:
         pts = w["series"][s]
+        u = (" " + metrics.UNITS[s]) if metrics.UNITS[s] else ""
         if not pts:
-            print(f"  {names[s]:<16} (no data)")
+            print(f"  {names[s]:<18} (no data)")
             continue
         mean = sum(p[1] for p in pts) / len(pts)
-        print(f"  {names[s]:<16} now {pts[-1][1]:5.1f} %   mean {mean:5.1f} %   "
-              f"min {min(p[2] for p in pts):5.1f} %   "
-              f"max {max(p[3] for p in pts):5.1f} %   ({len(pts)} points)")
+        print(f"  {names[s]:<18} now {pts[-1][1]:9.1f}{u}   mean {mean:9.1f}{u}   "
+              f"min {min(p[2] for p in pts):9.1f}   "
+              f"max {max(p[3] for p in pts):9.1f}   ({len(pts)} points)")
+    snap = traffic.snapshot(METRICS_DIR)
+    if snap["hosts"]:
+        print("\nLast hour per host (requests, long-lived, MB, mean s, "
+              "longest s, 5xx):")
+        for h, r in sorted(snap["hosts"].items(), key=lambda x: -x[1][0])[:15]:
+            timed = r[0] - r[1]
+            print(f"  {h[:44]:<44} {r[0]:6d} {r[1]:5d} {r[2] / 1e6:8.2f} "
+                  f"{(r[3] / timed if timed else 0):7.3f} {r[4]:8.2f} {r[5]:4d}")
+    if snap["containers"]:
+        print("\nBusiest containers now (% of one core, MB):")
+        for n, c, mb in snap["containers"]:
+            print(f"  {n[:44]:<44} {c:7.1f} {mb:8.1f}")
 
 
 def tenant_holdings(tid):
