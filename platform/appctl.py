@@ -90,6 +90,7 @@ import cohort  # noqa: E402
 # acting is cmd_metrics.
 import metrics  # noqa: E402
 import traffic  # noqa: E402
+import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
 # The broker's certificate (RFC-0054 stage 3): copied from the gateway or
@@ -11254,6 +11255,10 @@ def state_view_write(reg=None):
         cohort_view_write()
         tenant_build_view_write()
         tenant_request_view_write()
+        try:
+            catalog_view_write()
+        except (OSError, ValueError, KeyError):
+            pass
         return True
     except OSError as e:
         print(f"WARNING: could not write {STATE_VIEW}: {e}", flush=True)
@@ -13187,6 +13192,12 @@ def resolve_tenant_arg(label):
     """
     if not label:
         return ""
+    # The worker hands over the acting tenant's ID (the git path takes it
+    # as it is, `_install_from_dir`); the ZIP path of `cmd_install` asked
+    # for a label and refused it. Nothing reached that path from the
+    # worker until a store source could name a ZIP (RFC-0050).
+    if label in load_tenants():
+        return label
     tid, _t = tenant_by_label(label)
     if not tid:
         die(f"no tenant with label '{label}' on this node "
@@ -13367,10 +13378,13 @@ def cmd_install(args):
                 # browser or from this terminal answers "where did this
                 # come from?" with a person and a checksum -- there is
                 # no test instance behind it to point at.
-                sideloaded_by=("cli" if channel == "production" else ""))
+                sideloaded_by=("cli" if channel == "production"
+                               and not getattr(args, "store_source", "")
+                               else ""),
+                store_source=getattr(args, "store_source", "") or "")
         except ArtifactRejected as e:
             die(str(e))
-        if channel == "production":
+        if channel == "production" and not getattr(args, "store_source", ""):
             # In the CUSTOMER's log, not only in the deploy log: an
             # operator putting code into a tenant's production instance
             # is exactly the act RFC-0022 §6 says they must be able to
@@ -17665,7 +17679,7 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
 
 def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                      permit=None, ident=None, rehearsal=None,
-                     sideloaded_by=""):
+                     sideloaded_by="", store_source=""):
     """Phase 3: verify the upload against its grant, then install.
 
     `grant` is positional and mandatory on purpose. It was optional
@@ -17722,6 +17736,15 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                     "announced one — announce the manifest you are shipping")
         m = yaml.safe_load(manifest_bytes.decode("utf-8"))
         version = m["app"]["version"]
+        expect = _staged_expect(zip_path)
+        if expect and (m["app"]["id"] != expect.get("app_id")
+                       or version != expect.get("version")):
+            # The catalog's list named one thing, the package says
+            # another: refused before anything is built (RFC-0050).
+            raise ArtifactRejected(
+                f"the catalog lists {expect.get('app_id')} "
+                f"{expect.get('version')}, the package inside is "
+                f"{m['app']['id']} {version} -- not installed")
         stored = artifact_store(name, zip_path, version, sha, inst=ident)
         source = {"kind": "artifact", "version": version, "sha256": sha,
                   "stored": stored, "path": path,
@@ -17730,6 +17753,11 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
             # where production got it from (RFC-0020) — so "what runs
             # here?" is answerable with a test instance and a checksum
             source["promoted_from"] = origin
+        if store_source:
+            # Where it came from, so a later "update to vX" resolves
+            # against the same list (RFC-0012 3, `prefer`) and "what runs
+            # here?" has an answer next to the checksum (RFC-0050).
+            source["store_source"] = store_source
         if sideloaded_by:
             # RFC-0037: the same question, answered for a package that
             # arrived from a browser. A sideloaded instance has no test
@@ -19246,6 +19274,117 @@ def fetch_store_list(url, timeout=5):
         return None
 
 
+# --- a package catalog as a store source (RFC-0050 stage 2) -------------
+#
+# The catalog is an app; the node reads the files it wrote, from the
+# instance's storage on the host (catalog_source.py has the reasons). What
+# an install needs is a ZIP the node OWNS, verified, so the resolution
+# hands the existing ZIP path (RFC-0019) a staged, checked copy and
+# nothing else changes: the same envelope rule, version rule, channel
+# rule and audit line as for any package that arrives as a ZIP.
+
+CATALOG_STAGE = os.path.join(DATA_DIR, "data", "catalog-stage")
+CATALOG_STORAGE = "data"
+
+
+def _catalog_base(src):
+    """The host directory of the catalog instance's storage, or None."""
+    key = catalog_source.instance_of(src.get("url"))
+    inst = load_registry()["instances"].get(key) if key else None
+    if not inst:
+        return None
+    name = (src.get("catalog") or {}).get("storage") or CATALOG_STORAGE
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(name)):
+        return None
+    return os.path.join(instance_dir(key, inst), "storage", name)
+
+
+def _catalog_read(src):
+    """The validated list of a catalog source, or None (with the reason in
+    `_store_lookup.note`: "not listed" would hide a broken catalog)."""
+    base = _catalog_base(src)
+    if base is None:
+        _store_lookup.note = (f" ('{src['id']}' names a catalog instance "
+                              "that does not exist on this node)")
+        return None
+    try:
+        return catalog_source.read_list(base)
+    except catalog_source.CatalogError as e:
+        _store_lookup.note = f" ('{src['id']}': {e})"
+        return None
+
+
+def _catalog_stage(src, entry):
+    base = _catalog_base(src)
+    try:
+        staged = catalog_source.stage(base, entry, CATALOG_STAGE,
+                                      ARTIFACT_MAX_BYTES)
+    except catalog_source.CatalogError as e:
+        _store_lookup.note = f" ('{src['id']}': {e})"
+        return None, "", None
+    # What the list SAID about this package, kept next to the verified
+    # copy: install_artifact compares it with the manifest inside, so a
+    # list cannot hand out one app under another's name or version.
+    with open(staged + ".json", "w", encoding="utf-8") as f:
+        json.dump({"app_id": entry["id"], "version": entry["version"],
+                   "source": src["id"]}, f)
+    return ({"kind": "catalog", "url": staged, "path": "", "ref": ""},
+            entry.get("version", ""), src)
+
+
+def _staged_expect(zip_path):
+    """What the catalog said about a staged package, or None for any
+    other ZIP. Only a file the node staged itself carries one."""
+    try:
+        if os.path.dirname(os.path.abspath(zip_path)) != os.path.abspath(CATALOG_STAGE):
+            return None
+        with open(zip_path + ".json", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def catalog_view_write():
+    """The portal's copy of every catalog source's list (no file paths).
+
+    The portal cannot read an app's storage, and the store page needs the
+    list. Written with the state view (timer and after every worker
+    action), so a freshly released package appears within minutes; a
+    catalog that cannot be read is written as an error the page shows.
+    """
+    try:
+        sources = [s for s in load_sources()[0]
+                   if catalog_source.is_catalog_url(s.get("url"))]
+    except SourcesUnreadable:
+        return
+    keep = set()
+    for src in sources:
+        fn = f"catalog-{src['id']}.json"
+        keep.add(fn)
+        base = _catalog_base(src)
+        try:
+            if base is None:
+                raise catalog_source.CatalogError(
+                    "the catalog instance does not exist on this node")
+            doc = catalog_source.snapshot(catalog_source.read_list(base))
+        except catalog_source.CatalogError as e:
+            doc = {"error": str(e)[:300], "apps": []}
+        path = os.path.join(APPS_DIR, fn)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        os.replace(tmp, path)
+        os.chmod(path, 0o644)
+    try:
+        for fn in os.listdir(APPS_DIR):
+            if fn.startswith("catalog-") and fn.endswith(".json") \
+                    and fn not in keep:
+                os.remove(os.path.join(APPS_DIR, fn))
+    except OSError:
+        pass
+
+
 def _store_lookup(app_id, source_id="", prefer=""):
     """Resolve an app id against the CONFIGURED store sources (spec 2.6).
 
@@ -19271,13 +19410,19 @@ def _store_lookup(app_id, source_id="", prefer=""):
     if source_id:
         sources = [s for s in sources if s["id"] == source_id]
     hits = []
+    _store_lookup.note = ""
     for pos, src in enumerate(sources):
-        data = fetch_store_list(src["url"])
+        is_cat = catalog_source.is_catalog_url(src.get("url"))
+        data = _catalog_read(src) if is_cat else fetch_store_list(src["url"])
         if not data:
             continue
         for a in data.get("apps", []):
             pkg = a.get("package") or {}
-            if a.get("id") == app_id and pkg.get("git"):
+            # A catalog entry names a ZIP in the catalog's own storage
+            # (RFC-0050); a list read from the network names Git only --
+            # a "zip" in a remote list is not something this node fetches.
+            if a.get("id") == app_id and (pkg.get("git")
+                                          or (is_cat and pkg.get("zip"))):
                 hits.append((src, a, pos))
                 break
     if not hits:
@@ -19287,6 +19432,10 @@ def _store_lookup(app_id, source_id="", prefer=""):
                              h[2]))
     src, entry, _ = hits[0]
     pkg = entry["package"]
+    if catalog_source.is_catalog_url(src.get("url")):
+        # Only the WINNING entry is copied: staging every hit would copy
+        # a package per source for a lookup that installs one.
+        return _catalog_stage(src, entry)
     return ({"kind": "git", "url": pkg["git"],
              "path": pkg.get("path", ""),
              "ref": pkg.get("ref", "")},
@@ -19523,6 +19672,14 @@ def cmd_process_deploys(_args):
         # never share a key (measured 2026-09-29: `bec-admin` installing
         # `wegweiser` while the default tenant already has one).
         local_name = name
+        lookup_id = name          # the APP id, before any "-test" below
+        if action == "install" and req.get("channel") == "test" \
+                and not name.endswith("-test"):
+            # "With a test instance" (RFC-0050 4): the install lands as
+            # `<name>-test` on the test channel and goes live by
+            # promotion. Decided per install, by the person installing.
+            name = name + "-test"
+            local_name = name
         if action in ("create", "install"):
             found_key, found = find_instance(reg, act_tenant, name)
             if found is not None:
@@ -19620,10 +19777,15 @@ def cmd_process_deploys(_args):
             # key. The app id is what the caller asked for, which is
             # exactly what `local_name` still holds (RFC-0025 §8.1).
             src, _listed_version, store_src = _store_lookup(
-                local_name, req.get("source_id", ""),
+                lookup_id, req.get("source_id", ""),
                 prefer=((inst or {}).get("source") or {}).get("store_source", ""))
             if not src:
-                msg = "app is not listed in any configured store source"
+                note = getattr(_store_lookup, "note", "")
+                # A refusal by a catalog is not "not listed": the person
+                # who reads this has to know the package WAS found and
+                # what the node would not accept about it.
+                msg = (("a store source refused the package" + note) if note
+                       else "app is not listed in any configured store source")
             elif (store_src["trust"] == "unverified"
                   and req.get("confirm_source") != store_src["id"]):
                 # A brake against inattention, not a security boundary —
@@ -19634,7 +19796,8 @@ def cmd_process_deploys(_args):
                        "(RFC-0012 §3)")
             else:
                 revision = _resolve_revision(src)
-                channel = inst["channel"] if inst else "production"
+                channel = inst["channel"] if inst else (
+                    "test" if req.get("channel") == "test" else "production")
                 src["store_source"] = store_src["id"]
                 ok, msg = run_install(src, channel)
                 if ok:
@@ -22492,6 +22655,34 @@ def cmd_store(args):
         die(f"'{args.action}' needs an argument")
 
     src = None
+    if args.action == "add-catalog":
+        # RFC-0050: an instance of THIS node is the source. Not a URL, so
+        # nothing is exposed and the portal's request can never name it.
+        key = target
+        inst = load_registry()["instances"].get(key)
+        if not inst:
+            found_key, inst = find_instance(
+                load_registry(), resolve_tenant_arg(""), target)
+            key = found_key if inst else key
+        if not inst:
+            die(f"no instance '{target}' -- name the catalog app's instance "
+                "(see 'oaap app list')")
+        sid = args.id or f"catalog-{key}"
+        trust = args.trust or "verified"
+        if any(s["id"] == sid for s in sources):
+            die(f"a source with id '{sid}' already exists")
+        sources.append({"id": sid, "name": args.name or sid,
+                        "url": catalog_source.SCHEME + key, "trust": trust,
+                        "enabled": True, "origin": args.origin or "",
+                        "catalog": {"storage": CATALOG_STORAGE}})
+        removed[:] = [r for r in removed if r != sid]
+        save_sources(sources, removed)
+        state_view_write()
+        print(f"Catalog source added: {sid} ({TRUST_LABEL[trust]}) -- the "
+              f"packages released in '{key}' are now in the store."
+              + (" Installing from it asks for a confirmation each time."
+                 if trust == "unverified" else ""))
+        return
     if args.action != "add-source":
         src = find_source(sources, target)
         if not src:
@@ -23270,7 +23461,8 @@ def main():
     pri = sub.add_parser("restore-instances")
     pri.set_defaults(fn=cmd_restore_instances)
     ps = sub.add_parser("store")
-    ps.add_argument("action", choices=["list", "add-source", "remove-source",
+    ps.add_argument("action", choices=["list", "add-source", "add-catalog",
+                                       "remove-source",
                                        "enable", "disable", "trust", "rename",
                                        "reconcile"])
     ps.add_argument("target", nargs="?",

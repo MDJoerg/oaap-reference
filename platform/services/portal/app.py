@@ -1695,11 +1695,21 @@ STORE_APP_BODY = """
     <p class="muted">Diese App ist als <strong>nur für Experten</strong>
     gekennzeichnet — sie verlangt Wissen, das über die Bedienung hinausgeht.</p>
     {% endif %}
+    {% if not a.installed %}
+    <p style="margin:.2rem 0 .4rem"><strong>Wohin?</strong></p>
+    <label class="checkline"><input type="radio" name="channel" value="production" checked>
+      Direkt in Produktion</label>
+    <label class="checkline"><input type="radio" name="channel" value="test">
+      Mit einer Test-Instanz (<code>{{ a.id }}-test</code>) — später
+      „nach Produktiv übernehmen“</label>
+    {% endif %}
     <button>{{ ('Aktualisieren auf v' + a.version) if a.installed else 'Installieren' }}</button>
   </form>
-  <p class="muted" style="margin:.6rem 0 0">Installiert wird auf dem
-  Produktions-Kanal. Welches Paket geholt wird, entscheidet der Server
-  selbst anhand der eingetragenen Quellen — nicht diese Seite.</p>
+  <p class="muted" style="margin:.6rem 0 0">{% if a.installed %}Eine
+  bestehende Instanz behält ihren Kanal.{% else %}Du entscheidest je App:
+  eine Webseite braucht eine Test-Instanz, ein Kurzlink-Dienst nicht.{% endif %}
+  Welches Paket geholt wird, entscheidet der Server selbst anhand der
+  eingetragenen Quellen — nicht diese Seite.</p>
   {% endif %}
 </div>
 
@@ -6467,7 +6477,8 @@ def deploy_cancel_hook(name):
 # app id; the host-side worker resolves it against the configured
 # sources itself and installs from what that lookup returns.
 
-STORE_SOURCES_FILE = "/apps-registry/store-sources.json"
+APPS_REGISTRY_DIR = "/apps-registry"
+STORE_SOURCES_FILE = APPS_REGISTRY_DIR + "/store-sources.json"
 INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 
 # Store list rules live in store_view.py — merging, vocabulary, image
@@ -6625,10 +6636,24 @@ def store_catalogue():
     fetched, errors = [], []
     for src in configured_sources():
         try:
-            r = requests.get(src["url"], timeout=4)
-            r.raise_for_status()
-            data = r.json()
-        except (requests.RequestException, ValueError) as e:
+            if src["url"].startswith("catalog:"):
+                # A catalog of this node (RFC-0050): the host copies its
+                # list, without file paths, to where this container reads.
+                # The id is checked, because it becomes a file name.
+                if not _re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,62}[a-z0-9]",
+                                     src["id"]):
+                    raise ValueError("invalid source id")
+                with open(os.path.join(APPS_REGISTRY_DIR,
+                                       f"catalog-{src['id']}.json"),
+                          encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("error"):
+                    raise ValueError(str(data["error"]))
+            else:
+                r = requests.get(src["url"], timeout=4)
+                r.raise_for_status()
+                data = r.json()
+        except (requests.RequestException, ValueError, OSError) as e:
             # Show the cause, not just the class — "ConnectionError"
             # alone hides whether it is DNS, routing, or TLS.
             errors.append({"name": src["name"] or src["id"], "url": src["url"],
@@ -6800,6 +6825,11 @@ def store_install():
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"id": rid, "instance": app_id, "action": "install",
                    "source_id": source_id, "confirm_source": confirm,
+                   # Only "test" is a choice; anything else is production.
+                   # The host decides again, and an existing instance keeps
+                   # the channel it has (RFC-0050 4).
+                   "channel": ("test" if request.form.get("channel") == "test"
+                               else "production"),
                    "by": request.headers.get("X-OAAP-User", "?"),
                    "requested": datetime.now(timezone.utc).isoformat()}, f)
     os.replace(tmp, os.path.join(SPOOL_QUEUE, f"{rid}.json"))

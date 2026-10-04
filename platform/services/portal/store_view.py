@@ -59,7 +59,7 @@ def list_relative(list_url, path):
     announce its existence and address for the sake of a thumbnail. An
     entry that tries anyway is dropped here rather than rendered.
     """
-    if not path or "://" in path or path.startswith("/") or ".." in path:
+    if not path or "://" in path or path.startswith("/") or ".." in path             or str(list_url).startswith("catalog:"):
         return ""
     return list_url.rsplit("/", 1)[0] + "/" + path
 
@@ -150,7 +150,12 @@ def merge_catalogue(fetched, installed, pending, profiles, today=None):
     for pos, (src, data) in enumerate(fetched):
         src = dict(src, trust_label=TRUST_LABEL[src["trust"]], pos=pos)
         for a in (data or {}).get("apps", []):
-            if not a.get("id") or not (a.get("package") or {}).get("git"):
+            pkg = a.get("package") or {}
+            # Git for a list read from the network; `catalog` for a list
+            # the host copied from a package catalog of this node
+            # (RFC-0050) -- there is no package address to show, the
+            # host resolves it from the app id.
+            if not a.get("id") or not (pkg.get("git") or pkg.get("catalog")):
                 continue
             view = entry_view(a, src, installed, pending, profiles, today)
             cur = best.get(view["id"])
