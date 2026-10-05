@@ -492,6 +492,18 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
       say "  WARNING: 'store' service could not be started — check 'docker compose ps'."
     fi
   fi
+  # oaap.data.store 0.2 (RFC-0057 stage 0): the store is closed for a
+  # client it does not trust -- the shared database belongs to the
+  # platform's roles, the superuser has no network login. Every node that
+  # carried a store before this version has it open, and so has a store
+  # that was recreated on an empty data directory; neither can reach
+  # `store_close` by itself. Quiet when nothing had to be done; loud when
+  # a door is still open afterwards.
+  if docker exec oaap-store-1 pg_isready -U postgres >/dev/null 2>&1; then
+    OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" \
+      data store close --quiet 2>&1 | sed 's/^/  /' \
+      || say "  WARNING: the managed Postgres could not be closed — run 'sudo oaap data store close'."
+  fi
 fi
 
 # --- the digital twin service for a profiled node (RFC-0031 Schritt 3, oaap.data.twin 0.1) ---

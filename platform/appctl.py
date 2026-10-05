@@ -23,7 +23,8 @@ Node-level, not per app:
     oaap store trust <id> verified|unverified
     oaap store reconcile          (run by `oaap update`, RFC-0012 §4)
 
-    oaap data store status|schemas                    (oaap.data.store 0.1)
+    oaap data store status|schemas                    (oaap.data.store 0.2)
+    oaap data store close                              (RFC-0057 stage 0)
     oaap data store create <purpose> <tenant-id>
     oaap data store copy <schema> <new-name> | drop <schema> --yes
     oaap data store restore <dump-file>                (RFC-0031 Schritt 1)
@@ -7109,6 +7110,28 @@ def cmd_node(args):
                 print("The managed Postgres and the digital twin service "
                       "are starting ('docker compose ... --profile store "
                       "up -d store twin').")
+                # oaap.data.store 0.2: a fresh store comes up with the
+                # image's own login rules. Close it as soon as it answers;
+                # if it does not answer in time, the first client it gets
+                # and the next update both close it (`store_close`).
+                for _ in range(30):
+                    if _store_running():
+                        break
+                    time.sleep(1)
+                try:
+                    if _store_running():
+                        store_close()
+                        print("The store is closed (oaap.data.store 0.2)."
+                              if not store_open_doors() else
+                              "WARNING: the store is not closed yet -- run "
+                              "'sudo oaap data store close'.")
+                    else:
+                        print("NOTE: the store does not answer yet; close "
+                              "it once it does: 'sudo oaap data store close'.")
+                except (ValueError, RuntimeError,
+                        subprocess.CalledProcessError) as e:
+                    print(f"WARNING: the store could not be closed ({e}) -- "
+                          "run 'sudo oaap data store close'.")
             except (subprocess.CalledProcessError, OSError) as e:
                 err = (getattr(e, "stderr", "") or "").strip().splitlines()
                 print(f"WARNING: could not start the 'store'/'twin' services"
@@ -7323,6 +7346,192 @@ def _store_free_kb():
     return shutil.disk_usage(os.path.join(DATA_DIR, "data", "store")).free // 1024
 
 
+# ------------------------- the store, closed (oaap.data.store 0.2, RFC-0057)
+# Until 0.1 the store had one client, the twin service, and everything on
+# the platform network was trusted. RFC-0057 will attach APPS to it, so the
+# store is closed first, at three doors that do not depend on each other:
+#
+#   1. the privilege: CONNECT on the shared database 'postgres' belongs to
+#      the group role below, no longer to everyone (PostgreSQL's default);
+#   2. the login rule: pg_hba lets a role into 'postgres' only as a member
+#      of that group, and into any other database only if it carries the
+#      role's own name;
+#   3. the superuser has no network login at all -- the host talks to it
+#      through the container's socket (`_store_psql`), nothing else does.
+#
+# Measured on oaap-test, 2026-10-05, before this existed: a role with its
+# own database could still connect to 'postgres' and read the names of the
+# twin's tables; pg_hba ended with `host all all all scram-sha-256`.
+STORE_PLATFORM_ROLE = "oaap_platform"
+# Reserved for an app's own database and role (RFC-0057 3.2). Nothing with
+# this prefix may ever become a member of the group above -- which is why
+# `create`/`copy` refuse to make a schema role that starts with it.
+STORE_APP_PREFIX = "app_"
+STORE_HBA_BEGIN = "# >>> oaap.data.store -- managed by OAAP, do not edit"
+STORE_HBA_END = "# <<< oaap.data.store"
+STORE_HBA_RULES = (
+    ("host", "all", "postgres", "all", "reject"),
+    ("host", "sameuser", "all", "all", "scram-sha-256"),
+    ("host", "postgres", "+" + STORE_PLATFORM_ROLE, "all", "scram-sha-256"),
+)
+_HBA_LOOPBACK = {"127.0.0.1/32", "::1/128", "localhost"}
+
+
+def store_hba_rewrite(text):
+    """The pg_hba.conf the store runs with: `text` without the image's
+    catch-all and with OAAP's block at the end. Pure, idempotent.
+
+    Raises ValueError for a network rule it did not write and does not
+    know -- somebody edited the file, and guessing what they meant would
+    either open what they closed or close what they need."""
+    out, inside = [], False
+    for line in text.splitlines():
+        s = line.strip()
+        if s == STORE_HBA_BEGIN:
+            inside = True
+            continue
+        if s == STORE_HBA_END:
+            inside = False
+            continue
+        if inside:
+            continue
+        f = s.split()
+        if s and not s.startswith("#") and f[0].startswith("host") \
+                and not (len(f) > 3 and f[3] in _HBA_LOOPBACK):
+            # the one line the postgres image appends at initdb
+            if len(f) == 5 and f[:4] == ["host", "all", "all", "all"]:
+                continue
+            raise ValueError(f"unknown network rule in pg_hba.conf: '{s}'")
+        out.append(line)
+    while out and not out[-1].strip():
+        out.pop()
+    out += ["", STORE_HBA_BEGIN]
+    out += ["  ".join(r) for r in STORE_HBA_RULES]
+    out += [STORE_HBA_END, ""]
+    return "\n".join(out)
+
+
+def store_platform_roles(schemas, logins):
+    """Which roles belong in the platform's group: a login role that owns a
+    schema of its own name in the shared database -- the shape `create`,
+    `copy` and the twin produce -- and never one with the app prefix. Pure.
+
+    Deliberately NOT "every login role there is": that would be true today
+    and would hand an app's role the shared database on the first update
+    after apps exist."""
+    return sorted(s for s in set(schemas) & set(logins)
+                  if not s.startswith(STORE_APP_PREFIX))
+
+
+def _store_hba_path():
+    return _store_psql("SHOW hba_file").stdout.strip()
+
+
+def _store_login_roles():
+    out = _store_psql("SELECT rolname FROM pg_roles WHERE rolcanlogin "
+                      "AND NOT rolsuper").stdout
+    return [r.strip() for r in out.splitlines() if r.strip()]
+
+
+def _store_platform_login(role, password):
+    """A login role for a platform service in the shared database: the
+    one way such a role is made, so that none exists outside the group."""
+    _store_psql(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{password}\';')
+    _store_psql(f'GRANT "{STORE_PLATFORM_ROLE}" TO "{role}";')
+
+
+def store_open_doors():
+    """What is still open, read from Postgres itself -- an empty list
+    means closed. Never from what `store_close` believes it wrote."""
+    doors = []
+    for db in ("postgres", "template1"):
+        if _store_psql("SELECT has_database_privilege('public', "
+                       f"'{db}', 'CONNECT')").stdout.strip() == "t":
+            doors.append(f"everyone may connect to the database '{db}'")
+    members = set(_store_psql(
+        "SELECT m.rolname FROM pg_auth_members a "
+        "JOIN pg_roles g ON g.oid = a.roleid "
+        "JOIN pg_roles m ON m.oid = a.member "
+        f"WHERE g.rolname = '{STORE_PLATFORM_ROLE}'").stdout.split())
+    for r in sorted(members):
+        if r.startswith(STORE_APP_PREFIX):
+            doors.append(f"the app role '{r}' is in '{STORE_PLATFORM_ROLE}'")
+    rows = _store_psql(
+        "SELECT type, array_to_string(database, ','), "
+        "array_to_string(user_name, ','), coalesce(address, ''), "
+        "coalesce(netmask, ''), auth_method, coalesce(error, '') "
+        "FROM pg_hba_file_rules ORDER BY rule_number").stdout
+    net = []
+    for line in rows.splitlines():
+        f = line.split("|")
+        if len(f) != 7:
+            continue
+        if f[6]:
+            doors.append(f"pg_hba.conf has an error: {f[6]}")
+        if f[0].startswith("host") and f[3] not in ("127.0.0.1", "::1"):
+            net.append((f[0], f[1], f[2], f[3], f[5]))
+    if tuple(net) != STORE_HBA_RULES:
+        doors.append("the network rules in pg_hba.conf are not the three "
+                     "OAAP writes: " + ("; ".join(" ".join(r) for r in net)
+                                        or "none"))
+    return doors
+
+
+def store_close():
+    """Close the store (see the block comment above). Idempotent, and in
+    an order that never locks the twin out: the group and its members
+    first, then the privilege, then the login rule.
+
+    Returns (changed, strangers): what was done, and the login roles that
+    are neither in the group nor an app's -- named, never guessed at."""
+    changed = []
+    if _store_psql("SELECT 1 FROM pg_roles WHERE rolname = "
+                   f"'{STORE_PLATFORM_ROLE}'").stdout.strip() != "1":
+        _store_psql(f'CREATE ROLE "{STORE_PLATFORM_ROLE}" NOLOGIN;')
+        changed.append(f"group role '{STORE_PLATFORM_ROLE}' created")
+    logins = _store_login_roles()
+    members = set(_store_psql(
+        "SELECT m.rolname FROM pg_auth_members a "
+        "JOIN pg_roles g ON g.oid = a.roleid "
+        "JOIN pg_roles m ON m.oid = a.member "
+        f"WHERE g.rolname = '{STORE_PLATFORM_ROLE}'").stdout.split())
+    wanted = store_platform_roles([r["schema"] for r in store_schemas()],
+                                  logins)
+    for role in wanted:
+        if role not in members:
+            _store_psql(f'GRANT "{STORE_PLATFORM_ROLE}" TO "{role}";')
+            changed.append(f"'{role}' joined '{STORE_PLATFORM_ROLE}'")
+    strangers = [r for r in logins if r not in wanted
+                 and r not in members and not r.startswith(STORE_APP_PREFIX)]
+    for db in ("postgres", "template1"):
+        if _store_psql("SELECT has_database_privilege('public', "
+                       f"'{db}', 'CONNECT')").stdout.strip() == "t":
+            _store_psql(f'REVOKE CONNECT ON DATABASE "{db}" FROM PUBLIC;')
+            changed.append(f"CONNECT on '{db}' taken from everyone")
+    _store_psql(f'GRANT CONNECT ON DATABASE postgres TO "{STORE_PLATFORM_ROLE}";')
+    path = _store_hba_path()
+    current = run(["docker", "exec", "-u", "postgres", STORE_CONTAINER,
+                   "cat", path]).stdout
+    wanted_hba = store_hba_rewrite(current)
+    if wanted_hba.strip() != current.strip():
+        # Written next to the file and moved over it, so Postgres never
+        # reads half a file; checked by Postgres BEFORE the reload, because
+        # a reload of a broken file keeps the old rules and says nothing.
+        run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
+             "sh", "-c", f'cat > "{path}.oaap" && mv "{path}.oaap" "{path}"'],
+            input=wanted_hba)
+        bad = _store_psql("SELECT count(*) FROM pg_hba_file_rules "
+                          "WHERE error IS NOT NULL").stdout.strip()
+        if bad != "0":
+            run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
+                 "sh", "-c", f'cat > "{path}"'], input=current)
+            raise RuntimeError("the new pg_hba.conf was not accepted by "
+                               "Postgres; the old one was put back")
+        _store_psql("SELECT pg_reload_conf()")
+        changed.append("pg_hba.conf: network logins limited to three rules")
+    return changed, strangers
+
+
 def cmd_data(args):
     """'oaap data store|model ...' — the managed Postgres (oaap.data.store
     0.1) and the type registry built on it (oaap.data.model 0.1).
@@ -7369,6 +7578,15 @@ def cmd_data(args):
               f"{'running' if running else 'NOT running'}")
         if running:
             print(f"schemas: {len(store_schemas())}")
+            doors = store_open_doors()
+            if doors:
+                print("closed:  NO (oaap.data.store 0.2) --")
+                for d in doors:
+                    print(f"  {d}")
+                print("Close it with: sudo oaap data store close")
+            else:
+                print("closed:  yes -- the shared database is the "
+                      "platform's, the superuser has no network login")
         else:
             print("Check with: docker compose --project-directory "
                   f"{APP_DIR} --project-name oaap --profile store "
@@ -7390,6 +7608,31 @@ def cmd_data(args):
         for r in rows:
             print(f"{r['schema']}  purpose={r['purpose']}  "
                   f"tenant={r['tenant_id'] or '?'}")
+        return
+
+    if args.action == "close":
+        # oaap.data.store 0.2 / RFC-0057 stage 0. Run on every update
+        # (migrate.sh, --quiet) and by hand; says something only when it
+        # did something or when a door is still open afterwards.
+        try:
+            changed, strangers = store_close()
+        except (ValueError, RuntimeError) as e:
+            die(f"the store could not be closed: {e}. Nothing was guessed; "
+                "look at pg_hba.conf in the store's data directory.")
+        doors = store_open_doors()
+        if changed or doors or not args.quiet:
+            for c in changed:
+                print(f"  {c}")
+            print("The store is closed." if not doors else
+                  "The store is NOT closed:")
+        for d in doors:
+            print(f"  {d}")
+        for r in strangers:
+            print(f"  NOTE: login role '{r}' owns no schema of its own name "
+                  f"and was not put into '{STORE_PLATFORM_ROLE}' -- it cannot "
+                  "reach the shared database.")
+        if doors:
+            sys.exit(1)
         return
 
     if args.action == "migrate-twin":
@@ -7438,6 +7681,10 @@ def cmd_data(args):
         if not re.fullmatch(r"[a-z][a-z0-9]*", purpose):
             die("purpose must be lowercase letters/digits, starting with "
                 "a letter (it becomes part of the schema name)")
+        if (purpose + "_").startswith(STORE_APP_PREFIX):
+            die(f"the purpose '{purpose}' is reserved: names starting with "
+                f"'{STORE_APP_PREFIX}' belong to an app's own database "
+                "(RFC-0057), never to a schema in the shared one.")
         if tenant_id not in load_tenants():
             die(f"unknown tenant '{tenant_id}' — 'oaap tenant list' shows "
                 "the IDs. The schema name carries the tenant-ID, never "
@@ -7446,7 +7693,8 @@ def cmd_data(args):
         if schema in {r["schema"] for r in store_schemas()}:
             die(f"schema '{schema}' already exists")
         password = secrets.token_urlsafe(24)
-        _store_psql(f'CREATE ROLE "{schema}" LOGIN PASSWORD \'{password}\';')
+        store_close()
+        _store_platform_login(schema, password)
         _store_psql(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{schema}";')
         print(f"Schema '{schema}' created.")
         print(f"Role:     {schema}")
@@ -7483,6 +7731,9 @@ def cmd_data(args):
         if not re.fullmatch(r"[a-z][a-z0-9_]*", new_schema):
             die("new schema name must be lowercase letters/digits/"
                 "underscores, starting with a letter")
+        if new_schema.startswith(STORE_APP_PREFIX):
+            die(f"names starting with '{STORE_APP_PREFIX}' are reserved for "
+                "an app's own database (RFC-0057).")
         existing = {r["schema"] for r in store_schemas()}
         if schema not in existing:
             die(f"no such schema '{schema}'")
@@ -7510,7 +7761,8 @@ def cmd_data(args):
         # and GRANTs need it to already be there.
         rewritten = dump.replace(f'"{schema}"', f'"{new_schema}"')
         password = secrets.token_urlsafe(24)
-        _store_psql(f'CREATE ROLE "{new_schema}" LOGIN PASSWORD \'{password}\';')
+        store_close()
+        _store_platform_login(new_schema, password)
         run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
              "psql", "-v", "ON_ERROR_STOP=1", "postgres"], input=rewritten)
         print(f"Schema '{schema}' copied to '{new_schema}'.")
@@ -7535,6 +7787,10 @@ def cmd_data(args):
         run(["docker", "exec", "-i", "-u", "postgres", STORE_CONTAINER,
              "psql", "-v", "ON_ERROR_STOP=1", "postgres"], input=text)
         after = {r["schema"] for r in store_schemas()} - before
+        # A dump carries roles and privileges as they were when it was
+        # taken -- possibly from before the store was closed -- and never
+        # the login rules. Close again, whatever the dump said.
+        store_close()
         print(f"Restored {len(after)} schema(s): " + ", ".join(sorted(after))
               if after else "Restore ran; no new schema appeared — check "
                             "the dump was for this store.")
@@ -8382,7 +8638,9 @@ def _twin_ensure_schema(tenant_id):
     secrets_map = _twin_secrets_load()
     if schema not in existing:
         password = secrets.token_urlsafe(24)
-        _store_psql(f'CREATE ROLE "{schema}" LOGIN PASSWORD \'{password}\';')
+        # The first client a fresh store gets finds it closed already.
+        store_close()
+        _store_platform_login(schema, password)
         _store_psql(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{schema}";')
         secrets_map[schema] = {"role": schema, "password": password}
         _twin_secrets_save(secrets_map)
@@ -23506,7 +23764,7 @@ def main():
     pdt.add_argument("object", choices=["store", "model", "twin"])
     pdt.add_argument("action", choices=["status", "schemas", "create",
                                         "copy", "drop", "restore",
-                                        "migrate-twin",
+                                        "migrate-twin", "close",
                                         "types", "show", "register",
                                         "alias", "bindings",
                                         "readers", "add-reader",

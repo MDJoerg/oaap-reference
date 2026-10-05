@@ -190,8 +190,11 @@ print("\n=== 'copy' legt das Schema nicht doppelt an ===")
 _cmd_data_body = read("appctl.py").split("def cmd_data")[1].split("\ndef ")[0]
 _copy_body = _cmd_data_body.split('args.action == "copy"')[1].split(
     'args.action == "restore"')[0]
+# Seit oaap.data.store 0.2 entsteht die Rolle ueber `_store_platform_login`
+# (die eine Stelle, die sie zugleich in die Gruppe der Plattform nimmt --
+# test_store_closed.py); die Regel hier ist dieselbe geblieben.
 ok("'copy' legt vorher nur die ROLLE an, nicht das Schema",
-   "_store_psql(f'CREATE ROLE " in _copy_body
+   "_store_platform_login(new_schema, password)" in _copy_body
    and "_store_psql(f'CREATE SCHEMA " not in _copy_body)
 
 print("\n=== 'status' unterscheidet 'nicht erreichbar' von 'nicht laufend' ===")
