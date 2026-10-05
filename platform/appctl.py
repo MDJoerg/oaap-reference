@@ -14775,8 +14775,24 @@ def cmd_authz(args):
     users = _read_identity_users() or []
     ids = {u.get("username"): u.get("id") for u in users
            if resolve_tenant(u.get("tenant")) == tid}
+
+    def user_id(name):
+        uid = ids.get(name)
+        if not uid:
+            if _read_identity_users() is None:
+                die("cannot read the user store here (run with sudo)")
+            die(f"'{name}' is not a user of tenant '{label}'")
+        return uid
+
     if verb == "assignments":
-        doc = show(*_authz_call("GET", "/internal/authz/assignments?" + q))
+        import urllib.parse
+        qa = q
+        # `is not None`, not truthiness: a --user that was given but names
+        # nobody must be refused. Falling back to the whole tenant's list
+        # would look exactly like a filter that worked.
+        if args.user is not None:
+            qa += "&user=" + urllib.parse.quote(user_id(args.user), safe="")
+        doc = show(*_authz_call("GET", "/internal/authz/assignments?" + qa))
         names = {v: k for k, v in ids.items()}
         for a in doc["assignments"]:
             state = "ENDED" if a["ended"] else (
@@ -14784,16 +14800,13 @@ def cmd_authz(args):
             print(f"{a['id'][:8]}  {names.get(a['subject'], a['subject'][:8]):<18} "
                   f"{a['context']}  {state}  by {a['granted_by']}")
         if not doc["assignments"]:
-            print("No assignments yet.")
+            print(f"No assignments for '{args.user}' yet."
+                  if args.user is not None else "No assignments yet.")
         return
     if verb == "assign":
         if not (args.collection and args.user):
             die("assign needs --collection and --user")
-        uid = ids.get(args.user)
-        if not uid:
-            if _read_identity_users() is None:
-                die("cannot read the user store here (run with sudo)")
-            die(f"'{args.user}' is not a user of tenant '{label}'")
+        uid = user_id(args.user)
         doc = show(*_authz_call("POST", "/internal/authz/assignments", dict(
             who, collection=args.collection, user=uid,
             context={k: v for k, v in _kv_args(args.context,
@@ -23283,7 +23296,8 @@ def main():
                     help="for collection-add: a role name or id, repeatable")
     pz.add_argument("--collection", default=None)
     pz.add_argument("--user", default=None, help="a user NAME of the tenant "
-                    "(stored by id, RFC-0040)")
+                    "(stored by id, RFC-0040); for assign: who receives the "
+                    "collection, for assignments: list only this user's")
     pz.add_argument("--context", action="append", default=[],
                     metavar="FIELD=TWIN-ID",
                     help="for assign: fill a $context field")
