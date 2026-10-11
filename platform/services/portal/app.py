@@ -1672,13 +1672,49 @@ STORE_APP_BODY = """
 {% endif %}
 
 <div class="card">
-  <h2>Installieren</h2>
+  <h2>{% if instances %}Deine Instanzen dieser App{% else %}Installieren{% endif %}</h2>
   {% if a.pending %}
   <p class="muted" style="margin:0">⏳ Installation läuft — das Ergebnis
   erscheint hier und im Deploy-Protokoll auf der Gesundheitsseite.</p>
-  {% elif a.installed == a.version %}
-  <p class="ok" style="margin:0">Auf dem aktuellen Stand (v{{ a.version }}).</p>
   {% else %}
+  {% if instances %}
+  <table>
+    <tr><th>Instanz</th><th>Kanal</th><th>Version</th><th></th></tr>
+    {% for r in instances %}
+    <tr>
+      <td><a href="/instances/{{ r.key }}">{{ r.name }}</a>{% if r.tenant %}
+        <span class="muted">({{ r.tenant }})</span>{% endif %}</td>
+      <td>{{ 'Test' if r.channel == 'test' else 'Produktiv' }}</td>
+      <td>v{{ r.version }}</td>
+      <td>
+      {% if r.version == a.version %}<span class="ok">aktuell</span>
+      {% elif r.via_test %}
+        <span class="muted">Erst die Test-Instanz
+        <a href="/instances/{{ r.via_test.key }}">{{ r.via_test.name }}</a>
+        aktualisieren, dann „Nach Produktiv übernehmen“.</span>
+      {% else %}
+        <form method="post" action="/store/install" style="display:inline"
+              onsubmit="this.querySelector('button').disabled=true;
+                        this.querySelector('button').textContent='Wird aktualisiert …'">
+          <input type="hidden" name="app_id" value="{{ a.id }}">
+          <input type="hidden" name="source_id" value="{{ a.source.id }}">
+          <input type="hidden" name="update" value="{{ r.key }}">
+          {% if a.source.trust == 'unverified' %}
+          <label class="checkline"><input type="checkbox" name="confirm_source"
+                 value="{{ a.source.id }}" required> bewusst aus dieser Quelle</label>
+          {% endif %}
+          <button>Auf v{{ a.version }} aktualisieren</button>
+        </form>
+      {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted" style="margin:.6rem 0 0">Eine Instanz behält ihren Kanal.
+  Gibt es zu einer Produktiv-Instanz eine Test-Instanz derselben App, geht das
+  Update über die Test-Instanz und dann „Nach Produktiv übernehmen“.</p>
+  <h2 style="margin-top:1.2rem">Weitere Instanz anlegen</h2>
+  {% endif %}
   <form method="post" action="/store/install"
         onsubmit="this.querySelector('button').disabled=true;
                   this.querySelector('button').textContent='Wird installiert …'">
@@ -1695,19 +1731,22 @@ STORE_APP_BODY = """
     <p class="muted">Diese App ist als <strong>nur für Experten</strong>
     gekennzeichnet — sie verlangt Wissen, das über die Bedienung hinausgeht.</p>
     {% endif %}
-    {% if not a.installed %}
+    {% if instances %}
+    <label for="new_name">Name der neuen Instanz</label>
+    <input id="new_name" name="name" required pattern="[a-z0-9][a-z0-9-]*"
+           placeholder="{{ a.id }}-2">
+    <input type="hidden" name="new" value="1">
+    {% endif %}
     <p style="margin:.2rem 0 .4rem"><strong>Wohin?</strong></p>
     <label class="checkline"><input type="radio" name="channel" value="production" checked>
       Direkt in Produktion</label>
     <label class="checkline"><input type="radio" name="channel" value="test">
-      Mit einer Test-Instanz (<code>{{ a.id }}-test</code>) — später
+      Mit einer Test-Instanz (<code>{{ '&lt;Name&gt;' if instances else a.id }}-test</code>) — später
       „nach Produktiv übernehmen“</label>
-    {% endif %}
-    <button>{{ ('Aktualisieren auf v' + a.version) if a.installed else 'Installieren' }}</button>
+    <button>Installieren</button>
   </form>
-  <p class="muted" style="margin:.6rem 0 0">{% if a.installed %}Eine
-  bestehende Instanz behält ihren Kanal.{% else %}Du entscheidest je App:
-  eine Webseite braucht eine Test-Instanz, ein Kurzlink-Dienst nicht.{% endif %}
+  <p class="muted" style="margin:.6rem 0 0">Du entscheidest je App:
+  eine Webseite braucht eine Test-Instanz, ein Kurzlink-Dienst nicht.
   Welches Paket geholt wird, entscheidet der Server selbst anhand der
   eingetragenen Quellen — nicht diese Seite.</p>
   {% endif %}
@@ -6769,6 +6808,36 @@ def store_sources_change():
                     + ("" if res.get("ok") else "&err=1"), code=303)
 
 
+def _app_instances(app_id):
+    """The caller's own instances of one app, for the store's object page.
+
+    Through the boundary like every other list (visible_instances), so a
+    tenant sees its own and nothing of anybody else's. `via_test` is set
+    for a production instance that has a test instance of the same app in
+    the same tenant: its update goes through that one and then through
+    promotion, and the host holds to the same rule.
+    """
+    mine = [(k, i) for k, i in sorted(visible_instances().items())
+            if i.get("app_id") == app_id]
+    rows = []
+    for key, inst in mine:
+        t = resolve_tenant(inst.get("tenant")) or ""
+        via = None
+        if inst.get("channel") == "production":
+            for k2, i2 in mine:
+                if (i2.get("channel") == "test" and not i2.get("rehearsal")
+                        and (resolve_tenant(i2.get("tenant")) or "") == t):
+                    via = {"key": k2, "name": local_name(k2, i2)}
+                    break
+        label = ("" if (not multi_tenant() or t == default_tenant_id())
+                 else tenant_label(t))
+        rows.append({"key": key, "name": local_name(key, inst),
+                     "channel": inst.get("channel", ""),
+                     "version": inst.get("version", "?"),
+                     "tenant": label, "via_test": via})
+    return rows
+
+
 @app.get("/store/<source_id>/<app_id>")
 def store_app(source_id, app_id):
     """Object page for one app (§6) — the reason the format carries
@@ -6784,6 +6853,7 @@ def store_app(source_id, app_id):
                         + quote("Diese App steht in keiner eingetragenen "
                                 "Quelle (mehr)."), code=303)
     return page(STORE_APP_BODY, a["name"], "store", a=a,
+                instances=_app_instances(a["id"]),
                 profiles=node_profiles(),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
@@ -6819,11 +6889,34 @@ def store_install():
         return back("Nicht bestätigt: " + (src["name"] or source_id)
                     + " ist eine ungeprüfte Quelle. Bitte das Häkchen setzen.",
                     ok=False)
+    # One instance to update, or a name for a new one -- never a guess
+    # from the app id alone (that made a second instance instead of
+    # updating the first). The host judges both again.
+    update = request.form.get("update", "").strip()
+    new_name = request.form.get("name", "").strip().lower()
+    wants_new = bool(request.form.get("new")) and not update
+    own = visible_instances()
+    if update:
+        if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", update) \
+                or (own.get(update) or {}).get("app_id") != app_id:
+            return back("Diese Instanz gibt es nicht (mehr) oder sie gehört "
+                        "zu einer anderen App.", ok=False)
+    elif wants_new:
+        if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", new_name):
+            return back("Name der neuen Instanz: Kleinbuchstaben, Ziffern, "
+                        "Bindestriche.", ok=False)
+        if any(local_name(k, i) == new_name for k, i in own.items()):
+            return back(f"Eine Instanz '{new_name}' gibt es schon — zum "
+                        "Aktualisieren nimm den Knopf in der Liste.", ok=False)
     rid = _uuid.uuid4().hex
     os.makedirs(SPOOL_QUEUE, exist_ok=True)
     tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"id": rid, "instance": app_id, "action": "install",
+        json.dump({"id": rid, "instance": new_name if wants_new else app_id,
+                   "app_id": app_id,
+                   **({"update": update} if update else {}),
+                   **({"new": True} if wants_new else {}),
+                   "action": "install",
                    "source_id": source_id, "confirm_source": confirm,
                    # Only "test" is a choice; anything else is production.
                    # The host decides again, and an existing instance keeps

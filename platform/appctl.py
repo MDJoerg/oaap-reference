@@ -19947,15 +19947,51 @@ def cmd_process_deploys(_args):
         # never share a key (measured 2026-09-29: `bec-admin` installing
         # `wegweiser` while the default tenant already has one).
         local_name = name
-        lookup_id = name          # the APP id, before any "-test" below
-        if action == "install" and req.get("channel") == "test" \
+        # The APP id, before any "-test" below. A request may name the
+        # app apart from the instance it wants (a second instance of an
+        # app under its own name); without that, the two are one word.
+        lookup_id = str(req.get("app_id") or name) if action == "install" else name
+        # "Update THIS instance" (store, per instance): the request
+        # names the instance key it means. The name used to be the app
+        # id alone, so an instance called anything else -- or a second
+        # one -- was never found, and a new instance appeared instead.
+        # Judged here again: the spool is data, not trust.
+        update_key = str(req.get("update") or "") if action == "install" else ""
+        update_inst, update_refusal = None, ""
+        if update_key:
+            update_inst = reg["instances"].get(update_key)
+            if update_inst is None:
+                update_refusal = "the instance to update does not exist"
+            elif update_inst.get("app_id") != lookup_id:
+                update_refusal = (f"'{update_key}' is an instance of "
+                                  f"'{update_inst.get('app_id')}', not of "
+                                  f"'{lookup_id}'")
+            elif update_inst.get("channel") == "production":
+                # Test first, where a test instance exists: production
+                # follows by promotion, which carries the tested bytes.
+                t = resolve_tenant(update_inst.get("tenant")) or ""
+                sib = next((instance_name(k, i) for k, i in reg["instances"].items()
+                            if i.get("app_id") == lookup_id
+                            and i.get("channel") == "test"
+                            and not is_rehearsal(i)
+                            and (resolve_tenant(i.get("tenant")) or "") == t), "")
+                if sib:
+                    update_refusal = (
+                        f"'{instance_name(update_key, update_inst)}' has a test "
+                        f"instance ('{sib}'): update that one and promote it "
+                        "to production")
+        if action == "install" and not update_key \
+                and req.get("channel") == "test" \
                 and not name.endswith("-test"):
             # "With a test instance" (RFC-0050 4): the install lands as
             # `<name>-test` on the test channel and goes live by
             # promotion. Decided per install, by the person installing.
             name = name + "-test"
             local_name = name
-        if action in ("create", "install"):
+        if update_key and update_inst is not None:
+            name, inst = update_key, update_inst
+            local_name = instance_name(update_key, update_inst)
+        elif action in ("create", "install"):
             found_key, found = find_instance(reg, act_tenant, name)
             if found is not None:
                 name, inst = found_key, found
@@ -20017,8 +20053,11 @@ def cmd_process_deploys(_args):
                 store_source=src.get("store_source", ""),
                 # Only consulted when the instance is NEW: a redeploy
                 # keeps whatever the instance already says, so this can
-                # never move one between tenants.
-                tenant=act_tenant or "")
+                # never move one between tenants. An update names the
+                # tenant of the instance it updates: an operator has
+                # none of their own to find it in.
+                tenant=((resolve_tenant(inst.get("tenant"))
+                         if update_key and inst else act_tenant) or ""))
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -20037,8 +20076,14 @@ def cmd_process_deploys(_args):
         store_src = None
         if actor_refusal:
             msg = actor_refusal
+        elif update_refusal:
+            msg = update_refusal
         elif cross_tenant:
             msg = cross_tenant_refusal(action, name)
+        elif action == "install" and req.get("new") and inst is not None:
+            # A NEW instance under a name that is taken is a refusal,
+            # never a silent update of whoever holds the name.
+            msg = name_taken_msg(local_name)
         elif action == "install":
             # One-click store install (spec 2.6): the request names an
             # app id and at most a source id; what gets installed is

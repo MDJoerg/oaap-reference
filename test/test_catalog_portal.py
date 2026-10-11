@@ -138,8 +138,12 @@ ok("eine noch nicht installierte App bietet beide Wege an",
 ok("Produktion ist vorgewaehlt", 'value="production" checked' in t)
 INSTALLED["website"] = "0.1.0"
 t = c.get("/store/catalog-katalog/website", headers=H).get_data(as_text=True)
-ok("eine installierte App bietet die Wahl nicht an (die Instanz behaelt ihren Kanal)",
-   'name="channel"' not in t and "Aktualisieren auf v0.1.2" in t, t[-800:])
+i0 = t.index('name="update"')
+upd = t[t.rfind("<form", 0, i0):t.index("</form>", i0)]
+ok("eine installierte App: der Knopf der Instanz aktualisiert SIE (Schluessel), "
+   "ohne Kanalwahl -- die Instanz behaelt ihren Kanal",
+   'name="update" value="website"' in upd and 'name="channel"' not in upd
+   and "Auf v0.1.2 aktualisieren" in upd, upd[-600:])
 INSTALLED.clear()
 
 
