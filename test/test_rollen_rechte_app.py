@@ -266,10 +266,15 @@ ok("Bens Seite danach: nichts mehr, die Zeile bleibt als 'beendet'",
 s, h, b = req("POST", "/do/collection-retire", form={"id": cid})
 ok("jetzt geht das Ausblenden", s == 303, (s, b[:200]))
 s, _h, b = req("GET", "/collections")
-ok("die Sammlung ist aus der Liste", "Redaktion" not in b.split("Neue Sammlung")[0]
+ok("die Sammlung ist aus der Liste", "Redaktion" not in b.split("Neues Berechtigungspaket")[0]
    .split("<table>")[1], b[:600])
 s, _h, b = req("GET", "/collections?alle=1")
 ok("mit 'alle' ist sie wieder da, als ausgeblendet", "ausgeblendet" in b)
+s, _h, b = req("GET", "/mappings")
+ok("die Seiten nennen es Berechtigungspaket, das Wort Sammlung steht nirgends",
+   "Berechtigungspaket" in b and "Sammlung" not in b
+   and "Sammlung" not in req("GET", "/collections")[2]
+   and "Berechtigungspakete" in req("GET", "/collections")[2], b[:300])
 
 print("Gruppen und Protokoll")
 s, h, b = req("POST", "/do/collection-add", form={
