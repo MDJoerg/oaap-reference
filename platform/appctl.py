@@ -2086,14 +2086,15 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 6      # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 7      # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
                         # (RFC-0036 Teil B); 0.5 adds destinations
                         # (oaap.net.destinations 0.1, RFC-0033);
                         # 0.6 adds authorization (oaap.core.authorization 0.1,
-                        # RFC-0045)
+                        # RFC-0045); 0.7 adds services.<name>.shm (runtime
+                        # spec 2.20 -- a desktop in the browser needs it)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -8017,6 +8018,14 @@ def validate_manifest(m):
                 errs.append(f"services.{sname}.port: integer required")
             if bool(svc.get("build")) == bool(svc.get("image")):
                 errs.append(f"services.{sname}: exactly one of build/image")
+            # Manifest 0.7 (runtime spec 2.20): the size of /dev/shm the
+            # service needs. Optional; a bad value is a typo where it is
+            # written and is said here, not swallowed at `docker run`.
+            if svc.get("shm") is not None:
+                try:
+                    parse_shm(svc["shm"])
+                except ValueError as e:
+                    errs.append(f"services.{sname}.shm: {e}")
         multi = len(services) > 1
         routes = m.get("routes") or []
         if not routes:
@@ -10580,6 +10589,39 @@ def parse_resources(memory="", cpus="", pids=""):
     return out
 
 
+def parse_shm(value):
+    """Normalised `services.<name>.shm` (manifest 0.7, runtime spec 2.20):
+    `<n>m` or `<n>g`, at least Docker's own default of 64m — a smaller
+    value could only take away what every container has anyway.
+
+    Same unit rules as `resources.memory`, same reason: a bare number is
+    bytes to Docker, and "1024" meaning one kilobyte of shared memory is
+    a mistake nobody intends. Raises ValueError with the reason.
+    """
+    v = str(value if value is not None else "").strip().lower()
+    try:
+        memory_bytes(v)
+    except ValueError:
+        raise ValueError("a size like 512m or 1g, at least 64m (no bare "
+                         "number: docker would read bytes).") from None
+    return v
+
+
+def shm_args(service):
+    """`docker run` flags for a recorded service's `shm`, re-validated
+    like `resource_args`: the record is data on disk, and a hand-edited
+    value must not become a `docker run` that fails and leaves the
+    instance without its container. No `shm` recorded: no flag, Docker's
+    64 MB as ever.
+    """
+    if not isinstance(service, dict) or service.get("shm") is None:
+        return []
+    try:
+        return ["--shm-size", parse_shm(service["shm"])]
+    except ValueError:
+        return []
+
+
 def resource_args(res):
     """`docker run` flags for a stored `resources` record.
 
@@ -10676,9 +10718,13 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
         publish = _endpoint_publish(endpoints, s["service"], primary)
         subprocess.run(["docker", "rm", "-f", s["container"]],
                        capture_output=True, text=True)
+        # The service's own need (manifest 0.7, 2.20) — an app property
+        # recorded at install, not an operator limit: it travels with
+        # the service record through every door that recreates.
+        shm = shm_args(s)
         done = run(["docker", "run", "-d", "--name", s["container"],
                     "--restart", "unless-stopped", "--network", net, *alias,
-                    *CONTAINER_LOG_OPTS, *limits,
+                    *CONTAINER_LOG_OPTS, *limits, *shm,
                     "--env-file", env_path(name, inst), *mounts, *publish,
                     s["image"]])
         # A kernel without the memory cgroup (a Raspberry Pi as shipped)
@@ -13912,8 +13958,13 @@ def _install_from_dir(pkg, args, source):
             print(f"Pulling {img} ...")
             run(["docker", "pull", "-q", img])
             build = ""
-        services.append({"service": sname if multi else "", "container": cname,
-                         "image": img, "build": build, "port": svc["port"]})
+        rec = {"service": sname if multi else "", "container": cname,
+               "image": img, "build": build, "port": svc["port"]}
+        # Manifest 0.7 (2.20): what the service declared is what the
+        # container gets, at every (re)creation, from this record.
+        if svc.get("shm") is not None:
+            rec["shm"] = parse_shm(svc["shm"])
+        services.append(rec)
 
     primary = services[0]
     container, image = primary["container"], primary["image"]
