@@ -39,9 +39,20 @@ status() {
   echo "  Data dir:  $OAAP_DATA_DIR"
   echo ""
   echo "Core services:"
-  compose ps --format '  {{.Service}}: {{.State}}' 2>/dev/null \
+  # -a: a STOPPED core service is listed too (RFC-0059 measurement,
+  # 15.10.: the broker stayed down after a reboot and the count read
+  # "7/7"). The total is what the node DEFINES (`config --services`,
+  # profiles included), not what happens to be running -- a total taken
+  # from `ps` can never be larger than the running count.
+  compose ps -a --format '  {{.Service}}: {{.State}}' 2>/dev/null \
     || { echo "  ERROR: cannot query container runtime (run with sudo, or add your user to the 'docker' group)."; exit 1; }
-  total="$(compose ps --services | wc -l)"
+  defined="$(compose config --services 2>/dev/null || true)"
+  listed="$(compose ps -a --services 2>/dev/null || true)"
+  for svc in $defined; do
+    printf '%s\n' "$listed" | grep -qx "$svc" || echo "  $svc: missing (no container)"
+  done
+  total="$(printf '%s\n' "$defined" | grep -c . || true)"
+  [ "$total" -gt 0 ] || total="$(compose ps --services | wc -l)"
   running="$(compose ps --services --filter status=running | wc -l)"
   echo ""
   echo "Apps:"

@@ -46,6 +46,10 @@ docker() {
   if [ "$1" = compose ]; then
     local e s st
     case "$args" in
+      *" config "*)
+        # was der Knoten DEFINIERT (Profile eingerechnet), laufend oder nicht
+        if [ -n "${FAKE_DEFINED:-}" ]; then for s in $FAKE_DEFINED; do echo "$s"; done
+        else for e in $FAKE_CORE; do echo "${e%%:*}"; done; fi ;;
       *" --services "*)
         for e in $FAKE_CORE; do s="${e%%:*}"; st="${e##*:}"
           if [ -z "$status_filter" ] || [ "$st" = "$status_filter" ]; then echo "$s"; fi
@@ -74,7 +78,7 @@ export -f docker
 '''
 
 
-def status(core, apps):
+def status(core, apps, defined=None):
     bash = shutil.which("bash")
     if not bash:
         return None
@@ -85,6 +89,8 @@ def status(core, apps):
         open(os.path.join(d, "app", "VERSION"), "w").write("0.0.0-test\n")
         env = dict(os.environ, OAAP_DATA_DIR=data,
                    FAKE_CORE=" ".join(core), FAKE_APPS=" ".join(apps))
+        if defined:
+            env["FAKE_DEFINED"] = " ".join(defined)
         script = FAKE_DOCKER + f'\nbash "{WRAPPER}" status\n'
         r = subprocess.run([bash, "-c", script], env=env, capture_output=True,
                            text=True, encoding="utf-8", errors="replace")
@@ -119,6 +125,21 @@ ok("eine gestoppte App -> DEGRADED wie bisher (1/2)",
 code, overall, out = status(CORE[:3] + ["connect:restarting"], ["bdt-hub:running"])
 ok("ein Kerndienst in der Neustartschleife -> DEGRADED (3/4 core services)",
    overall.startswith("Overall: DEGRADED") and "3/4 core services" in overall, out)
+
+# 15.10. (RFC-0059): der Broker blieb nach einem Reboot gestoppt, und es stand
+# "HEALTHY (7/7 ...)" -- die Summe kam aus `ps`, das nur Laufendes nennt.
+# Der Container ist da (exited), der Dienst gehoert zur Definition.
+code, overall, out = status(CORE + ["broker:exited"], ["bdt-hub:running"])
+ok("ein GESTOPPTER Kerndienst -> DEGRADED, und er steht in der Summe (4/5)",
+   overall.startswith("Overall: DEGRADED") and "4/5 core services" in overall
+   and code == 1, out)
+ok("... und die Liste nennt ihn", "broker: exited" in out, out)
+
+code, overall, out = status(CORE, ["bdt-hub:running"],
+                            defined=["gateway", "identity", "portal", "connect", "relay"])
+ok("ein definierter Dienst OHNE Container -> DEGRADED (4/5), 'missing' in der Liste",
+   overall.startswith("Overall: DEGRADED") and "4/5 core services" in overall
+   and "relay: missing" in out, out)
 
 code, overall, out = status(CORE, [])
 ok("keine Apps -> HEALTHY 0/0", overall.startswith("Overall: HEALTHY")
