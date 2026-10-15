@@ -213,6 +213,68 @@ def known_tenants():
         return {}
 
 
+# RFC-0059: instances in maintenance. Written by the platform's own commands
+# synchronously; read here on every request, so switching it on holds at once.
+MODES_FILE = os.environ.get("OAAP_MODES_FILE", "/platform-apps/instance-modes.json")
+MAINTENANCE_DEFAULT = ("Diese Anwendung wird gerade gewartet. "
+                       "Wir sind in Kürze wieder da.")
+
+
+def maintenance_of(instance):
+    """{'message', 'tenant'} when this instance is in maintenance, else None.
+    An unreadable file means "not in maintenance" -- the platform command
+    that wrote it is the authority, and a missing file is the normal case."""
+    if not instance:
+        return None
+    try:
+        with open(MODES_FILE, encoding="utf-8") as f:
+            rec = ((json.load(f) or {}).get("instances") or {}).get(instance)
+    except (OSError, ValueError):
+        return None
+    if not rec or not rec.get("maintenance"):
+        return None
+    return {"message": rec["maintenance"].get("message") or "",
+            "tenant": rec.get("tenant") or ""}
+
+
+def may_pass_maintenance(user, maint):
+    """Only an administrator: the server administrator, or the tenant
+    administrator of the tenant the instance belongs to (RFC-0059 D3)."""
+    if not user:
+        return False
+    roles = set(user.get("roles") or [])
+    if "server_admin" in roles:
+        return True
+    if "tenant_admin" in roles:
+        want = resolve_tenant(maint.get("tenant"))
+        mine = resolve_tenant(user.get("tenant"))
+        return want is not None and want == mine
+    return False
+
+
+def maintenance_response(maint):
+    """503 with Retry-After: the page, or JSON for a machine caller. The
+    sentence is the operator's own text, escaped; the page is the
+    platform's, never the app's."""
+    from markupsafe import escape
+    message = maint.get("message") or MAINTENANCE_DEFAULT
+    accept = request.headers.get("Accept", "")
+    headers = {"Retry-After": "300", "Cache-Control": "no-store"}
+    if "application/json" in accept and "text/html" not in accept:
+        return (json.dumps({"error": "maintenance", "message": message}), 503,
+                {**headers, "Content-Type": "application/json"})
+    body = ("<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>Wartung</title><style>body{font-family:system-ui,sans-serif;"
+            "display:grid;place-items:center;min-height:100vh;margin:0;"
+            "background:#f4f5f7;color:#1c2330}main{max-width:32rem;padding:2rem;"
+            "text-align:center}h1{font-size:1.4rem}a{color:#555;font-size:.85rem}"
+            "</style></head><body><main><h1>Wartungsarbeiten</h1><p>"
+            + str(escape(message)) + "</p><p><a href=\"/auth/login\">"
+            "Administrator? Anmelden</a></p></main></body></html>")
+    return body, 503, {**headers, "Content-Type": "text/html; charset=utf-8"}
+
+
 def resolve_tenant(ref):
     """Spec 2.5, and the difference between the two rules is the whole
     safety argument: ABSENT means the default tenant (that is how every
@@ -1603,6 +1665,12 @@ def verify():
     """
     user, _method, refusal = resolve_principal(
         request.args.get("instance", ""))
+    # RFC-0059: before anything else, so an anonymous visitor sees the
+    # "back soon" page rather than a login form they could not use.
+    maint = maintenance_of(request.args.get("instance", ""))
+    if maint is not None and not may_pass_maintenance(
+            user if refusal is None else None, maint):
+        return maintenance_response(maint)
     if refusal is not None:
         return refusal
     required = request.args.get("roles", "")

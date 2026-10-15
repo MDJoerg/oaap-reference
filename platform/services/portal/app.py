@@ -8867,6 +8867,83 @@ def instance_access(name):
     return _inst_back(name, msg=res.get("message", "Zugang geöffnet.") + hint)
 
 
+WAKE_KEY_FILE = "/apps-registry/wake-key"
+
+WAKE_PAGE = """<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wird gestartet</title><style>
+body{font-family:system-ui,sans-serif;display:grid;place-items:center;
+min-height:100vh;margin:0;background:#f4f5f7;color:#1c2330}
+main{max-width:32rem;padding:2rem;text-align:center}h1{font-size:1.4rem}
+.bar{height:4px;background:#d8dce3;border-radius:2px;overflow:hidden;margin:1.5rem 0}
+.bar i{display:block;height:100%;width:30%;background:#3b6fd4;
+animation:m 1.4s ease-in-out infinite}
+@keyframes m{0%{margin-left:-30%}100%{margin-left:100%}}
+</style></head><body><main><h1>{{ headline }}</h1><p>{{ text }}</p>
+<div class="bar"><i></i></div><p id="s"></p></main>
+<script>
+var auto = {{ 'true' if auto else 'false' }};
+function poll(){fetch(location.href,{headers:{Accept:"application/json"},
+ credentials:"same-origin",cache:"no-store"}).then(function(r){return r.json()})
+ .then(function(j){ if(!j.asleep){location.reload();} else {setTimeout(poll,2000);} })
+ .catch(function(){setTimeout(poll,3000);});}
+if(auto){fetch(location.href,{method:"POST",credentials:"same-origin"})
+ .then(function(){poll();}).catch(function(){poll();});}
+else{setTimeout(poll,5000);}
+</script></body></html>"""
+
+
+@app.route("/wake/<name>", methods=["GET", "POST"])
+def instance_wake(name):
+    """The page a sleeping instance's address shows (RFC-0059 §2.3).
+
+    The gateway rewrites EVERY path of a sleeping instance to this one, after
+    the instance's own forward_auth -- so a request that arrives here with
+    X-OAAP-Wake: auto has already been judged "may open this instance". The
+    key proves it came from the gateway; the portal's own host, reached
+    without it, is refused. A public route shows the page and never wakes.
+    """
+    try:
+        with open(WAKE_KEY_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+    except OSError:
+        key = ""
+    given = request.headers.get("X-OAAP-Gateway-Key", "")
+    if not key or not hmac.compare_digest(key, given):
+        return "Forbidden", 403
+    inst = load_instances().get(name)
+    if not inst:
+        return "Not found", 404
+    state = inst.get("state") or ""
+    asleep = state in ("standby", "waking")
+    auto = request.headers.get("X-OAAP-Wake", "") == "auto"
+    if request.method == "POST":
+        if asleep and auto and state == "standby":
+            _queue_with_id(_uuid.uuid4().hex, name, {"action": "wake"}, 0)
+        return app.response_class(
+            json.dumps({"asleep": asleep}), mimetype="application/json",
+            headers={"Cache-Control": "no-store"})
+    accept = request.headers.get("Accept", "")
+    if "application/json" in accept and "text/html" not in accept:
+        return app.response_class(
+            json.dumps({"asleep": asleep}), mimetype="application/json",
+            headers={"Cache-Control": "no-store"})
+    if not asleep:
+        return ("<!doctype html><meta charset=utf-8><script>location.reload()"
+                "</script>", 200, {"Cache-Control": "no-store"})
+    if auto:
+        headline, text = ("Dein Arbeitsplatz wird gestartet",
+                          "Er war im Standby. Das dauert einen Moment — "
+                          "deine Dateien sind alle da.")
+    else:
+        headline, text = ("Diese Anwendung ruht",
+                          "Sie ist im Standby. Wer sie öffnen darf, kann sie "
+                          "nach der Anmeldung aufwecken.")
+    return (render_template_string(WAKE_PAGE, headline=headline, text=text,
+                                   auto=auto), 503,
+            {"Retry-After": "5", "Cache-Control": "no-store"})
+
+
 @app.post("/instances/<name>/restart")
 def instance_restart(name):
     """Die Container dieser Instanz neu erzeugen (RFC-0038 D4).

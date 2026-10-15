@@ -2514,6 +2514,7 @@ def resolve_instance_ref(reg, ref, tenant_label=""):
 # first argument is sometimes an access id or a token, and a resolver
 # that guessed which would be a second opinion about what was typed.
 INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
+                  "standby", "wake", "maintenance",
                   "diagnose", "endpoint", "tile", "resources", "config",
                   "address", "throttle", "artifact", "promote", "rehearse",
                   "rehearsal")
@@ -9575,6 +9576,13 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     """
     if login_only is None:
         login_only = bool(scope) and scope in rehearsal_keys()
+    # RFC-0059: asked here, like the rehearsal -- the one body every entry
+    # point shares. A maintained instance asks identity on EVERY route (the
+    # decision is identity's); a sleeping one shows the waking page.
+    _sleeping, _maintained = mode_keys()
+    sleeping = bool(scope) and scope in _sleeping
+    if bool(scope) and scope in _maintained:
+        login_only = True
     # While a diagnosis window is open, THIS instance's requests are
     # logged to a file of its own (RFC-0038 D3). Here, in the one body
     # every entry point shares, so the window covers the LAN port, the
@@ -9619,9 +9627,14 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
             lines.append("\t}")
             lines.append(f"\thandle @preflight{idx} {{")
             lines += strip_identity()
-            lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
+            if sleeping:
+                # RFC-0059: nobody is home; an honest 503, not a dead upstream
+                lines.append("\t\trespond 503")
+            else:
+                lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
             lines.append("\t}")
         lines.append(f"\thandle{matcher} {{")
+        gated = bool(roles or "public" not in r["roles"] or login_only)
         if roles or "public" not in r["roles"] or login_only:
             # No explicit strip here: Caddy's directive order runs
             # request_header AFTER forward_auth, which would wipe the
@@ -9654,7 +9667,10 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
         target_c, target_p = container, svc_port
         if services and r.get("service") in services:
             target_c, target_p = services[r["service"]]
-        lines += _proxy(f"{target_c}:{target_p}", "\t\t")
+        if sleeping:
+            lines += _wake_proxy(scope, gated, "\t\t")
+        else:
+            lines += _proxy(f"{target_c}:{target_p}", "\t\t")
         lines.append("\t}")
     if not any(r["path"] == "/" for r in routes):
         lines.append("\thandle {")
@@ -10737,7 +10753,11 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
         # recorded at install, not an operator limit: it travels with
         # the service record through every door that recreates.
         shm = shm_args(s)
-        done = run(["docker", "run", "-d", "--name", s["container"],
+        # RFC-0059: a sleeping instance is re-made but NOT started -- this is
+        # the one place every door passes, so a configuration save, a
+        # redeploy or an update cannot wake it by accident.
+        verb = ["create"] if stored.get("state") == "standby" else ["run", "-d"]
+        done = run(["docker", *verb, "--name", s["container"],
                     "--restart", "unless-stopped", "--network", net, *alias,
                     *CONTAINER_LOG_OPTS, *limits, *shm,
                     "--env-file", env_path(name, inst), *mounts, *publish,
@@ -11561,7 +11581,11 @@ def state_view_write(reg=None):
                 rows.append({"service": s.get("service") or "",
                              "container": s["container"],
                              **(fact or {"state": "absent"})})
-            out[name] = {"services": rows}
+            out[name] = {"services": rows,
+                         "mode": ("standby" if inst.get("state") == "standby"
+                                  else "waking" if inst.get("state") == "waking"
+                                  else "running"),
+                         "maintenance": bool(inst.get("maintenance"))}
         os.makedirs(APPS_DIR, exist_ok=True)
         tmp = STATE_VIEW + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -11935,6 +11959,263 @@ def restart_instance(name, inst, own_rid="", who="root", role="root"):
     for fact in states.values():
         started = (fact.get("started") or "")[:19].replace("T", " ")
     return ("restarted" + (f", running since {started} UTC" if started else ""))
+
+
+# --- RFC-0059: standby, wake on use, maintenance -------------------------
+#
+# One state on the instance record, asked in ONE place where containers are
+# made (recreate_instance_containers) and in the one body every gateway site
+# shares (site_body). The record is the fact; the containers follow it.
+#   state: "standby"  -- containers stopped, gateway shows the waking page
+#   state: "waking"   -- being started; the page stays until the app answers
+#   maintenance: {since, by, message} -- running, but only administrators pass
+MODES_FILE = os.path.join(APPS_DIR, "instance-modes.json")
+WAKE_KEY_FILE = os.path.join(APPS_DIR, "wake-key")
+MAINTENANCE_MESSAGE = ("Diese Anwendung wird gerade gewartet. "
+                       "Wir sind in Kürze wieder da.")
+WAKE_WAIT_SECONDS = 180
+
+
+def is_standby(inst):
+    return (inst or {}).get("state") == "standby"
+
+
+def maintenance_of(inst):
+    m = (inst or {}).get("maintenance")
+    return m if isinstance(m, dict) and m else None
+
+
+_MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset()}
+
+
+def mode_keys():
+    """(sleeping keys, maintained keys), cached against the registry's own
+    stamp -- the construction of rehearsal_keys(), for the same reason: the
+    rule must hold at every place a site is written."""
+    try:
+        st = os.stat(REGISTRY)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return frozenset(), frozenset()
+    if _MODE_CACHE["stamp"] != stamp:
+        try:
+            with open(REGISTRY, encoding="utf-8") as f:
+                reg = json.load(f)
+        except (OSError, ValueError):
+            return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
+        insts = reg.get("instances") or {}
+        _MODE_CACHE["standby"] = frozenset(
+            k for k, i in insts.items() if i.get("state") in ("standby", "waking"))
+        _MODE_CACHE["maintained"] = frozenset(
+            k for k, i in insts.items() if maintenance_of(i))
+        _MODE_CACHE["stamp"] = stamp
+    return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
+
+
+def wake_key():
+    """The key the gateway shows the portal's wake endpoint. Lives beside the
+    registry (the portal reads that directory read-only); an outsider who
+    reaches the portal's own host without it gets 403."""
+    try:
+        with open(WAKE_KEY_FILE, encoding="utf-8") as f:
+            k = f.read().strip()
+        if k:
+            return k
+    except OSError:
+        pass
+    os.makedirs(APPS_DIR, exist_ok=True)
+    k = secrets.token_hex(24)
+    tmp = WAKE_KEY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(k + "\n")
+    os.replace(tmp, WAKE_KEY_FILE)
+    os.chmod(WAKE_KEY_FILE, 0o644)
+    return k
+
+
+def _wake_proxy(scope, gated, indent):
+    """The waking page, in place of the app. `gated` says the route asked
+    identity first, so the visitor is somebody who may open the instance
+    and may wake it; a public route shows the page and never wakes (D4)."""
+    return [f"{indent}rewrite * /wake/{scope}",
+            f"{indent}reverse_proxy portal:8000 {{",
+            f"{indent}\theader_up Host portal:8000",
+            f"{indent}\theader_up X-OAAP-Gateway-Key {wake_key()}",
+            f"{indent}\theader_up X-OAAP-Wake {'auto' if gated else 'no'}",
+            f"{indent}}}"]
+
+
+def write_instance_modes(reg=None):
+    """What identity and the status line read: who is in maintenance (with
+    the sentence to show), and which containers sleep on purpose. Written
+    synchronously by every command here -- not by a timer -- because
+    maintenance has to hold from the moment it is switched on."""
+    reg = reg if reg is not None else load_registry()
+    out, sleeping = {}, []
+    for key, inst in (reg.get("instances") or {}).items():
+        m = maintenance_of(inst)
+        st = inst.get("state") if inst.get("state") in ("standby", "waking") else ""
+        if not (m or st):
+            continue
+        out[key] = {"state": st or "running",
+                    "tenant": instance_tenant_ref(inst) or ""}
+        if m:
+            out[key]["maintenance"] = {"since": m.get("since", ""),
+                                       "by": m.get("by", ""),
+                                       "message": m.get("message", "")}
+        if st == "standby":
+            try:
+                sleeping += [s["container"] for s in instance_services(inst)
+                             if s.get("container")]
+            except (KeyError, TypeError):
+                pass
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = MODES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "written": _iso_now(), "instances": out,
+                   "standby_containers": sorted(sleeping)}, f, indent=2)
+    os.replace(tmp, MODES_FILE)
+    os.chmod(MODES_FILE, 0o644)
+
+
+def _containers_of(inst):
+    return [s["container"] for s in instance_services(inst) if s.get("container")]
+
+
+def _republish_sites(name, inst):
+    write_app_caddy(name, inst)
+    refresh_generated_sites()
+    reload_gateway()
+
+
+def _answers(inst, seconds):
+    """Does the primary service answer HTTP, seen from the gateway's side?
+    Any status line counts: a 401 is an app that is up."""
+    s = instance_services(inst)[0]
+    path = inst.get("health_path") or "/"
+    url = f"http://{s['container']}:{s.get('port') or inst.get('svc_port')}{path}"
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        r = subprocess.run(["docker", "exec", GATEWAY_CONTAINER, "wget", "-S",
+                            "-q", "-O", "/dev/null", "-T", "3", url],
+                           capture_output=True, text=True)
+        if "HTTP/" in (r.stderr or "") + (r.stdout or ""):
+            return True
+        time.sleep(2)
+    return False
+
+
+def standby_instance(name, inst, who="root", role="root"):
+    """Put an instance to sleep. The fact and the waking page come FIRST,
+    the containers stop after, so a visitor never meets a dead upstream."""
+    if is_standby(inst):
+        return "is already in standby"
+    if inst.get("state") == "waking":
+        raise DiagnoseRefused("this instance is being woken just now — wait "
+                              "until it answers, then put it to sleep.")
+    if deployment_in_flight(name):
+        raise DiagnoseRefused("a deployment of this instance is queued or "
+                              "running — standby would collide with it.")
+    reg = load_registry()
+    cur = reg["instances"][name]
+    cur["state"] = "standby"
+    cur["standby"] = {"since": _iso_now(), "by": who}
+    save_registry(reg)
+    _republish_sites(name, cur)
+    for c in _containers_of(cur):
+        subprocess.run(["docker", "stop", "-t", "30", c],
+                       capture_output=True, text=True)
+    write_instance_modes(reg)
+    state_view_write()
+    audit_tenant("instance.standby", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role)
+    return "is in standby — data kept, containers stopped"
+
+
+def wake_instance(name, inst, who="root", role="root", wait=WAKE_WAIT_SECONDS):
+    """Start a sleeping instance and hand the address back to it once the
+    app answers. The waking page stays until then."""
+    if not is_standby(inst):
+        return ("is already being woken" if inst.get("state") == "waking"
+                else "is not in standby")
+    reg = load_registry()
+    cur = reg["instances"][name]
+    cur["state"] = "waking"
+    save_registry(reg)
+    for c in _containers_of(cur):
+        r = subprocess.run(["docker", "start", c], capture_output=True, text=True)
+        if r.returncode != 0:
+            # the container is gone (a prune, a hand removal): make it again
+            # from the record -- the state is "waking", so this one STARTS it
+            recreate_instance_containers(name, instance_services(cur),
+                                         cur.get("storage") or [])
+            break
+    up = _answers(cur, wait)
+    reg = load_registry()
+    cur = reg["instances"][name]
+    cur.pop("state", None)
+    cur.pop("standby", None)
+    save_registry(reg)
+    _republish_sites(name, cur)
+    write_instance_modes(reg)
+    state_view_write()
+    audit_tenant("instance.wake", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail="" if up else f"no answer within {wait} s")
+    return ("is running" if up else
+            f"was started but did not answer within {wait} s — see its logs")
+
+
+def maintenance_set(name, inst, on, message="", who="root", role="root"):
+    reg = load_registry()
+    cur = reg["instances"][name]
+    if on:
+        cur["maintenance"] = {"since": _iso_now(), "by": who,
+                              "message": (message or "").strip()[:500]}
+    else:
+        if not maintenance_of(cur):
+            return "is not in maintenance"
+        cur.pop("maintenance", None)
+    save_registry(reg)
+    _republish_sites(name, cur)
+    write_instance_modes(reg)
+    state_view_write()
+    audit_tenant("instance.maintenance", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail="on" if on else "off")
+    return ("is in maintenance — only administrators pass" if on
+            else "is out of maintenance")
+
+
+def _mode_cli(args, fn):
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"unknown instance '{args.name}'")
+    who = os.environ.get("SUDO_USER") or "root"
+    try:
+        msg = fn(args.name, inst, who)
+    except DiagnoseRefused as e:
+        die(str(e))
+    except subprocess.CalledProcessError as e:
+        die((e.stderr or str(e)).strip().splitlines()[-1])
+    print(f"'{args.name}' {msg}.")
+
+
+def cmd_standby(args):
+    """`oaap app standby <instance>`."""
+    _mode_cli(args, lambda n, i, who: standby_instance(n, i, who=who))
+
+
+def cmd_wake(args):
+    """`oaap app wake <instance>`."""
+    _mode_cli(args, lambda n, i, who: wake_instance(n, i, who=who))
+
+
+def cmd_maintenance(args):
+    """`oaap app maintenance <instance> on|off [--message TEXT]`."""
+    _mode_cli(args, lambda n, i, who: maintenance_set(
+        n, i, args.switch == "on", args.message, who=who))
 
 
 # --- RFC-0044: an access (Zugang) into one instance network ------------
@@ -14303,7 +14584,9 @@ def cmd_list(_args):
     if not reg["instances"]:
         print("No app instances installed.")
     for name, i in sorted(reg["instances"].items()):
-        print(f"{name}: {i['app_name']} {i['version']} [{i['channel']}] port {i['port']} ({i['container']})")
+        mode = ((" -- STANDBY" if i.get("state") in ("standby", "waking") else "")
+                + (" -- MAINTENANCE" if i.get("maintenance") else ""))
+        print(f"{name}: {i['app_name']} {i['version']} [{i['channel']}] port {i['port']} ({i['container']}){mode}")
     # Data an operator still owes somebody an answer about. It used to
     # be invisible: `oaap app remove` said where it kept it, once, and
     # after that nothing ever mentioned it again.
@@ -21721,6 +22004,30 @@ def cmd_process_deploys(_args):
                              or ensure_default_tenant(), subject=name,
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
+        elif action in ("standby", "wake", "maintenance"):
+            # RFC-0059: the portal's own doors (the waking page, later the
+            # buttons) -- the same functions the CLI runs.
+            if not inst:
+                msg = "unknown instance"
+            else:
+                try:
+                    _who = actor or "portal"
+                    if action == "standby":
+                        msg = standby_instance(name, inst, who=_who,
+                                               role=act_role or "-")
+                    elif action == "wake":
+                        msg = wake_instance(name, inst, who=_who,
+                                            role=act_role or "-")
+                    else:
+                        msg = maintenance_set(name, inst,
+                                              bool(req.get("on")),
+                                              str(req.get("message") or ""),
+                                              who=_who, role=act_role or "-")
+                    ok = True
+                except DiagnoseRefused as e:
+                    msg = str(e)
+                except subprocess.CalledProcessError as e:
+                    msg = (e.stderr or str(e)).strip().splitlines()[-1]
         elif action == "rehearsal-extend":
             try:
                 new_date = rehearsal_extend(
@@ -21753,6 +22060,7 @@ def cmd_process_deploys(_args):
                "rehearsal-extend": "portal",
                "diagnose-open": "portal", "diagnose-close": "portal",
                "diagnose-logs": "portal", "restart": "portal",
+               "standby": "portal", "wake": "portal", "maintenance": "portal",
                "config": "portal", "token": "portal", "resources": "portal",
                "address": "portal", "throttle": "portal", "cohort": "api",
                "remove": "portal", "create": "portal",
@@ -23436,6 +23744,23 @@ def main():
                          help="recreate an instance's containers (RFC-0038 D4)")
     prs.add_argument("name")
     prs.set_defaults(fn=cmd_restart)
+    psb = sub.add_parser("standby",
+                         help="put an instance to sleep: containers stopped, "
+                              "data kept, stays asleep over update and reboot "
+                              "(RFC-0059)")
+    psb.add_argument("name")
+    psb.set_defaults(fn=cmd_standby)
+    pwk = sub.add_parser("wake", help="start a sleeping instance (RFC-0059)")
+    pwk.add_argument("name")
+    pwk.set_defaults(fn=cmd_wake)
+    pmt = sub.add_parser("maintenance",
+                         help="only administrators pass; everybody else sees "
+                              "a 'back soon' page (RFC-0059)")
+    pmt.add_argument("name")
+    pmt.add_argument("switch", choices=["on", "off"])
+    pmt.add_argument("--message", default="",
+                     help="the sentence shown to visitors")
+    pmt.set_defaults(fn=cmd_maintenance)
     pdg = sub.add_parser("diagnose",
                          help="the portal's diagnosis window, from the "
                               "machine (RFC-0038 D2)")
