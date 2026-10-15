@@ -624,7 +624,23 @@ REMOVED.clear(); DELETED.clear()
 code, out = cli("remove", target="kurs-2026-10", yes=False)
 ok("remove ohne --yes und ohne Eingabe: nichts wird entfernt (die Frage nennt den Namen)",
    code not in (None, 0) and not REMOVED and "kurs-2026-10" in out, (code, out))
+# Randfall RFC-0058 §3.1: ein Platz wurde von Hand mit `oaap app remove` entfernt;
+# die Kohorte kennt ihn noch, `app remove` hat Daten und einen Merkzettel dagelassen.
+reg_ = a.load_registry()
+reg_["instances"].pop("kurs-2026-10-ide-01", None)
+left = os.path.join(a.tenant_dir(TID), "instances", "leftbehind01")
+os.makedirs(os.path.join(left, "storage"), exist_ok=True)
+reg_.setdefault("retained", {})[a.retained_key(TID, "kurs-2026-10-ide-01")] = {
+    "id": "leftbehind01", "name": "kurs-2026-10-ide-01", "tenant": TID, "app_name": "ide"}
+a.save_registry(reg_)
+code, out = cli("list", target="kurs-2026-10")
+ok("list einer Kohorte mit von Hand entferntem Platz stuerzt nicht ab", code is None and "Traceback" not in out, (code, out))
+REMOVED.clear()
 code, out = cli("remove", target="kurs-2026-10", purge=True)
+ok("remove --purge: der von Hand entfernte Platz wird genannt, seine liegengebliebenen Daten sind weg",
+   "Already removed by hand" in out and "kurs-2026-10-ide-01" in out and not os.path.isdir(left)
+   and a.retained_key(TID, "kurs-2026-10-ide-01") not in (a.load_registry().get("retained") or {})
+   and ("kurs-2026-10-ide-01", True) not in REMOVED, (code, out, REMOVED))
 ok("remove der ganzen Kohorte: Plaetze, gemeinsame Instanz, Eintrag weg",
    ("kurs-2026-10-git", True) in REMOVED and a.load_cohort(TID, "kurs-2026-10") is None, (REMOVED, out))
 ok("Audit fuer jeden Schritt",

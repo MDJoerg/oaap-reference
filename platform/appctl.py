@@ -16094,6 +16094,13 @@ def _cohort_capacity_note(tpl, seats):
               "if every seat fills its limit, the kernel ends containers.")
 
 
+def _cohort_services(reg, key):
+    """The services of a cohort instance, [] when somebody removed it by hand
+    (the cohort record still names it; RFC-0058 §3.1 open case)."""
+    inst = reg["instances"].get(key)
+    return instance_services(inst) if inst else []
+
+
 def _cohort_instances(rec, sids=None):
     """[(seat id or '', app name, registry key)] of a cohort."""
     out = []
@@ -16219,7 +16226,7 @@ def _cohort_table(rec):
     rows = _cohort_instances(rec)
     names = []
     for _sid, _app, key in rows:
-        for s in instance_services(reg["instances"].get(key) or {}):
+        for s in _cohort_services(reg, key):
             names.append(s["container"])
     states, _ok = container_states(names)
     print(f"{'seat':<6} {'user':<28} {'instance':<34} {'state':<10} address")
@@ -16488,7 +16495,7 @@ def _cohort_power(args, start):
     reg = load_registry()
     verb = "start" if start else "stop"
     for _sid, _app, key in _cohort_instances(rec):
-        for s in instance_services(reg["instances"].get(key) or {}):
+        for s in _cohort_services(reg, key):
             subprocess.run(["docker", verb, s["container"]],
                            capture_output=True, text=True)
     rec["stopped"] = not start
@@ -16666,18 +16673,47 @@ def _cohort_export(args):
           "A later 'oaap cohort create' from this directory is the next run.")
 
 
+def _cohort_purge_left_behind(rec, key):
+    """--purge for a seat instance somebody removed by hand: `app remove`
+    keeps the data and a retained note; the cohort's own purge has to
+    reach it, or "DELETED" would be a promise about the wrong thing."""
+    reg = load_registry()
+    tid = rec["tenant"]
+    for rkey, v in sorted((reg.get("retained") or {}).items()):
+        if v.get("tenant") != tid or instance_key(tid, v.get("name", "")) != key:
+            continue
+        d = os.path.join(tenant_dir(tid), "instances", v["id"])
+        shutil.rmtree(d, ignore_errors=True)
+        reg["retained"].pop(rkey, None)
+        save_registry(reg)
+        audit_tenant("instance.purge", tid, subject=v["name"],
+                     who=os.environ.get("SUDO_USER") or "root")
+        print(f"  data left behind by '{v['name']}' deleted")
+        return
+    print(f"  {key}: no data left behind to delete")
+
+
 def _cohort_remove(args):
     rec = find_cohort(args.target, args.tenant)
     if args.seat and args.seat not in (rec.get("seats") or {}):
         die(f"the cohort has no seat '{args.seat}'")
     sids = {args.seat} if args.seat else set(rec.get("seats") or {})
-    items = [(s, a, k) for s, a, k in _cohort_instances(rec, sids)
-             if s or not args.seat]
+    all_items = [(s, a, k) for s, a, k in _cohort_instances(rec, sids)
+                 if s or not args.seat]
+    reg0 = load_registry()
+    items = [i for i in all_items if i[2] in reg0["instances"]]
+    gone = [i for i in all_items if i[2] not in reg0["instances"]]
     lines = [f"This removes {len(items)} instance(s) of cohort '{rec['name']}'"
              + (f", seat {args.seat}" if args.seat else "") + ":"]
     lines += [f"  {k}" for _s, _a, k in items]
     lines.append("Their storage is DELETED with them." if args.purge else
                  "Their storage is KEPT (oaap app purge deletes it later).")
+    if gone:
+        lines.append("Already removed by hand (no instance any more): "
+                     + ", ".join(k for _s, _a, k in gone) + " -- "
+                     + ("the data they left behind is DELETED too."
+                        if args.purge else
+                        "their data stays (oaap app purge <name> deletes it)."))
     base = _cohort_shared_base(rec)
     if not args.seat and os.path.isdir(base) and os.listdir(base):
         lines.append("The shared folders (" + ", ".join(sorted(os.listdir(base)))
@@ -16694,6 +16730,9 @@ def _cohort_remove(args):
         reg = load_registry()
         if key in reg["instances"]:
             print(remove_instance(reg, key, args.purge).capitalize() + ".")
+    if args.purge:
+        for _s, _a, key in gone:
+            _cohort_purge_left_behind(rec, key)
     for sid in sorted(sids):
         if args.users:
             code, res = identity_user_delete(rec["seats"][sid]["user"])
@@ -16756,7 +16795,7 @@ def _cohort_secret(args):
 def _cohort_stop_containers(rec):
     reg = load_registry()
     for _sid, _app, key in _cohort_instances(rec):
-        for s in instance_services(reg["instances"].get(key) or {}):
+        for s in _cohort_services(reg, key):
             subprocess.run(["docker", "stop", s["container"]],
                            capture_output=True, text=True)
 
@@ -16920,7 +16959,7 @@ def cohort_describe(rec, states=None):
     if states is None:
         names = []
         for _sid, _app, key in _cohort_instances(rec):
-            for s in instance_services(reg["instances"].get(key) or {}):
+            for s in _cohort_services(reg, key):
                 names.append(s["container"])
         states, _ok = container_states(names)
     seats = []
