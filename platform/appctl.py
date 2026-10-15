@@ -11955,6 +11955,9 @@ def restart_instance(name, inst, own_rid="", who="root", role="root"):
     audit_tenant("instance.restarted", resolve_tenant(inst.get("tenant"))
                  or ensure_default_tenant(), subject=name, who=who, role=role)
     started = ""
+    if (load_registry()["instances"].get(name) or {}).get("state") == "standby":
+        # RFC-0059: re-made, not started -- there is no start time to report
+        return "recreated; it stays in standby (oaap app wake starts it)"
     states, _ok = container_states([instance_services(inst)[0]["container"]])
     for fact in states.values():
         started = (fact.get("started") or "")[:19].replace("T", " ")
