@@ -16279,6 +16279,20 @@ def _cohort_create(args):
     if why:
         die("handout: " + why)
     _cohort_capacity_note(tpl, len(tpl["seat_ids"]))
+    if args.dry_run:
+        # Everything above only read. Nothing below runs: no record, no
+        # template copy, no user, no instance, no handout file.
+        print(f"(dry run) cohort '{tpl['name']}' in tenant "
+              f"'{tenant_label(tid) or 'default'}' would be "
+              f"{'finished' if existing else 'created'}:")
+        print(f"  seats: {', '.join(tpl['seat_ids'])}")
+        print(f"  apps:  {', '.join(a['name'] for a in tpl['apps'])}")
+        for sh in tpl.get("shared_storage") or []:
+            print(f"  shared folder: {sh['name']} at {sh['mount']} "
+                  f"({sh.get('access', 'rw')} for participants)")
+        print(f"  handout would go to: {out}")
+        print("(dry run) nothing was created.")
+        return
     if existing:
         rec = existing
     else:
@@ -23348,7 +23362,7 @@ def main():
     pcoh.add_argument("--stdin", action="store_true",
                       help="secret set: read the value from standard input")
     pcoh.add_argument("--dry-run", action="store_true",
-                      help="sweep, extend: say what would happen, change nothing")
+                      help="create, sweep, extend: say what would happen, change nothing")
     pcoh.set_defaults(fn=cmd_cohort)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])

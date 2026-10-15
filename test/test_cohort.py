@@ -396,6 +396,15 @@ tdir = template(os.path.join(WORK, "t-create"), extra_app="""  - id: forgejo
     name: git
     shared: true
 """)
+n_docker, n_users = len(DOCKER), len(USERS)
+code, out = cli("create", target=tdir, dry_run=True,
+                handout_file=os.path.join(WORK, "out", "h0.csv"))
+ok("create --dry-run sagt den Plan und legt NICHTS an (Kohorte, Benutzer, Container, Handout)",
+   code is None and "dry run" in out and "nothing was created" in out
+   and a.load_cohort(TID, "kurs-2026-10") is None
+   and len(USERS) == n_users and len(DOCKER) == n_docker
+   and not os.path.exists(os.path.join(WORK, "out", "h0.csv"))
+   and not os.path.exists(a._cohort_path(TID, "kurs-2026-10")), (code, out))
 code, out = cli("create", target=tdir, handout_file=os.path.join(WORK, "out", "h1.csv"))
 rec = a.load_cohort(TID, "kurs-2026-10")
 ok("create endet ohne Fehler, die Kohorte ist fertig", code is None and rec and rec["complete"], out)
