@@ -10698,11 +10698,26 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
     stored = (load_registry().get("instances") or {}).get(name) or {}
     limits = resource_args(stored.get("resources")
                            or (inst or {}).get("resources"))
+    # RFC-0058: mounts that belong to a cohort, not to this instance --
+    # recorded on the instance like `resources`, asked of the registry for
+    # the same reason. They go to the primary service; one that names the
+    # mount point of an own storage entry takes that entry's place.
+    shared = [x for x in (stored.get("shared_mounts")
+                          or (inst or {}).get("shared_mounts") or [])
+              if isinstance(x, dict) and x.get("host") and x.get("mount")]
+    shared_at = {x["mount"] for x in shared}
     for s in services:
         uid = image_uid(s["image"])
         mounts = []
+        if s["service"] == primary:
+            for x in shared:
+                os.makedirs(x["host"], exist_ok=True)
+                mounts += ["-v", f"{x['host']}:{x['mount']}"
+                           + (":ro" if x.get("ro") else "")]
         for st in storage or []:
             if (st.get("service") or primary) != s["service"]:
+                continue
+            if st["mount"] in shared_at:
                 continue
             host = os.path.join(instance_dir(name, inst), "storage", st["name"])
             os.makedirs(host, exist_ok=True)
@@ -14088,6 +14103,8 @@ def _install_from_dir(pkg, args, source):
         hook(name, ident, services, m)
     if preset.get("resources") and not (inst and inst.get("resources")):
         ident = dict(ident, resources=preset["resources"])
+    if preset.get("shared_mounts") and not (inst and inst.get("shared_mounts")):
+        ident = dict(ident, shared_mounts=preset["shared_mounts"])
 
     # per-instance storage, writable for the container user (guarantee 4);
     # every service container lands on the instance's own network (RFC-0016)
@@ -14235,6 +14252,12 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["resources"] = dict(inst["resources"])
     elif preset.get("resources"):
         reg["instances"][name]["resources"] = dict(preset["resources"])
+    # RFC-0058: the cohort's shared folders (and whether this seat may
+    # write them) are not the app's declaration -- a redeploy keeps them.
+    if inst and inst.get("shared_mounts"):
+        reg["instances"][name]["shared_mounts"] = [dict(x) for x in inst["shared_mounts"]]
+    elif preset.get("shared_mounts"):
+        reg["instances"][name]["shared_mounts"] = [dict(x) for x in preset["shared_mounts"]]
     # which cohort seat this instance belongs to (RFC-0046 §3): kept by a
     # redeploy like the limits, so `oaap cohort` still finds it
     if (inst or {}).get("cohort") or preset.get("cohort"):
@@ -15959,7 +15982,28 @@ def _cohort_env_value(key, value, multiline):
     return text
 
 
-def _cohort_before_start(tpl, tdir, sid, app, secrets_map):
+def _cohort_shared_base(rec):
+    """Where a cohort's shared folders live (RFC-0058 §3.1): beside the
+    cohort record, outside `tenants/<tid>`, so no nightly archive carries
+    them -- the cohort `export` does."""
+    return os.path.join(_cohort_path(rec["tenant"], rec["name"]), "shared")
+
+
+def _cohort_fill_shared(tpl, tdir, base, uid):
+    """Create the cohort's shared folders and fill each from its `source`
+    ONCE -- a folder that already has content is never touched here
+    (`material update` is the way to replace it)."""
+    for x in tpl.get("shared_storage") or []:
+        host = os.path.join(base, x["name"])
+        fresh = not os.path.isdir(host)
+        os.makedirs(host, exist_ok=True)
+        if uid is not None:
+            os.chown(host, uid, uid)
+        if x["source"] and (fresh or not os.listdir(host)):
+            cohort.copy_material(os.path.join(tdir, x["source"]), host, uid)
+
+
+def _cohort_before_start(tpl, tdir, sid, app, secrets_map, shared_base=""):
     """The hook `_install_from_dir` calls after the environment file and
     before the first start: configuration, seeds and material land where
     the app finds them on its FIRST run (RFC-0046 §2)."""
@@ -15984,13 +16028,15 @@ def _cohort_before_start(tpl, tdir, sid, app, secrets_map):
                     key, cohort.expand(val, ctx),
                     bool(decl[key].get("multiline")))
         save_env(name, env, ident)
+        uid = image_uid(services[0]["image"])
+        if shared_base and tpl.get("shared_storage"):
+            _cohort_fill_shared(tpl, tdir, shared_base, uid)
         if not (app["seed"] or app["material"]):
             return
         storages = {s["name"] for s in m.get("storage") or []}
         base = os.path.join(instance_dir(name, ident), "storage")
         # The image's own user owns what is written: the container runs
         # as it, and a seed it cannot touch is worse than none.
-        uid = image_uid(services[0]["image"])
         if app["seed"]:
             if app["seed_to"] not in storages:
                 die(f"'{app['id']}' has no storage '{app['seed_to']}' for the seeds")
@@ -16001,7 +16047,12 @@ def _cohort_before_start(tpl, tdir, sid, app, secrets_map):
             for target, src_file in app["seed"].items():
                 cohort.write_seed(root, target,
                                   cohort.read_seed(tdir, src_file, ctx), uid)
-        if app["material"]:
+        shadow = {x["mount"] for x in tpl.get("shared_storage") or []}
+        mat_mount = next((s["mount"] for s in m.get("storage") or []
+                          if s["name"] == "material"), None)
+        if app["material"] and mat_mount in shadow:
+            pass  # a shared folder sits on the material mount (RFC-0058)
+        elif app["material"]:
             if "material" not in storages:
                 die(f"'{app['id']}' has no storage 'material'")
             cohort.copy_material(os.path.join(tdir, app["material"]),
@@ -16063,9 +16114,18 @@ def _cohort_install(tpl, tdir, tid, rec, sid, app, src, secrets_map):
     key, inst = find_instance(reg, tid, local)
     if inst is not None:
         return key, False
-    group = cohort.cohort_group(tpl) if app["shared"] else cohort.seat_group(tpl, sid)
-    preset = {"visibility": {"groups": [group]},
+    groups = ([cohort.cohort_group(tpl)] if app["shared"]
+              else [cohort.seat_group(tpl, sid)])
+    # RFC-0058 §2.2: a trainer sees every participant's desk -- by the
+    # trainer group on the participants' instances, not by a role.
+    if (not app["shared"] and tpl.get("trainer_ids")
+            and not cohort.is_trainer(tpl, sid)):
+        groups.append(cohort.trainer_group(tpl))
+    preset = {"visibility": {"groups": groups},
               "cohort": {"name": tpl["name"], "seat": "" if app["shared"] else sid}}
+    base = _cohort_shared_base(rec)
+    if not app["shared"] and tpl.get("shared_storage"):
+        preset["shared_mounts"] = cohort.shared_mounts(tpl, sid, base)
     res = _cohort_resources(tpl, app)
     if res:
         preset["resources"] = res
@@ -16074,7 +16134,8 @@ def _cohort_install(tpl, tdir, tid, rec, sid, app, src, secrets_map):
         ref=src.get("ref", ""), name=local, channel=app["channel"],
         store_source=src.get("store_source", ""), tenant=tid, confirm=False,
         bind=[], preset=preset,
-        before_start=_cohort_before_start(tpl, tdir, sid, app, secrets_map))
+        before_start=_cohort_before_start(tpl, tdir, sid, app, secrets_map,
+                                          shared_base=base))
     cmd_install(ns)
     key, inst = find_instance(load_registry(), tid, local)
     if inst is None:
@@ -16096,7 +16157,8 @@ def _cohort_seat(tpl, tdir, tid, rec, sid, existing_users, handout, srcs,
     user = cohort.user_name(tpl, sid)
     seat = rec["seats"].setdefault(sid, {
         "user": user, "group": cohort.seat_group(tpl, sid),
-        "label": cohort.seat_label(tpl, sid) or "", "instances": {}})
+        "label": cohort.seat_label(tpl, sid) or "", "instances": {},
+        **({"trainer": True} if cohort.is_trainer(tpl, sid) else {})})
     password = "(vorhanden)"
     if user in existing_users:
         print(f"  {user}: user exists")
@@ -16105,7 +16167,9 @@ def _cohort_seat(tpl, tdir, tid, rec, sid, existing_users, handout, srcs,
         deactivate_at, delete_at = cohort.user_dates(tpl)
         body = {"username": user, "roles": tpl["users"]["roles"],
                 "groups": sorted({cohort.seat_group(tpl, sid),
-                                  cohort.cohort_group(tpl)}),
+                                  cohort.cohort_group(tpl)}
+                                 | ({cohort.trainer_group(tpl)}
+                                    if cohort.is_trainer(tpl, sid) else set())),
                 "tenant": tid, "password": password,
                 "display_name": cohort.display_name(tpl, sid),
                 "must_change_password": True}
@@ -16525,11 +16589,32 @@ def _cohort_material(args):
             dest = os.path.join(instance_dir(key, inst), "storage", "material")
             cohort.copy_material(stored, dest, uid, replace=True)
             done += 1
-    if not done:
+    # RFC-0058: a shared folder with a `source` is replaced IN PLACE (content,
+    # never the directory: running containers keep their bind mount). Not
+    # atomic -- a reader may see the folder empty for a moment.
+    base = _cohort_shared_base(rec)
+    folders = 0
+    for x in tpl.get("shared_storage") or []:
+        if not x["source"]:
+            continue
+        stored = os.path.join(tdir, x["source"])
+        shutil.rmtree(stored, ignore_errors=True)
+        shutil.copytree(new, stored, symlinks=True)
+        host = os.path.join(base, x["name"])
+        uid = None
+        for _sid, _app, key in _cohort_instances(rec):
+            inst = reg["instances"].get(key)
+            if inst:
+                uid = image_uid(instance_services(inst)[0]["image"])
+                break
+        cohort.copy_material(stored, host, uid, replace=True)
+        folders += 1
+    if not done and not folders:
         die("no app of this cohort has a material directory")
-    _cohort_audit("cohort.material", rec, f"{done} instance(s)")
-    print(f"Material replaced in {done} instance(s); the participants' own "
-          "files (their home) were not touched.")
+    _cohort_audit("cohort.material", rec,
+                  f"{done} instance(s), {folders} shared folder(s)")
+    print(f"Material replaced in {done} instance(s) and {folders} shared "
+          "folder(s); the participants' own files (their home) were not touched.")
 
 
 def _cohort_handout(args):
@@ -16552,6 +16637,12 @@ def _cohort_export(args):
         die(f"{dest} exists and is not empty")
     _tpl, tdir = _cohort_template(rec)
     shutil.copytree(tdir, dest, symlinks=True, dirs_exist_ok=True)
+    # RFC-0058 D5: the shared folders are in no node backup; their CONTENT
+    # (what the trainers changed during the course) goes along here.
+    base = _cohort_shared_base(rec)
+    if os.path.isdir(base):
+        shutil.copytree(base, os.path.join(dest, "shared-content"),
+                        symlinks=True, dirs_exist_ok=True)
     made = {k: v for k, v in rec.items() if k != "handout"}
     with open(os.path.join(dest, "created.json"), "w", encoding="utf-8") as f:
         json.dump(made, f, indent=2, ensure_ascii=False)
@@ -16573,6 +16664,11 @@ def _cohort_remove(args):
     lines += [f"  {k}" for _s, _a, k in items]
     lines.append("Their storage is DELETED with them." if args.purge else
                  "Their storage is KEPT (oaap app purge deletes it later).")
+    base = _cohort_shared_base(rec)
+    if not args.seat and os.path.isdir(base) and os.listdir(base):
+        lines.append("The shared folders (" + ", ".join(sorted(os.listdir(base)))
+                     + ") are " + ("DELETED with the cohort."
+                                   if args.purge else "KEPT (--purge deletes them)."))
     if args.users:
         lines.append("The users are DELETED as well: "
                      + ", ".join(sorted(rec["seats"][s]["user"] for s in sids)))
@@ -16593,6 +16689,10 @@ def _cohort_remove(args):
         rec["seats"].pop(sid, None)
     if not args.seat:
         rec["shared"] = {}
+        base = _cohort_shared_base(rec)
+        if args.purge and os.path.isdir(base):
+            shutil.rmtree(base, ignore_errors=True)
+            print("  shared folders deleted")
     _cohort_audit("cohort.remove", rec,
                   f"{'purge' if args.purge else 'keep storage'}"
                   f"{', users' if args.users else ''}",

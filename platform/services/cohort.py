@@ -31,7 +31,14 @@ CHANNELS = ("test", "production")
 SECRET_KEY = re.compile(r"(PASS|SECRET|TOKEN|KEY)", re.I)
 PLACEHOLDERS = ("nn", "name", "user", "seat", "app")
 TOP_KEYS = {"oaap_cohort", "name", "tenant", "seats", "participants",
-            "lifetime", "resources", "apps", "users", "handout"}
+            "lifetime", "resources", "apps", "users", "handout",
+            "shared_storage", "trainers"}
+MAX_TRAINERS = 9
+# Mount points a shared folder may not take: the platform's and the
+# container's own, and the home the seat is built on (RFC-0058 §2.1).
+SHARED_MOUNT_RE = re.compile(r"/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+SHARED_MOUNT_DENY = ("/", "/config", "/etc", "/proc", "/sys", "/dev", "/usr",
+                     "/bin", "/sbin", "/lib", "/var", "/root", "/run", "/tmp")
 APP_KEYS = {"id", "git", "path", "ref", "source", "name", "channel", "config",
             "seed", "seed_to", "material", "start", "resources", "shared"}
 
@@ -147,6 +154,22 @@ def validate(raw, directory):
     if len(set(ids)) != len(ids):
         bad.append("Platznamen doppelt")
 
+    # RFC-0058: trainer seats are seats of their own kind, after the
+    # participants; they share the cohort's apps and limits.
+    trainer_ids = []
+    n_tr = raw.get("trainers", 0)
+    if n_tr in (None, ""):
+        n_tr = 0
+    if not isinstance(n_tr, int) or isinstance(n_tr, bool) or not 0 <= n_tr <= MAX_TRAINERS:
+        bad.append(f"trainers: eine Zahl von 0 bis {MAX_TRAINERS}")
+        n_tr = 0
+    if n_tr:
+        trainer_ids = [f"t{i:02d}" for i in range(1, n_tr + 1)]
+        if set(trainer_ids) & set(ids):
+            bad.append("Platznamen t01… sind für Trainer reserviert")
+        ids = ids + trainer_ids
+        labels = labels + [None] * n_tr
+
     life = raw.get("lifetime") or {}
     if not isinstance(life, dict):
         bad.append("lifetime muss ein Objekt sein")
@@ -203,6 +226,8 @@ def validate(raw, directory):
     for i, a in enumerate(apps_raw, 1):
         apps.append(_validate_app(a, i, directory, bad, seen))
 
+    shared_storage = _validate_shared(raw.get("shared_storage"), directory, bad)
+
     handout = str(raw.get("handout", "handout.csv") or "")
     if handout and (os.path.isabs(handout) or ".." in handout.replace("\\", "/").split("/")):
         bad.append("handout: ein Dateiname, kein Pfad nach außen")
@@ -213,12 +238,57 @@ def validate(raw, directory):
                         "deactivate_users_after": str(d_after or ""),
                         "delete_users_after": str(x_after or "")},
            "resources": {k: str(v) for k, v in res.items()},
-           "apps": apps, "users": users, "handout": handout}
+           "apps": apps, "users": users, "handout": handout,
+           "shared_storage": shared_storage, "trainer_ids": trainer_ids}
     if not bad:
         bad += _length_problems(tpl)
     if bad:
         raise TemplateError(bad)
     return tpl
+
+
+def _validate_shared(raw, directory, bad):
+    """`shared_storage:` -> [{name, mount, access, source}] (RFC-0058 §2.1)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        bad.append("shared_storage muss eine Liste sein")
+        return []
+    out, names, mounts = [], set(), set()
+    for i, x in enumerate(raw, 1):
+        where = f"shared_storage[{i}]"
+        if not isinstance(x, dict):
+            bad.append(f"{where}: muss ein Objekt sein")
+            continue
+        unknown = sorted(set(x) - {"name", "mount", "access", "source"})
+        if unknown:
+            bad.append(f"{where}: unbekannte Schlüssel: {', '.join(unknown)}")
+        name = str(x.get("name") or "")
+        if not PART_RE.fullmatch(name):
+            bad.append(f"{where}: name (Kleinbuchstaben, Ziffern, '-')")
+        if name in names:
+            bad.append(f"{where}: Name '{name}' kommt doppelt vor")
+        names.add(name)
+        mount = str(x.get("mount") or "")
+        if (not SHARED_MOUNT_RE.fullmatch(mount) or ".." in mount.split("/")
+                or mount in SHARED_MOUNT_DENY
+                or any(mount.startswith(d + "/") for d in SHARED_MOUNT_DENY[1:])):
+            bad.append(f"{where}: mount '{mount}' ist kein erlaubter Pfad im Container")
+        if mount in mounts:
+            bad.append(f"{where}: mount '{mount}' kommt doppelt vor")
+        mounts.add(mount)
+        access = str(x.get("access") or "rw")
+        if access not in ("rw", "ro"):
+            bad.append(f"{where}: access rw oder ro")
+        source = str(x.get("source") or "")
+        if source:
+            full = os.path.join(directory, source)
+            if seed_path_refusal(source.rstrip("/") or ".") or not os.path.isdir(full)                     or not _inside(directory, full):
+                bad.append(f"{where}.source: Verzeichnis '{source}' fehlt oder "
+                           "liegt außerhalb der Vorlage")
+        out.append({"name": name, "mount": mount, "access": access,
+                    "source": source.rstrip("/")})
+    return out
 
 
 def _validate_app(a, i, directory, bad, seen):
@@ -327,8 +397,18 @@ def _length_problems(tpl):
 
 # ---------------------------------------------------------------- the seat
 
+def is_trainer(tpl, sid):
+    return sid in (tpl.get("trainer_ids") or [])
+
+
 def user_name(tpl, sid):
+    if is_trainer(tpl, sid):
+        return f"{tpl['name']}-{sid}"
     return f"{tpl['name']}-{tpl['users']['prefix']}-{sid}"
+
+
+def trainer_group(tpl):
+    return f"{tpl['name']}-trainer"
 
 
 def seat_group(tpl, sid):
@@ -370,6 +450,8 @@ def expand(text, ctx):
 
 
 def display_name(tpl, sid):
+    if is_trainer(tpl, sid):
+        return f"Trainer {sid[1:]}"
     return expand(tpl["users"]["display_name"], context(tpl, sid))
 
 
@@ -387,6 +469,21 @@ def user_dates(tpl):
         out.append((ends + datetime.timedelta(days=days)).isoformat()
                    if ends and days else "")
     return tuple(out)
+
+
+def shared_mounts(tpl, sid, base):
+    """The shared folders one seat gets -> [{name, mount, host, ro}].
+
+    A trainer seat has every folder writable; a participant gets what the
+    template says (RFC-0058 §2.1/§2.2). `base` is the cohort's own place
+    for them, outside any tenant directory (D5).
+    """
+    out = []
+    for x in tpl.get("shared_storage") or []:
+        ro = x["access"] == "ro" and not is_trainer(tpl, sid)
+        out.append({"name": x["name"], "mount": x["mount"],
+                    "host": os.path.join(base, x["name"]), "ro": ro})
+    return out
 
 
 # ------------------------------------------------------- what lands on disk
