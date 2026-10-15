@@ -48,11 +48,18 @@ docker() {
     case "$args" in
       *" config "*)
         # was der Knoten DEFINIERT (Profile eingerechnet), laufend oder nicht
+        # ohne FAKE_DEFINED: nur die Dienste des Standardprofils (hier: keine
+        # Profildienste wie broker) -- wie auf einem echten Knoten
         if [ -n "${FAKE_DEFINED:-}" ]; then for s in $FAKE_DEFINED; do echo "$s"; done
-        else for e in $FAKE_CORE; do echo "${e%%:*}"; done; fi ;;
+        else for e in $FAKE_CORE; do n_="${e%%:*}"; [ "$n_" = broker ] || echo "$n_"; done; fi ;;
       *" --services "*)
+        # Wie das echte compose: ohne -a und ohne Filter nur Laufendes
+        local all_=""; case "$args" in *" -a "*) all_=1 ;; esac
         for e in $FAKE_CORE; do s="${e%%:*}"; st="${e##*:}"
-          if [ -z "$status_filter" ] || [ "$st" = "$status_filter" ]; then echo "$s"; fi
+          if [ -n "$status_filter" ]; then [ "$st" = "$status_filter" ] || continue
+          elif [ -z "$all_" ]; then [ "$st" = running ] || [ "$st" = restarting ] || continue
+          fi
+          echo "$s"
         done ;;
       *) for e in $FAKE_CORE; do echo "  ${e%%:*}: ${e##*:}"; done ;;
     esac

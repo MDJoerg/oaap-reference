@@ -51,7 +51,10 @@ status() {
   for svc in $defined; do
     printf '%s\n' "$listed" | grep -qx "$svc" || echo "  $svc: missing (no container)"
   done
-  total="$(printf '%s\n' "$defined" | grep -c . || true)"
+  # `config --services` knows only the services of the DEFAULT profile set (a
+  # node's own profiles -- broker, store -- are not in it), `ps -a` knows every
+  # container that exists. A service counts if either names it.
+  total="$(printf '%s\n%s\n' "$defined" "$listed" | grep . | sort -u | wc -l)"
   [ "$total" -gt 0 ] || total="$(compose ps --services | wc -l)"
   running="$(compose ps --services --filter status=running | wc -l)"
   echo ""
