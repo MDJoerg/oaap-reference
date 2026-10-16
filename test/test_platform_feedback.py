@@ -280,5 +280,49 @@ ok("die Site des eigenen Namens reserviert /platform/feedback*",
    ext[:400])
 
 print("")
+print("7. Die Tuer fuer das Backend einer App (RFC-0061 §3.2)")
+m.refresh_cases_sites()
+body = site("hbvp-portal-test")
+sb = block(body, "handle /platform/cases/submit {")
+ok("die Site reserviert /platform/cases/submit", sb is not None, body[:300])
+ok("/platform/cases/submit landet in genau diesem Block",
+   route_for(body, "/platform/cases/submit") == "handle /platform/cases/submit {")
+ok("… gefragt wird der Schluessel DIESER Instanz, keine Rolle",
+   sb and f"uri /verify?roles=&tenant={tid}&instance=oaap.cases.submit:hbvp-portal-test" in sb, sb)
+ok("… und das Gateway setzt die Herkunft",
+   sb and "header_up X-OAAP-Source-Instance hbvp-portal-test" in sb
+   and "reverse_proxy oaap-app-vorgaenge:8000 {" in sb, sb)
+other = block(site("hbvp-portal"), "handle /platform/cases/submit {") or []
+ok("die Nachbarinstanz fragt nach IHREM Schluessel",
+   any(x.startswith("uri ") and x.endswith("&instance=oaap.cases.submit:hbvp-portal")
+       for x in other), other)
+ok("ohne vorgaenge im Mandanten: 404",
+   "respond 404" in (block(site("fremd"), "handle /platform/cases/submit {") or []))
+man =dict(base, routes=[{"path": "/", "roles": ["user"]}])
+
+
+def man_errs(extra):
+    out, err = _io.StringIO(), _io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            m.validate_manifest(dict(man, **extra))
+    except SystemExit:
+        pass
+    return [ln for ln in (out.getvalue() + err.getvalue()).splitlines()
+            if ln.strip().startswith("- ")]
+
+
+ok("Manifest: cases.submit 'yes' wird abgelehnt",
+   any("cases.submit" in e for e in man_errs({"cases": {"submit": "yes"}})))
+ok("Manifest: cases als Liste wird abgelehnt",
+   any("cases:" in e for e in man_errs({"cases": ["submit"]})))
+ok("Manifest: cases.submit true geht durch", not man_errs({"cases": {"submit": True}}))
+ok("nur ein woertliches true verlangt den Schluessel",
+   [m.cases_submit_wanted(x) for x in ({"cases": {"submit": True}}, {"cases": {"submit": "yes"}},
+                                        {"cases": []}, {})] == [True, False, False, False])
+ok("OAAP_CASES_KEY und _URL sind Plattformvariablen",
+   {"OAAP_CASES_KEY", "OAAP_CASES_URL"} <= m.RESERVED_ENV)
+
+print("")
 print("ALLE PASS" if not fails else f"{fails} FAIL")
 sys.exit(1 if fails else 0)

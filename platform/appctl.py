@@ -2184,7 +2184,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 8      # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 9      # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -2194,7 +2194,9 @@ MANIFEST_MINOR = 8      # 0.2 adds app.class (runtime spec 2.10);
                         # RFC-0045); 0.7 adds services.<name>.shm (runtime
                         # spec 2.20 -- a desktop in the browser needs it);
                         # 0.8 adds services.<name>.tun (runtime spec 2.23,
-                        # RFC-0060 -- a VPN client needs it)
+                        # RFC-0060 -- a VPN client needs it);
+                        # 0.9 adds cases.submit (RFC-0061 §3.2 -- an app's
+                        # backend opens a case in its tenant)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -8168,6 +8170,13 @@ def validate_manifest(m):
             # typo, and a typo must not decide whether a door opens.
             if "tun" in svc and not isinstance(svc["tun"], bool):
                 errs.append(f"services.{sname}.tun: true or false")
+        # Manifest 0.9 (RFC-0061 §3.2): same rule as `tun` -- a key is
+        # minted for a literal true and nothing else.
+        if "cases" in m:
+            if not isinstance(m["cases"], dict):
+                errs.append("cases: object expected")
+            elif "submit" in m["cases"] and not isinstance(m["cases"]["submit"], bool):
+                errs.append("cases.submit: true or false")
         multi = len(services) > 1
         routes = m.get("routes") or []
         if not routes:
@@ -9060,6 +9069,49 @@ def _twin_issue_instance_key(name, tenant_id):
     return json.loads(out)
 
 
+# RFC-0061 §3.2: an app's backend opens a case in its tenant's `vorgaenge`.
+# The key is limited to a pseudo-instance NAMED AFTER the instance, so it
+# opens exactly one door: /platform/cases/submit on that instance's own
+# site, where the gateway passes this value as `instance` (see
+# _platform_site_lines). The key of instance A is refused on B's site, and
+# on every page of A itself -- the D5 rule doing what it did for the twin.
+CASES_SUBMIT_SCOPE = "oaap.cases.submit"
+
+
+def cases_submit_scope(name):
+    return f"{CASES_SUBMIT_SCOPE}:{name}"
+
+
+def _cases_issue_submit_key(name, tenant_id):
+    """Key for the machine principal 'instance:<name>', limited to
+    cases_submit_scope(name). Returns the bearer token."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_T_INST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
+        "    'oaap.cases.submit (RFC-0061 §3.2)', m.KEY_MAX_DAYS, 'root')\n"
+        "print(json.dumps(secret))\n",
+        {"OAAP_T_NAME": f"instance:{name}", "OAAP_T_INST": name,
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": cases_submit_scope(name)})
+    return json.loads(out)
+
+
+def cases_submit_wanted(m):
+    """Does this manifest ask to open cases from its backend? Only a
+    literal `cases: {submit: true}` -- "yes" is a typo, not a request."""
+    return (m.get("cases") or {}).get("submit") is True if isinstance(
+        m.get("cases"), dict) else False
+
+
 # ----------------------- business authorization (oaap.core.authorization 0.1)
 # What a person may DO inside an app (RFC-0045 stages 1+2). The state lives
 # in identity; this file only hands it a declaration at install, mints the
@@ -9715,7 +9767,8 @@ CASES_MARKER = "# platform-feedback "
 # /platform/feedback* and so swallowed /platform/feedback.js (measured
 # on oaap-test, 2026-10-16, before any release). 3: the path is passed
 # on unchanged -- a stripped one became the login's return target.
-CASES_BLOCK_FORMAT = 3
+# 4: /platform/cases/submit, the backend's door (RFC-0061 §3.2).
+CASES_BLOCK_FORMAT = 4
 
 _CASES_CACHE = {"stamp": None, "insts": {}}
 
@@ -9836,6 +9889,30 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
             f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
     for matcher in ("/platform/feedback", "/platform/feedback/*"):
         lines += [f"\thandle {matcher} {{"] + fb + ["\t}"]
+    # RFC-0061 §3.2: the app's BACKEND opens a case. The only credential
+    # that passes is a key limited to cases_submit_scope(this instance) --
+    # the one minted for this instance's machine principal. No roles asked:
+    # the key carries none worth asking about, and the door is the scope.
+    # The app behind (`vorgaenge`) also checks that the principal is
+    # `instance:<this instance>`, so a person's session that reached this
+    # path is refused there.
+    lines.append("\thandle /platform/cases/submit {")
+    if not target:
+        lines += login_lines() if login_only else strip_identity()
+        lines.append("\t\trespond 404")
+    else:
+        uri = "/verify?roles="
+        if tenant:
+            uri += f"&tenant={tenant}"
+        uri += f"&instance={cases_submit_scope(scope or '-')}"
+        lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
+                  "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
+        source = (scope or "-", me.get("app_id") or "-",
+                  me.get("version") or "-",
+                  tenant or (instance_tenant_ref(me) if me else "-"))
+        lines += _proxy(target, "\t\t", extra=[
+            f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
+    lines.append("\t}")
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
     lines.append("\t\turi strip_prefix /platform")
@@ -10793,7 +10870,8 @@ def reload_gateway():
 
 RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_ADMIN_KEY", "OAAP_AUTHZ_URL",
-                "OAAP_INSTANCE_NAMES"}  # platform-owned, never operator-editable
+                "OAAP_INSTANCE_NAMES",
+                "OAAP_CASES_KEY", "OAAP_CASES_URL"}  # platform-owned, never operator-editable
 
 
 def tenant_dir(tid):
@@ -14875,6 +14953,23 @@ def _install_from_dir(pkg, args, source):
         _authz_set_administer(name, twin_tenant, app["id"], False)
         env.pop("OAAP_AUTHZ_ADMIN_KEY", None)
         print(f"'{name}' no longer asks to administer: its door is closed.")
+    # RFC-0061 §3.2: the key this instance's backend presents to open a
+    # case. Minted once, like the others; never for a rehearsal (it would
+    # write into the production tenant's inbox). The URL is the instance's
+    # OWN gateway port, because that site is what tells the gateway which
+    # instance is speaking -- the source headers come from there.
+    if cases_submit_wanted(m) and not is_artefact and not rehearsal:
+        if "OAAP_CASES_KEY" not in env:
+            env["OAAP_CASES_KEY"] = _cases_issue_submit_key(name, twin_tenant)
+            print(f"Issued a case-submission key for '{name}' (RFC-0061 §3.2) "
+                  "-- OAAP_CASES_KEY/OAAP_CASES_URL are in its environment.")
+        env["OAAP_CASES_URL"] = (f"http://{GATEWAY_CONTAINER}:{port}"
+                                 "/platform/cases/submit")
+    elif "OAAP_CASES_KEY" in env:
+        env.pop("OAAP_CASES_KEY", None)
+        env.pop("OAAP_CASES_URL", None)
+        print(f"'{name}' no longer asks to open cases: its key is no longer "
+              "handed to the app.")
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     # RFC-0043: the instance's own names, canonical first, so the app
