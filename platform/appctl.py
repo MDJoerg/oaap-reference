@@ -14644,6 +14644,12 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["resources"] = dict(inst["resources"])
     elif preset.get("resources"):
         reg["instances"][name]["resources"] = dict(preset["resources"])
+    # RFC-0059: the operator's (or the cohort template's) auto-standby time
+    # is a decision about this instance, not the app's declaration
+    if inst and inst.get("standby_after"):
+        reg["instances"][name]["standby_after"] = inst["standby_after"]
+    elif preset.get("standby_after"):
+        reg["instances"][name]["standby_after"] = int(preset["standby_after"])
     # RFC-0058: the cohort's shared folders (and whether this seat may
     # write them) are not the app's declaration -- a redeploy keeps them.
     if inst and inst.get("shared_mounts"):
@@ -16467,6 +16473,27 @@ def _cohort_resources(tpl, app):
         die(f"resources of '{app['name']}': {e}")
 
 
+def _cohort_standby_after(tpl, app):
+    """Minutes of idleness after which the app's instances go to sleep by
+    themselves (RFC-0059 stage 4): the cohort default, the app on top;
+    0 = not at all. The template validator already holds it to >= 5."""
+    own = app.get("standby_after")
+    return int(tpl.get("standby_after") or 0) if own is None else int(own)
+
+
+def _cohort_apply_standby_after(key, minutes):
+    """Bring a rebuilt instance's record to what the template says."""
+    reg = load_registry()
+    inst = reg["instances"].get(key)
+    if inst is None or inst.get("standby_after", 0) == minutes:
+        return
+    if minutes:
+        inst["standby_after"] = minutes
+    else:
+        inst.pop("standby_after", None)
+    save_registry(reg)
+
+
 def _cohort_capacity_note(tpl, seats):
     """Say BEFORE the first container what the limits add up to (§7)."""
     per_seat = 0
@@ -16532,6 +16559,9 @@ def _cohort_install(tpl, tdir, tid, rec, sid, app, src, secrets_map):
     res = _cohort_resources(tpl, app)
     if res:
         preset["resources"] = res
+    after = _cohort_standby_after(tpl, app)
+    if after:
+        preset["standby_after"] = after
     ns = argparse.Namespace(
         package=source_package_arg(local, src), path=src.get("path", ""),
         ref=src.get("ref", ""), name=local, channel=app["channel"],
@@ -16844,6 +16874,7 @@ def _cohort_reset(args):
         cur = (load_registry()["instances"].get(key) or {}).get("resources") or {}
         if res != cur:
             apply_resources(key, res, who=_operator_name(), role="root")
+        _cohort_apply_standby_after(key, _cohort_standby_after(tpl, app))
         print(f"  {key}: rebuilt")
     save_cohort(rec)
     _cohort_audit("cohort.reset", rec,

@@ -80,6 +80,7 @@ lifetime:
 resources:
   memory: 3g
   cpus: 1.5
+standby_after: 15
 apps:
   - id: code-server
     name: ide
@@ -159,6 +160,21 @@ bad = problems(lambda t: t.replace("seats: 3", "seats: 3\nfoo: 1")
                .replace("oaap_cohort: \"0.1\"", "oaap_cohort: \"9\""))
 ok("ALLE Fehler auf einmal, nicht einer je Lauf", len(bad) >= 2, bad)
 
+for bad_val in ("3", "0", "true", "1.5", "soon"):
+    bad = problems(lambda t, v=bad_val: t.replace("standby_after: 15", f"standby_after: {v}"))
+    ok(f"standby_after: {bad_val} wird abgelehnt (ganze Minuten >= 5 oder off)",
+       any("standby_after" in p for p in bad), bad)
+bad = problems(lambda t: t.replace("    name: ide\n", "    name: ide\n    standby_after: 2\n"))
+ok("auch an der App gilt die Untergrenze", any("apps[1].standby_after" in p or
+                                               "standby_after" in p for p in bad), bad)
+ok("Vorlage: 15 Minuten als Kohortenwert", tpl["standby_after"] == 15
+   and tpl["apps"][0]["standby_after"] is None)
+off_tpl = dict(tpl, standby_after=0)
+ok("ohne Wert kein Auto-Standby; App-Wert geht vor Kohortenwert",
+   a._cohort_standby_after(off_tpl, tpl["apps"][0]) == 0
+   and a._cohort_standby_after(tpl, tpl["apps"][0]) == 15
+   and a._cohort_standby_after(tpl, dict(tpl["apps"][0], standby_after=30)) == 30
+   and a._cohort_standby_after(tpl, dict(tpl["apps"][0], standby_after=0)) == 0)
 ok("Namen: Benutzer kurs-2026-10-tn-02, Gruppe kurs-2026-10-02, Instanz "
    "kurs-2026-10-ide-02",
    cohort.user_name(tpl, "02") == "kurs-2026-10-tn-02"
@@ -333,6 +349,8 @@ def fake_install(ns):
         rec["visibility"] = dict(preset.get("visibility") or {})
     if preset.get("resources") and not rec.get("resources"):
         rec["resources"] = dict(preset["resources"])
+    if rec.get("standby_after") or preset.get("standby_after"):
+        rec["standby_after"] = int(rec.get("standby_after") or preset["standby_after"])
     if (rec.get("cohort") or preset.get("cohort")):
         rec["cohort"] = dict(rec.get("cohort") or preset["cohort"])
     reg["instances"][key] = rec
@@ -395,6 +413,7 @@ os.chdir(os.path.join(WORK, "out"))
 tdir = template(os.path.join(WORK, "t-create"), extra_app="""  - id: forgejo
     name: git
     shared: true
+    standby_after: off
 """)
 n_docker, n_users = len(DOCKER), len(USERS)
 code, out = cli("create", target=tdir, dry_run=True,
@@ -428,6 +447,9 @@ ok("die gemeinsame Instanz fuer die Kohortengruppe",
    reg["kurs-2026-10-git"]["visibility"] == {"groups": ["kurs-2026-10"]})
 ok("Grenzen aus der Vorlage schon im ersten Eintrag",
    reg["kurs-2026-10-ide-01"]["resources"] == {"memory": "3g", "cpus": 1.5})
+ok("standby_after der Vorlage (15) steht im Eintrag; 'off' an der App hebt es auf",
+   reg["kurs-2026-10-ide-01"].get("standby_after") == 15
+   and "standby_after" not in reg["kurs-2026-10-git"], reg["kurs-2026-10-git"])
 ok("die Instanz weiss, zu welchem Platz sie gehoert",
    reg["kurs-2026-10-ide-02"]["cohort"] == {"name": "kurs-2026-10", "seat": "02"})
 env = SEEN_ENV["kurs-2026-10-ide-02"]
@@ -1106,6 +1128,9 @@ ok("_install_from_dir ruft den Haken NACH save_env und VOR dem ersten Container"
    < APPCTL.index("recreate_instance_containers(name, services, m.get(\"storage\") or [], granted,"))
 ok("ein Redeploy behaelt den Kohorten-Vermerk",
    '(inst or {}).get("cohort") or preset.get("cohort")' in APPCTL)
+ok("ein Redeploy behaelt standby_after; reset zieht es auf die Vorlage nach (RFC-0059 Stufe 4)",
+   'inst.get("standby_after"):\n        reg["instances"][name]["standby_after"] = inst["standby_after"]' in APPCTL
+   and "_cohort_apply_standby_after(key, _cohort_standby_after(tpl, app))" in APPCTL)
 ok("bin/oaap kennt `oaap cohort`", 'cohort)      exec python3 "$APP_DIR/appctl.py" cohort' in BIN)
 INSTALL_SH = open(os.path.join(HERE, "..", "install.sh"), encoding="utf-8").read()
 MIGRATE_SH = open(os.path.join(PLATFORM, "migrate.sh"), encoding="utf-8").read()

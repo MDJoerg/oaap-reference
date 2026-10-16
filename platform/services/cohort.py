@@ -32,7 +32,7 @@ SECRET_KEY = re.compile(r"(PASS|SECRET|TOKEN|KEY)", re.I)
 PLACEHOLDERS = ("nn", "name", "user", "seat", "app")
 TOP_KEYS = {"oaap_cohort", "name", "tenant", "seats", "participants",
             "lifetime", "resources", "apps", "users", "handout",
-            "shared_storage", "trainers"}
+            "shared_storage", "trainers", "standby_after"}
 MAX_TRAINERS = 9
 # Mount points a shared folder may not take: the platform's and the
 # container's own, and the home the seat is built on (RFC-0058 §2.1).
@@ -40,7 +40,28 @@ SHARED_MOUNT_RE = re.compile(r"/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
 SHARED_MOUNT_DENY = ("/", "/config", "/etc", "/proc", "/sys", "/dev", "/usr",
                      "/bin", "/sbin", "/lib", "/var", "/root", "/run", "/tmp")
 APP_KEYS = {"id", "git", "path", "ref", "source", "name", "channel", "config",
-            "seed", "seed_to", "material", "start", "resources", "shared"}
+            "seed", "seed_to", "material", "start", "resources", "shared",
+            "standby_after"}
+
+
+# RFC-0059 stage 4: same floor as `oaap app standby-after`
+STANDBY_AFTER_MIN = 5
+
+
+def standby_after_value(raw, where, bad):
+    """Template value -> minutes (int), 0 for "off", None when not given.
+    Whole minutes, at least STANDBY_AFTER_MIN; anything else is a problem
+    of the template, never a silent default."""
+    if raw is None:
+        return None
+    # a bare `off` in YAML is the boolean false: that means "off", too
+    if raw is False or (isinstance(raw, str) and raw.strip().lower() == "off"):
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < STANDBY_AFTER_MIN:
+        bad.append(f"{where}.standby_after: ganze Minuten, mindestens "
+                   f"{STANDBY_AFTER_MIN}, oder \"off\"")
+        return None
+    return raw
 
 
 class TemplateError(Exception):
@@ -195,6 +216,8 @@ def validate(raw, directory):
         bad.append("resources: nur memory, cpus, pids")
         res = {}
 
+    standby_after = standby_after_value(raw.get("standby_after"), "standby_after", bad)
+
     users_raw = raw.get("users") or {}
     if not isinstance(users_raw, dict):
         bad.append("users muss ein Objekt sein")
@@ -238,6 +261,7 @@ def validate(raw, directory):
                         "deactivate_users_after": str(d_after or ""),
                         "delete_users_after": str(x_after or "")},
            "resources": {k: str(v) for k, v in res.items()},
+           "standby_after": standby_after or 0,
            "apps": apps, "users": users, "handout": handout,
            "shared_storage": shared_storage, "trainer_ids": trainer_ids}
     if not bad:
@@ -368,7 +392,9 @@ def _validate_app(a, i, directory, bad, seen):
     if not isinstance(res, dict) or set(res) - {"memory", "cpus", "pids"}:
         bad.append(f"{where}.resources: nur memory, cpus, pids")
         res = {}
+    own_after = standby_after_value(a.get("standby_after"), where, bad)
     return {"id": app_id, "kind": "git" if a.get("git") else "store",
+            "standby_after": own_after,
             "path": str(a.get("path") or ""), "ref": str(a.get("ref") or ""),
             "source": str(a.get("source") or ""), "name": name,
             "channel": channel, "config": config, "seed": seed,
