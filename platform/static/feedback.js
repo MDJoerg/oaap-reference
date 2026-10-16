@@ -19,6 +19,9 @@
  *  - The object reference {kind, id} is read when the dialog OPENS,
  *    never at page load -- single-page apps change the current object
  *    without reloading.
+ *  - Light or dark is decided when the dialog opens: open({theme:
+ *    "dark"|"light"}), else <html data-theme="dark|light">, else the
+ *    operating system (asked for by HVP, letter of 2026-10-16).
  *  - window.oaapFeedback.open({object: {kind, id}}) is the same dialog,
  *    not a second door.
  *  - It never sends cookies' contents, storage, request or response
@@ -145,7 +148,27 @@
     "button.p{background:var(--oaap-color-primary,#2f6fed);color:var(--oaap-color-primary-text,#fff);border-color:transparent}" +
     ".chk{display:flex;gap:6px;align-items:center;margin-top:10px}.chk input{width:auto}" +
     ".msg{margin-top:10px}.err{color:var(--oaap-color-danger,#c4342f)}.ok{color:var(--oaap-color-success,#1f8a4c)}" +
-    ".obj{color:var(--oaap-color-text-muted,#5b616b);margin-top:6px}";
+    ".obj{color:var(--oaap-color-text-muted,#5b616b);margin-top:6px}" +
+    // Dark: fixed values, not the page's variables -- a light theme.css
+    // on a dark app would otherwise paint the dialog light again.
+    ".dark .dlg{background:#1d232a;color:#e8eaed}" +
+    ".dark label,.dark .obj{color:#aab2bd}" +
+    ".dark input,.dark select,.dark textarea{background:#12171c;color:#e8eaed;border-color:#3b444f}" +
+    ".dark pre{background:#2a3139;color:#e8eaed}" +
+    ".dark button.b{background:#2a3139;color:#e8eaed;border-color:#3b444f}" +
+    ".dark button.p{background:#5b8def;color:#fff;border-color:transparent}" +
+    ".dark .err{color:#ff8a80}.dark .ok{color:#7bd88f}";
+
+  /* Which colours the dialog uses, decided when it OPENS (the app may have
+   * switched since load): open({theme}) first, then the app's own setting
+   * <html data-theme="dark|light">, then the operating system. */
+  function darkFor(opts) {
+    var t = opts && opts.theme;
+    if (t === "dark" || t === "light") return t === "dark";
+    var a = document.documentElement.getAttribute("data-theme");
+    if (a === "dark" || a === "light") return a === "dark";
+    return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  }
 
   function mount() {
     if (host) return;
@@ -192,7 +215,7 @@
       msg,
       el("div", { "class": "row" }, [cancel, send])
     ]);
-    var back = el("div", { "class": "back" }, [dlg]);
+    var back = el("div", { "class": darkFor(opts) ? "back dark" : "back" }, [dlg]);
     function close() { if (back.parentNode) back.parentNode.removeChild(back); document.removeEventListener("keydown", onKey, true); }
     function onKey(e) { if (e.key === "Escape") close(); }
     document.addEventListener("keydown", onKey, true);
