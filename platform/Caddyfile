@@ -8,6 +8,15 @@
 	on_demand_tls {
 		ask http://portal:8000/edge/tls-ask
 	}
+	# Requests in flight per listener and host name, read from the admin
+	# API (127.0.0.1:2019, inside the container only) by `oaap` once a
+	# minute: the signal for automatic standby (RFC-0059 stage 3). A
+	# WebSocket is in flight for as long as it is open.
+	servers {
+		metrics {
+			per_host
+		}
+	}
 }
 #
 # Public routes (the only ones, per spec):

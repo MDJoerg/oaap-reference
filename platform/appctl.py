@@ -91,6 +91,7 @@ import cohort  # noqa: E402
 # acting is cmd_metrics.
 import metrics  # noqa: E402
 import traffic  # noqa: E402
+import idle  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -5200,6 +5201,11 @@ def cmd_metrics(args):
     `show` is the same data the health page will draw, as text.
     """
     if args.action == "sample":
+        try:
+            idle_sweep()
+        except Exception as exc:  # noqa: BLE001 -- same rule as below
+            print(f"idle: sweep skipped ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
         try:
             metrics.take_sample(
                 METRICS_DIR, DATA_DIR,
@@ -12221,6 +12227,108 @@ def cmd_maintenance(args):
         n, i, args.switch == "on", args.message, who=who))
 
 
+# --- RFC-0059 stage 3: an unused instance goes to sleep by itself ------
+#
+# Opt-in per instance (`standby_after` minutes on the record, set by
+# `oaap app standby-after`; the cohort template in stage 4). The signal
+# is the gateway's own count of requests in flight (services/idle.py),
+# read once a minute from the same job that samples the metrics. Waking
+# is not new: a visitor who passes the instance's own authentication
+# meets the waking page of stage 1, which wakes it.
+
+IDLE_FILE = os.path.join(DATA_DIR, "data", "idle-state.json")
+STANDBY_AFTER_MIN = 5          # minutes; below this a click pause would sleep a desk
+
+
+def _gateway_get(path):
+    r = subprocess.run(["docker", "exec", GATEWAY_CONTAINER, "wget", "-q", "-O",
+                        "-", "-T", "5", "http://127.0.0.1:2019" + path],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "gateway admin API not answering").strip())
+    return r.stdout
+
+
+def _idle_specs(reg):
+    ext = load_external()
+    out = {}
+    for name, inst in (reg.get("instances") or {}).items():
+        if inst.get("state") in ("standby", "waking"):
+            continue
+        out[name] = {"port": inst.get("port"),
+                     "hosts": instance_auto_hosts(name, inst, ext_host=ext)}
+    return out
+
+
+def idle_sweep(now=None):
+    """One minute of `idle`: read the gateway, update the state file and
+    put to sleep every instance that asked for it and has been unused for
+    its time. Returns the names put to sleep. A gateway that cannot be
+    read changes NOTHING (neither the clock nor any instance)."""
+    now = time.time() if now is None else now
+    reg = load_registry()
+    try:
+        metrics_text = _gateway_get("/metrics")
+        ports = idle.server_ports(_gateway_get("/config/"))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        print(f"idle: gateway numbers unavailable ({exc}); nothing changed",
+              file=sys.stderr)
+        return []
+    try:
+        with open(IDLE_FILE, encoding="utf-8") as f:
+            state = json.load(f).get("instances", {})
+    except (OSError, ValueError):
+        state = {}
+    reads = idle.readings(idle.parse_metrics(metrics_text), ports,
+                          _idle_specs(reg))
+    state = idle.update(state, now, reads)
+    os.makedirs(os.path.dirname(IDLE_FILE), exist_ok=True)
+    tmp = IDLE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "written": _iso_now(), "instances": state}, f)
+    os.replace(tmp, IDLE_FILE)
+    slept = []
+    for name, inst in sorted((reg.get("instances") or {}).items()):
+        after = inst.get("standby_after")
+        if not isinstance(after, int) or after < STANDBY_AFTER_MIN:
+            continue
+        if inst.get("state") or maintenance_of(inst) or deployment_in_flight(name):
+            continue
+        idle_for = idle.idle_minutes(state, name, now)
+        if idle_for is None or idle_for < after:
+            continue
+        try:
+            standby_instance(name, inst, who="auto-standby", role="system")
+        except (DiagnoseRefused, subprocess.SubprocessError, OSError) as exc:
+            print(f"idle: '{name}' not put to sleep ({exc})", file=sys.stderr)
+            continue
+        slept.append(name)
+    return slept
+
+
+def cmd_standby_after(args):
+    """`oaap app standby-after <instance> <minutes>|off`."""
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"unknown instance '{args.name}'")
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.minutes == "off":
+        inst.pop("standby_after", None)
+        msg = "will no longer go to sleep by itself"
+    else:
+        if not args.minutes.isdigit() or int(args.minutes) < STANDBY_AFTER_MIN:
+            die(f"minutes: a number of at least {STANDBY_AFTER_MIN}, or 'off'")
+        inst["standby_after"] = int(args.minutes)
+        msg = (f"goes to sleep after {args.minutes} minutes without use "
+               "(no request in flight, none finished)")
+    save_registry(reg)
+    audit_tenant("instance.standby_after", resolve_tenant(inst.get("tenant"))
+                 or ensure_default_tenant(), subject=args.name, who=who,
+                 role="root", detail=args.minutes)
+    print(f"'{args.name}' {msg}.")
+
+
 # --- RFC-0044: an access (Zugang) into one instance network ------------
 #
 # Stage 1 (2026-09-27, oaap.net.remote-access 0.1): the object, its
@@ -14588,7 +14696,9 @@ def cmd_list(_args):
         print("No app instances installed.")
     for name, i in sorted(reg["instances"].items()):
         mode = ((" -- STANDBY" if i.get("state") in ("standby", "waking") else "")
-                + (" -- MAINTENANCE" if i.get("maintenance") else ""))
+                + (" -- MAINTENANCE" if i.get("maintenance") else "")
+                + (f" -- auto-standby {i['standby_after']} min"
+                   if i.get("standby_after") else ""))
         print(f"{name}: {i['app_name']} {i['version']} [{i['channel']}] port {i['port']} ({i['container']}){mode}")
     # Data an operator still owes somebody an answer about. It used to
     # be invisible: `oaap app remove` said where it kept it, once, and
@@ -23753,6 +23863,12 @@ def main():
                               "(RFC-0059)")
     psb.add_argument("name")
     psb.set_defaults(fn=cmd_standby)
+    psa = sub.add_parser("standby-after",
+                         help="let an unused instance go to sleep by itself "
+                              "after N minutes, or 'off' (RFC-0059 stage 3)")
+    psa.add_argument("name")
+    psa.add_argument("minutes", help="at least 5, or 'off'")
+    psa.set_defaults(fn=cmd_standby_after)
     pwk = sub.add_parser("wake", help="start a sleeping instance (RFC-0059)")
     pwk.add_argument("name")
     pwk.set_defaults(fn=cmd_wake)
