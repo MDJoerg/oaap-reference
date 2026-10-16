@@ -389,6 +389,47 @@ EOF
     || say "  WARNING: the rehearsal sweep timer could not be enabled."
 fi
 
+# --- keys of instances that no longer exist (0.1.202, RFC-0062 D4) ---
+# Before 0.1.202 removing an instance left its platform keys valid, and
+# they answered for the next instance of the same name. Cleared once;
+# silent when there is nothing.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-instance-keys \
+  2>&1 | sed 's/^/  /' || say "  WARNING: orphaned instance keys could not be checked — run 'oaap app instance-keys orphans'."
+
+# --- the instance key renewal timer (RFC-0062 D3) ---
+# An instance key lives 365 days (RFC-0027 D3), and an app whose key
+# expires is refused without a word. Renewed 30 days ahead at 04:30 --
+# after the backup's stop, before the sweeps -- with one recreate of the
+# instance's containers. Idempotent, like the units around it.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+  cat > /etc/systemd/system/oaap-instance-keys.service <<EOF
+[Unit]
+Description=OAAP instance key renewal (RFC-0062: renews what expires within 30 days)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py instance-keys renew --quiet
+EOF
+  cat > /etc/systemd/system/oaap-instance-keys.timer <<'EOF'
+[Unit]
+Description=OAAP instance key renewal, daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# A node that was off at 04:30 still renews: 30 days ahead leaves room,
+# but not for a machine that is never on at night.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-instance-keys.timer >/dev/null 2>&1 \
+    || say "  WARNING: the instance key renewal timer could not be enabled."
+fi
+
 # --- the cohort sweep timer (RFC-0046 5) ---
 # The dates of a course (instances stopped after `ends`, participants
 # deactivated and deleted on their dates). Without it a stored date is

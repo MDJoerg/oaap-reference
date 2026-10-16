@@ -771,6 +771,29 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  # Instance key renewal (RFC-0062 D3): a platform key of an instance that
+  # expires within 30 days is renewed at night, with one recreate of the
+  # instance's containers. An app whose key expired is refused without a word.
+  cat > /etc/systemd/system/oaap-instance-keys.service <<EOF
+[Unit]
+Description=OAAP instance key renewal (RFC-0062: renews what expires within 30 days)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py instance-keys renew --quiet
+EOF
+  cat > /etc/systemd/system/oaap-instance-keys.timer <<'EOF'
+[Unit]
+Description=OAAP instance key renewal, daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   # Cohort sweep (RFC-0046 5): the dates of a course -- instances stopped
   # after `ends`, participants deactivated and deleted on their dates.
   # It never deletes an instance or its storage (RFC-0030 D4).
@@ -849,6 +872,7 @@ EOF
   systemctl enable --now oaap-deployd.path >/dev/null 2>&1 || true
   systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-cohort-sweep.timer >/dev/null 2>&1 || true
+  systemctl enable --now oaap-instance-keys.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."

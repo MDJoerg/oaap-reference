@@ -9105,6 +9105,209 @@ def _cases_issue_submit_key(name, tenant_id):
     return json.loads(out)
 
 
+# ------------------------------------- instance keys follow the instance
+#
+# RFC-0062. Identity and the twin find the instance a key speaks for by
+# the NAME in its principal, `instance:<name>`. Until 0.1.202 nothing
+# managed the keys' life: measured on oaap-test (2026-10-16), a key stayed
+# valid after `remove --purge` and, once a different app was installed
+# under the same name, answered AS that app (authorization 200 with the
+# new app; case door 201 recorded as the new app). So:
+#   D1  removal revokes, deletes the principal and the authorization
+#       record, and takes the keys out of a kept instance.env;
+#   D2  rename reissues under the new name;
+#   D3  a key that expires within RENEW_DAYS is renewed at night;
+#   D4  an update step clears what already lies on a node.
+
+# env variable -> what it is. One table, read by every step above.
+INSTANCE_KEY_VARS = ("OAAP_PLATFORM_KEY", "OAAP_AUTHZ_KEY",
+                     "OAAP_AUTHZ_ADMIN_KEY", "OAAP_CASES_KEY")
+RENEW_DAYS = 30
+
+
+def _key_id(token):
+    """The id inside a bearer token (`oaapk_<id>_<secret>`), or ""."""
+    parts = str(token or "").split("_")
+    return parts[1] if len(parts) >= 3 and parts[0] == "oaapk" else ""
+
+
+def instance_keys_retire(name, keep_authz=False):
+    """Revoke every key of `instance:<name>`, delete the principal, drop the
+    instance's authorization record (unless keep_authz). Returns
+    {'revoked': [...], 'deleted': bool, 'authz': <the dropped record>}."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "inst = os.environ['OAAP_T_INST']\n"
+        "p = 'instance:' + inst\n"
+        "revoked = [k['id'] for k in m.load_keys()\n"
+        "           if k['principal'] == p and not k['revoked']]\n"
+        "for kid in revoked:\n"
+        "    m.revoke_key(kid)\n"
+        "deleted = False\n"
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, p)\n"
+        "    if u and u.get('kind') == 'machine':\n"
+        "        res = m._delete_user(p, users, 'oaap (RFC-0062)', 'server_admin', '')\n"
+        "        deleted = not isinstance(res, tuple)\n"
+        "rec = None\n"
+        "if os.environ.get('OAAP_T_KEEP') != '1':\n"
+        "    with m.authz_rw() as st:\n"
+        "        rec = st['instances'].pop(inst, None)\n"
+        "        if rec is not None:\n"
+        "            m.save_authz(st)\n"
+        "print(json.dumps({'revoked': revoked, 'deleted': deleted, 'authz': rec}))\n",
+        {"OAAP_T_INST": name, "OAAP_T_KEEP": "1" if keep_authz else "0"})
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def instance_keys_issue(name, tenant_id, app_id, which, administer=False, port=None):
+    """Mint the keys named in `which` (env variables) for `instance:<name>`.
+    Returns {variable: token}, plus OAAP_CASES_URL when the case key is
+    among them and a port is known."""
+    out = {}
+    for var in which:
+        if var == "OAAP_PLATFORM_KEY":
+            out[var] = _twin_issue_instance_key(name, tenant_id)
+        elif var == "OAAP_AUTHZ_KEY":
+            out[var] = _authz_issue_instance_key(name, tenant_id, app_id)
+        elif var == "OAAP_AUTHZ_ADMIN_KEY":
+            out[var] = _authz_issue_instance_key(name, tenant_id, app_id,
+                                                 AUTHZ_ADMIN_KEY_SCOPE)
+            if administer:
+                _authz_set_administer(name, tenant_id, app_id, True)
+        elif var == "OAAP_CASES_KEY":
+            out[var] = _cases_issue_submit_key(name, tenant_id)
+            if port:
+                out["OAAP_CASES_URL"] = (f"http://{GATEWAY_CONTAINER}:{port}"
+                                         "/platform/cases/submit")
+    return out
+
+
+def _instance_tenant_id(inst):
+    return resolve_tenant((inst or {}).get("tenant")) or (inst or {}).get("tenant") or ""
+
+
+def _identity_key_records(principal_prefix="instance:"):
+    """Every key record of the instance principals, as identity holds them."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "p = os.environ['OAAP_T_PREFIX']\n"
+        "print(json.dumps([k for k in m.load_keys() if str(k['principal']).startswith(p)]))\n",
+        {"OAAP_T_PREFIX": principal_prefix})
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def renew_instance_keys(days=RENEW_DAYS, dry_run=False, only=None, now=None):
+    """D3: renew every platform key of every instance that expires within
+    `days` (or is unknown to identity, or revoked -- a key in an instance's
+    environment that no longer works is the same outage, earlier). A
+    running instance's containers are recreated so the app gets the new
+    key; then the old one is revoked. A sleeping instance gets the new key
+    in its environment and the old one revoked at once -- waking recreates
+    its containers anyway. Returns a list of (instance, variable, reason)."""
+    import datetime
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    horizon = (now + datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    recs = {k["id"]: k for k in _identity_key_records()}
+    reg = load_registry()
+    sleeping, _maint = mode_keys()
+    done = []
+    for name, inst in sorted((reg.get("instances") or {}).items()):
+        if only and name != only:
+            continue
+        if is_rehearsal(inst):
+            continue
+        env = load_env(name, inst)
+        due = []
+        for var in INSTANCE_KEY_VARS:
+            if not env.get(var):
+                continue
+            rec = recs.get(_key_id(env[var]))
+            if rec is None:
+                due.append((var, "unknown to identity"))
+            elif rec.get("revoked"):
+                due.append((var, "revoked"))
+            elif rec.get("expires") and rec["expires"][:19] <= horizon:
+                due.append((var, f"expires {rec['expires'][:10]}"))
+        if not due:
+            continue
+        done += [(name, v, why) for v, why in due]
+        if dry_run:
+            continue
+        old_ids = [_key_id(env[v]) for v, _ in due]
+        tid = _instance_tenant_id(inst)
+        admin = bool(_authz_instance_record(name).get("administer"))
+        fresh = instance_keys_issue(name, tid, inst.get("app_id", ""),
+                                    [v for v, _ in due], administer=admin,
+                                    port=inst.get("port"))
+        env.update(fresh)
+        save_env(name, env, inst)
+        if name not in sleeping and (inst.get("image") or inst.get("services")):
+            recreate_instance_containers(name, instance_services(inst),
+                                         inst.get("storage") or [],
+                                         inst.get("endpoints") or [], inst=inst)
+        _identity_exec(
+            "import os, app as m\n"
+            "for kid in os.environ['OAAP_T_IDS'].split(','):\n"
+            "    if kid:\n"
+            "        m.revoke_key(kid)\n",
+            {"OAAP_T_IDS": ",".join(i for i in old_ids if i)})
+    return done
+
+
+def cmd_instance_keys(args):
+    """`oaap app instance-keys renew|orphans` (RFC-0062)."""
+    if args.action == "renew":
+        done = renew_instance_keys(days=args.days, dry_run=args.dry_run,
+                                   only=args.name or None)
+        if not done:
+            if not args.quiet:
+                print(f"No instance key expires within {args.days} days.")
+            return
+        verb = "would renew" if args.dry_run else "renewed"
+        for name, var, why in done:
+            print(f"{name}: {var} {verb} ({why})")
+        return
+    if args.action == "orphans":
+        cmd_migrate_instance_keys(args)
+
+
+def cmd_migrate_instance_keys(_args):
+    """D4: principals `instance:<name>` and authorization records whose
+    instance is gone -- the keys of a removed instance before 0.1.202.
+    Revoked and deleted once; silent when there is nothing to do."""
+    names = set((load_registry().get("instances") or {}))
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "names = set(json.loads(os.environ['OAAP_T_NAMES']))\n"
+        "users = m.load_users()\n"
+        "gone = sorted(u['username'][9:] for u in users\n"
+        "              if str(u.get('username', '')).startswith('instance:')\n"
+        "              and u.get('kind') == 'machine' and u['username'][9:] not in names)\n"
+        "live = sorted({k['principal'][9:] for k in m.load_keys()\n"
+        "               if str(k['principal']).startswith('instance:') and not k['revoked']\n"
+        "               and k['principal'][9:] not in names})\n"
+        "recs = sorted(n for n in m.load_authz()['instances'] if n not in names)\n"
+        "print(json.dumps({'principals': sorted(set(gone) | set(live)), 'authz': recs}))\n",
+        {"OAAP_T_NAMES": json.dumps(sorted(names))})
+    found = json.loads(out.strip().splitlines()[-1])
+    if not found["principals"] and not found["authz"]:
+        return
+    print("")
+    print("Retiring keys of instances that no longer exist (RFC-0062) ...")
+    revoked = 0
+    for n in found["principals"]:
+        res = instance_keys_retire(n)
+        revoked += len(res["revoked"])
+    for n in found["authz"]:
+        if n not in found["principals"]:
+            instance_keys_retire(n)
+    print(f"  {revoked} key(s) revoked, {len(found['principals'])} principal(s) "
+          f"and {len(found['authz'])} authorization record(s) cleared"
+          + (f": {', '.join(found['principals'] + [a for a in found['authz'] if a not in found['principals']])}"
+             if found["principals"] or found["authz"] else "") + ".")
+
+
 def cases_submit_wanted(m):
     """Does this manifest ask to open cases from its backend? Only a
     literal `cases: {submit: true}` -- "yes" is a typo, not a request."""
@@ -15296,6 +15499,33 @@ def remove_instance(reg, name, purge):
         purge = True
         print(f"'{local}' is a rehearsal — its copy of production data is "
               "deleted with it (RFC-0030 D4).")
+    # RFC-0062 D1: the platform's keys go with the instance -- with AND
+    # without --purge. Otherwise a key of this instance answers for the
+    # next instance of the same name (measured: authorization 200 AS the
+    # new app). Best effort, like closing the admin door above: identity
+    # down must not block a removal, and the update step (D4) finds what
+    # was left.
+    try:
+        res = instance_keys_retire(name)
+        if res["revoked"] or res["deleted"] or res["authz"]:
+            print(f"Retired the platform keys of '{local}' (RFC-0062): "
+                  f"{len(res['revoked'])} key(s) revoked"
+                  + (", principal deleted" if res["deleted"] else "")
+                  + (", authorization record dropped" if res["authz"] else "")
+                  + ".")
+    except (Exception, SystemExit) as e:        # noqa: BLE001
+        print(f"WARNING: could not retire the keys of '{local}': {e}. "
+              "The next `oaap update` clears them (RFC-0062 D4).")
+    if not purge:
+        # The kept instance.env is what a reinstall under this name reads.
+        # Without its keys the reinstall mints fresh ones (it does so for
+        # any variable that is absent), and nothing of this instance's
+        # credentials reaches the next one.
+        env = load_env(name, inst)
+        kept_env = {k: v for k, v in env.items()
+                    if k not in INSTANCE_KEY_VARS and k != "OAAP_CASES_URL"}
+        if kept_env != env:
+            save_env(name, kept_env, inst)
     if purge:
         shutil.rmtree(data_dir, ignore_errors=True)
         kept.pop(retained_key(tid, local), None)
@@ -15427,7 +15657,38 @@ def rekey_instance(reg, old_key, new_key, grace):
     old_site = os.path.join(CADDY_APPS_DIR, f"{old_key}.caddy")
     if os.path.isfile(old_site):
         os.remove(old_site)
+    # ... and the LAN site written again under the new key -- always, also
+    # when the old one was already missing. Since 0.1.61 a rename removed
+    # it and wrote nothing back: the instance's LAN port answered nothing
+    # until its next deployment (its names kept working --
+    # refresh_generated_sites rebuilds those). Found on oaap-test
+    # 2026-10-16, because the case door (RFC-0061 §3.2) is reached through
+    # exactly that port.
+    if inst.get("routes") and inst.get("port") and inst.get("svc_port"):
+        write_app_caddy(new_key, inst)
 
+    # RFC-0062 D2: the platform's keys belong to `instance:<key>`, and the
+    # key just changed. Reissued under the new name BEFORE the containers
+    # are recreated below, so the app starts with keys that work; the old
+    # principal goes, so a later instance under the old name shares nothing
+    # with this one. Before 0.1.202 a rename left the twin refusing the
+    # instance and the case key failing at its own door.
+    env = load_env(new_key, inst)
+    had = [v for v in INSTANCE_KEY_VARS if env.get(v)]
+    if had:
+        try:
+            old = instance_keys_retire(old_key)
+            env.update(instance_keys_issue(
+                new_key, _instance_tenant_id(inst), inst.get("app_id", ""), had,
+                administer=bool((old.get("authz") or {}).get("administer")),
+                port=inst.get("port")))
+            save_env(new_key, env, inst)
+            print(f"Reissued {len(had)} platform key(s) under the new name "
+                  f"'{new_key}' (RFC-0062).")
+        except (Exception, SystemExit) as e:    # noqa: BLE001
+            print(f"WARNING: the platform keys could not be reissued: {e}. "
+                  f"Run `oaap app instance-keys renew --name {new_key}` -- it reissues "
+                  "keys that no longer work.")
     # A record that never got containers -- one restored from a backup,
     # or half-installed -- has nothing to rebuild, and saying so beats
     # failing a rename over it.
@@ -24609,6 +24870,22 @@ def main():
                          help="internal: carry RFC-0040's identity headers "
                               "into sites written before 0.1.107")
     pmi.set_defaults(fn=cmd_migrate_identity_headers)
+    pik = sub.add_parser("instance-keys",
+                         help="the platform's keys of each instance (RFC-0062): "
+                              "renew those that expire soon, or clear orphans")
+    pik.add_argument("action", choices=["renew", "orphans"])
+    pik.add_argument("--days", type=int, default=RENEW_DAYS,
+                     help=f"renew what expires within this many days "
+                          f"(default {RENEW_DAYS})")
+    pik.add_argument("--name", default="", help="only this instance (its key)")
+    pik.add_argument("--dry-run", action="store_true", help="say, change nothing")
+    pik.add_argument("--quiet", action="store_true",
+                     help="say nothing when nothing is due (the nightly timer)")
+    pik.set_defaults(fn=cmd_instance_keys)
+    pmk = sub.add_parser("migrate-instance-keys",
+                         help="internal: retire keys, principals and authorization "
+                              "records of instances that no longer exist (RFC-0062 D4)")
+    pmk.set_defaults(fn=cmd_migrate_instance_keys)
     pmp = sub.add_parser("migrate-platform-routes",
                          help="internal: reserve /platform/* on instance "
                               "sites written before 0.1.199 (RFC-0061)")
