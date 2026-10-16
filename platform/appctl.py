@@ -2087,7 +2087,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 7      # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 8      # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -2095,7 +2095,9 @@ MANIFEST_MINOR = 7      # 0.2 adds app.class (runtime spec 2.10);
                         # (oaap.net.destinations 0.1, RFC-0033);
                         # 0.6 adds authorization (oaap.core.authorization 0.1,
                         # RFC-0045); 0.7 adds services.<name>.shm (runtime
-                        # spec 2.20 -- a desktop in the browser needs it)
+                        # spec 2.20 -- a desktop in the browser needs it);
+                        # 0.8 adds services.<name>.tun (runtime spec 2.23,
+                        # RFC-0060 -- a VPN client needs it)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -8033,6 +8035,11 @@ def validate_manifest(m):
                     parse_shm(svc["shm"])
                 except ValueError as e:
                     errs.append(f"services.{sname}.shm: {e}")
+            # Manifest 0.8 (runtime spec 2.23, RFC-0060): a tunnel device
+            # for this one container. A boolean, nothing else -- "yes" is a
+            # typo, and a typo must not decide whether a door opens.
+            if "tun" in svc and not isinstance(svc["tun"], bool):
+                errs.append(f"services.{sname}.tun: true or false")
         multi = len(services) > 1
         routes = m.get("routes") or []
         if not routes:
@@ -10698,6 +10705,48 @@ def resources_sum(instances):
     return total, limited, free
 
 
+# What `tun: true` grants (runtime spec 2.23, RFC-0060 D1): the device
+# and the one capability, for one container. Nothing more is ever added
+# here -- no --privileged, no host network, no other capability.
+TUN_ARGS = ["--device", "/dev/net/tun", "--cap-add", "NET_ADMIN"]
+
+
+def tun_args(service, rehearsal=False):
+    """`docker run` flags for a recorded service's `tun`. Only the
+    literal `True` grants: the record is data on disk, and a hand-edited
+    "yes" or 1 must neither open the door nor break the `docker run`.
+    A rehearsal never gets it (D6), whatever its record says."""
+    if rehearsal or not isinstance(service, dict) or service.get("tun") is not True:
+        return []
+    return list(TUN_ARGS)
+
+
+def tun_refusal(m, inst, rehearsal, confirmed):
+    """Why an install must stop before it builds anything, or ''
+    (runtime spec 2.23, RFC-0060 D2). Asked once, for a service that
+    does not hold the grant yet; a redeploy that keeps it does not ask
+    again, a rehearsal gets nothing and is not asked."""
+    if confirmed or rehearsal:
+        return ""
+    multi = len(m.get("services") or {}) > 1
+    held = {s.get("service", "") for s in instance_services(inst)
+            if s.get("tun") is True} if inst else set()
+    new = [sname for sname, svc in (m.get("services") or {}).items()
+           if isinstance(svc, dict) and svc.get("tun") is True
+           and (sname if multi else "") not in held]
+    if not new:
+        return ""
+    return (f"'{m['app']['id']}' asks for a network tunnel (services."
+            f"{', services.'.join(new)}: tun: true). That container gets the "
+            "device /dev/net/tun and NET_ADMIN: it may create a tunnel and "
+            "change routes, addresses and packet filters INSIDE ITS OWN "
+            "container -- not on this host, not in another container. What "
+            "goes through the tunnel is the app's promise, not the "
+            "platform's. Nothing was built. Only the node's operator can "
+            "accept this: install again from the command line with "
+            "--confirm-tun (oaap.apps.runtime 2.23, RFC-0060).")
+
+
 def recreate_instance_containers(name, services, storage, endpoints=None,
                                  inst=None):
     """(Re)create ALL of an instance's service containers on its own
@@ -10759,13 +10808,18 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
         # recorded at install, not an operator limit: it travels with
         # the service record through every door that recreates.
         shm = shm_args(s)
+        # Manifest 0.8 (2.23): the tunnel grant, from the same record by
+        # the same rule -- and never for a rehearsal, asked of the
+        # registry and of what the caller handed in, because a new
+        # rehearsal has no registry record yet at its first creation.
+        tun = tun_args(s, rehearsal=is_rehearsal(stored) or is_rehearsal(inst))
         # RFC-0059: a sleeping instance is re-made but NOT started -- this is
         # the one place every door passes, so a configuration save, a
         # redeploy or an update cannot wake it by accident.
         verb = ["create"] if stored.get("state") == "standby" else ["run", "-d"]
         done = run(["docker", *verb, "--name", s["container"],
                     "--restart", "unless-stopped", "--network", net, *alias,
-                    *CONTAINER_LOG_OPTS, *limits, *shm,
+                    *CONTAINER_LOG_OPTS, *limits, *shm, *tun,
                     "--env-file", env_path(name, inst), *mounts, *publish,
                     s["image"]])
         # A kernel without the memory cgroup (a Raspberry Pi as shipped)
@@ -14256,6 +14310,14 @@ def _install_from_dir(pkg, args, source):
     # registers: it shares the production app id and must not move what
     # the production tenant's roles are built on.
     authz_decl, authz_admin = authz_split_section(m.get("authorization"))
+    # Runtime spec 2.23 (RFC-0060 D2): a tunnel is a door the node's
+    # operator must know about -- asked HERE, before anything is built,
+    # and only the command line can say yes (no other door sets it).
+    if not is_artefact:
+        why = tun_refusal(m, inst, rehearsal,
+                          getattr(args, "confirm_tun", False))
+        if why:
+            die(why)
     if not is_artefact and not rehearsal:
         why = authz_admin_refusal(
             app["id"], authz_admin, _authz_admin_open(name),
@@ -14374,6 +14436,14 @@ def _install_from_dir(pkg, args, source):
         # container gets, at every (re)creation, from this record.
         if svc.get("shm") is not None:
             rec["shm"] = parse_shm(svc["shm"])
+        # Manifest 0.8 (2.23): confirmed above, recorded here, applied by
+        # recreate_instance_containers. A rehearsal records nothing (D6).
+        if svc.get("tun") is True:
+            if rehearsal:
+                print(f"NOTE: service '{sname}' declares tun, but a rehearsal "
+                      "gets no tunnel (RFC-0060 D6) -- created without it.")
+            else:
+                rec["tun"] = True
         services.append(rec)
 
     primary = services[0]
@@ -23715,6 +23785,11 @@ def main():
                          "can create roles, collections, assignments and "
                          "mappings for that tenant (oaap.core.authorization "
                          "2.10)")
+    pi.add_argument("--confirm-tun", dest="confirm_tun", action="store_true",
+                    help="accept an app whose service declares tun: true -- "
+                         "that container gets /dev/net/tun and NET_ADMIN "
+                         "inside its own namespace (oaap.apps.runtime 2.23, "
+                         "RFC-0060)")
     pi.add_argument("--confirm-authorization", dest="confirm_authorization",
                     action="store_true",
                     help="accept a version that REMOVES something it had "
