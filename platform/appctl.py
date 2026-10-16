@@ -17460,7 +17460,7 @@ def _cohort_standby_cmd(args):
         bad.append("not a number")
     if bad or minutes is None:
         die("standby_after: whole minutes, at least "
-            f"{cohort.STANDBY_AFTER_MIN}, or \"off\" ({'; '.join(bad)})")
+            f"{cohort.STANDBY_AFTER_MIN}, or \"off\" (got '{args.second}')")
     tpl, tdir = _cohort_template(rec)
     path = os.path.join(tdir, cohort.TEMPLATE_FILE)
     with open(path, encoding="utf-8", newline="") as f:
