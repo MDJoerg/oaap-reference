@@ -16639,16 +16639,23 @@ def cmd_user(args):
         u = json.loads(out.strip().splitlines()[-1])
         if u is None:
             die(f"no such user: {args.username}")
-        print(f"This DELETES the user '{u['username']}' "
+        # A forewarning, worded as one. Until 2026-10-16 it said "The record
+        # is gone for good" BEFORE identity was asked -- and when identity
+        # refused (a key still valid), that sentence stood alone on stdout,
+        # and through a pipe it even arrived after the error. Flushed here
+        # so it cannot overtake the answer.
+        print(f"About to DELETE the user '{u['username']}' "
               f"(id {u['id']}, tenant {tenant_label(u['tenant']) or 'default'}, "
               f"roles {','.join(u['roles'])}).")
-        print("The record is gone for good; the audit log keeps the name and the id.")
+        print("Once deleted, the record cannot be restored; the audit log "
+              "keeps the name and the id.", flush=True)
         if not args.yes:
             if input(f"Type the username to confirm: ").strip() != u["username"]:
                 die("not confirmed -- nothing was deleted")
         code, res = identity_user_delete(args.username)
         if code != 200:
-            die(res.get("error") or f"identity answered {code}")
+            die("nothing was deleted -- "
+                + (res.get("error") or f"identity answered {code}"))
         print(f"User '{args.username}' deleted.")
         return
 
