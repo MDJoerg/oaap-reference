@@ -97,7 +97,10 @@ def readings(metrics, ports_of, instances):
     for name, spec in instances.items():
         servers = by_port.get(spec.get("port"), set()) if spec.get("port") else set()
         hosts = {h.lower() for h in spec.get("hosts") or [] if h}
-        row = {"inflight": 0, "done": 0, "seen": False}
+        # A listener the gateway HAS is seen even before its first request:
+        # Caddy writes no number for a server nobody has talked to, and an
+        # instance nobody uses is exactly the one that must be found.
+        row = {"inflight": 0, "done": 0, "seen": bool(servers)}
         for (srv, host), r in metrics.items():
             # the port-wise server also carries the "(other)" host label,
             # so everything on that listener is this instance's

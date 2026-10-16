@@ -76,6 +76,9 @@ ok("der Host-Name zaehlt, auch auf einem fremden Listener",
    rd["desk"]["inflight"] == 2 and rd["desk"]["done"] == 7, rd)
 ok("eine nie gesehene Instanz ist 'unbekannt', nicht 'ruhig'",
    not rd["ghost"]["seen"], rd)
+rq = idle.readings({}, ports, {"crm": {"port": 8101, "hosts": []}})
+ok("ein Listener ohne jede Zahl (nie angesprochen) ist gesehen und ruhig",
+   rq["crm"]["seen"] and rq["crm"]["inflight"] == 0, rq)
 
 print("")
 print("Ruhe und Benutzung")
