@@ -192,6 +192,21 @@ reg = m.load_registry()
 reg["instances"]["vorgaenge"].pop("rehearsal")
 m.save_registry(reg)
 m.refresh_cases_sites()
+# Gemessen auf oaapx01 (16.10.): der Mandant hatte nur einen TEST-Eingang,
+# und die Produktions-App zeigte darauf. Echte Meldungen gehoeren nicht
+# in eine Testinstanz.
+reg = m.load_registry()
+reg["instances"]["vorgaenge"]["channel"] = "test"
+m.save_registry(reg)
+m.refresh_cases_sites()
+ok("nur ein Test-Eingang: die Produktions-App meldet NICHT dorthin (404)",
+   "respond 404" in (block(site("hbvp-portal"), "handle /platform/feedback {") or []))
+ok("… die Test-App schon",
+   "reverse_proxy oaap-app-vorgaenge:8000 {" in (block(site("hbvp-portal-test"), "handle /platform/feedback {") or []))
+reg = m.load_registry()
+reg["instances"]["vorgaenge"]["channel"] = "production"
+m.save_registry(reg)
+m.refresh_cases_sites()
 # Eine Generalprobe als QUELLE: sie bedient keinen oeffentlichen Block
 # (RFC-0030 2.15.2) -- auch die beiden /platform-Bloecke nicht.
 lazy = "\n".join(m.site_body(reg["instances"]["fremd"]["routes"], "oaap-app-fremd",

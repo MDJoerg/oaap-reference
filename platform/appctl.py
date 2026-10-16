@@ -9746,8 +9746,12 @@ def cases_target(insts, scope):
 
     Same tenant always -- the boundary is the point. Among several, the
     one on the source's own channel (a test app reports into a test
-    inbox), else production, else the first by name. A rehearsal never
-    receives: it is a copy of production data that disappears.
+    inbox), else -- for a test app only -- production. A production app
+    NEVER reports into a test inbox: its reporters are real people, and
+    a test instance is where code is tried, not where their words
+    belong (measured on oaapx01, 2026-10-16: hbvp-portal pointed at the
+    tenant's only, test, inbox). A rehearsal never receives: it is a
+    copy of production data that disappears.
     """
     me = insts.get(scope)
     if not me:
@@ -9757,12 +9761,10 @@ def cases_target(insts, scope):
                    if i.get("app_id") == CASES_APP_ID and not is_rehearsal(i)
                    and instance_tenant_ref(i) == tenant
                    and i.get("container") and i.get("svc_port"))
-    if not cands:
-        return ""
-    pick = (next((i for _, i in cands if i.get("channel") == me.get("channel")), None)
-            or next((i for _, i in cands if i.get("channel") == "production"), None)
-            or cands[0][1])
-    return f"{pick['container']}:{pick['svc_port']}"
+    same = [i for _, i in cands if i.get("channel") == me.get("channel")]
+    prod = [i for _, i in cands if i.get("channel") == "production"]
+    pick = (same or (prod if me.get("channel") != "production" else []) or [None])[0]
+    return f"{pick['container']}:{pick['svc_port']}" if pick else ""
 
 
 def cases_marker(insts, scope):
