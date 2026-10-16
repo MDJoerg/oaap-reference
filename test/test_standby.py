@@ -331,6 +331,48 @@ if pa is not None:
              ).get_json() == {"asleep": False})
     ok("eine unbekannte Instanz: 404", c.get("/wake/nix", headers=H).status_code == 404)
 
+    # The page's own script, run with a stubbed browser: once the instance is
+    # up, the address answers with the APP's page (HTML), not our JSON -- the
+    # page must reload then, not poll forever (measured by Joerg, 2026-10-16).
+    import shutil
+    import subprocess as sp
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node is None:
+        print("SKIP  kein node: das Skript der Weckseite wurde nicht ausgefuehrt")
+    else:
+        page = c.get("/wake/crm", headers=H).get_data(as_text=True)
+        script = page.split("<script>")[1].split("</script>")[0]
+        harness = """
+let reloads = 0, calls = 0;
+global.location = {href: "http://x/", reload(){ reloads++; }};
+const mode = process.argv[2];
+global.fetch = (url, opt) => { calls++;
+  if (opt && opt.method === "POST") return Promise.resolve({});
+  const h = {get: () => mode === "html" ? "text/html" : "application/json"};
+  return Promise.resolve({headers: h, json: async () => { if (mode === "html") throw new SyntaxError("Unexpected token <"); return {asleep: mode === "asleep"}; }}); };
+global.setTimeout = (f, ms) => { setImmediate(f); return 0; };
+""" + script.replace("setTimeout(", "setTimeout(") + """
+setTimeout2 = null;
+new Promise(r => setImmediate(() => setImmediate(() => setImmediate(() => r())))).then(() => {
+  console.log(JSON.stringify({reloads: reloads, polled: calls > 1})); process.exit(0); });
+"""
+        def run_mode(mode):
+            hf = os.path.join(DATA, "wakepage-harness.js")
+            with open(hf, "w", encoding="utf-8") as f:
+                f.write(harness)
+            # Popen, not run: this test replaces subprocess.run with a fake
+            pr = sp.Popen([node, hf, mode], stdout=sp.PIPE, stderr=sp.PIPE,
+                          text=True, encoding="utf-8")
+            out, err = pr.communicate(timeout=20)
+            return (json.loads(out.strip().splitlines()[-1]) if out.strip()
+                    else {"rc": pr.returncode, "err": err[-400:]})
+        ok("Weckseite: antwortet die Adresse mit HTML (App ist da) -> neu laden",
+           run_mode("html").get("reloads", 0) >= 1, run_mode("html"))
+        ok("Weckseite: asleep=false -> neu laden",
+           run_mode("awake").get("reloads", 0) >= 1, run_mode("awake"))
+        ok("Weckseite: asleep=true -> weiter fragen, nicht laden",
+           run_mode("asleep").get("reloads", 1) == 0, run_mode("asleep"))
+
     print("")
     print("Portal-Knoepfe (Stufe 2): dieselben Auftraege wie die CLI")
     ROLES = ["server_admin"]

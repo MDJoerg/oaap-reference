@@ -8935,8 +8935,13 @@ animation:m 1.4s ease-in-out infinite}
 <script>
 var auto = {{ 'true' if auto else 'false' }};
 function poll(){fetch(location.href,{headers:{Accept:"application/json"},
- credentials:"same-origin",cache:"no-store"}).then(function(r){return r.json()})
- .then(function(j){ if(!j.asleep){location.reload();} else {setTimeout(poll,2000);} })
+ credentials:"same-origin",cache:"no-store"}).then(function(r){
+ var t=r.headers.get("content-type")||"";
+ /* once the instance is up this address is ITS page, not this one: anything
+    that is not our JSON answer means the way is open */
+ if(t.indexOf("json")<0){setTimeout(function(){location.reload();},500);return null;}
+ return r.json();})
+ .then(function(j){ if(!j)return; if(!j.asleep){location.reload();} else {setTimeout(poll,2000);} })
  .catch(function(){setTimeout(poll,3000);});}
 if(auto){fetch(location.href,{method:"POST",credentials:"same-origin"})
  .then(function(){poll();}).catch(function(){poll();});}
