@@ -17187,6 +17187,86 @@ def _cohort_extend(args):
               f"oaap cohort start {rec['name']}")
 
 
+def _cohort_standby_cmd(args):
+    """Change the cohort's idle limit later (RFC-0059 stage 4).
+
+    The stored template gets the new head value (comments stay), and the
+    instances of the cohort follow it -- except an app that names its own
+    `standby_after`, which keeps it (the app wins, RFC-0046). Nothing is
+    restarted, nothing is woken or put to sleep: the idle sweep decides.
+    """
+    rec = find_cohort(args.target, args.tenant)
+    if not args.second:
+        die("usage: oaap cohort standby-after <cohort> <minutes|off> [--dry-run]")
+    raw = args.second.strip().lower()
+    bad = []
+    if raw == "off":
+        minutes = 0
+    elif raw.isdigit():
+        minutes = cohort.standby_after_value(int(raw), "standby_after", bad)
+    else:
+        minutes = None
+        bad.append("not a number")
+    if bad or minutes is None:
+        die("standby_after: whole minutes, at least "
+            f"{cohort.STANDBY_AFTER_MIN}, or \"off\" ({'; '.join(bad)})")
+    tpl, tdir = _cohort_template(rec)
+    path = os.path.join(tdir, cohort.TEMPLATE_FILE)
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    nl = "\r\n" if "\r\n" in text else "\n"
+    line = f"standby_after: {minutes if minutes else 'off'}"
+    head = re.compile(r"(?m)^standby_after:[^\r\n]*")
+    if head.search(text):
+        new_text = head.sub(line, text, count=1)
+    elif re.search(r"(?m)^apps:", text):
+        new_text = re.sub(r"(?m)^apps:", lambda m: line + nl + "apps:", text, count=1)
+    else:
+        die("the stored template has no 'apps:' line to put the value before")
+    old = int(tpl.get("standby_after") or 0)
+    new_tpl = dict(tpl, standby_after=minutes)
+    reg = load_registry()
+    plan, own = [], []
+    for _sid, app_name, key in _cohort_instances(rec):
+        app = next((x for x in tpl["apps"] if x["name"] == app_name), None)
+        inst = reg["instances"].get(key)
+        if app is None or inst is None:
+            continue
+        if app.get("standby_after") is not None:
+            if app_name not in own:
+                own.append(app_name)
+            continue
+        want = _cohort_standby_after(new_tpl, app)
+        if int(inst.get("standby_after") or 0) != want:
+            plan.append((key, want))
+    shown = lambda m: f"{m} min" if m else "off"
+    verb = "would set" if args.dry_run else "sets"
+    print(f"Cohort '{rec['name']}': idle limit {shown(old)} -> {shown(minutes)}")
+    for key, want in plan:
+        print(f"  {key}: {verb} {shown(want)}")
+    if own:
+        print(f"  {', '.join(own)}: names its own standby_after -- kept")
+    if not plan:
+        print("  no instance needed a change.")
+    if args.dry_run:
+        print("(dry run) nothing changed.")
+        return
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(new_text)
+    try:
+        cohort.load(tdir)
+    except cohort.TemplateError as e:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        die("the changed template would be unusable, nothing was changed: "
+            + "; ".join(e.problems))
+    for key, want in plan:
+        _cohort_apply_standby_after(key, want)
+    _cohort_audit("cohort.standby_after", rec,
+                  detail=f"{shown(old)} -> {shown(minutes)}, {len(plan)} instance(s)")
+    print("The idle sweep decides when an instance sleeps; nothing was put to sleep now.")
+
+
 def _cohort_material(args):
     if args.target != "update" or not args.second or not args.third:
         die("usage: oaap cohort material update <cohort> <directory>")
@@ -17798,6 +17878,8 @@ def cmd_cohort(args):
         return _cohort_power(args, act == "start")
     if act == "extend":
         return _cohort_extend(args)
+    if act == "standby-after":
+        return _cohort_standby_cmd(args)
     if act == "material":
         return _cohort_material(args)
     if act == "handout":
@@ -24003,10 +24085,12 @@ def main():
     pcoh = sub.add_parser("cohort",
                           help="a training landscape from one template "
                                "(RFC-0046): create, add, reset, list, stop, "
-                               "start, material, handout, export, remove, secret, sweep, extend")
+                               "start, material, handout, export, remove, secret, sweep, extend, "
+                               "standby-after")
     pcoh.add_argument("action", choices=["create", "add", "reset", "list", "stop",
                                          "start", "material", "handout", "export",
-                                         "remove", "secret", "sweep", "extend"])
+                                         "remove", "secret", "sweep", "extend",
+                                         "standby-after"])
     pcoh.add_argument("target", nargs="?",
                       help="create: the template directory; otherwise the "
                            "cohort (material: `update`; secret: set|list|remove)")

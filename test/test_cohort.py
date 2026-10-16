@@ -726,7 +726,7 @@ a.identity_user_delete = sweep_delete
 
 t_sw = template(os.path.join(WORK, "t-sweep"),
                 mutate=lambda t: t.replace("kurs-2026-10", "kurs-sweep"))
-code, out = cli("create", target=t_sw, handout_file=os.path.join(WORK, "out", "hs.csv"))
+code, out = cli("create", target=t_sw, handout_file=os.path.join(WORK, "out", "hsb.csv"))
 rec = a.load_cohort(TID, "kurs-sweep")
 ok("die Kohorte fuer den Lauf steht, Termine liegen am Benutzer",
    code is None and rec and rec["complete"]
@@ -897,6 +897,59 @@ ok("am alten Ende-Tag danach tut der Lauf nichts mehr",
 sw = sweep(2999, 11, 8)
 ok("am Tag nach dem neuen Ende stoppt er",
    a.load_cohort(TID, "kurs-ext")["ended"] == "2999-11-07", sw)
+
+# ------------------------------------------------ Leerlaufgrenze spaeter aendern
+print("")
+print("Die Leerlaufgrenze einer laufenden Kohorte aendern (RFC-0059 Stufe 4)")
+t_sb = template(os.path.join(WORK, "t-sb"), extra_app="""  - id: forgejo
+    name: git
+    shared: true
+    standby_after: 30
+""", mutate=lambda t: t.replace("kurs-2026-10", "kurs-sb"))
+code, out = cli("create", target=t_sb, handout_file=os.path.join(WORK, "out", "h-standby.csv"))
+ok("die Kohorte fuer standby-after steht", code is None, out)
+sb_yaml = os.path.join(a._cohort_path(TID, "kurs-sb"), "template", "cohort.yaml")
+before = open(sb_yaml, encoding="utf-8", newline="").read()
+reg = a.load_registry()["instances"]
+ok("Ausgang: Plaetze 15, die gemeinsame App behaelt ihre eigenen 30",
+   reg["kurs-sb-ide-01"].get("standby_after") == 15 and reg["kurs-sb-git"].get("standby_after") == 30)
+for bad_val in ("3", "soon", "0", "-5"):
+    code, out = cli("standby-after", target="kurs-sb", second=bad_val)
+    ok(f"'{bad_val}' wird abgelehnt, die Vorlage bleibt", code not in (None, 0)
+       and open(sb_yaml, encoding="utf-8", newline="").read() == before, (code, out))
+code, out = cli("standby-after", target="kurs-sb")
+ok("ohne Wert -> Gebrauchshinweis", code not in (None, 0) and "usage" in out, out)
+code, out = cli("standby-after", target="kurs-sb", second="45", dry_run=True)
+ok("--dry-run nennt die Plaetze und aendert nichts",
+   code is None and "would set 45 min" in out and "kurs-sb-ide-01" in out
+   and open(sb_yaml, encoding="utf-8", newline="").read() == before
+   and a.load_registry()["instances"]["kurs-sb-ide-01"]["standby_after"] == 15, (code, out))
+AUDIT.clear()
+code, out = cli("standby-after", target="kurs-sb", second="45")
+reg = a.load_registry()["instances"]
+txt = open(sb_yaml, encoding="utf-8", newline="").read()
+ok("die gespeicherte Vorlage traegt 45, sonst ist sie unveraendert",
+   code is None and "standby_after: 45" in txt and txt.replace("standby_after: 45", "standby_after: 15") == before
+   and cohort.load(os.path.dirname(sb_yaml))["standby_after"] == 45, (code, out))
+ok("alle drei Plaetze ziehen mit; die App mit eigenem Wert (30) bleibt",
+   all(reg[f"kurs-sb-ide-0{i}"]["standby_after"] == 45 for i in (1, 2, 3))
+   and reg["kurs-sb-git"]["standby_after"] == 30 and "names its own" in out, (reg["kurs-sb-git"], out))
+ok("das Protokoll kennt es", [x[0] for x in AUDIT] == ["cohort.standby_after"], AUDIT)
+code, out = cli("standby-after", target="kurs-sb", second="45")
+ok("derselbe Wert nochmal: nichts zu tun", code is None and "no instance needed a change" in out, out)
+code, out = cli("standby-after", target="kurs-sb", second="off")
+reg = a.load_registry()["instances"]
+ok("'off' nimmt die Grenze von den Plaetzen; die App mit eigenem Wert bleibt",
+   code is None and "standby_after" not in reg["kurs-sb-ide-02"]
+   and reg["kurs-sb-git"]["standby_after"] == 30
+   and "standby_after: off" in open(sb_yaml, encoding="utf-8", newline="").read(), (code, out))
+ok("ein neuer Platz bekommt danach die NEUE Grenze (Vorlagenkopie, nicht Datei des Trainers)",
+   a._cohort_standby_after(a._cohort_template(a.load_cohort(TID, "kurs-sb"))[0],
+                           a._cohort_template(a.load_cohort(TID, "kurs-sb"))[0]["apps"][0]) == 0)
+code, out = cli("standby-after", target="kurs-sb", second="20")
+ok("auch aus 'off' heraus: die Zeile wird ersetzt, nicht doppelt",
+   code is None and open(sb_yaml, encoding="utf-8", newline="").read().count("standby_after:") == 2
+   and a.load_registry()["instances"]["kurs-sb-ide-03"]["standby_after"] == 20, out)
 
 # ------------------------------------------------ Handout unter sudo
 print("")
