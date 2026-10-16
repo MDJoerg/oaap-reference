@@ -2197,10 +2197,12 @@ INSTANCES_LIST_BODY = """
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Instanz</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
+  <tr><th>Instanz</th><th>Status</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/instances/{{ i.key }}">{{ i.name }}</a></td>
+    <td title="{{ i.status.detail }}"><span class="dot {{ i.status.state }}"></span>{{ i.status.label }}
+        {% if i.maintenance %}<span class="badge todo">Wartung</span>{% endif %}</td>
     <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
     {% if show_tenant %}<td class="muted">{{ i.tenant or "?" }}</td>{% endif %}
     <td><span class="badge {{ i.channel }}">{{ i.channel_label }}</span>
@@ -5715,6 +5717,22 @@ def _core_states():
     return core
 
 
+def _sleep_status(inst):
+    """(state, label, detail) when the record says the instance sleeps
+    (RFC-0059), else None. A sleeping instance is not probed: the probe
+    would read the waking page as a fault."""
+    st = (inst or {}).get("state") or ""
+    if st == "standby":
+        sb = inst.get("standby") or {}
+        by = sb.get("by", "")
+        return ("warn", "Standby",
+                "schläft seit " + str(sb.get("since", ""))[:16].replace("T", " ")
+                + (f" ({by})" if by else ""))
+    if st == "waking":
+        return ("warn", "Wird geweckt", "startet gerade")
+    return None
+
+
 def _instance_probe(name, inst):
     """State/label/detail of one instance — shared by the health page
     and /fleet/status.
@@ -5775,9 +5793,10 @@ def health():
 
     apps = []
     insts = sorted(load_instances().items())
-    probed = fleet_view.probe_all(insts, _instance_probe)
+    probed = fleet_view.probe_all(
+        [(n, i) for n, i in insts if not _sleep_status(i)], _instance_probe)
     for name, inst in insts:
-        state, label, detail = probed[name]
+        state, label, detail = _sleep_status(inst) or probed[name]
         channel = inst.get("channel", "production")
         apps.append({
             "name": inst.get("app_name", name), "instance": name,
@@ -7117,11 +7136,18 @@ def instances_list():
         return denied
     role, mine = caller_scope()
     rows = []
-    for name, inst in sorted(visible_instances().items()):
+    shown = sorted(visible_instances().items())
+    # status: the record for the sleeping ones, one probe round for the rest
+    probed = fleet_view.probe_all(
+        [(n, i) for n, i in shown if not _sleep_status(i)], _instance_probe)
+    for name, inst in shown:
         groups = _instance_groups(inst)
         channel = inst.get("channel", "production")
+        st = _sleep_status(inst) or probed.get(name) or ("unknown", "Unbekannt", "")
         rows.append({
             "key": name, "name": local_name(name, inst),
+            "status": {"state": st[0], "label": st[1], "detail": st[2]},
+            "maintenance": bool(inst.get("maintenance")),
             "app_name": inst.get("app_name", name),
             "version": inst.get("version", "?"),
             "channel": channel, "channel_label": CHANNEL_LABELS.get(channel, channel),

@@ -422,6 +422,28 @@ new Promise(r => setImmediate(() => setImmediate(() => setImmediate(() => r())))
     ok("Ansicht einer wachen Instanz: leer",
        pa._mode_view({})["state"] == "" and not pa._mode_view({})["maintenance"])
 
+    print("")
+    print("Instanzliste und Gesundheit: der Zustand steht da (RFC-0059)")
+    PROBED = []
+    pa._instance_probe = lambda n, i: PROBED.append(n) or ("ok", "Gesund", "HTTP 200")
+    insts = {"crm": {"app_name": "CRM", "version": "1", "state": "standby",
+                     "standby": {"since": "2026-10-16T10:00:00Z", "by": "auto-standby"}},
+             "wach": {"app_name": "Wach", "version": "1", "maintenance": {"message": "x"}},
+             "weckt": {"app_name": "Weckt", "version": "1", "state": "waking"}}
+    pa.visible_instances = lambda: insts
+    pa.load_instances = lambda: insts
+    pa.caller_roles = lambda: {"server_admin"}
+    page = c.get("/instances").get_data(as_text=True)
+    ok("Liste: Spalte Status, Standby mit Urheber, geweckt, Wartung",
+       "<th>Status</th>" in page and "Standby" in page and "auto-standby" in page
+       and "Wird geweckt" in page and "Wartung" in page and "Gesund" in page, page[:300])
+    ok("Schlafende werden nicht abgefragt (die Weckseite ist kein Fehler)",
+       PROBED == ["wach"], PROBED)
+    ok("Helfer (Liste und Gesundheitsseite teilen ihn): schlafend -> warn, wach -> None",
+       pa._sleep_status(insts["crm"])[:2] == ("warn", "Standby")
+       and pa._sleep_status(insts["weckt"])[1] == "Wird geweckt"
+       and pa._sleep_status(insts["wach"]) is None)
+
 print("")
 print("OK" if not fails else f"{fails} FEHLER")
 sys.exit(1 if fails else 0)
