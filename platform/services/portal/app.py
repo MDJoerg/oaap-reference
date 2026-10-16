@@ -5948,9 +5948,11 @@ def fleet_status():
     # then instance rows carry no automatic name at all.
     ext = external_host()
     insts = sorted(load_instances().items())
-    probed = fleet_view.probe_all(insts, _instance_probe)
+    probed = fleet_view.probe_all(
+        [(n, i) for n, i in insts if not _sleep_status(i)], _instance_probe)
     for name, inst in insts:
-        state, _label, _detail = probed[name]
+        # asleep (or waking) on purpose: its own state, not a fault (0.4)
+        state = "standby" if _sleep_status(inst) else probed[name][0]
         instances.append(fleet_view.instance_row(name, inst, state, ext))
         if _pending_envelope(name):
             pending.append(name)

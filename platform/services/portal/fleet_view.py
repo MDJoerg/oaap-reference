@@ -1,4 +1,4 @@
-"""Fleet status document (RFC-0021, spec `oaap.fleet.status` 0.3).
+"""Fleet status document (RFC-0021, spec `oaap.fleet.status` 0.4).
 
 The rules live here, Flask-free, so they are testable without a node:
 which bearer key is valid, which facts an instance row may carry, and
@@ -14,7 +14,7 @@ import hashlib
 import hmac
 from concurrent.futures import ThreadPoolExecutor, wait
 
-SCHEMA = "oaap.fleet.status/0.3"
+SCHEMA = "oaap.fleet.status/0.4"
 
 # The document's state vocabulary. The health page grew two spellings
 # ("err" from probes, "error" from the worker); consumers get one.
@@ -24,6 +24,14 @@ _STATES = {"ok": "ok", "warn": "warn", "err": "error", "error": "error",
 
 def normalize_state(state):
     return _STATES.get(state, "unknown")
+
+
+def instance_state(state):
+    """An instance row's state: the common vocabulary plus `standby` (0.4,
+    RFC-0059) -- an instance asleep on purpose is neither healthy nor broken,
+    and must not read as either. Core services and names never sleep, so
+    they keep `normalize_state`."""
+    return "standby" if state == "standby" else normalize_state(state)
 
 
 def valid_key(presented, keys):
@@ -76,6 +84,9 @@ def auto_verdict(name, inst, state, node_host):
         # No site was generated for this name — it lands on the
         # catch-all, not on the app.
         return auto, "error"
+    if state == "standby":
+        # the route exists and answers -- with the waking page (0.4)
+        return auto, "ok"
     st = normalize_state(state)
     if st in ("ok", "unknown"):
         return auto, st
@@ -94,7 +105,7 @@ def instance_row(name, inst, state, node_host=""):
         "app": inst.get("app_name", name),
         "version": inst.get("version", "?"),
         "channel": inst.get("channel", "production"),
-        "state": normalize_state(state),
+        "state": instance_state(state),
     }
     if inst.get("promoted_from"):
         origin = "promoted"

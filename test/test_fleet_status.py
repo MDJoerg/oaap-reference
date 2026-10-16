@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fleet status rules (RFC-0021, spec oaap.fleet.status 0.3).
+"""Fleet status rules (RFC-0021, spec oaap.fleet.status 0.4).
 
 Two halves, both without docker and without a node:
 
@@ -177,12 +177,28 @@ check("empty resolved is omitted",
       "resolved" not in fv.name_row({"name": "x", "what": "Knoten",
                                      "state": "ok", "resolved": "–"}))
 
+print("\n-- a sleeping instance has its own state (schema 0.4, RFC-0059)")
+row = fv.instance_row("bdt-app", routed, "standby", "oaap.joomp.de")
+check("standby is its own state in the instance row", row["state"] == "standby")
+check("its automatic name still answers (the waking page): auto_state ok",
+      row["auto_state"] == "ok")
+check("core services and names never take 'standby'",
+      fv.normalize_state("standby") == "unknown"
+      and fv.name_row({"name": "x", "what": "Knoten", "state": "standby"})["state"] == "unknown")
+check("a sleeping instance is not an attention item",
+      not [a for a in fv.attention_items(
+          [], [fv.instance_row("s", routed, "standby")], [], [])
+          if a["kind"] == "instance_unhealthy"])
+check("an unhealthy one still is",
+      [a for a in fv.attention_items([], [fv.instance_row("s", routed, "err")], [], [])
+       if a["kind"] == "instance_unhealthy"])
+
 print("\n-- the assembled document")
 doc = fv.build_document(node="oaap.joomp.de", version="0.1.41",
                         profiles=["dev"], now_iso="2026-08-23T10:15:00Z",
                         core=core, instances=instances, dns_rows=dns,
                         pending_names=["b-test"], public_ip="203.0.113.7")
-check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.3")
+check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.4")
 check("names and public_ip carried",
       len(doc["names"]) == 3 and doc["public_ip"] == "203.0.113.7")
 check("no public_ip -> field absent",

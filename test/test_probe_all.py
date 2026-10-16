@@ -87,8 +87,9 @@ ok("eine Instanz geht auch", fv.probe_all([("x", {})], boom)["x"][0] == "ok")
 print("\n=== die Aufrufer ===")
 src = open(os.path.join(HERE, "..", "platform", "services", "portal", "app.py"),
            encoding="utf-8").read()
-ok("Gesundheitsseite und Flottendokument rufen probe_all",
-   src.count("fleet_view.probe_all(insts, _instance_probe)") == 2)
+ok("Gesundheitsseite, Instanzliste und Flottendokument rufen probe_all (ohne Schlafende)",
+   src.count("fleet_view.probe_all(") == 3
+   and src.count("if not _sleep_status(i)], _instance_probe)") == 3)
 ok("keine Schleife ruft _instance_probe mehr nacheinander",
    "= _instance_probe(name, inst)" not in src)
 
