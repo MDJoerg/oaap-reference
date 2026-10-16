@@ -331,6 +331,55 @@ if pa is not None:
              ).get_json() == {"asleep": False})
     ok("eine unbekannte Instanz: 404", c.get("/wake/nix", headers=H).status_code == 404)
 
+    print("")
+    print("Portal-Knoepfe (Stufe 2): dieselben Auftraege wie die CLI")
+    ROLES = ["server_admin"]
+    pa.caller_roles = lambda: ROLES
+    pa.visible_instances = lambda: ["crm"]
+    pa._deploy_now = lambda n: None
+    SENT = []
+    ANSWER = [{"ok": True, "message": "x"}]
+    pa._queue_and_wait = lambda name, payload, wait: SENT.append(
+        (name, payload, wait)) or ANSWER[0]
+    r = c.post("/instances/crm/standby", data={"tab": "diagnose"})
+    ok("Standby-Knopf: Auftrag 'standby' an den Host, Weiterleitung",
+       SENT[-1][:2] == ("crm", {"action": "standby"}) and r.status_code == 303, SENT)
+    c.post("/instances/crm/wake")
+    ok("Wecken-Knopf: Auftrag 'wake', Wartezeit laenger als beim Standby",
+       SENT[-1][:2] == ("crm", {"action": "wake"}) and SENT[-1][2] > SENT[-2][2], SENT)
+    c.post("/instances/crm/maintenance", data={"op": "on", "message": " Zehn Minuten. "})
+    ok("Wartung an: Auftrag mit on=True und dem Text, getrimmt",
+       SENT[-1][1] == {"action": "maintenance", "on": True, "message": "Zehn Minuten."}, SENT[-1])
+    c.post("/instances/crm/maintenance", data={"op": "off", "message": "bleibt weg"})
+    ok("Wartung aus: on=False, kein Text",
+       SENT[-1][1] == {"action": "maintenance", "on": False, "message": ""}, SENT[-1])
+    n = len(SENT)
+    ANSWER[0] = {"ok": False, "message": "kein Platz"}
+    r = c.post("/instances/crm/wake")
+    ok("Ablehnung des Hosts erscheint als Fehler auf der Seite",
+       r.status_code == 303 and "err=" in r.headers["Location"]
+       and "kein" in r.headers["Location"], r.headers.get("Location"))
+    ANSWER[0] = {"ok": True}
+    ROLES[:] = ["user"]
+    ok("ohne Verwalterrolle: 403 und KEIN Auftrag",
+       c.post("/instances/crm/standby").status_code == 403 and len(SENT) == n + 1)
+    ROLES[:] = ["tenant_admin"]
+    ok("tenant_admin einer fremden Instanz: 404 und kein Auftrag",
+       c.post("/instances/wach/standby").status_code == 404 and len(SENT) == n + 1)
+    ROLES[:] = ["server_admin"]
+    pa._deploy_now = lambda n: {"x": 1}
+    r = c.post("/instances/crm/standby")
+    ok("laeuft ein Deployment: abgelehnt, kein Auftrag",
+       "err=" in r.headers["Location"] and len(SENT) == n + 1)
+    pa._deploy_now = lambda n: None
+    mv = pa._mode_view({"state": "standby", "standby": {"since": "2026-10-16T10:00:00Z", "by": "joerg"},
+                        "maintenance": {"message": "bald"}})
+    ok("Ansicht: Standby und Wartung getrennt lesbar",
+       mv["state"] == "standby" and mv["by"] == "joerg" and mv["maintenance"]
+       and mv["m_message"] == "bald", mv)
+    ok("Ansicht einer wachen Instanz: leer",
+       pa._mode_view({})["state"] == "" and not pa._mode_view({})["maintenance"])
+
 print("")
 print("OK" if not fails else f"{fails} FEHLER")
 sys.exit(1 if fails else 0)

@@ -3228,6 +3228,53 @@ INSTANCE_EDIT_BODY = """
   {% endif %}
 </div>
 
+<div class="card">
+  <h2>Standby und Wartung</h2>
+  {% if i.mode.state %}
+  <p><span class="badge todo">Standby</span> Die Instanz schläft{% if i.mode.since %}
+     seit {{ i.mode.since }} UTC{% endif %}{% if i.mode.by %} (gelegt von
+     <strong>{{ i.mode.by }}</strong>){% endif %}. Daten, Adresse und Benutzer
+     bleiben; auch ein Update oder Neustart des Knotens weckt sie nicht.
+     Besucher sehen eine Weckseite.</p>
+  <form method="post" action="/instances/{{ i.key }}/wake">
+    <input type="hidden" name="tab" value="diagnose">
+    <button {{ 'disabled' if i.mode.state == 'waking' }}>{{ 'Wird geweckt …' if i.mode.state == 'waking' else 'Jetzt aufwecken' }}</button>
+  </form>
+  {% else %}
+  <p>Im <strong>Standby</strong> ruhen die Container, bis jemand die
+     Instanz aufweckt. <strong>Dateien und Einstellungen bleiben</strong>;
+     was gerade im Arbeitsspeicher lief (offene Fenster, ungespeicherte
+     Arbeit), geht verloren.</p>
+  <form method="post" action="/instances/{{ i.key }}/standby">
+    <input type="hidden" name="tab" value="diagnose">
+    <button class="secondary" {{ 'disabled' if i.diag and i.diag.deploy_running }}>In den Standby legen</button>
+  </form>
+  {% endif %}
+  <hr>
+  {% if i.mode.maintenance %}
+  <p><span class="badge todo">Wartung</span> Nur Verwalter kommen hinein{% if i.mode.m_since %},
+     seit {{ i.mode.m_since }} UTC{% endif %}{% if i.mode.m_by %} (gesetzt von
+     <strong>{{ i.mode.m_by }}</strong>){% endif %}. Alle anderen sehen:
+     „{{ i.mode.m_message or 'Wir sind in Kürze wieder da.' }}“</p>
+  <form method="post" action="/instances/{{ i.key }}/maintenance">
+    <input type="hidden" name="tab" value="diagnose">
+    <input type="hidden" name="op" value="off">
+    <button>Wartungsmodus beenden</button>
+  </form>
+  {% else %}
+  <p>Im <strong>Wartungsmodus</strong> läuft die Instanz weiter, aber nur
+     Verwalter kommen hinein. Alle anderen — auch Maschinen und
+     Anonyme — sehen den Text unten.</p>
+  <form method="post" action="/instances/{{ i.key }}/maintenance">
+    <input type="hidden" name="tab" value="diagnose">
+    <input type="hidden" name="op" value="on">
+    <label>Text für Besucher
+      <input type="text" name="message" maxlength="500" placeholder="Wir sind in Kürze wieder da."></label>
+    <button class="secondary">Wartungsmodus einschalten</button>
+  </form>
+  {% endif %}
+</div>
+
 <form method="post" action="/instances/{{ i.key }}/restart">
   <input type="hidden" name="tab" value="diagnose">
   <div class="card">
@@ -7711,6 +7758,10 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # so kann keiner der vier Namen mit einem Feld der Instanz
          # kollidieren.
          "diag": _diagnose_page(name, inst),
+         # Standby und Wartung (RFC-0059 Stufe 2): der Zustand steht am
+         # Instanz-Eintrag; die Karte zeigt ihn und bietet nur den Schritt an,
+         # der jetzt möglich ist.
+         "mode": _mode_view(inst),
          # Fernzugang (RFC-0044, oaap.net.remote-access 0.2): eigener
          # Schlüssel wie "diag" -- ein anderes Objekt, kein Feld der
          # Instanz.
@@ -8942,6 +8993,79 @@ def instance_wake(name):
     return (render_template_string(WAKE_PAGE, headline=headline, text=text,
                                    auto=auto), 503,
             {"Retry-After": "5", "Cache-Control": "no-store"})
+
+
+STANDBY_WAIT_SECONDS = 90       # Gateway umschreiben, Container anhalten
+WAKE_WAIT_SECONDS = 200         # Container starten, auf die erste Antwort warten
+MAINTENANCE_WAIT_SECONDS = 60   # Gateway-Site und Modus-Datei schreiben
+
+
+def _mode_view(inst):
+    """Standby und Wartung einer Instanz für die Karte (RFC-0059)."""
+    state = inst.get("state") or ""
+    m = inst.get("maintenance") or None
+    sb = inst.get("standby") or {}
+    return {
+        "state": state if state in ("standby", "waking") else "",
+        "since": str(sb.get("since", ""))[:19].replace("T", " "),
+        "by": sb.get("by", ""),
+        "maintenance": bool(m),
+        "m_since": str((m or {}).get("since", ""))[:19].replace("T", " "),
+        "m_by": (m or {}).get("by", ""),
+        "m_message": (m or {}).get("message", ""),
+    }
+
+
+def _mode_action(name, payload, wait, ok_text, fail_text, pending_text):
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+                        code=303)
+    if _deploy_now(name):
+        return _inst_back(name, err="Für diese Instanz läuft gerade ein "
+                                    "Deployment — warte, bis es fertig ist.")
+    res = _queue_and_wait(name, payload, wait)
+    if res is None:
+        return _inst_back(name, err=pending_text)
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message", fail_text))
+    return _inst_back(name, msg=ok_text)
+
+
+@app.post("/instances/<name>/standby")
+def instance_standby_button(name):
+    """Die Instanz schlafen legen (RFC-0059): Daten bleiben, Container ruhen."""
+    return _mode_action(
+        name, {"action": "standby"}, STANDBY_WAIT_SECONDS,
+        "Die Instanz schläft jetzt. Wer sie öffnen darf, kann sie über die "
+        "Weckseite aufwecken — oder du hier.",
+        "Standby fehlgeschlagen.",
+        "Der Standby läuft noch — der Zustand ist gleich in der Instanzliste "
+        "zu sehen.")
+
+
+@app.post("/instances/<name>/wake")
+def instance_wake_button(name):
+    return _mode_action(
+        name, {"action": "wake"}, WAKE_WAIT_SECONDS,
+        "Die Instanz ist wieder da.", "Aufwecken fehlgeschlagen.",
+        "Das Aufwecken läuft noch — die App braucht etwas länger zum Starten.")
+
+
+@app.post("/instances/<name>/maintenance")
+def instance_maintenance_button(name):
+    """Wartungsmodus ein/aus; nur Verwalter kommen währenddessen hinein."""
+    on = request.form.get("op") == "on"
+    message = (request.form.get("message") or "").strip()[:500] if on else ""
+    return _mode_action(
+        name, {"action": "maintenance", "on": on, "message": message},
+        MAINTENANCE_WAIT_SECONDS,
+        "Wartungsmodus ist an — nur Verwalter kommen noch hinein." if on
+        else "Wartungsmodus ist aus.",
+        "Wartungsmodus konnte nicht umgeschaltet werden.",
+        "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
 
 
 @app.post("/instances/<name>/restart")
