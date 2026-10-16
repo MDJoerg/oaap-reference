@@ -127,6 +127,10 @@ m.deployment_in_flight = lambda name, own_rid="": False
 m.load_external = lambda: "node.example"
 m.instance_auto_hosts = lambda name, inst, ext_host=None: (
     ["desk.node.example"] if name == "desk" else [])
+ok("eigene Namen (Adresse + Aliasse) einer Instanz zaehlen als ihre Hosts",
+   m._idle_specs({"instances": {"own": record("own", 8105, address="app.kunde.de",
+                                              aliases=["a.kunde.de", "app.kunde.de"])}})
+   ["own"]["hosts"][-2:] == ["app.kunde.de", "a.kunde.de"])
 m.standby_instance = lambda name, inst, who="root", role="root": CALLS.append((name, who, role))
 GW = {"/metrics": METRICS, "/config/": json.dumps({"apps": {"http": {"servers": {
     "srv0": {"listen": [":443"]}, "srv1": {"listen": [":8101"]},

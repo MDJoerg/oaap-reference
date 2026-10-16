@@ -12255,8 +12255,11 @@ def _idle_specs(reg):
     for name, inst in (reg.get("instances") or {}).items():
         if inst.get("state") in ("standby", "waking"):
             continue
+        # the automatic addresses AND the instance's own names (address and
+        # aliases, RFC-0009/0018): traffic on any of them is use
         out[name] = {"port": inst.get("port"),
-                     "hosts": instance_auto_hosts(name, inst, ext_host=ext)}
+                     "hosts": instance_auto_hosts(name, inst, ext_host=ext)
+                     + instance_names(inst)}
     return out
 
 
