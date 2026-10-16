@@ -749,6 +749,16 @@ def write_destinations_caddy(reg=None):
                           '(oaap destination set-secret)." 503', "\t}"]
                 continue
             via = (d.get("target") or {}).get("via")
+            through = (d.get("target") or {}).get("through")
+            if through:
+                # RFC-0060 D4: a tunnel APP of this tenant, asked NOW --
+                # an instance that is gone, asleep or holds no tunnel is
+                # answered with a sentence, never with somebody else's
+                # container that happens to carry the same name later.
+                upstream, why = through_upstream(reg, tid, through)
+                if why:
+                    lines += [f"\t\trespond {_caddy_quote(why)} 502", "\t}"]
+                    continue
             # `route`, not bare directives: inside `handle` Caddy SORTS
             # directives, and `rewrite` sorts before `uri`. Measured on
             # oaap-test 2026-09-25 -- the target received
@@ -756,7 +766,14 @@ def write_destinations_caddy(reg=None):
             lines.append("\t\troute {")
             lines += strip_identity("\t\t\t")
             lines.append(f"\t\t\turi strip_prefix /destinations/{need}")
-            if via:
+            if through:
+                # The tunnel app serves the name at /t/<name>/ on its own
+                # instance network, which the gateway is a member of
+                # (runtime 2.11). The app sets the target's Host itself.
+                tname = through.split("/", 1)[1]
+                lines.append(f"\t\t\trewrite * /t/{tname}{{uri}}")
+                lines.append(f"\t\t\treverse_proxy http://{upstream} {{")
+            elif via:
                 # oaap.net.connector 2.5: the same call, carried into the
                 # tunnel by the connector service. Three headers of the
                 # gateway's own -- set, never passed on, so whatever the
@@ -834,7 +851,21 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
                                  "letter or digit")
     if kind not in DEST_KINDS:
         raise DestinationRefused(f"kind is one of {', '.join(DEST_KINDS)}")
-    if (target or "").strip().startswith("via:"):
+    if (target or "").strip().startswith("through:"):
+        # RFC-0060 D4: a name served by a tunnel app of THIS tenant. HTTP
+        # only, like `via`; another tenant's instance is answered as one
+        # that is not there (oaap.core.tenant 2.3).
+        if kind != "http":
+            raise DestinationRefused("a tcp destination through a tunnel app is "
+                                     "not part of RFC-0060 stage 1 -- http only")
+        local, tname = parse_through(target)
+        _k, inst = find_instance(load_registry(), tid, local)
+        if inst is None or not tunnel_service(inst):
+            raise DestinationRefused(
+                f"this tenant has no tunnel instance '{local}' -- an instance "
+                "whose app declares a service with tun: true (RFC-0060)")
+        target_obj = {"through": f"{local}/{tname}"}
+    elif (target or "").strip().startswith("via:"):
         # oaap.net.connector 2.5: through a tunnel this node accepts.
         # HTTP only in 0.1, and only a tunnel of THIS tenant -- the
         # connector service checks the same again on every call.
@@ -1294,7 +1325,73 @@ def parse_via(target):
 
 def dest_target_text(d):
     t = d.get("target") or {}
+    if t.get("through"):
+        return f"through {t['through']}"
     return f"via {t['via']}" if t.get("via") else t.get("direct", "")
+
+
+def parse_through(target):
+    """`through:<instance>/<name>` -> (instance, name), or raise (RFC-0060)."""
+    t = (target or "").strip()
+    m = re.fullmatch(rf"through:({DEST_NAME_RE})/({DEST_NAME_RE})", t)
+    if not m:
+        raise DestinationRefused("a tunnel-app target is through:<instance>/<name>, "
+                                 f"both [a-z0-9-] (got '{t}')")
+    return m.group(1), m.group(2)
+
+
+def tunnel_service(inst):
+    """The service of an instance that holds a tunnel (runtime 2.23), or
+    None. Only the recorded literal True counts, as for the grant itself."""
+    for s in instance_services(inst or {}):
+        if isinstance(s, dict) and s.get("tun") is True:
+            return s
+    return None
+
+
+def through_upstream(reg, tid, through):
+    """(`container:port`, '') for a `through` target, or ('', the
+    sentence the caller gets instead). Asked every time the listener is
+    written -- the instance's state is the answer, not what it was when
+    the destination was made (RFC-0060 §2.3)."""
+    local, _name = through.split("/", 1)
+    _key, inst = find_instance(reg, tid, local)
+    if inst is None:
+        return "", (f"The tunnel instance '{local}' does not exist (any more) "
+                    "on this node (RFC-0060).")
+    s = tunnel_service(inst)
+    if s is None:
+        return "", (f"The instance '{local}' holds no tunnel: its app declares "
+                    "no service with tun: true (RFC-0060).")
+    if is_rehearsal(inst):
+        return "", f"'{local}' is a rehearsal and holds no tunnel (RFC-0060 D6)."
+    if is_standby(inst):
+        return "", (f"The tunnel instance '{local}' is asleep (standby) -- wake "
+                    "it to reach what lies behind it (RFC-0060).")
+    return f"{s['container']}:{s.get('port') or inst.get('svc_port')}", ""
+
+
+def through_destinations(reg, key):
+    """Every (tenant, destination) that reaches through this instance."""
+    inst = (reg.get("instances") or {}).get(key)
+    if inst is None:
+        return []
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    local = instance_name(key, inst)
+    return [(tid, n) for n, d in sorted((load_destinations().get(tid) or {}).items())
+            if ((d.get("target") or {}).get("through") or "").split("/")[0] == local]
+
+
+def through_removal_refusal(reg, key):
+    """Why this instance must not be removed yet, or '' (RFC-0060 §2.3)."""
+    used = through_destinations(reg, key)
+    if not used:
+        return ""
+    return (f"'{instance_name(key, reg['instances'][key])}' holds the tunnel for "
+            "destination(s) " + ", ".join(f"'{n}'" for _t, n in used)
+            + " -- remove those first (oaap destination remove); removing the "
+              "tunnel would cut every app behind them off without anybody "
+              "having decided to")
 
 
 def via_destinations(tunnel):
@@ -12149,6 +12246,9 @@ def _republish_sites(name, inst):
     write_app_caddy(name, inst)
     refresh_generated_sites()
     reload_gateway()
+    # A sleeping tunnel app answers its `through` destinations with a
+    # sentence, a woken one forwards again (RFC-0060 §2.3).
+    refresh_destinations()
 
 
 def _answers(inst, seconds):
@@ -15116,6 +15216,9 @@ def cmd_remove(args):
     reg = load_registry()
     if args.name not in reg["instances"]:
         die(f"no instance named '{args.name}'")
+    why = through_removal_refusal(reg, args.name)
+    if why:
+        die(why)
     print(remove_instance(reg, args.name, args.purge).capitalize() + ".")
 
 
@@ -21888,6 +21991,8 @@ def cmd_process_deploys(_args):
                 msg = "unknown instance"
             elif req.get("confirm", "") != name:
                 msg = "confirmation did not match the instance name"
+            elif through_removal_refusal(reg, name):
+                msg = through_removal_refusal(reg, name)
             else:
                 msg = remove_instance(reg, name, bool(req.get("purge")))
                 ok = True
@@ -23839,8 +23944,9 @@ def main():
     pdst.add_argument("--tenant", default="", help="tenant label (default: the default tenant)")
     pdst.add_argument("--kind", choices=list(DEST_KINDS), default="http")
     pdst.add_argument("--target", default="",
-                      help="https://host[:port][/base], tcp://host:port, or "
-                           "via:<tunnel>/<offer> (oaap.net.connector)")
+                      help="https://host[:port][/base], tcp://host:port, "
+                           "via:<tunnel>/<offer> (oaap.net.connector), or "
+                           "through:<instance>/<name> (a tunnel app, RFC-0060)")
     pdst.add_argument("--auth", choices=["none", "basic", "bearer", "header"],
                       default="none")
     pdst.add_argument("--user", default="", help="basic: the user name")

@@ -3851,6 +3851,8 @@ DESTINATIONS_FILE = "/apps-registry/destinations.json"
 def _dest_target_label(target, tunnels):
     """The direct address, or `via` with the tunnel's state -- an app
     cannot tell the two apart (oaap.net.connector 1), its operator must."""
+    if target.get("through"):
+        return f"über Tunnel-App {target['through']}"
     via = target.get("via")
     if not via:
         return target.get("direct", "")
