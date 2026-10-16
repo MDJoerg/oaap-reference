@@ -4075,6 +4075,38 @@ def cmd_migrate_identity_headers(_args):
           "is overwritten again instead of passing straight through.")
 
 
+def cmd_migrate_platform_routes(_args):
+    """Carry /platform/* into instance sites written before it (0.1.199).
+
+    RFC-0061 §3.0: the gateway served /platform/* on the portal apex
+    only, so the feedback script on an app's own name reached the app
+    and came back 404. The generator knows better now; the files that
+    already lie on a node do not, until something rewrites them -- the
+    lesson of 0.1.108 and of 0.1.117, the third time for the same kind
+    of route. Idempotent, and silent when there is nothing to carry.
+    """
+    insts = _cases_registry()
+    behind = [n for n, i in sorted(insts.items())
+              if i.get("routes") and i.get("svc_port") and i.get("port")
+              and _read_file(os.path.join(CADDY_APPS_DIR, f"{n}.caddy")) is not None
+              and CASES_MARKER not in (_read_file(
+                  os.path.join(CADDY_APPS_DIR, f"{n}.caddy")) or "")]
+    generated = [f for f in ("external.caddy", "instance-addresses.caddy")
+                 if (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")
+                 and CASES_MARKER not in
+                 (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")]
+    if not behind and not generated:
+        return
+    print("")
+    print("Reserving /platform/* on every instance site (RFC-0061) ...")
+    refresh_generated_sites()
+    reload_gateway()
+    parts = ([f"{len(behind)} instance site(s)"] if behind else []) + generated
+    print(f"  {', '.join(parts)} rewritten. /platform/feedback.js now comes "
+          "from the gateway on an app's own name too, instead of reaching "
+          "the app.")
+
+
 def _print_connector(name, c, note=True):
     """One connector as an operator reads it.
 
@@ -8038,6 +8070,9 @@ def read_manifest_version(value):
     return int(mv.group(2)), ""
 
 
+RESERVED_ROUTE_PREFIXES = ("/auth", "/platform")
+
+
 def validate_manifest(m):
     """Minimal validation mirroring oaap-spec/schema/oaap-app.schema.json.
 
@@ -8144,6 +8179,16 @@ def validate_manifest(m):
         for r in routes:
             if not str(r.get("path", "")).startswith("/"):
                 errs.append(f"routes: path must start with / ({r.get('path')})")
+            # The gateway answers these itself on every instance site
+            # (/auth/* since 0.1.x, /platform/* since 0.1.199, RFC-0061
+            # §3.0); an app route there would be declared and never
+            # reached. Said at install, not discovered as a silent 404.
+            rpath = str(r.get("path", "")).rstrip("/")
+            for reserved in RESERVED_ROUTE_PREFIXES:
+                if rpath == reserved or rpath.startswith(reserved + "/"):
+                    errs.append(f"routes {r.get('path')}: {reserved}/ is "
+                                "reserved for the platform on every instance "
+                                "site")
             roles = set(r.get("roles") or [])
             if not roles or not roles <= ROLES:
                 errs.append(f"routes {r.get('path')}: roles must be non-empty subset of {sorted(ROLES)}")
@@ -9509,7 +9554,10 @@ def _site_identity_stale(body):
     file complete that names only the longer one.
     """
     lines = [ln.strip() for ln in (body or "").splitlines()]
-    strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")}
+    # The source headers of RFC-0061 are stripped the same way and are
+    # not identity headers; counting them would call every new site stale.
+    strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")
+              and not ln.startswith("request_header -X-OAAP-Source-")}
     if strips and strips != {f"request_header -{h}" for h in IDENTITY_HEADERS}:
         return True
     return any(ln.startswith("copy_headers ") and ln != _COPY_IDENTITY
@@ -9634,6 +9682,184 @@ def rehearsal_days_left(inst, now=None):
     return (when - now).days if when >= now else -((now - when).days + 1)
 
 
+# ------------------------------------------------- cases (RFC-0061 stage 1)
+#
+# The feedback button is the platform's own script on the app's own
+# origin, and its form posts to /platform/feedback on that same origin.
+# The gateway routes the post to the `vorgaenge` instance of the SAME
+# tenant and adds what it knows about the source -- which instance,
+# which app, which version -- as headers the app behind it never sees
+# and therefore cannot forge (RFC-0061 §3.1, Q1).
+#
+# Until 0.1.199 an instance site reserved /auth/* and nothing else, so
+# /platform/feedback.js on an app's own name reached the app's catch-all
+# route and came back 404 from the app (RFC-0061 §3.0, found when HVP
+# asked us to confirm the opposite). Now every instance site carries
+# both blocks, from the one body every entry point shares.
+CASES_APP_ID = "vorgaenge"
+
+# Set by the gateway on the feedback route only, stripped on EVERY
+# request of every instance site first -- otherwise a client could send
+# them straight to the `vorgaenge` instance's own address and claim any
+# source it likes. Named apart from IDENTITY_HEADERS on purpose: they
+# say where a report came from, not who is asking.
+SOURCE_HEADERS = ("X-OAAP-Source-Instance", "X-OAAP-Source-App",
+                  "X-OAAP-Source-Version", "X-OAAP-Source-Tenant")
+
+# One line in each instance site that says which target and which source
+# version its feedback block was written for. The target lives in ANOTHER
+# instance's record, so installing, moving or removing a `vorgaenge`
+# instance changes the right answer for every site of its tenant;
+# refresh_cases_sites() compares this line and rewrites what is behind.
+CASES_MARKER = "# platform-feedback "
+
+_CASES_CACHE = {"stamp": None, "insts": {}}
+
+
+def _cases_registry():
+    """The registry's instances, cached against its own stamp -- the
+    construction of rehearsal_keys(), for the same reason: site_body()
+    asks, every writer gets the answer."""
+    try:
+        st = os.stat(REGISTRY)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _CASES_CACHE["stamp"] != stamp:
+        try:
+            with open(REGISTRY, encoding="utf-8") as f:
+                reg = json.load(f)
+        except (OSError, ValueError):
+            return _CASES_CACHE["insts"]
+        _CASES_CACHE["insts"] = reg.get("instances") or {}
+        _CASES_CACHE["stamp"] = stamp
+    return _CASES_CACHE["insts"]
+
+
+def cases_target(insts, scope):
+    """container:port of the `vorgaenge` instance that takes the reports
+    of instance `scope`, or "" when its tenant has none.
+
+    Same tenant always -- the boundary is the point. Among several, the
+    one on the source's own channel (a test app reports into a test
+    inbox), else production, else the first by name. A rehearsal never
+    receives: it is a copy of production data that disappears.
+    """
+    me = insts.get(scope)
+    if not me:
+        return ""
+    tenant = instance_tenant_ref(me)
+    cands = sorted((k, i) for k, i in insts.items()
+                   if i.get("app_id") == CASES_APP_ID and not is_rehearsal(i)
+                   and instance_tenant_ref(i) == tenant
+                   and i.get("container") and i.get("svc_port"))
+    if not cands:
+        return ""
+    pick = (next((i for _, i in cands if i.get("channel") == me.get("channel")), None)
+            or next((i for _, i in cands if i.get("channel") == "production"), None)
+            or cands[0][1])
+    return f"{pick['container']}:{pick['svc_port']}"
+
+
+def cases_marker(insts, scope):
+    """The marker line a site for `scope` carries (see CASES_MARKER)."""
+    me = insts.get(scope) or {}
+    return (f"{CASES_MARKER}{cases_target(insts, scope) or '-'} "
+            f"{me.get('app_id') or '-'}@{me.get('version') or '-'}")
+
+
+def _platform_site_lines(routes, groups, scope, tenant, login_only):
+    """The reserved /platform/* blocks of an instance site (RFC-0061 §3.0).
+
+    1. /platform/feedback*: asks identity like any non-public route --
+       a logged-in member of this instance's tenant who may use this
+       app -- and proxies to the tenant's `vorgaenge` instance with the
+       source headers set. No such instance: 404, and the script shows
+       nothing.
+    2. /platform/*: public and static, as on the portal apex -- the
+       script itself, the theme, the tenant logos.
+    """
+    insts = _cases_registry()
+    me = insts.get(scope) or {}
+    target = cases_target(insts, scope)
+
+    def login_lines():
+        # A rehearsal or a maintained instance serves NO public block
+        # (RFC-0030 2.15.2, RFC-0059) -- /auth/* is the one exception,
+        # and these two are not it. Logged in is all they ask.
+        uri = "/verify?roles="
+        if tenant:
+            uri += f"&tenant={tenant}"
+        if scope:
+            uri += f"&instance={scope}"
+        return (["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
+                 "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"])
+
+    lines = ["\t" + cases_marker(insts, scope)]
+    # Site level, so it runs before every handle block below and above.
+    lines += [f"\trequest_header -{h}" for h in SOURCE_HEADERS]
+    lines.append("\thandle /platform/feedback* {")
+    if not target:
+        lines += login_lines() if login_only else strip_identity()
+        lines.append("\t\trespond 404")
+    else:
+        roles = sorted({x for r in routes for x in r["roles"] if x != "public"})
+        uri = f"/verify?roles={','.join(roles)}"
+        if groups:
+            uri += f"&groups={','.join(sorted(set(groups)))}"
+        if tenant:
+            uri += f"&tenant={tenant}"
+        if scope:
+            uri += f"&instance={scope}"
+        lines.append("\t\tforward_auth identity:8000 {")
+        lines.append(f"\t\t\turi {uri}")
+        lines.append("\t\t\t" + _COPY_IDENTITY)
+        lines += _AUTH_NO_UPGRADE
+        lines.append("\t\t}")
+        lines.append("\t\turi strip_prefix /platform")
+        source = (scope or "-", me.get("app_id") or "-",
+                  me.get("version") or "-",
+                  tenant or (instance_tenant_ref(me) if me else "-"))
+        lines += _proxy(target, "\t\t", extra=[
+            f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
+    lines.append("\t}")
+    lines.append("\thandle /platform/* {")
+    lines += login_lines() if login_only else strip_identity()
+    lines.append("\t\turi strip_prefix /platform")
+    lines.append("\t\troot * /etc/caddy/static")
+    lines.append("\t\tfile_server")
+    lines.append("\t}")
+    return lines
+
+
+def refresh_cases_sites():
+    """Rewrite every LAN instance site whose feedback block is behind.
+
+    The block names another instance (the tenant's `vorgaenge`), so it
+    goes stale when THAT instance comes, goes or moves, not when this
+    one is deployed. Called from refresh_generated_sites(), which every
+    such change already runs; the external and address sites are
+    rewritten there wholesale anyway. A site written before 0.1.199 has
+    no marker at all and is rewritten the first time -- that is the
+    migration. Returns the names rewritten.
+    """
+    insts = _cases_registry()
+    done = []
+    for name, inst in sorted(insts.items()):
+        if not inst.get("routes") or not inst.get("svc_port") \
+                or not inst.get("port"):
+            continue
+        path = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
+        body = _read_file(path)
+        if body is None:
+            continue
+        want = cases_marker(insts, name)
+        if not any(ln.strip() == want for ln in body.splitlines()):
+            write_app_caddy(name, inst)
+            done.append(name)
+    return done
+
+
 def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
               edge="", services=None, tenant="", login_only=None):
     """Shared handler block for one app instance (LAN and external sites).
@@ -9705,6 +9931,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     lines += strip_identity()
     lines.append("\t\treverse_proxy identity:8000")
     lines.append("\t}")
+    lines += _platform_site_lines(routes, groups, scope, tenant, login_only)
     # longest prefix first; catch-all "/" last
     ordered = sorted(routes, key=lambda r: len(r["path"]), reverse=True)
     for idx, r in enumerate(ordered):
@@ -10338,6 +10565,9 @@ def refresh_generated_sites():
     write_external_caddy()
     write_instance_address_caddy()
     write_internal_health_caddy()
+    # RFC-0061: the feedback block of a LAN site names the tenant's
+    # `vorgaenge` instance, which is another instance's record
+    refresh_cases_sites()
     # written like the others and reloaded by the caller like the others;
     # the moments that must not wait for a caller (a network removed, a
     # binding changed) reload through refresh_destinations() themselves
@@ -24256,6 +24486,10 @@ def main():
                          help="internal: carry RFC-0040's identity headers "
                               "into sites written before 0.1.107")
     pmi.set_defaults(fn=cmd_migrate_identity_headers)
+    pmp = sub.add_parser("migrate-platform-routes",
+                         help="internal: reserve /platform/* on instance "
+                              "sites written before 0.1.199 (RFC-0061)")
+    pmp.set_defaults(fn=cmd_migrate_platform_routes)
     psc = sub.add_parser("scrub-access-log",
                          help="internal: filter access-log lines written "
                               "before 0.1.103 (once per node)")

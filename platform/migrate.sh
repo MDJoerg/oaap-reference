@@ -301,6 +301,14 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-stream-close
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-identity-headers \
   2>&1 | sed 's/^/  /' || say "  WARNING: the identity headers could not be carried into the gateway sites — run 'oaap status'."
 
+# --- /platform/* on every instance site (0.1.199, RFC-0061 §3.0) ---
+# The third time for the same class: the generator now reserves
+# /platform/* (the feedback script, and its attested route to the
+# tenant's `vorgaenge` instance) on every instance site; the files on
+# disk learn it here, once.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-platform-routes \
+  2>&1 | sed 's/^/  /' || say "  WARNING: /platform/* could not be reserved on the gateway sites — run 'oaap status'."
+
 # --- notes about data that is in use again (0.1.110) ---
 # `oaap app remove` without --purge leaves a note so that reinstalling
 # under the same name finds the data again. The reinstall then does
