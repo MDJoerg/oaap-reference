@@ -79,6 +79,21 @@ def block(body, opener):
     return None
 
 
+def route_for(body, path):
+    """Welcher handle-Block bekommt `path`? Caddys Regel fuer Bloecke mit
+    einem Pfad-Matcher: der laengste Matcher zuerst; `x*` ist ein Praefix,
+    alles andere ein exakter Pfad. (Bloecke mit benannten Matchern --
+    @preflight -- greifen nur bei OPTIONS und sind hier nicht gemeint.)"""
+    cands = []
+    for ln in body.splitlines():
+        if ln.startswith("	handle /") and ln.endswith(" {"):
+            mt = ln.strip()[len("handle "):-2]
+            hit = path.startswith(mt[:-1]) if mt.endswith("*") else path == mt
+            if hit:
+                cands.append((len(mt), ln.strip()))
+    return max(cands)[1] if cands else "handle {"
+
+
 tid = m.ensure_default_tenant()
 OTHER = "t-other00000"
 reg = m.load_registry()
@@ -92,7 +107,7 @@ for n in reg["instances"]:
 print("")
 print("1. Ohne `vorgaenge` im Mandanten")
 body = site("hbvp-portal-test")
-fb = block(body, "handle /platform/feedback* {")
+fb = block(body, "handle /platform/feedback {")
 ok("die Site reserviert /platform/feedback*", fb is not None, body)
 ok("… und antwortet dort 404", fb and "respond 404" in fb, fb)
 st = block(body, "handle /platform/* {")
@@ -101,12 +116,24 @@ ok("die Site reserviert /platform/* statisch",
 ok("/platform/* streicht die Identitaetszeilen",
    st and all(f"request_header -{h}" in st for h in m.IDENTITY_HEADERS), st)
 ok("die Bloecke stehen vor jeder App-Route",
-   body.index("handle /platform/feedback* {") < body.index("\thandle {")
+   body.index("handle /platform/feedback {") < body.index("\thandle {")
    and body.index("handle /platform/* {") < body.index("handle /display* {"))
 ok("die Herkunftszeilen werden auf Site-Ebene gestrichen",
    all(f"\trequest_header -{h}" in body.splitlines() for h in m.SOURCE_HEADERS))
 ok("die Site gilt NICHT als veraltet fuer die Identitaetszeilen-Migration",
    not m._site_identity_stale(body))
+# Gemessen auf oaap-test (16.10.): /platform/feedback* nahm auch das
+# Script selbst und antwortete 404. Welcher Block welche URL bekommt:
+for path, want in (("/platform/feedback.js", "handle /platform/* {"),
+                   ("/platform/theme.css", "handle /platform/* {"),
+                   ("/platform/feedback", "handle /platform/feedback {"),
+                   ("/platform/feedback/session", "handle /platform/feedback/* {"),
+                   ("/platform/feedbackx", "handle /platform/* {"),
+                   ("/display/1", "handle /display* {")):
+    got = route_for(body, path)
+    ok(f"{path} -> {want}", got == want, got)
+ok("beide Feedback-Bloecke sind gleich",
+   block(body, "handle /platform/feedback {") == block(body, "handle /platform/feedback/* {"))
 
 print("")
 print("2. Mit `vorgaenge` im Mandanten (Produktion und Test)")
@@ -119,7 +146,7 @@ m.save_registry(reg)
 del RELOADS[:]
 m.refresh_generated_sites()
 body = site("hbvp-portal-test")
-fb = block(body, "handle /platform/feedback* {")
+fb = block(body, "handle /platform/feedback {")
 ok("eine Test-App meldet in den Test-Eingang",
    fb and "reverse_proxy oaap-app-vorgaenge-test:8000 {" in fb, fb)
 ok("… mit Anmeldung, Mandant und Instanz",
@@ -133,9 +160,9 @@ want = {"header_up X-OAAP-Source-Instance hbvp-portal-test",
         f"header_up X-OAAP-Source-Tenant {tid}"}
 ok("… und das Gateway setzt die Herkunft", fb and want <= set(fb), fb)
 ok("die Produktions-App meldet in den Produktions-Eingang",
-   "reverse_proxy oaap-app-vorgaenge:8000 {" in (block(site("hbvp-portal"), "handle /platform/feedback* {") or []))
+   "reverse_proxy oaap-app-vorgaenge:8000 {" in (block(site("hbvp-portal"), "handle /platform/feedback {") or []))
 ok("ein anderer Mandant bekommt NICHT dieses `vorgaenge` (404)",
-   "respond 404" in (block(site("fremd"), "handle /platform/feedback* {") or []))
+   "respond 404" in (block(site("fremd"), "handle /platform/feedback {") or []))
 
 print("")
 print("3. Das Ziel folgt der Registry")
@@ -144,7 +171,7 @@ reg["instances"].pop("vorgaenge-test")
 m.save_registry(reg)
 done = m.refresh_cases_sites()
 ok("Test-Eingang entfernt: die Test-App faellt auf Produktion zurueck",
-   "reverse_proxy oaap-app-vorgaenge:8000 {" in (block(site("hbvp-portal-test"), "handle /platform/feedback* {") or []))
+   "reverse_proxy oaap-app-vorgaenge:8000 {" in (block(site("hbvp-portal-test"), "handle /platform/feedback {") or []))
 ok("… und nur die betroffenen Sites wurden neu geschrieben",
    "hbvp-portal-test" in done and "fremd" not in done, done)
 ok("ein zweiter Lauf schreibt nichts", m.refresh_cases_sites() == [])
@@ -159,7 +186,7 @@ reg["instances"]["vorgaenge"]["rehearsal"] = {"of": "x", "expires": "2099-01-01T
 m.save_registry(reg)
 m.refresh_cases_sites()
 ok("eine Generalprobe nimmt keine Meldungen an",
-   "respond 404" in (block(site("hbvp-portal"), "handle /platform/feedback* {") or []))
+   "respond 404" in (block(site("hbvp-portal"), "handle /platform/feedback {") or []))
 reg = m.load_registry()
 reg["instances"]["vorgaenge"].pop("rehearsal")
 m.save_registry(reg)
@@ -171,7 +198,7 @@ lazy = "\n".join(m.site_body(reg["instances"]["fremd"]["routes"], "oaap-app-frem
 ok("Generalprobe: /platform/* verlangt eine Anmeldung",
    any(x.startswith("uri /verify?roles=") for x in (block(lazy, "handle /platform/* {") or [])), lazy)
 ok("Generalprobe: auch der 404-Block verlangt eine Anmeldung",
-   any(x.startswith("uri /verify?roles=") for x in (block(lazy, "handle /platform/feedback* {") or [])), lazy)
+   any(x.startswith("uri /verify?roles=") for x in (block(lazy, "handle /platform/feedback {") or [])), lazy)
 
 print("")
 print("4. Das Manifest")

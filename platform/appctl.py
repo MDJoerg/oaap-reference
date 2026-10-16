@@ -4085,15 +4085,11 @@ def cmd_migrate_platform_routes(_args):
     lesson of 0.1.108 and of 0.1.117, the third time for the same kind
     of route. Idempotent, and silent when there is nothing to carry.
     """
-    insts = _cases_registry()
-    behind = [n for n, i in sorted(insts.items())
-              if i.get("routes") and i.get("svc_port") and i.get("port")
-              and _read_file(os.path.join(CADDY_APPS_DIR, f"{n}.caddy")) is not None
-              and CASES_MARKER not in (_read_file(
-                  os.path.join(CADDY_APPS_DIR, f"{n}.caddy")) or "")]
+    behind = _cases_sites_behind()
+    current = f"{CASES_MARKER}{CASES_BLOCK_FORMAT} "
     generated = [f for f in ("external.caddy", "instance-addresses.caddy")
-                 if (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")
-                 and CASES_MARKER not in
+                 if "\thandle " in (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")
+                 and current not in
                  (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")]
     if not behind and not generated:
         return
@@ -9712,6 +9708,13 @@ SOURCE_HEADERS = ("X-OAAP-Source-Instance", "X-OAAP-Source-App",
 # instance changes the right answer for every site of its tenant;
 # refresh_cases_sites() compares this line and rewrites what is behind.
 CASES_MARKER = "# platform-feedback "
+# The shape of the blocks themselves. Raised whenever the generator
+# writes them differently, so the files already on a node follow --
+# the marker compares it like the target. 2: the feedback route is
+# /platform/feedback and /platform/feedback/* exactly; 1 matched
+# /platform/feedback* and so swallowed /platform/feedback.js (measured
+# on oaap-test, 2026-10-16, before any release).
+CASES_BLOCK_FORMAT = 2
 
 _CASES_CACHE = {"stamp": None, "insts": {}}
 
@@ -9764,7 +9767,8 @@ def cases_target(insts, scope):
 def cases_marker(insts, scope):
     """The marker line a site for `scope` carries (see CASES_MARKER)."""
     me = insts.get(scope) or {}
-    return (f"{CASES_MARKER}{cases_target(insts, scope) or '-'} "
+    return (f"{CASES_MARKER}{CASES_BLOCK_FORMAT} "
+            f"{cases_target(insts, scope) or '-'} "
             f"{me.get('app_id') or '-'}@{me.get('version') or '-'}")
 
 
@@ -9798,10 +9802,13 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
     lines = ["\t" + cases_marker(insts, scope)]
     # Site level, so it runs before every handle block below and above.
     lines += [f"\trequest_header -{h}" for h in SOURCE_HEADERS]
-    lines.append("\thandle /platform/feedback* {")
+    # Two exact matchers, never /platform/feedback*: that one also takes
+    # /platform/feedback.js, the script itself, and answers it with the
+    # 404 or the proxy meant for the form.
+    fb = []
     if not target:
-        lines += login_lines() if login_only else strip_identity()
-        lines.append("\t\trespond 404")
+        fb += login_lines() if login_only else strip_identity()
+        fb.append("\t\trespond 404")
     else:
         roles = sorted({x for r in routes for x in r["roles"] if x != "public"})
         uri = f"/verify?roles={','.join(roles)}"
@@ -9811,18 +9818,19 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
             uri += f"&tenant={tenant}"
         if scope:
             uri += f"&instance={scope}"
-        lines.append("\t\tforward_auth identity:8000 {")
-        lines.append(f"\t\t\turi {uri}")
-        lines.append("\t\t\t" + _COPY_IDENTITY)
-        lines += _AUTH_NO_UPGRADE
-        lines.append("\t\t}")
-        lines.append("\t\turi strip_prefix /platform")
+        fb.append("\t\tforward_auth identity:8000 {")
+        fb.append(f"\t\t\turi {uri}")
+        fb.append("\t\t\t" + _COPY_IDENTITY)
+        fb += _AUTH_NO_UPGRADE
+        fb.append("\t\t}")
+        fb.append("\t\turi strip_prefix /platform")
         source = (scope or "-", me.get("app_id") or "-",
                   me.get("version") or "-",
                   tenant or (instance_tenant_ref(me) if me else "-"))
-        lines += _proxy(target, "\t\t", extra=[
+        fb += _proxy(target, "\t\t", extra=[
             f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
-    lines.append("\t}")
+    for matcher in ("/platform/feedback", "/platform/feedback/*"):
+        lines += [f"\thandle {matcher} {{"] + fb + ["\t}"]
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
     lines.append("\t\turi strip_prefix /platform")
@@ -9844,20 +9852,28 @@ def refresh_cases_sites():
     migration. Returns the names rewritten.
     """
     insts = _cases_registry()
-    done = []
+    done = _cases_sites_behind()
+    for name in done:
+        write_app_caddy(name, insts[name])
+    return done
+
+
+def _cases_sites_behind():
+    """Names of the LAN instance sites whose marker is not the one the
+    generator would write now (refresh_cases_sites, the migration)."""
+    insts = _cases_registry()
+    out = []
     for name, inst in sorted(insts.items()):
         if not inst.get("routes") or not inst.get("svc_port") \
                 or not inst.get("port"):
             continue
-        path = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
-        body = _read_file(path)
+        body = _read_file(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"))
         if body is None:
             continue
         want = cases_marker(insts, name)
         if not any(ln.strip() == want for ln in body.splitlines()):
-            write_app_caddy(name, inst)
-            done.append(name)
-    return done
+            out.append(name)
+    return out
 
 
 def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
