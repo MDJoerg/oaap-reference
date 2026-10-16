@@ -9713,8 +9713,9 @@ CASES_MARKER = "# platform-feedback "
 # the marker compares it like the target. 2: the feedback route is
 # /platform/feedback and /platform/feedback/* exactly; 1 matched
 # /platform/feedback* and so swallowed /platform/feedback.js (measured
-# on oaap-test, 2026-10-16, before any release).
-CASES_BLOCK_FORMAT = 2
+# on oaap-test, 2026-10-16, before any release). 3: the path is passed
+# on unchanged -- a stripped one became the login's return target.
+CASES_BLOCK_FORMAT = 3
 
 _CASES_CACHE = {"stamp": None, "insts": {}}
 
@@ -9823,7 +9824,9 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
         fb.append("\t\t\t" + _COPY_IDENTITY)
         fb += _AUTH_NO_UPGRADE
         fb.append("\t\t}")
-        fb.append("\t\turi strip_prefix /platform")
+        # The path stays as it is: `uri` runs before forward_auth in
+        # Caddy's order, so stripping here would hand a login the wrong
+        # return target (/feedback instead of /platform/feedback).
         source = (scope or "-", me.get("app_id") or "-",
                   me.get("version") or "-",
                   tenant or (instance_tenant_ref(me) if me else "-"))

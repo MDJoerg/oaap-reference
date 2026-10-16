@@ -153,7 +153,8 @@ ok("… mit Anmeldung, Mandant und Instanz",
    fb and any(x.startswith("uri /verify?roles=admin,user&tenant=" + tid + "&instance=hbvp-portal-test")
               for x in fb), fb)
 ok("… die Identitaet kommt aus copy_headers", fb and m._COPY_IDENTITY in fb, fb)
-ok("… der Pfad verliert /platform", fb and "uri strip_prefix /platform" in fb, fb)
+ok("… der Pfad bleibt, wie er ist (sonst waere er das Ruecksprungziel der Anmeldung)",
+   fb and not any(x.startswith("uri strip_prefix") for x in fb), fb)
 want = {"header_up X-OAAP-Source-Instance hbvp-portal-test",
         "header_up X-OAAP-Source-App hbsha",
         "header_up X-OAAP-Source-Version 2.5.0",
