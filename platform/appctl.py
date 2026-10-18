@@ -5951,6 +5951,8 @@ class _BuildDrivers:
             argv += ["--skip", a["skip"]]
         for pair in [x for x in (a.get("groups") or "").split(",") if x.strip()]:
             argv += ["--group-for", pair.strip()]
+        for pair in [x for x in (a.get("names") or "").split(",") if x.strip()]:
+            argv += ["--name-for", pair.strip()]
         return argv
 
     def _check_authz_setup(self, a, ctx):
@@ -5973,6 +5975,10 @@ class _BuildDrivers:
         for pair in [x for x in (a.get("groups") or "").split(",") if x.strip()]:
             k, _s, v = pair.partition("=")
             groups[k.strip()] = v.strip()
+        names = {}
+        for pair in [x for x in (a.get("names") or "").split(",") if x.strip()]:
+            k, _s, v = pair.partition("=")
+            names[k.strip()] = v.strip()
         try:
             plan = authorization.plan_setup(
                 st, tid, a["app"],
@@ -5980,7 +5986,7 @@ class _BuildDrivers:
                       if x.strip()],
                 skip=[x.strip() for x in (a.get("skip") or "").split(",")
                       if x.strip()],
-                group_for=groups)
+                group_for=groups, name_for=names)
         except authorization.AuthzError as e:
             return CONFLICT_, str(e)
         clash = [r["template"] for r in plan["rows"] if r["state"] == "conflict"]
@@ -16330,11 +16336,17 @@ def _authz_setup(args, label, tid, who, q, show):
         if not (k.strip() and sep and v.strip()):
             die(f"--group-for wants KEY=PATH, got '{pair}'")
         group_for[k.strip()] = v.strip()
+    name_for = {}
+    for pair in args.name_for or []:
+        k, sep, v = pair.partition("=")
+        if not (k.strip() and sep and v.strip()):
+            die(f"--name-for wants KEY=NAME, got '{pair}'")
+        name_for[k.strip()] = v.strip()
     st = _authz_setup_state(tid, q, show)
     try:
         plan = authorization.plan_setup(
             st, tid, app_id, only=keys(args.only), skip=keys(args.skip),
-            group_for=group_for)
+            group_for=group_for, name_for=name_for)
     except authorization.AuthzError as e:
         die(str(e))
     print(f"Setting up '{app_id}' in tenant '{label}':")
@@ -25472,6 +25484,11 @@ def main():
                     default=[], metavar="KEY=PATH",
                     help="for setup: the group path for a template "
                          "(overrides the manifest's suggestion), repeatable")
+    pz.add_argument("--name-for", dest="name_for", action="append",
+                    default=[], metavar="KEY=NAME",
+                    help="for setup: the name of the role and the collection "
+                         "for a template, instead of its title (the way out "
+                         "of a name that is taken), repeatable")
     pz.add_argument("--no-groups", dest="no_groups", action="store_true",
                     help="for setup: do not make the groups in the realm; the "
                          "mappings are still written")

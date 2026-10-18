@@ -56,8 +56,9 @@ STEP_TYPES = {
                                    "path", "ref")),
     # oaap.core.authorization 0.4 section 2.11: roles, collections, mappings
     # and realm groups from the templates of one app. `only`/`skip` are
-    # comma-separated template keys, `groups` is KEY=PATH[,KEY=PATH].
-    "authz.setup":    (("app",), ("only", "skip", "groups")),
+    # comma-separated template keys, `groups` is KEY=PATH[,KEY=PATH] and
+    # `names` is KEY=NAME[,KEY=NAME] (a name holds no comma).
+    "authz.setup":    (("app",), ("only", "skip", "groups", "names")),
     "manual":         (("text", "done_when"), ()),
     "backup.check":   ((), ()),
 }

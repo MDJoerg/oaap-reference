@@ -244,6 +244,50 @@ r = rows(az.plan_setup(st, T1, APP))
 ok("KOEDER: eine ausgeblendete Rolle wird nie wiederverwendet, ihr Name bleibt belegt",
    r["announcer"]["state"] == "conflict", r["announcer"])
 
+print("Eigener Name (--name-for)")
+st = fresh()
+other = az.create_role(st, T1, APP, "announcer", "Betreuer/in")
+r = rows(az.plan_setup(st, T1, APP))
+ok("Ausgangslage: der Titel 'Betreuer/in' ist belegt -> Konflikt",
+   r["official"]["state"] == "conflict", r["official"])
+p = az.plan_setup(st, T1, APP, name_for={"official": "Betreuer (Mannschaft)"})
+r = rows(p)
+ok("--name-for loest den Konflikt: Rolle UND Sammlung tragen den gewaehlten Namen",
+   r["official"]["state"] == "ready"
+   and r["official"]["role"]["name"] == "Betreuer (Mannschaft)"
+   and r["official"]["collection"]["name"] == "Betreuer (Mannschaft)", r["official"])
+apply(st, p)
+ok("angelegt unter diesem Namen",
+   any(x["name"] == "Betreuer (Mannschaft)" for x in st["roles"].values())
+   and any(x["name"] == "Betreuer (Mannschaft)" for x in st["collections"].values()))
+ok("und der naechste Plan sagt 'present' fuer diese Vorlage, auch ohne --name-for",
+   rows(az.plan_setup(st, T1, APP))["official"]["state"] == "present")
+st = fresh()
+az.create_collection(st, T1, "Obmann", [az.create_role(st, T1, APP, "official", "x")])
+r = rows(az.plan_setup(st, T1, APP, name_for={"chef": "Obmann des Vereins"}))
+ok("auch ein belegter Sammlungsname laesst sich so umgehen",
+   r["chef"]["state"] == "ready"
+   and r["chef"]["collection"]["name"] == "Obmann des Vereins", r["chef"])
+st = fresh()
+rid = az.create_role(st, T1, APP, "announcer", "Sprecher von Hand")
+az.create_collection(st, T1, "Sprecherpaket", [rid])
+r = rows(az.plan_setup(st, T1, APP, name_for={"announcer": "Sprecherin"}))
+ok("KOEDER: eine vorhandene Rolle wird NICHT umbenannt, der Plan sagt, dass --name-for nicht benutzt wurde",
+   r["announcer"]["role"]["name"] == "Sprecher von Hand"
+   and r["announcer"]["role"]["action"] == "present"
+   and any("not used" in n for n in r["announcer"]["notes"]), r["announcer"])
+for bad, why in (("", "leer"), (" x", "Leerzeichen vorn"), ("x" * 81, "81 Zeichen"),
+                 ("ab", "Steuerzeichen")):
+    refuses(f"--name-for mit einem unbrauchbaren Namen ({why}) wird abgelehnt",
+            lambda b=bad: az.plan_setup(fresh(), T1, APP, name_for={"official": b}),
+            "--name-for")
+refuses("--name-for mit unbekanntem Schluessel wird abgelehnt",
+        lambda: az.plan_setup(fresh(), T1, APP, name_for={"nope": "X"}), "nope")
+p = az.plan_setup(fresh(), T1, APP, name_for={"official": "Betreuung"},
+                  skip=["official"])
+ok("eine abgewaehlte Vorlage bleibt abgewaehlt, auch mit --name-for",
+   rows(p)["official"]["state"] == "skipped", rows(p)["official"])
+
 print("Mandanten")
 st = fresh()
 apply(st, az.plan_setup(st, T1, APP))

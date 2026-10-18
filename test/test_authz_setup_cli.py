@@ -283,6 +283,26 @@ out, code = cli("--app", "gibtsnicht")
 ok("eine App ohne Erklaerung: abgelehnt, nichts geschrieben",
    code != 0 and writes() == [], out)
 
+print("--name-for")
+reset()
+STATE["roles"]["x"] = {"id": "x", "tenant": TID, "app": "andere", "template": "t",
+                       "name": "Betreuer/in", "values": {}}
+out, code = cli("--app", APP, "--dry-run")
+ok("Ausgangslage: der Name 'Betreuer/in' ist belegt, der Probelauf zeigt den Konflikt",
+   "conflict" in out and "taken" in out, out)
+out, code = cli("--app", APP, "--name-for", "official=Betreuung")
+names = {r["name"] for r in STATE["roles"].values()}
+ok("mit --name-for: Erfolg, die Rolle traegt den gewaehlten Namen",
+   code == 0 and "Betreuung" in names and "Betreuer/in" in names, (out, names))
+ok("und die Sammlung auch", any(c["name"] == "Betreuung"
+                                 for c in STATE["collections"].values()))
+reset()
+out, code = cli("--app", APP, "--name-for", "official")
+ok("--name-for ohne Name: abgelehnt, nichts geschrieben", code != 0 and writes() == [], out)
+out, code = cli("--app", APP, "--name-for", "nope=X")
+ok("--name-for mit unbekanntem Schluessel: abgelehnt, nichts geschrieben",
+   code != 0 and writes() == [] and "nope" in out, out)
+
 print("Eine Zeile scheitert")
 reset()
 FAIL_ROLE.add("Hallensprecher/in")

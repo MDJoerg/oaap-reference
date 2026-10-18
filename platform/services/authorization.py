@@ -787,7 +787,8 @@ def group_path_problem(raw):
     return ""
 
 
-def plan_setup(state, tenant, app, only=None, skip=None, group_for=None):
+def plan_setup(state, tenant, app, only=None, skip=None, group_for=None,
+               name_for=None):
     """What `oaap authz setup` would do for one app in one tenant.
 
     Pure: reads the stored declaration and the tenant's roles, collections
@@ -795,15 +796,19 @@ def plan_setup(state, tenant, app, only=None, skip=None, group_for=None):
     per template, in declaration order. A row is READY (something to do),
     PRESENT (nothing to do), SKIPPED (the tenant must decide something) or
     CONFLICT (a name is taken by something else; that template is left
-    alone and the others go on).
+    alone and the others go on). `name_for` {template key: name} chooses the
+    name of the role and of the collection instead of the template's title --
+    the way out of a conflict.
     """
     decl = _decl(state, app)
     templates = decl.get("role_templates") or []
     keys = [t["key"] for t in templates]
     only, skip = list(only or ()), list(skip or ())
     group_for = dict(group_for or {})
+    name_for = dict(name_for or {})
     for label, wanted in (("--only", only), ("--skip", skip),
-                          ("--group-for", list(group_for))):
+                          ("--group-for", list(group_for)),
+                          ("--name-for", list(name_for))):
         bad = [k for k in wanted if k not in keys]
         if bad:
             raise AuthzError(f"{label} names {', '.join(bad)}, which "
@@ -813,6 +818,10 @@ def plan_setup(state, tenant, app, only=None, skip=None, group_for=None):
         why = group_path_problem(path)
         if why:
             raise AuthzError(f"--group-for {k}: {why}")
+    for k, nm in name_for.items():
+        if not NAME_RE.match(nm or "") or nm != nm.strip():
+            raise AuthzError(f"--name-for {k}: a name of 1 to 80 characters, "
+                             "no blank at either end")
     roles = [r for r in state["roles"].values() if r["tenant"] == tenant]
     colls = [c for c in state["collections"].values() if c["tenant"] == tenant]
     maps = [m for m in state["mappings"].values() if m["tenant"] == tenant]
@@ -841,10 +850,14 @@ def plan_setup(state, tenant, app, only=None, skip=None, group_for=None):
         have = next((r for r in roles if r["app"] == app
                      and r["template"] == key and not r.get("retired")
                      and not r.get("values")), None)
-        title = tpl["title"]
+        title = name_for.get(key) or tpl["title"]
         if have:
             row["role"] = {"action": "present", "name": have["name"],
                            "id": have["id"]}
+            if key in name_for and have["name"] != title:
+                row["notes"].append(
+                    f"--name-for not used: the role is there already, as "
+                    f"'{have['name']}'")
         else:
             if any(r["name"] == title for r in roles):
                 row["state"] = "conflict"

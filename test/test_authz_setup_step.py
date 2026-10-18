@@ -158,6 +158,18 @@ ok("--only und --skip stehen in der Argumentliste",
    == "announcer" and "--skip" in SEEN["argv"]
    and SEEN["argv"][SEEN["argv"].index("--skip") + 1] == "bereich", SEEN["argv"])
 
+drv.do("authz.setup", {"app": APP, "names": "announcer=Sprecherin,bereich=Bereichsleitung"}, {})
+ok("`names` erreicht den Befehl als --name-for, je Paar einmal",
+   SEEN["argv"].count("--name-for") == 2
+   and "announcer=Sprecherin" in SEEN["argv"]
+   and "bereich=Bereichsleitung" in SEEN["argv"], SEEN["argv"])
+verdict, note = drv.check("authz.setup", {"app": APP, "names": "nope=X"}, {})
+ok("und die Pruefung kennt `names`: ein unbekannter Schluessel ist ein CONFLICT",
+   verdict == tb.CONFLICT and "nope" in note, (verdict, note))
+prof["steps"][0].update(app="hib", names="announcer=Sprecherin")
+prof["steps"][0].pop("shell", None)
+ok("das Profil erlaubt `names`", tb.profile_problems(prof) == [], tb.profile_problems(prof))
+
 print("Konflikt")
 STATE["roles"].clear(), STATE["collections"].clear(), STATE["mappings"].clear()
 az.create_role(STATE, TID, APP, "announcer", "Hallensprecher/in")
