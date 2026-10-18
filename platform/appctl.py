@@ -15477,6 +15477,27 @@ def _install_from_dir(pkg, args, source):
     sync_instance_names(reg, only=name)
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
     print(f"Entry point: port {port} (through the gateway, login required)")
+    if not inst:
+        # Nothing was held back: a new instance has nothing to be compared
+        # with. Said here and written to the tenant's log, so a person can
+        # check that these are the circles meant.
+        beyond = roles_beyond_user(m.get("routes"))
+        public = public_route_paths(m.get("routes"))
+        who_ = os.environ.get("SUDO_USER") or getpass.getuser()
+        tid_ = resolve_tenant(reg["instances"][name].get("tenant"))
+        if beyond:
+            print("NOTE: first installation -- routes accept roles beyond "
+                  "'user': " + "; ".join(beyond))
+            audit_tenant("instance.roles-beyond-user", tid_, name, who=who_,
+                         role="root", detail="; ".join(beyond))
+        if public:
+            print("NOTE: first installation -- routes reachable WITHOUT "
+                  "login: " + ", ".join(public))
+            audit_tenant("instance.public-routes", tid_, name, who=who_,
+                         role="root", detail=", ".join(public))
+        if beyond or public:
+            print("      Nothing was held back (there was nothing to "
+                  "compare with); check that this is intended.")
     for auto in instance_auto_hosts(name, reg["instances"][name]):
         print(f"External:    https://{auto}/")
 
@@ -19427,6 +19448,30 @@ def source_package_arg(name, src):
 
 def _public_paths(routes):
     return {r["path"] for r in (routes or []) if "public" in (r.get("roles") or [])}
+
+
+def roles_beyond_user(routes):
+    """['path (role, role)'] -- the roles a route accepts beyond `user`.
+
+    `public` is a route without login and is judged by its own rule. Used
+    to REPORT a first installation: the envelope rule compares with what an
+    instance had, and a new instance had nothing, so without this the
+    widest circle a package asks for (`partner` for people outside the
+    organisation, `admin`, `keyuser`) would pass the first install
+    unmentioned. A report, never a refusal (decided 2026-10-18).
+    """
+    found = {}
+    for r in routes or []:
+        extra = set(r.get("roles") or []) - {"user", "public"}
+        if extra:
+            found.setdefault(r.get("path"), set()).update(extra)
+    return sorted(f"{p} ({', '.join(sorted(rs))})" for p, rs in found.items())
+
+
+def public_route_paths(routes):
+    """Sorted paths of the routes reachable without login (first-install report)."""
+    return sorted({r.get("path") for r in routes or []
+                   if "public" in (r.get("roles") or [])})
 
 
 def _route_role_additions(old_routes, new_routes):
