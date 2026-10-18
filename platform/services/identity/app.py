@@ -1333,6 +1333,11 @@ _CARD_STYLE = """
   button:hover{background:var(--blue-700)}
   .err{color:var(--err)}.ok{color:var(--ok)}.hint{color:var(--muted);font-size:.9rem}
   a{color:var(--blue-600)}
+  details.local{margin-top:1.1rem;border-top:1px solid var(--border);padding-top:.7rem}
+  details.local summary{color:var(--muted);font-size:.85rem;cursor:pointer;
+       text-align:center;list-style:none}
+  details.local summary::-webkit-details-marker{display:none}
+  details.local[open] summary{margin-bottom:.8rem}
 </style>
 """
 
@@ -1375,15 +1380,16 @@ LOGIN_PAGE = _HEAD + "<title>Anmelden — {{ face.title if at_place else 'OAAP' 
 {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
   <button>{{ provider }}</button>
 </form>
-<p class="hint" style="text-align:center;margin:.9rem 0">oder mit einem
-   Konto dieses Knotens</p>
 {% endif %}
+{% if provider %}<details class="local"{% if error %} open{% endif %}>
+<summary>Mit einem Konto dieses Knotens anmelden</summary>{% endif %}
 <form method="post" action="/auth/login">
 {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
-  <label>Benutzername <input name="username" autofocus autocomplete="username"></label>
+  <label>Benutzername <input name="username"{% if not provider or error %} autofocus{% endif %} autocomplete="username"></label>
   <label>Passwort <input name="password" type="password" autocomplete="current-password"></label>
   <button>Anmelden</button>
 </form>
+{% if provider %}</details>{% endif %}
 </div></body></html>"""])
 
 
