@@ -54,6 +54,10 @@ STEP_TYPES = {
     # form an UPLOADED profile may use -- see upload_problems).
     "app.install":    (("name",), ("source", "app", "source_id", "channel",
                                    "path", "ref")),
+    # oaap.core.authorization 0.4 section 2.11: roles, collections, mappings
+    # and realm groups from the templates of one app. `only`/`skip` are
+    # comma-separated template keys, `groups` is KEY=PATH[,KEY=PATH].
+    "authz.setup":    (("app",), ("only", "skip", "groups")),
     "manual":         (("text", "done_when"), ()),
     "backup.check":   ((), ()),
 }

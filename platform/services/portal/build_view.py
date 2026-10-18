@@ -28,6 +28,7 @@ STEP_TYPE = {
     "tenant.policy": "Richtlinie für die erste Anmeldung",
     "tenant.face": "Gesicht (Titel, Farben)",
     "app.install": "Anwendung installieren",
+    "authz.setup": "Rollen, Pakete und Gruppen aus den Vorlagen einrichten",
     "manual": "Ein Mensch erledigt das",
     "backup.check": "Sicherung prüfen",
 }
@@ -295,7 +296,7 @@ TEMPLATE = {
         "label, text, color, word, connector oder bool (Haken). Ein Schritt mit "
         "'when': '<bool-Parameter>' läuft nur, wenn der Haken gesetzt ist. "
         "Schrittarten: tenant.create, address.ensure, address.wait, idp.provision, "
-        "tenant.policy, tenant.face, app.install, manual, backup.check. app.install "
+        "tenant.policy, tenant.face, app.install, authz.setup, manual, backup.check. app.install "
         "nennt in einem hochgeladenen Profil eine App des Katalogs ('app'), nie einen "
         "Pfad; ersetze 'webseite' durch eine ID aus deinem Katalog. Platzhalter wie "
         "{label} setzt der Knoten ein, er wertet sie nie als Befehl aus."),

@@ -157,6 +157,49 @@ hard, confirm = m.envelope_review(inst, widened)
 check("new public route needs confirmation",
       not hard and any("without login" in c for c in confirm), (hard, confirm))
 
+# A new ROLE on a route (hbsha, 2026-10-18: `partner` on `/`, the way for
+# people outside the club). Not public, not a new port, not storage -- and
+# still a wider circle, so a person confirms it.
+rl = yaml.safe_load(MANIFEST)
+rl["app"]["version"] = "0.2.0"
+rl["routes"] = [{"path": "/", "roles": ["user", "partner"]}]
+hard, confirm = m.envelope_review(inst, rl)
+check("a new role on an existing route needs confirmation",
+      not hard and any("did not accept before: / (partner)" in c
+                       for c in confirm), (hard, confirm))
+rl2 = yaml.safe_load(MANIFEST)
+rl2["app"]["version"] = "0.2.0"
+rl2["routes"] = [{"path": "/", "roles": ["user"]},
+                 {"path": "/club", "roles": ["admin"]}]
+hard, confirm = m.envelope_review(inst, rl2)
+check("a NEW path with a role no route had before needs confirmation",
+      any("/club (admin)" in c for c in confirm), confirm)
+rl3 = yaml.safe_load(MANIFEST)
+rl3["app"]["version"] = "0.2.0"
+rl3["routes"] = [{"path": "/", "roles": ["user"]},
+                 {"path": "/more", "roles": ["user"]}]
+hard, confirm = m.envelope_review(inst, rl3)
+check("a new path for a role the instance already served is no widening",
+      not confirm, confirm)
+rl4 = yaml.safe_load(MANIFEST)
+rl4["app"]["version"] = "0.2.0"
+rl4["routes"] = [{"path": "/", "roles": []}]
+hard, confirm = m.envelope_review(inst, rl4)
+check("fewer roles never need confirmation", not confirm, confirm)
+inst_wide = dict(inst, routes=[{"path": "/", "roles": ["user", "partner"]}])
+hard, confirm = m.envelope_review(inst_wide, rl)
+check("a role the instance accepted already is not new", not confirm, confirm)
+inst_blank = dict(inst, routes=[])
+hard, confirm = m.envelope_review(inst_blank, rl)
+check("an instance with no recorded routes: no guess, no confirmation",
+      not confirm, confirm)
+pub = yaml.safe_load(MANIFEST)
+pub["app"]["version"] = "0.2.0"
+pub["routes"] = [{"path": "/", "roles": ["public"]}]
+hard, confirm = m.envelope_review(inst, pub)
+check("a public route is judged by its own rule, not twice",
+      sum(1 for c in confirm if "route" in c) == 1, confirm)
+
 ep = yaml.safe_load(MANIFEST)
 ep["app"]["version"] = "0.2.0"
 ep["endpoints"] = [{"name": "media", "protocol": "udp", "container_port": 8280}]

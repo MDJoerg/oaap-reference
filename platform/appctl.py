@@ -5942,6 +5942,63 @@ class _BuildDrivers:
         return ((PRESENT_, "an account holds tenant_admin") if admins
                 else (ABSENT_, "no account holds tenant_admin yet"))
 
+    # authz.setup ----------------------------------------------------------
+    def _setup_argv(self, a):
+        argv = ["authz", "setup", "--tenant", self.label, "--app", a["app"]]
+        if a.get("only"):
+            argv += ["--only", a["only"]]
+        if a.get("skip"):
+            argv += ["--skip", a["skip"]]
+        for pair in [x for x in (a.get("groups") or "").split(",") if x.strip()]:
+            argv += ["--group-for", pair.strip()]
+        return argv
+
+    def _check_authz_setup(self, a, ctx):
+        tid, _t = self._tenant()
+        if not tid:
+            return ABSENT_, "there is no tenant yet"
+
+        def show(status, doc):
+            if status >= 300:
+                raise RuntimeError(str((doc or {}).get("error")
+                                       or f"answered {status}"))
+            return doc
+
+        q = "actor=root&operator=1&tenant=" + tid
+        st = _authz_setup_state(tid, q, show)
+        if a["app"] not in st["declarations"]:
+            return ABSENT_, (f"the app '{a['app']}' has registered no "
+                             "declaration yet (install it first)")
+        groups = {}
+        for pair in [x for x in (a.get("groups") or "").split(",") if x.strip()]:
+            k, _s, v = pair.partition("=")
+            groups[k.strip()] = v.strip()
+        try:
+            plan = authorization.plan_setup(
+                st, tid, a["app"],
+                only=[x.strip() for x in (a.get("only") or "").split(",")
+                      if x.strip()],
+                skip=[x.strip() for x in (a.get("skip") or "").split(",")
+                      if x.strip()],
+                group_for=groups)
+        except authorization.AuthzError as e:
+            return CONFLICT_, str(e)
+        clash = [r["template"] for r in plan["rows"] if r["state"] == "conflict"]
+        if clash:
+            return CONFLICT_, ("a name is taken by something else for: "
+                               + ", ".join(clash))
+        todo = [r["template"] for r in plan["rows"] if r["state"] == "ready"]
+        if todo:
+            return ABSENT_, ("still to set up: " + ", ".join(todo))
+        return PRESENT_, ("every template of '" + a["app"] + "' is set up "
+                          "(or left to the tenant)")
+
+    def _do_authz_setup(self, a, ctx):
+        ok, note = self._verb(self._setup_argv(a),
+                              "roles, collections, mappings and realm groups "
+                              "were set up from the templates")
+        return ok, note, []
+
     # backup.check ---------------------------------------------------------
     def _check_backup_check(self, a, ctx):
         tid, _t = self._tenant()
@@ -16168,6 +16225,190 @@ def _kv_args(pairs, what):
     return out
 
 
+def _authz_setup_state(tid, q, show):
+    """The tenant's authorization as the plan reads it (spec 2.11)."""
+    decls = show(*_authz_call("GET", "/internal/authz/declarations?" + q))
+    roles = show(*_authz_call("GET", "/internal/authz/roles?" + q))["roles"]
+    colls = show(*_authz_call("GET", "/internal/authz/collections?" + q))[
+        "collections"]
+    maps = show(*_authz_call("GET", "/internal/authz/mappings?" + q))[
+        "mappings"]
+    return {
+        "declarations": {d["app"]: {"version": d["version"],
+                                    "declaration": d["declaration"]}
+                         for d in decls["declarations"]},
+        "roles": {r["id"]: dict(r, tenant=tid) for r in roles},
+        "collections": {c["id"]: dict(c, tenant=tid) for c in colls},
+        "mappings": {m["id"]: dict(m, tenant=tid) for m in maps},
+        "assignments": {},
+    }
+
+
+def _authz_setup_print(plan):
+    word = {"create": "make", "present": "there", "none": "-"}
+    for r in plan["rows"]:
+        print(f"  {r['template']:<16} {r['title']:<24} [{r['state']}]")
+        if r["state"] in ("skipped", "conflict"):
+            for n in r["notes"]:
+                print(f"      {n}")
+            continue
+        print(f"      role {word[r['role']['action']]:<5} "
+              f"collection {word[r['collection']['action']]:<5} "
+              f"mapping {word[r['mapping']['action']]:<5}"
+              + (f"  group {r['group']}  ({r['group_source']})"
+                 if r["group"] else ""))
+        for n in r["notes"]:
+            print(f"      {n}")
+
+
+def _authz_setup_groups(t, groups, accept):
+    """(done, sentence). Make the realm groups through the tenant's connector.
+
+    `done` is True when the groups exist afterwards, False when this tenant
+    has no way to have them made here (then the sentence says why, and the
+    caller decides); a connector that is there and FAILS dies.
+    """
+    provider = idp.provider_of(t)
+    if not provider:
+        return False, "this tenant has no provider, so no realm to make groups in"
+    name = provider.get("connector") or ""
+    conn = load_idp_connectors().get(name) if name else None
+    if not conn:
+        return False, ("the provider of this tenant was not made by a connector "
+                       "of this node, so OAAP cannot make groups in it")
+    kind = conn["kind"]
+    bad = idp_admin.groups_refusal(kind, groups)
+    if bad:
+        return False, bad
+    space = (provider.get("space")
+             or (idp.policy_of(t)["realm"] or {}).get("space") or "").strip()
+    if not space:
+        return False, "the provider names no realm"
+    # The record of a connector and a realm is for a human to read; what
+    # binds a tenant to a provider is the issuer and nothing else. So the
+    # connector is used only when the issuer it would make for that realm
+    # IS the tenant's issuer.
+    expected = idp_admin.issuer_for(kind, conn["base_url"], space)
+    if (expected or "").rstrip("/") != (provider.get("issuer") or "").rstrip("/"):
+        return False, (f"the connector '{name}' is at {conn['base_url']}, and "
+                       "the provider of this tenant is somewhere else "
+                       f"({provider.get('issuer')})")
+    admin = idp_admin.Admin(kind, conn["base_url"], conn["auth"],
+                            conn["admin_id"], conn["admin_secret"],
+                            auth_realm=conn.get("auth_realm", ""))
+    ok, got, msg = admin.ensure_groups(
+        space, groups, accept_version=accept or conn.get("accept_version", ""))
+    for line in admin.trace:
+        print("  " + line)
+    if not ok:
+        die("the groups could not be made, so NOTHING was written on the OAAP "
+            "side: " + msg)
+    for line in idp_admin.groups_words(got):
+        print("  " + line)
+    return True, msg
+
+
+def _authz_setup(args, label, tid, who, q, show):
+    """`oaap authz setup` -- oaap.core.authorization 0.4 section 2.11.
+
+    One explicit act for one app in one tenant: the roles, the collections,
+    the mappings and the realm's groups, from the app's templates. The plan
+    is computed first (pure) and printed; the realm groups come BEFORE the
+    first write on the OAAP side, so a failing realm leaves it as it was.
+    """
+    app_id = (args.app or "").strip()
+    if not app_id:
+        die("setup needs --app <app id> (see `oaap authz declarations "
+            f"--tenant {label}`)")
+
+    def keys(raw):
+        return [k.strip() for k in (raw or "").split(",") if k.strip()]
+
+    group_for = {}
+    for pair in args.group_for or []:
+        k, sep, v = pair.partition("=")
+        if not (k.strip() and sep and v.strip()):
+            die(f"--group-for wants KEY=PATH, got '{pair}'")
+        group_for[k.strip()] = v.strip()
+    st = _authz_setup_state(tid, q, show)
+    try:
+        plan = authorization.plan_setup(
+            st, tid, app_id, only=keys(args.only), skip=keys(args.skip),
+            group_for=group_for)
+    except authorization.AuthzError as e:
+        die(str(e))
+    print(f"Setting up '{app_id}' in tenant '{label}':")
+    print("")
+    _authz_setup_print(plan)
+    print("")
+    todo = [r for r in plan["rows"] if r["state"] == "ready"]
+    if args.dry_run:
+        print("Nothing was changed: --dry-run.")
+        return
+    if not todo:
+        print("Nothing to do.")
+        return
+    t = tenant_by_label(label, include_former=False)[1]
+    if plan["groups"] and not args.no_groups:
+        done, msg = _authz_setup_groups(t, plan["groups"], args.accept_version)
+        if not done:
+            print(f"  The realm groups are NOT made here: {msg}.")
+            print("  The mappings are written anyway; each group has to exist "
+                  "in the realm before it gives anything.")
+    elif plan["groups"]:
+        print("  --no-groups: the realm groups are not made; each has to "
+              "exist in the realm before it gives anything.")
+    made = {"roles": 0, "collections": 0, "mappings": 0}
+    failed = []
+
+    def call(method, path, body):
+        status, doc = _authz_call(method, path, body)
+        if status >= 300:
+            raise RuntimeError(str((doc or {}).get("error")
+                                   or f"answered {status}"))
+        return doc
+
+    for r in todo:
+        try:
+            role = r["role"].get("id") or ""
+            if r["role"]["action"] == "create":
+                doc = call("POST", "/internal/authz/roles", dict(
+                    who, app=app_id, template=r["template"],
+                    name=r["role"]["name"], values={}))
+                role = doc["role"]["id"]
+                made["roles"] += 1
+            coll = r["collection"].get("id") or ""
+            if r["collection"]["action"] == "create":
+                doc = call("POST", "/internal/authz/collections", dict(
+                    who, name=r["collection"]["name"], roles=[role]))
+                coll = doc["collection"]["id"]
+                made["collections"] += 1
+            if r["mapping"]["action"] == "create":
+                call("POST", "/internal/authz/mappings", dict(
+                    who, group=r["group"], collection=coll))
+                made["mappings"] += 1
+        except RuntimeError as e:
+            failed.append((r["template"], str(e)))
+    who_name = os.environ.get("SUDO_USER") or getpass.getuser()
+    audit_tenant("authz.setup", tid, app_id, who=who_name, role="root",
+                 detail=(f"{made['roles']} Rolle(n), {made['collections']} "
+                         f"Sammlung(en), {made['mappings']} Abbildung(en); "
+                         f"Konflikte: "
+                         f"{sum(1 for r in plan['rows'] if r['state'] == 'conflict')}"
+                         f"; uebersprungen: "
+                         f"{sum(1 for r in plan['rows'] if r['state'] == 'skipped')}"))
+    print(f"Made {made['roles']} role(s), {made['collections']} collection(s), "
+          f"{made['mappings']} mapping(s).")
+    held = [r for r in plan["rows"] if r["state"] in ("skipped", "conflict")]
+    if held:
+        print(f"{len(held)} template(s) were left alone (see above).")
+    if failed:
+        for key, why in failed:
+            print(f"FAILED  {key}: {why}")
+        print("Run it again: what is there is not touched, only the rest is made.")
+        sys.exit(1)
+
+
 def cmd_authz(args):
     """Business authorization from the host (oaap.core.authorization 0.1).
 
@@ -16190,6 +16431,8 @@ def cmd_authz(args):
             die(str((doc or {}).get("error") or f"answered {status}"))
         return doc
 
+    if verb == "setup":
+        return _authz_setup(args, label, tid, who, q, show)
     if verb == "declarations":
         doc = show(*_authz_call("GET", "/internal/authz/declarations?" + q))
         if not doc["declarations"]:
@@ -19174,6 +19417,32 @@ def _public_paths(routes):
     return {r["path"] for r in (routes or []) if "public" in (r.get("roles") or [])}
 
 
+def _route_role_additions(old_routes, new_routes):
+    """['path (role, role)'] -- who may now reach what they could not before.
+
+    A role added to a path the instance already had, or a role that no
+    route of the instance named before at all. `public` is judged by its own
+    rule (a route without login), so it is left out here. An instance with no
+    recorded routes says nothing, and a rule that guesses would confirm every
+    redeploy of it.
+    """
+    if not old_routes:
+        return []
+    old_by_path, old_all = {}, set()
+    for r in old_routes:
+        roles = set(r.get("roles") or []) - {"public"}
+        old_by_path.setdefault(r.get("path"), set()).update(roles)
+        old_all |= roles
+    out = []
+    for r in new_routes or []:
+        roles = set(r.get("roles") or []) - {"public"}
+        had = old_by_path.get(r.get("path"))
+        added = (roles - had) if had is not None else (roles - old_all)
+        if added:
+            out.append(f"{r.get('path')} ({', '.join(sorted(added))})")
+    return sorted(set(out))
+
+
 def _endpoint_keys(endpoints):
     return {(e.get("name", ""), e.get("protocol", ""), e.get("container_port"),
              bool(e.get("fixed"))) for e in (endpoints or [])}
@@ -19205,6 +19474,10 @@ def envelope_review(inst, m):
     if new_public:
         confirm.append("routes become reachable without login: "
                        + ", ".join(sorted(new_public)))
+    new_roles = _route_role_additions(inst.get("routes"), m.get("routes"))
+    if new_roles:
+        confirm.append("routes accept roles they did not accept before: "
+                       + "; ".join(new_roles))
     new_ep = _endpoint_keys(m.get("endpoints")) - _endpoint_keys(inst.get("declared_endpoints"))
     if new_ep:
         confirm.append("new declared endpoints (ports past the gateway): "
@@ -25165,7 +25438,8 @@ def main():
                                      "collections", "collection-add",
                                      "assignments", "assign", "revoke",
                                      "mappings", "map-add", "map-remove",
-                                     "role-retire", "collection-retire"])
+                                     "role-retire", "collection-retire",
+                                     "setup"])
     pz.add_argument("name", nargs="?", help="for 'revoke' / 'map-remove' / "
                     "'role-retire' / 'collection-retire': the id (or its first "
                     "characters; a name for the last two)")
@@ -25190,6 +25464,22 @@ def main():
                     help="for assign: fill a $context field")
     pz.add_argument("--from", dest="valid_from", default=None, metavar="DATE")
     pz.add_argument("--to", dest="valid_to", default=None, metavar="DATE")
+    pz.add_argument("--only", default="", metavar="KEY[,KEY]",
+                    help="for setup: only these templates")
+    pz.add_argument("--skip", default="", metavar="KEY[,KEY]",
+                    help="for setup: leave these templates out")
+    pz.add_argument("--group-for", dest="group_for", action="append",
+                    default=[], metavar="KEY=PATH",
+                    help="for setup: the group path for a template "
+                         "(overrides the manifest's suggestion), repeatable")
+    pz.add_argument("--no-groups", dest="no_groups", action="store_true",
+                    help="for setup: do not make the groups in the realm; the "
+                         "mappings are still written")
+    pz.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="for setup: print the plan, change nothing")
+    pz.add_argument("--accept-version", dest="accept_version", default="",
+                    help="for setup: the provider's version, as the operator's "
+                         "word, when the connector cannot read it")
     pz.set_defaults(fn=cmd_authz)
     pm = sub.add_parser("machine", help="machine principals (RFC-0027) -- "
                         "accounts that authenticate by key, never by password")

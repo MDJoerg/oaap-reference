@@ -133,6 +133,8 @@ CONNECTOR_KINDS = {
             "group_client_roles":
                 "/admin/realms/{space}/groups/{uuid}/role-mappings/clients/"
                 "{client}",
+            # Group paths for `oaap authz setup` (spec 2.11, RFC-0056 §6).
+            "group_children": "/admin/realms/{space}/groups/{uuid}/children",
             "client_roles": "/admin/realms/{space}/clients/{client}/roles",
             "client_mappers":
                 "/admin/realms/{space}/clients/{uuid}/protocol-mappers/models",
@@ -222,7 +224,7 @@ CONNECTOR_KINDS = {
             "people_key": "users",
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
-                  "export", "admin_group"),
+                  "export", "admin_group", "groups"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
@@ -239,7 +241,7 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
-OPTIONAL_VERBS = ("settings", "export", "admin_group")
+OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -1448,6 +1450,114 @@ def admin_group_plan(kind, space):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Group paths (RFC-0056 section 6, oaap.core.authorization 0.4 section 2.11)
+
+GROUP_DEPTH_MAX = 3
+GROUP_SEGMENT_MAX = 64
+
+
+def group_segments(path):
+    """The segments of a group path, or None when it is not one.
+
+    1 to 3 segments of 1 to 64 characters, no blank at either end of a
+    segment, no control character. A leading slash (how the product shows a
+    path) is dropped; an empty segment is refused, never skipped.
+    """
+    p = str(path or "").strip().lstrip("/")
+    segs = p.split("/")
+    if not 1 <= len(segs) <= GROUP_DEPTH_MAX:
+        return None
+    for seg in segs:
+        if (not seg or seg != seg.strip() or len(seg) > GROUP_SEGMENT_MAX
+                or any(ord(c) < 32 for c in seg)):
+            return None
+    return segs
+
+
+def groups_refusal(kind, paths):
+    """Why group paths cannot be made at this connector, or ''."""
+    bad = verb_refusal(kind, "groups")
+    if bad:
+        return bad
+    if not paths:
+        return "no group path was given"
+    for p in paths:
+        if group_segments(p) is None:
+            return (f"'{p}' is not a group path: 1 to {GROUP_DEPTH_MAX} "
+                    f"segments of 1 to {GROUP_SEGMENT_MAX} characters, e.g. "
+                    "'Verein/Trainer'")
+    return ""
+
+
+def groups_plan(kind, space, paths):
+    """Every call making group paths, in order (the dry run prints it).
+
+    Reads first, writes only what a read showed to be missing. No call
+    touches a member or a role.
+    """
+    if kind_refusal(kind) or groups_refusal(kind, paths):
+        return []
+    c = connector_of(kind)
+    word = c["space_word"]
+    out = [
+        {"verb": "version", "method": "GET", "when": "always",
+         "writes": False, "path": c["version_path"],
+         "why": f"which {c['product']} is this? checked against the pinned "
+                f"{c['pinned']} BEFORE anything is created"},
+        {"verb": "space", "method": "GET", "when": "always",
+         "writes": False, "path": path_of(kind, "space", space=space),
+         "why": f"the {word} must exist -- this step makes none"},
+    ]
+    seen = set()
+    for raw in paths:
+        segs = group_segments(raw)
+        for depth in range(len(segs)):
+            full = "/".join(segs[:depth + 1])
+            if full in seen:
+                continue
+            seen.add(full)
+            if depth == 0:
+                out.append({
+                    "verb": "groups", "method": "GET", "when": "always",
+                    "writes": False,
+                    "path": path_of(kind, "groups", space=space,
+                                    query={"search": segs[0],
+                                           "exact": "true"}),
+                    "why": f"is there a group '{full}'?"})
+                out.append({
+                    "verb": "groups", "method": "POST", "when": "absent",
+                    "writes": True,
+                    "path": path_of(kind, "groups", space=space),
+                    "why": f"create the group '{full}' -- a group, never a "
+                           "person"})
+            else:
+                out.append({
+                    "verb": "groups", "method": "GET", "when": "always",
+                    "writes": False,
+                    "path": path_of(kind, "group_children", space=space,
+                                    uuid="<parent>"),
+                    "why": f"is there a group '{full}'?"})
+                out.append({
+                    "verb": "groups", "method": "POST", "when": "absent",
+                    "writes": True,
+                    "path": path_of(kind, "group_children", space=space,
+                                    uuid="<parent>"),
+                    "why": f"create the group '{full}' -- a group, never a "
+                           "person"})
+    return out
+
+
+def groups_words(result):
+    """What the space looks like after the run."""
+    out = []
+    if result.get("created"):
+        out.append("made: " + ", ".join(result["created"]))
+    if result.get("present"):
+        out.append("already there: " + ", ".join(result["present"]))
+    return out
+
+
 def role_reaches(name, composites_of, management_id, seen=None):
     """Whether a realm role leads, through composites, to a management role.
 
@@ -1986,6 +2096,140 @@ class Admin:
         return next((x.get("id") for x in groups
                      if isinstance(x, dict) and x.get("name") == name
                      and x.get("path", "/" + name) == "/" + name), ""), ""
+
+    def _group_at(self, space, parent_id, name, full):
+        """(id, error) of the group `name` under `parent_id` ('' = top)."""
+        if not parent_id:
+            groups, err = self._read_list(
+                self._path("groups", space=space,
+                           query={"search": name, "exact": "true"}),
+                "looking for the group")
+            if err:
+                return "", err
+            return next((x.get("id") for x in groups
+                         if isinstance(x, dict) and x.get("name") == name
+                         and x.get("path", "/" + name) == "/" + full),
+                        ""), ""
+        kids, err = self._read_list(
+            self._path("group_children", space=space, uuid=parent_id,
+                       query={"first": "0", "max": "500"}),
+            "looking for the group")
+        if err:
+            return "", err
+        return next((x.get("id") for x in kids
+                     if isinstance(x, dict) and x.get("name") == name), ""), ""
+
+    def _resolve_group(self, space, segs):
+        """(id, error) of the group a full path names, '' when absent."""
+        parent = ""
+        for depth, name in enumerate(segs):
+            parent, err = self._group_at(space, parent, name,
+                                         "/".join(segs[:depth + 1]))
+            if err or not parent:
+                return "", err
+        return parent, ""
+
+    def ensure_groups(self, space, paths, accept_version=""):
+        """Make sure group paths exist. (ok, result, sentence).
+
+        Order is the rule, as for the administrator group: version, the
+        space, then the reads, and a write only for what a read showed to
+        be missing. Adds groups, nothing else: an existing group is not
+        touched -- not its members, not its roles -- and no person is
+        created. The paths are read again at the end and what is reported
+        is what the space answered.
+        """
+        self._space_now = space
+        paths = list(dict.fromkeys(paths or ()))
+        bad = groups_refusal(self.kind, paths)
+        if bad:
+            return False, {}, bad
+        plan = groups_plan(self.kind, space, paths)
+        bad = plan_refusal(plan)
+        if bad:
+            return False, {}, bad
+        bad = space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        ok, msg = self.login()
+        if not ok:
+            return False, {}, msg
+        said, err = self.version()
+        if err:
+            return False, {}, err
+        how, bad = version_check(self.kind, said, accept_version)
+        if bad:
+            return False, {}, bad
+        seen_version = said or (accept_version or "").strip()
+        self._note(f"{self.decl['product']} "
+                   + version_words(how, seen_version, self.kind))
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        if not exists:
+            return False, {}, (
+                f"there is no {self.decl['space_word']} '{space}' at "
+                f"{self.base}; `oaap idp provision` makes it, and this step "
+                "does not")
+        created, present = [], []
+        done = set()
+        for raw in paths:
+            segs = group_segments(raw)
+            parent = ""
+            for depth, name in enumerate(segs):
+                full = "/".join(segs[:depth + 1])
+                gid, err = self._group_at(space, parent, name, full)
+                if err:
+                    return False, {"created": created, "present": present}, err
+                if gid:
+                    if full not in done:
+                        present.append(full)
+                else:
+                    path = (self._path("groups", space=space) if not parent
+                            else self._path("group_children", space=space,
+                                            uuid=parent))
+                    status, _doc, err = self._call("POST", path,
+                                                   body={"name": name})
+                    if err:
+                        return False, {"created": created,
+                                       "present": present}, err
+                    if status == 403:
+                        return False, {"created": created,
+                                       "present": present}, self._not_ours(
+                            space, "create a group")
+                    if status not in (201, 204, 409):
+                        return False, {"created": created,
+                                       "present": present}, (
+                            f"creating the group '{full}' answered {status}")
+                    gid, err = self._group_at(space, parent, name, full)
+                    if err:
+                        return False, {"created": created,
+                                       "present": present}, err
+                    if not gid:
+                        return False, {"created": created,
+                                       "present": present}, (
+                            f"the group '{full}' was created and cannot be "
+                            "found again -- refusing to guess")
+                    if full not in done:
+                        created.append(full)
+                        self._note(f"created the group '{full}'")
+                done.add(full)
+                parent = gid
+        ids = {}
+        for raw in paths:
+            segs = group_segments(raw)
+            gid, err = self._resolve_group(space, segs)
+            if err:
+                return False, {"created": created, "present": present}, err
+            if not gid:
+                return False, {"created": created, "present": present}, (
+                    f"the group '{'/'.join(segs)}' was asked for and the "
+                    f"{self.decl['space_word']} says it is not there")
+            ids["/".join(segs)] = gid
+        result = {"created": created, "present": present, "ids": ids,
+                  "version": seen_version, "version_how": how, "space": space}
+        return True, result, (f"{len(ids)} group path(s) exist in '{space}'; "
+                              "OAAP created nobody to put in them")
 
     def admin_group(self, space, accept_version=""):
         """Prepare the administrator group. (ok, result, sentence).

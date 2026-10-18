@@ -35,7 +35,12 @@ VALUE = "$value"
 
 OBJECT_KEYS = {"key", "title", "activities", "fields"}
 FIELD_KEYS = {"key", "context", "values"}
-TEMPLATE_KEYS = {"key", "title", "grants", "may_grant"}
+TEMPLATE_KEYS = {"key", "title", "grants", "may_grant", "suggested_group"}
+# oaap.core.authorization 0.4 section 2.11: 1-3 segments, 1-64 characters
+# each, no blank at either end of a segment, no control character.
+SUGGESTED_GROUP_RE = re.compile(
+    r"^[^/\s\x00-\x1f](?:[^/\x00-\x1f]{0,62}[^/\s\x00-\x1f])?"
+    r"(?:/[^/\s\x00-\x1f](?:[^/\x00-\x1f]{0,62}[^/\s\x00-\x1f])?){0,2}$")
 GRANT_RESERVED = {"object", "activities"}
 
 
@@ -211,6 +216,11 @@ def validate_declaration(decl):
                 isinstance(x, str) and x in tkeys for x in mg)):
             errs.append(f"{where}: 'may_grant' names templates that are "
                         "not declared")
+        if "suggested_group" in t and not (
+                isinstance(t["suggested_group"], str)
+                and SUGGESTED_GROUP_RE.match(t["suggested_group"])):
+            errs.append(f"{where}: 'suggested_group' is a group path of 1 to "
+                        "3 segments, e.g. 'Verein/Trainer'")
     return errs
 
 
@@ -763,6 +773,128 @@ def remove_mapping(state, tenant, mapping_id, who=""):
             a["ended_by"] = "mapping removed" + (f" by {who}" if who else "")
             n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# Setting up from the declaration (0.4, section 2.11)
+
+def group_path_problem(raw):
+    """Why this is not a usable group path, or ''."""
+    path = group_path(raw)
+    if not SUGGESTED_GROUP_RE.match(path):
+        return ("a group path has 1 to 3 segments of 1 to 64 characters, "
+                "e.g. 'Verein/Trainer'")
+    return ""
+
+
+def plan_setup(state, tenant, app, only=None, skip=None, group_for=None):
+    """What `oaap authz setup` would do for one app in one tenant.
+
+    Pure: reads the stored declaration and the tenant's roles, collections
+    and mappings, writes nothing, and is what the dry run prints. One row
+    per template, in declaration order. A row is READY (something to do),
+    PRESENT (nothing to do), SKIPPED (the tenant must decide something) or
+    CONFLICT (a name is taken by something else; that template is left
+    alone and the others go on).
+    """
+    decl = _decl(state, app)
+    templates = decl.get("role_templates") or []
+    keys = [t["key"] for t in templates]
+    only, skip = list(only or ()), list(skip or ())
+    group_for = dict(group_for or {})
+    for label, wanted in (("--only", only), ("--skip", skip),
+                          ("--group-for", list(group_for))):
+        bad = [k for k in wanted if k not in keys]
+        if bad:
+            raise AuthzError(f"{label} names {', '.join(bad)}, which "
+                             f"{app} does not declare (declared: "
+                             f"{', '.join(keys) or 'none'})")
+    for k, path in group_for.items():
+        why = group_path_problem(path)
+        if why:
+            raise AuthzError(f"--group-for {k}: {why}")
+    roles = [r for r in state["roles"].values() if r["tenant"] == tenant]
+    colls = [c for c in state["collections"].values() if c["tenant"] == tenant]
+    maps = [m for m in state["mappings"].values() if m["tenant"] == tenant]
+    rows = []
+    for tpl in templates:
+        key = tpl["key"]
+        row = {"template": key, "title": tpl["title"], "state": "ready",
+               "role": {"action": "none"}, "collection": {"action": "none"},
+               "group": "", "group_source": "", "mapping": {"action": "none"},
+               "notes": []}
+        rows.append(row)
+        if (only and key not in only) or key in skip:
+            row["state"], row["notes"] = "skipped", ["not chosen"]
+            continue
+        if value_fields(decl, tpl):
+            row["state"] = "skipped"
+            row["notes"] = ["needs values the tenant chooses: make the role "
+                            "with `role-add --value`"]
+            continue
+        ctx = context_fields(decl, tpl)
+        nogroup = ("a group says 'is a trainer', not 'of which team': it "
+                   "needs a context" if ctx else
+                   "the role may hand rights on (may_grant): a delegation "
+                   "chain must not start in the provider's console"
+                   if tpl.get("may_grant") else "")
+        have = next((r for r in roles if r["app"] == app
+                     and r["template"] == key and not r.get("retired")
+                     and not r.get("values")), None)
+        title = tpl["title"]
+        if have:
+            row["role"] = {"action": "present", "name": have["name"],
+                           "id": have["id"]}
+        else:
+            if any(r["name"] == title for r in roles):
+                row["state"] = "conflict"
+                row["notes"] = [f"the role name '{title}' is taken by "
+                                "something else (retired names stay taken)"]
+                continue
+            row["role"] = {"action": "create", "name": title}
+        mine = None
+        if have:
+            mine = next((c for c in colls if not c.get("retired")
+                         and c["roles"] == [have["id"]]), None)
+        if mine:
+            row["collection"] = {"action": "present", "name": mine["name"],
+                                 "id": mine["id"]}
+        else:
+            if any(c["name"] == title for c in colls):
+                row["state"] = "conflict"
+                row["role"] = {"action": "none"}
+                row["notes"] = [f"the collection name '{title}' is taken by "
+                                "something else (retired names stay taken)"]
+                continue
+            row["collection"] = {"action": "create", "name": title}
+        path = group_for.get(key) or tpl.get("suggested_group") or ""
+        row["group"] = group_path(path)
+        row["group_source"] = ("tenant" if key in group_for else
+                               "manifest" if path else "")
+        if nogroup:
+            row["group"], row["group_source"] = "", ""
+            row["notes"].append("no group: " + nogroup)
+        elif not path:
+            row["notes"].append("no group path known: give one with "
+                                "--group-for " + key + "=Verein/Name")
+        else:
+            why = group_path_problem(path)
+            if why:
+                row["state"], row["notes"] = "conflict", [why]
+                row["role"] = row["collection"] = {"action": "none"}
+                row["group"], row["group_source"] = "", ""
+                continue
+            there = mine and any(m["group"] == row["group"]
+                                 and m["collection"] == mine["id"]
+                                 for m in maps)
+            row["mapping"] = {"action": "present" if there else "create"}
+        if all(row[x]["action"] in ("present", "none")
+               for x in ("role", "collection", "mapping")):
+            row["state"] = "present"
+    return {"app": app, "tenant": tenant, "rows": rows,
+            "groups": sorted({r["group"] for r in rows
+                              if r["mapping"]["action"] in ("create", "present")
+                              and r["group"]})}
 
 
 def sync_login(state, tenant, user_id, groups):
