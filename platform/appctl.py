@@ -16828,7 +16828,10 @@ def cmd_user(args):
                         if r.strip()})
         groups = sorted({g.strip().lower() for g in (args.groups or "").split(",")
                          if g.strip()})
-        tid = (resolve_tenant(args.tenant) if args.tenant
+        # a LABEL or an id, like every other --tenant (resolve_tenant_arg);
+        # resolve_tenant() takes ids only -- `user add --tenant vuebung`
+        # was refused by the first tenant built from a profile (2026-10-18)
+        tid = (resolve_tenant_arg(args.tenant) if args.tenant
                else ensure_default_tenant())
         if tid is None:
             die(f"this node has no tenant '{args.tenant}'")
