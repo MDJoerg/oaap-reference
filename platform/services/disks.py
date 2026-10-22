@@ -375,7 +375,12 @@ def archive_argv(reg, name):
     disk."""
     s = reg["sources"][name]
     arch = os.path.join(disk_mount(s["disk"]), s["path"].lstrip("/"))
-    argv = [ratarmount_bin(), "-f", "-o", "allow_other",
+    # `-d 0`: at its default level ratarmount writes the archive's path
+    # into the journal when it builds an index ("Creating offset
+    # dictionary for <path>") -- a file name, and a name may be content
+    # (D7). Measured 2026-10-22: level 0 is silent; an error still names
+    # the file, which is when it is needed.
+    argv = [ratarmount_bin(), "-f", "-d", "0", "-o", "allow_other",
             "--index-file", index_file(reg, name)]
     if s.get("recursive"):
         argv.append("--recursive")

@@ -189,8 +189,9 @@ check("fehlende Pflicht-Freigabe wird gemeldet, optionale nicht",
 
 argv = disks.archive_argv(dict(dreg, sources=dict(dreg["sources"], leak=dict(
     dreg["sources"]["leak"], index_on="arbeit"))), "leak")
-check("ratarmount: Vordergrund, allow_other, Index auf der Arbeitsplatte, nie neben dem Archiv",
-      argv[1:4] == ["-f", "-o", "allow_other"]
+check("ratarmount: Vordergrund, still (-d 0: kein Archivname im Journal), allow_other, "
+      "Index auf der Arbeitsplatte, nie neben dem Archiv",
+      argv[1:6] == ["-f", "-d", "0", "-o", "allow_other"]
       and argv[argv.index("--index-file") + 1].startswith(disks.disk_mount("arbeit"))
       and argv[-2].startswith(disks.disk_mount("roh")), argv)
 
