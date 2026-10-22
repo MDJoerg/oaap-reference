@@ -27,6 +27,7 @@ from markupsafe import Markup
 
 import build_view
 import cohort_view
+import disk_view
 import fleet_view
 # place.py sits BESIDE this file in the image (the build context is
 # services/, see docker-compose.yml) and one level up in the
@@ -313,6 +314,7 @@ LAYOUT = STYLE + """
     {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
     {% if has_cohorts %}<a href="/kohorten" class="{{ 'active' if active == 'cohorts' }}">Kohorten</a>{% endif %}
     {% if can_build %}<a href="/aufbau" class="{{ 'active' if active == 'build' }}">Aufbau</a>{% endif %}
+    {% if can_build %}<a href="/datentraeger" class="{{ 'active' if active == 'disks' }}">Datenträger</a>{% endif %}
     {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
@@ -3476,6 +3478,15 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'verwaltung' }}">
+{% if i.disk_grants %}
+<div class="card">
+  <h2>Datenträger</h2>
+  <p>{% for g in i.disk_grants %}<code>{{ g.grant }}</code> ({{ g.mode }}{{ ', optional' if g.optional }})
+     <span class="badge {{ '' if g.tone == 'ok' else 'off' }}">{{ g.arrived }}</span>{{ ", " if not loop.last }}{% endfor %}</p>
+  <p class="muted">Im Container unter <code>/oaap/disks/&lt;Name&gt;</code>. Freigaben
+     gibt und entzieht der Betreiber des Knotens auf der Seite „Datenträger“.</p>
+</div>
+{% endif %}
 {% if i.can_limit %}
 <form method="post" action="/instances/{{ i.key }}/resources">
   <input type="hidden" name="tab" value="verwaltung">
@@ -7796,6 +7807,10 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # Schlüssel wie "diag" -- ein anderes Objekt, kein Feld der
          # Instanz.
          "access": _access_page(name, inst),
+         # Datenträger (RFC-0063 §6): read-only here; the grants are the
+         # operator's, on their own page.
+         "disk_grants": disk_view.grants_of(_disk_view(), name,
+                                            inst.get("disk_grants")),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
@@ -11032,3 +11047,228 @@ def build_profile_delete(pid):
     rid = management_api.enqueue(sc[0], sc[1], "delete", {"id": pid},
                                  action="tenant-profile")
     return redirect(f"/aufbau?job={rid}")
+
+
+# ---------------------------------------------------------------------------
+# Datenträger -- disks and archives as node resources (RFC-0063 stage 2,
+# oaap.data.disks 0.2)
+#
+# The page reads the view the host writes (disk-view.json): names the
+# operator chose, numbers, sizes, states -- never a path, a file name or a
+# key (D7); disks.json is root only and never read here. Every button
+# queues one `oaap disk` command (management_api.enqueue, action `disk`),
+# and the host re-checks the role from the actor's own record. Operator
+# only, and only at the node's own address -- the same door as Aufbau.
+DISK_VIEW_FILE = "/apps-registry/disk-view.json"
+
+
+def _disk_view():
+    try:
+        with open(DISK_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+DISK_BODY = """
+<div class="pagehead"><h1>Datenträger</h1></div>
+""" + BUILD_BANNER + """
+<p class="muted">Platten an diesem Knoten, die Quellen darauf (Archive und Ordner) und
+welche Instanz was sieht. Eine Instanz sieht eine Freigabe unter
+<code>/oaap/disks/&lt;Name&gt;</code>. Dateinamen zeigt diese Seite nie, nur Nummern,
+Größen und Formate (RFC-0063 D7); die Namen zeigt
+<code>sudo oaap disk scan &lt;platte&gt; --names</code> am Knoten.
+{% if written %}Stand: {{ written }}.{% endif %}</p>
+{% if not written %}
+<div class="card"><p>Auf diesem Knoten ist die Verwaltung der Datenträger noch nicht
+eingerichtet. Am Knoten einmal: <code>sudo bash ops/install-disk-tools.sh</code>. Das
+installiert die Werkzeuge und liest die Platten zum ersten Mal ein; danach hält der
+Knoten diese Seite jede Minute aktuell.</p></div>
+{% elif not tools.ratarmount or not tools.cryptsetup %}
+<div class="card"><p class="err">Auf diesem Knoten fehlen Werkzeuge
+({% if not tools.ratarmount %}ratarmount{% endif %}{% if not tools.ratarmount and not tools.cryptsetup %}, {% endif %}{% if not tools.cryptsetup %}cryptsetup{% endif %}).
+Am Knoten einmal: <code>sudo bash ops/install-disk-tools.sh</code></p></div>
+{% endif %}
+
+<div class="card" style="overflow-x:auto">
+<h2>Platten</h2>
+{% if disks %}
+<table>
+  <tr><th>Name</th><th>Rolle</th><th>Zustand</th><th>Größe</th><th>Frei</th><th>Anschluss</th><th></th></tr>
+  {% for d in disks %}
+  <tr>
+    <td><strong>{{ d.name }}</strong><br><small class="muted">{{ d.encryption }} · {{ d.label }} {{ d.model }}<br>UUID {{ d.uuid }}</small></td>
+    <td>{{ d.role_label }}</td>
+    <td><span class="badge {{ '' if d.tone == 'ok' else 'off' }}">{{ d.state_label }}</span>
+      {% if d.stale %}<br><span class="err">Das Gerät ist weg, die Einhängung hängt noch.
+      Auswerfen, wieder anstecken, öffnen.</span>{% endif %}</td>
+    <td>{{ d.size }}</td><td>{{ d.free }}</td>
+    <td>{{ d.usb }}{% if d.slow %}<br><span class="err">langsamer Anschluss (USB 2)</span>{% endif %}</td>
+    <td>
+      {% if d.can_open %}<form method="post" action="/datentraeger/open"><input type="hidden" name="disk" value="{{ d.name }}"><button>Öffnen</button></form>{% endif %}
+      {% if d.can_scan %}<form method="post" action="/datentraeger/scan"><input type="hidden" name="disk" value="{{ d.name }}"><button>Durchsuchen</button></form>{% endif %}
+      {% if d.can_eject %}<form method="post" action="/datentraeger/eject"><input type="hidden" name="disk" value="{{ d.name }}"><button>Auswerfen</button></form>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">Auswerfen nimmt erst die Freigaben aus den Containern (die laufen weiter),
+hält die Archive an und schließt die Platte. Danach steht hier „Angesteckt, zu“: dann
+darf das Kabel raus. Hält ein Programm die Platte fest, sagt die Antwort, welches.</p>
+{% else %}
+<p>Noch keine Platte übernommen.</p>
+{% endif %}
+</div>
+
+{% if devices %}
+<div class="card" style="overflow-x:auto">
+<h2>Angesteckt, nicht übernommen</h2>
+<table>
+  <tr><th>Gerät</th><th>Größe</th><th>Übernehmen als</th></tr>
+  {% for v in devices %}
+  <tr>
+    <td>{{ v.label or "ohne Bezeichnung" }} <small class="muted">{{ v.fstype }} · {{ v.model }} · {{ v.usb }}<br>UUID {{ v.uuid }}</small></td>
+    <td>{{ v.size }}</td>
+    <td><form method="post" action="/datentraeger/adopt">
+      <input type="hidden" name="uuid" value="{{ v.uuid }}">
+      <label>Name <input type="text" name="name" required pattern="[a-z][a-z0-9-]{0,39}" placeholder="z. B. bak03"></label>
+      <label>Rolle <select name="role" required>
+        <option value="">bitte wählen</option>
+        <option value="raw">Rohdaten – wird nie beschrieben</option>
+        <option value="work">Arbeitsplatte – darf formatiert werden</option></select></label>
+      {% if v.luks %}<p class="muted">Verschlüsselt (LUKS): Der Schlüssel muss vorher am Knoten unter
+      <code>/etc/oaap/disks/&lt;Name&gt;.key</code> liegen, oder Du übernimmst sie dort mit
+      <code>oaap disk adopt … --luks-key</code>. Eine Passphrase nimmt diese Seite nie an.</p>{% endif %}
+      <button>Übernehmen</button></form></td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">Die Systemplatte steht hier nie. Eine Platte wird an ihrer UUID erkannt, nicht am Steckplatz.</p>
+</div>
+{% endif %}
+
+<div class="card" style="overflow-x:auto">
+<h2>Quellen und Freigaben</h2>
+{% if sources %}
+<table>
+  <tr><th>Quelle</th><th>Art</th><th>Da?</th><th>Index</th><th>Prüfsummen</th><th>Freigaben</th></tr>
+  {% for s in sources %}
+  <tr>
+    <td><strong>{{ s.name }}</strong><br><small class="muted">auf {{ s.disk }}</small></td>
+    <td>{{ s.kind }}{% if s.format %} ({{ s.format }}){% endif %}</td>
+    <td><span class="badge {{ '' if s.available else 'off' }}">{{ "ja" if s.available else "nein" }}</span></td>
+    <td>{{ s.index_size }}{% if s.index_on %}<br><small class="muted">auf {{ s.index_on }}</small>{% endif %}</td>
+    <td><span class="{{ 'err' if s.verify_alarm }}">{{ s.verify }}</span>
+      {% if s.available %}<form method="post" action="/datentraeger/verify"><input type="hidden" name="source" value="{{ s.name }}"><button>Prüfen</button></form>{% endif %}</td>
+    <td>{% for g in s.grants %}
+      <div><a href="/instances/{{ g.instance }}?tab=verwaltung">{{ g.instance }}</a>:
+        <code>{{ g.grant }}</code> ({{ g.mode }}{{ ', optional' if g.optional }})
+        <span class="badge {{ '' if g.arrived_tone == 'ok' else 'off' }}">{{ g.arrived_label }}</span>
+        <form method="post" action="/datentraeger/revoke" style="display:inline">
+          <input type="hidden" name="instance" value="{{ g.instance }}"><input type="hidden" name="grant" value="{{ g.grant }}">
+          <button>Entziehen</button></form></div>
+      {% else %}<span class="muted">keine</span>{% endfor %}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">„Angekommen“ heißt: der Container sieht die Freigabe, im richtigen Modus
+(nachgesehen in seiner Einhängetabelle). Entziehen geht ohne Neustart.</p>
+{% else %}
+<p>Noch keine Quelle.</p>
+{% endif %}
+</div>
+
+{% if sources and instances %}
+<div class="card">
+<h2>Freigeben</h2>
+<form method="post" action="/datentraeger/grant">
+  <label>Quelle <select name="source" required>{% for s in sources %}<option value="{{ s.name }}">{{ s.name }}</option>{% endfor %}</select></label>
+  <label>Instanz <select name="instance" required>{% for i in instances %}<option value="{{ i }}">{{ i }}</option>{% endfor %}</select></label>
+  <label>Name im Container <input type="text" name="as" required pattern="[a-z][a-z0-9-]{0,39}" placeholder="z. B. roh"></label>
+  <label class="checkline"><input type="checkbox" name="rw" value="1">Schreibbar (nur ein Ordner auf einer Arbeitsplatte)</label>
+  <label>Eigentümer bei „schreibbar“ (uid, optional) <input type="text" name="owner" inputmode="numeric" placeholder="z. B. 1000 für einen Webtop"></label>
+  <label class="checkline"><input type="checkbox" name="optional" value="1">Optional: die Instanz startet auch ohne</label>
+  <p class="muted">Die erste Freigabe einer Instanz startet ihren Container einmal neu; jede weitere kommt ohne Neustart an.</p>
+  <button>Freigeben</button>
+</form>
+</div>
+{% endif %}
+
+{% for name, sc in scans.items() %}
+<div class="card" style="overflow-x:auto">
+<h2>Archiv als Quelle anlegen: {{ name }}</h2>
+<p class="muted">Durchsucht {{ sc.written }}: {{ sc.count }} Dateien{% if sc.count > sc.files|length %}, die ersten {{ sc.files|length }} gezeigt{% endif %}.
+Nummer, Größe und Format; den Namen der Datei zeigt diese Seite nicht.</p>
+<form method="post" action="/datentraeger/archive-add">
+  <input type="hidden" name="disk" value="{{ name }}">
+  <table>
+    <tr><th></th><th>Nr.</th><th>Größe</th><th>Format</th><th>Quelle</th></tr>
+    {% for f in sc.files %}
+    <tr><td>{% if f.addable %}<input type="radio" name="nr" value="{{ f.nr }}" required>{% endif %}</td>
+      <td>#{{ '%03d' % f.nr }}</td><td>{{ f.size }}</td><td>{{ f.format }}</td><td>{{ f.source }}</td></tr>
+    {% endfor %}
+  </table>
+  <label>Name der Quelle <input type="text" name="name" required pattern="[a-z][a-z0-9-]{0,39}" placeholder="z. B. {{ name }}-09"></label>
+  <label>Index auf <select name="index_on"><option value="">der einzigen geöffneten Arbeitsplatte</option>
+    {% for d in disks if d.role == 'work' and d.state == 'open' %}<option value="{{ d.name }}">{{ d.name }}</option>{% endfor %}</select></label>
+  <label class="checkline"><input type="checkbox" name="recursive" value="1">Archive im Archiv als Ordner zeigen</label>
+  <p class="muted">Beim ersten Mal baut der Knoten einen Index; bei einem großen Archiv dauert das Minuten.</p>
+  <button>Quelle anlegen</button>
+</form>
+</div>
+{% endfor %}
+
+{% if formattable %}
+<div class="card">
+<h2>Arbeitsplatte formatieren</h2>
+<p class="err">Formatieren löscht <strong>alles</strong> auf der Platte. Nur eine Arbeitsplatte,
+nur wenn sie zu ist und keine Quelle trägt. Eine Rohdaten-Platte wird nie formatiert.</p>
+<form method="post" action="/datentraeger/format">
+  <label>Platte <select name="disk" required>{% for d in formattable %}<option value="{{ d.name }}">{{ d.name }} (UUID {{ d.uuid }})</option>{% endfor %}</select></label>
+  <label>Art <select name="mode" required><option value="luks">verschlüsselt (LUKS2 + ext4, empfohlen)</option><option value="plain">ohne Verschlüsselung (ext4)</option></select></label>
+  <label>Zur Bestätigung die UUID der Platte eingeben <input type="text" name="confirm_uuid" required autocomplete="off"></label>
+  <p class="muted">Verschlüsselt erzeugt der Knoten einen Schlüssel und eine Sicherung des Kopfes.
+  Danach am Knoten eine eigene Passphrase dazulegen; die Antwort sagt, wie.</p>
+  <button class="btn">Formatieren</button>
+</form>
+</div>
+{% endif %}
+"""
+
+
+@app.get("/datentraeger")
+def disks_page():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    view = _disk_view()
+    dk = disk_view.disks(view)
+    return page(DISK_BODY, "Datenträger", "disks",
+                written=build_view._when(view.get("written")),
+                tools=view.get("tools") or {"ratarmount": True, "cryptsetup": True},
+                disks=dk, devices=disk_view.devices(view),
+                sources=disk_view.sources(view),
+                scans={k: v for k, v in disk_view.scans(view).items()
+                       if any(d["name"] == k and d["can_scan"] for d in dk)},
+                instances=disk_view.instances(view),
+                formattable=[d for d in dk if d["formattable"]],
+                job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/datentraeger/<verb>")
+def disks_act(verb):
+    """One button, one `oaap disk` command through the spool."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if verb not in disk_view.VERBS:
+        return redirect("/datentraeger")
+    try:
+        args = disk_view.request_args(verb, request.form, _disk_view())
+    except ValueError as e:
+        return redirect("/datentraeger?err=" + quote(str(e)))
+    rid = management_api.enqueue(sc[0], sc[1], verb, args, action="disk")
+    return redirect(f"/datentraeger?job={rid}")

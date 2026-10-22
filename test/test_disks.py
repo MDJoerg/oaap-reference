@@ -303,5 +303,160 @@ check("wake_instance fragt die Startregel (docker start umgeht recreate)",
       "def wake_instance" in src and src.index("disk_absent_sentence(name, gone)",
                                                 src.index("def wake_instance")) > 0)
 
+# ------------------------------------- stage 2: the page's view and the job
+print("=== Stufe 2: Ansicht ohne Namen, Auftrag `disk` ===")
+SECRET_PATH = "Vertraulich/Postfach-Vorstand.tar"
+SECRET_REL = "Vertraulich/Bilanz-geheim.zip"
+V_REG = {"disks": {
+    "roh": {"name": "roh", "uuid": "U-ROH", "role": "raw", "encryption": "none",
+            "label": "BAK01", "model": "HDD", "size": 900},
+    "arbeit": {"name": "arbeit", "uuid": "U-ARB", "role": "work", "encryption": "luks",
+               "key": os.path.join(TMP, "keys", "arbeit.key"), "size": 400},
+    "weg": {"name": "weg", "uuid": "U-WEG", "role": "work", "encryption": "none"}},
+    "sources": {"leak": {"kind": "archive", "disk": "roh", "path": SECRET_PATH,
+                         "format": "tar", "index_on": "arbeit"},
+                "proj": {"kind": "path", "disk": "arbeit", "path": "projekt-Geheimname"}}}
+V_DEVS = [{"uuid": "U-ROH", "path": "/dev/sdb1", "disk": "/dev/sdb", "size": 900,
+           "fstype": "exfat", "label": "BAK01", "model": "HDD", "mountpoints": [],
+           "usb_speed": 480, "system": False, "loop": False},
+          {"uuid": "U-ARB", "path": "/dev/sdc1", "disk": "/dev/sdc", "size": 400,
+           "fstype": "crypto_LUKS", "label": "", "model": "", "mountpoints": [],
+           "usb_speed": 5000, "system": False, "loop": False},
+          {"uuid": "U-NEU", "path": "/dev/sdd1", "disk": "/dev/sdd", "size": 64,
+           "fstype": "vfat", "label": "STICK", "model": "Flash", "mountpoints": [],
+           "usb_speed": 5000, "system": False, "loop": False},
+          {"uuid": "U-SYS", "path": "/dev/sda1", "disk": "/dev/sda", "size": 500,
+           "fstype": "ext4", "label": "", "model": "", "mountpoints": ["/"],
+           "usb_speed": 0, "system": True, "loop": False}]
+V_INST = {"instances": {
+    "desk": {"id": "iid-9", "container": "c9", "image": "img",
+             "disk_grants": [{"grant": "roh", "source": "leak"},
+                             {"grant": "arbeit", "source": "proj", "rw": True}]},
+    "desk-probe": {"id": "iid-10", "container": "c10", "image": "img",
+                   "rehearsal": {"of": "desk"}}}}
+for d_ in ("roh", "arbeit"):
+    os.makedirs(disks.disk_mount(d_), exist_ok=True)
+integ = os.path.join(disks.disk_mount("arbeit"), "integritaet")
+os.makedirs(integ, exist_ok=True)
+open(os.path.join(integ, "leak-20261022-100000.sha256"), "w").write(
+    "aa  ./a/Brief-an-Minister.eml\nbb  ./b.txt\n")
+open(os.path.join(integ, "leak-20261022-110000.sha256"), "w").write(
+    "aa  ./a/Brief-an-Minister.eml\ncc  ./b.txt\ndd  ./neu.txt\n")
+V_MOUNTS = {disks.disk_mount("roh"), disks.disk_mount("arbeit"),
+            disks.archive_mount("leak"), disks.disk_mount("weg"),
+            os.path.join(disks.grant_base("iid-9"), "roh")}
+V_SCANS = {"roh": {"written": "2026-10-22T10:00:00+00:00", "files": [
+    {"nr": 1, "rel": SECRET_PATH, "size": 50, "format": "tar"},
+    {"nr": 2, "rel": SECRET_REL, "size": 70, "format": "zip"}]},
+    "nicht-da": {"files": [{"nr": 1, "rel": "x", "size": 1, "format": "tar"}]}}
+real_open2 = open
+
+
+def proc_open(p, *x, **k):
+    if p == "/proc/4712/mountinfo":
+        return real_open2(os.path.join(pid_dir, "mi9"), *x, **k)
+    return real_open2(p, *x, **k)
+
+
+real_open2(os.path.join(pid_dir, "mi9"), "w").write(
+    "37 36 98:1 / /oaap/disks/roh ro,relatime - fuse r rw\n")
+a.container_pid = lambda c: 4712 if c == "c9" else None
+a.open = proc_open
+vw = a._disk_view_build(V_REG, V_INST, V_DEVS, V_MOUNTS, V_SCANS, {})
+del a.open
+blob = json.dumps(vw)
+check("Ansicht: kein Pfad einer Quelle, kein Dateiname aus Scan oder Pruefliste, kein Schluessel (D7)",
+      not any(x in blob for x in ("Vertraulich", "Postfach", "Bilanz", "Geheimname",
+                                  "Minister", ".key", "/dev/")), blob[:400])
+dv_ = {d["name"]: d for d in vw["disks"]}
+check("Platte eingehaengt, Geraet weg (Kabel gezogen): 'stale', nicht 'zu'",
+      dv_["weg"]["state"] == "absent" and dv_["weg"]["stale"], dv_["weg"])
+check("Rohplatte offen, USB-Geschwindigkeit und Nutzung fuer die Warnung",
+      dv_["roh"]["state"] == "open" and dv_["roh"]["usb_speed"] == 480 and dv_["roh"]["in_use"]
+      and dv_["roh"]["free"] is not None)
+check("nicht uebernommen: der Stick ja, die Systemplatte und Uebernommenes nie",
+      [x["uuid"] for x in vw["devices"]] == ["U-NEU"], vw["devices"])
+sv = {s["name"]: s for s in vw["sources"]}
+g = {x["grant"]: x for x in sv["leak"]["grants"] + sv["proj"]["grants"]}
+check("Freigabe angekommen: Host haengt, Container sieht ro wie verlangt",
+      g["roh"]["arrived"] == "ok" and g["roh"]["mode"] == "ro", g)
+check("rw-Freigabe, die der Container nicht sieht: 'missing'", g["arbeit"]["arrived"] == "missing", g)
+check("Generalprobe steht nicht zur Wahl fuer Freigaben", vw["instances"] == ["desk"], vw["instances"])
+check("Pruefsummen: nur Zahlen, gegen die Liste davor (1 anders, 1 neu)",
+      sv["leak"]["verify"].get("different") == 1 and sv["leak"]["verify"].get("new") == 1
+      and sv["leak"]["verify"].get("files") == 3 and sv["leak"]["verify"]["on"] == "arbeit",
+      sv["leak"]["verify"])
+sc_ = vw["scans"]
+check("Scan: Nummer, Groesse, Format, und welche Nummer schon Quelle ist; fremde Platte faellt weg",
+      sc_["roh"]["files"] == [{"nr": 1, "size": 50, "format": "tar", "source": "leak"},
+                              {"nr": 2, "size": 70, "format": "zip", "source": ""}]
+      and "nicht-da" not in sc_, sc_)
+old = {"sources": [dict(sv["leak"], verify=dict(sv["leak"]["verify"], files=999))]}
+a.open = proc_open
+vw2 = a._disk_view_build(V_REG, V_INST, V_DEVS, V_MOUNTS, V_SCANS, old)
+del a.open
+check("ohne neue Liste werden die Pruefsummen nicht jede Minute neu gelesen",
+      {s["name"]: s for s in vw2["sources"]}["leak"]["verify"]["files"] == 999)
+
+a.DISK_SCAN = os.path.join(TMP, "disk-scan.json")
+a.disk_scan_save("disks", [{"nr": 1, "rel": "x", "size": 1, "format": "tar"}])
+check("Scan-Speicher: nur root (0600, er traegt die Namen), eine Platte namens 'disks' stoert nicht",
+      oct(os.stat(a.DISK_SCAN).st_mode & 0o777) == "0o600" and "disks" in a.disk_scans())
+
+bad = [("archive-add", {"disk": "roh", "nr": "../x", "name": "s"}),
+       ("archive-add", {"disk": "roh", "nr": True, "name": "s"}),
+       ("archive-add", {"disk": "roh", "path": SECRET_PATH, "name": "s"}),
+       ("adopt", {"uuid": "U-NEU", "name": "x", "role": "admin"}),
+       ("grant", {"source": "leak", "instance": "desk", "as": "g", "owner": True}),
+       ("grant", {"source": "leak", "instance": "../desk", "as": "g"}),
+       ("format", {"disk": "arbeit", "mode": "luks"}),
+       ("forget", {"disk": "roh"}), ("open", {"disk": "Roh;rm"})]
+refused = []
+for op_, args_ in bad:
+    try:
+        a._disk_job_args(op_, args_)
+    except disks.DiskRefused:
+        refused.append(op_)
+check("Auftrag: jedes Feld geprueft, kein Pfad statt Nummer, kein forget von der Seite",
+      len(refused) == len(bad), refused)
+ns = a._disk_job_args("archive-add", {"disk": "roh", "nr": 2, "name": "neu",
+                                      "index_on": "arbeit", "recursive": True})
+check("Auftrag archive-add wird zu `oaap disk archive add roh 2 --name neu --index-on arbeit`",
+      ns.action == "archive" and ns.rest == ["add", "roh", "2"] and ns.name == "neu"
+      and ns.index_on == "arbeit" and ns.recursive, vars(ns))
+ns = a._disk_job_args("grant", {"source": "leak", "instance": "desk", "as": "g",
+                                "rw": "yes", "owner": 1000})
+check("nur ein echtes true schaltet rw ein", ns.rw is False and ns.owner == 1000, vars(ns))
+
+seen_who = []
+_cmd = a.cmd_disk
+a.cmd_disk = lambda ns: seen_who.append((ns.action, a._dest_who()))
+ok_, msg_ = a.disk_job({"op": "open", "args": {"disk": "roh"}}, "tenant_admin", "kunde")
+check("Auftrag von jemandem ohne server_admin: abgelehnt, nichts ausgefuehrt",
+      not ok_ and not seen_who and "server_admin" in msg_, msg_)
+ok_, msg_ = a.disk_job({"op": "open", "args": {"disk": "roh"}}, "server_admin", "betreiberin")
+check("Auftrag: dasselbe Kommando, im Audit die Person, die gefragt hat",
+      ok_ and seen_who == [("open", "betreiberin")] and a.ACTING_FOR is None, seen_who)
+
+
+def refusing(ns):
+    print("  archive leak: did not come up", flush=True)
+    print("Oct 22 10:00:00 demo ratarmount[42]: " + SECRET_PATH, file=sys.stderr)
+    a.die("archive 'leak' did not come up within 60 s:")
+
+
+a.cmd_disk = refusing
+ok_, msg_ = a.disk_job({"op": "open", "args": {"disk": "roh"}}, "server_admin", "b")
+check("abgelehnter Auftrag: Satz ohne ERROR-Vorsilbe, Journalzeilen (Dateinamen) fallen weg",
+      not ok_ and "did not come up" in msg_ and "Vertraulich" not in msg_
+      and "ERROR" not in msg_, msg_)
+a.cmd_disk = _cmd
+check("Worker: Zweig `disk`, Antwortdatei fuer den Job, Ansicht im Minutentakt",
+      'elif action == "disk":' in src and '"tenant-profile", "disk"):' in src
+      and src.index("disk_view_write()", src.index("def state_view_write")) > 0)
+check("Minutentakt nur, wo Platten im Spiel sind (sonst kein lsblk auf jedem Knoten)",
+      "if os.path.isfile(DISKS_FILE) or os.path.isfile(DISK_VIEW):\n            disk_view_write()"
+      in src)
+
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAIL")
 sys.exit(1 if FAILS else 0)

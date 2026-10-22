@@ -17,4 +17,10 @@ if ! /usr/local/bin/ratarmount --version 2>/dev/null | grep -q "ratarmount $RATA
     pipx install --force "ratarmount==$RATARMOUNT_VERSION" >/dev/null
 fi
 echo "cryptsetup $(cryptsetup --version | awk '{print $2}'), $(/usr/local/bin/ratarmount --version | head -1)"
-echo "Next: oaap disk list"
+# The first `oaap disk` command writes the portal's view; from then on the
+# minute timer keeps it current (a node without one never runs lsblk).
+if command -v oaap >/dev/null; then
+  oaap disk list
+else
+  echo "Next: oaap disk list"
+fi

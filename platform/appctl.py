@@ -37,8 +37,10 @@ tiles yet; role `public` supported but discouraged.
 """
 
 import argparse
+import contextlib
 import datetime
 import getpass
+import io
 import ipaddress
 import json
 import os
@@ -843,8 +845,14 @@ def refresh_destinations(reg=None):
               file=sys.stderr)
 
 
+# Set by the worker for the duration of one portal request whose core is a
+# command (a disk job, RFC-0063 stage 2): the audit then names the person
+# who asked, not the worker's root.
+ACTING_FOR = None
+
+
 def _dest_who():
-    return os.environ.get("SUDO_USER") or getpass.getuser()
+    return ACTING_FOR or os.environ.get("SUDO_USER") or getpass.getuser()
 
 
 def destination_add(tid, name, kind, target, auth_type="none", user="",
@@ -6084,7 +6092,7 @@ def job_result_fill(req, rid, ok, msg):
     """
     if str(req.get("action") or "") not in (
             "cohort", "tenant-build", "tenant-request", "tenant-request-submit",
-            "tenant-profile"):
+            "tenant-profile", "disk"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
         return
@@ -12425,6 +12433,11 @@ def state_view_write(reg=None):
         cohort_view_write()
         tenant_build_view_write()
         tenant_request_view_write()
+        # Only where disks are in use: the first `oaap disk` command makes
+        # the view, and a node that never ran one is not asked for its
+        # block devices every minute.
+        if os.path.isfile(DISKS_FILE) or os.path.isfile(DISK_VIEW):
+            disk_view_write()
         try:
             catalog_view_write()
         except (OSError, ValueError, KeyError):
@@ -23419,6 +23432,24 @@ def cmd_process_deploys(_args):
                          ensure_default_tenant(), subject=str(_pid or ""),
                          result="ok" if ok else "denied", who=actor or "api",
                          role=act_role or "-", detail=msg)
+        elif action == "disk":
+            # RFC-0063 stage 2: the page "Datenträger". The very command
+            # `oaap disk` runs; role and actor from the ACTOR's record. A
+            # done command audits itself (with the actor); a refused one is
+            # recorded here, without its sentence, which may name a device.
+            ok, msg = disk_job(req, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("disk." + str(req.get("op") or "?"),
+                             ensure_default_tenant(), result="denied",
+                             who=actor or "portal", role=act_role or "-")
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -23512,6 +23543,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
+               "disk": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -25082,6 +25114,17 @@ def _ensure_container_base(name, inst):
 
 
 def cmd_disk(args):
+    """`oaap disk ...`, and the portal's disk jobs through disk_job. Every
+    action but the reading ones leaves the page's view current, also when
+    it was refused half way (a disk opened, its archive not)."""
+    try:
+        _cmd_disk(args)
+    finally:
+        if args.action != "archive-run":
+            disk_view_write()
+
+
+def _cmd_disk(args):
     a, rest = args.action, list(args.rest or [])
     dreg = disks.load(DISKS_FILE)
 
@@ -25293,6 +25336,7 @@ def cmd_disk(args):
         if not os.path.ismount(mnt):
             die(f"'{rec['name']}' is not open")
         found = disks.scan(mnt)
+        disk_scan_save(rec["name"], found)
         for x in found:
             print(f"  #{x['nr']:03d}  {_gb(x['size']):>10}  {x['format']:<10}"
                   + (f"  {x['rel']}" if args.names else ""))
@@ -25488,17 +25532,20 @@ def _revoke(reg, name, gname):
     _disk_audit("revoke", name, tenant=inst.get("tenant"), detail=gname)
 
 
-def _verify_status(out_dir, s, unit):
-    active = subprocess.run(["systemctl", "is-active", unit],
-                            capture_output=True, text=True).stdout.strip()
+def _verify_runs(out_dir, s):
     try:
-        runs = sorted(f for f in os.listdir(out_dir)
+        return sorted(f for f in os.listdir(out_dir)
                       if f.startswith(s + "-") and f.endswith(".sha256"))
-    except FileNotFoundError:
-        runs = []
-    print(f"run: {active or 'unknown'}; finished lists: {len(runs)}")
+    except OSError:
+        return []
+
+
+def _verify_summary(out_dir, s, runs=None):
+    """The latest finished list of a source against the one before, in
+    counts only -> {} without a list. The names stay in the files (D7)."""
+    runs = _verify_runs(out_dir, s) if runs is None else runs
     if not runs:
-        return
+        return {}
 
     def read(f):
         d = {}
@@ -25509,15 +25556,337 @@ def _verify_status(out_dir, s, unit):
         return d
 
     last = read(runs[-1])
-    print(f"latest: {runs[-1][len(s) + 1:-7]}, {len(last)} files")
+    out = {"lists": len(runs), "latest_file": runs[-1],
+           "latest": runs[-1][len(s) + 1:-7], "files": len(last)}
     if len(runs) > 1:
         prev = read(runs[-2])
         diff = sum(1 for p in last if p in prev and prev[p] != last[p])
         new = sum(1 for p in last if p not in prev)
-        gone = sum(1 for p in prev if p not in last)
-        same = len(last) - diff - new
-        print(f"against {runs[-2][len(s) + 1:-7]}: {same} equal, {diff} DIFFERENT, "
-              f"{new} new, {gone} missing" + ("" if diff or new or gone else "  -- unchanged"))
+        out.update(against=runs[-2][len(s) + 1:-7], different=diff, new=new,
+                   missing=sum(1 for p in prev if p not in last),
+                   equal=len(last) - diff - new)
+    return out
+
+
+def _verify_status(out_dir, s, unit):
+    active = subprocess.run(["systemctl", "is-active", unit],
+                            capture_output=True, text=True).stdout.strip()
+    v = _verify_summary(out_dir, s)
+    print(f"run: {active or 'unknown'}; finished lists: {v.get('lists', 0)}")
+    if not v:
+        return
+    print(f"latest: {v['latest']}, {v['files']} files")
+    if "against" in v:
+        print(f"against {v['against']}: {v['equal']} equal, {v['different']} DIFFERENT, "
+              f"{v['new']} new, {v['missing']} missing"
+              + ("" if v["different"] or v["new"] or v["missing"] else "  -- unchanged"))
+
+
+# ------------------------------------------------ the page (RFC-0063 stage 2)
+#
+# The portal reads apps/ and must never read disks.json, whose paths are
+# file names (D7). So the host writes what the page shows into a view of
+# its own, without one path, one file name or one key: names the operator
+# chose (disks, sources, grants, instances), numbers, sizes, formats,
+# states. The minute timer refreshes it (state_view_write), and so does
+# every disk command, so a pulled cable shows up within a minute even
+# though the platform does not act on it yet (stage 3).
+#
+# A scan's numbers are what lets the page add an archive without a name:
+# the scan is kept beside disks.json, root only, with its names, and the
+# view gets the numbers.
+
+DISK_VIEW = os.path.join(APPS_DIR, "disk-view.json")
+DISK_SCAN = os.path.join(APPS_DIR, "disk-scan.json")
+DISK_SCAN_SHOWN = 500        # rows of one scan on the page
+
+
+def disk_scans():
+    try:
+        with open(DISK_SCAN, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("scans") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def disk_scan_save(disk, found):
+    scans = disk_scans()
+    scans[disk] = {"written": _iso_now(), "files": found}
+    disks.save(DISK_SCAN, {"scans": scans})   # 0600: it carries the names
+
+
+def _mount_table():
+    """The host's mount points from the kernel's table, not by stat: a
+    pulled disk's mount point answers stat with an I/O error, and the page
+    must say 'stale' rather than 'closed' (measured 2026-10-22)."""
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as f:
+            return set(disks.parse_mountinfo(f.read()))
+    except OSError:
+        return set()
+
+
+def _disk_view_build(dreg, reg, devs, mounts, scans, old):
+    """The view as a dict. Pure apart from the reads it is handed and a
+    few cheap host calls (free space of an open disk, a container's
+    mountinfo, a verify unit's state), so the tests can feed it."""
+    vw = {"schema": "0.1", "written": _iso_now(),
+          "tools": {"ratarmount": bool(shutil.which("ratarmount")
+                                       or os.path.exists(disks.ratarmount_bin())),
+                    "cryptsetup": bool(shutil.which("cryptsetup"))},
+          "disks": [], "devices": [], "sources": [], "scans": {},
+          "instances": []}
+    known = set()
+    for rec in sorted(dreg["disks"].values(), key=lambda r: r["name"]):
+        dev = disks.find_device(devs, rec["uuid"])
+        known.add(rec["uuid"].lower())
+        mounted = disks.disk_mount(rec["name"]) in mounts
+        row = {"name": rec["name"], "role": rec["role"],
+               "encryption": rec.get("encryption", "none"),
+               "uuid": rec["uuid"], "label": rec.get("label", ""),
+               "model": rec.get("model", ""),
+               "state": ("absent" if not dev else "open" if mounted else "present"),
+               "stale": bool(mounted and not dev),
+               "size": (dev or {}).get("size") or rec.get("size") or 0,
+               "usb_speed": (dev or {}).get("usb_speed") or 0,
+               "free": None,
+               "in_use": any(rec["name"] in (x["disk"], x.get("index_on"))
+                             for x in dreg["sources"].values())}
+        if dev and mounted:
+            try:
+                row["free"] = shutil.disk_usage(disks.disk_mount(rec["name"])).free
+            except OSError:
+                row["stale"] = True
+        vw["disks"].append(row)
+    for d in devs:
+        if d["uuid"].lower() in known or d["system"] or (d["loop"] and d["mountpoints"]):
+            continue
+        vw["devices"].append({"uuid": d["uuid"], "fstype": d["fstype"],
+                              "size": d["size"], "label": d["label"],
+                              "model": d["model"], "usb_speed": d["usb_speed"],
+                              "luks": d["fstype"] == "crypto_LUKS"})
+    work_open = [r["name"] for r in dreg["disks"].values() if r["role"] == "work"
+                 and disks.disk_mount(r["name"]) in mounts]
+    old_verify = {s["name"]: s.get("verify") or {} for s in (old or {}).get("sources") or []}
+    pids, inside = {}, {}
+    granted = {}
+    for iname, inst in sorted((reg.get("instances") or {}).items()):
+        if is_rehearsal(inst):
+            continue
+        vw["instances"].append(iname)
+        grants, iid = disk_grants_of(inst)
+        if not grants:
+            continue
+        pid = container_pid(instance_services(inst)[0]["container"]) \
+            if instance_services(inst) else None
+        pids[iname] = pid
+        try:
+            with open(f"/proc/{pid}/mountinfo", encoding="utf-8") as f:
+                inside[iname] = disks.parse_mountinfo(f.read())
+        except (OSError, TypeError):
+            inside[iname] = None
+        for g in grants:
+            seen = (inside[iname] or {}).get(f"{disks.CONTAINER_BASE}/{g['grant']}")
+            host = os.path.join(disks.grant_base(iid), g["grant"]) in mounts
+            want = "rw" if g.get("rw") else "ro"
+            arrived = (None if inside[iname] is None else
+                       "ok" if seen is not None and ("ro" in seen) == (want == "ro") and host
+                       else "mismatch" if seen is not None and ("ro" in seen) != (want == "ro")
+                       else "missing")
+            granted.setdefault(g["source"], []).append(
+                {"instance": iname, "grant": g["grant"], "mode": want,
+                 "optional": bool(g.get("optional")), "since": g.get("since", ""),
+                 "by": g.get("by", ""), "arrived": arrived})
+    for s, src in sorted(dreg["sources"].items()):
+        avail = (disks.archive_mount(s) in mounts if src["kind"] == "archive"
+                 else disks.disk_mount(src["disk"]) in mounts)
+        row = {"name": s, "kind": src["kind"], "disk": src["disk"],
+               "format": src.get("format", ""), "index_on": src.get("index_on", ""),
+               "recursive": bool(src.get("recursive")), "available": avail,
+               "added": src.get("added", ""), "index_size": None,
+               "grants": granted.get(s, []), "verify": {}}
+        if src["kind"] == "archive":
+            idx = disks.index_file(dreg, s)
+            if not src.get("index_on") or src["index_on"] in work_open:
+                try:
+                    row["index_size"] = os.path.getsize(idx)
+                except OSError:
+                    pass
+        # the latest list of each open work disk; the counts are read
+        # again only when a new list has appeared since the last view
+        best = {}
+        for w in work_open:
+            out_dir = os.path.join(disks.disk_mount(w), "integritaet")
+            runs = _verify_runs(out_dir, s)
+            if runs and runs[-1] > best.get("latest_file", ""):
+                prev = old_verify.get(s) or {}
+                best = (dict(prev) if prev.get("latest_file") == runs[-1]
+                        and prev.get("lists") == len(runs)
+                        else _verify_summary(out_dir, s, runs))
+                best["on"] = w
+        row["verify"] = best
+        row["verify_running"] = subprocess.run(
+            ["systemctl", "is-active", f"oaap-disk-verify-{s}"],
+            capture_output=True, text=True).stdout.strip() in ("active", "activating")
+        vw["sources"].append(row)
+    paths = {(x["disk"], x["path"]): s for s, x in dreg["sources"].items()}
+    for dname, sc in sorted((scans or {}).items()):
+        if dname not in dreg["disks"] or not isinstance(sc, dict):
+            continue
+        files = sc.get("files") or []
+        vw["scans"][dname] = {
+            "written": sc.get("written", ""), "count": len(files),
+            "files": [{"nr": x["nr"], "size": x["size"], "format": x["format"],
+                       "source": paths.get((dname, x["rel"]), "")}
+                      for x in files[:DISK_SCAN_SHOWN]]}
+    return vw
+
+
+def disk_view_write():
+    """Write the page's view (0644). Never raises: it runs on the minute
+    timer of every node."""
+    try:
+        dreg = disks.load(DISKS_FILE)
+        try:
+            devs = disks.devices()
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            devs = []
+        scans = disk_scans()
+        old = {}
+        try:
+            with open(DISK_VIEW, encoding="utf-8") as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            pass
+        vw = _disk_view_build(dreg, load_registry(), devs, _mount_table(),
+                              scans, old)
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = DISK_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(vw, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, DISK_VIEW)
+        return True
+    except (OSError, ValueError, KeyError, TypeError, SystemExit) as e:
+        print(f"WARNING: could not write {DISK_VIEW}: {e}", flush=True)
+        return False
+
+
+# What the portal may ask for (RFC-0063 §6). Each is one `oaap disk`
+# command; forget, path add and source remove stay on the command line.
+DISK_JOB_OPS = ("adopt", "open", "eject", "format", "scan", "archive-add",
+                "grant", "revoke", "verify")
+DISK_JOB_MAX = 2500           # characters of the answer the page shows
+# A line of the journal (an archive that did not come up) may name the
+# archive's file; the page never shows one (D7).
+_JOURNAL_LINE = re.compile(r"^\s*(\w{3} +\d+ \d\d:\d\d:\d\d |-- |\d{4}-\d\d-\d\dT)")
+
+
+def _disk_job_args(op, a):
+    """The request's fields -> the Namespace `oaap disk` would parse, or a
+    refusal. Every field is judged here: the spool is data, not trust."""
+    def text(k, rx=r"^[a-z][a-z0-9-]{0,39}$"):
+        v = a.get(k, "")
+        if not isinstance(v, str) or not re.match(rx, v):
+            raise disks.DiskRefused(f"'{k}' is missing or not valid")
+        return v
+
+    def flag(k):
+        return a.get(k) is True
+
+    ns = argparse.Namespace(action=op, rest=[], name="", role="", luks_key="",
+                            all=False, luks=False, plain=False, confirm_uuid="",
+                            names=False, index_on="", recursive=False,
+                            instance="", grant_as="", rw=False, owner=None,
+                            optional=False, revoke=False, to="", status=False)
+    if op == "adopt":
+        ns.rest = [text("uuid", r"^[0-9A-Fa-f-]{4,64}$")]
+        ns.name, ns.role = text("name"), text("role", r"^(raw|work)$")
+        # a LUKS disk comes with its key file, put there by the operator;
+        # the page never carries a key or a passphrase
+        key = disks.key_path(ns.name)
+        if os.path.isfile(key):
+            ns.luks_key = key
+    elif op in ("open", "eject", "scan"):
+        ns.rest = [text("disk")]
+    elif op == "format":
+        ns.rest = [text("disk")]
+        mode = text("mode", r"^(luks|plain)$")
+        ns.luks, ns.plain = mode == "luks", mode == "plain"
+        ns.confirm_uuid = text("confirm_uuid", r"^[0-9A-Fa-f-]{4,64}$")
+    elif op == "archive-add":
+        ns.action = "archive"
+        nr = a.get("nr")
+        if not isinstance(nr, int) or isinstance(nr, bool) or nr < 1:
+            raise disks.DiskRefused("'nr' is missing or not valid")
+        # a number only, never a path: the page knows no names (D7)
+        ns.rest = ["add", text("disk"), str(nr)]
+        ns.name = text("name")
+        ns.index_on = text("index_on") if a.get("index_on") else ""
+        ns.recursive = flag("recursive")
+    elif op == "grant":
+        ns.rest = [text("source")]
+        ns.instance = text("instance", r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+        ns.grant_as = text("as")
+        ns.rw, ns.optional = flag("rw"), flag("optional")
+        own = a.get("owner")
+        if own is not None:
+            if not isinstance(own, int) or isinstance(own, bool) or not 0 <= own < 2 ** 31:
+                raise disks.DiskRefused("'owner' is not a uid")
+            ns.owner = own
+    elif op == "revoke":
+        ns.rest = [text("grant")]
+        ns.instance = text("instance", r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+    elif op == "verify":
+        ns.rest = [text("source")]
+        ns.to = text("to") if a.get("to") else ""
+    else:
+        raise disks.DiskRefused(f"unknown disk operation '{op}'")
+    return ns
+
+
+def _disk_job_text(out, err):
+    lines = [ln for ln in (out + "\n" + err).splitlines()
+             if ln.strip() and not _JOURNAL_LINE.match(ln)]
+    text = "\n".join(ln.replace("ERROR: ", "") for ln in lines)
+    return text[-DISK_JOB_MAX:] if len(text) > DISK_JOB_MAX else text
+
+
+def disk_job(req, role, actor):
+    """One disk operation from the portal -> (ok, sentence). The very
+    command `oaap disk` runs, with the actor's name in the audit. The role
+    comes from the ACTOR's record (the worker derives it), never from the
+    request."""
+    global ACTING_FOR
+    op = str(req.get("op") or "")
+    a = req.get("args")
+    a = a if isinstance(a, dict) else {}
+    if role != "server_admin":
+        return False, "disks are managed by server_admin"
+    try:
+        ns = _disk_job_args(op, a)
+    except disks.DiskRefused as e:
+        return False, str(e)
+    out, err = io.StringIO(), io.StringIO()
+    ok = True
+    ACTING_FOR = actor or None
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                cmd_disk(ns)
+            except SystemExit as e:
+                ok = e.code in (0, None)
+            except (disks.DiskRefused, DiskAbsent, DiagnoseRefused) as e:
+                ok = False
+                print(str(e).splitlines()[0], file=sys.stderr)
+            except subprocess.CalledProcessError as e:
+                ok = False
+                print(((e.stderr or "").strip().splitlines() or [str(e)])[-1],
+                      file=sys.stderr)
+    finally:
+        ACTING_FOR = None
+    text = _disk_job_text(out.getvalue(), err.getvalue())
+    return ok, text or ("done" if ok else "refused")
 
 
 def main():
