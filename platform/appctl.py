@@ -5242,6 +5242,7 @@ METRICS_SENDER_DIR = os.path.join(DATA_DIR, "data", "metrics-sender")
 # (RFC-0054 stage 3).
 BROKER_CERT_DIR = os.path.join(DATA_DIR, "data", "broker-certs")
 BROKER_CA_DIR = os.path.join(DATA_DIR, "data", "broker-ca")
+BROKER_DATA_DIR = os.path.join(DATA_DIR, "data", "broker")   # /mosquitto/data
 CADDY_DATA_DIR = os.path.join(DATA_DIR, "data", "gateway", "caddy-data")
 
 
@@ -7209,6 +7210,38 @@ def broker_sync(announce=False):
                       "plain port " + ("republished" if ok else "NOT republished"))
     except Exception as exc:  # noqa: BLE001
         print(f"broker: plain-port check skipped ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+    try:
+        # The data directory belongs to the broker's user. Nobody made it,
+        # so Docker created the bind source at the first start -- root,
+        # 0755 -- and Mosquitto (uid 1000) could never save its database:
+        # retained messages and sessions were lost at every restart
+        # (measured 2026-10-22 on oaap-demo AND oaap-test).
+        os.makedirs(BROKER_DATA_DIR, exist_ok=True)
+        st_ = os.stat(BROKER_DATA_DIR)
+        if (st_.st_uid, st_.st_gid) != (broker_certs.BROKER_UID, broker_certs.BROKER_UID):
+            os.chown(BROKER_DATA_DIR, broker_certs.BROKER_UID, broker_certs.BROKER_UID)
+            print("broker: data directory given to the broker's user "
+                  f"(uid {broker_certs.BROKER_UID}) -- it can save its database again")
+    except Exception as exc:  # noqa: BLE001
+        print(f"broker: data directory check skipped ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+    try:
+        # A node with the profile has a broker. After the reboot of
+        # 2026-10-22 Docker restored every container of oaap-demo but this
+        # one, without a word in its log (restart policy unless-stopped,
+        # not marked as stopped by hand); the broker stayed down until
+        # somebody looked. This runs every minute, so it is back within
+        # one. Stopping it on purpose is `oaap node remove-profile broker`.
+        state = run(["docker", "ps", "-a", "--filter", "name=^oaap-broker-1$",
+                     "--format", "{{.State}}"]).stdout.strip()
+        if state not in ("running", "restarting"):
+            ok = _apply_broker_ports()
+            print(f"broker: was {state or 'missing'} although this node has the "
+                  "profile 'broker' -- " + ("started" if ok else "could NOT be started"),
+                  file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"broker: running check skipped ({type(exc).__name__}: {exc})",
               file=sys.stderr)
     return res
 

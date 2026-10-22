@@ -260,12 +260,21 @@ class Res:
         self.stdout = out
 
 
+BROKER_STATE = ["running"]
+
+
 def fake_run(cmd, **kw):
     sh.append(cmd)
+    if cmd[:3] == ["docker", "ps", "-a"]:
+        return Res(BROKER_STATE[0] + "\n")
     return Res("abc123\n" if cmd[:2] == ["docker", "ps"] else "")
 
 
 a.run = fake_run
+a.BROKER_DATA_DIR = tempfile.mkdtemp(prefix="oaap-bt-data-")
+CHOWN = []
+_real_chown = a.os.chown
+a.os.chown = lambda p, u, g: CHOWN.append((p, u, g))
 a.load_external_conf = lambda: ("", "")
 a.has_profile = lambda p: p in ("broker",)
 verdicts = {}
@@ -315,6 +324,33 @@ a.lan_address = lambda: None
 envset.clear()
 a.broker_sync()
 ok("... faellt die Adresse weg, wird NICHT geraten (kein Bind auf irgendetwas)", not envset)
+
+print("\n=== Datenordner und Laufen (2026-10-22, oaap-demo) ===")
+CHOWN.clear()
+_uid = bc.BROKER_UID
+bc.BROKER_UID = 4242            # whoever runs the test is not that user
+a.broker_sync()
+ok("Datenordner, den Docker als root angelegt hat: bekommt den Broker-Benutzer",
+   CHOWN == [(a.BROKER_DATA_DIR, 4242, 4242)], CHOWN)
+bc.BROKER_UID = _uid
+comp.clear()
+BROKER_STATE[0] = "running"
+a.broker_sync()
+ok("Broker laeuft: nicht angefasst", not comp)
+for st in ("exited", ""):
+    comp.clear()
+    BROKER_STATE[0] = st
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        a.broker_sync()
+    ok(f"Broker {st or 'fehlt'} trotz Profil: mit denselben Dateien gestartet, und gesagt",
+       comp == [1] and "started" in err.getvalue(), (comp, err.getvalue()))
+comp.clear()
+BROKER_STATE[0] = "restarting"
+a.broker_sync()
+ok("Broker startet gerade neu: nicht dazwischen", not comp)
+BROKER_STATE[0] = "running"
+a.os.chown = _real_chown
 
 print("\n=== `oaap broker ca` / `show` ===")
 a.BROKER_CA_DIR = tempfile.mkdtemp(prefix="oaap-bt-ca-")
