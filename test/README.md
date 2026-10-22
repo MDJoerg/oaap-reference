@@ -52,6 +52,7 @@ python3 test/test_twin_remote_reader.py # Zwilling: entfernter Leser, nur lesen,
 python3 test/test_throttle_routes.py   # Bremse je Route: Werte je Route, alle Erzeuger, Redeploy, Migration, identity (braucht flask)
 python3 test/test_user_lifetime.py    # Lebenszeit einer Person: Passwortzwang an jeder Tuer, Termine, Loeschen mit Verweigerungen, `oaap user add|delete|schedule` (braucht flask)
 python3 test/test_cohort.py                 # Kohorte: Vorlage (Geheimnis/Pfad/Rolle abgelehnt), Platz vollstaendig VOR dem ersten Start, Saat fuellt/reset ersetzt, Handout einmal+0600+nicht in der Vorlage, halbe Kohorte, add/reset/stop/material/export/remove, taeglicher Lauf (Ende stoppt, Termine deaktivieren/loeschen, Loeschung wartet auf leeren Platz)
+python3 test/test_disks.py                  # RFC-0063: Platten, Quellen, Freigaben: Mount-Regeln je Rolle, ro in EINEM Aufruf, Basisordner versiegelt, Pruefung im Container, Startregel vor docker rm, keine Freigabe in der Generalprobe
 python3 test/test_cohort_shared.py          # RFC-0058: shared_storage/trainers der Vorlage (Mount, access, Trainer-Plaetze), Mount-Argumente der Laufzeit (ro, Ersatz des eigenen Speichers)
 python3 test/test_instance_resources.py    # Ressourcen-Grenzen je Instanz: Flags in jedem docker run (auch ohne inst), keine Vorgabe, Redeploy, Werte, Summe, Gesundheitszeile, nur server_admin
 python3 test/test_status_restarting.py # oaap status: eine Neustartschleife zaehlt nicht als laufend (braucht bash)

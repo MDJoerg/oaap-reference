@@ -819,6 +819,35 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  # Disks and archives (RFC-0063): at boot, open the adopted disks that
+  # are plugged in, start their archives and mount the grants. Docker
+  # starts the containers on its own meanwhile; their grant bases stay
+  # sealed (immutable on the system disk) until this has run (M12).
+  cat > /etc/systemd/system/oaap-disks.service <<EOF
+[Unit]
+Description=OAAP disks: open adopted disks, start archives, mount grants (RFC-0063)
+After=local-fs.target docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py disk open --all
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > /etc/systemd/system/oaap-archive@.service <<EOF
+[Unit]
+Description=OAAP archive %i as a read-only folder (RFC-0063)
+
+[Service]
+Type=simple
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py disk archive-run %i
+KillMode=mixed
+EOF
   # Instance watch (RFC-0038 D1/D2, RFC-0044 stage 1): three small jobs,
   # one minute apart.
   #
@@ -874,6 +903,7 @@ EOF
   systemctl enable --now oaap-cohort-sweep.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-keys.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
+  systemctl enable oaap-disks.service >/dev/null 2>&1 || true
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."
   say "WARNING: and an expired rehearsal (RFC-0030) will not be removed by itself — 'sudo oaap app rehearsal sweep' does it by hand."

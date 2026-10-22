@@ -87,6 +87,9 @@ import move  # noqa: E402
 # The cohort (RFC-0046): what a template may say and how a seat is
 # called. Pure; the acting is cmd_cohort below.
 import cohort  # noqa: E402
+# Disks and archives as node resources (RFC-0063): the host rules and
+# their mounts. The acting is cmd_disk below.
+import disks  # noqa: E402
 # Node metrics (RFC-0051): the sampler and the tiered store. Pure; the
 # acting is cmd_metrics.
 import metrics  # noqa: E402
@@ -112,6 +115,7 @@ STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
 EXTERNAL_FILE = os.path.join(APPS_DIR, "external.json")
 EDGE_FILE = os.path.join(APPS_DIR, "edge.json")
 NODE_FILE = os.path.join(APPS_DIR, "node.json")   # node profiles (RFC-0011)
+DISKS_FILE = os.path.join(APPS_DIR, "disks.json")  # disks and sources (RFC-0063)
 # accounts and tenants of THIS node (oaap.core.tenant 0.1, RFC-0022).
 # Lives beside the registry because identity and portal already mount
 # this directory read-only -- both must read it, neither may write it.
@@ -11439,6 +11443,55 @@ def tun_refusal(m, inst, rehearsal, confirmed):
             "--confirm-tun (oaap.apps.runtime 2.23, RFC-0060).")
 
 
+def disk_grants_of(stored, inst=None):
+    """(grants, instance id) of an instance, from the registry record first
+    (the same reason as `resources`: the door must not decide). A
+    rehearsal has none, whatever its record says (RFC-0063 §4.9), and
+    neither has an instance without an id -- a grant base is keyed by it."""
+    if is_rehearsal(stored) or is_rehearsal(inst):
+        return [], ""
+    iid = (stored or {}).get("id") or (inst or {}).get("id") or ""
+    grants = [g for g in ((stored or {}).get("disk_grants")
+                          or (inst or {}).get("disk_grants") or [])
+              if isinstance(g, dict) and g.get("grant") and g.get("source")]
+    return (grants, iid) if iid and grants else ([], "")
+
+
+def disk_absent_sentence(name, gone):
+    parts = [f"'{g}' (source '{s}' on disk '{d}')" for g, s, d in gone]
+    return (f"'{name}' was not started: its grant{'s' if len(gone) > 1 else ''} "
+            + ", ".join(parts) + " is not there. Plug the disk in and open it "
+            "(oaap disk open <disk>), or mark the grant optional "
+            "(oaap.data.disks 0.1, RFC-0063 §4.3).")
+
+
+def container_pid(container):
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", container],
+                       capture_output=True, text=True)
+    try:
+        pid = int((r.stdout or "").strip())
+    except ValueError:
+        return None
+    return pid or None
+
+
+def open_instance_grants(name, grants, iid, container):
+    """Mount an instance's grants into its base and check them from inside
+    the running container. Never raises: the container already runs, and a
+    grant that did not arrive is reported, not fatal."""
+    try:
+        return disks.open_grants(disks.load(DISKS_FILE), iid, grants,
+                                 pid=container_pid(container))
+    except (disks.DiskRefused, subprocess.CalledProcessError, OSError) as e:
+        return [("*", f"failed: {getattr(e, 'stderr', '') or e}")]
+
+
+def report_grants(name, report):
+    for g, outcome in report:
+        if outcome not in ("mounted", "kept"):
+            print(f"WARNING: {name}: grant '{g}': {outcome}", file=sys.stderr)
+
+
 def recreate_instance_containers(name, services, storage, endpoints=None,
                                  inst=None):
     """(Re)create ALL of an instance's service containers on its own
@@ -11469,9 +11522,22 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
                           or (inst or {}).get("shared_mounts") or [])
               if isinstance(x, dict) and x.get("host") and x.get("mount")]
     shared_at = {x["mount"] for x in shared}
+    # RFC-0063: disks and archives granted to this instance. Asked of the
+    # registry like the shared folders, never for a rehearsal (§4.9). The
+    # start rule is checked HERE, before the first `docker rm`: a refusal
+    # after it would leave the instance with no container at all.
+    grants, iid = disk_grants_of(stored, inst)
+    if grants:
+        dreg = disks.load(DISKS_FILE)
+        gone = disks.missing(dreg, grants)
+        if gone:
+            raise DiskAbsent(disk_absent_sentence(name, gone))
+        disks.ensure_base(iid)
     for s in services:
         uid = image_uid(s["image"])
         mounts = []
+        if s["service"] == primary and grants:
+            mounts += disks.grant_mount_args(iid)
         if s["service"] == primary:
             for x in shared:
                 os.makedirs(x["host"], exist_ok=True)
@@ -11526,6 +11592,9 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
     # (RFC-0016). Ohne das ist eine Verbindung nach jeder
     # Konfigurationsänderung still tot.
     restore_links(name)
+    if grants:
+        report_grants(name, open_instance_grants(name, grants, iid,
+                                                 services[0]["container"]))
 
 
 ENDPOINT_PORT_RANGE = range(8200, 8300)
@@ -12240,6 +12309,12 @@ class DiagnoseRefused(Exception):
     EndpointPortTaken already does)."""
 
 
+class DiskAbsent(DiagnoseRefused):
+    """An instance must not start: a mandatory grant's source is not there
+    (RFC-0063 §4.3). A DiagnoseRefused, so every door that already answers
+    a refused restart in its own words answers this one too."""
+
+
 # --- D1: what the container runtime knows -------------------------------
 #
 # ONE `docker inspect` for the whole node, not one per container: this
@@ -12896,6 +12971,11 @@ def wake_instance(name, inst, who="root", role="root", wait=WAKE_WAIT_SECONDS):
     if not is_standby(inst):
         return ("is already being woken" if inst.get("state") == "waking"
                 else "is not in standby")
+    # RFC-0063 §4.3: `docker start` passes no other check, so it is asked here
+    grants, _ = disk_grants_of(inst)
+    gone = disks.missing(disks.load(DISKS_FILE), grants) if grants else []
+    if gone:
+        raise DiskAbsent(disk_absent_sentence(name, gone))
     reg = load_registry()
     cur = reg["instances"][name]
     cur["state"] = "waking"
@@ -15441,6 +15521,10 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["shared_mounts"] = [dict(x) for x in inst["shared_mounts"]]
     elif preset.get("shared_mounts"):
         reg["instances"][name]["shared_mounts"] = [dict(x) for x in preset["shared_mounts"]]
+    # RFC-0063: the operator's disk grants, not the app's declaration -- a
+    # redeploy keeps them; a rehearsal never carries them (§4.9)
+    if inst and inst.get("disk_grants") and not rehearsal:
+        reg["instances"][name]["disk_grants"] = [dict(g) for g in inst["disk_grants"]]
     # which cohort seat this instance belongs to (RFC-0046 §3): kept by a
     # redeploy like the limits, so `oaap cohort` still finds it
     if (inst or {}).get("cohort") or preset.get("cohort"):
@@ -15548,6 +15632,12 @@ def remove_instance(reg, name, purge):
     for s in instance_services(inst):
         subprocess.run(["docker", "rm", "-f", s["container"]],
                        capture_output=True, text=True)
+    # RFC-0063 §4.9: the grants go with the instance, and so does its base
+    if inst.get("id") and os.path.isdir(disks.grant_base(inst["id"])):
+        try:
+            disks.remove_base(inst["id"])
+        except (disks.DiskRefused, subprocess.CalledProcessError, OSError) as e:
+            print(f"WARNING: grant base of '{name}' not removed: {e}", file=sys.stderr)
     for other in partners:
         teardown_link_network(name, other)
     # drop the instance's own network (disconnects the gateway first)
@@ -24889,6 +24979,547 @@ def cmd_store(args):
     save_sources(sources, removed)
 
 
+# --- RFC-0063: disks and archives as node resources ---------------------
+#
+# `oaap disk ...`. The host rules live in services/disks.py; this is the
+# acting: records, order, audit. Disk-level actions are filed in the
+# node's default tenant, grants in the tenant of the instance that gets
+# them (the customer must be able to see that the operator handed their
+# instance a disk -- the same counterweight as RFC-0022 D5).
+
+def _disk_audit(action, subject, tenant=None, detail=""):
+    tid = resolve_tenant(tenant) if tenant else ""
+    audit_tenant(f"disk.{action}", tid or ensure_default_tenant(),
+                 subject=subject, who=_dest_who(), role="server_admin",
+                 detail=detail)
+
+
+def _gb(n):
+    return f"{(n or 0) / 1e9:.1f} GB"
+
+
+def _disk_rec(dreg, name):
+    rec = dreg["disks"].get(name or "")
+    if not rec:
+        die(f"no disk '{name}' (oaap disk list)")
+    return rec
+
+
+def _disk_instance(ref):
+    reg = load_registry()
+    key, err = resolve_instance_ref(reg, ref or "", "")
+    if not key:
+        die(err or f"no instance '{ref}'")
+    return reg, key, reg["instances"][key]
+
+
+def _grants_using(reg, sources):
+    """[(instance, grant record)] of every grant on one of `sources`."""
+    out = []
+    for name, inst in (reg.get("instances") or {}).items():
+        for g in inst.get("disk_grants") or []:
+            if g.get("source") in sources:
+                out.append((name, g))
+    return out
+
+
+def _open_all_grants(reg, only_sources=None):
+    for name, inst in (reg.get("instances") or {}).items():
+        grants, iid = disk_grants_of(inst)
+        if not grants or (only_sources is not None
+                          and not {g["source"] for g in grants} & only_sources):
+            continue
+        rep = open_instance_grants(name, grants, iid,
+                                   instance_services(inst)[0]["container"])
+        for g, outcome in rep:
+            print(f"  {name}: {g} -> {outcome}")
+
+
+def _start_archives(dreg, names):
+    for s in sorted(names):
+        src = dreg["sources"][s]
+        if src["kind"] != "archive":
+            continue
+        need = {src["disk"]} | ({src["index_on"]} if src.get("index_on") else set())
+        if not all(os.path.ismount(disks.disk_mount(d)) for d in need):
+            print(f"  archive {s}: waits for disk {', '.join(sorted(need))}")
+            continue
+        try:
+            disks.start_archive(dreg, s)
+            print(f"  archive {s}: mounted")
+        except disks.DiskRefused as e:
+            print(f"  archive {s}: {e}", file=sys.stderr)
+
+
+def _work_disk(dreg, name=None):
+    """The work disk to write to: the named one, else the only open one."""
+    if name:
+        rec = _disk_rec(dreg, name)
+        if rec["role"] != "work":
+            die(f"'{name}' is not a work disk")
+        return rec
+    open_work = [r for r in dreg["disks"].values() if r["role"] == "work"
+                 and os.path.ismount(disks.disk_mount(r["name"]))]
+    if len(open_work) != 1:
+        die("name the work disk (--to / --index-on): "
+            + (f"{len(open_work)} are open" if open_work else "none is open"))
+    return open_work[0]
+
+
+def _ensure_container_base(name, inst):
+    """A container made before its first grant has no base mount; it gets
+    one by being recreated once (every later grant arrives live, D4)."""
+    c = instance_services(inst)[0]["container"]
+    r = subprocess.run(["docker", "inspect", "-f",
+                        "{{range .Mounts}}{{.Destination}}\n{{end}}", c],
+                       capture_output=True, text=True)
+    if disks.CONTAINER_BASE in (r.stdout or "").split():
+        return False
+    print(f"{name}: first grant -- the container is recreated once to get "
+          f"{disks.CONTAINER_BASE}")
+    print(restart_instance(name, inst, who=_dest_who(), role="server_admin"))
+    return True
+
+
+def cmd_disk(args):
+    a, rest = args.action, list(args.rest or [])
+    dreg = disks.load(DISKS_FILE)
+
+    def save():
+        disks.save(DISKS_FILE, dreg)
+
+    if a == "list":
+        devs = disks.devices()
+        known = set()
+        print("Datentraeger (adopted):" if dreg["disks"] else "No adopted disks.")
+        for rec in sorted(dreg["disks"].values(), key=lambda r: r["name"]):
+            dev = disks.find_device(devs, rec["uuid"])
+            known.add(rec["uuid"].lower())
+            st = disks.state(rec, devs)
+            line = (f"  {rec['name']:<16} {rec['role']:<4} "
+                    f"{rec.get('encryption', 'none'):<5} {st:<8}")
+            if dev:
+                line += f" {_gb(dev['size'])}  {dev['path']}"
+                if dev["usb_speed"]:
+                    line += f"  USB {dev['usb_speed']} Mbit/s" + (
+                        "  (slow port)" if dev["usb_speed"] < 5000 else "")
+            if st == "open":
+                u = shutil.disk_usage(disks.disk_mount(rec["name"]))
+                line += f"  free {_gb(u.free)}"
+            print(line)
+        # a mounted loop device (a snap, an image somebody uses) is not a
+        # disk waiting to be adopted
+        unknown = [d for d in devs if d["uuid"].lower() not in known
+                   and not d["system"] and not (d["loop"] and d["mountpoints"])]
+        if unknown:
+            print("Not adopted (oaap disk adopt <uuid> --name N --role raw|work):")
+            for d in unknown:
+                print(f"  {d['uuid']:<38} {d['fstype']:<12} {_gb(d['size'])}  "
+                      f"{d['label'] or '-'}  {d['model'] or ''}  {d['path']}"
+                      + (f"  USB {d['usb_speed']} Mbit/s" if d["usb_speed"] else ""))
+        if dreg["sources"]:
+            reg = load_registry()
+            print("Sources:")
+            for s, src in sorted(dreg["sources"].items()):
+                g = [f"{i}:{x['grant']}" + ("(rw)" if x.get("rw") else "")
+                     for i, x in _grants_using(reg, {s})]
+                print(f"  {s:<20} {src['kind']:<7} on {src['disk']:<14} "
+                      f"{'there' if disks.source_available(dreg, s) else 'not there':<9} "
+                      f"grants: {', '.join(g) or '-'}")
+        return
+
+    if a == "adopt":
+        if not rest or not args.name or args.role not in disks.ROLES:
+            die("usage: oaap disk adopt <uuid> --name N --role raw|work [--luks-key FILE]")
+        uuid_, name = rest[0], disks.check_name("disk", args.name)
+        if name in dreg["disks"]:
+            die(f"a disk '{name}' is already adopted")
+        if any(r["uuid"].lower() == uuid_.lower() for r in dreg["disks"].values()):
+            die(f"UUID {uuid_} is already adopted")
+        dev = disks.find_device(disks.devices(), uuid_)
+        if not dev:
+            die(f"no device with UUID {uuid_} (oaap disk list)")
+        if dev["system"]:
+            die("that device belongs to the system disk; refused")
+        rec = {"name": name, "uuid": dev["uuid"], "role": args.role,
+               "fstype": dev["fstype"], "size": dev["size"],
+               "label": dev["label"], "model": dev["model"],
+               "adopted": _iso_now(), "by": _dest_who(), "encryption": "none"}
+        if dev["fstype"] == "crypto_LUKS":
+            if not args.luks_key:
+                die("a LUKS device needs --luks-key FILE (the platform never "
+                    "asks for a passphrase)")
+            key = disks.key_path(name)
+            os.makedirs(disks.KEY_DIR, mode=0o700, exist_ok=True)
+            if os.path.abspath(args.luks_key) != key:
+                shutil.copyfile(args.luks_key, key)
+            os.chmod(key, 0o400)
+            r = subprocess.run(["cryptsetup", "open", "--test-passphrase",
+                                "--key-file", key, dev["path"]],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                die("the key file does not open this device")
+            rec.update(encryption="luks", key=key)
+        dreg["disks"][name] = rec
+        save()
+        _disk_audit("adopt", name, detail=f"{args.role}, {rec['encryption']}, "
+                                          f"UUID {rec['uuid']}")
+        print(f"adopted '{name}' ({args.role}, {rec['encryption']}). "
+              f"Open it: oaap disk open {name}")
+        return
+
+    if a == "forget":
+        rec = _disk_rec(dreg, rest[0] if rest else "")
+        used = [s for s, x in dreg["sources"].items()
+                if rec["name"] in (x["disk"], x.get("index_on"))]
+        if used:
+            die(f"'{rec['name']}' still carries sources: {', '.join(used)}")
+        if os.path.ismount(disks.disk_mount(rec["name"])):
+            die(f"'{rec['name']}' is open; eject it first")
+        del dreg["disks"][rec["name"]]
+        save()
+        _disk_audit("forget", rec["name"])
+        print(f"forgot '{rec['name']}' (key file, if any, left in {disks.KEY_DIR})")
+        return
+
+    if a == "open":
+        devs = disks.devices()
+        names = (sorted(dreg["disks"]) if args.all
+                 else [_disk_rec(dreg, rest[0] if rest else "")["name"]])
+        opened = set()
+        for n in names:
+            rec = dreg["disks"][n]
+            if args.all and not disks.find_device(devs, rec["uuid"]):
+                print(f"{n}: not plugged in")
+                continue
+            try:
+                print(f"{n}: open at {disks.open_disk(rec, devs)}")
+                opened.add(n)
+            except (disks.DiskRefused, subprocess.CalledProcessError) as e:
+                print(f"{n}: {getattr(e, 'stderr', '') or e}", file=sys.stderr)
+                if not args.all:
+                    sys.exit(1)
+        save()
+        srcs = {s for s, x in dreg["sources"].items()
+                if x["disk"] in opened or x.get("index_on") in opened}
+        _start_archives(dreg, srcs)
+        _open_all_grants(load_registry(), None if args.all else srcs)
+        if opened and not args.all:
+            _disk_audit("open", ",".join(sorted(opened)))
+        return
+
+    if a == "eject":
+        rec = _disk_rec(dreg, rest[0] if rest else "")
+        srcs = {s for s, x in dreg["sources"].items()
+                if rec["name"] in (x["disk"], x.get("index_on"))}
+        reg = load_registry()
+        for name, g in _grants_using(reg, srcs):
+            iid = reg["instances"][name].get("id")
+            if iid:
+                disks.close_grants(iid, only={g["grant"]})
+                print(f"  {name}: {g['grant']} unmounted")
+        for s in sorted(srcs):
+            if dreg["sources"][s]["kind"] == "archive":
+                disks.stop_archive(s)
+                print(f"  archive {s}: stopped")
+        disks.close_disk(rec)
+        _disk_audit("eject", rec["name"])
+        print(f"'{rec['name']}' is closed -- safe to unplug.")
+        return
+
+    if a == "format":
+        rec = _disk_rec(dreg, rest[0] if rest else "")
+        if rec["role"] != "work":
+            die(f"'{rec['name']}' is a raw disk: it is never formatted (RFC-0063 D5)")
+        if args.luks == args.plain:
+            die("say --luks (recommended) or --plain")
+        if (args.confirm_uuid or "").lower() != rec["uuid"].lower():
+            die(f"formatting erases '{rec['name']}'. Type its UUID back: "
+                f"--confirm-uuid {rec['uuid']}")
+        if os.path.ismount(disks.disk_mount(rec["name"])):
+            die(f"'{rec['name']}' is open; eject it first")
+        used = [s for s, x in dreg["sources"].items()
+                if rec["name"] in (x["disk"], x.get("index_on"))]
+        if used:
+            die(f"'{rec['name']}' carries sources ({', '.join(used)}); remove them first")
+        dev = disks.find_device(disks.devices(), rec["uuid"])
+        if not dev or dev["system"]:
+            die(f"'{rec['name']}' is not plugged in")
+        mapper = disks.mapper_name(rec["name"])
+        if os.path.exists("/dev/mapper/" + mapper):
+            run(["cryptsetup", "close", mapper])
+        run(["wipefs", "-a", "-q", dev["path"]])
+        label = rec["name"][:16]
+        if args.luks:
+            os.makedirs(disks.KEY_DIR, mode=0o700, exist_ok=True)
+            key, hdr = disks.key_path(rec["name"]), disks.key_path(rec["name"])[:-4] + ".luks-header"
+            for old in (key, hdr):
+                if os.path.exists(old):
+                    os.replace(old, old + ".old-" + time.strftime("%Y%m%d%H%M%S"))
+            fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+            with os.fdopen(fd, "wb") as f:
+                f.write(secrets.token_bytes(64))
+            run(["cryptsetup", "luksFormat", "--type", "luks2", "--batch-mode",
+                 "--label", label, "--key-file", key, dev["path"]])
+            run(["cryptsetup", "luksHeaderBackup", dev["path"],
+                 "--header-backup-file", hdr])
+            os.chmod(hdr, 0o400)
+            run(["cryptsetup", "open", "--key-file", key, dev["path"], mapper])
+            try:
+                run(["mkfs.ext4", "-q", "-L", label, "-m", "0", "/dev/mapper/" + mapper])
+            finally:
+                run(["cryptsetup", "close", mapper])
+            rec.update(encryption="luks", key=key, fstype="crypto_LUKS")
+        else:
+            run(["mkfs.ext4", "-q", "-F", "-L", label, "-m", "0", dev["path"]])
+            rec.update(encryption="none", fstype="ext4")
+            rec.pop("key", None)
+        rec["uuid"] = run(["blkid", "-s", "UUID", "-o", "value", dev["path"]]).stdout.strip()
+        rec["formatted"] = _iso_now()
+        save()
+        _disk_audit("format", rec["name"], detail=f"{rec['encryption']}, new UUID {rec['uuid']}")
+        print(f"'{rec['name']}' formatted ({'LUKS2 + ' if args.luks else ''}ext4), "
+              f"new UUID {rec['uuid']}.")
+        if args.luks:
+            print("Add a passphrase of your own as a second key -- type it "
+                  "yourself, the platform never sees it:\n"
+                  f"  sudo cryptsetup luksAddKey --key-file {rec['key']} {dev['path']}\n"
+                  f"Copy {hdr} somewhere that is not this node.")
+        return
+
+    if a == "scan":
+        rec = _disk_rec(dreg, rest[0] if rest else "")
+        mnt = disks.disk_mount(rec["name"])
+        if not os.path.ismount(mnt):
+            die(f"'{rec['name']}' is not open")
+        found = disks.scan(mnt)
+        for x in found:
+            print(f"  #{x['nr']:03d}  {_gb(x['size']):>10}  {x['format']:<10}"
+                  + (f"  {x['rel']}" if args.names else ""))
+        print(f"{len(found)} files" + ("" if args.names else
+                                       " (names hidden; --names shows them, RFC-0063 D7)"))
+        return
+
+    if a in ("archive", "path") and rest[:1] == ["add"]:
+        if len(rest) < 3 or not args.name:
+            die(f"usage: oaap disk {a} add <disk> <{'nr|' if a == 'archive' else ''}path> --name S")
+        rec = _disk_rec(dreg, rest[1])
+        s = disks.check_name("source", args.name)
+        if s in dreg["sources"]:
+            die(f"a source '{s}' exists already")
+        mnt = disks.disk_mount(rec["name"])
+        if not os.path.ismount(mnt):
+            die(f"'{rec['name']}' is not open")
+        ref = rest[2]
+        if a == "archive" and ref.lstrip("#").isdigit():
+            hit = [x for x in disks.scan(mnt) if x["nr"] == int(ref.lstrip("#"))]
+            if not hit:
+                die(f"no file #{ref} on '{rec['name']}' (oaap disk scan {rec['name']})")
+            rel = hit[0]["rel"]
+        else:
+            rel = os.path.normpath(ref.lstrip("/"))
+            if rel.startswith(".."):
+                die("the path must lie on the disk")
+        full = os.path.join(mnt, rel)
+        src = {"kind": a, "disk": rec["name"], "path": rel,
+               "added": _iso_now(), "by": _dest_who()}
+        if a == "archive":
+            if not os.path.isfile(full):
+                die("no such file on the disk")
+            fmt = disks.detect_format(full)
+            if fmt not in disks.ARCHIVE_FORMATS:
+                die(f"format '{fmt}' is not supported (measured: "
+                    f"{', '.join(disks.ARCHIVE_FORMATS)})")
+            idx = (_work_disk(dreg, args.index_on)["name"] if args.index_on
+                   else next((r["name"] for r in dreg["disks"].values()
+                              if r["role"] == "work"
+                              and os.path.ismount(disks.disk_mount(r["name"]))), ""))
+            src.update(format=fmt, index_on=idx, recursive=bool(args.recursive))
+        elif not os.path.isdir(full):
+            die("no such folder on the disk")
+        dreg["sources"][s] = src
+        save()
+        if a == "archive":
+            try:
+                disks.start_archive(dreg, s)
+            except disks.DiskRefused as e:
+                del dreg["sources"][s]
+                save()
+                die(str(e))
+        _disk_audit("source-add", s, detail=f"{a} on {rec['name']}")
+        print(f"source '{s}' ({a}) is there: {disks.source_path(dreg, s)}"
+              + ("" if a == "path" or src.get("index_on")
+                 else f"\nNOTE: index on the system disk ({disks.index_file(dreg, s)}) "
+                      "-- no work disk was open"))
+        return
+
+    if a == "source":
+        sub_ = rest[0] if rest else "list"
+        if sub_ == "list":
+            reg = load_registry()
+            for s, src in sorted(dreg["sources"].items()):
+                g = _grants_using(reg, {s})
+                print(f"{s:<20} {src['kind']:<7} {src['disk']:<14} "
+                      f"{'there' if disks.source_available(dreg, s) else 'not there':<9} "
+                      f"{len(g)} grant(s)")
+            return
+        if sub_ == "remove" and len(rest) > 1:
+            s = rest[1]
+            if s not in dreg["sources"]:
+                die(f"no source '{s}'")
+            reg = load_registry()
+            used = _grants_using(reg, {s})
+            if used and not args.revoke:
+                die(f"'{s}' is granted to {', '.join(i for i, _ in used)}; "
+                    "--revoke takes those grants away first")
+            for name, g in used:
+                _revoke(reg, name, g["grant"])
+            if dreg["sources"][s]["kind"] == "archive":
+                disks.stop_archive(s)
+            del dreg["sources"][s]
+            save()
+            _disk_audit("source-remove", s)
+            print(f"source '{s}' removed (its index file stays)")
+            return
+        die("usage: oaap disk source list | remove <source> [--revoke]")
+
+    if a == "grant":
+        if not rest or not args.instance or not args.grant_as:
+            die("usage: oaap disk grant <source> --instance I --as G [--rw] [--optional]")
+        s = rest[0]
+        src = dreg["sources"].get(s) or die(f"no source '{s}'")
+        why = disks.grant_refusal(dreg["disks"][src["disk"]], src, args.rw)
+        if why:
+            die(why)
+        gname = disks.check_name("grant", args.grant_as)
+        reg, name, inst = _disk_instance(args.instance)
+        if is_rehearsal(inst):
+            die("a rehearsal gets no grants (RFC-0063 §4.9)")
+        if any(g["grant"] == gname for g in inst.get("disk_grants") or []):
+            die(f"'{name}' has a grant '{gname}' already")
+        if not args.optional and not disks.source_available(dreg, s):
+            die(f"source '{s}' is not there; open its disk first, or --optional")
+        if args.rw:
+            # the image's user, unless told otherwise: an image that starts
+            # as root and drops to its own user (linuxserver: abc, 1000)
+            # says 0 here, and its user then cannot write (measured on
+            # webtop, 2026-10-22)
+            uid = args.owner if args.owner is not None else image_uid(
+                instance_services(inst)[0]["image"])
+            if uid is not None:
+                os.chown(disks.source_path(dreg, s), uid, uid)
+                print(f"  folder of '{s}' given to uid {uid}"
+                      + ("" if args.owner is not None else
+                         " (the image's user; --owner UID if the app drops to another)"))
+        inst.setdefault("disk_grants", []).append(
+            {"grant": gname, "source": s, "rw": bool(args.rw),
+             "optional": bool(args.optional), "since": _iso_now(), "by": _dest_who()})
+        save_registry(reg)
+        _disk_audit("grant", name, tenant=inst.get("tenant"),
+                    detail=f"{gname} <- {s} ({'rw' if args.rw else 'ro'})")
+        if not _ensure_container_base(name, inst):
+            grants, iid = disk_grants_of(inst)
+            for g, outcome in open_instance_grants(
+                    name, grants, iid, instance_services(inst)[0]["container"]):
+                print(f"  {g} -> {outcome}")
+        print(f"'{name}' sees it at {disks.CONTAINER_BASE}/{gname} "
+              f"({'rw' if args.rw else 'ro'})")
+        return
+
+    if a == "revoke":
+        if not rest or not args.instance:
+            die("usage: oaap disk revoke <grant> --instance I")
+        reg, name, inst = _disk_instance(args.instance)
+        if not any(g["grant"] == rest[0] for g in inst.get("disk_grants") or []):
+            die(f"'{name}' has no grant '{rest[0]}'")
+        _revoke(reg, name, rest[0])
+        print(f"'{rest[0]}' taken from '{name}' (no restart)")
+        return
+
+    if a == "verify":
+        s = rest[0] if rest else ""
+        if s not in dreg["sources"]:
+            die(f"no source '{s}'")
+        work = _work_disk(dreg, args.to)
+        out_dir = os.path.join(disks.disk_mount(work["name"]), "integritaet")
+        unit = f"oaap-disk-verify-{s}"
+        if args.status:
+            _verify_status(out_dir, s, unit)
+            return
+        if not disks.source_available(dreg, s):
+            die(f"source '{s}' is not there")
+        os.makedirs(out_dir, mode=0o700, exist_ok=True)
+        out = os.path.join(out_dir, f"{s}-{time.strftime('%Y%m%d-%H%M%S')}.sha256")
+        script = (f"cd '{disks.source_path(dreg, s)}' && find . -type f -print0 "
+                  f"| sort -z | xargs -0 -r sha256sum > '{out}.part' "
+                  f"&& mv '{out}.part' '{out}'")
+        run(["systemd-run", f"--unit={unit}", "--collect", "--nice=10",
+             "-p", "IOSchedulingClass=idle", "/bin/sh", "-c", script])
+        _disk_audit("verify", s, detail=f"to {work['name']}")
+        print(f"verification of '{s}' runs as {unit}; "
+              f"oaap disk verify {s} --status shows the outcome")
+        return
+
+    if a == "archive-run":
+        # the ExecStart of oaap-archive@<source>.service
+        s = rest[0] if rest else ""
+        if s not in dreg["sources"] or dreg["sources"][s]["kind"] != "archive":
+            die(f"no archive source '{s}'")
+        argv = disks.archive_argv(dreg, s)
+        os.execv(argv[0], argv)
+
+    die("usage: oaap disk list|adopt|forget|open|eject|format|scan|"
+        "archive add|path add|source list|source remove|grant|revoke|verify")
+
+
+def _revoke(reg, name, gname):
+    inst = reg["instances"][name]
+    keep = [g for g in inst.get("disk_grants") or [] if g["grant"] != gname]
+    iid = inst.get("id")
+    if iid:
+        disks.close_grants(iid, only={gname})
+    inst["disk_grants"] = keep
+    if not keep:
+        inst.pop("disk_grants")
+    save_registry(reg)
+    if iid and os.path.ismount(disks.grant_base(iid)):
+        # the placeholder goes too, so the container no longer lists it
+        disks.open_grants(disks.load(DISKS_FILE), iid, keep)
+    _disk_audit("revoke", name, tenant=inst.get("tenant"), detail=gname)
+
+
+def _verify_status(out_dir, s, unit):
+    active = subprocess.run(["systemctl", "is-active", unit],
+                            capture_output=True, text=True).stdout.strip()
+    try:
+        runs = sorted(f for f in os.listdir(out_dir)
+                      if f.startswith(s + "-") and f.endswith(".sha256"))
+    except FileNotFoundError:
+        runs = []
+    print(f"run: {active or 'unknown'}; finished lists: {len(runs)}")
+    if not runs:
+        return
+
+    def read(f):
+        d = {}
+        with open(os.path.join(out_dir, f), encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                h, _, p = ln.rstrip("\n").partition("  ")
+                d[p] = h
+        return d
+
+    last = read(runs[-1])
+    print(f"latest: {runs[-1][len(s) + 1:-7]}, {len(last)} files")
+    if len(runs) > 1:
+        prev = read(runs[-2])
+        diff = sum(1 for p in last if p in prev and prev[p] != last[p])
+        new = sum(1 for p in last if p not in prev)
+        gone = sum(1 for p in prev if p not in last)
+        same = len(last) - diff - new
+        print(f"against {runs[-2][len(s) + 1:-7]}: {same} equal, {diff} DIFFERENT, "
+              f"{new} new, {gone} missing" + ("" if diff or new or gone else "  -- unchanged"))
+
+
 def main():
     p = argparse.ArgumentParser(prog="oaap app")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -25029,6 +25660,48 @@ def main():
                      help="expose: no login for visitors (braked, still expires)")
     pco.add_argument("-n", "--lines", type=int, default=30, help="log: how many calls")
     pco.set_defaults(fn=cmd_connector)
+    pdk = sub.add_parser("disk",
+                         help="disks and archives as node resources (RFC-0063): "
+                              "list, adopt, forget, open, eject, format, scan, "
+                              "archive add, path add, source list|remove, grant, "
+                              "revoke, verify")
+    pdk.add_argument("action", choices=["list", "adopt", "forget", "open", "eject",
+                                        "format", "scan", "archive", "path", "source",
+                                        "grant", "revoke", "verify", "archive-run"])
+    pdk.add_argument("rest", nargs="*",
+                     help="adopt: <uuid>; open/eject/format/scan/forget: <disk>; "
+                          "archive|path add <disk> <nr|path>; source list|remove "
+                          "<source>; grant/verify: <source>; revoke: <grant>")
+    pdk.add_argument("--name", default="", help="adopt: the disk's name; "
+                     "archive/path add: the source's name")
+    pdk.add_argument("--role", default="", help="adopt: raw (as delivered, never "
+                     "written) or work (the platform may format it)")
+    pdk.add_argument("--luks-key", default="", help="adopt: key file of a LUKS disk")
+    pdk.add_argument("--all", action="store_true", help="open: every adopted disk "
+                     "that is plugged in (the boot unit)")
+    pdk.add_argument("--luks", action="store_true", help="format: LUKS2 + ext4")
+    pdk.add_argument("--plain", action="store_true", help="format: ext4 only")
+    pdk.add_argument("--confirm-uuid", default="", help="format: the disk's UUID, typed back")
+    pdk.add_argument("--names", action="store_true",
+                     help="scan: show file names (hidden by default, D7)")
+    pdk.add_argument("--index-on", default="", help="archive add: the work disk for the index")
+    pdk.add_argument("--recursive", action="store_true",
+                     help="archive add: show archives inside the archive as folders")
+    pdk.add_argument("--instance", default="", help="grant/revoke: the instance")
+    pdk.add_argument("--as", dest="grant_as", default="",
+                     help="grant: the name under /oaap/disks in the container")
+    pdk.add_argument("--rw", action="store_true",
+                     help="grant: writable (only a path on a work disk)")
+    pdk.add_argument("--owner", type=int, default=None,
+                     help="grant --rw: the uid that gets the folder (default: the image's user)")
+    pdk.add_argument("--optional", action="store_true",
+                     help="grant: the instance starts without it")
+    pdk.add_argument("--revoke", action="store_true",
+                     help="source remove: take its grants away first")
+    pdk.add_argument("--to", default="", help="verify: the work disk for the list")
+    pdk.add_argument("--status", action="store_true",
+                     help="verify: the last run and its comparison, counts only")
+    pdk.set_defaults(fn=cmd_disk)
     pcoh = sub.add_parser("cohort",
                           help="a training landscape from one template "
                                "(RFC-0046): create, add, reset, list, stop, "
@@ -25821,6 +26494,8 @@ def main():
         args.fn(args)
     except subprocess.CalledProcessError as e:
         die(f"command failed: {' '.join(e.cmd)}\n{e.stderr}")
+    except (disks.DiskRefused, DiskAbsent) as e:
+        die(str(e))
 
 
 if __name__ == "__main__":

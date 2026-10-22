@@ -463,6 +463,42 @@ EOF
     || say "  WARNING: the cohort sweep timer could not be enabled."
 fi
 
+# --- disks and archives (RFC-0063) ---
+# The boot unit that opens adopted disks, and the template unit an archive
+# source runs in. A node that was updated rather than installed has
+# neither. Enabled, not started: with nothing adopted it has nothing to do.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+  cat > /etc/systemd/system/oaap-disks.service <<EOF
+[Unit]
+Description=OAAP disks: open adopted disks, start archives, mount grants (RFC-0063)
+After=local-fs.target docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py disk open --all
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > /etc/systemd/system/oaap-archive@.service <<EOF
+[Unit]
+Description=OAAP archive %i as a read-only folder (RFC-0063)
+
+[Service]
+Type=simple
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py disk archive-run %i
+KillMode=mixed
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable oaap-disks.service >/dev/null 2>&1 \
+    || say "  WARNING: the disks unit could not be enabled."
+fi
+
 # --- the instance watch timer (RFC-0038 D1/D2, RFC-0044 stage 1) ---
 # Three one-shot jobs a minute: the container facts the instance page
 # shows, the expiry of diagnosis windows, and (since oaap.net.remote-
