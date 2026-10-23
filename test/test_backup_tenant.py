@@ -218,9 +218,52 @@ ok("und sagt, dass das Archiv keine vollstaendige Kopie mehr ist",
 print("")
 print("D5b, Bedingung 1 — das Archiv schreibt auf, was es weglaesst")
 
-said = backup()
+# Beide Container laufen. Mitgeschrieben wird, wen `docker stop` und
+# `docker start` nennen -- `start` laeuft an m.run vorbei (direkt ueber
+# subprocess), also wird auch dieser Weg abgefangen, und NUR fuer docker:
+# tar weiter unten geht durch dasselbe Modul.
+DOCKER = []
+_real_sub = subprocess.run
+
+
+def _two_running(cmd, **kw):
+    if cmd and cmd[0] == "docker":
+        if cmd[1] == "ps":
+            r = _Empty()
+            r.stdout = "oaap-app-portal\noaap-app-cls-viewer\n"
+            return r
+        DOCKER.append(list(cmd))
+        return _Empty()
+    return _real_run(cmd, **kw)
+
+
+def _sub_docker(cmd, *a, **kw):
+    if cmd and cmd[0] == "docker":
+        DOCKER.append(list(cmd))
+        return _Empty()
+    return _real_sub(cmd, *a, **kw)
+
+
+m.run, subprocess.run = _two_running, _sub_docker
+try:
+    said = backup()
+finally:
+    m.run, subprocess.run = _no_docker, _real_sub
+stopped = [c for cmd in DOCKER if cmd[1] == "stop" for c in cmd[2:]]
+started = [c for cmd in DOCKER if cmd[1] == "start" for c in cmd[2:]]
 arc = newest("oaap-backup-")
 ok("das Knotenarchiv wird trotzdem geschrieben", bool(arc), said)
+# Gefunden auf oaap-demo am 23.10.2026: der Desktop des Betreibers
+# (Mandant 'joerg', ausgenommen) wurde jede Nacht um 02:30 neu gestartet,
+# mitten in einem laufenden Skript -- fuer ein Archiv, das seine Daten
+# gar nicht enthaelt.
+ok("die Container des ausgenommenen Mandanten werden NICHT gestoppt",
+   "oaap-app-cls-viewer" not in stopped and "oaap-app-cls-viewer" not in started,
+   DOCKER)
+ok("die des anderen schon, und sie starten wieder",
+   stopped == ["oaap-app-portal"] and started == ["oaap-app-portal"], DOCKER)
+ok("die Ausgabe sagt, wer weiterlaeuft",
+   "keep running (oaap-app-cls-viewer)" in said, said)
 entries = listing(arc) if arc else []
 ok("die Daten des ausgenommenen Mandanten fehlen",
    not any(f"tenants/{CLS}/" in e for e in entries), entries[:12])

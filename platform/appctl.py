@@ -24413,7 +24413,22 @@ def cmd_backup(args):
         print(f"NOTE: {len(_reh)} rehearsal instance(s) on this node "
               f"({', '.join(sorted(_reh))}) — this archive therefore holds a "
               "second copy of their production data (RFC-0030).")
-    running = run(["docker", "ps", "-q", "--filter", "name=^oaap-app-"]).stdout.split()
+    # An excluded tenant's data is not copied, so stopping its containers
+    # buys this archive nothing -- and costs that tenant the outage
+    # anyway. Found on oaap-demo, 2026-10-23: the operator's desktop
+    # (tenant 'joerg', excluded since 15.10.) was restarted at 02:30
+    # every night, with a script running in it. Named by container, so
+    # the filter below cannot match more than it says.
+    keep_running = {c for tid in _ex
+                    for i in tenant_instances(reg, tid).values()
+                    for c in _containers_of(i)}
+    running = [c for c in run(["docker", "ps", "--format", "{{.Names}}",
+                               "--filter", "name=^oaap-app-"]).stdout.split()
+               if c not in keep_running]
+    if keep_running:
+        print(f"NOTE: {len(keep_running)} container(s) of excluded tenant(s) "
+              f"keep running ({', '.join(sorted(keep_running))}) — "
+              "their data is not in this archive, so they need not stand still.")
     stage = tempfile.mkdtemp(prefix="oaap-backup-")
     # The managed Postgres (oaap.data.store 0.1, spec 2.4): a DUMP, not
     # a copy of its data directory -- a dump survives a Postgres
