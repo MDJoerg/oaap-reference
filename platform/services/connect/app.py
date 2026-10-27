@@ -68,6 +68,8 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 
+import propagate
+
 APPS = os.environ.get("CONNECT_APPS", "/platform-apps")
 SECRETS = os.environ.get("CONNECT_SECRETS", "/secrets")
 STATE = os.environ.get("CONNECT_STATE", "/state")
@@ -81,6 +83,14 @@ EXPOSURES_FILE = os.path.join(STATE, "exposures.json")
 # read-only here, exactly like connect.json above.
 ACCESS_FILE = os.path.join(APPS, "remote-access.json")
 AUDIT_LOG = os.environ.get("CONNECT_AUDIT", "/audit/tenant-log.jsonl")
+# RFC-0066 stage 1 (oaap.net.destinations 2.9). The destinations are
+# appctl's file in the same read-only mount as connect.json; the tenant
+# CAs are this service's own, in a directory nobody else mounts; the
+# assertion key is the host's, shared read-only with identity.
+DESTINATIONS_FILE = os.path.join(APPS, "destinations.json")
+CA_DIR = os.environ.get("CONNECT_CA", "/ca")
+ASSERTION_KEY_FILE = os.environ.get("CONNECT_ASSERTION_KEY", "/assertion/key")
+PROPAGATE_TIMEOUT = 120
 IDENTITY = os.environ.get("CONNECT_IDENTITY", "http://identity:8000").rstrip("/")
 CLIENT_FILE = os.environ.get("CONNECT_CLIENT_FILE", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "client", "oaap-expose.py"))
@@ -120,7 +130,8 @@ SWEEP_EVERY = 5
 RECHECK_EVERY = int(os.environ.get("CONNECT_RECHECK", "60"))
 SESSION_COOKIE = "oaap_session"
 IDENTITY_HEADERS = ("X-OAAP-User", "X-OAAP-Roles", "X-OAAP-User-Id",
-                    "X-OAAP-Display-Name", "X-OAAP-Email")
+                    "X-OAAP-Display-Name", "X-OAAP-Email",
+                    "X-OAAP-User-Assertion")
 # RFC 7230 6.1 plus the ones a proxy must never pass on. X-Forwarded-*
 # would tell the backend where the call came from on the OUTER node --
 # nothing it has a use for, and nothing the inner side chose to learn.
@@ -366,6 +377,12 @@ class Node:
         self.opened = []           # outer: when names were opened (2.8.7)
         self.brakes = {}           # outer: (name, client) -> deque of times
         self.http = None           # one client session for identity
+        # RFC-0066: certificates per (destination, person), and a client
+        # that NEVER reuses a connection. A TLS session is authenticated
+        # by the person's certificate; a pooled one handed to the next
+        # caller would carry the previous person into their request.
+        self.prop_certs = propagate.CertCache()
+        self.prop_http = None
         self.exposure_log = StreamLog("exposures")
         self._state_dirty = asyncio.Event()
 
@@ -387,12 +404,18 @@ class Node:
         return (self.conf.get("connectors") or {}).get(label)
 
     async def watch(self):
+        dest_seen = None
         while True:
             try:
                 if self.load():
                     await self.reconcile()
             except Exception as e:                       # noqa: BLE001
                 log(f"reconcile: {e!r}")
+            seen = mtime(DESTINATIONS_FILE)
+            if seen != dest_seen:
+                dest_seen = seen
+                await asyncio.get_running_loop().run_in_executor(
+                    None, self.ensure_cas)
             await asyncio.sleep(1)
 
     async def reconcile(self):
@@ -784,7 +807,12 @@ class Node:
         status, headers, body = await self.identity(
             "/verify", fwd, params={"tenant": e["tenant"]})
         if status == 204:
-            return web.Response(status=204, headers={h: headers.get(h, "") for h in IDENTITY_HEADERS})
+            # The assertion (RFC-0066) is for a destination of THIS node;
+            # an exposure leads elsewhere, so it is answered empty and the
+            # gateway overwrites whatever arrived with nothing.
+            return web.Response(status=204, headers={
+                h: ("" if h == propagate.ASSERTION_HEADER else headers.get(h, ""))
+                for h in IDENTITY_HEADERS})
         keep = {k: v for k, v in headers.items()
                 if k.lower() in ("location", "www-authenticate", "retry-after",
                                  "cache-control", "content-type")}
@@ -948,6 +976,151 @@ class Node:
             return text(501, "A WebSocket through the tunnel is not part of "
                              "oaap.net.connector 0.1.")
         return await t.call(request, offer, caller, dest)
+
+    # --- the person, carried through (RFC-0066, destinations 2.9) -----------
+    def propagation_destination(self, dest):
+        """(tenant, name, record, refusal) of a principal_propagation
+        destination. Read from appctl's file on every call: an unbind or
+        a removal must not live on in this process."""
+        tid, _, name = (dest or "").partition("/")
+        d = ((read_json(DESTINATIONS_FILE).get("destinations") or {})
+             .get(tid) or {}).get(name)
+        if not tid or not d:
+            return tid, name, None, "this destination is not on this node"
+        auth = d.get("auth") or {}
+        if auth.get("type") != "principal_propagation":
+            return tid, name, None, "this destination does not carry the person"
+        if not (d.get("target") or {}).get("direct", "").startswith("https://"):
+            return tid, name, None, "propagation reaches https targets only"
+        if not auth.get("server_cert"):
+            return tid, name, None, "this destination has no pinned server certificate"
+        return tid, name, d, ""
+
+    def tenant_label_of(self, tid):
+        return str((self.tenants().get(tid) or {}).get("label") or tid)
+
+    def ensure_cas(self):
+        """A tenant that has a propagation destination has a CA -- made
+        here, before the first call, so `oaap destination ca` can show it
+        to the target's administrator before anybody needs it."""
+        dests = read_json(DESTINATIONS_FILE).get("destinations") or {}
+        for tid, own in dests.items():
+            if not any(((d or {}).get("auth") or {}).get("type")
+                       == "principal_propagation" for d in (own or {}).values()):
+                continue
+            try:
+                _c, _k, made = propagate.ensure_ca(CA_DIR, tid,
+                                                   self.tenant_label_of(tid))
+            except Exception as e:                       # noqa: BLE001
+                log(f"propagation CA for {tid}: {e!r}")
+                continue
+            if made:
+                log(f"propagation CA made for tenant {tid}")
+                self.audit("destination.propagation.ca", tid,
+                           subject=self.tenant_label_of(tid), who="connect",
+                           detail="issuing CA made")
+
+    async def handle_propagate(self, request):
+        presented = request.headers.get(GW_KEY, "")
+        if not self.gateway_key or not hmac.compare_digest(presented, self.gateway_key):
+            return web.Response(status=403, text="denied\n")
+        caller = request.headers.get(GW_CALLER, "")
+        tid, name, d, why = self.propagation_destination(
+            request.headers.get(GW_DEST, ""))
+        if why:
+            return text(502, f"Destination '{name}': {why}.")
+        if request.headers.get("Upgrade"):
+            return text(501, "A WebSocket is not carried with the person "
+                             "(oaap.net.destinations 2.9).")
+        claims, why = propagate.check_assertion(
+            propagate.read_key(ASSERTION_KEY_FILE),
+            request.headers.get(propagate.ASSERTION_HEADER, ""), caller)
+        if why:
+            return text(403, f"Destination '{name}' acts as the signed-in person, "
+                             f"and {why} (the app must pass on "
+                             f"{propagate.ASSERTION_HEADER} unchanged).")
+        if claims.get("ten") != tid:
+            return text(403, f"Destination '{name}': the person belongs to another "
+                             "tenant than this destination.")
+        auth = d["auth"]
+        user, why = propagate.backend_user(auth.get("user"), claims.get("prop"),
+                                           auth.get("name_check", ""))
+        if why:
+            return text(403, f"Destination '{name}': {why}.")
+        # The path as it arrived, still percent-encoded, is what goes on
+        # (the `via` call's rule); the decoded form is only checked.
+        prefix = f"/propagate/{request.match_info['need']}"
+        raw = request.raw_path.split("?", 1)[0]
+        raw = raw[len(prefix):] if raw.startswith(prefix) else "/"
+        raw = raw if raw.startswith("/") else "/" + raw
+        _path, why = clean_path(raw)
+        if why:
+            return text(400, f"Refused: {why}.")
+        ckey = (tid, name, claims.get("sub", ""), user)
+        hit = self.prop_certs.get(ckey)
+        if hit is None:
+            try:
+                ca_cert, ca_key, _made = propagate.ensure_ca(
+                    CA_DIR, tid, self.tenant_label_of(tid))
+                cert_pem, key_pem, serial, not_after = propagate.issue(
+                    ca_cert, ca_key, self.tenant_label_of(tid), user,
+                    claims.get("sub", ""), auth.get("lifetime_minutes", 10))
+                ctx = propagate.client_context(cert_pem, key_pem, auth["server_cert"])
+            except Exception as e:                       # noqa: BLE001
+                log(f"propagate {tid}/{name}: {e!r}")
+                return text(500, f"Destination '{name}': the certificate for this "
+                                 "person could not be made on this node.")
+            self.prop_certs.put(ckey, ctx, serial, not_after)
+            hit = self.prop_certs.get(ckey)
+            # spec 2.9.8: every certificate, never the request
+            self.audit("destination.propagation.issue", tid, subject=name,
+                       who=claims.get("usr", "?"),
+                       detail=f"instance {caller} · person {claims.get('sub', '')} "
+                              f"· backend {user} · serial {serial} "
+                              f"· valid until {not_after.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        target = d["target"]["direct"].rstrip("/")
+        query = request.raw_path.partition("?")[2]
+        url = target + raw + (("?" + query) if query else "")
+        drop = HOP | {"authorization", "cookie", propagate.ASSERTION_HEADER.lower()}
+        headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in drop and not k.lower().startswith("x-oaap-")}
+        if self.prop_http is None or self.prop_http.closed:
+            self.prop_http = aiohttp.ClientSession(
+                # NO cookie jar. Measured against a4h on 2026-10-27: with
+                # aiohttp's default jar the first person's SAP logon
+                # ticket (MYSAPSSO2 / SAP_SESSIONID) came back as a cookie,
+                # the jar sent it on the next calls, and two OTHER people
+                # -- one of them locked in SAP -- arrived as the first.
+                # Dropping the app's Cookie header was not enough; the
+                # client itself must keep nothing between calls.
+                cookie_jar=aiohttp.DummyCookieJar(),
+                connector=aiohttp.TCPConnector(force_close=True),
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=15,
+                                              sock_read=PROPAGATE_TIMEOUT),
+                auto_decompress=False)
+        body = request.content if request.body_exists else None
+        try:
+            async with self.prop_http.request(
+                    request.method, URL(url, encoded=True), headers=headers,
+                    data=body, ssl=hit["ctx"], allow_redirects=False) as up:
+                out = web.StreamResponse(status=up.status, reason=up.reason)
+                for k, v in up.headers.items():
+                    # no Set-Cookie: a backend session is the person's,
+                    # and 0.5 keeps no session state between calls
+                    if k.lower() in HOP or k.lower() == "set-cookie":
+                        continue
+                    out.headers.add(k, v)
+                await out.prepare(request)
+                async for chunk in up.content.iter_chunked(CHUNK):
+                    await out.write(chunk)
+                await out.write_eof()
+                return out
+        except aiohttp.ClientConnectorCertificateError:
+            return text(502, f"Destination '{name}': the target did not present "
+                             "the pinned certificate -- nothing was sent.")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            return text(502, f"Destination '{name}': the target could not be "
+                             f"reached ({type(e).__name__}).")
 
     # --- a person's port forward (RFC-0044 §4, oaap.net.remote-access 0.2) ----
     async def handle_forward(self, request):
@@ -1581,6 +1754,8 @@ def make_app(node):
     app.router.add_route("*", r"/via/{tunnel:[a-z0-9-]+}/{offer:[a-z0-9-]+}{rest:(/.*)?}",
                          node.handle_via)
     app.router.add_get("/connect/client", node.handle_client)
+    app.router.add_route("*", r"/propagate/{need:[a-z0-9-]+}{rest:(/.*)?}",
+                         node.handle_propagate)
     app.router.add_get("/connect/forward", node.handle_forward)
     app.router.add_get("/exposure/verify", node.handle_expose_verify)
     app.router.add_route("*", r"/exposed{rest:(/.*)?}", node.handle_exposed)

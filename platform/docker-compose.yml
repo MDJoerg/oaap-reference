@@ -107,6 +107,9 @@ services:
       # and read-only keeps identity from ever writing it -- appctl on
       # the host owns this file, exactly as it owns tenants.json.
       - "${OAAP_DATA_DIR}/data/idp:/platform-idp:ro"
+      # the node's assertion key (oaap.core.identity 2.11, RFC-0066) --
+      # read-only; the host writes it, connect checks with the same key
+      - "${OAAP_DATA_DIR}/data/assertion:/platform-assertion:ro"
       # writable, and the only thing identity writes outside its own
       # data: the tenant audit log (oaap.core.tenant 1.7). User
       # administration is the one state change that never passes the
@@ -186,6 +189,13 @@ services:
       - "${OAAP_DATA_DIR}/data/connect/secrets:/secrets:ro"
       # the one thing it writes: state.json and the stream logs
       - "${OAAP_DATA_DIR}/data/connect/state:/state"
+      # RFC-0066 stage 1: the tenants' issuing CAs for principal
+      # propagation -- written by this service only, 0700/0600, mounted
+      # by NO other container and not in the backup (destinations 2.9.3)
+      - "${OAAP_DATA_DIR}/data/connect/ca:/ca"
+      # the node's assertion key, shared read-only with identity
+      # (oaap.core.identity 2.11); the host writes it
+      - "${OAAP_DATA_DIR}/data/assertion:/assertion:ro"
       # append only, and the same file identity appends to: one line for
       # each decision of a person about an exposure (spec 2.8.8)
       - "${OAAP_DATA_DIR}/data/audit:/audit"

@@ -6,6 +6,7 @@ COPY identity/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY place.py .
 COPY idp.py .
+COPY assertion.py .
 COPY authorization.py .
 COPY mqtt_acl.py .
 COPY identity/app.py .

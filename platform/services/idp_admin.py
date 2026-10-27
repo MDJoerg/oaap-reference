@@ -141,6 +141,9 @@ CONNECTOR_KINDS = {
             "realm_roles": "/admin/realms/{space}/roles",
             "realm_role_composites":
                 "/admin/realms/{space}/roles/{alias}/composites",
+            # RFC-0066 / destinations 2.9.6: who may edit an attribute a
+            # destination acts on. Read only, never written.
+            "user_profile": "/admin/realms/{space}/users/profile",
         },
         # RFC-0056: the narrow door for the customer's own
         # administrator. A GROUP that carries these roles of
@@ -1606,6 +1609,27 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def attribute_edit_of(kind, doc, name):
+    """Who may edit attribute `name`, as the space's own profile says:
+    "admin" (administrators only), "self" (the person too), "absent"
+    (not declared), or "" when the document cannot be read.
+
+    Only Keycloak's declarative user profile is understood, and that is
+    said: a product whose profile this does not read gets "", which the
+    caller treats as "not checked" -- never as "admin".
+    """
+    if (kind or "").strip().lower() != "keycloak" or not isinstance(doc, dict):
+        return ""
+    for a in doc.get("attributes") or []:
+        if not isinstance(a, dict) or a.get("name") != name:
+            continue
+        edit = ((a.get("permissions") or {}).get("edit")) or []
+        if not isinstance(edit, list):
+            return ""
+        return "self" if "user" in edit else "admin"
+    return "absent"
+
+
 class Admin:
     """A provider's admin API, held by this node.
 
@@ -1902,6 +1926,22 @@ class Admin:
                 return {}, f"reading the sign-in rules answered {status}"
             docs[where] = doc
         return settings_of(self.kind, docs), ""
+
+    def attribute_edits(self, space, names):
+        """({name: "admin"|"self"|"absent"|""}, error). A pure read of
+        the space's user profile (destinations 2.9.6)."""
+        path = self._path("user_profile", space=space)
+        if not path:
+            return {}, (f"this connector does not say where "
+                        f"{self.decl['product']} keeps its user profile")
+        status, doc, err = self._call("GET", path)
+        if err:
+            return {}, err
+        if status == 403:
+            return {}, self._not_ours(space, "read the user profile")
+        if status != 200:
+            return {}, f"reading the user profile of '{space}' answered {status}"
+        return {n: attribute_edit_of(self.kind, doc, n) for n in names}, ""
 
     def count_people(self, space):
         """(count, error). How many people the space says are in it.

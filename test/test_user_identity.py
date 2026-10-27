@@ -74,8 +74,11 @@ sys.path.insert(0, PLATFORM_DIR)
 import appctl  # noqa: E402
 
 NEW = ("X-OAAP-User-Id", "X-OAAP-Display-Name", "X-OAAP-Email")
-ok("die Liste nennt die zwei alten und die drei neuen",
-   appctl.IDENTITY_HEADERS == ("X-OAAP-User", "X-OAAP-Roles") + NEW,
+# oaap.core.identity 0.6.2 (RFC-0066): the sixth, the assertion for the
+# way out -- stripped and copied like the five, so it belongs on the list.
+ok("die Liste nennt die zwei alten, die drei neuen und die Zusicherung",
+   appctl.IDENTITY_HEADERS == ("X-OAAP-User", "X-OAAP-Roles") + NEW
+   + ("X-OAAP-User-Assertion",),
    appctl.IDENTITY_HEADERS)
 
 appctl_src = read(PLATFORM_DIR, "appctl.py")

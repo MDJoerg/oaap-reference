@@ -46,6 +46,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy identity:8000
 	}
 
@@ -55,6 +56,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy portal:8000
 	}
 
@@ -68,6 +70,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		uri strip_prefix /platform
 		root * /etc/caddy/static
 		file_server
@@ -83,6 +86,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy portal:8000
 	}
 
@@ -96,6 +100,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy portal:8000
 	}
 
@@ -108,6 +113,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy portal:8000
 	}
 
@@ -124,6 +130,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy connect:8000 {
 			stream_close_delay 12h
 		}
@@ -138,6 +145,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy connect:8000
 	}
 
@@ -151,6 +159,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy connect:8000 {
 			stream_close_delay 12h
 		}
@@ -175,7 +184,7 @@
 	handle /twin/* {
 		forward_auth identity:8000 {
 			uri /verify?roles=user&instance=oaap.twin
-			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email
+			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email X-OAAP-User-Assertion
 			header_up -Connection
 			header_up -Upgrade
 		}
@@ -195,6 +204,7 @@
 		request_header -X-OAAP-User-Id
 		request_header -X-OAAP-Display-Name
 		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
 		reverse_proxy identity:8000
 	}
 
@@ -209,7 +219,7 @@
 	handle /broker/* {
 		forward_auth identity:8000 {
 			uri /verify?roles=user
-			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email
+			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email X-OAAP-User-Assertion
 			header_up -Connection
 			header_up -Upgrade
 		}
@@ -223,7 +233,7 @@
 	handle {
 		forward_auth identity:8000 {
 			uri /verify
-			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email
+			copy_headers X-OAAP-User X-OAAP-Roles X-OAAP-User-Id X-OAAP-Display-Name X-OAAP-Email X-OAAP-User-Assertion
 			# The auth call is a plain GET — never hand it the
 			# handshake's hop-by-hop headers. The WSGI server answers
 			# those with 400, and forward_auth returns that to the

@@ -849,6 +849,33 @@ def factor_asserted(claims):
     return any(str(x).strip().lower() in SECOND_FACTOR_METHODS for x in amr)
 
 
+# What a provider's claims may carry onward to a destination as the
+# person (oaap.core.identity 2.11, RFC-0066 stage 1). A NAME pattern,
+# not "every claim": a claim reaches a backend as somebody's user name,
+# so only the ones somebody decided to mean that are taken.
+PROPAGATE_CLAIM_RE = r"sap_user(_[a-z0-9]{1,16})?"
+PROPAGATE_VALUE_RE = r"[A-Za-z0-9_.@-]{1,64}"
+
+
+def propagation_from(claims):
+    """{claim: value} of the attributes a destination may act on.
+
+    Taken fresh at every sign-in and REPLACING what was stored: a claim
+    the provider no longer sends must disappear, or a person whose SAP
+    user an administrator removed would keep acting as it until they
+    happened to be deleted. A value that is not a plain string of the
+    allowed characters is left out rather than cleaned -- a cleaned
+    user name is somebody else's user name.
+    """
+    out = {}
+    for k, v in (claims or {}).items():
+        if not re.fullmatch(PROPAGATE_CLAIM_RE, str(k)):
+            continue
+        if isinstance(v, str) and re.fullmatch(PROPAGATE_VALUE_RE, v):
+            out[k] = v
+    return out
+
+
 def profile_from(claims):
     """Display name and e-mail a provider offered, for a local record.
 

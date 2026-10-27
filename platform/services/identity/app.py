@@ -56,6 +56,7 @@ import idp  # noqa: E402
 import mqtt_acl  # noqa: E402
 # Business authorization (RFC-0045): the pure half, beside idp.py.
 import authorization as authz  # noqa: E402
+import assertion  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -730,7 +731,43 @@ def _header_value(value):
     return quote(value, safe="", encoding="utf-8")
 
 
-def identity_headers(user):
+# The node's assertion key (oaap.core.identity 2.11): written by the
+# host into its own directory, mounted read-only here and into the one
+# service that checks assertions. Read on every call through the mtime,
+# so a key made after this process started is used without a restart.
+ASSERTION_KEY_FILE = os.environ.get("ASSERTION_KEY_FILE",
+                                    "/platform-assertion/key")
+_assertion_key = {"mtime": None, "key": b""}
+
+
+def assertion_key():
+    try:
+        mt = os.stat(ASSERTION_KEY_FILE).st_mtime
+    except OSError:
+        return b""
+    if mt != _assertion_key["mtime"]:
+        try:
+            with open(ASSERTION_KEY_FILE, encoding="ascii") as f:
+                raw = bytes.fromhex(f.read().strip())
+        except (OSError, ValueError):
+            raw = b""
+        _assertion_key.update(mtime=mt, key=raw if len(raw) >= 32 else b"")
+    return _assertion_key["key"]
+
+
+def user_assertion(user, instance):
+    """The sixth header's value, or "" (spec 2.11): a person only, an
+    instance only, a key only."""
+    if not instance or (user.get("kind") or "human") != "human":
+        return ""
+    return assertion.mint(assertion_key(), user.get("id", ""),
+                          user.get("username", ""),
+                          resolve_tenant(user.get("tenant")) or "",
+                          instance,
+                          (user.get("idp") or {}).get("propagate") or {})
+
+
+def identity_headers(user, instance=""):
     """The trusted headers the gateway copies onto the app's request.
 
     ALWAYS all five, empty where there is no value, never a shorter
@@ -753,6 +790,9 @@ def identity_headers(user):
         "X-OAAP-Display-Name": _header_value(user.get("display_name") or ""),
         "X-OAAP-Email": (_header_value(user.get("email") or "")
                          if user.get("email_verified") else ""),
+        # 0.6.2: always present, empty where there is none -- the same
+        # overwrite rule as the five above.
+        assertion.HEADER: user_assertion(user, instance),
     }
 
 
@@ -1703,7 +1743,7 @@ def verify():
         mine = resolve_tenant(user.get("tenant"))
         if want is None or mine is None or want != mine:
             return "Forbidden: this app belongs to another tenant", 403
-    return "", 204, identity_headers(user)
+    return "", 204, identity_headers(user, request.args.get("instance", ""))
 
 
 @app.get("/auth/login")
@@ -2122,6 +2162,15 @@ def _idp_principal(tid, provider, claims):
                 changed = True
             u["idp"]["last_login"] = _now_iso()
             u["idp"]["factor"] = factor
+            # Replaced, never merged (spec 2.11): what the provider no
+            # longer says, the platform no longer acts on.
+            prop = idp.propagation_from(claims)
+            if (u["idp"].get("propagate") or {}) != prop:
+                changed = True
+            if prop:
+                u["idp"]["propagate"] = prop
+            else:
+                u["idp"].pop("propagate", None)
             save_users(users)
             audit("user.idp-login", tid, u["username"], who=u["username"],
                   role="-", detail=f"{pkey} · {factor or 'kein Faktor genannt'}"
@@ -2150,6 +2199,9 @@ def _idp_principal(tid, provider, claims):
                     "bound": _now_iso(), "last_login": _now_iso(),
                     "factor": factor},
         }
+        prop = idp.propagation_from(claims)
+        if prop:
+            record["idp"]["propagate"] = prop
         users.append(record)
         save_users(users)
     audit("user.idp-first-login", tid, username, who=username, role="-",

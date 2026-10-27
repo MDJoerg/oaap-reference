@@ -421,8 +421,19 @@ DEST_SITE = "_destinations.caddy"
 DEST_ENV_PREFIX = "OAAP_DESTINATION_"
 DEST_NAME_RE = r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"
 DEST_KINDS = ("http", "tcp")
-DEST_AUTH = {"http": ("none", "basic", "bearer", "header"),
+DEST_AUTH = {"http": ("none", "basic", "bearer", "header",
+                      "principal_propagation"),
              "tcp": ("none", "basic")}
+# RFC-0066 stage 1 (oaap.net.destinations 2.9). The node's assertion key
+# lives in a directory of its own, mounted read-only into identity (which
+# signs) and connect (which checks) -- and into nothing else. The tenant
+# CAs are connect's, in data/connect/ca; appctl only READS their public
+# half to show it.
+ASSERTION_DIR = os.path.join(DATA_DIR, "data", "assertion")
+ASSERTION_KEY_FILE = os.path.join(ASSERTION_DIR, "key")
+PROPAGATION_CA_DIR = os.path.join(DATA_DIR, "data", "connect", "ca")
+PROPAGATION_DEFAULT_CLAIM = "sap_user"
+PROPAGATION_NAME_CHECKS = ("", "sap")
 # What a header value may contain without being interpreted: printable
 # ASCII minus whitespace, quotes, backslash and braces. Braces are the
 # Caddyfile's placeholders -- a secret containing `{env.X}` would be
@@ -744,6 +755,9 @@ def write_destinations_caddy(reg=None):
                       "\t}",
                       f"\thandle {m} {{"]
             auth = d.get("auth") or {"type": "none"}
+            if auth["type"] == "principal_propagation":
+                lines += _propagation_route(name, inst, need, tid, dname)
+                continue
             secret = (dest_secrets.get(tid) or {}).get(dname, "")
             if auth["type"] != "none" and not secret:
                 # After a restore the object is back and its secret is
@@ -834,6 +848,33 @@ def write_destinations_caddy(reg=None):
     return True
 
 
+def _propagation_route(name, inst, need, tid, dname):
+    """The body of one propagation binding (destinations 2.9.4, 2.9.7).
+
+    Without the grant: a sentence, and the app's call goes nowhere. With
+    it: the identity headers are stripped EXCEPT the assertion, which is
+    the proof the service needs, and the call goes to connect -- which
+    checks the assertion against the caller named HERE, by the listener,
+    never by the app."""
+    if need not in (inst.get("propagate") or []):
+        return [f"\t\trespond {_caddy_quote(f'This binding does not carry the signed-in person -- a tenant_admin grants that separately (oaap destination bind {name} {dname} --propagate).')} 403",
+                "\t}"]
+    return (["\t\troute {"]
+            + strip_identity("\t\t\t", keep=(ASSERTION_HEADER,))
+            + [f"\t\t\turi strip_prefix /destinations/{need}",
+               f"\t\t\trewrite * /propagate/{need}{{uri}}",
+               f"\t\t\treverse_proxy {CONNECT_SERVICE} {{",
+               f"\t\t\t\theader_up {CONNECT_GW_KEY} "
+               f"{_caddy_quote(connect_gateway_key())}",
+               f"\t\t\t\theader_up {CONNECT_GW_CALLER} {_caddy_quote(name)}",
+               f"\t\t\t\theader_up {CONNECT_GW_DEST} "
+               f"{_caddy_quote(f'{tid}/{dname}')}",
+               "\t\t\t\theader_up -X-Forwarded-For",
+               "\t\t\t\theader_up -X-Forwarded-Proto",
+               "\t\t\t\theader_up -X-Forwarded-Host",
+               "\t\t\t}", "\t\t}", "\t}"])
+
+
 def refresh_destinations(reg=None):
     """Write the listener and reload the gateway if it changed. The one
     call every network change and every binding change ends in."""
@@ -855,8 +896,90 @@ def _dest_who():
     return ACTING_FOR or os.environ.get("SUDO_USER") or getpass.getuser()
 
 
+def ensure_assertion_key():
+    """The node's assertion key, made once (oaap.core.identity 2.11).
+    0600 in 0700; identity and connect run as root and read it through
+    their read-only mounts. Rotating it means removing the file: every
+    assertion in flight then fails for at most five minutes."""
+    have = (_read_file(ASSERTION_KEY_FILE) or "").strip()
+    if len(have) >= 64:
+        return False
+    os.makedirs(ASSERTION_DIR, exist_ok=True)
+    os.chmod(ASSERTION_DIR, 0o700)
+    tmp = ASSERTION_KEY_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(secrets.token_hex(32) + "\n")
+    os.replace(tmp, ASSERTION_KEY_FILE)
+    return True
+
+
+def fetch_server_cert(host, port):
+    """(pem, sha256-hex) of what the target presents NOW.
+
+    Read without trusting it -- that is the point: nothing is trusted
+    until the operator repeats the fingerprint (spec 2.9.2). The
+    security level is lowered for this one read so a 1024-bit SAP
+    default certificate can be SHOWN; whether it is accepted is decided
+    by the pin, never by this function."""
+    import hashlib
+    import socket
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    try:
+        with socket.create_connection((host, port), timeout=15) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                der = tls.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError) as e:
+        raise DestinationRefused(f"the target's certificate could not be read "
+                                 f"from {host}:{port} ({e})") from None
+    if not der:
+        raise DestinationRefused(f"{host}:{port} presented no certificate")
+    return ssl.DER_cert_to_PEM_cert(der), hashlib.sha256(der).hexdigest()
+
+
+def _norm_fp(fp):
+    return re.sub(r"[^0-9a-f]", "", (fp or "").lower())
+
+
+def propagation_claim_check(tid, claims):
+    """({claim: "admin"|"self"|"absent"|""}, how) -- who may edit each
+    claim, read from the tenant's provider through its connector
+    (destinations 2.9.6). `how` names the source, or says why nothing
+    could be read; the caller decides what an unread answer means."""
+    t = load_tenants().get(tid) or {}
+    provider = idp.provider_of(t)
+    cname = (provider or {}).get("connector") or ""
+    space = (provider or {}).get("space") or ""
+    if not cname or not space:
+        return {}, ("this tenant's sign-in service was not made by a "
+                    "connector of this node, so OAAP cannot read who may "
+                    "edit the attribute")
+    c = load_idp_connectors().get(cname)
+    if not c:
+        return {}, f"the connector '{cname}' is not on this node"
+    admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                            c["admin_id"], c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    ok, msg = admin.login()
+    if not ok:
+        return {}, msg
+    said, err = admin.attribute_edits(space, list(claims))
+    if err:
+        return {}, err
+    return said, f"read from {c['base_url']} realm '{space}' at {_iso_now()}"
+
+
 def destination_add(tid, name, kind, target, auth_type="none", user="",
-                    header="", secret="", who="root", role="root"):
+                    header="", secret="", who="root", role="root",
+                    accept_sha256="", claims=(), name_check="",
+                    lifetime=10, unchecked_claim=""):
     if not re.fullmatch(DEST_NAME_RE, name or ""):
         raise DestinationRefused("a destination name is [a-z0-9-], 2-40 "
                                  "characters, starting and ending with a "
@@ -901,6 +1024,9 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
         raise DestinationRefused(f"a {kind} destination authenticates with "
                                  f"{' | '.join(DEST_AUTH[kind])}")
     auth = {"type": auth_type}
+    if auth_type == "principal_propagation":
+        auth.update(_propagation_auth(tid, target_obj, accept_sha256, claims,
+                                      name_check, lifetime, unchecked_claim))
     if auth_type == "basic":
         if not user or ":" in user or not re.fullmatch(r"[\x21-\x7e]+", user):
             raise DestinationRefused("basic needs a user without ':' or spaces")
@@ -911,23 +1037,136 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
         if header.lower() in {h.lower() for h in IDENTITY_HEADERS} | {"host"}:
             raise DestinationRefused(f"'{header}' is not a header a destination may set")
         auth["header"] = header
-    if auth_type != "none":
+    if auth_type not in ("none", "principal_propagation"):
         check_dest_secret(auth_type, secret)
     dests = load_destinations()
     own = dests.setdefault(tid, {})
     if name in own:
         raise DestinationRefused(f"this tenant already has a destination '{name}'")
     own[name] = {"kind": kind, "target": target_obj,
-                 "auth": auth, "secret": auth_type != "none",
+                 "auth": auth,
+                 "secret": auth_type not in ("none", "principal_propagation"),
                  "created": _iso_now(), "created_by": who}
-    if auth_type != "none":
+    if auth_type == "principal_propagation":
+        ensure_assertion_key()
+    if auth_type not in ("none", "principal_propagation"):
         s = load_dest_secrets()
         s.setdefault(tid, {})[name] = secret
         save_dest_secrets(s)
     save_destinations(dests)
     audit_tenant("destination.add", tid, subject=name, who=who, role=role,
-                 detail=f"{kind} {target.strip()} auth {auth_type}")
+                 detail=f"{kind} {target.strip()} auth {auth_type}"
+                 + (f" · pinned {auth['server_sha256'][:16]}… · claims "
+                    + ",".join(r['name'] for r in auth['user'])
+                    + f" · checked: {auth['claim_check']}"
+                    if auth_type == "principal_propagation" else ""))
     return own[name]
+
+
+def _propagation_auth(tid, target_obj, accept_sha256, claims, name_check,
+                      lifetime, unchecked_claim):
+    """The auth record of a principal_propagation destination, or raise.
+
+    Three things are settled here and nowhere later: the server
+    certificate is pinned (2.9.2), the claim rules are named (2.9.5),
+    and it is READ, not assumed, that the person cannot edit the claim
+    the target will believe (2.9.6)."""
+    direct = (target_obj or {}).get("direct", "")
+    if not direct:
+        raise DestinationRefused("principal_propagation reaches a direct target "
+                                 "in this version -- via and through follow "
+                                 "(RFC-0066 stage 2)")
+    scheme, host, port, _base = parse_dest_target("http", direct)
+    if scheme != "https":
+        raise DestinationRefused("principal_propagation needs an https target: "
+                                 "the certificate travels in the TLS handshake")
+    pem, fp = fetch_server_cert(host, port or 443)
+    if _norm_fp(accept_sha256) != fp:
+        shown = ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()
+        raise DestinationRefused(
+            f"{host}:{port or 443} presents a certificate with SHA-256\n\n"
+            f"    {shown}\n\n"
+            "Compare it with what the target's administrator sees (SAP: "
+            "STRUST, the SSL server PSE's own certificate) and repeat it "
+            "with --accept-sha256 to pin it. Nothing was stored.")
+    claims = [c for c in (claims or ()) if c] or [PROPAGATION_DEFAULT_CLAIM]
+    for c in claims:
+        if not re.fullmatch(idp.PROPAGATE_CLAIM_RE, c):
+            raise DestinationRefused(
+                f"'{c}' is not a claim the platform propagates -- "
+                "sap_user or sap_user_<x> (oaap.core.identity 2.11)")
+    if name_check not in PROPAGATION_NAME_CHECKS:
+        raise DestinationRefused("--name-check is 'sap' or nothing")
+    try:
+        lifetime = int(lifetime)
+    except (TypeError, ValueError):
+        lifetime = 0
+    if not 1 <= lifetime <= 60:
+        raise DestinationRefused("--lifetime is 1 to 60 minutes")
+    said, how = propagation_claim_check(tid, claims)
+    selfish = [c for c in claims if said.get(c) == "self"]
+    if selfish:
+        raise DestinationRefused(
+            "the person can edit " + ", ".join(f"'{c}'" for c in selfish)
+            + " themselves -- anybody could then set it to anybody's user "
+              "name. Allow editing to administrators only (Keycloak: realm "
+              "settings -> user profile -> the attribute -> who can edit: "
+              f"admin) and add the destination again. ({how})")
+    unread = [c for c in claims if said.get(c) not in ("admin", "absent")]
+    if unread and not (unchecked_claim or "").strip():
+        raise DestinationRefused(
+            "OAAP could not read who may edit "
+            + ", ".join(f"'{c}'" for c in unread) + f": {how}. If you have "
+            "checked by hand that only administrators can, say so with "
+            "--unchecked-claim \"<who checked, and how>\" -- it is recorded")
+    absent = [c for c in claims if said.get(c) == "absent"]
+    if unread:
+        check = f"by hand: {unchecked_claim.strip()[:200]}"
+    else:
+        check = how + ("" if not absent else
+                       " (not declared there: " + ", ".join(absent) + ")")
+    return {"credential": "x509",
+            "user": [{"rule": "claim", "name": c} for c in claims],
+            "name_check": name_check, "lifetime_minutes": lifetime,
+            "server_cert": pem, "server_sha256": fp,
+            "claim_check": check}
+
+
+# Issued INSIDE connect, the one place that holds the CA key; this
+# script is passed to `python -c` there and prints one PEM certificate.
+_SAMPLE_SCRIPT = (
+    "import sys, propagate\n"
+    "c, k, _m = propagate.ensure_ca(propagate_dir, tid, label)\n"
+    "pem, _key, _s, _n = propagate.issue(c, k, label, name, '', 60)\n"
+    "sys.stdout.write(pem.decode())\n")
+
+
+def propagation_sample(tid, name):
+    """A certificate of the tenant's CA for `name`, one hour, WITHOUT its
+    key -- the sample a target's mapping tool needs to make a rule.
+    Measured on a4h (2026-10-27): CERTRULE binds every rule to the
+    ISSUER of the sample it was made from, so the sample must come from
+    this very CA; one made by hand from another CA builds a rule that
+    never matches the platform's certificates."""
+    if not re.fullmatch(r"[A-Z0-9_]{1,12}", name or ""):
+        raise DestinationRefused("--sample takes a user name like MUSTER "
+                                 "([A-Z0-9_], up to 12)")
+    code = (f"propagate_dir={json.dumps('/ca')}; tid={json.dumps(tid)}; "
+            f"label={json.dumps(tenant_label(tid))}; name={json.dumps(name)}\n"
+            + _SAMPLE_SCRIPT)
+    r = subprocess.run(["docker", "exec", CONNECT_CONTAINER, "python", "-c", code],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or "BEGIN CERTIFICATE" not in r.stdout:
+        raise DestinationRefused("the connect service could not issue a sample: "
+                                 + (r.stderr.strip().splitlines() or ["no answer"])[-1])
+    return r.stdout
+
+
+def propagation_ca_text(tid):
+    """The public half of a tenant's issuing CA, or "" while connect has
+    not made it yet (it does within a second of the first propagation
+    destination of the tenant appearing)."""
+    return _read_file(os.path.join(PROPAGATION_CA_DIR, f"{tid}.crt")) or ""
 
 
 def check_dest_secret(auth_type, secret):
@@ -997,7 +1236,7 @@ def destination_set_secret(tid, name, secret, who="root", role="root"):
 
 
 def destination_bind(reg, key, name, need="", rehearsal_exception=False,
-                     who="root", role="root"):
+                     who="root", role="root", propagate=False):
     """Bind instance `key` to its tenant's destination `name` under `need`."""
     inst = reg["instances"].get(key)
     if not inst:
@@ -1026,15 +1265,31 @@ def destination_bind(reg, key, name, need="", rehearsal_exception=False,
     if declared and declared.get("kind") != d["kind"]:
         raise DestinationRefused(f"'{key}' declares '{need}' as "
                                  f"{declared.get('kind')}, '{name}' is {d['kind']}")
+    carries = (d.get("auth") or {}).get("type") == "principal_propagation"
+    if propagate and not carries:
+        raise DestinationRefused(f"'{name}' does not carry the person -- "
+                                 "--propagate is for principal_propagation "
+                                 "destinations")
+    grants = set(inst.get("propagate") or [])
     binds = dict(inst.get("destinations") or {})
-    if binds.get(need) == name:
+    if binds.get(need) == name and (need in grants) == bool(propagate and carries):
         return False
     binds[need] = name
     inst["destinations"] = binds
+    if propagate and carries:
+        grants.add(need)
+    else:
+        grants.discard(need)
+    if grants:
+        inst["propagate"] = sorted(grants)
+    else:
+        inst.pop("propagate", None)
     save_registry(reg)
     audit_tenant("destination.bind", tid, subject=key, who=who, role=role,
                  detail=f"{need} -> {name} ({d['kind']}"
                         + (", handover" if d["kind"] == "tcp" else "") + ")"
+                        + (" -- ACTS AS THE SIGNED-IN PERSON (propagation granted)"
+                           if propagate and carries else "")
                         + (" -- REHEARSAL EXCEPTION" if is_rehearsal(inst) else ""))
     refresh_destinations(reg)
     sync_destination_env(reg, only=key)
@@ -1048,6 +1303,12 @@ def _dest_line(tid, name, d, dest_secrets, reg):
         a += f" ({auth.get('user', '')})"
     elif a == "header":
         a += f" ({auth.get('header', '')})"
+    elif a == "principal_propagation":
+        fp = auth.get("server_sha256", "")
+        a += (f" (as the signed-in person: "
+              + ", ".join(r.get("name", "") for r in auth.get("user") or [])
+              + f"; certificates {auth.get('lifetime_minutes', 10)} min; "
+              f"server pinned {fp[:16]}…; claim checked {auth.get('claim_check', '?')})")
     if d.get("secret"):
         a += (", secret set" if (dest_secrets.get(tid) or {}).get(name)
               else ", SECRET MISSING -- calls are refused until it is set")
@@ -1121,11 +1382,15 @@ def cmd_destination(args):
             if args.action == "bind":
                 if destination_bind(reg, key, other, need=args.as_ or "",
                                     rehearsal_exception=args.rehearsal_exception,
-                                    who=who):
+                                    who=who, propagate=args.propagate):
                     need = args.as_ or other
                     d = load_destinations()[resolve_tenant(
                         reg["instances"][key].get("tenant"))][other]
                     print(f"Bound: '{key}' reaches '{other}' as '{need}'.")
+                    if args.propagate:
+                        print("  PROPAGATION GRANTED: the app's calls carry the "
+                              "signed-in person -- it must pass on "
+                              f"{ASSERTION_HEADER} unchanged.")
                     if d["kind"] == "http":
                         print(f"  The app calls {dest_env_name(need)}="
                               f"{dest_url(need)} -- the platform adds the "
@@ -1141,15 +1406,46 @@ def cmd_destination(args):
             return
         # the object itself
         tid = resolve_tenant_arg(args.tenant) or ensure_default_tenant()
+        if args.action == "ca" and args.sample:
+            sys.stdout.write(propagation_sample(tid, args.sample.upper()))
+            return
+        if args.action == "ca":
+            pem = propagation_ca_text(tid)
+            if not pem:
+                print("This tenant has no issuing CA yet. The node makes it "
+                      "within a second of the tenant's first "
+                      "principal_propagation destination; ask again then.")
+                return
+            print(pem.strip())
+            print("")
+            print(f"Import this certificate into the target (SAP: STRUST -> "
+                  f"SSL server standard -> import -> add to certificate list "
+                  f"-> save). Certificates it issues read "
+                  f"O=OAAP, OU={tenant_label(tid)}, CN=<user>; map them by CN "
+                  f"with a subject filter on O and OU (SAP: CERTRULE) -- that "
+                  f"filter is the tenant border in the target. The rule must "
+                  f"be made from a certificate OF THIS CA (CERTRULE binds it "
+                  f"to the issuer): oaap destination ca --tenant "
+                  f"{tenant_label(tid)} --sample MUSTER > muster.cer")
+            return
         name = args.name or die(f"'destination {args.action}' needs a name")
         if args.action == "add":
             auth_type = args.auth or "none"
             secret = ""
-            if auth_type != "none":
+            if auth_type not in ("none", "principal_propagation"):
                 secret = _read_dest_secret(args)
             destination_add(tid, name, args.kind or "http", args.target or "",
                             auth_type, args.user or "", args.header or "",
-                            secret, who=who)
+                            secret, who=who,
+                            accept_sha256=args.accept_sha256,
+                            claims=args.user_claim or (),
+                            name_check=args.name_check,
+                            lifetime=args.lifetime,
+                            unchecked_claim=args.unchecked_claim)
+            if auth_type == "principal_propagation":
+                print("  It carries the signed-in person. The tenant's issuing "
+                      "CA for the target: oaap destination ca --tenant "
+                      f"{tenant_label(tid)}")
             print(f"Destination '{name}' added. Nothing reaches it until an "
                   f"instance is bound: oaap destination bind <instance> {name}")
         elif args.action == "remove":
@@ -1189,6 +1485,11 @@ def destination_unbind(reg, key, need, who="root", role="root"):
         inst["destinations"] = binds
     else:
         inst.pop("destinations", None)
+    grants = [g for g in inst.get("propagate") or [] if g != need]
+    if grants:
+        inst["propagate"] = grants
+    else:
+        inst.pop("propagate", None)
     save_registry(reg)
     audit_tenant("destination.unbind", resolve_tenant(inst.get("tenant")),
                  subject=key, who=who, role=role, detail=f"{need} -> {name}")
@@ -4061,6 +4362,10 @@ def cmd_migrate_identity_headers(_args):
     lines at all. Idempotent, and silent when there is nothing to carry.
     """
     reg = load_registry()
+    # The destination listener strips the identity headers too (2.3), and
+    # it is written at binding time only -- 0.1.213's sixth header would
+    # otherwise reach every destination bound before the update.
+    refresh_destinations(reg)
     stale = []
     for name, inst in sorted(reg.get("instances", {}).items()):
         if not inst.get("routes") or not inst.get("svc_port"):
@@ -9889,14 +10194,24 @@ _AUTH_NO_UPGRADE = ["\t\t\theader_up -Connection", "\t\t\theader_up -Upgrade"]
 # and a reader stayed behind; the answer is not to be more careful but
 # to leave nowhere to be careless.
 IDENTITY_HEADERS = ("X-OAAP-User", "X-OAAP-Roles", "X-OAAP-User-Id",
-                    "X-OAAP-Display-Name", "X-OAAP-Email")
+                    "X-OAAP-Display-Name", "X-OAAP-Email",
+                    # oaap.core.identity 2.11 (RFC-0066): stripped and
+                    # copied like the five, and stripped AGAIN on every
+                    # destination call that is not a propagation
+                    "X-OAAP-User-Assertion")
+ASSERTION_HEADER = "X-OAAP-User-Assertion"
 
 _COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
 
 
-def strip_identity(indent="\t\t"):
-    """Drop every client-sent identity header (contract guarantee 1)."""
-    return [f"{indent}request_header -{h}" for h in IDENTITY_HEADERS]
+def strip_identity(indent="\t\t", keep=()):
+    """Drop every client-sent identity header (contract guarantee 1).
+
+    `keep` exists for exactly one caller: the route of a propagation
+    destination, where the app's copy of the assertion IS the proof the
+    service behind needs (destinations 2.9.4)."""
+    return [f"{indent}request_header -{h}" for h in IDENTITY_HEADERS
+            if h not in keep]
 
 
 def _site_identity_stale(body):
@@ -26012,7 +26327,7 @@ def main():
                                "(oaap.net.destinations 0.1, RFC-0033)")
     pdst.add_argument("action", choices=["list", "show", "add", "remove",
                                          "set-secret", "bind", "unbind",
-                                         "bindings"])
+                                         "bindings", "ca"])
     pdst.add_argument("name", nargs="?",
                       help="the destination (list/show/add/remove/set-secret) "
                            "or the instance (bind/unbind/bindings)")
@@ -26024,8 +26339,30 @@ def main():
                       help="https://host[:port][/base], tcp://host:port, "
                            "via:<tunnel>/<offer> (oaap.net.connector), or "
                            "through:<instance>/<name> (a tunnel app, RFC-0060)")
-    pdst.add_argument("--auth", choices=["none", "basic", "bearer", "header"],
+    pdst.add_argument("--auth", choices=["none", "basic", "bearer", "header",
+                                         "principal_propagation"],
                       default="none")
+    pdst.add_argument("--accept-sha256", default="",
+                      help="principal_propagation: pin the target's server "
+                           "certificate (the fingerprint the first try shows)")
+    pdst.add_argument("--user-claim", action="append", default=[],
+                      help="principal_propagation: the claim naming the backend "
+                           "user, in order (default sap_user)")
+    pdst.add_argument("--name-check", choices=list(PROPAGATION_NAME_CHECKS),
+                      default="sap",
+                      help="principal_propagation: user name rules (default sap)")
+    pdst.add_argument("--lifetime", type=int, default=10,
+                      help="principal_propagation: certificate minutes, 1-60")
+    pdst.add_argument("--unchecked-claim", default="",
+                      help="principal_propagation: who checked by hand that "
+                           "only administrators edit the claim (recorded)")
+    pdst.add_argument("--sample", default="",
+                      help="ca: print a one-hour certificate of the tenant's CA "
+                           "for this user name, to make the target's mapping "
+                           "rule from (no key)")
+    pdst.add_argument("--propagate", action="store_true",
+                      help="bind: grant that the app's calls carry the "
+                           "signed-in person (RFC-0066)")
     pdst.add_argument("--user", default="", help="basic: the user name")
     pdst.add_argument("--header", default="", help="header: the header name")
     pdst.add_argument("--secret-stdin", action="store_true",
