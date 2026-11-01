@@ -93,7 +93,10 @@ class Authz:
             fresh = min(MAX_CACHE, max(0, int(doc.get("fresh_for", 0))))
         except (TypeError, ValueError):
             fresh = 0
-        self._cache[user_id] = (self._clock() + fresh, doc["grants"])
+        # "Nothing yet" is not kept: somebody just given a project should not
+        # stand outside for 30 seconds. Remembering it would protect nothing.
+        if doc["grants"]:
+            self._cache[user_id] = (self._clock() + fresh, doc["grants"])
         return doc["grants"]
 
     def may(self, user_id, permission, **fields):
@@ -135,6 +138,13 @@ class Authz:
         status, doc = self._delegate("GET", "grantable", proof)
         got = doc.get("grantable") if status == 200 else None
         return got if isinstance(got, list) else []
+
+    def find_person(self, proof, name):
+        """{id, name, display_name, kind} for one exact name, or None. None
+        also when this person hands nothing on: nothing to tell them apart."""
+        status, doc = self._delegate("GET", "person?name="
+                                     + urllib.parse.quote(name or "", safe=""), proof)
+        return doc if status == 200 and doc.get("id") else None
 
     def delegate(self, proof, collection, user_id, context=None, valid_to=None):
         """(True, assignment) or (False, reason)."""

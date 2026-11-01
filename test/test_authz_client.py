@@ -72,7 +72,7 @@ class H(BaseHTTPRequestHandler):
         else:
             uid = self.path.split("user=")[1].split("&")[0]
             doc = {"user": STATE["user"] or uid, "app": STATE["app"],
-                   "tenant": "t", "grants": GRANTS,
+                   "tenant": "t", "grants": STATE.get("grants", GRANTS),
                    "fresh_for": STATE["fresh"]}
             if mode == "no-grants-key":
                 doc.pop("grants")
@@ -168,6 +168,20 @@ STATE["calls"] = 0
 c.may("u-ben", "kasse.read")
 c.may("u-ben", "kasse.read")
 ok("ein unlesbares fresh_for heisst: nicht speichern", STATE["calls"] == 2)
+STATE.update(fresh=30, grants=[])
+c = client()
+STATE["calls"] = 0
+ok("noch nichts: nein", not c.may("u-neu", "kasse.read"))
+c.may("u-neu", "kasse.read")
+ok("eine leere Antwort wird nicht gespeichert", STATE["calls"] == 2, STATE["calls"])
+del STATE["grants"]
+ok("wer gerade etwas bekam, darf sofort", c.may("u-neu", "kasse.read"))
+STATE["grants"] = []
+ok("KOEDER: ein Entzug bleibt in den 30 s, das Recht aus dem Speicher gilt noch",
+   c.may("u-neu", "kasse.read"))
+T[0] += 31
+ok("... und danach nicht mehr", not c.may("u-neu", "kasse.read"))
+del STATE["grants"]
 
 print("Client und Kern antworten gleich")
 asks = [("team.edit_lineup", {"team": "mB"}), ("team.edit_lineup", {"team": "mC"}),

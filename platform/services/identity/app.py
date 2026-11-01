@@ -4060,12 +4060,36 @@ def authz_delegate_door(rest):
     if request.method == "GET" and parts == ["grantable"]:
         return {"grantable": authz.grantable(load_authz(), inst["tenant"],
                                              inst["app"], person["id"])}
+    if request.method == "GET" and parts == ["person"]:
+        return _authz_delegate_lookup(inst, person)
     if request.method == "POST" and parts == ["assignments"]:
         return _authz_delegate_assign(name, inst, person)
     if request.method == "DELETE" and len(parts) == 2 \
             and parts[0] == "assignments" and parts[1]:
         return _authz_delegate_end(name, inst, person, parts[1])
     return {"error": "Das gibt es an dieser Tuer nicht."}, 404
+
+
+def _authz_delegate_lookup(inst, person):
+    """One exact name to one id, never a list (RFC-0067 D7). Every question is
+    in the log: this is how somebody would test which names exist."""
+    tenant = inst["tenant"]
+    wanted = (request.args.get("name") or "").strip()[:128]
+    if not authz.grantable(load_authz(), tenant, inst["app"], person["id"]):
+        audit("authz.delegate-lookup", tenant, wanted, result="refused",
+              who=person["username"], role="delegate")
+        return {"error": "Du gibst hier nichts weiter."}, 403
+    target = find_user(load_users(), wanted) if wanted else None
+    if (not target or ":" in wanted or not target.get("active", True)
+            or resolve_tenant(target.get("tenant")) != tenant):
+        audit("authz.delegate-lookup", tenant, wanted, result="not_found",
+              who=person["username"], role="delegate")
+        return {"error": "Diesen Namen gibt es hier nicht."}, 404
+    audit("authz.delegate-lookup", tenant, wanted, who=person["username"],
+          role="delegate")
+    return {"id": target["id"], "name": target["username"],
+            "display_name": target.get("display_name", ""),
+            "kind": target.get("kind", "human")}
 
 
 def _authz_delegate_assign(name, inst, person):

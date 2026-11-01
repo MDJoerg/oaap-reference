@@ -249,6 +249,51 @@ ok("wer nichts weitergeben darf, bekommt eine leere Liste",
    door("get", "grantable", prf=proof("u-carla", "carla")).get_json()
    == {"grantable": []})
 
+# --- einen Namen finden (RFC-0067 D7) ---------------------------------------
+def lookup(name, **kw):
+    return door("get", "person?name=" + name, **kw)
+
+
+def lookups():
+    with open(m.AUDIT_LOG, encoding="utf-8") as f:
+        return [json.loads(x) for x in f if "authz.delegate-lookup" in x]
+
+
+seen = len(lookups())
+r = lookup("carla")
+ok("ein exakter Name: die ID", r.status_code == 200 and r.get_json()["id"] == "u-carla",
+   r.get_json())
+ok("KOEDER: nur Id, Name, Anzeigename, Art",
+   set(r.get_json()) == {"id", "name", "display_name", "kind"}, r.get_json())
+ok("ein Agent ist findbar und sagt, was er ist",
+   lookup("agent-a").get_json().get("kind") == "machine")
+for wrong, why in (("car", "Teil eines Namens"), ("*", "Stern"), ("%25", "Prozent"),
+                   ("CARLA", "andere Schreibweise"), ("", "leer"),
+                   ("niemand", "unbekannt"), ("max", "anderer Mandant"),
+                   ("gesperrt", "gesperrt"), ("instance:vp-prod", "Instanz-Prinzipal")):
+    r = lookup(wrong)
+    ok(f"KOEDER: {why}: 404, gleiche Antwort",
+       r.status_code == 404 and r.get_json() == {"error": "Diesen Namen gibt es hier nicht."},
+       (r.status_code, r.get_json()))
+r = lookup("ben")
+ok("sich selbst finden geht, weitergeben nicht", r.status_code == 200)
+for label, kw in (("ohne Nachweis", {"prf": ""}), ("fremde Instanz", {"prf": proof(aud="anders")})):
+    ok(f"KOEDER: {label}: 401", lookup("carla", **kw).status_code == 401)
+ok("Schluessel ohne Bereich: 403", lookup("carla", key=KEY_NOSCOPE).status_code == 403)
+plain = proof("u-carla", "carla")
+a1, a2 = lookup("dora", prf=plain), lookup("niemand", prf=plain)
+ok("KOEDER: wer nichts weitergibt, fragt nicht: 403",
+   a1.status_code == 403, a1.status_code)
+ok("KOEDER: und erfaehrt nicht, ob es den Namen gibt",
+   (a1.status_code, a1.get_json()) == (a2.status_code, a2.get_json()))
+log = lookups()[seen:]
+ok("jede Frage steht im Protokoll, mit dem Ausgang", {"ok", "not_found", "refused"}
+   == {x.get("result") for x in log} and len(log) >= 13, len(log))
+ok("und nennt, wer gefragt hat", all(x.get("who") in ("ben", "carla") for x in log), log[:1])
+ok("gefragte Namen werden gekuerzt",
+   lookup("x" * 500).status_code == 404 and len(lookups()[-1].get("subject", "")) <= 128,
+   lookups()[-1])
+
 r = give("Co", ctx={"team": "mC"})
 ok("Trainer von mB nicht in mC: 403", r.status_code == 403, r.get_json())
 r = give("Co", ctx={"team": ["mB", "mC"]})
