@@ -329,8 +329,8 @@ ok("Maschine bekommt an dieser Tuer kein may_grant: 403",
 r = c.post("/internal/authz/assignments", headers=H, json={
     "actor": "vp_chef", "collection": C["Untertrainer"], "user": "u-agent",
     "context": {"team": "mB"}})
-ok("KOEDER: auch nicht an der Tuer des Hosts: 403", r.status_code == 403,
-   r.get_json())
+ok("KOEDER: auch nicht an der Tuer des Hosts: 400 mit dem Satz",
+   r.status_code == 400 and "Maschinen" in r.get_json()["error"], r.get_json())
 r = give("Co", target="u-agent")
 ok("ein einfaches Paket darf ein Agent bekommen: 201",
    r.status_code == 201, r.get_json())
@@ -377,12 +377,38 @@ ok("nichts davon wurde beendet",
    not any(left[x]["ended"] for x in (aid_mc, aid_idp, aid_fremd)))
 
 # --- verwaist und geloescht -------------------------------------------------
+def listed(aid):
+    rows = c.get("/authz/admin/assignments?on_behalf_of=u-chef",
+                 headers=ADMIN_H).get_json()["assignments"]
+    return next(a for a in rows if a["id"] == aid)
+
+
+ok("solange der Trainer haelt: nicht verwaist", listed(a1["id"])["orphaned"] is False,
+   listed(a1["id"]))
+ok("KOEDER: was der Admin von Hand gab, ist nie verwaist",
+   listed(aid_mc)["orphaned"] is False)
+a3 = give("Co", target="u-dora").get_json()["assignment"]
 with m.authz_rw() as st:
     az.revoke(st, "t-vp", A_BEN, who="vp_chef")
     m.save_authz(st)
 ok("Der Trainer geht: was er vergab, bleibt (A2)",
    not assignments()[a1["id"]]["ended"])
+ok("und es steht in der Liste als verwaist",
+   listed(a1["id"])["orphaned"] is True and listed(a1["id"])["live"] is True,
+   listed(a1["id"]))
+r = c.get("/authz/admin/effective?on_behalf_of=u-chef&user=" + a1["subject"],
+          headers=ADMIN_H).get_json()
+ok("auch auf der Seite der Person",
+   next(a for a in r["assignments"] if a["id"] == a1["id"])["orphaned"] is True, r)
+ok("verwaist heisst nicht weg: die Rechte gelten weiter",
+   az.may(az.effective(m.load_authz(), "t-vp", "vereinsportal", a1["subject"]),
+          "team.read", team="mB"))
 ok("und er kann nichts mehr weitergeben", give("Co").status_code == 403)
+ok("auch was er Dora gab", listed(a3["id"])["orphaned"] is True, listed(a3["id"]))
+r = door("delete", "assignments/" + a3["id"], prf=proof("u-carla", "carla"))
+ok("die Nachfolgerin beendet es, obwohl sie es nicht gab (D4)",
+   r.status_code == 200 and r.get_json()["ended"] is True, r.get_json())
+ok("Beendetes gilt nicht mehr als verwaist", listed(a3["id"])["orphaned"] is False)
 
 with m.users_rw() as us:
     res = m._delete_user("carla", us, "vp_chef", "tenant_admin", "t-vp")

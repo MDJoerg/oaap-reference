@@ -88,6 +88,8 @@ with open(m.USERS_FILE, "w", encoding="utf-8") as f:
         user("u-sgl-chef", "sgl_chef", ["tenant_admin", "user"], "t-sgl"),
         user("u-sgl-max", "max", ["user"], "t-sgl"),
         user("u-inst-rr", "instance:rr", ["user"], "t-vp", "machine"),
+        user("u-vp-agent", "agent-vp", ["user"], "t-vp", "machine"),
+        user("u-sgl-agent", "agent-sgl", ["user"], "t-sgl", "machine"),
     ], f)
 
 ic = m.app.test_client()
@@ -95,11 +97,22 @@ HI = {"X-OAAP-Internal-Key": "k"}
 DECL = {"objects": [{"key": "news", "title": "News",
                      "activities": ["read", "publish"],
                      "fields": [{"key": "area",
-                                 "values": ["news", "sponsoring"]}]}],
+                                 "values": ["news", "sponsoring"]}]},
+                    {"key": "team", "title": "Team", "activities": ["read"],
+                     "fields": [{"key": "team", "context": "Team"}]}],
         "role_templates": [{"key": "bereich", "title": "Bereich",
                             "grants": [{"object": "news",
                                         "activities": ["read", "publish"],
-                                        "area": "$value"}]}]}
+                                        "area": "$value"}]},
+                           {"key": "teamchef", "title": "Teamchef",
+                            "may_grant": ["teamhilfe"],
+                            "grants": [{"object": "team",
+                                        "activities": ["read"],
+                                        "team": "$context"}]},
+                           {"key": "teamhilfe", "title": "Teamhilfe",
+                            "grants": [{"object": "team",
+                                        "activities": ["read"],
+                                        "team": "$context"}]}]}
 assert ic.post("/internal/authz/register", headers=HI, json={
     "app": "vereinsportal", "version": "1", "declaration": DECL}
 ).status_code == 200
@@ -297,6 +310,77 @@ ok("das Protokoll nennt die Person, nicht die App",
 s, _h, b = req("GET", "/log", who="u-vp-ben")
 ok("KOEDER: das Protokoll sieht ein normaler Benutzer nicht", s == 403
    and "authz.assign" not in b)
+
+print("Weitergaben und Agenten (RFC-0067 Stufe 3)")
+s, _h, b = req("GET", "/agents")
+ok("die Agenten des Mandanten stehen da", s == 200 and "agent-vp" in b, b[:400])
+ok("KOEDER: kein Instanz-Prinzipal, kein fremder Agent, keine Person",
+   "instance:rr" not in b and "agent-sgl" not in b and "carla" not in b, b[:800])
+s, _h, b = req("GET", "/")
+ok("KOEDER: unter Personen steht kein Agent", "agent-vp" not in b, b[:800])
+for pfad in ("/agents", "/delegated"):
+    s, _h, b = req("GET", pfad, who="u-vp-ben")
+    ok(f"KOEDER: {pfad} sieht ein normaler Benutzer nicht",
+       s == 403 and "agent-vp" not in b and "Gegeben von" not in b, b[:300])
+s, _h, b = req("GET", "/delegated")
+ok("noch keine Weitergabe: die Seite sagt es", s == 200
+   and "Keine gueltige Weitergabe" in b, b[:400])
+ok("und sie nennt die Grenze der Tuer", "fuenf Minuten" in " ".join(b.split()), b[:800])
+for key, name in (("teamchef", "Chef"), ("teamhilfe", "Hilfe")):
+    req("POST", "/do/role-add", form={"app": "vereinsportal", "template": key,
+                                      "name": name})
+rid_of = {r["name"]: r["id"] for r in state()["roles"].values()}
+s, _h, b = req("GET", "/roles")
+ok("die Rolle sagt, was sie weitergeben darf",
+   "darf weitergeben: Teamhilfe" in " ".join(b.split()), b[:900])
+for name in ("Chef", "Hilfe"):
+    req("POST", "/do/collection-add", form={"name": "Paket " + name,
+                                            "roles": [rid_of[name]]})
+cid_of = {c["name"]: c["id"] for c in state()["collections"].values()}
+s, _h, b = req("GET", "/person?id=u-vp-agent")
+ok("der Agent hat seine Seite; Pakete mit Weitergabe werden ihm nicht angeboten",
+   s == 200 and "Paket Hilfe" in b and "Paket Chef" not in b, b[:900])
+s, _h, b = req("GET", "/person?id=u-vp-ben")
+ok("KOEDER: einer Person werden sie angeboten", "Paket Chef" in b, b[:900])
+before = state()
+s, _h, b = req("POST", "/do/assign", form={
+    "user": "u-vp-agent", "collection": cid_of["Paket Chef"], "ctx_team": "t1",
+    "back": "/person?id=u-vp-agent"})
+ok("KOEDER: das Formular von Hand: nichts geschrieben, und der Satz des Dienstes "
+   "kommt an, nicht 'Kein Zugriff'",
+   s == 200 and "Maschinen" in b and "Kein Zugriff" not in b and state() == before,
+   b[:500])
+with m.authz_rw() as st:
+    a_chef = m.authz.assign(st, "t-vp", cid_of["Paket Chef"], "u-vp-carla",
+                            {"team": ["t1"]}, granted_by="vp_chef")
+    a_ben = m.authz.assign(st, "t-vp", cid_of["Paket Hilfe"], "u-vp-ben",
+                           {"team": ["t1"]}, granted_by="carla", source="delegated")
+    st["assignments"][a_ben]["granted_by_id"] = "u-vp-carla"
+    a_ag = m.authz.assign(st, "t-vp", cid_of["Paket Hilfe"], "u-vp-agent",
+                          {"team": ["t1"]}, granted_by="carla", source="delegated")
+    st["assignments"][a_ag]["granted_by_id"] = "u-vp-carla"
+    m.save_authz(st)
+s, _h, b = req("GET", "/delegated")
+ok("beide Weitergaben stehen da, unter Namen, der Agent auch",
+   ">ben<" in b and ">agent-vp<" in b and "Paket Hilfe" in b, b[:900])
+ok("solange die Geberin haelt, ist nichts verwaist",
+   "Geber hält es nicht mehr" not in b, b[:900])
+with m.authz_rw() as st:
+    m.authz.revoke(st, "t-vp", a_chef, who="vp_chef")
+    m.save_authz(st)
+s, _h, b = req("GET", "/delegated")
+ok("die Geberin geht: Hinweis in der Liste, die Weitergabe gilt weiter",
+   "Geber hält es nicht mehr" in b and ">ben<" in b, b[:900])
+s, _h, b = req("GET", "/person?id=u-vp-ben")
+ok("und auf der Seite der Person", "Geber hält es nicht mehr" in b
+   and "weitergegeben" in b, b[:900])
+s, h, b = req("POST", "/do/revoke", form={"id": a_ben, "back": "/delegated"})
+ok("der Admin beendet sie", s == 303 and state()["assignments"][a_ben]["ended"], dict(h))
+s, _h, b = req("GET", "/delegated")
+ok("beendet: nicht mehr in der Liste", ">ben<" not in b and ">agent-vp<" in b, b[:900])
+s, _h, b = req("GET", "/person?id=u-vp-carla")
+ok("KOEDER: was der Admin von Hand gab, ist nie verwaist",
+   "Geber hält es nicht mehr" not in b, b[:900])
 
 print("Wenn etwas fehlt")
 os.environ["OAAP_AUTHZ_ADMIN_KEY"] = ""

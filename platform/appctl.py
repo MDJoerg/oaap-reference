@@ -17092,7 +17092,9 @@ def cmd_authz(args):
             state = "ENDED" if a["ended"] else (
                 f"{a['valid_from'] or '-'} .. {a['valid_to'] or '-'}")
             print(f"{a['id'][:8]}  {names.get(a['subject'], a['subject'][:8]):<18} "
-                  f"{a['context']}  {state}  by {a['granted_by']}")
+                  f"{a['context']}  {state}  by {a['granted_by']}"
+                  + ("  ORPHANED (grantor no longer holds it)"
+                     if a.get("orphaned") else ""))
         if not doc["assignments"]:
             print(f"No assignments for '{args.user}' yet."
                   if args.user is not None else "No assignments yet.")

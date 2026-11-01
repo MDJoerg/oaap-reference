@@ -818,6 +818,21 @@ def may_end(state, tenant, app, holder, assignment, today=None):
                for a in _granting(state, tenant, holder, today))
 
 
+def orphaned(state, assignment, today=None):
+    """A live handed-on assignment whose grantor could not give it today
+    (RFC-0045 A2, RFC-0067 §3.3). It is a remark, never a refusal: the
+    assignment stays live until somebody ends it."""
+    if assignment.get("source") != "delegated":
+        return False
+    today = today or datetime.now(timezone.utc).date()
+    if not _live(assignment, today):
+        return False
+    coll = state["collections"].get(assignment.get("collection")) or {}
+    role = state["roles"].get(next(iter(coll.get("roles", [])), "")) or {}
+    return not may_end(state, assignment.get("tenant"), role.get("app"),
+                       assignment.get("granted_by_id", ""), assignment, today)
+
+
 def grantable(state, tenant, app, holder, today=None):
     """What this person could hand on now, per granting assignment."""
     today = today or datetime.now(timezone.utc).date()

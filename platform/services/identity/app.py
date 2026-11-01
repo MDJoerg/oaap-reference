@@ -3675,7 +3675,10 @@ def authz_assignments_list():
         return bad
     st = load_authz()
     who = request.args.get("user", "")
-    return {"assignments": [a for a in st["assignments"].values()
+    today = datetime.now(timezone.utc).date()
+    return {"assignments": [dict(a, live=authz._live(a, today),
+                                 orphaned=authz.orphaned(st, a, today))
+                            for a in st["assignments"].values()
                             if a["tenant"] == tenant
                             and (not who or a["subject"] == who)]}
 
@@ -3698,7 +3701,9 @@ def authz_assignments_create():
         coll = coll if coll in st["collections"] else by_name.get(coll, coll)
         if target.get("kind") == "machine" and coll in st["collections"] \
                 and authz.has_may_grant(st, st["collections"][coll]):
-            return {"error": AUTHZ_MACHINE_NO_GRANT}, 403
+            # 400, like every other refusal of THIS assignment: the actor is
+            # an admin, and an admin app reads 403 as "you may not administer"
+            return {"error": AUTHZ_MACHINE_NO_GRANT}, 400
         try:
             # granted_by is the AUTHENTICATED actor, whatever the body says
             aid = authz.assign(
@@ -3897,9 +3902,11 @@ def authz_admin_effective():
             a, collection_name=c.get("name", ""),
             roles=[(st["roles"].get(r) or {}).get("name", "")
                    for r in c.get("roles", [])],
-            live=authz._live(a, today)))
+            live=authz._live(a, today),
+            orphaned=authz.orphaned(st, a, today)))
     rows.sort(key=lambda a: a["granted_at"], reverse=True)
     return {"user": uid, "username": target.get("username", ""),
+            "kind": target.get("kind", "human"),
             "apps": [{"app": a, "grants": authz.effective(st, tenant, a, uid)}
                      for a in apps],
             "assignments": rows}
