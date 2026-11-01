@@ -1743,7 +1743,10 @@ def verify():
         mine = resolve_tenant(user.get("tenant"))
         if want is None or mine is None or want != mine:
             return "Forbidden: this app belongs to another tenant", 403
-    return "", 204, identity_headers(user, request.args.get("instance", ""))
+    # Spec 2.11: an assertion says a PERSON is at the screen. A key is not
+    # that, whoever it belongs to, so it gets the header empty.
+    return "", 204, identity_headers(
+        user, "" if _method == "key" else request.args.get("instance", ""))
 
 
 @app.get("/auth/login")
@@ -3394,6 +3397,9 @@ def _delete_user(username, users, actor_name, role, actor_tenant):
                          "entziehen.", "keys": live}, 409
     users.remove(u)
     save_users(users)
+    with authz_rw() as st:
+        if authz.end_for_subject(st, u.get("id", ""), who=actor_name):
+            save_authz(st)
     audit("user.delete", resolve_tenant(u.get("tenant")) or "", username,
           who=actor_name, role=role,
           detail=f"id {u.get('id', '')}"
@@ -3690,6 +3696,9 @@ def authz_assignments_create():
         by_name = {c["name"]: c["id"] for c in st["collections"].values()
                    if c["tenant"] == tenant}
         coll = coll if coll in st["collections"] else by_name.get(coll, coll)
+        if target.get("kind") == "machine" and coll in st["collections"] \
+                and authz.has_may_grant(st, st["collections"][coll]):
+            return {"error": AUTHZ_MACHINE_NO_GRANT}, 403
         try:
             # granted_by is the AUTHENTICATED actor, whatever the body says
             aid = authz.assign(
@@ -3851,11 +3860,17 @@ def authz_admin_users():
     door = g.get("authz_admin")
     if not door:
         return {"error": "nicht ueber die Verwaltungs-Tuer"}, 403
-    out = [{"id": u["id"], "username": u.get("username", ""),
-            "display_name": u.get("display_name", ""),
-            "active": u.get("active", True)}
+    # ?kind=machine (RFC-0067 §4): the agents of the tenant, so that an admin
+    # app can show their rights. Principals the platform made for itself
+    # (`instance:`, `remote:`) are nobody's to assign to, and stay out.
+    want = "machine" if request.args.get("kind") == "machine" else "human"
+    out = [dict({"id": u["id"], "username": u.get("username", ""),
+                 "display_name": u.get("display_name", ""),
+                 "active": u.get("active", True)},
+                **({"kind": "machine"} if want == "machine" else {}))
            for u in load_users()
-           if u.get("id") and u.get("kind", "human") != "machine"
+           if u.get("id") and u.get("kind", "human") == want
+           and ":" not in u.get("username", "")
            and resolve_tenant(u.get("tenant")) == door["tenant"]]
     return {"users": sorted(out, key=lambda u: u["username"].lower())}
 
@@ -3956,9 +3971,8 @@ def authz_admin_door(rest):
     return globals()[fn](*args)
 
 
-@app.get("/authz/effective")
-def authz_effective():
-    """What the asking app's own objects allow a person NOW (spec 2.4).
+def _authz_instance_caller():
+    """The asking instance: (name, its record, None) or (None, None, refusal).
 
     Authenticated HERE, not by the gateway: the route trusts no header,
     only a bearer key issued for scope `oaap.authz` to an instance
@@ -3968,15 +3982,15 @@ def authz_effective():
     if request.headers.get("Authorization", "")[:7].lower() != "bearer ":
         # An API route: no key is a 401, not a redirect to a login page
         # that a script would follow and call success.
-        return {"error": "Ein Schluessel (Bereich " + AUTHZ_SCOPE
-                + ") wird gebraucht."}, 401
+        return None, None, ({"error": "Ein Schluessel (Bereich " + AUTHZ_SCOPE
+                             + ") wird gebraucht."}, 401)
     user, method, refusal = resolve_principal(AUTHZ_SCOPE)
     if refusal is not None:
-        return refusal
+        return None, None, refusal
     if method != "key" or user.get("kind") != "machine" \
             or not str(user.get("username", "")).startswith("instance:"):
-        return {"error": "Nur eine App-Instanz mit ihrem Schluessel fragt "
-                         "das."}, 403
+        return None, None, ({"error": "Nur eine App-Instanz mit ihrem "
+                             "Schluessel fragt das."}, 403)
     # `_by_key` lets an UNSCOPED key through for any instance (that is
     # what unscoped means). Here that is not good enough: this route
     # answers only to a key made for exactly this purpose.
@@ -3985,16 +3999,133 @@ def authz_effective():
     krec = next((k for k in load_keys() if hit and k["id"] == hit.group(1)),
                 None)
     if not krec or krec.get("instance") != AUTHZ_SCOPE:
-        return {"error": "Dieser Schluessel ist nicht fuer Fachrechte "
-                         "ausgestellt (Bereich " + AUTHZ_SCOPE + ")."}, 403
-    st = load_authz()
-    inst = st["instances"].get(user["username"].split(":", 1)[1])
+        return None, None, ({"error": "Dieser Schluessel ist nicht fuer "
+                             "Fachrechte ausgestellt (Bereich " + AUTHZ_SCOPE
+                             + ")."}, 403)
+    name = user["username"].split(":", 1)[1]
+    inst = load_authz()["instances"].get(name)
     if not inst:
-        return {"error": "Diese Instanz ist fuer Fachrechte nicht "
-                         "eingetragen."}, 403
+        return None, None, ({"error": "Diese Instanz ist fuer Fachrechte "
+                             "nicht eingetragen."}, 403)
     if resolve_tenant(user.get("tenant")) != inst["tenant"]:
-        return {"error": "Der Schluessel gehoert zu einem anderen "
-                         "Mandanten als die Instanz."}, 403
+        return None, None, ({"error": "Der Schluessel gehoert zu einem anderen "
+                             "Mandanten als die Instanz."}, 403)
+    return name, inst, None
+
+
+# Delegation (spec 2.12, RFC-0067 §3). The instance's ordinary key opens the
+# door; the PERSON is proven by the assertion the gateway gave the app for this
+# very person, copied here unchanged. There is no `on_behalf_of`: at this door
+# an app cannot name anybody. Not the header X-OAAP-User-Assertion itself: the
+# gateway strips every identity header on /authz/*, and that stays true.
+AUTHZ_PROOF_HEADER = "X-OAAP-Person-Proof"
+AUTHZ_MACHINE_NO_GRANT = ("Ein Maschinen-Prinzipal gibt nichts weiter: Pakete "
+                          "mit may_grant bekommt er nicht (RFC-0067 D2).")
+
+
+def _authz_delegate_person(name, inst):
+    """(person, None) from the signed proof, or (None, refusal)."""
+    claims, why = assertion.check(assertion_key(),
+                                  request.headers.get(AUTHZ_PROOF_HEADER, ""),
+                                  name)
+    if claims is None:
+        return None, ({"error": why}, 401)
+    if claims.get("ten") != inst["tenant"]:
+        return None, ({"error": "the assertion belongs to another tenant"}, 401)
+    person = next((u for u in load_users() if u.get("id") == claims.get("sub")),
+                  None)
+    if (not person or person.get("kind", "human") != "human"
+            or not person.get("active", True)
+            or resolve_tenant(person.get("tenant")) != inst["tenant"]):
+        return None, ({"error": "Diese Person ist hier nicht berechtigt."}, 403)
+    return person, None
+
+
+@app.route("/authz/delegate/<path:rest>", methods=["GET", "POST", "DELETE"])
+def authz_delegate_door(rest):
+    name, inst, bad = _authz_instance_caller()
+    if bad is not None:
+        return bad
+    person, bad = _authz_delegate_person(name, inst)
+    if bad is not None:
+        return bad
+    parts = rest.strip("/").split("/")
+    if request.method == "GET" and parts == ["grantable"]:
+        return {"grantable": authz.grantable(load_authz(), inst["tenant"],
+                                             inst["app"], person["id"])}
+    if request.method == "POST" and parts == ["assignments"]:
+        return _authz_delegate_assign(name, inst, person)
+    if request.method == "DELETE" and len(parts) == 2 \
+            and parts[0] == "assignments" and parts[1]:
+        return _authz_delegate_end(name, inst, person, parts[1])
+    return {"error": "Das gibt es an dieser Tuer nicht."}, 404
+
+
+def _authz_delegate_assign(name, inst, person):
+    body = request.get_json(force=True, silent=True)
+    body = body if isinstance(body, dict) else {}
+    tenant = inst["tenant"]
+    uid = str(body.get("user") or "").strip()
+    target = next((u for u in load_users() if u.get("id") == uid), None)
+    if not target or resolve_tenant(target.get("tenant")) != tenant:
+        return {"error": "Diese Benutzer-ID gibt es in diesem Mandanten "
+                         "nicht."}, 404
+    with authz_rw() as st:
+        cid = str(body.get("collection") or "")
+        coll = st["collections"].get(cid)
+        if target.get("kind") == "machine" and coll \
+                and authz.has_may_grant(st, coll):
+            return {"error": AUTHZ_MACHINE_NO_GRANT}, 403
+        context = body.get("context") if isinstance(body.get("context"),
+                                                    dict) else {}
+        try:
+            _via, end = authz.hand_on(st, tenant, inst["app"], person["id"], uid,
+                                      cid, context, body.get("valid_to"))
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 403
+        try:
+            aid = authz.assign(st, tenant, cid, uid, context, None, end or None,
+                               granted_by=person["username"],
+                               source="delegated")
+        except authz.AuthzError as e:
+            return {"error": str(e)}, 400
+        st["assignments"][aid]["granted_by_id"] = person["id"]
+        save_authz(st)
+        a = st["assignments"][aid]
+        cname = st["collections"][cid]["name"]
+    audit("authz.delegate-assign", tenant, target["username"],
+          who=person["username"], role="delegate",
+          detail=f"{cname}; Kontext {a['context']}; bis {a['valid_to'] or '-'}; "
+                 f"ueber App-Instanz {name}")
+    return {"ok": True, "assignment": a,
+            "end_set_by_holder": bool(end and not body.get("valid_to"))}, 201
+
+
+def _authz_delegate_end(name, inst, person, aid):
+    tenant = inst["tenant"]
+    with authz_rw() as st:
+        a = st["assignments"].get(aid)
+        if not a or not authz.may_end(st, tenant, inst["app"], person["id"], a):
+            # the same answer for "not there" and "not yours": a delegate does
+            # not learn which assignments exist outside their contexts
+            return {"error": "Diese Zuordnung kannst du nicht beenden."}, 403
+        changed = authz.revoke(st, tenant, aid, who=person["username"])
+        save_authz(st)
+        subject = a["subject"]
+    if changed:
+        audit("authz.delegate-revoke", tenant, subject, who=person["username"],
+              role="delegate", detail=f"Zuordnung {aid[:8]}; "
+                                      f"ueber App-Instanz {name}")
+    return {"ok": True, "ended": changed}
+
+
+@app.get("/authz/effective")
+def authz_effective():
+    """What the asking app's own objects allow a person NOW (spec 2.4)."""
+    _name, inst, bad = _authz_instance_caller()
+    if bad is not None:
+        return bad
+    st = load_authz()
     uid = (request.args.get("user") or "").strip()
     target = next((u for u in load_users() if u.get("id") == uid), None)
     if not target or resolve_tenant(target.get("tenant")) != inst["tenant"]:

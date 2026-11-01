@@ -15643,6 +15643,13 @@ def _install_from_dir(pkg, args, source):
         env["OAAP_AUTHZ_URL"] = f"http://{GATEWAY_CONTAINER}/authz"
         print(f"Issued an authorization key for '{name}' (RFC-0045) -- "
               "OAAP_AUTHZ_KEY/OAAP_AUTHZ_URL are in its environment.")
+    # RFC-0067: delegation proves the person by the signed assertion, and
+    # without the node's key that header stays empty. Not behind the "key not
+    # minted yet" test above: a new version may be the first to declare it.
+    if authz_decl is not None and not is_artefact and not rehearsal \
+            and any(t.get("may_grant")
+                    for t in authz_decl.get("role_templates") or []):
+        ensure_assertion_key()
     # 0.3: the key of a tenant administrator's tool, minted once like the
     # others, and the door opened (or closed again) for the instance. Never
     # for a rehearsal: it would administer the PRODUCTION tenant.
@@ -16893,6 +16900,46 @@ def _authz_setup(args, label, tid, who, q, show):
         sys.exit(1)
 
 
+def _authz_agent_add(args, label, tid, who, show):
+    """One act for an agent in one context (RFC-0067 §4): its own machine
+    principal, its own assignment, a key limited to one instance.
+
+    In that order, because the key is the only part shown once: if the
+    collection or the context is wrong, nothing is left behind and no secret
+    has been printed yet.
+    """
+    name = (args.name or "").strip()
+    if not (name and args.collection and args.instance):
+        die("agent-add needs a name, --collection and --instance")
+    reg = load_registry()
+    key, err = resolve_instance_ref(reg, args.instance, label)
+    if err:
+        die(err)
+    if resolve_tenant(reg["instances"][key].get("tenant")) != tid:
+        die(f"the instance '{args.instance}' is not in tenant '{label}'")
+    status, doc = identity_user_create({
+        "username": name, "kind": "machine", "roles": ["user"], "tenant": tid,
+        "display_name": args.label or name})
+    if status >= 300:
+        die(str((doc or {}).get("error") or f"answered {status}"))
+    uid = next((u["id"] for u in (_read_identity_users() or [])
+                if u.get("username") == name), "")
+    status, doc = _authz_call("POST", "/internal/authz/assignments", dict(
+        who, collection=args.collection, user=uid,
+        context=_kv_args(args.context, "--context"),
+        valid_from=args.valid_from, valid_to=args.valid_to))
+    if status >= 300:
+        identity_user_delete(name)
+        die(str((doc or {}).get("error") or f"answered {status}")
+            + f"\nNothing was kept: the principal '{name}' is gone again.")
+    print(f"Agent '{name}' holds '{args.collection}' in '{label}' (assignment "
+          f"{doc['assignment']['id'][:8]}, context "
+          f"{doc['assignment']['context']}).")
+    cmd_key(argparse.Namespace(
+        action="issue", kind="tenant", name=name, roles="user", instance=key,
+        label=args.label or f"agent {name}", days=args.days))
+
+
 def cmd_authz(args):
     """Business authorization from the host (oaap.core.authorization 0.1).
 
@@ -17027,6 +17074,9 @@ def cmd_authz(args):
                 die("cannot read the user store here (run with sudo)")
             die(f"'{name}' is not a user of tenant '{label}'")
         return uid
+
+    if verb == "agent-add":
+        return _authz_agent_add(args, label, tid, who, show)
 
     if verb == "assignments":
         import urllib.parse
@@ -26923,10 +26973,17 @@ def main():
                                      "assignments", "assign", "revoke",
                                      "mappings", "map-add", "map-remove",
                                      "role-retire", "collection-retire",
-                                     "setup"])
+                                     "setup", "agent-add"])
     pz.add_argument("name", nargs="?", help="for 'revoke' / 'map-remove' / "
                     "'role-retire' / 'collection-retire': the id (or its first "
-                    "characters; a name for the last two)")
+                    "characters; a name for the last two); for 'agent-add': "
+                    "the agent's name")
+    pz.add_argument("--instance", default=None, help="for agent-add: the one "
+                    "instance its key is limited to")
+    pz.add_argument("--days", type=int, default=90, help="for agent-add: how "
+                    "long the key is valid (1-365, default 90)")
+    pz.add_argument("--label", default=None, help="for agent-add: what this "
+                    "agent is for")
     pz.add_argument("--group", default=None, help="for map-add: the group's "
                     "path in the realm, e.g. Verein/Hallenwart")
     pz.add_argument("--tenant", default=None, help="the tenant's label")

@@ -103,3 +103,50 @@ class Authz:
     def may_any(self, user_id, permission):
         g = self.grants(user_id)
         return bool(g) and may_any_in(g, permission)
+
+    # Delegation (RFC-0067). `proof` is the X-OAAP-User-Assertion of the
+    # person's own request, copied unchanged and never stored. Nothing here
+    # names the person: without a valid proof the platform refuses.
+
+    def _delegate(self, method, path, proof, body=None):
+        """(status, document); (0, {}) when it could not be asked."""
+        if not (self.url and self.key and proof):
+            return 0, {}
+        req = urllib.request.Request(
+            self.url + "/delegate/" + path, method=method,
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
+            headers={"Authorization": "Bearer " + self.key,
+                     "X-OAAP-Person-Proof": proof,
+                     "Content-Type": "application/json",
+                     "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8"))
+            except ValueError:
+                return e.code, {}
+        except (urllib.error.URLError, OSError, ValueError):
+            return 0, {}
+
+    def grantable(self, proof):
+        """What this person may hand on, or [] if it cannot be known."""
+        status, doc = self._delegate("GET", "grantable", proof)
+        got = doc.get("grantable") if status == 200 else None
+        return got if isinstance(got, list) else []
+
+    def delegate(self, proof, collection, user_id, context=None, valid_to=None):
+        """(True, assignment) or (False, reason)."""
+        status, doc = self._delegate("POST", "assignments", proof, {
+            "collection": collection, "user": user_id,
+            "context": context or {}, "valid_to": valid_to})
+        if status == 201:
+            return True, doc.get("assignment")
+        return False, doc.get("error") or "the platform could not be asked"
+
+    def end(self, proof, assignment_id):
+        """True only if the platform confirmed it."""
+        status, doc = self._delegate("DELETE", "assignments/"
+                                     + urllib.parse.quote(assignment_id), proof)
+        return status == 200 and bool(doc.get("ok"))

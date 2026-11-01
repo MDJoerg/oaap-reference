@@ -686,6 +686,177 @@ def may_any(grants, permission):
 
 
 # ---------------------------------------------------------------------------
+# Delegation (RFC-0067 section 3): nobody hands on more than they hold
+#
+# Pure, like everything above. WHO is asking is the door's business (a signed
+# assertion, never the app's word); this only answers whether that person's
+# own live assignments carry what is being handed on.
+
+def has_may_grant(state, collection):
+    """Whether a collection can start a delegation (a machine never holds it)."""
+    for rid in collection.get("roles", []):
+        r = state["roles"].get(rid)
+        if not r:
+            continue
+        try:
+            tpl = _template(_decl(state, r["app"]), r["template"])
+        except AuthzError:
+            continue
+        if tpl.get("may_grant"):
+            return True
+    return False
+
+
+def _listed(state, tenant, app, a):
+    """The templates of `app` this assignment may hand on."""
+    out = set()
+    coll = state["collections"].get(a["collection"]) or {}
+    for rid in coll.get("roles", []):
+        r = state["roles"].get(rid)
+        if not r or r["app"] != app or r["tenant"] != tenant:
+            continue
+        try:
+            out |= set(_template(_decl(state, app),
+                                 r["template"]).get("may_grant") or [])
+        except AuthzError:
+            continue
+    return out
+
+
+def _handing_on_refused(state, tenant, app, a, coll, context):
+    """Why assignment `a` may not hand `coll` on in `context`, or ""."""
+    listed = _listed(state, tenant, app, a)
+    if not listed:
+        return "you hold nothing here that may be handed on"
+    for rid in coll["roles"]:
+        r = state["roles"].get(rid)
+        if not r or r["app"] != app or r["tenant"] != tenant:
+            return "the collection holds a role of another app"
+        if r["template"] not in listed:
+            return (f"your role does not list '{r['template']}' as something "
+                    "it may hand on")
+    need = {fk for (_a, _t, _o, fk) in collection_contexts(state, coll)}
+    held = a.get("context") or {}
+    if held:
+        # A context-bound holder never hands on a context-free collection:
+        # the trainer of mB would be handing out a role for every team.
+        if not need:
+            return ("the collection has no context, and yours does: it would "
+                    "reach further than you do")
+        for fk in need:
+            if fk not in held:
+                return f"you hold no context '{fk}'"
+            wanted = context.get(fk)
+            wanted = wanted if isinstance(wanted, list) else [wanted]
+            if not set(wanted) <= set(held[fk]):
+                return f"the context '{fk}' is not one you hold"
+    # The same for what a role fixes in values: a holder limited to area=news
+    # does not hand on a role for area=sponsoring.
+    mine = {}
+    for rid in (state["collections"].get(a["collection"]) or {}).get("roles", []):
+        for fk, vs in ((state["roles"].get(rid) or {}).get("values") or {}).items():
+            mine.setdefault(fk, set()).update(vs)
+    for rid in coll["roles"]:
+        for fk, vs in (state["roles"][rid].get("values") or {}).items():
+            if fk in mine and not set(vs) <= mine[fk]:
+                return f"the role reaches a value of '{fk}' you do not hold"
+    return ""
+
+
+def _granting(state, tenant, holder, today):
+    """The holder's live assignments, the longest-lasting first: where several
+    could carry a grant, the one that limits it least should."""
+    live = [a for a in state["assignments"].values()
+            if a["tenant"] == tenant and a["subject"] == holder
+            and _live(a, today)]
+    return sorted(live, key=lambda a: (bool(a.get("valid_to")),
+                                       [-ord(c) for c in a.get("valid_to", "")]))
+
+
+def hand_on(state, tenant, app, holder, target, collection_id, context=None,
+            valid_to=None, today=None):
+    """Assign a collection as a delegate. Returns the new assignment's id.
+
+    Raises AuthzError with the reason. `holder` and `target` are user ids the
+    CALLER has established; `granted_by` is set by the caller as with `assign`.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    coll = state["collections"].get(collection_id)
+    if not coll or coll["tenant"] != tenant:
+        raise AuthzError("this tenant has no such collection")
+    if holder == target:
+        raise AuthzError("nobody hands a right on to themselves")
+    context = context or {}
+    wanted_end = _day(valid_to, "valid_to")
+    reasons = []
+    for a in _granting(state, tenant, holder, today):
+        why = _handing_on_refused(state, tenant, app, a, coll, context)
+        if not why and a.get("valid_to") and wanted_end \
+                and wanted_end > date.fromisoformat(a["valid_to"]):
+            why = "the end date lies beyond the end of your own assignment"
+        if why:
+            reasons.append(why)
+            continue
+        end = wanted_end.isoformat() if wanted_end else a.get("valid_to", "")
+        return a["id"], end
+    # the most specific reason: "holds nothing" only if nothing else was said
+    plain = "you hold nothing here that may be handed on"
+    raise AuthzError(next((r for r in reasons if r != plain), plain))
+
+
+def may_end(state, tenant, app, holder, assignment, today=None):
+    """Whether a delegate may end this assignment, whoever granted it
+    (RFC-0067 D4). A provider's group gave it? Then the next login would give
+    it back, and saying it ended would be false."""
+    today = today or datetime.now(timezone.utc).date()
+    coll = state["collections"].get(assignment.get("collection"))
+    if not coll or assignment.get("tenant") != tenant \
+            or assignment.get("source") == "idp":
+        return False
+    return any(not _handing_on_refused(state, tenant, app, a, coll,
+                                       assignment.get("context") or {})
+               for a in _granting(state, tenant, holder, today))
+
+
+def grantable(state, tenant, app, holder, today=None):
+    """What this person could hand on now, per granting assignment."""
+    today = today or datetime.now(timezone.utc).date()
+    out = []
+    for a in _granting(state, tenant, holder, today):
+        if not _listed(state, tenant, app, a):
+            continue
+        held = a.get("context") or {}
+        rows = []
+        for c in state["collections"].values():
+            if c["tenant"] != tenant or c.get("retired"):
+                continue
+            fields = sorted({fk for (_a, _t, _o, fk)
+                             in collection_contexts(state, c)})
+            probe = {fk: held[fk] for fk in fields if fk in held}
+            if not _handing_on_refused(state, tenant, app, a, c, probe):
+                rows.append({"id": c["id"], "name": c["name"],
+                             "context_fields": fields})
+        if rows:
+            out.append({"assignment": a["id"], "context": held,
+                        "valid_to": a.get("valid_to", ""),
+                        "collections": sorted(rows, key=lambda r: r["name"])})
+    return out
+
+
+def end_for_subject(state, subject, who=""):
+    """End everything a deleted user held. The records stay; ids never come
+    back, so this grants nothing either way -- but a live assignment naming
+    nobody would keep its collection from being retired, unexplained."""
+    n = 0
+    for a in state["assignments"].values():
+        if a["subject"] == subject and not a.get("ended"):
+            a["ended"] = now_iso()
+            a["ended_by"] = who
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # The provider's groups (RFC-0045 section 5, stage 3)
 #
 # The provider says WHO a person is, OAAP says what they may do. A group
