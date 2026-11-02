@@ -961,16 +961,93 @@ def _egress_backup_lines(tid):
     return lines
 
 
-def egress_page(tid, t):
-    """Every way out, read from its source now (RFC-0068 §5)."""
-    reg = load_registry()
+def egress_facts(tid, t, reg=None, rule_check=None):
+    """Every way out of one tenant, read from its source now (RFC-0068 §5),
+    as data. The command line and the portal print the same facts, so the
+    two pages cannot drift apart."""
+    reg = reg or load_registry()
     mine = tenant_instances(reg, tid)
     closed = tenant_egress_closed(tid)
     e = t.get("egress") or {}
-    print(f"Tenant '{t.get('label')}': egress {'CLOSED' if closed else 'open'}"
-          + (f", since {e.get('since')} by {e.get('by')}" if e.get("since") else "")
-          + (f". Reason: {e.get('reason')}" if not closed and e.get("reason") else ""))
-    if not closed:
+    own = load_destinations().get(tid) or {}
+    f = {"label": t.get("label", ""), "closed": closed, "since": e.get("since", ""),
+         "by": e.get("by", ""), "reason": "" if closed else e.get("reason", "")}
+    f["instances"] = [{"key": n, "name": instance_name(n, i),
+                       "closed": instance_egress_closed(i),
+                       "rehearsal": is_rehearsal(i),
+                       "exception": egress_exception(i) or None}
+                      for n, i in sorted(mine.items())]
+    f["allowed"], f["allowable"] = [], []
+    for dn, d in sorted(own.items()):
+        if egress_destination_allowed(d):
+            a = d["egress_allowed"]
+            read = a.get("read") if isinstance(a.get("read"), dict) else None
+            f["allowed"].append({
+                "name": dn, "target": dest_target_text(d), "reason": a["reason"],
+                "by": a.get("by", ""), "since": a.get("since", ""),
+                "read": egress_read_sentence(read) if read else "never",
+                "read_bad": not read or bool(read.get("refused")),
+                "bound": [k for k, _n in destination_bindings(reg, tid, dn)]})
+        elif d.get("kind") != "tcp" and not (d.get("target") or {}).get("through"):
+            f["allowable"].append({"name": dn, "target": dest_target_text(d)})
+    f["other_bindings"] = [
+        {"instance": n, "need": need, "destination": dn,
+         "target": dest_target_text(own[dn]) if dn in own else ""}
+        for n, i in sorted(mine.items()) if not instance_egress_closed(i)
+        for need, dn in sorted((i.get("destinations") or {}).items())
+        if not egress_destination_allowed(own.get(dn))]
+    f["links"] = []
+    for n in sorted(mine):
+        for p in sorted(app_link_partners(reg, n)):
+            if p not in mine:
+                f["links"].append({"instance": n, "partner": p, "kind": "tenant"})
+            elif not instance_egress_closed(reg["instances"].get(p) or {}):
+                f["links"].append({"instance": n, "partner": p, "kind": "open"})
+    f["public"] = [{"instance": n, "paths": public_route_paths(i.get("routes"))}
+                   for n, i in sorted(mine.items()) if public_route_paths(i.get("routes"))]
+    f["access"] = [{"instance": r["instance"], "shape": r["shape"],
+                    "holder": r["holder"], "expires": r["expires"]}
+                   for r in access_list(tenant=tid)]
+    f["ai"], f["ai_links"] = [], []
+    for n, i in sorted(mine.items()):
+        for need, dn in sorted((i.get("destinations") or {}).items()):
+            read = ((own.get(dn) or {}).get("egress_allowed") or {}).get("read") or {}
+            if read.get("gateway"):
+                f["ai"].append({"instance": n, "need": need, "destination": dn,
+                                "ceiling": read.get("ceiling"), "at": read.get("at")})
+        for p in sorted(app_link_partners(reg, n)):
+            if (reg["instances"].get(p) or {}).get("app_id") == AI_GATEWAY_APP_ID:
+                f["ai_links"].append({"instance": n, "partner": p})
+    f["backups"] = _egress_backup_lines(tid)
+    faults = []
+    if closed:
+        for n, i in sorted(mine.items()):
+            if instance_egress_closed(i):
+                faults += [f"{n}: {x}" for x in
+                           egress_instance_faults(n, i, rule_check or egress_node_rule_present)]
+                faults += [f"{n}: bound as {need} to a destination that refuses it: "
+                           f"{egress_destination_refusal(i, dn, own[dn])}"
+                           for need, dn in sorted((i.get("destinations") or {}).items())
+                           if dn in own and egress_destination_refusal(i, dn, own[dn])]
+                faults += [f"{n}: {egress_link_refusal(reg, n, p)}"
+                           for p in sorted(app_link_partners(reg, n))
+                           if egress_link_refusal(reg, n, p)]
+    f["faults"] = faults
+    # What closing would have to settle first: the page shows it before
+    # the button, the act refuses with the same sentences.
+    f["close_blockers"] = [] if closed else [
+        b for n, i in sorted(mine.items()) if is_rehearsal(i) or not egress_exception(i)
+        for b in egress_instance_blockers(n, i)]
+    return f
+
+
+def egress_page(tid, t):
+    """Every way out, read from its source now (RFC-0068 §5)."""
+    f = egress_facts(tid, t)
+    print(f"Tenant '{f['label']}': egress {'CLOSED' if f['closed'] else 'open'}"
+          + (f", since {f['since']} by {f['by']}" if f["since"] else "")
+          + (f". Reason: {f['reason']}" if f["reason"] else ""))
+    if not f["closed"]:
         print("Its instances can reach whatever this node can.")
 
     def section(title, rows):
@@ -979,71 +1056,130 @@ def egress_page(tid, t):
             print(f"  {r}")
 
     section("1. Instances with an exception",
-            [f"{n}: {egress_exception(i)['reason']} (by {egress_exception(i).get('by')})"
-             for n, i in sorted(mine.items()) if egress_exception(i)])
-    own = load_destinations().get(tid) or {}
+            [f"{i['key']}: {i['exception']['reason']} (by {i['exception'].get('by')})"
+             for i in f["instances"] if i["exception"]])
     section("2. Allowed destination targets, with the instances bound to them",
-            [f"{dn}: {dest_target_text(d)}. {d['egress_allowed']['reason']} "
-             f"(by {d['egress_allowed'].get('by')}). Read: "
-             + (egress_read_sentence(d["egress_allowed"]["read"])
-                if isinstance(d["egress_allowed"].get("read"), dict) else "never")
-             + ". Bound: "
-             + (", ".join(k for k, _n in destination_bindings(reg, tid, dn)) or "nothing")
-             for dn, d in sorted(own.items()) if egress_destination_allowed(d)])
-    other = [f"{n}: {need} -> {dn}" + (f", {dest_target_text(own[dn])}" if dn in own else "")
-             for n, i in sorted(mine.items()) if not instance_egress_closed(i)
-             for need, dn in sorted((i.get("destinations") or {}).items())
-             if not egress_destination_allowed(own.get(dn))]
-    if other:
-        section("   Other bindings, of instances that are not closed", other)
-    links = []
-    for n in sorted(mine):
-        for p in sorted(app_link_partners(reg, n)):
-            other = reg["instances"].get(p) or {}
-            if p not in mine:
-                links.append(f"{n} <-> {p}: another tenant's instance")
-            elif not instance_egress_closed(other):
-                links.append(f"{n} <-> {p}: an open instance, it can pass data on")
-    section("3. Links to another tenant or to an open instance", links)
+            [f"{d['name']}: {d['target']}. {d['reason']} (by {d['by']}). Read: "
+             f"{d['read']}. Bound: {', '.join(d['bound']) or 'nothing'}"
+             for d in f["allowed"]])
+    if f["other_bindings"]:
+        section("   Other bindings, of instances that are not closed",
+                [f"{b['instance']}: {b['need']} -> {b['destination']}"
+                 + (f", {b['target']}" if b["target"] else "")
+                 for b in f["other_bindings"]])
+    section("3. Links to another tenant or to an open instance",
+            [f"{x['instance']} <-> {x['partner']}: "
+             + ("another tenant's instance" if x["kind"] == "tenant"
+                else "an open instance, it can pass data on")
+             for x in f["links"]])
     section("4. Public routes: whoever asks gets an answer, without a login",
-            [f"{n}: {', '.join(public_route_paths(i.get('routes')))}"
-             for n, i in sorted(mine.items()) if public_route_paths(i.get("routes"))])
+            [f"{x['instance']}: {', '.join(x['paths'])}" for x in f["public"]])
     section("5. Remote access",
             [f"{r['instance']}: {r['shape']} for {r['holder']}, until {r['expires']}"
-             for r in access_list(tenant=tid)])
-    ai = []
-    for n, i in sorted(mine.items()):
-        for need, dn in sorted((i.get("destinations") or {}).items()):
-            read = ((own.get(dn) or {}).get("egress_allowed") or {}).get("read") or {}
-            if read.get("gateway"):
-                ai.append(f"{n}: {need} -> {dn}, an OAAP AI gateway, key light "
-                          f"'{read.get('ceiling')}' (read {read.get('at')})")
-        for p in sorted(app_link_partners(reg, n)):
-            if (reg["instances"].get(p) or {}).get("app_id") == AI_GATEWAY_APP_ID:
-                ai.append(f"{n} <-> {p}: an AI gateway over a link, with a key the "
-                          "app holds; its light is not visible here")
-    section("6. AI: which instance uses which light", ai + [
-        "an AI is recognised only as an OAAP AI gateway behind a destination; "
-        "any other target is what its allowance says it is"])
-    section("7. Backups", _egress_backup_lines(tid))
-    faults = []
-    if closed:
-        for n, i in sorted(mine.items()):
-            if instance_egress_closed(i):
-                faults += [f"{n}: {f}" for f in
-                           egress_instance_faults(n, i, egress_node_rule_present)]
-                faults += [f"{n}: bound as {need} to a destination that refuses it: "
-                           f"{egress_destination_refusal(i, dn, own[dn])}"
-                           for need, dn in sorted((i.get("destinations") or {}).items())
-                           if dn in own and egress_destination_refusal(i, dn, own[dn])]
-                faults += [f"{n}: {egress_link_refusal(reg, n, p)}"
-                           for p in sorted(app_link_partners(reg, n))
-                           if egress_link_refusal(reg, n, p)]
-    section("8. Faults", faults)
+             for r in f["access"]])
+    section("6. AI: which instance uses which light",
+            [f"{x['instance']}: {x['need']} -> {x['destination']}, an OAAP AI gateway, "
+             f"key light '{x['ceiling']}' (read {x['at']})" for x in f["ai"]]
+            + [f"{x['instance']} <-> {x['partner']}: an AI gateway over a link, with a "
+               "key the app holds; its light is not visible here" for x in f["ai_links"]]
+            + ["an AI is recognised only as an OAAP AI gateway behind a destination; "
+               "any other target is what its allowance says it is"])
+    section("7. Backups", f["backups"])
+    section("8. Faults", f["faults"])
     print("\nWhat this rule does not do: a person can copy out what they can read.")
     print("A public route serves whatever the app serves. A cooperating instance")
     print("reached through a public route or a link can pass data on. An off-site")
     print("backup leaves the node. The gateway cannot tell what a request carries.")
+
+
+EGRESS_VIEW = os.path.join(APPS_DIR, "egress-view.json")
+
+
+def egress_view_write():
+    """Write the portal's view of every tenant's ways out (0644). The portal
+    shows a tenant_admin their own tenant and no other. Never raises: it
+    runs on the minute timer of every node."""
+    try:
+        reg = load_registry()
+        root = not hasattr(os, "geteuid") or os.geteuid() == 0
+        # Like the sweep: without a closed instance nothing is asked.
+        rule = egress_node_rule_present() if root and egress_closed_instances(reg) else None
+        tenants = {}
+        for tid, t in sorted(load_tenants().items()):
+            tenants[tid] = egress_facts(tid, t, reg, rule_check=lambda: rule is not False)
+        vw = {"schema": "0.1", "written": _iso_now(), "node_rule": rule,
+              "tenants": tenants}
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = EGRESS_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(vw, fh)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, EGRESS_VIEW)
+        return True
+    except (OSError, ValueError, KeyError, TypeError, SystemExit,
+            subprocess.SubprocessError) as e:
+        print(f"WARNING: could not write {EGRESS_VIEW}: {e}", flush=True)
+        return False
+
+
+# What the portal may ask for (RFC-0068 §6). The role is judged by the very
+# functions the command line calls; the tenant comes from the actor.
+EGRESS_JOB_OPS = ("close", "open", "except", "end-exception", "allow", "disallow")
+
+
+def egress_job(req, act_tenant, role, actor):
+    """One act of the page -> (ok, sentence, tenant id). A tenant_admin acts
+    in their own tenant only; a server_admin names the tenant."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    if role not in ("server_admin", "tenant_admin"):
+        # Refused, and recorded in the tenant of the one who asked.
+        u = next((x for x in (_read_identity_users() or [])
+                  if x.get("username") == (actor or "")), None)
+        return (False, "closed egress is its tenant admin's or the server admin's",
+                resolve_tenant((u or {}).get("tenant")) or None)
+    label = str(a.get("tenant") or "").strip().lower()
+    tid = act_tenant
+    if label:
+        tid, _t = tenant_by_label(label, include_former=False)
+        if not tid or (role != "server_admin" and tid != act_tenant):
+            # One sentence for "not there" and "not yours": a tenant admin
+            # learns nothing about another tenant, not even that it exists.
+            return False, f"no tenant '{label}' to act in", act_tenant
+    if not tid or tid not in load_tenants():
+        return False, "no tenant to act in", act_tenant
+    if op not in EGRESS_JOB_OPS:
+        return False, f"unknown egress operation '{op}'", tid
+    reason = str(a.get("reason") or "")
+    who = actor or "portal"
+    try:
+        if op in ("allow", "disallow"):
+            dn = str(a.get("destination") or "")
+            if op == "allow":
+                read = egress_allow_destination(tid, dn, reason, who=who, role=role)
+                return True, (f"'{dn}' is allowed. Read at the target: "
+                              f"{egress_read_sentence(read)}"), tid
+            egress_disallow_destination(tid, dn, who=who, role=role)
+            return True, f"'{dn}' is no longer allowed", tid
+        if op == "close":
+            moved, failed = egress_close(tid, who=who, role=role)
+        elif op == "open":
+            moved, failed = egress_open(tid, reason, who=who, role=role)
+        else:
+            key = str(a.get("instance") or "")
+            if key not in tenant_instances(load_registry(), tid):
+                return False, f"this tenant has no instance '{key}'", tid
+            moved = [key] if egress_set_exception(
+                key, reason if op == "except" else "", who=who, role=role) else []
+            failed = []
+    except EgressRefused as e:
+        return False, str(e), tid
+    except subprocess.CalledProcessError as e:
+        return False, ((e.stderr or "").strip().splitlines() or [str(e)])[-1], tid
+    msg = "Moved: " + (", ".join(moved) or "nothing had to move") + "."
+    if failed:
+        msg += " NOT moved: " + "; ".join(failed)
+    return not failed, msg, tid
 
 
 def _tenant_egress_cli(args):
@@ -13674,6 +13810,7 @@ def state_view_write(reg=None):
         # block devices every minute.
         if os.path.isfile(DISKS_FILE) or os.path.isfile(DISK_VIEW):
             disk_view_write()
+        egress_view_write()
         try:
             catalog_view_write()
         except (OSError, ValueError, KeyError):
@@ -24758,6 +24895,25 @@ def cmd_process_deploys(_args):
                 audit_tenant("disk." + str(req.get("op") or "?"),
                              ensure_default_tenant(), result="denied",
                              who=actor or "portal", role=act_role or "-")
+        elif action == "egress":
+            # RFC-0068 stage 4: the page "Abfluss". The functions the command
+            # line calls judge the role; role and tenant come from the
+            # ACTOR's record. A done act audits itself, a refused one is
+            # recorded here, in the tenant it was meant for.
+            ok, msg, _etid = egress_job(req, act_tenant, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok and _etid:
+                audit_tenant("egress." + str(req.get("op") or "?"), _etid,
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
+            egress_view_write()
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -24851,7 +25007,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal",
+               "disk": "portal", "egress": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(

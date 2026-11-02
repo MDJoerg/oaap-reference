@@ -1833,7 +1833,8 @@ TENANT_BODY = """
      <code>&lt;instanz&gt;.{{ me.label }}.{{ host }}</code>, dieser Mandant
      selbst unter <code>{{ me.label }}.{{ host }}</code>.</p>
   {% endif %}
-  <p><a class="btn" href="/tenant/face">Das Gesicht aendern</a></p>
+  <p><a class="btn" href="/tenant/face">Das Gesicht aendern</a>
+     <a class="btn" href="/tenant/egress">Abfluss: jeder Weg hinaus</a></p>
 </div>
 {% if me.rights_url %}
 <div class="card">
@@ -1903,7 +1904,8 @@ TENANT_BODY = """
       <td class="muted">{{ t.idp.first_login }}</td>
       <td class="muted">{{ t.created }}</td>
       <td>{% if not t.is_default %}<a class="rowaction"
-          href="/tenant/face?tenant={{ t.label }}">Gesicht</a>{% endif %}</td></tr>
+          href="/tenant/face?tenant={{ t.label }}">Gesicht</a>{% endif %}
+          <a class="rowaction" href="/tenant/egress?tenant={{ t.label }}">Abfluss</a></td></tr>
   {% endfor %}
 </table>
 </div>
@@ -11272,3 +11274,268 @@ def disks_act(verb):
         return redirect("/datentraeger?err=" + quote(str(e)))
     rid = management_api.enqueue(sc[0], sc[1], verb, args, action="disk")
     return redirect(f"/datentraeger?job={rid}")
+
+
+# --- Abfluss: every way out of a tenant (RFC-0068 §5, §6) -------------------
+#
+# The page reads the view the host writes (egress-view.json), the same facts
+# `oaap tenant egress <label>` prints. A tenant_admin sees their own tenant
+# and may close it; opening, exceptions and allowed targets are the server
+# admin's, each with a reason. Every button queues one act (action `egress`)
+# and the host judges the role again from the actor's own record: the button
+# is not the boundary.
+EGRESS_VIEW_FILE = "/apps-registry/egress-view.json"
+EGRESS_OPS = ("close", "open", "except", "end-exception", "allow", "disallow")
+_EGRESS_NAME = _re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+
+
+def _egress_view():
+    try:
+        with open(EGRESS_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _egress_target():
+    """(tenant_id, label, role) or (None, None, refusal). A tenant_admin
+    reads their own tenant; a label naming another one is answered as a
+    tenant that does not exist."""
+    role, mine = caller_scope()
+    want = (request.values.get("tenant") or "").strip().lower()
+    tid = tenant_id_by_label(want) if want else mine
+    if not tid or tid not in load_tenants() or (role != "server_admin" and tid != mine):
+        return None, None, ("Diesen Mandanten gibt es auf diesem Knoten nicht.", 404)
+    return tid, load_tenants()[tid].get("label", ""), role
+
+
+EGRESS_BODY = """
+<div class="pagehead"><h1>Abfluss: {{ label }}</h1></div>
+""" + BUILD_BANNER + """
+{% if not f %}
+<div class="card"><p>Der Knoten hat diese Seite noch nicht geschrieben. Sie kommt mit
+dem nächsten Minutenlauf; am Knoten zeigt <code>sudo oaap tenant egress {{ label }}</code>
+dasselbe sofort.</p></div>
+{% else %}
+<div class="card">
+  {% if f.closed %}
+  <p><span class="badge">GESCHLOSSEN</span> seit {{ f.since }}, von {{ f.by }}.
+  Die Instanzen dieses Mandanten erreichen nichts außerhalb des Knotens, nur die
+  erlaubten Ziele unten (Abschnitt 2).</p>
+  {% else %}
+  <p><span class="badge off">offen</span>{% if f.since %} seit {{ f.since }}, von {{ f.by }}{% endif %}.
+  {% if f.reason %}Begründung: {{ f.reason }}.{% endif %}
+  Die Instanzen dieses Mandanten erreichen alles, was dieser Knoten erreicht.</p>
+  {% endif %}
+  {% if f.closed and node_rule is sameas false %}
+  <p class="err">Die Knotenregel fehlt (RFC-0068 §3.2). Der Knoten setzt sie im
+  nächsten Minutenlauf wieder; bis dahin stoppt er jede geschlossene Instanz.</p>
+  {% endif %}
+  <p class="muted">Stand {{ written }}, jede Minute vom Knoten neu gelesen.
+  Am Knoten dasselbe: <code>sudo oaap tenant egress {{ label }}</code>.</p>
+</div>
+
+<div class="card">
+  <h2>Schalten</h2>
+  {% if not f.closed %}
+  <p>Schließen heißt: kein Weg mehr hinaus außer über erlaubte Ziele. Das stoppt,
+  verschiebt und startet neu: {{ movers|join(", ") or "nichts" }}.</p>
+  {% if f.close_blockers %}
+  <p class="err">Erst zu klären, sonst wird nichts geschlossen:</p>
+  <ul>{% for b in f.close_blockers %}<li>{{ b }}</li>{% endfor %}</ul>
+  {% endif %}
+  <form method="post" action="/tenant/egress/close">
+    <input type="hidden" name="tenant" value="{{ label }}">
+    <label class="checkline"><input type="checkbox" name="confirm" value="1" required>
+    Ja, die Instanzen werden dafür kurz gestoppt.</label>
+    <button {% if f.close_blockers %}disabled{% endif %}>Mandant schließen</button>
+  </form>
+  {% elif is_server_admin %}
+  <form method="post" action="/tenant/egress/open">
+    <input type="hidden" name="tenant" value="{{ label }}">
+    <label>Begründung, in Worten, die der Mandant lesen kann
+      <input type="text" name="reason" required maxlength="300"></label>
+    <label class="checkline"><input type="checkbox" name="confirm" value="1" required>
+    Ja, das stoppt, verschiebt und startet neu: {{ movers|join(", ") or "nichts" }}.</label>
+    <button>Mandant öffnen</button>
+  </form>
+  {% else %}
+  <p class="muted">Öffnen, eine Instanz ausnehmen und ein Ziel erlauben darf nur der
+  Betreiber dieses Knotens, jeweils mit Begründung. Das Versprechen soll nicht von
+  dem Konto zurückgenommen werden können, das am ehesten darum gebeten wird
+  (RFC-0068 §6). Jede dieser Handlungen steht im Protokoll des Mandanten.</p>
+  {% endif %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>1. Instanzen mit Ausnahme</h2>
+  {% for i in f.instances if i.exception %}
+  <p><strong>{{ i.name }}</strong>: {{ i.exception.reason }}
+    <small class="muted">(von {{ i.exception.by }}, seit {{ i.exception.since }})</small></p>
+    {% if is_server_admin %}
+    <form method="post" action="/tenant/egress/end-exception">
+      <input type="hidden" name="tenant" value="{{ label }}">
+      <input type="hidden" name="instance" value="{{ i.key }}">
+      <label class="checkline"><input type="checkbox" name="confirm" value="1" required>
+      Ja, {{ "sie wird dafür neu gestartet" if f.closed else "sie wird beim Schließen mit verschoben" }}.</label>
+      <button>Ausnahme beenden</button></form>
+    {% endif %}
+  {% else %}<p class="muted">keine</p>{% endfor %}
+  {% if is_server_admin and exceptable %}
+  <form method="post" action="/tenant/egress/except">
+    <input type="hidden" name="tenant" value="{{ label }}">
+    <label>Instanz <select name="instance" required>
+      {% for i in exceptable %}<option value="{{ i.key }}">{{ i.name }}</option>{% endfor %}
+    </select></label>
+    <label>Begründung <input type="text" name="reason" required maxlength="300"></label>
+    <label class="checkline"><input type="checkbox" name="confirm" value="1" required>
+    Ja, {{ "die Instanz wird dafür neu gestartet" if f.closed else "die Instanz bleibt beim Schließen offen" }}.</label>
+    <button>Ausnehmen</button>
+  </form>
+  <p class="muted">Eine Generalprobe hat nie eine Ausnahme: sie hält eine Kopie der
+  Produktivdaten.</p>
+  {% endif %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>2. Erlaubte Ziele und wer daran gebunden ist</h2>
+  {% if f.allowed %}
+  <table>
+    <tr><th>Ziel</th><th>Begründung</th><th>Gelesen</th><th>Gebunden</th><th></th></tr>
+    {% for d in f.allowed %}
+    <tr><td><strong>{{ d.name }}</strong><br><small class="muted">{{ d.target }}</small></td>
+      <td>{{ d.reason }}<br><small class="muted">von {{ d.by }}, seit {{ d.since }}</small></td>
+      <td><span class="{{ 'err' if d.read_bad }}">{{ d.read }}</span></td>
+      <td>{{ d.bound|join(", ") or "nichts" }}</td>
+      <td>{% if is_server_admin and not d.bound %}
+        <form method="post" action="/tenant/egress/disallow">
+          <input type="hidden" name="tenant" value="{{ label }}">
+          <input type="hidden" name="destination" value="{{ d.name }}">
+          <button>Nicht mehr erlauben</button></form>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">keine</p>{% endif %}
+  {% if f.other_bindings %}
+  <p>Andere Bindungen, von Instanzen, die nicht geschlossen sind:</p>
+  <ul>{% for b in f.other_bindings %}<li>{{ b.instance }}: {{ b.need }} → {{ b.destination }}{% if b.target %}, {{ b.target }}{% endif %}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if is_server_admin and f.allowable %}
+  <form method="post" action="/tenant/egress/allow">
+    <input type="hidden" name="tenant" value="{{ label }}">
+    <label>Destination <select name="destination" required>
+      {% for d in f.allowable %}<option value="{{ d.name }}">{{ d.name }} ({{ d.target }})</option>{% endfor %}
+    </select></label>
+    <label>Begründung <input type="text" name="reason" required maxlength="300"></label>
+    <p class="muted">Vor dem Erlauben liest der Knoten das Ziel mit dem Schlüssel der
+    Destination. Ein OAAP-KI-Gateway wird nur erlaubt, wenn der Schlüssel höchstens
+    „green“ darf. Ein Ziel, das nicht antwortet, wird nicht erlaubt.</p>
+    <button>Erlauben</button>
+  </form>
+  {% endif %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>3. Links zu einem anderen Mandanten oder einer offenen Instanz</h2>
+  {% for x in f.links %}<p>{{ x.instance }} ↔ {{ x.partner }}:
+    {{ "Instanz eines anderen Mandanten" if x.kind == "tenant" else "eine offene Instanz, sie kann Daten weitergeben" }}</p>
+  {% else %}<p class="muted">keine</p>{% endfor %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>4. Öffentliche Pfade: wer fragt, bekommt eine Antwort, ohne Anmeldung</h2>
+  {% for x in f.public %}<p>{{ x.instance }}: {% for p in x.paths %}<code>{{ p }}</code> {% endfor %}</p>
+  {% else %}<p class="muted">keine</p>{% endfor %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>5. Fernzugänge</h2>
+  {% for r in f.access %}<p>{{ r.instance }}: {{ r.shape }} für {{ r.holder }}, bis {{ r.expires }}</p>
+  {% else %}<p class="muted">keine</p>{% endfor %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>6. KI: welche Instanz welches Licht nutzt</h2>
+  {% for x in f.ai %}<p>{{ x.instance }}: {{ x.need }} → {{ x.destination }}, ein OAAP-KI-Gateway,
+    Licht des Schlüssels <strong>{{ x.ceiling }}</strong> <small class="muted">(gelesen {{ x.at }})</small></p>{% endfor %}
+  {% for x in f.ai_links %}<p>{{ x.instance }} ↔ {{ x.partner }}: ein KI-Gateway über einen Link,
+    mit einem Schlüssel, den die App hält; sein Licht ist hier nicht zu sehen.</p>{% endfor %}
+  <p class="muted">Eine KI wird nur als OAAP-KI-Gateway hinter einer Destination erkannt;
+  jedes andere Ziel ist das, was seine Erlaubnis sagt.</p>
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>7. Sicherungen</h2>
+  {% for line in f.backups %}<p>{{ line }}</p>{% endfor %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>8. Fehler</h2>
+  {% for line in f.faults %}<p class="err">{{ line }}</p>
+  {% else %}<p class="muted">keine</p>{% endfor %}
+</div>
+
+<div class="card">
+  <h2>Was diese Regel nicht tut</h2>
+  <p>Eine Person kann hinauskopieren, was sie lesen kann. Ein öffentlicher Pfad liefert,
+  was die App liefert. Eine mitarbeitende Instanz, erreicht über einen öffentlichen Pfad
+  oder einen Link, kann Daten weitergeben. Eine Sicherung außer Haus verlässt den
+  Knoten. Das Gateway kann nicht erkennen, was eine Anfrage trägt.</p>
+</div>
+{% endif %}
+"""
+
+
+@app.get("/tenant/egress")
+def tenant_egress_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label, role = _egress_target()
+    if tid is None:
+        return role
+    view = _egress_view()
+    f = (view.get("tenants") or {}).get(tid)
+    insts = (f or {}).get("instances", [])
+    return page(EGRESS_BODY, "Abfluss", "tenant", label=label, f=f,
+                is_server_admin=role == "server_admin",
+                node_rule=view.get("node_rule"),
+                written=build_view._when(view.get("written")),
+                movers=[i["name"] for i in insts if i["rehearsal"] or not i["exception"]],
+                exceptable=[i for i in insts if not i["exception"] and not i["rehearsal"]],
+                job=_build_job_note(tid, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/tenant/egress/<op>")
+def tenant_egress_act(op):
+    """One button, one act through the spool; the host judges it again."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _egress_target()
+    if tid is None:
+        return role
+    named = role == "server_admin"
+    back = "/tenant/egress" + (f"?tenant={quote(label)}" if named else "")
+    joiner = "&" if "?" in back else "?"
+    if op not in EGRESS_OPS:
+        return redirect(back, code=303)
+    args = {"reason": (request.form.get("reason") or "").strip()[:300]}
+    if named:
+        # Only a server_admin names a tenant; for anyone else the host takes
+        # the actor's own (as tenant-face does, I-32).
+        args["tenant"] = label
+    for k in ("instance", "destination"):
+        v = (request.form.get(k) or "").strip()
+        if v:
+            if not _EGRESS_NAME.match(v):
+                return redirect(f"{back}{joiner}err=" + quote(f"'{k}' ist nicht gültig."),
+                                code=303)
+            args[k] = v
+    if op in ("close", "open", "except", "end-exception") and not request.form.get("confirm"):
+        return redirect(f"{back}{joiner}err="
+                        + quote("Bitte bestätigen: das startet Instanzen neu."), code=303)
+    rid = management_api.enqueue(tid, role, op, args, action="egress")
+    return redirect(f"{back}{joiner}job={rid}", code=303)
