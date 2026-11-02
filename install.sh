@@ -819,6 +819,23 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  # Closed egress (RFC-0068 §3.2): the one node rule, set before Docker
+  # starts any container, on every node. Without a closed tenant no bridge
+  # carries the prefix and the rule matches nothing.
+  cat > /etc/systemd/system/oaap-egress.service <<'EOF'
+[Unit]
+Description=OAAP closed egress: nothing from a closed instance reaches this node (RFC-0068)
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -w -C INPUT -i oaapc+ -j DROP 2>/dev/null || iptables -w -I INPUT 1 -i oaapc+ -j DROP'
+ExecStart=/bin/sh -c '[ ! -e /proc/net/if_inet6 ] || ip6tables -w -C INPUT -i oaapc+ -j DROP 2>/dev/null || ip6tables -w -I INPUT 1 -i oaapc+ -j DROP'
+
+[Install]
+WantedBy=multi-user.target
+EOF
   # Disks and archives (RFC-0063): at boot, open the adopted disks that
   # are plugged in, start their archives and mount the grants. Docker
   # starts the containers on its own meanwhile; their grant bases stay
@@ -883,6 +900,8 @@ ExecStart=-$PYTHON3 $OAAP_DATA_DIR/app/appctl.py metrics sample
 # The broker's certificate and its plain-port address (RFC-0054): a
 # comparison and nothing else on a node without the 'broker' profile.
 ExecStart=-$PYTHON3 $OAAP_DATA_DIR/app/appctl.py broker sync
+# Closed egress (RFC-0068): a closed instance not closed in fact is stopped.
+ExecStart=-$PYTHON3 $OAAP_DATA_DIR/app/appctl.py egress-sweep
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]
@@ -904,6 +923,7 @@ EOF
   systemctl enable --now oaap-instance-keys.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
   systemctl enable oaap-disks.service >/dev/null 2>&1 || true
+  systemctl enable --now oaap-egress.service >/dev/null 2>&1 || say "WARNING: the node rule of closed egress could not be set."
 else
   say "WARNING: systemd not found — deploy-hook requests will queue up but nothing will process them."
   say "WARNING: and an expired rehearsal (RFC-0030) will not be removed by itself — 'sudo oaap app rehearsal sweep' does it by hand."

@@ -99,7 +99,7 @@ class Done:
     stdout = ""
 
 
-a.ensure_app_network = lambda n: "net"
+a.ensure_app_network = lambda n, closed=None: "net"
 a.connect_gateway = lambda n: None
 a.restore_links = lambda n: None
 a.load_registry = lambda: {"instances": {}}

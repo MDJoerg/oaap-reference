@@ -59,7 +59,7 @@ def fake_run(cmd, *x, **kw):
 a.run = fake_run
 a.subprocess.run = lambda *x, **k: types.SimpleNamespace(
     stdout="", stderr="", returncode=0)
-a.ensure_app_network = lambda name: "net-" + name
+a.ensure_app_network = lambda name, closed=None: "net-" + name
 a.connect_gateway = lambda net: None
 a.image_uid = lambda image: None
 a.restore_links = lambda name: None

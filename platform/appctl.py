@@ -214,10 +214,22 @@ def _network_exists(net):
                           capture_output=True, text=True).returncode == 0
 
 
-def ensure_app_network(name):
+def ensure_app_network(name, closed=None):
     net = app_network(name)
+    if closed is None:
+        closed = instance_egress_closed(
+            (load_registry().get("instances") or {}).get(name))
     if not _network_exists(net):
-        run(["docker", "network", "create", net])
+        if closed:
+            _create_closed_network(net)
+        else:
+            run(["docker", "network", "create", net])
+    elif closed:
+        why = egress_network_fault(net)
+        if why:
+            raise EgressRefused(f"'{name}' was not started: {why}. Docker cannot "
+                                "change that flag; oaap tenant egress <label> "
+                                "--close --yes moves it (RFC-0068 §3.1).")
     return net
 
 
@@ -298,6 +310,620 @@ def network_members(net):
     return r.stdout.split() if r.returncode == 0 else []
 
 
+# ------------------------------------------- closed egress (RFC-0068)
+# A closed tenant's instances start no connection of their own. An
+# internal Docker network does most of it, and two gaps were measured
+# (RFC-0068 §1): the bridge's own address is the node, and one ordinary
+# second network opens everything again.
+#
+# So every network a closed instance joins is internal AND has a bridge
+# named with one prefix, and ONE rule on the node drops what arrives on
+# such a bridge. One rule, not one per subnet: Docker starts these
+# containers at boot on its own, before anything of ours could list the
+# subnets, and a subnet can change. The unit oaap-egress.service sets the
+# rule before docker.service, on every node, closed tenant or not.
+#
+# Docker is asked, the record never remembers: a closed instance on the
+# wrong network does not start, and the sweep stops one already running.
+EGRESS_BRIDGE_PREFIX = "oaapc"
+EGRESS_BRIDGE_OPTION = "com.docker.network.bridge.name"
+EGRESS_ENDPOINT_REFUSAL = (
+    "a non-HTTP endpoint is refused while this instance is closed "
+    "(RFC-0068 §3.3): it does not work on an internal network, and it is a "
+    "way in that bypasses the gateway. An exception for the instance is "
+    "the server admin's: oaap tenant egress <label> --except-instance")
+
+
+def egress_bridge_name(net):
+    """A bridge device name is at most 15 characters."""
+    return EGRESS_BRIDGE_PREFIX + hashlib.sha256(net.encode()).hexdigest()[:10]
+
+
+def tenant_egress_closed(tid):
+    return bool((load_tenants().get(tid) or {}).get("egress", {}).get("closed"))
+
+
+def egress_exception(inst):
+    """The instance's exception, if it has a reason; none without one."""
+    ex = (inst or {}).get("egress_exception")
+    return ex if isinstance(ex, dict) and ex.get("reason") else None
+
+
+def instance_egress_closed(inst):
+    """The rule for one record. A rehearsal holds a copy of the production
+    data, so it is closed even where its original is excepted."""
+    if not tenant_egress_closed(_instance_tenant_id(inst)):
+        return False
+    return is_rehearsal(inst) or not egress_exception(inst)
+
+
+def _create_closed_network(net):
+    run(["docker", "network", "create", "--internal", "-o",
+         f"{EGRESS_BRIDGE_OPTION}={egress_bridge_name(net)}", net])
+
+
+def network_is_internal(net):
+    r = subprocess.run(["docker", "network", "inspect", "-f", "{{.Internal}}", net],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def egress_network_fault(net):
+    """Why Docker's answer about this network does not hold a closed
+    instance, or ''."""
+    r = subprocess.run(
+        ["docker", "network", "inspect", "-f",
+         '{{.Internal}} {{index .Options "' + EGRESS_BRIDGE_OPTION + '"}}', net],
+        capture_output=True, text=True)
+    parts = (r.stdout or "").split() if r.returncode == 0 else []
+    if not parts or parts[0] != "true":
+        return f"network {net} is not internal"
+    if len(parts) < 2 or not parts[1].startswith(EGRESS_BRIDGE_PREFIX):
+        return f"network {net} has no {EGRESS_BRIDGE_PREFIX} bridge, the node rule misses it"
+    return ""
+
+
+def _egress_rule_tools():
+    return ["iptables"] + (["ip6tables"] if os.path.exists("/proc/net/if_inet6") else [])
+
+
+EGRESS_RULE_MATCH = ["-i", EGRESS_BRIDGE_PREFIX + "+", "-j", "DROP"]
+
+
+def egress_node_rule_present():
+    """Does the node say the rule is there? Needs root; changes nothing."""
+    try:
+        return all(subprocess.run([tool, "-w", "-C", "INPUT", *EGRESS_RULE_MATCH],
+                                  capture_output=True, text=True).returncode == 0
+                   for tool in _egress_rule_tools())
+    except OSError:
+        return False
+
+
+def egress_node_rule_ensure():
+    """Is the node rule there, set now if it was not? Never raises."""
+    try:
+        for tool in _egress_rule_tools():
+            if subprocess.run([tool, "-w", "-C", "INPUT", *EGRESS_RULE_MATCH],
+                              capture_output=True, text=True).returncode == 0:
+                continue
+            if subprocess.run([tool, "-w", "-I", "INPUT", "1", *EGRESS_RULE_MATCH],
+                              capture_output=True, text=True).returncode != 0:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def egress_start_refusal(name, inst, services, endpoints=None):
+    """Why this closed instance must not start, or ''. Called before the
+    first `docker rm`: a refusal after it would leave no container."""
+    if endpoints or (inst or {}).get("endpoints"):
+        return f"'{name}': " + EGRESS_ENDPOINT_REFUSAL
+    if not is_rehearsal(inst) and any(
+            isinstance(s, dict) and s.get("tun") is True for s in services or []):
+        return (f"'{name}' holds a network tunnel (tun: true), and a tunnel is "
+                "a route out by construction. It is refused while this "
+                "instance is closed (RFC-0068 §3.3).")
+    if not egress_node_rule_ensure():
+        return (f"'{name}' was not started: the node rule of closed egress "
+                "could not be set, and without it the instance reaches this "
+                "node (RFC-0068 §3.2).")
+    return ""
+
+
+def egress_instance_faults(name, inst, rule_check=None):
+    """What keeps this closed instance from being closed, as Docker and the
+    node say it right now. `rule_check` is how the node rule is asked:
+    a door about to start the instance sets a missing rule (the default),
+    a page only reads it, and without root nobody can ask at all."""
+    check = rule_check or egress_node_rule_ensure
+    out = [] if check() else ["the node rule is missing"]
+    own = app_network(name)
+    nets = {own} if _network_exists(own) else set()
+    for s in instance_services(inst):
+        nets |= set(container_networks(s["container"]))
+    out += [f for f in (egress_network_fault(n) for n in sorted(nets)) if f]
+    return out
+
+
+def egress_closed_instances(reg=None):
+    reg = reg or load_registry()
+    return {k: i for k, i in (reg.get("instances") or {}).items()
+            if instance_egress_closed(i)}
+
+
+def egress_sweep():
+    """Stop every closed instance that is not closed in fact. Runs every
+    minute. Without a closed tenant it asks Docker nothing."""
+    stopped = []
+    closed = egress_closed_instances()
+    if closed and not egress_node_rule_present():
+        # Something removed it, and for that time the bridge was open:
+        # the tenants hear of it, whether it can be set again or not.
+        result = "ok" if egress_node_rule_ensure() else "refused"
+        for tid in sorted({_instance_tenant_id(i) for i in closed.values()}):
+            audit_tenant("egress.rule-missing", tid, result=result,
+                         detail="the node rule of closed egress was gone")
+    for name, inst in sorted(closed.items()):
+        faults = egress_instance_faults(name, inst, egress_node_rule_present)
+        if not faults:
+            continue
+        running = [s["container"] for s in instance_services(inst)
+                   if subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}",
+                                      s["container"]], capture_output=True,
+                                     text=True).stdout.strip() == "true"]
+        if not running:
+            continue
+        subprocess.run(["docker", "stop", "-t", "3", *running],
+                       capture_output=True, text=True)
+        audit_tenant("egress.fault-stopped", _instance_tenant_id(inst), subject=name,
+                     result="refused", detail="; ".join(faults))
+        stopped.append(name)
+    return stopped
+
+
+def egress_faults_line():
+    """The line `oaap status` shows, '' on a node without a closed instance."""
+    closed = egress_closed_instances()
+    if not closed:
+        return ""
+    root = not hasattr(os, "geteuid") or os.geteuid() == 0
+    rule_check = egress_node_rule_present if root else (lambda: True)
+    bad = {n: f for n, i in sorted(closed.items())
+           for f in [egress_instance_faults(n, i, rule_check)] if f}
+    if not bad:
+        return (f"Closed egress: {len(closed)} instance(s), as Docker "
+                + ("and this node report them" if root
+                   else "reports them; the node rule needs sudo to be read"))
+    return "Closed egress: FAULT: " + "; ".join(
+        f"{n}: {', '.join(f)}" for n, f in bad.items())
+
+
+def egress_destination_allowed(d):
+    a = (d or {}).get("egress_allowed")
+    return isinstance(a, dict) and bool(a.get("reason"))
+
+
+def egress_destination_refusal(inst, name, d):
+    """Why this closed instance must not use this destination, or '' (RFC-0068
+    §4). A rule in a function, for the three doors it comes through: the
+    binding, the listener and the handover. A destination is the one way
+    out, so it is asked at the moment of use too: a binding can be older
+    than the closing, restored or adopted."""
+    if not instance_egress_closed(inst):
+        return ""
+    t = (d or {}).get("target") or {}
+    if (d or {}).get("kind") == "tcp":
+        return (f"'{name}' is a tcp destination: the app would connect by itself "
+                "and hold the credential, and a closed instance has no route for "
+                "that (RFC-0068 §4). Only an http destination goes through the "
+                "gateway.")
+    if t.get("through"):
+        return (f"'{name}' goes through a tunnel app, a route out by construction. "
+                "It is refused while this instance is closed (RFC-0068 §3.3).")
+    if not egress_destination_allowed(d):
+        return (f"'{name}' is not allowed for this closed tenant (RFC-0068 §4). "
+                "The server admin allows it: oaap tenant egress <label> "
+                f"--allow-destination {name} --reason ...")
+    return ""
+
+
+def egress_binding_blockers(name, inst):
+    """Bindings of this instance a closed tenant would not let through."""
+    tid = resolve_tenant(inst.get("tenant"))
+    own = load_destinations().get(tid or "") or {}
+    probe = {k: v for k, v in inst.items() if k != "egress_exception"}
+    out = []
+    for need, dname in sorted((inst.get("destinations") or {}).items()):
+        d = own.get(dname)
+        if d and egress_destination_refusal(probe, dname, d):
+            out.append(f"'{name}' is bound to '{dname}' (as {need}), which a closed "
+                       "instance may not use. Allow it (http only) or unbind it")
+    return out
+
+
+def egress_allow_destination(tid, name, reason, who="root", role="root"):
+    """Allow one target of a closed tenant: an act with a reason (§4, §6)."""
+    _egress_only_server_admin(role, "allowing a target")
+    reason = (reason or "").strip()
+    if not reason:
+        raise EgressRefused("say why, in words the tenant can read: --reason \"...\"")
+    dests = load_destinations()
+    d = (dests.get(tid) or {}).get(name)
+    if not d:
+        raise EgressRefused(f"no destination '{name}' in this tenant")
+    if d.get("kind") == "tcp" or (d.get("target") or {}).get("through"):
+        raise EgressRefused(f"'{name}' cannot be allowed: only an http destination "
+                            "that does not go through a tunnel app passes the "
+                            "gateway alone (RFC-0068 §4)")
+    d["egress_allowed"] = {"reason": reason, "by": who, "since": _iso_now()}
+    save_destinations(dests)
+    audit_tenant("egress.destination-allowed", tid, subject=name, who=who, role=role,
+                 detail=f"{dest_target_text(d)}: {reason}")
+    refresh_destinations()
+
+
+def egress_disallow_destination(tid, name, who="root", role="root"):
+    """Take the allowance back. Refused while a closed instance is bound, for
+    the reason a bound destination cannot be removed: nobody decided to cut
+    that app off."""
+    _egress_only_server_admin(role, "taking back an allowed target")
+    dests = load_destinations()
+    d = (dests.get(tid) or {}).get(name)
+    if not d or not egress_destination_allowed(d):
+        raise EgressRefused(f"'{name}' is not an allowed target of this tenant")
+    reg = load_registry()
+    bound = [f"'{k}' (as {n})" for k, n in destination_bindings(reg, tid, name)
+             if instance_egress_closed(reg["instances"][k])]
+    if bound:
+        raise EgressRefused(f"'{name}' is still bound to {', '.join(bound)}: unbind first")
+    d.pop("egress_allowed")
+    save_destinations(dests)
+    audit_tenant("egress.destination-disallowed", tid, subject=name, who=who, role=role)
+    refresh_destinations()
+
+
+def egress_instance_blockers(name, inst):
+    """What must end before this instance can move to a closed network."""
+    out = []
+    why = ""
+    if inst.get("endpoints"):
+        why = "it holds a non-HTTP endpoint"
+    elif any(s.get("tun") is True for s in instance_services(inst)):
+        why = "it holds a network tunnel (tun: true)"
+    if why and not is_rehearsal(inst):
+        out.append(f"'{name}': {why}. Deny it, or except the instance with a reason")
+    out += egress_binding_blockers(name, inst)
+    out += egress_move_blockers(name)
+    return out
+
+
+def egress_move_blockers(name):
+    """What a change of this instance's network would break."""
+    out = []
+    if access_list(instance=name):
+        out.append(f"'{name}': a remote access is open on its network. Close it "
+                   "first, it can be opened again afterwards")
+    if deployment_in_flight(name):
+        out.append(f"'{name}': a deployment is queued or running")
+    return out
+
+
+def egress_needs_move(name, inst):
+    if not (inst.get("image") or inst.get("services")):
+        return False
+    if instance_egress_closed(inst):
+        if egress_instance_faults(name, inst):
+            return True
+        return inst.get("state") != "standby" and any(
+            subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", s["container"]],
+                           capture_output=True, text=True).stdout.strip() != "true"
+            for s in instance_services(inst))
+    return network_is_internal(app_network(name))
+
+
+def egress_apply_instance(name):
+    """Bring one instance's network in line with the rule. Docker's
+    Internal flag cannot be changed, so this removes and recreates the
+    network: stop, swap, start. Returns whether it moved."""
+    inst = load_registry()["instances"][name]
+    if not egress_needs_move(name, inst):
+        return False
+    services = instance_services(inst)
+    if instance_egress_closed(inst):
+        why = egress_start_refusal(name, inst, services)
+        if why:
+            raise EgressRefused(why)
+    grants, _ = disk_grants_of(inst)
+    gone = disks.missing(disks.load(DISKS_FILE), grants) if grants else []
+    if gone:
+        raise DiskAbsent(disk_absent_sentence(name, gone))
+    for s in services:
+        subprocess.run(["docker", "rm", "-f", s["container"]],
+                       capture_output=True, text=True)
+    connect_leave_network(app_network(name))
+    remove_app_network(name)
+    recreate_instance_containers(name, services, inst.get("storage") or [],
+                                 inst.get("endpoints") or [], inst=inst)
+    refresh_destinations()
+    return True
+
+
+def egress_apply_tenant(tid):
+    """(moved, sentences of what did not). One failure must not stop the
+    others; the sweep stops what stays on the wrong network."""
+    moved, failed = [], []
+    for name in sorted(tenant_instances(load_registry(), tid)):
+        try:
+            if egress_apply_instance(name):
+                moved.append(name)
+        except (DiagnoseRefused, subprocess.CalledProcessError) as e:
+            failed.append(f"{name}: {getattr(e, 'stderr', '') or e}")
+    refresh_destinations()
+    state_view_write()
+    return moved, failed
+
+
+def _egress_only_server_admin(role, act):
+    if role not in ("root", "server_admin"):
+        raise EgressRefused(f"{act} is the server admin's: the promise must not "
+                            "be undone by the account most likely to be asked "
+                            "to (RFC-0068 §6)")
+
+
+def egress_close(tid, who="root", role="root"):
+    """Close a tenant. A tenant admin may: tightening is safe, and it is
+    their data."""
+    if role not in ("root", "server_admin", "tenant_admin"):
+        raise EgressRefused("closing a tenant is its admin's or the server admin's")
+    blockers = []
+    for name, inst in sorted(tenant_instances(load_registry(), tid).items()):
+        if is_rehearsal(inst) or not egress_exception(inst):
+            blockers += egress_instance_blockers(name, inst)
+    if blockers:
+        raise EgressRefused("nothing was closed: " + "; ".join(blockers))
+    if not egress_node_rule_ensure():
+        raise EgressRefused("nothing was closed: the node rule could not be set "
+                            "(RFC-0068 §3.2)")
+    tenants = load_tenants()
+    tenants[tid]["egress"] = {"closed": True, "since": _iso_now(), "by": who}
+    save_tenants(tenants)
+    audit_tenant("egress.close", tid, who=who, role=role)
+    return egress_apply_tenant(tid)
+
+
+def egress_open(tid, reason, who="root", role="root"):
+    _egress_only_server_admin(role, "opening a tenant")
+    reason = (reason or "").strip()
+    if not reason:
+        raise EgressRefused("say why, in words the tenant can read: --reason \"...\"")
+    blockers = [b for n in tenant_instances(load_registry(), tid)
+                for b in egress_move_blockers(n)]
+    if blockers:
+        raise EgressRefused("nothing was opened: " + "; ".join(blockers))
+    tenants = load_tenants()
+    tenants[tid]["egress"] = {"closed": False, "since": _iso_now(), "by": who,
+                              "reason": reason}
+    save_tenants(tenants)
+    audit_tenant("egress.open", tid, who=who, role=role, detail=reason)
+    return egress_apply_tenant(tid)
+
+
+def egress_set_exception(name, reason, who="root", role="root"):
+    """Except one instance (reason given) or end its exception (none)."""
+    _egress_only_server_admin(role, "an exception")
+    reg = load_registry()
+    inst = reg["instances"].get(name)
+    if not inst:
+        raise EgressRefused(f"no instance named '{name}'")
+    tid = _instance_tenant_id(inst)
+    reason = (reason or "").strip()
+    if reason:
+        if is_rehearsal(inst):
+            raise EgressRefused(f"'{name}' is a rehearsal: it holds a copy of the "
+                                "production data and has no exception (RFC-0068 §3.3)")
+        blockers = egress_move_blockers(name) if tenant_egress_closed(tid) else []
+        if blockers:
+            raise EgressRefused("; ".join(blockers))
+        inst["egress_exception"] = {"reason": reason, "by": who, "since": _iso_now()}
+    else:
+        if not egress_exception(inst):
+            raise EgressRefused(f"'{name}' has no exception")
+        blockers = (egress_instance_blockers(name, inst)
+                    if tenant_egress_closed(tid) else [])
+        if blockers:
+            raise EgressRefused("; ".join(blockers))
+        inst.pop("egress_exception", None)
+    save_registry(reg)
+    audit_tenant("egress.exception" if reason else "egress.exception-ended", tid,
+                 subject=name, who=who, role=role, detail=reason)
+    moved = egress_apply_instance(name)
+    refresh_destinations()
+    state_view_write()
+    return moved
+
+
+def egress_install_refusal(m, tid, inst, rehearsal):
+    """Why an install must stop before it builds anything, or ''."""
+    if rehearsal or not instance_egress_closed({**(inst or {}), "tenant": tid}):
+        return ""
+    tun = [s for s, svc in (m.get("services") or {}).items()
+           if isinstance(svc, dict) and svc.get("tun") is True]
+    if not tun:
+        return ""
+    return (f"'{m['app']['id']}' asks for a network tunnel "
+            f"(services.{', services.'.join(tun)}: tun: true), and this "
+            "instance's tenant is closed: a tunnel is a route out by "
+            "construction (RFC-0068 §3.3). Nothing was built.")
+
+
+def _egress_backup_lines(tid):
+    """What leaves the node, as far as this node can read it."""
+    try:
+        with open(BACKUP_SCHEDULE_FILE, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        rec = None
+    lines = []
+    if tid in excluded_tenants():
+        lines.append("this tenant is excluded from the node backup")
+    elif rec:
+        lines.append(f"node backup on this machine, into {rec.get('target')}")
+    else:
+        lines.append("no nightly backup is set up on this node")
+    found = []
+    for d in (SYSTEMD_DIR, "/etc/cron.d"):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            text = _read_file(os.path.join(d, n)) if os.path.isfile(os.path.join(d, n)) else ""
+            if re.search(r"backup-push|rclone|rsync", text or ""):
+                found.append(f"{n} ({'age-encrypted at the source' if '--age-recipient' in text else 'NOT encrypted at the source'})")
+    lines += [f"copy leaving the node: {x}" for x in found]
+    keys = _read_file("/root/.ssh/authorized_keys") or ""
+    if "backup-serve" in keys:
+        lines.append("a vault may pull archives from this node (RFC-0053); "
+                     "whether they are encrypted depends on that vault's mode")
+    lines.append("an arrangement made by hand elsewhere is not visible from here")
+    return lines
+
+
+def egress_page(tid, t):
+    """Every way out, read from its source now (RFC-0068 §5)."""
+    reg = load_registry()
+    mine = tenant_instances(reg, tid)
+    closed = tenant_egress_closed(tid)
+    e = t.get("egress") or {}
+    print(f"Tenant '{t.get('label')}': egress {'CLOSED' if closed else 'open'}"
+          + (f", since {e.get('since')} by {e.get('by')}" if e.get("since") else "")
+          + (f". Reason: {e.get('reason')}" if not closed and e.get("reason") else ""))
+    if not closed:
+        print("Its instances can reach whatever this node can.")
+
+    def section(title, rows):
+        print(f"\n{title}")
+        for r in rows or ["none"]:
+            print(f"  {r}")
+
+    section("1. Instances with an exception",
+            [f"{n}: {egress_exception(i)['reason']} (by {egress_exception(i).get('by')})"
+             for n, i in sorted(mine.items()) if egress_exception(i)])
+    own = load_destinations().get(tid) or {}
+    section("2. Allowed destination targets, with the instances bound to them",
+            [f"{dn}: {dest_target_text(d)}. {d['egress_allowed']['reason']} "
+             f"(by {d['egress_allowed'].get('by')}). Bound: "
+             + (", ".join(k for k, _n in destination_bindings(reg, tid, dn)) or "nothing")
+             for dn, d in sorted(own.items()) if egress_destination_allowed(d)])
+    other = [f"{n}: {need} -> {dn}" + (f", {dest_target_text(own[dn])}" if dn in own else "")
+             for n, i in sorted(mine.items()) if not instance_egress_closed(i)
+             for need, dn in sorted((i.get("destinations") or {}).items())
+             if not egress_destination_allowed(own.get(dn))]
+    if other:
+        section("   Other bindings, of instances that are not closed", other)
+    links = []
+    for n in sorted(mine):
+        for p in sorted(app_link_partners(reg, n)):
+            other = reg["instances"].get(p) or {}
+            if p not in mine:
+                links.append(f"{n} <-> {p}: another tenant's instance")
+            elif not instance_egress_closed(other):
+                links.append(f"{n} <-> {p}: an open instance, it can pass data on")
+    section("3. Links to another tenant or to an open instance", links)
+    section("4. Public routes: whoever asks gets an answer, without a login",
+            [f"{n}: {', '.join(public_route_paths(i.get('routes')))}"
+             for n, i in sorted(mine.items()) if public_route_paths(i.get("routes"))])
+    section("5. Remote access",
+            [f"{r['instance']}: {r['shape']} for {r['holder']}, until {r['expires']}"
+             for r in access_list(tenant=tid)])
+    section("6. AI: which instance uses which light",
+            ["not read yet (RFC-0068 stage 3)"])
+    section("7. Backups", _egress_backup_lines(tid))
+    faults = []
+    if closed:
+        for n, i in sorted(mine.items()):
+            if instance_egress_closed(i):
+                faults += [f"{n}: {f}" for f in
+                           egress_instance_faults(n, i, egress_node_rule_present)]
+                faults += [f"{n}: bound as {need} to a destination that refuses it: "
+                           f"{egress_destination_refusal(i, dn, own[dn])}"
+                           for need, dn in sorted((i.get("destinations") or {}).items())
+                           if dn in own and egress_destination_refusal(i, dn, own[dn])]
+    section("8. Faults", faults)
+    print("\nWhat this rule does not do: a person can copy out what they can read.")
+    print("A public route serves whatever the app serves. A cooperating instance")
+    print("reached through a public route or a link can pass data on. An off-site")
+    print("backup leaves the node. The gateway cannot tell what a request carries.")
+
+
+def _tenant_egress_cli(args):
+    """`oaap tenant egress <label>`: the page, and the acts of RFC-0068 §6."""
+    label = (args.name or "").strip().lower()
+    tid, t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the label '{label}'")
+    acts = [x for x in (args.egress_close, args.egress_open, args.except_instance,
+                        args.end_exception, args.allow_destination,
+                        args.disallow_destination) if x]
+    if not acts:
+        return egress_page(tid, t)
+    if len(acts) > 1:
+        die("one act at a time: --close, --open, --except-instance, --end-exception, "
+            "--allow-destination or --disallow-destination")
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.allow_destination or args.disallow_destination:
+        try:
+            if args.allow_destination:
+                egress_allow_destination(tid, args.allow_destination, args.idp_reason, who=who)
+                print(f"'{args.allow_destination}' is allowed for this tenant. A closed "
+                      "instance can be bound to it now.")
+            else:
+                egress_disallow_destination(tid, args.disallow_destination, who=who)
+                print(f"'{args.disallow_destination}' is no longer allowed.")
+        except EgressRefused as e:
+            die(str(e))
+        return None
+    mine = tenant_instances(load_registry(), tid)
+    single = args.except_instance or args.end_exception
+    if single and single not in mine:
+        die(f"'{label}' has no instance named '{single}'")
+    reason = (args.idp_reason or "").strip()
+    if args.egress_open or args.except_instance:
+        if not reason:
+            die("say why, in words the tenant can read: --reason \"...\"")
+    if not args.yes:
+        print("This stops, moves and restarts: "
+              + (", ".join(sorted([single] if single else mine)) or "nothing"))
+        if args.egress_close:
+            rows = [b for n, i in sorted(mine.items())
+                    if is_rehearsal(i) or not egress_exception(i)
+                    for b in egress_binding_blockers(n, i)]
+            if rows:
+                print("Each of these has to be settled first:")
+                print(chr(10).join("  " + r for r in rows))
+        print("Nothing changed. Again with --yes to carry it out.")
+        return None
+    try:
+        if args.egress_close:
+            moved, failed = egress_close(tid, who=who)
+        elif args.egress_open:
+            moved, failed = egress_open(tid, reason, who=who)
+        else:
+            moved = [single] if egress_set_exception(
+                single, reason if args.except_instance else "", who=who) else []
+            failed = []
+    except EgressRefused as e:
+        die(str(e))
+    print("Moved: " + (", ".join(moved) or "nothing had to move") + ".")
+    for line in failed:
+        print(f"NOT moved: {line}")
+    if failed:
+        sys.exit(1)
+    return None
+
+
 # ------------------------------------------- app-to-app links (RFC-0016)
 # Default is isolation: no app can reach another. A link is a deliberate,
 # operator-declared, revocable grant recorded in the registry (survives
@@ -329,8 +955,17 @@ def app_link_partners(reg, name):
 
 def setup_link_network(reg, a, b):
     net = link_network(a, b)
+    # One ordinary second network opens a closed instance again (RFC-0068
+    # §1), so one closed end makes the wire internal. It stays usable: both
+    # ends reach each other on it, and an open end keeps its own way out.
+    closed = any(instance_egress_closed(reg["instances"][w]) for w in (a, b))
+    if closed and _network_exists(net) and egress_network_fault(net):
+        teardown_link_network(a, b)
     if not _network_exists(net):
-        run(["docker", "network", "create", net])
+        if closed:
+            _create_closed_network(net)
+        else:
+            run(["docker", "network", "create", net])
     for who in (a, b):
         c = reg["instances"][who]["container"]
         subprocess.run(["docker", "network", "connect", net, c],
@@ -650,6 +1285,9 @@ def destination_env(inst, dests=None, dest_secrets=None):
         fields = (needs.get(need) or {}).get("env") or {}
         if (needs.get(need) or {}).get("kind") != "tcp" or not fields:
             continue
+        # RFC-0068 §4: no credential into a container that may not use it
+        if egress_destination_refusal(inst, dname, d):
+            continue
         _s, host, port, _b = parse_dest_target("tcp", d["target"]["direct"])
         values = {"host": host, "port": str(port)}
         if (d.get("auth") or {}).get("type") == "basic":
@@ -754,6 +1392,10 @@ def write_destinations_caddy(reg=None):
                       f"\t\tpath /destinations/{need} /destinations/{need}/*",
                       "\t}",
                       f"\thandle {m} {{"]
+            why = egress_destination_refusal(inst, dname, d)
+            if why:
+                lines += [f"\t\trespond {_caddy_quote(why)} 403", "\t}"]
+                continue
             auth = d.get("auth") or {"type": "none"}
             if auth["type"] == "principal_propagation":
                 lines += _propagation_route(name, inst, need, tid, dname)
@@ -1248,6 +1890,9 @@ def destination_bind(reg, key, name, need="", rehearsal_exception=False,
         # one that does not exist -- "that is someone else's" is already
         # an answer across the boundary.
         raise DestinationRefused(f"no destination '{name}' in this instance's tenant")
+    why = egress_destination_refusal(inst, name, d)
+    if why:
+        raise DestinationRefused(why)
     need = need or name
     if not re.fullmatch(DEST_NAME_RE, need):
         raise DestinationRefused("the need name is [a-z0-9-], 2-40 characters")
@@ -2430,6 +3075,13 @@ def cmd_migrate_networks(_args):
     for name, inst in sorted(reg["instances"].items()):
         net = app_network(name)
         nets = container_networks(inst["container"])
+        if instance_egress_closed(inst):
+            # An update must not fail on it and must not repair it into
+            # the open; the sweep stops the instance within a minute.
+            faults = egress_instance_faults(name, inst)
+            if faults:
+                print(f"  WARNING: closed instance '{name}': {'; '.join(faults)}")
+                continue
         if PLATFORM_NETWORK in nets or net not in nets:
             # still on the flat network (or missing its own) — isolate it.
             # recreate_instance_containers creates the network, connects
@@ -6904,6 +7556,9 @@ def cmd_tenant(args):
 
     if args.action == "adopt":
         return _tenant_adopt(args)
+
+    if args.action == "egress":
+        return _tenant_egress_cli(args)
 
     if args.action == "create":
         label = (args.name or "").strip().lower()
@@ -11856,18 +12511,26 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
     are ordered primary-first). A granted non-HTTP endpoint (RFC-0015)
     publishes a raw host port on its service's container."""
     primary = services[0]["service"]
-    # RFC-0016: the instance's own network, gateway bridged in. Set up
-    # before the containers so they land on the right network at
-    # `docker run` time; the migration step restores the gateway link
-    # after a platform update recreates the gateway.
-    net = ensure_app_network(name)
-    connect_gateway(net)
     # The operator's limits (RFC-0046 §7). The REGISTRY is asked, not
     # `inst`: callers pass an incomplete record (a config save and a
     # restart pass none, an install passes the bare identity), and a
     # limit must not depend on WHICH door recreated the container, or
     # the first configuration save would quietly lift it.
     stored = (load_registry().get("instances") or {}).get(name) or {}
+    # RFC-0068: asked of both for the same reason a tunnel is below, and
+    # before anything is removed. A new instance has only `inst`.
+    egress_record = {**(inst or {}), **stored}
+    closed = instance_egress_closed(egress_record)
+    if closed:
+        why = egress_start_refusal(name, egress_record, services, endpoints)
+        if why:
+            raise EgressRefused(why)
+    # RFC-0016: the instance's own network, gateway bridged in. Set up
+    # before the containers so they land on the right network at
+    # `docker run` time; the migration step restores the gateway link
+    # after a platform update recreates the gateway.
+    net = ensure_app_network(name, closed=closed)
+    connect_gateway(net)
     limits = resource_args(stored.get("resources")
                            or (inst or {}).get("resources"))
     # RFC-0058: mounts that belong to a cohort, not to this instance --
@@ -12665,6 +13328,11 @@ class DiagnoseRefused(Exception):
     EndpointPortTaken already does)."""
 
 
+class EgressRefused(DiagnoseRefused):
+    """A closed instance must not start, or an act on the rule is refused
+    (RFC-0068), with the sentence that says why."""
+
+
 class DiskAbsent(DiagnoseRefused):
     """An instance must not start: a mandatory grant's source is not there
     (RFC-0063 §4.3). A DiagnoseRefused, so every door that already answers
@@ -13337,6 +14005,11 @@ def wake_instance(name, inst, who="root", role="root", wait=WAKE_WAIT_SECONDS):
     gone = disks.missing(disks.load(DISKS_FILE), grants) if grants else []
     if gone:
         raise DiskAbsent(disk_absent_sentence(name, gone))
+    # RFC-0068 §3.1, and for the same reason
+    if instance_egress_closed(inst):
+        faults = egress_instance_faults(name, inst)
+        if faults:
+            raise EgressRefused(f"'{name}' was not started: {'; '.join(faults)}")
     reg = load_registry()
     cur = reg["instances"][name]
     cur["state"] = "waking"
@@ -15449,6 +16122,9 @@ def _install_from_dir(pkg, args, source):
     # Runtime spec 2.23 (RFC-0060 D2): a tunnel is a door the node's
     # operator must know about -- asked HERE, before anything is built,
     # and only the command line can say yes (no other door sets it).
+    why = egress_install_refusal(m, twin_tenant, inst, rehearsal)
+    if why:
+        die(why)
     if not is_artefact:
         why = tun_refusal(m, inst, rehearsal,
                           getattr(args, "confirm_tun", False))
@@ -15883,6 +16559,9 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["standby_after"] = inst["standby_after"]
     elif preset.get("standby_after"):
         reg["instances"][name]["standby_after"] = int(preset["standby_after"])
+    # RFC-0068: an exception is the operator's decision, never the app's.
+    if inst and egress_exception(inst):
+        reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
     # RFC-0058: the cohort's shared folders (and whether this seat may
     # write them) are not the app's declaration -- a redeploy keeps them.
     if inst and inst.get("shared_mounts"):
@@ -16515,6 +17194,8 @@ def cmd_endpoint(args):
         die(f"'{args.name}' declares no endpoint named '{ep_name}'")
 
     if args.action == "allow":
+        if instance_egress_closed(inst):
+            die(EGRESS_ENDPOINT_REFUSAL)
         if not has_profile("exposed"):
             die("this node has no profile 'exposed' — granting a "
                 "gateway-bypassing port is refused. Set it deliberately on "
@@ -23195,6 +23876,8 @@ def cmd_process_deploys(_args):
                        "requires server_admin")
             elif not decl:
                 msg = f"no declared endpoint '{ep_name}'"
+            elif op == "allow" and instance_egress_closed(inst):
+                msg = EGRESS_ENDPOINT_REFUSAL
             elif op == "allow" and not has_profile("exposed"):
                 msg = ("this node has no profile 'exposed' — a gateway-"
                        "bypassing port is refused (set it on the machine)")
@@ -26637,6 +27320,13 @@ def main():
                      help="open --shape wireguard: the address the peer "
                           "will dial (this node's own reachable name)")
     pac.set_defaults(fn=cmd_access)
+    pms = sub.add_parser("egress-sweep",
+                         help="internal: stop closed instances that are not "
+                              "closed in fact (RFC-0068)")
+    pms.set_defaults(fn=lambda _a: egress_sweep())
+    pms = sub.add_parser("egress-faults",
+                         help="internal: the line of closed egress for 'oaap status'")
+    pms.set_defaults(fn=lambda _a: print(egress_faults_line() or "", end=""))
     pms = sub.add_parser("state-index",
                          help="internal: write container state facts where "
                               "the portal can read them (RFC-0038 D1)")
@@ -26793,7 +27483,7 @@ def main():
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
-                               "build"])
+                               "build", "egress"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "
@@ -26862,6 +27552,22 @@ def main():
                       help="for 'build confirm': the waiting step")
     pten.add_argument("--json", dest="as_json", action="store_true",
                       help="for 'build': the state as JSON")
+    # Closed egress (RFC-0068). Not in any manifest: an app can neither ask
+    # for it nor ask out of it.
+    pten.add_argument("--close", dest="egress_close", action="store_true",
+                      help="for 'egress': close this tenant; its instances "
+                           "start no connection of their own")
+    pten.add_argument("--open", dest="egress_open", action="store_true",
+                      help="for 'egress': open it again, with --reason")
+    pten.add_argument("--except-instance", dest="except_instance", default=None,
+                      help="for 'egress': except one instance, with --reason")
+    pten.add_argument("--end-exception", dest="end_exception", default=None,
+                      help="for 'egress': end one instance's exception")
+    pten.add_argument("--allow-destination", dest="allow_destination", default=None,
+                      help="for 'egress': allow one http destination for this "
+                           "tenant's closed instances, with --reason")
+    pten.add_argument("--disallow-destination", dest="disallow_destination", default=None,
+                      help="for 'egress': take that back; refused while bound")
     pten.add_argument("--clear-idp", dest="clear_idp", action="store_true",
                       help="detach the provider; the users' bindings stay")
     # What a FIRST login becomes (K4). Only server_admin gets here at
@@ -26884,8 +27590,9 @@ def main():
                       help="realm-group=oaap-group,... -- an explicit local "
                            "mapping; an unmapped group grants nothing")
     pten.add_argument("--reason", dest="idp_reason", default=None,
-                      help="why a dangerous combination is wanted; goes into "
-                           "this tenant's log")
+                      help="why a dangerous combination is wanted, or for "
+                           "'egress' why this is opened or excepted; goes "
+                           "into this tenant's log")
     pten.set_defaults(fn=cmd_tenant)
     pbk = sub.add_parser("broker", help="the MQTT broker's certificate "
                                         "(RFC-0054)")
@@ -27296,6 +28003,7 @@ def main():
                  # reports and deliberately repairs nothing. Creating and
                  # renaming change the node and need root like everything
                  # else that does.
+                 or args.cmd == "egress-faults"
                  or (args.cmd == "tenant"
                      and args.action in ("list", "show", "check", "log"))
                  or (args.cmd == "metrics"
@@ -27307,7 +28015,7 @@ def main():
         args.fn(args)
     except subprocess.CalledProcessError as e:
         die(f"command failed: {' '.join(e.cmd)}\n{e.stderr}")
-    except (disks.DiskRefused, DiskAbsent) as e:
+    except (disks.DiskRefused, DiskAbsent, EgressRefused) as e:
         die(str(e))
 
 

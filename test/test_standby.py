@@ -136,7 +136,7 @@ ok("keine haengt mehr an der Drossel statt an identity",
 
 print("")
 print("recreate_instance_containers: schlafend heisst anlegen, nicht starten")
-m.ensure_app_network = lambda name: "net-" + name
+m.ensure_app_network = lambda name, closed=None: "net-" + name
 m.connect_gateway = lambda net: None
 m.restore_links = lambda name: None
 m.image_uid = lambda image: None

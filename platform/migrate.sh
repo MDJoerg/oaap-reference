@@ -131,6 +131,29 @@ if [ -f "$ENVF" ] && ! grep -q '^BROKER_RELAY_KEY=' "$ENVF"; then
   say "  Done."
 fi
 
+# --- the node rule of closed egress (RFC-0068 §3.2) ---
+# Before the networks are looked at, because a closed instance without the
+# rule counts as a fault there.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  cat > /etc/systemd/system/oaap-egress.service <<'EOF'
+[Unit]
+Description=OAAP closed egress: nothing from a closed instance reaches this node (RFC-0068)
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -w -C INPUT -i oaapc+ -j DROP 2>/dev/null || iptables -w -I INPUT 1 -i oaapc+ -j DROP'
+ExecStart=/bin/sh -c '[ ! -e /proc/net/if_inet6 ] || ip6tables -w -C INPUT -i oaapc+ -j DROP 2>/dev/null || ip6tables -w -I INPUT 1 -i oaapc+ -j DROP'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-egress.service >/dev/null 2>&1 \
+    || say "  WARNING: the node rule of closed egress could not be set."
+fi
+
 # --- per-app networks + gateway links (RFC-0016) ---
 # Two jobs, both idempotent: isolate any app still on the flat platform
 # network onto its own (one-time for apps installed before 0.1.30), and
@@ -531,6 +554,8 @@ ExecStart=-$PYTHON3 $APP_DIR/appctl.py metrics sample
 # The broker's certificate and its plain-port address (RFC-0054): a
 # comparison and nothing else on a node without the 'broker' profile.
 ExecStart=-$PYTHON3 $APP_DIR/appctl.py broker sync
+# Closed egress (RFC-0068): a closed instance not closed in fact is stopped.
+ExecStart=-$PYTHON3 $APP_DIR/appctl.py egress-sweep
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]

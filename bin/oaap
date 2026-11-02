@@ -82,8 +82,12 @@ except Exception:
   apps_running="$(docker ps -q --filter 'name=^oaap-app-' --filter status=running | wc -l)"
   echo ""
   df -Ph "$OAAP_DATA_DIR" | awk 'NR==2 {printf "Disk: %s free of %s (%s used)\n", $4, $2, $5}'
+  # RFC-0068: what Docker and the node say now; nothing on an open node.
+  egress="$(python3 "$APP_DIR/appctl.py" egress-faults 2>/dev/null || true)"
+  [ -z "$egress" ] || echo "$egress"
   echo ""
-  if [ "$running" -eq "$total" ] && [ "$total" -gt 0 ] && [ "$apps_running" -eq "$apps_total" ]; then
+  if [ "$running" -eq "$total" ] && [ "$total" -gt 0 ] && [ "$apps_running" -eq "$apps_total" ] \
+     && ! printf '%s' "$egress" | grep -q FAULT; then
     echo "Overall: HEALTHY ($running/$total core services, $apps_running/$apps_total apps running$([ "$sleeping" -gt 0 ] && echo ", $sleeping in standby"))"
   else
     echo "Overall: DEGRADED ($running/$total core services, $apps_running/$apps_total apps running)"
@@ -156,6 +160,11 @@ uninstall() {
   # are (mounted or not) -- removing the platform does not eject them.
   systemctl stop 'oaap-archive@*.service' >/dev/null 2>&1 || true
   systemctl disable oaap-disks.service >/dev/null 2>&1 || true
+  # RFC-0068: the unit stays RemainAfterExit, so the rule goes by hand.
+  systemctl disable --now oaap-egress.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/oaap-egress.service
+  iptables -w -D INPUT -i oaapc+ -j DROP >/dev/null 2>&1 || true
+  ip6tables -w -D INPUT -i oaapc+ -j DROP >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/oaap-disks.service /etc/systemd/system/oaap-archive@.service
   systemctl daemon-reload >/dev/null 2>&1 || true
 

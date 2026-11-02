@@ -237,7 +237,7 @@ a.disks.ismount = disks.ismount
 a.DISKS_FILE = os.path.join(TMP, "disks.json")
 json.dump(dreg, open(a.DISKS_FILE, "w"))
 calls, sub = [], []
-a.ensure_app_network = lambda n: "net"
+a.ensure_app_network = lambda n, closed=None: "net"
 a.connect_gateway = lambda n: None
 a.restore_links = lambda n: None
 a.image_uid = lambda i: None
