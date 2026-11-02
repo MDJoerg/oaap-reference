@@ -53,6 +53,8 @@ import sys
 import tempfile
 import textwrap
 import time
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 
@@ -458,6 +460,11 @@ def egress_sweep():
     minute. Without a closed tenant it asks Docker nothing."""
     stopped = []
     closed = egress_closed_instances()
+    if closed:
+        # The listener is the door of use, and a file: one written by older
+        # code, by hand or by a restore would keep a binding open that the
+        # rule refuses now. Written again only when it says something else.
+        refresh_destinations()
     if closed and not egress_node_rule_present():
         # Something removed it, and for that time the bridge was open:
         # the tenants hear of it, whether it can be set again or not.
@@ -526,7 +533,101 @@ def egress_destination_refusal(inst, name, d):
         return (f"'{name}' is not allowed for this closed tenant (RFC-0068 §4). "
                 "The server admin allows it: oaap tenant egress <label> "
                 f"--allow-destination {name} --reason ...")
+    read = d["egress_allowed"].get("read")
+    again = (" The server admin allows it again: oaap tenant egress <label> "
+             f"--allow-destination {name} --reason ...")
+    if not isinstance(read, dict):
+        return (f"'{name}' was allowed without its target being read (RFC-0068 "
+                "stage 3), so nobody knows whether it is an AI gateway and with "
+                "which light." + again)
+    if read.get("refused"):
+        return f"'{name}': {read['refused']}" + again
+    if read.get("gateway"):
+        if read.get("ceiling") != EGRESS_AI_LIGHT:
+            return (f"'{name}' is an AI gateway whose key may use "
+                    f"'{read.get('ceiling')}'. A closed instance may only use "
+                    f"'{EGRESS_AI_LIGHT}', the one light where the data stays "
+                    "(RFC-0068 §4).")
+        tid = _instance_tenant_id(inst)
+        secret = (load_dest_secrets().get(tid) or {}).get(name, "")
+        if _egress_key_digest(secret) != read.get("key"):
+            return (f"'{name}': its credential changed after the gateway was read, "
+                    "and the new key's light is unknown." + again)
     return ""
+
+
+EGRESS_AI_LIGHT = "green"
+
+
+def _egress_key_digest(secret):
+    return hashlib.sha256((secret or "").encode()).hexdigest()[:16]
+
+
+def _egress_probe_urls(d):
+    """Where an OAAP AI gateway behind this target would answer `/v1/usage`
+    (oaap.ai.gateway): at the root of the host, and under the target's own
+    path for a gateway behind a path."""
+    scheme, host, port, base = parse_dest_target("http", d["target"]["direct"])
+    origin = f"{scheme}://" + (f"[{host}]" if ":" in host else host) + (f":{port}" if port else "")
+    paths = ["/v1/usage"]
+    if base:
+        paths.append(base + ("/usage" if base.endswith("/v1") else "/v1/usage"))
+    return [origin + p for p in dict.fromkeys(paths)]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *x, **k):
+        return None
+
+
+def egress_read_target(tid, name, d):
+    """What the platform reads at a target before a closed tenant may use it
+    (RFC-0068 stage 3). A key's light is a declaration the gateway holds,
+    so the gateway is asked, with the credential the listener would send.
+    Anything that cannot be read is refused: an AI gateway that happened
+    to be down must not pass as a plain target."""
+    import base64
+    now = _iso_now()
+    if (d.get("target") or {}).get("via"):
+        return {"at": now, "refused": "its target lies behind a connector tunnel, "
+                "and this node cannot read what answers there (RFC-0068 stage 3)."}
+    secret = (load_dest_secrets().get(tid) or {}).get(name, "")
+    auth = d.get("auth") or {}
+    headers = {"Accept": "application/json"}
+    if auth.get("type") == "bearer":
+        headers["Authorization"] = "Bearer " + secret
+    elif auth.get("type") == "basic":
+        headers["Authorization"] = "Basic " + base64.b64encode(
+            f"{auth.get('user', '')}:{secret}".encode()).decode()
+    elif auth.get("type") == "header":
+        headers[auth["header"]] = secret
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    answers = []
+    for url in _egress_probe_urls(d):
+        try:
+            with opener.open(urllib.request.Request(url, headers=headers), timeout=8) as r:
+                status, body = r.status, r.read(65536)
+        except urllib.error.HTTPError as e:
+            status, body = e.code, b""
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return {"at": now, "refused": f"its target did not answer ({url}: "
+                    f"{getattr(e, 'reason', e)}), so it could not be read."}
+        if status >= 500:
+            return {"at": now, "refused": f"its target answered {url} with HTTP "
+                    f"{status}, so it could not be read."}
+        if status in (401, 403):
+            return {"at": now, "refused": f"its target refused the destination's "
+                    f"credential ({url}: HTTP {status}). Set the right one first."}
+        try:
+            doc = json.loads(body.decode("utf-8")) if status == 200 else None
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and "ceiling" in doc:
+            return {"at": now, "gateway": True, "ceiling": str(doc.get("ceiling")),
+                    "key": _egress_key_digest(secret), "url": url}
+        answers.append(f"HTTP {status}")
+    return {"at": now, "gateway": False,
+            "answer": "no OAAP AI gateway (" + ", ".join(answers) + ")"}
 
 
 def egress_binding_blockers(name, inst):
@@ -557,11 +658,49 @@ def egress_allow_destination(tid, name, reason, who="root", role="root"):
         raise EgressRefused(f"'{name}' cannot be allowed: only an http destination "
                             "that does not go through a tunnel app passes the "
                             "gateway alone (RFC-0068 §4)")
-    d["egress_allowed"] = {"reason": reason, "by": who, "since": _iso_now()}
+    read = egress_read_target(tid, name, d)
+    sentence = egress_read_sentence(read)
+    if read.get("refused") or (read.get("gateway") and read.get("ceiling") != EGRESS_AI_LIGHT):
+        audit_tenant("egress.destination-allowed", tid, subject=name, who=who, role=role,
+                     result="refused", detail=f"{dest_target_text(d)}: {sentence}")
+        raise EgressRefused(f"'{name}' was not allowed: {sentence}")
+    d["egress_allowed"] = {"reason": reason, "by": who, "since": _iso_now(), "read": read}
     save_destinations(dests)
     audit_tenant("egress.destination-allowed", tid, subject=name, who=who, role=role,
-                 detail=f"{dest_target_text(d)}: {reason}")
+                 detail=f"{dest_target_text(d)}: {reason}. Read: {sentence}")
     refresh_destinations()
+    return read
+
+
+def egress_read_sentence(read):
+    """What was read at a target, in one sentence for the log and the page."""
+    if read.get("refused"):
+        return read["refused"]
+    if read.get("gateway"):
+        if read.get("ceiling") != EGRESS_AI_LIGHT:
+            return (f"an OAAP AI gateway whose key may use '{read.get('ceiling')}'; "
+                    f"a closed instance may only use '{EGRESS_AI_LIGHT}' (RFC-0068 §4)")
+        return (f"an OAAP AI gateway, the key may use '{EGRESS_AI_LIGHT}' only "
+                f"(read {read.get('at')})")
+    return f"{read.get('answer')}, read {read.get('at')}"
+
+
+def egress_reread_destination(tid, name, who="root", role="root"):
+    """A new credential is a new key: read the target again. What it says
+    replaces what was read before, a refusal included, so the listener
+    never sends a key nobody looked at. '' when nothing is allowed."""
+    dests = load_destinations()
+    d = (dests.get(tid) or {}).get(name)
+    if not egress_destination_allowed(d):
+        return ""
+    read = egress_read_target(tid, name, d)
+    sentence = egress_read_sentence(read)
+    bad = read.get("refused") or (read.get("gateway") and read.get("ceiling") != EGRESS_AI_LIGHT)
+    d["egress_allowed"]["read"] = read if not bad else {"at": read["at"], "refused": sentence}
+    save_destinations(dests)
+    audit_tenant("egress.destination-read", tid, subject=name, who=who, role=role,
+                 result="refused" if bad else "ok", detail=sentence)
+    return sentence
 
 
 def egress_disallow_destination(tid, name, who="root", role="root"):
@@ -595,7 +734,36 @@ def egress_instance_blockers(name, inst):
     if why and not is_rehearsal(inst):
         out.append(f"'{name}': {why}. Deny it, or except the instance with a reason")
     out += egress_binding_blockers(name, inst)
+    out += egress_ai_link_blockers(name, inst)
     out += egress_move_blockers(name)
+    return out
+
+
+def egress_ai_link_blockers(name, inst, opening=False):
+    """Links that would join a closed instance to an open AI gateway once
+    this act is done: `name` closing (or ending its exception), or, with
+    `opening`, `name` -- an AI gateway -- being excepted, or its whole
+    tenant opened (`opening="tenant"`)."""
+    reg = load_registry()
+    tid = _instance_tenant_id(inst)
+
+    def closed_after(k):
+        i = reg["instances"].get(k) or {}
+        if opening == "tenant":
+            return instance_egress_closed(i) and _instance_tenant_id(i) != tid
+        if opening:
+            return instance_egress_closed(i) and k != name
+        if _instance_tenant_id(i) == tid:
+            return is_rehearsal(i) or not egress_exception(i) or k == name
+        return instance_egress_closed(i)
+
+    out = []
+    for p in sorted(app_link_partners(reg, name)):
+        c, g = (p, name) if opening else (name, p)
+        if (closed_after(c) and not closed_after(g)
+                and (reg["instances"].get(g) or {}).get("app_id") == AI_GATEWAY_APP_ID):
+            out.append(f"'{c}' is linked to the AI gateway '{g}'. Remove the "
+                       "link; reach the gateway through an allowed destination")
     return out
 
 
@@ -698,8 +866,9 @@ def egress_open(tid, reason, who="root", role="root"):
     reason = (reason or "").strip()
     if not reason:
         raise EgressRefused("say why, in words the tenant can read: --reason \"...\"")
-    blockers = [b for n in tenant_instances(load_registry(), tid)
-                for b in egress_move_blockers(n)]
+    blockers = [b for n, i in tenant_instances(load_registry(), tid).items()
+                for b in egress_move_blockers(n)
+                + egress_ai_link_blockers(n, i, opening="tenant")]
     if blockers:
         raise EgressRefused("nothing was opened: " + "; ".join(blockers))
     tenants = load_tenants()
@@ -723,7 +892,8 @@ def egress_set_exception(name, reason, who="root", role="root"):
         if is_rehearsal(inst):
             raise EgressRefused(f"'{name}' is a rehearsal: it holds a copy of the "
                                 "production data and has no exception (RFC-0068 §3.3)")
-        blockers = egress_move_blockers(name) if tenant_egress_closed(tid) else []
+        blockers = (egress_move_blockers(name) + egress_ai_link_blockers(name, inst, opening=True)
+                    if tenant_egress_closed(tid) else [])
         if blockers:
             raise EgressRefused("; ".join(blockers))
         inst["egress_exception"] = {"reason": reason, "by": who, "since": _iso_now()}
@@ -814,7 +984,10 @@ def egress_page(tid, t):
     own = load_destinations().get(tid) or {}
     section("2. Allowed destination targets, with the instances bound to them",
             [f"{dn}: {dest_target_text(d)}. {d['egress_allowed']['reason']} "
-             f"(by {d['egress_allowed'].get('by')}). Bound: "
+             f"(by {d['egress_allowed'].get('by')}). Read: "
+             + (egress_read_sentence(d["egress_allowed"]["read"])
+                if isinstance(d["egress_allowed"].get("read"), dict) else "never")
+             + ". Bound: "
              + (", ".join(k for k, _n in destination_bindings(reg, tid, dn)) or "nothing")
              for dn, d in sorted(own.items()) if egress_destination_allowed(d)])
     other = [f"{n}: {need} -> {dn}" + (f", {dest_target_text(own[dn])}" if dn in own else "")
@@ -838,8 +1011,20 @@ def egress_page(tid, t):
     section("5. Remote access",
             [f"{r['instance']}: {r['shape']} for {r['holder']}, until {r['expires']}"
              for r in access_list(tenant=tid)])
-    section("6. AI: which instance uses which light",
-            ["not read yet (RFC-0068 stage 3)"])
+    ai = []
+    for n, i in sorted(mine.items()):
+        for need, dn in sorted((i.get("destinations") or {}).items()):
+            read = ((own.get(dn) or {}).get("egress_allowed") or {}).get("read") or {}
+            if read.get("gateway"):
+                ai.append(f"{n}: {need} -> {dn}, an OAAP AI gateway, key light "
+                          f"'{read.get('ceiling')}' (read {read.get('at')})")
+        for p in sorted(app_link_partners(reg, n)):
+            if (reg["instances"].get(p) or {}).get("app_id") == AI_GATEWAY_APP_ID:
+                ai.append(f"{n} <-> {p}: an AI gateway over a link, with a key the "
+                          "app holds; its light is not visible here")
+    section("6. AI: which instance uses which light", ai + [
+        "an AI is recognised only as an OAAP AI gateway behind a destination; "
+        "any other target is what its allowance says it is"])
     section("7. Backups", _egress_backup_lines(tid))
     faults = []
     if closed:
@@ -851,6 +1036,9 @@ def egress_page(tid, t):
                            f"{egress_destination_refusal(i, dn, own[dn])}"
                            for need, dn in sorted((i.get("destinations") or {}).items())
                            if dn in own and egress_destination_refusal(i, dn, own[dn])]
+                faults += [f"{n}: {egress_link_refusal(reg, n, p)}"
+                           for p in sorted(app_link_partners(reg, n))
+                           if egress_link_refusal(reg, n, p)]
     section("8. Faults", faults)
     print("\nWhat this rule does not do: a person can copy out what they can read.")
     print("A public route serves whatever the app serves. A cooperating instance")
@@ -876,9 +1064,11 @@ def _tenant_egress_cli(args):
     if args.allow_destination or args.disallow_destination:
         try:
             if args.allow_destination:
-                egress_allow_destination(tid, args.allow_destination, args.idp_reason, who=who)
+                read = egress_allow_destination(tid, args.allow_destination,
+                                                args.idp_reason, who=who)
                 print(f"'{args.allow_destination}' is allowed for this tenant. A closed "
                       "instance can be bound to it now.")
+                print(f"Read at the target: {egress_read_sentence(read)}")
             else:
                 egress_disallow_destination(tid, args.disallow_destination, who=who)
                 print(f"'{args.disallow_destination}' is no longer allowed.")
@@ -953,7 +1143,32 @@ def app_link_partners(reg, name):
     return partners
 
 
+AI_GATEWAY_APP_ID = "ai-gateway"
+
+
+def egress_link_refusal(reg, a, b):
+    """Why these two instances must not be linked, or '' (RFC-0068 stage 3).
+    Over a link the app calls an AI gateway with a key it holds itself, and
+    the platform cannot see that key's light. A destination holds the key
+    on the platform, where it is read. A closed gateway is no way out."""
+    for x, y in ((a, b), (b, a)):
+        ix, iy = reg["instances"].get(x) or {}, reg["instances"].get(y) or {}
+        if (instance_egress_closed(ix) and iy.get("app_id") == AI_GATEWAY_APP_ID
+                and not instance_egress_closed(iy)):
+            return (f"'{x}' is closed and '{y}' is an AI gateway: over a link the "
+                    "app would hold a key whose light nobody can read. Reach it "
+                    "through a destination with the key on the platform, allowed "
+                    "for the tenant (RFC-0068 §4)")
+    return ""
+
+
 def setup_link_network(reg, a, b):
+    """Returns the refusal when the wire must not be there; it is then taken
+    down, wherever the call came from -- a restore can bring an old link."""
+    why = egress_link_refusal(reg, a, b)
+    if why:
+        teardown_link_network(a, b)
+        return why
     net = link_network(a, b)
     # One ordinary second network opens a closed instance again (RFC-0068
     # §1), so one closed end makes the wire internal. It stays usable: both
@@ -970,6 +1185,7 @@ def setup_link_network(reg, a, b):
         c = reg["instances"][who]["container"]
         subprocess.run(["docker", "network", "connect", net, c],
                        capture_output=True, text=True)
+    return ""
 
 
 def teardown_link_network(a, b):
@@ -1870,11 +2086,13 @@ def destination_set_secret(tid, name, secret, who="root", role="root"):
     s.setdefault(tid, {})[name] = secret
     save_dest_secrets(s)
     audit_tenant("destination.secret", tid, subject=name, who=who, role=role)
+    read = egress_reread_destination(tid, name, who=who, role=role)
     # The listener and every tcp handover carry the value -- both follow.
     reg = load_registry()
     refresh_destinations(reg)
     for k, _need in destination_bindings(reg, tid, name):
         sync_destination_env(reg, only=k)
+    return read
 
 
 def destination_bind(reg, key, name, need="", rehearsal_exception=False,
@@ -2097,9 +2315,11 @@ def cmd_destination(args):
             destination_remove(tid, name, who=who)
             print(f"Destination '{name}' removed, with its secret.")
         elif args.action == "set-secret":
-            destination_set_secret(tid, name, _read_dest_secret(args), who=who)
+            read = destination_set_secret(tid, name, _read_dest_secret(args), who=who)
             print(f"Secret of '{name}' set; the gateway and every bound "
                   "instance have it now.")
+            if read:
+                print(f"Allowed for a closed tenant, read again: {read}")
         elif args.action == "show":
             d = (load_destinations().get(tid) or {}).get(name) or die(
                 f"no destination '{name}' in this tenant")
@@ -17098,6 +17318,9 @@ def cmd_link(args):
             refusal = rehearsal_refusal(reg, who, "an app-to-app link")
             if refusal:
                 die(refusal)
+        refusal = egress_link_refusal(reg, a, b)
+        if refusal:
+            die(refusal)
     inst = reg["instances"][a]
     links = set(inst.get("links") or [])
 
@@ -23933,6 +24156,8 @@ def cmd_process_deploys(_args):
                 msg = f"unknown target instance '{target}'"
             elif target == name:
                 msg = "an instance cannot link to itself"
+            elif req.get("op") == "add" and egress_link_refusal(reg, name, target):
+                msg = egress_link_refusal(reg, name, target)
             else:
                 links = set(inst.get("links") or [])
                 if op == "add":

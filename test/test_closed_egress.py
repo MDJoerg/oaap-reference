@@ -545,6 +545,9 @@ ok("und die Seite nennt den Grund", "Probe beendet" in cli("zu")[1])
 
 # ---------------------------------------------- Stufe 2: die Destination
 print("=== Destinations: der eine Weg hinaus (Stufe 2) ===")
+REAL_READ = a.egress_read_target
+PLAIN = {"at": "t", "gateway": False, "answer": "no OAAP AI gateway (HTTP 404)"}
+a.egress_read_target = lambda tid, name, d: dict(PLAIN)
 T3 = tenant("dz")
 instance("d1", T3)
 cli("dz", "--close", "--yes")
@@ -615,6 +618,11 @@ a.save_destinations(ds)
 ok("ein handbearbeitetes `true` ist keine Erlaubnis", "reverse_proxy http://10.10.10.95" not in listener())
 ds[T3]["lan"]["egress_allowed"] = {"reason": "KI-Knoten im LAN", "by": "root"}
 a.save_destinations(ds)
+ok("eine Erlaubnis ohne Lesen (vor Stufe 3) leitet nicht weiter",
+   "reverse_proxy http://10.10.10.95" not in listener()
+   and "without its target being read" in listener())
+ds[T3]["lan"]["egress_allowed"]["read"] = dict(PLAIN)
+a.save_destinations(ds)
 
 print("=== die Uebergabe: kein Geheimnis in einen geschlossenen Container ===")
 needs = [{"name": "mail", "kind": "tcp", "env": {"host": "SMTP_HOST", "password": "SMTP_PASSWORD"}}]
@@ -667,6 +675,222 @@ _b, why = bind("d1", "tun1")
 ok("through: abgewiesen", "tunnel app" in why, why)
 why = refused(a.egress_allow_destination, T3, "tun1", "weil")
 ok("und nicht erlaubbar", "cannot be allowed" in why, why)
+
+# ------------------------------------------------- Stufe 3: das KI-Gateway
+print("=== das Lesen des Ziels, gegen einen echten HTTP-Dienst (Stufe 3) ===")
+import http.server                                            # noqa: E402
+import json                                                   # noqa: E402
+import threading                                              # noqa: E402
+
+KEYS = {"Bearer sk-gruen": "green", "Bearer sk-gelb": "yellow"}
+SEEN = []
+MODE = {"is": "gateway"}
+
+
+class FakeGateway(http.server.BaseHTTPRequestHandler):
+    """Antwortet wie oaap.ai.gateway auf /v1/usage, und wie anderes sonst."""
+    def log_message(self, *x):
+        pass
+
+    def do_GET(self):
+        SEEN.append((self.path, self.headers.get("Authorization")))
+        if MODE["is"] == "kaputt":
+            self.send_response(502)
+            self.end_headers()
+            return
+        if MODE["is"] == "weiter":
+            self.send_response(303)
+            self.send_header("Location", "/v1/usage")
+            self.end_headers()
+            return
+        if (MODE["is"] == "anders" or not self.path.endswith("/v1/usage")
+                or (MODE["is"] == "pfad" and not self.path.startswith("/ki/"))):
+            self.send_response(404)
+            self.end_headers()
+            return
+        light = KEYS.get(self.headers.get("Authorization") or "")
+        body = json.dumps({"ceiling": light} if light else
+                          {"error": {"code": "invalid_api_key"}}).encode()
+        self.send_response(200 if light else 403)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeGateway)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+PORT = srv.server_address[1]
+a.egress_read_target = REAL_READ
+
+
+def read_at(path, secret, auth="bearer", mode="gateway"):
+    """Das echte Lesen; nur der Ort zeigt auf den Dienst im Test."""
+    MODE["is"] = mode
+    s = a.load_dest_secrets()
+    s.setdefault(T3, {})["probe"] = secret
+    a.save_dest_secrets(s)
+    d = {"kind": "http", "target": {"direct": f"http://127.0.0.1:{PORT}{path}"},
+         "auth": {"type": auth}}
+    return a.egress_read_target(T3, "probe", d)
+
+
+r = read_at("/v1", "sk-gruen")
+ok("ein Gateway mit gruenem Schluessel: erkannt, Licht und Schluessel-Fingerabdruck",
+   r.get("gateway") is True and r.get("ceiling") == "green"
+   and r.get("key") == a._egress_key_digest("sk-gruen") and "sk-gruen" not in json.dumps(r), r)
+ok("... und es fragte mit dem Schluessel, den der Listener schickt",
+   ("/v1/usage", "Bearer sk-gruen") in SEEN, SEEN)
+r = read_at("/v1", "sk-gelb")
+ok("gelber Schluessel: erkannt als gelb", r.get("gateway") and r.get("ceiling") == "yellow", r)
+r = read_at("/v1", "sk-falsch")
+ok("ein Schluessel, den das Ziel abweist: nicht lesbar, abgewiesen",
+   "HTTP 403" in (r.get("refused") or ""), r)
+r = read_at("/ki", "sk-gruen", mode="anders")
+ok("ein anderes Ziel (404): kein Gateway, an beiden Orten gefragt",
+   r.get("gateway") is False and r.get("answer", "").count("404") == 2, r)
+r = read_at("/v1", "sk-gruen", mode="kaputt")
+ok("ein Ziel, das 502 sagt: nicht lesbar, abgewiesen", "502" in (r.get("refused") or ""), r)
+SEEN.clear()
+r = read_at("/v1", "sk-gruen", mode="weiter")
+ok("eine Umleitung wird nicht verfolgt (der Schluessel ginge mit)",
+   r.get("gateway") is False and "303" in r.get("answer", "") and len(SEEN) == 1, (r, SEEN))
+r = read_at("/ki/v1", "sk-gruen", mode="pfad")
+ok("ein Gateway unter einem Pfad wird dort gefunden",
+   r.get("gateway") is True and r.get("url", "").endswith("/ki/v1/usage"), r)
+MODE["is"] = "gateway"
+dead = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeGateway)
+dead_port = dead.server_address[1]
+dead.server_close()
+s = a.load_dest_secrets()
+d = {"kind": "http", "target": {"direct": f"http://127.0.0.1:{dead_port}/v1"}, "auth": {"type": "none"}}
+r = a.egress_read_target(T3, "probe", d)
+ok("ein Gateway, das gerade nicht antwortet, geht nicht als gewoehnliches Ziel durch",
+   "did not answer" in (r.get("refused") or ""), r)
+r = a.egress_read_target(T3, "probe", {"kind": "http", "target": {"via": "t/o"}})
+ok("hinter einem Connector-Tunnel: nicht lesbar, abgewiesen", "connector tunnel" in (r.get("refused") or ""), r)
+ok("unter einem Pfad wird auch dort gefragt",
+   a._egress_probe_urls({"target": {"direct": "https://h.example.org/ki/v1"}})
+   == ["https://h.example.org/v1/usage", "https://h.example.org/ki/v1/usage"])
+
+print("=== erlauben, binden, weiterleiten: nur gruen ===")
+a._egress_probe_urls = lambda d: [f"http://127.0.0.1:{PORT}/v1/usage"]
+a.destination_add(T3, "ki", "http", "https://ki.example.org/v1", "bearer", secret="sk-gelb")
+code, out = cli("dz", "--allow-destination", "ki", "--reason", "lokales Modell")
+ok("gelber Schluessel: Erlaubnis abgewiesen, sagt warum",
+   code and "'yellow'" in out and not a.egress_destination_allowed(a.load_destinations()[T3]["ki"]), out)
+ok("die Absage steht im Log", any(e.get("action") == "egress.destination-allowed"
+                                  and e.get("result") == "refused"
+                                  for e in a.read_tenant_log(T3, limit=100)))
+read = a.destination_set_secret(T3, "ki", "sk-gruen")
+ok("ein neuer Schluessel ohne Erlaubnis liest nichts", read == "", read)
+code, out = cli("dz", "--allow-destination", "ki", "--reason", "lokales Modell")
+ok("gruener Schluessel: erlaubt, und es sagt, was gelesen wurde",
+   code == 0 and "AI gateway" in out and "'green'" in out, out)
+done, why = bind("d1", "ki")
+ok("die geschlossene Instanz bindet ihn", done is True, why)
+text = listener()
+ok("der Listener leitet weiter, mit dem Schluessel", "reverse_proxy https://ki.example.org:443" in text
+   and "Bearer sk-gruen" in text, text)
+page = cli("dz")[1]
+ok("die Seite nennt Instanz, Ziel und Licht",
+   "d1: ki -> ki, an OAAP AI gateway, key light 'green'" in page, page)
+read = a.destination_set_secret(T3, "ki", "sk-gelb")
+ok("ein neuer gelber Schluessel wird sofort gelesen", "'yellow'" in read, read)
+text = listener()
+ok("... und der Listener schickt ihn nicht: 403 mit Satz",
+   "sk-gelb" not in text and "may only use" in text, text)
+ok("die Seite nennt den Fehler", "bound as ki" in cli("dz")[1])
+ok("im Log", any(e.get("action") == "egress.destination-read" and e.get("result") == "refused"
+                 for e in a.read_tenant_log(T3, limit=100)))
+a.destination_set_secret(T3, "ki", "sk-gruen")
+ok("wieder gruen: der Listener leitet weiter", "Bearer sk-gruen" in listener())
+ds = a.load_destinations()
+ds[T3]["ki"]["egress_allowed"]["read"]["ceiling"] = "yellow"
+a.save_destinations(ds)
+text = listener()
+ok("ein gelbes Licht im Datensatz (Hand, Wiederherstellung): 403, kein Schluessel",
+   "sk-gruen" not in text and "may only use" in text, text)
+ds[T3]["ki"]["egress_allowed"]["read"]["ceiling"] = "green"
+a.save_destinations(ds)
+s = a.load_dest_secrets()
+s[T3]["ki"] = "sk-unbekannt"
+a.save_dest_secrets(s)
+text = listener()
+ok("ein Schluessel, von Hand getauscht, ohne Lesen: 403, kein Schluessel im Listener",
+   "credential changed" in text and "sk-unbekannt" not in text, text)
+_b, why = bind("d2", "ki")
+ok("und beim Binden abgewiesen", "credential changed" in why, why)
+s[T3]["ki"] = "sk-gruen"
+a.save_dest_secrets(s)
+srv.shutdown()
+srv.server_close()
+code, out = cli("dz", "--allow-destination", "ki", "--reason", "nochmal")
+ok("ein Gateway, das beim Erlauben nicht antwortet: abgewiesen", code and "did not answer" in out, out)
+ok("die alte, gelesene Erlaubnis bleibt", "Bearer sk-gruen" in listener())
+calls = []
+a.refresh_destinations = lambda *x, **k: calls.append(1)
+a.egress_sweep()
+ok("die Sweep schreibt den Listener neu (eine aeltere Datei haelt sonst offen)", calls, calls)
+a.refresh_destinations = lambda *x, **k: None
+
+print("=== ein Link zum KI-Gateway: der Schluessel laege in der App ===")
+
+
+def link(action, src, dst):
+    out = io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+        try:
+            a.cmd_link(types.SimpleNamespace(action=action, source=src, target=dst))
+        except SystemExit as e:
+            code = e.code or 0
+    return code, out.getvalue()
+
+
+instance("gw", T2, app_id="ai-gateway")
+code, out = link("add", "d1", "gw")
+ok("geschlossen -> offenes Gateway: abgewiesen, nennt den Weg",
+   code and "destination" in out and "gw" not in (rec("d1").get("links") or []), out)
+code, out = link("add", "gw", "d1")
+ok("auch in die andere Richtung", code and "gw" not in (rec("gw").get("links") or []), out)
+ok("kein Netz gebaut", a.link_network("d1", "gw") not in NETS)
+code, out = link("add", "o3", "gw")
+ok("eine offene Instanz darf", code == 0 and "gw" in rec("o3")["links"], out)
+r = a.load_registry()
+r["instances"]["d1"]["links"] = ["gw"]
+a.save_registry(r)
+a.restore_links("d1")
+ok("ein Link, der zurueckkommt (Wiederherstellung), bekommt kein Netz",
+   a.link_network("d1", "gw") not in NETS, NETS.get(a.link_network("d1", "gw")))
+ok("die Seite nennt ihn als Fehler", "an AI gateway" in cli("dz")[1].split("8. Faults")[1])
+r["instances"]["d1"]["links"] = []
+a.save_registry(r)
+T4 = tenant("kz")
+instance("k1", T4, links=["gw"])
+why = refused(a.egress_close, T4)
+ok("schliessen mit einem Link zum offenen Gateway: abgewiesen, nennt ihn",
+   "'k1' is linked to the AI gateway 'gw'" in why and not a.tenant_egress_closed(T4), why)
+instance("gw2", T4, app_id="ai-gateway")
+r = a.load_registry()
+r["instances"]["k1"]["links"] = ["gw2"]
+a.save_registry(r)
+ok("ein Gateway im selben Mandanten schliesst mit: geht", refused(a.egress_close, T4) == "")
+ok("der Link zum geschlossenen Gateway steht, intern",
+   a.setup_link_network(a.load_registry(), "k1", "gw2") == ""
+   and closed_shape(NETS[a.link_network("k1", "gw2")]))
+why = refused(a.egress_set_exception, "gw2", "Anbieter im Netz")
+ok("das Gateway ausnehmen, solange eine geschlossene Instanz verlinkt ist: abgewiesen",
+   "'k1' is linked to the AI gateway 'gw2'" in why and not a.egress_exception(rec("gw2")), why)
+r = a.load_registry()
+r["instances"]["k1"]["links"] = []
+a.save_registry(r)
+instance("x1", T3, links=["gw2"])
+r = a.load_registry()
+why = refused(a.egress_open, T4, "Versuch")
+ok("den Mandanten des Gateways oeffnen, solange ein fremder Geschlossener verlinkt ist: abgewiesen",
+   "'x1' is linked to the AI gateway 'gw2'" in why and a.tenant_egress_closed(T4), why)
+r["instances"]["x1"]["links"] = []
+a.save_registry(r)
 
 print("=== der echte Parser ===")
 real_argv = sys.argv
