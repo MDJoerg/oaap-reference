@@ -317,11 +317,15 @@ class Client:
     """One connection. `deadline` is a time.monotonic() value for the
     whole run; every wait is cut to what is left of it."""
 
-    def __init__(self, cfg, deadline):
+    def __init__(self, cfg, deadline, client_id=None):
         self.cfg = cfg
         self.deadline = deadline
         self.sock = None
         self.pid = 0
+        # The sender's own id by default; another host-side publisher
+        # (the node's care event, appctl._care_publish) names itself,
+        # so that two connections never kick each other off the broker.
+        self.client_id = client_id or "oaap-metrics-" + cfg["node"]
 
     def _timeout(self, cap):
         left = self.deadline - time.monotonic()
@@ -348,8 +352,7 @@ class Client:
         self.sock = sock
         try:
             sock.settimeout(self._timeout(CONNECT_TIMEOUT))
-            sock.sendall(connect_packet("oaap-metrics-" + self.cfg["node"],
-                                        self.cfg["user"], secret))
+            sock.sendall(connect_packet(self.client_id, self.cfg["user"], secret))
             ptype, _flags, body = read_packet(sock)
         except (OSError, struct.error) as exc:
             self.close()

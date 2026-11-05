@@ -26,6 +26,11 @@ Was hier gehalten wird:
    /platform/care.json auf einem nie veroeffentlichten Port, die Datei
    neben den Site-Dateien; jede Instanz erfaehrt OAAP_CARE_URL, die
    Migration traegt es in jede instance.env.
+10. RFC-0069 Stufe 4 (0.1.224): auf einem Broker-Knoten geht jede Bewegung
+    des Plans als Ereignis auf den Baum jedes Mandanten mit Posteingang,
+    oaap/<mandant>/node/<host>, vom Host mit dem Relais-Prinzipal; was der
+    Broker nicht nahm, wartet in einer Datei und geht mit der naechsten
+    Minute.
 """
 import contextlib
 import io as _io
@@ -502,6 +507,86 @@ door = json.load(open(os.path.join(m.CADDY_APPS_DIR, _hc.DOOR_FILE), encoding="u
 ok("die Door-Datei liegt neben den Sites und traegt weder Grund noch Kernel",
    door["reboot_at"] == "2026-11-08T03:15:00Z" and "secret" not in json.dumps(door)
    and "6.12" not in json.dumps(door), door)
+
+print("")
+print("10. Das Ereignis auf einem Broker-Knoten (RFC-0069 Stufe 4)")
+import metrics_sender as _ms  # noqa: E202
+PUB = []
+BROKER_DOWN = [False]
+CONNECTS = []
+
+
+class FakeClient:
+    def __init__(self, cfg, deadline, client_id=None):
+        self.cfg, self.client_id = cfg, client_id
+
+    def connect(self, secret):
+        CONNECTS.append((self.cfg["url"], self.cfg["user"], secret, self.client_id))
+        if BROKER_DOWN[0]:
+            raise _ms.SenderError("cannot connect to 172.18.0.7:1883 (ConnectionRefusedError)")
+
+    def publish(self, topic, payload):
+        PUB.append((topic, json.loads(payload.decode("utf-8"))))
+
+    def close(self):
+        pass
+
+
+PROFILES = set()
+m.has_profile = lambda n: n in PROFILES
+m.metrics_sender.Client = FakeClient
+m.container_ip = lambda c, n: "172.18.0.7" if (c, n) == ("oaap-broker-1", "oaap_default") else ""
+m._read_platform_env = lambda k: "relay-secret" if k == "BROKER_RELAY_KEY" else None
+if os.path.exists(m.CARE_EVENTS_PENDING):
+    os.remove(m.CARE_EVENTS_PENDING)
+m._care_broker([("reboot.planned", "kernel", "x")], plan, None)
+ok("ohne Profil broker: nichts, nicht einmal eine Wartedatei", PUB == [] and CONNECTS == []
+   and not os.path.exists(m.CARE_EVENTS_PENDING))
+PROFILES.add("broker")
+tids = m._care_broker_tenants()
+ok("die Baeume: die Mandanten der Posteingaenge (einer je Eingang)", len(tids) == 2, tids)
+m._care_broker([("reboot.planned", "kernel", "x")], plan, None)
+host = __import__("socket").gethostname()
+ok("angekuendigt: ein Ereignis je Mandantenbaum, Relais-Prinzipal, eigene Client-ID, Container-Adresse",
+   sorted(t for t, _ in PUB) == [f"oaap/{t}/node/{host}" for t in tids]
+   and CONNECTS == [("mqtt://172.18.0.7:1883", "oaap.relay", "relay-secret", "oaap-node-care")]
+   and PUB[0][1]["kind"] == "reboot.planned" and PUB[0][1]["at"] == plan["at"]
+   and not os.path.exists(m.CARE_EVENTS_PENDING), (PUB, CONNECTS))
+del PUB[:]
+del CONNECTS[:]
+BROKER_DOWN[0] = True
+errs = _io.StringIO()
+with contextlib.redirect_stderr(errs):
+    m._care_broker([("reboot.moved", "kernel", "x")], moved, plan)
+ok("Broker weg: das Ereignis wartet in der Datei, das Journal sagt es, nichts ging",
+   PUB == [] and os.path.exists(m.CARE_EVENTS_PENDING)
+   and len(json.load(open(m.CARE_EVENTS_PENDING, encoding="utf-8"))) == 2
+   and "2 event(s) wait" in errs.getvalue(), errs.getvalue())
+with contextlib.redirect_stderr(errs):
+    m._care_broker([("reboot.started", "kernel", "x")], moved, None)
+ok("noch eins dazu, in Reihenfolge", [x["topic"] for x in json.load(open(m.CARE_EVENTS_PENDING, encoding="utf-8"))]
+   == [f"oaap/{t}/node/{host}" for t in tids] * 2)
+ip_was = m.container_ip
+m.container_ip = lambda c, n: "<no value>"
+errs = _io.StringIO()
+with contextlib.redirect_stderr(errs):
+    n = m._care_broker_flush()
+ok("ein gestoppter Container antwortet '<no value>': keine Adresse, gesagt, nichts fliegt",
+   n == 0 and "has no address" in errs.getvalue() and len(json.load(open(m.CARE_EVENTS_PENDING, encoding="utf-8"))) == 4,
+   errs.getvalue())
+m.container_ip = ip_was
+BROKER_DOWN[0] = False
+n = m._care_broker_flush()
+ok("der Broker ist zurueck: die naechste Minute schickt alles, aelteste zuerst, die Datei ist weg",
+   n == 4 and [p[1]["kind"] for p in PUB] == ["reboot.moved", "reboot.moved", "reboot.started", "reboot.started"]
+   and not os.path.exists(m.CARE_EVENTS_PENDING), (n, [p[1]["kind"] for p in PUB]))
+c0 = len(CONNECTS)
+ok("nichts mehr zu schicken: kein Verbinden", m._care_broker_flush() == 0 and len(CONNECTS) == c0)
+del PUB[:]
+m._care_announce([("reboot.done", "kernel", "rebooted; running 6.12.115")], stored=moved)
+ok("_care_announce: Log, Eingaenge UND Broker (state done)",
+   [p[1]["state"] for p in PUB] == ["done", "done"] and "6.12" not in json.dumps(PUB), PUB)
+PROFILES.clear()
 
 print("")
 print("ALLE PASS" if not fails else f"{fails} FAIL")

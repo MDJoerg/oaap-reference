@@ -645,6 +645,32 @@ ok("the door file round-trips next to the site files",
    hc.write_door(dict(node(), plan=crit), tmp).endswith(hc.DOOR_FILE)
    and json.load(open(os.path.join(tmp, hc.DOOR_FILE)))["urgency"] == "critical")
 
+print("\n-- test 22: the event on a broker node (2.7.8)")
+ok("the topic: the tenant's tree, type node, the host", hc.event_topic("t-1", HOST) == f"oaap/t-1/node/{HOST}")
+msgs = hc.event_messages([("reboot.planned", "kernel", "x")], held, None, HOST, now="2026-11-06T10:00:00Z", tz=BERLIN)
+ok("announced: the RFC-0032 envelope and the five facts of the case, plus the case's sentence",
+   len(msgs) == 1 and msgs[0]["kind"] == "reboot.planned" and msgs[0]["object_id"] == f"urn:oaap:node:{HOST}"
+   and msgs[0]["group_key"] == "care" and msgs[0]["origin"] == "oaap.node.care"
+   and msgs[0]["recorded_at"] == "2026-11-06T10:00:00Z" and msgs[0]["ref"] == "kernel:2026-11-06T10:00:00Z"
+   and msgs[0]["state"] == "planned" and msgs[0]["at"] == "2026-11-14T03:15:00Z"
+   and msgs[0]["at_local"] == "2026-11-14 04:15 CET" and msgs[0]["urgency"] == "care"
+   and msgs[0]["reason"] == "ein Kernel-Update wartet (aus dem Sicherheitsarchiv der Distribution)"
+   and msgs[0]["held_by"][0]["instance"] == "joerg-desk" and msgs[0]["overridden"] == []
+   and msgs[0]["text"].startswith(f"Der Knoten {HOST} startet am 2026-11-14 04:15 CET neu."), msgs)
+ok("no kernel version in the event", "6.12" not in json.dumps(msgs))
+msgs = hc.event_messages([("reboot.planned", "manual", "x")], m, None, HOST, now="n", tz=BERLIN)
+ok("a plan by hand: the operator's reason", msgs[0]["reason"] == "glibc update", msgs[0]["reason"])
+msgs = hc.event_messages([("reboot.done", "kernel", "rebooted; running 6.12.115")], None, held, HOST, now="n", tz=BERLIN)
+ok("done from the plan that closed: state done, the proof as the sentence",
+   msgs[0]["state"] == "done" and msgs[0]["at"] == held["at"] and "läuft wieder" in msgs[0]["text"], msgs)
+msgs = hc.event_messages([("reboot.cancelled", "manual", "cancelled: Irrtum")], None, m, HOST, now="n", tz=BERLIN)
+ok("cancelled: state cancelled, the words", msgs[0]["state"] == "cancelled" and "Irrtum" in msgs[0]["text"], msgs)
+ok("instance.protected and the like: no event, same rule as the case",
+   hc.event_messages([("instance.protected", "x", "y")], held, None, HOST, now="n") == [])
+ok("two events, two messages, in order",
+   [x["kind"] for x in hc.event_messages([("reboot.moved", "kernel", "x"), ("reboot.override", "joerg-desk", "y")],
+                                         crit, held, HOST, now="n", tz=BERLIN)] == ["reboot.moved", "reboot.override"])
+
 print()
 print("FAILED" if fails else "ALL PASS", f"({fails} failing)")
 sys.exit(1 if fails else 0)

@@ -8790,6 +8790,107 @@ def _care_cases(events, plan, stored):
         plan["cases"] = cases
 
 
+# 2.7.8: the event on a broker node. The minute job publishes from the
+# host with the platform's relay principal (oaap.events.broker 2.4) --
+# the relay container is the twin's and is not extended for this. The
+# broker's container address on the platform network, the plain port
+# that never leaves the node; a message the broker did not take waits in
+# a file and goes with the next minute (the broker comes up late after
+# the very reboot the last message is about).
+CARE_RELAY_USER = "oaap.relay"            # identity's RELAY_USER, exactly
+CARE_EVENT_CLIENT = "oaap-node-care"
+CARE_EVENTS_PENDING = os.path.join(APPS_DIR, "care-events-pending.json")
+CARE_EVENTS_KEEP = 50
+CARE_BROKER_CONTAINER = "oaap-broker-1"
+
+
+def _care_broker_tenants():
+    """The tenants whose tree carries the node's event: the operator
+    tenants of RFC-0069 §4, the ones that hold an inbox."""
+    return sorted({_instance_tenant_id(i) for i in _care_inboxes().values()} - {""})
+
+
+def _care_publish(messages):
+    """Publish [(topic, payload bytes)] retained, QoS 1, as the relay
+    principal. Raises metrics_sender.SenderError / OSError with a
+    sentence; a message the broker refused is said as such."""
+    key = _read_platform_env("BROKER_RELAY_KEY")
+    if not key:
+        raise OSError("no BROKER_RELAY_KEY in the platform .env (oaap update makes one)")
+    ip = container_ip(CARE_BROKER_CONTAINER, PLATFORM_NETWORK)
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        # A stopped container answers "<no value>", not "" -- measured.
+        raise OSError(f"{CARE_BROKER_CONTAINER} has no address on {PLATFORM_NETWORK} "
+                      "(is the broker running?)") from None
+    cfg = {"url": f"mqtt://{ip}:1883", "user": CARE_RELAY_USER, "node": socket.gethostname()}
+    client = metrics_sender.Client(cfg, time.monotonic() + 15, client_id=CARE_EVENT_CLIENT)
+    client.connect(key)
+    try:
+        for topic, payload in messages:
+            client.publish(topic, payload)
+    finally:
+        client.close()
+
+
+def _care_pending_rw(fn):
+    try:
+        with open(CARE_EVENTS_PENDING, encoding="utf-8") as f:
+            pending = json.load(f)
+    except (OSError, ValueError):
+        pending = []
+    pending = fn(list(pending) if isinstance(pending, list) else [])
+    if pending:
+        tmp = CARE_EVENTS_PENDING + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(pending[-CARE_EVENTS_KEEP:], f, ensure_ascii=False)
+        os.replace(tmp, CARE_EVENTS_PENDING)
+    elif os.path.exists(CARE_EVENTS_PENDING):
+        os.remove(CARE_EVENTS_PENDING)
+    return pending
+
+
+def _care_broker_flush():
+    """Send what waits for the broker, oldest first; what the broker did
+    not take stays. Called with every event and every minute. Returns
+    the number sent."""
+    if not has_profile("broker"):
+        return 0
+    pending = _care_pending_rw(lambda p: p)
+    if not pending:
+        return 0
+    try:
+        _care_publish([(m["topic"], m["payload"].encode("utf-8")) for m in pending])
+    except (metrics_sender.SenderError, metrics_sender.ConfigError, OSError) as e:
+        print(f"node care: broker: {len(pending)} event(s) wait: {e}", file=sys.stderr)
+        return 0
+    _care_pending_rw(lambda p: p[len(pending):])
+    return len(pending)
+
+
+def _care_broker(events, plan, stored):
+    """2.7.8: the node's event on every operator tenant's tree, where the
+    node runs a broker. Queued, then sent -- never lost to a broker that
+    is still starting."""
+    if not has_profile("broker"):
+        return
+    host = socket.gethostname()
+    msgs = host_care.event_messages(events, plan, stored, host, tz=host_care.local_tz())
+    if not msgs:
+        return
+    tids = _care_broker_tenants()
+    if not tids:
+        print("node care: broker: no inbox on this node, so no tenant tree for the event",
+              file=sys.stderr)
+        return
+    new = [{"topic": host_care.event_topic(tid, host),
+            "payload": json.dumps(m, ensure_ascii=False, separators=(",", ":"))}
+           for m in msgs for tid in tids]
+    _care_pending_rw(lambda p: p + new)
+    _care_broker_flush()
+
+
 def _care_announce(events, who="root", role="root", only_tenant=None, plan=None, stored=None):
     """File the plan's events (oaap.core.tenant 1.7, `reboot.*`) in EVERY
     tenant's log on the node -- a reboot concerns all of them -- or, for
@@ -8803,6 +8904,7 @@ def _care_announce(events, who="root", role="root", only_tenant=None, plan=None,
             audit_tenant(action, tid, subject, "ok", who=who, role=role, detail=detail)
     if plan is not None or stored is not None:
         _care_cases(events, plan, stored)
+        _care_broker(events, plan, stored)
 
 
 def _care_evaluate(facts, now=None, who="root", role="root"):
@@ -8822,6 +8924,11 @@ def _care_evaluate(facts, now=None, who="root", role="root"):
         host_care.clear_plan(APPS_DIR)
     facts["plan"] = plan
     facts["protections"] = host_care._held_rows(live)
+    # 2.7.8: an event the broker did not take yet goes now.
+    try:
+        _care_broker_flush()
+    except OSError as e:
+        print(f"node care: broker: {e}", file=sys.stderr)
     # 2.7.7: the door an instance reads, every minute, and the listener
     # that serves it once (a node updated before 0.1.223 has none yet).
     try:

@@ -974,6 +974,76 @@ def case_ops(events, plan, stored, host, tz=None):
     return ops
 
 
+# --- the event on a broker node (2.7.8, RFC-0069 stage 4) -------------------
+#
+# Where the node runs a broker, every move of the plan is one retained
+# message on the operator tenant's tree, `oaap/<tenant>/node/<hostname>`:
+# the envelope of RFC-0032 (kind, object, group, origin, recorded_at) and
+# the five facts the case carries (when, urgency, reason in words, held
+# by, overridden) plus the case's own sentence. Never a kernel version.
+# The last message on the topic is the plan's last state, so a subscriber
+# arriving later still knows (done, cancelled) -- the topic is not cleared.
+
+EVENT_SCHEMA = "oaap.care-event/0.1"
+EVENT_TYPE = "node"
+EVENT_GROUP = "care"
+EVENT_ORIGIN = "oaap.node.care"
+_CLOSED_STATE = {"reboot.done": "done", "reboot.cancelled": "cancelled"}
+
+
+def event_topic(tenant_id, host):
+    """The topic of the node's care event on one tenant's tree."""
+    return f"oaap/{tenant_id}/{EVENT_TYPE}/{host}"
+
+
+def reason_text(plan):
+    """The reason as the case says it: the operator's words for a plan by
+    hand, the kernel's origin in words otherwise -- never the version."""
+    if plan.get("source") == "manual":
+        return plan.get("reason", "")
+    return "ein Kernel-Update wartet (" + ORIGIN_DE.get(plan.get("origin", ""),
+                                                        "Herkunft unbekannt") + ")"
+
+
+def event_ref(plan):
+    """What makes two events the same plan -- like plan_ref, but without
+    the kernel: the event leaves the node, the version does not."""
+    return f"{plan.get('source', '')}:{plan.get('announced', '')}"
+
+
+def event_messages(events, plan, stored, host, now=None, tz=None):
+    """[payload dict] -- one per event the inboxes would hear (the same
+    rule as case_ops, so case and event never disagree), in order. `now`
+    is the ISO time stamped as recorded_at."""
+    cur = plan or stored or {}
+    now = now or now_iso()
+    out = []
+    for ev in events:
+        ops = case_ops([ev], plan, stored, host, tz)
+        if not ops:
+            continue
+        op = ops[0]
+        out.append({
+            "schema": EVENT_SCHEMA,
+            "kind": ev[0],
+            "object_id": f"urn:oaap:node:{host}",
+            "group_key": EVENT_GROUP,
+            "origin": EVENT_ORIGIN,
+            "recorded_at": now,
+            "node": host,
+            "ref": event_ref(cur),
+            "state": _CLOSED_STATE.get(ev[0], cur.get("state")),
+            "at": cur.get("at"),
+            "at_local": cur.get("at_local"),
+            "urgency": cur.get("urgency"),
+            "reason": reason_text(cur),
+            "held_by": list(cur.get("held_by") or []),
+            "overridden": list(cur.get("overridden") or []),
+            "text": op.get("body") if op["op"] == "open" else op.get("text", ""),
+        })
+    return out
+
+
 # --- the door an instance reads (2.7.7, RFC-0069 stage 3) ------------------
 #
 # What an app may know about the node's reboot: when, how urgent, whether a
