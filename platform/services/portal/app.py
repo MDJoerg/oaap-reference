@@ -355,6 +355,18 @@ DASHBOARD_BODY = """
 {% if place_title %}
 <p class="muted">Die Apps dieses Mandanten, so weit Ihre Rollen reichen.</p>
 {% endif %}
+{# oaap.core.updates 2.7.5: a planned reboot concerns everybody on the
+   node, so every signed-in person sees it on their place -- time and
+   urgency, the reason only in the operator's words. #}
+{% if plan_text %}
+<div class="card warn">
+  <h2>Geplanter Neustart dieses Knotens</h2>
+  <p>{{ plan_text }}</p>
+  <p class="muted">Ein Neustart des Knotens trifft jede App darauf; offene Arbeit
+     vorher sichern. Ein Schutz je Instanz ist am Knoten möglich
+     (<code>sudo oaap node care protect &lt;instanz&gt; --reason …</code>).</p>
+</div>
+{% endif %}
 {# oaap.core.updates 2.6.2: the care band -- only a server_admin, only
    when something needs a hand (a reboot, auto-updates, the gateway). #}
 {% if care %}
@@ -1021,7 +1033,9 @@ HEALTH_BODY = """
   <p class="muted">{% if care_when %}Gemessen {{ care_when }} UTC auf der Maschine
      (der Minutenlauf misst alle zehn Minuten neu).{% endif %}
      Einstellungen an der Maschine: <code>sudo oaap node care auto-updates on</code>,
-     <code>sudo oaap node care reboot-window HH:MM | off</code>.</p>
+     <code>sudo oaap node care reboot-window HH:MM | off</code>,
+     <code>sudo oaap node care protect &lt;instanz&gt; --reason …</code>,
+     <code>sudo oaap node care reboot at 'YYYY-MM-DD HH:MM' --reason …</code>.</p>
 </div>
 <div class="card">
   <h2>Kernservices</h2>
@@ -4389,9 +4403,12 @@ def dashboard():
         care, care_when = care_state()
         if host_care.worst(care) not in ("warn", "err"):
             care = []
+    # 2.7.5: the plan, for everybody on the node.
+    plan_text = host_care.plan_text((care_facts() or {}).get("plan"), de=True)
     return page(DASHBOARD_BODY, place_title or "Apps", "apps",
                 sections=iv.grouped_tiles(tiles),
                 place_title=place_title, care=care, care_when=care_when,
+                plan_text=plan_text,
                 hidden_count=hidden if "server_admin" in roles else 0)
 
 
@@ -5351,7 +5368,23 @@ def care_rows(facts):
                    + (f"; letzter Lauf {(a.get('last_run') or '')[:16].replace('T', ' ')} UTC"
                       if a.get("last_run") else "")
                    + (f"; Neustart-Fenster {win}" if win != "off" else "; kein Neustart-Fenster")),
-    }, {
+    }]
+    plan = facts.get("plan")
+    if plan:
+        rows.append({
+            "name": "Neustart-Plan",
+            "state": {"overdue": "err"}.get(plan.get("state"), "warn"),
+            "label": plan.get("at_local", ""),
+            "detail": host_care.plan_text(plan, de=True),
+        })
+    if facts.get("protections"):
+        rows.append({
+            "name": "Neustart-Schutz",
+            "state": "ok",
+            "label": f"{len(facts['protections'])} Instanz(en)",
+            "detail": host_care.protections_text(facts["protections"], de=True),
+        })
+    rows += [{
         "name": "Gateway-Listener",
         "state": {"off": "ok", "on": "warn"}.get(g.get("mptcp"), "unknown"),
         "label": {"off": "reines TCP", "on": "MPTCP"}.get(g.get("mptcp"), "unbekannt"),
@@ -6063,7 +6096,8 @@ def fleet_status():
             pending.append(name)
     dns = dns_check() or {}
     # 0.5: the care state of the machine, whitelisted (oaap.core.updates
-    # 2.6) -- the view that was missing on 2026-11-05.
+    # 2.6) -- the view that was missing on 2026-11-05; 0.6: the reboot
+    # plan and the protections (2.7).
     facts = care_facts()
     return fleet_view.build_document(
         host=host_care.fleet_host(facts),

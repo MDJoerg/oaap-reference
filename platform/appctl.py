@@ -8606,45 +8606,131 @@ def cmd_broker(args):
         print("  plain port 1883: not published (profile 'broker-plain')")
 
 
+def _care_known_instances():
+    return set((load_registry().get("instances") or {}).keys())
+
+
+def _care_tenant_of(name):
+    inst = (load_registry().get("instances") or {}).get(name) or {}
+    return resolve_tenant(inst.get("tenant")) or ""
+
+
+def _care_announce(events, who="root", role="root", only_tenant=None):
+    """File the plan's events (oaap.core.tenant 1.7, `reboot.*`) in EVERY
+    tenant's log on the node -- a reboot concerns all of them -- or, for
+    an instance's own entries, in its tenant only."""
+    if not events:
+        return
+    tenants = [only_tenant] if only_tenant else list(load_tenants().keys())
+    for action, subject, detail in events:
+        for tid in tenants:
+            audit_tenant(action, tid, subject, "ok", who=who, role=role, detail=detail)
+
+
+def _care_evaluate(facts, now=None, who="root", role="root"):
+    """2.7.1: the plan from the facts, the live protections and the
+    stored plan; the events filed; the care file carries the live view
+    of both for the three readers. Returns the facts, completed."""
+    tz = host_care.local_tz()
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    live = host_care.live_protections(host_care.load_protections(APPS_DIR),
+                                      _care_known_instances(), now.astimezone(tz).date())
+    stored = host_care.load_plan(APPS_DIR)
+    plan, events = host_care.compute_plan(facts, live, stored, now=now, tz=tz)
+    _care_announce(events, who=who, role=role)
+    if plan:
+        host_care.save_plan(plan, APPS_DIR)
+    elif stored:
+        host_care.clear_plan(APPS_DIR)
+    facts["plan"] = plan
+    facts["protections"] = host_care._held_rows(live)
+    return facts
+
+
+def _care_fresh(who="root", role="root"):
+    """Measure, evaluate, write -- the one path every verb ends in."""
+    host_care.migrate_conf()
+    facts = host_care.measure(external=load_external() or "")
+    facts = _care_evaluate(facts, who=who, role=role)
+    host_care.write(facts, APPS_DIR)
+    return facts
+
+
+def _care_reboot_if_due(facts):
+    """2.7.1, the act on fresh facts: T has come -> measure again, and
+    reboot only when the rules still allow it. Announces, marks the
+    plan `rebooting`, writes the care file, then `systemctl reboot`."""
+    plan = facts.get("plan")
+    if not host_care.due(plan):
+        return False
+    facts = _care_fresh()
+    plan = facts.get("plan")
+    if not plan or plan.get("state") == "rebooting":
+        return False
+    tz = host_care.local_tz()
+    live = host_care.live_protections(host_care.load_protections(APPS_DIR),
+                                      _care_known_instances(),
+                                      datetime.datetime.now(tz).date())
+    allowed, why = host_care.may_reboot(facts, plan, live)
+    if not allowed:
+        # Not silently: the plan says so next minute (moved or held).
+        return False
+    plan["state"] = "rebooting"
+    plan["rebooting_at"] = host_care.now_iso()
+    host_care.save_plan(plan, APPS_DIR)
+    facts["plan"] = plan
+    host_care.write(facts, APPS_DIR)
+    _care_announce([("reboot.started", plan.get("source", ""),
+                     f"{plan.get('at_local')} ({plan.get('urgency')}): {why}")])
+    subprocess.run(["systemctl", "reboot"], capture_output=True, text=True)
+    return True
+
+
 def cmd_node_care(args):
     """`oaap node care [measure | sample | auto-updates on |
-    reboot-window HH:MM|off]` (oaap.core.updates 2.6, oaap.core.host 2.3).
+    reboot-window HH:MM|off | reboot at <time>|cancel | protect <inst> |
+    release <inst>]` (oaap.core.updates 2.6 and 2.7, oaap.core.host 2.3).
 
     Without a verb: measure afresh when root, else show the last
     measurement. `measure` is quiet (migrate.sh); `sample` is the minute
-    job and re-measures only past ten minutes. The two settings require
-    root like everything that changes the node (main's rule), and both
-    re-measure when done so the status answers the change at once.
+    job: re-measures past ten minutes, evaluates the plan EVERY minute
+    and runs the reboot at its hour. The settings require root like
+    everything that changes the node (main's rule), and every verb
+    re-measures when done so the status answers the change at once.
     """
     verb = (args.profile or "").strip().lower()
-    rest = [r.strip().lower() for r in (getattr(args, "rest", None) or [])]
+    rest = [r.strip() for r in (getattr(args, "rest", None) or [])]
     root = not hasattr(os, "geteuid") or os.geteuid() == 0
-
-    def fresh():
-        facts = host_care.measure()
-        host_care.write(facts, APPS_DIR)
-        if host_care.ensure_marker(facts):
-            print(f"Reboot marker written ({host_care.REBOOT_MARKER}): the "
-                  f"node reboots at {facts['reboot_window']}.")
-        return facts
+    who = os.environ.get("SUDO_USER") or "root"
+    reason = getattr(args, "care_reason", None) or ""
 
     if verb == "sample":
         facts = host_care.read(APPS_DIR)
-        if facts and not host_care.is_stale(facts):
-            return
-        fresh()
+        # A measurement younger than ten minutes is still the OLD machine
+        # when the node has booted since (measured 2026-11-05: the plan
+        # stayed `rebooting` for a minute job that trusted the file).
+        # The boot time is the fact that says so.
+        if (not facts or host_care.is_stale(facts)
+                or facts.get("boot_time") != host_care.boot_time()):
+            facts = _care_fresh()
+        else:
+            before = json.dumps(facts.get("plan"), sort_keys=True)
+            facts = _care_evaluate(facts)
+            if json.dumps(facts.get("plan"), sort_keys=True) != before:
+                host_care.write(facts, APPS_DIR)
+        _care_reboot_if_due(facts)
         return
     if verb == "measure":
-        fresh()
+        _care_fresh()
         return
     if verb == "":
-        facts = fresh() if root else host_care.read(APPS_DIR)
+        facts = _care_fresh() if root else host_care.read(APPS_DIR)
         host_care.print_status(facts)
         if not root:
             print("  (last measurement; 'sudo oaap node care' measures afresh)")
         return
     if verb == "auto-updates":
-        if rest != ["on"]:
+        if [r.lower() for r in rest] != ["on"]:
             die("usage: oaap node care auto-updates on")
         try:
             host_care.auto_updates_enable()
@@ -8657,11 +8743,82 @@ def cmd_node_care(args):
             host_care.reboot_window_set(rest[0])
         except ValueError as e:
             die(str(e))
+    elif verb == "reboot":
+        # 2.7.1: a hand-made plan, or the stored plan cancelled.
+        sub = (rest[0].lower() if rest else "")
+        if sub == "cancel":
+            stored = host_care.load_plan(APPS_DIR)
+            if not stored:
+                print("No stored plan.")
+            else:
+                host_care.clear_plan(APPS_DIR)
+                _care_announce([("reboot.cancelled", stored.get("source", ""),
+                                 f"{stored.get('at_local')} cancelled"
+                                 + (": " + reason if reason else ""))],
+                               who=who, role="server_admin")
+                print(f"Plan for {stored.get('at_local')} cancelled"
+                      + (" -- a computed plan returns next minute with a fresh lead "
+                         "while the kernel waits." if stored.get("source") == "kernel"
+                         else "."))
+        elif sub == "at" and len(rest) >= 2:
+            try:
+                plan = host_care.manual_plan(" ".join(rest[1:]), reason, who,
+                                             critical=bool(getattr(args, "care_critical", False)),
+                                             tz=host_care.local_tz())
+            except ValueError as e:
+                die(str(e))
+            host_care.save_plan(plan, APPS_DIR)
+            _care_announce([("reboot.planned", "manual",
+                             f"{plan['at_local']} ({plan['urgency']}, by hand"
+                             + (", sooner than 24 h" if plan.get("shortened") else "")
+                             + f"): {plan['reason']}")], who=who, role="server_admin")
+            print(f"Reboot planned by hand: {plan['at_local']} ({plan['urgency']}).")
+            facts = _care_fresh(who=who, role="server_admin")
+            if host_care.due(facts.get("plan")):
+                print("Due now: measuring once more and rebooting.")
+                if not _care_reboot_if_due(facts):
+                    print("Not rebooted: " + host_care.may_reboot(
+                        facts, facts.get("plan"), {})[1])
+                return
+        else:
+            die("usage: oaap node care reboot at 'YYYY-MM-DD HH:MM'|now --reason \"...\" "
+                "[--critical] | reboot cancel")
+    elif verb in ("protect", "release"):
+        # 2.7.2: a protection -- reason, end, and the tenant's log.
+        if len(rest) != 1:
+            die(f"usage: oaap node care {verb} <instance>"
+                + (" --reason \"...\" [--until YYYY-MM-DD]" if verb == "protect" else ""))
+        name = rest[0]
+        if name not in _care_known_instances():
+            die(f"no instance '{name}' on this node")
+        prot = host_care.load_protections(APPS_DIR)
+        tid = _care_tenant_of(name)
+        if verb == "protect":
+            try:
+                rec = host_care.protect(prot, name, reason, who, tid,
+                                        until=getattr(args, "care_until", None))
+            except ValueError as e:
+                die(str(e))
+            host_care.save_protections(prot, APPS_DIR)
+            _care_announce([("instance.protected", name,
+                             f"until {rec['until']}: {rec['reason']}")],
+                           who=who, role="server_admin", only_tenant=tid)
+            print(f"{name} protected against a care reboot until {rec['until']}: "
+                  f"{rec['reason']}")
+        else:
+            if host_care.release(prot, name):
+                host_care.save_protections(prot, APPS_DIR)
+                _care_announce([("instance.released", name, "released")],
+                               who=who, role="server_admin", only_tenant=tid)
+                print(f"{name} released.")
+            else:
+                print(f"{name} was not protected.")
     else:
         die("usage: oaap node care [measure | sample | auto-updates on | "
-            "reboot-window HH:MM|off]")
+            "reboot-window HH:MM|off | reboot at <time>|cancel | "
+            "protect <instance> | release <instance>]")
     print("")
-    host_care.print_status(fresh())
+    host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
 
 def cmd_node(args):
@@ -28378,7 +28535,14 @@ def main():
                     help="node profile, e.g. dev (RFC-0011); for 'care': "
                          "measure | sample | auto-updates | reboot-window")
     pn.add_argument("rest", nargs="*",
-                    help="care auto-updates on | care reboot-window HH:MM|off")
+                    help="care auto-updates on | care reboot-window HH:MM|off | "
+                         "care reboot at <time>|cancel | care protect|release <inst>")
+    pn.add_argument("--reason", dest="care_reason", default="",
+                    help="for care reboot/protect: why, in words every tenant can read")
+    pn.add_argument("--until", dest="care_until", default=None,
+                    help="for care protect: the last day (YYYY-MM-DD, default 7 days)")
+    pn.add_argument("--critical", dest="care_critical", action="store_true",
+                    help="for care reboot at: urgency critical (overrides protections)")
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "
