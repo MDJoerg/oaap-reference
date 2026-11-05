@@ -974,6 +974,33 @@ def case_ops(events, plan, stored, host, tz=None):
     return ops
 
 
+# --- the door an instance reads (2.7.7, RFC-0069 stage 3) ------------------
+#
+# What an app may know about the node's reboot: when, how urgent, whether a
+# protection holds it, and the plan's state -- never which kernel, never
+# why. Served by the gateway on a listener that is never published, so
+# only a container on the node can read it; the file lies next to the
+# site files, which the gateway already mounts.
+
+DOOR_SCHEMA = "oaap.care-door/0.1"
+DOOR_FILE = "_care-door.json"
+
+
+def door_facts(facts):
+    plan = (facts or {}).get("plan") or {}
+    return {"schema": DOOR_SCHEMA,
+            "reboot_at": plan.get("at") or None,
+            "at_local": plan.get("at_local") or None,
+            "urgency": plan.get("urgency") or None,
+            "held": bool(plan.get("held_by")),
+            "state": plan.get("state") or None,
+            "measured": (facts or {}).get("measured") or now_iso()}
+
+
+def write_door(facts, sites_dir):
+    return _write_json(os.path.join(sites_dir, DOOR_FILE), door_facts(facts))
+
+
 # --- the three readers -----------------------------------------------------
 
 def plan_text(plan, de=False):

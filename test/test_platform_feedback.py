@@ -22,6 +22,10 @@ Was hier gehalten wird:
    platform:<diese Instanz> annimmt; keine andere Site traegt sie. Der
    Schluessel je Posteingang wird einmal gepraegt und erneuert, und die
    Vorgaenge gehen in jeden Produktions-Eingang, einen je Mandant.
+9. RFC-0069 Stufe 3 (0.1.223): die Tuer, die eine Instanz liest --
+   /platform/care.json auf einem nie veroeffentlichten Port, die Datei
+   neben den Site-Dateien; jede Instanz erfaehrt OAAP_CARE_URL, die
+   Migration traegt es in jede instance.env.
 """
 import contextlib
 import io as _io
@@ -456,6 +460,48 @@ del POSTS[:]
 m._care_announce([("reboot.cancelled", "kernel", "x cancelled")], stored=moved)
 ok("_care_announce mit stored: das Mandanten-Log UND die Eingaenge (close)",
    [p[1]["op"] for p in POSTS] == ["close", "close"], POSTS)
+
+print("")
+print("9. Die Tuer, die eine Instanz liest (RFC-0069 Stufe 3)")
+import host_care as _hc  # noqa: E402
+carep = os.path.join(m.CADDY_APPS_DIR, "_internal-care.caddy")
+if os.path.exists(carep):
+    os.remove(carep)
+ok("der Listener wird geschrieben", m.write_internal_care_caddy() is True and os.path.exists(carep))
+cbody = open(carep, encoding="utf-8").read()
+ok("Port 8097 (nie veroeffentlicht), file_server aus dem Site-Verzeichnis, die Door-Datei, kein Cache",
+   ":8097 {" in cbody and "root * /etc/caddy/apps" in cbody and f"rewrite * /{_hc.DOOR_FILE}" in cbody
+   and "file_server" in cbody and "Cache-Control no-store" in cbody and "respond 404" in cbody, cbody)
+ok("ein zweiter Lauf aendert nichts", m.write_internal_care_caddy() is False)
+ok("die Adresse, die jede Instanz erfaehrt",
+   m.care_url() == "http://oaap-gateway-1:8097/platform/care.json" and "OAAP_CARE_URL" in m.RESERVED_ENV)
+reg = m.load_registry()
+for n, inst in reg["instances"].items():
+    e = m.load_env(n, inst)
+    e.pop("OAAP_CARE_URL", None)
+    m.save_env(n, e, inst)
+os.remove(carep)
+del RELOADS[:]
+out = _io.StringIO()
+with contextlib.redirect_stdout(out):
+    m.cmd_migrate_care_url(None)
+envs = {n: m.load_env(n, i).get("OAAP_CARE_URL") for n, i in reg["instances"].items()}
+ok("die Migration schreibt den Listener, laedt das Gateway einmal und traegt OAAP_CARE_URL in jede instance.env",
+   os.path.exists(carep) and RELOADS == [1] and set(envs.values()) == {m.care_url()}
+   and f"told to {len(envs)} instance(s)" in out.getvalue(), (envs, out.getvalue()))
+del RELOADS[:]
+out = _io.StringIO()
+with contextlib.redirect_stdout(out):
+    m.cmd_migrate_care_url(None)
+ok("ein zweiter Lauf schweigt und laedt nicht", out.getvalue() == "" and not RELOADS, out.getvalue())
+facts = {"measured": "2026-11-06T10:00:00Z", "plan": {"at": "2026-11-08T03:15:00Z", "at_local": "x",
+                                                    "urgency": "care", "held_by": [], "state": "planned",
+                                                    "reason": "secret", "kernel": "6.12.120"}}
+_hc.write_door(facts, m.CADDY_APPS_DIR)
+door = json.load(open(os.path.join(m.CADDY_APPS_DIR, _hc.DOOR_FILE), encoding="utf-8"))
+ok("die Door-Datei liegt neben den Sites und traegt weder Grund noch Kernel",
+   door["reboot_at"] == "2026-11-08T03:15:00Z" and "secret" not in json.dumps(door)
+   and "6.12" not in json.dumps(door), door)
 
 print("")
 print("ALLE PASS" if not fails else f"{fails} FAIL")

@@ -332,6 +332,13 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-identity-hea
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-platform-routes \
   2>&1 | sed 's/^/  /' || say "  WARNING: /platform/* could not be reserved on the gateway sites — run 'oaap status'."
 
+# --- the door an instance reads (0.1.223, RFC-0069 stage 3) ---
+# /platform/care.json on a listener that is never published, and the
+# address in every instance.env; a running container learns it at its
+# next restart.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-care-url \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the care door could not be opened — run 'sudo oaap node care'."
+
 # --- notes about data that is in use again (0.1.110) ---
 # `oaap app remove` without --purge leaves a note so that reinstalling
 # under the same name finds the data again. The reinstall then does

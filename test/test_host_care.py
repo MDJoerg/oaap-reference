@@ -31,7 +31,8 @@ and stage 2 (2.7.6, 0.1.222):
   (Debian 13, every node of the fleet, 2026-11-05);
 - what the inboxes hear: one `open` per plan, a `note` per move, a `close`
   with the proof -- in words, without a kernel version (test 19);
-- the case numbers travel with the plan across minutes (test 20).
+- the case numbers travel with the plan across minutes (test 20);
+- the door an instance reads says when, not why (2.7.7, test 21).
 
 Run: python3 test/test_host_care.py
 """
@@ -628,6 +629,21 @@ mw, ev = hc.compute_plan(node(running="6.12.115+deb13.1-amd64", external=""), li
 ok("a hand-made plan carries them too", mw["cases"] == {"vorgaenge": "V-1"}, mw)
 ok("the ref of the moved plan is the ref of the first announcement",
    hc.plan_ref(mv) == hc.plan_ref(carep))
+
+print("\n-- test 21: the door an instance reads (2.7.7)")
+d = hc.door_facts(dict(node(external=""), plan=held, measured="2026-11-06T10:00:00Z"))
+ok("with a held care plan: when, local time, urgency, held, state, measured -- and nothing else",
+   d == {"schema": "oaap.care-door/0.1", "reboot_at": "2026-11-14T03:15:00Z",
+         "at_local": "2026-11-14 04:15 CET", "urgency": "care", "held": True,
+         "state": "planned", "measured": "2026-11-06T10:00:00Z"}, d)
+ok("no kernel, no reason, no instance names in the door",
+   "6.12" not in json.dumps(d) and "reason" not in d and "joerg-desk" not in json.dumps(d))
+d0 = hc.door_facts(node(running="6.12.115+deb13.1-amd64", external=""))
+ok("without a plan: nulls, not held", d0["reboot_at"] is None and d0["urgency"] is None
+   and d0["held"] is False and d0["state"] is None, d0)
+ok("the door file round-trips next to the site files",
+   hc.write_door(dict(node(), plan=crit), tmp).endswith(hc.DOOR_FILE)
+   and json.load(open(os.path.join(tmp, hc.DOOR_FILE)))["urgency"] == "critical")
 
 print()
 print("FAILED" if fails else "ALL PASS", f"({fails} failing)")
