@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host care (oaap.core.updates 2.6 and 2.7, oaap.fleet.status 0.6, 0.1.221).
+"""Host care (oaap.core.updates 2.6 and 2.7, oaap.fleet.status 0.6, 0.1.221/0.1.222).
 
 The rules the fleet measurement of 2026-11-05 (CVE-2026-98432) produced,
 executed without a node -- every command the module would run is replaced
@@ -23,7 +23,15 @@ and the rules of RFC-0069 (2.7), measured here before a kernel arrives:
 - a protection holds `care` and not `critical`, needs a reason and an end
   (test 15); urgency comes from origin and exposure (test 16);
 - the plan closes with proof, or shows as overdue (test 17);
-- the distribution's own reboot is off whatever the window (test 18).
+- the distribution's own reboot is off whatever the window (test 18);
+
+and stage 2 (2.7.6, 0.1.222):
+
+- the node's zone comes from /etc/localtime when /etc/timezone is gone
+  (Debian 13, every node of the fleet, 2026-11-05);
+- what the inboxes hear: one `open` per plan, a `note` per move, a `close`
+  with the proof -- in words, without a kernel version (test 19);
+- the case numbers travel with the plan across minutes (test 20).
 
 Run: python3 test/test_host_care.py
 """
@@ -521,6 +529,105 @@ ok("the plan file round-trips", hc.save_plan(held, tmp) and hc.load_plan(tmp)["a
    and hc.clear_plan(tmp) and hc.load_plan(tmp) is None)
 ok("the protections file round-trips",
    hc.save_protections(prot, tmp) and hc.load_protections(tmp) == prot)
+
+print("\n-- the zone from /etc/localtime (Debian 13 has no /etc/timezone)")
+zdir = os.path.join(tmp, "usr", "share", "zoneinfo", "Europe")
+os.makedirs(zdir, exist_ok=True)
+with open(os.path.join(zdir, "Berlin"), "w") as f:
+    f.write("")
+ok("no /etc/timezone, /etc/localtime -> .../zoneinfo/Europe/Berlin: the zone's name",
+   hc.zone_name(timezone_file=os.path.join(tmp, "none"), localtime=os.path.join(zdir, "Berlin")) == "Europe/Berlin")
+tz1 = hc.local_tz(timezone_file=os.path.join(tmp, "none"), localtime=os.path.join(zdir, "Berlin"))
+ok("... and the zone with its DST rule where the zoneinfo has it (here: %s)" % type(BERLIN).__name__,
+   str(tz1) == "Europe/Berlin" if type(BERLIN).__name__ == "ZoneInfo" else tz1 is not None, tz1)
+with open(os.path.join(tmp, "timezone"), "w") as f:
+    f.write("Europe/Lisbon\n")
+ok("/etc/timezone first when it exists",
+   hc.zone_name(timezone_file=os.path.join(tmp, "timezone"), localtime=os.path.join(zdir, "Berlin")) == "Europe/Lisbon")
+ok("no link into a zoneinfo: no name",
+   hc.zone_name(timezone_file=os.path.join(tmp, "none"), localtime=os.path.join(tmp, "none2")) == "")
+tz3 = hc.local_tz(timezone_file=os.path.join(tmp, "none"), localtime=os.path.join(tmp, "none2"))
+ok("neither: the offset of now, never an exception", tz3 is not None and str(tz3) != "Europe/Berlin", tz3)
+
+print("\n-- test 19: what the inboxes hear (2.7.6)")
+HOST = "oaap-test"
+critp, ev = hc.compute_plan(node(), live, None, now=T0, tz=BERLIN)
+ops = hc.case_ops(ev, critp, None, HOST, BERLIN)
+ok("announced: one open, then the override as a note",
+   [o["op"] for o in ops] == ["open", "note"], ops)
+ok("the ref names source, kernel and announcement",
+   ops[0]["ref"] == "kernel:6.12.115+deb13.1-amd64:2026-11-06T10:00:00Z", ops[0]["ref"])
+ok("the title: node, local time, urgency in German",
+   ops[0]["title"] == "Neustart des Knotens oaap-test: 2026-11-08 04:15 CET (kritisch)", ops[0]["title"])
+body = ops[0]["body"]
+ok("the body says when, why (origin in words), the overridden protection, the 24 h",
+   "startet am 2026-11-08 04:15 CET neu" in body and "Sicherheitsarchiv" in body
+   and "überstimmt (kritisch): joerg-desk bis 2026-11-13 (Schulung bis Mittwoch)" in body
+   and "Angekündigt am 2026-11-06 11:00 CET" in body and "24 Stunden" in body, body)
+ok("… and NO kernel version", "6.12" not in body and "6.12" not in ops[0]["title"], body)
+ok("the override note names the instance and the end",
+   ops[1]["text"] == "Schutz von joerg-desk bis 2026-11-13 überstimmt: der Neustart ist kritisch und wartet nicht.", ops[1])
+carep, ev = hc.compute_plan(node(external=""), {}, None, now=T0, tz=BERLIN)
+ops = hc.case_ops(ev, carep, None, HOST, BERLIN)
+ok("a care plan: Pflege, the protection rule explained",
+   ops[0]["title"].endswith("(Pflege)") and "Pflege — ein Schutz je Instanz" in ops[0]["body"], ops[0])
+movedp, ev = hc.compute_plan(node(external=""), live, carep, now=T0 + timedelta(minutes=1), tz=BERLIN)
+ops = hc.case_ops(ev, movedp, carep, HOST, BERLIN)
+ok("moved: a note with the new time and the holder",
+   ops == [{"op": "note", "text": "Verschoben auf 2026-11-14 04:15 CET: gehalten durch "
+                                   "joerg-desk bis 2026-11-13 (Schulung bis Mittwoch)."}], ops)
+backp, ev = hc.compute_plan(node(external=""), {}, movedp, now=T0 + timedelta(minutes=2), tz=BERLIN)
+ops = hc.case_ops(ev, backp, movedp, HOST, BERLIN)
+ok("released: moved back, 'nicht mehr gehalten'",
+   ops == [{"op": "note", "text": "Verschoben auf 2026-11-08 04:15 CET: nicht mehr gehalten."}], ops)
+ops = hc.case_ops([("reboot.started", "kernel", "x")], carep, None, HOST, BERLIN)
+ok("started: a note", ops == [{"op": "note", "text": "Der Knoten startet jetzt neu."}], ops)
+ops = hc.case_ops([("reboot.overdue", "kernel", "planned 2026-11-08 04:15 CET, no reboot happened")],
+                  dict(carep, state="overdue"), carep, HOST, BERLIN)
+ok("overdue (no reboot): a note asking after the minute job",
+   ops[0]["op"] == "note" and ops[0]["text"].startswith("Überfällig: geplant 2026-11-08 04:15 CET, kein Neustart"), ops)
+ops = hc.case_ops([("reboot.overdue", "kernel", "reboot started 2026-11-08T03:15:30Z, the machine has not booted since")],
+                  rebooting, rebooting, HOST, BERLIN)
+ok("overdue (started, not back): says so", "nicht wieder hochgekommen" in ops[0]["text"], ops)
+after, ev = hc.compute_plan(node(running="6.12.115+deb13.1-amd64", boot="2026-11-08T03:16:40Z"),
+                            {}, rebooting, now=datetime(2026, 11, 8, 3, 18, tzinfo=timezone.utc), tz=BERLIN)
+ops = hc.case_ops(ev, after, rebooting, HOST, BERLIN)
+ok("done: a close with the proof, from the plan that closed (the new one is None)",
+   after is None and ops == [{"op": "close", "text": "Neustart erfolgt nach 2026-11-08 04:15 CET; "
+                                                     "der Knoten oaap-test läuft wieder."}], ops)
+ops = hc.case_ops([("reboot.done", "kernel", "rebooted after x; running 6.12.115 -- but 6.12.120 still waits")],
+                  None, rebooting, HOST, BERLIN)
+ok("done with another kernel waiting: says a new plan follows", "ein neuer Plan folgt" in ops[0]["text"], ops)
+ops = hc.case_ops([("reboot.cancelled", "kernel", "the reboot window was removed")], None, carep, HOST, BERLIN)
+ok("window removed: closed as cancelled, the reason in words",
+   ops == [{"op": "close", "text": "Abgesagt — das Neustart-Fenster wurde entfernt."}], ops)
+ops = hc.case_ops([("reboot.cancelled", "manual", "2026-11-08 04:15 CET cancelled: glibc kam doch nicht")],
+                  None, m, HOST, BERLIN)
+ok("cancelled by hand with a reason: the operator's words",
+   ops == [{"op": "close", "text": "Abgesagt — vom Betreiber zurückgenommen: glibc kam doch nicht."}], ops)
+ops = hc.case_ops([("reboot.cancelled", "manual", "2026-11-08 04:15 CET cancelled")], None, m, HOST, BERLIN)
+ok("cancelled by hand without a reason", ops[0]["text"] == "Abgesagt — vom Betreiber zurückgenommen.", ops)
+ops = hc.case_ops([("reboot.planned", "manual", "x")], m, None, HOST, BERLIN)
+ok("a plan by hand: the reason in the operator's words, the maker named",
+   "Grund (joerg, von Hand geplant): glibc update" in ops[0]["body"] and ops[0]["ref"] == "manual:hand:2026-11-06T10:00:00Z", ops[0])
+ops = hc.case_ops([("reboot.planned", "manual", "x")], m2, None, HOST, BERLIN)
+ok("sooner than 24 h: said as the operator's explicit act",
+   "ausdrücklich kürzer als 24 Stunden" in ops[0]["body"] and "Angekündigt am" not in ops[0]["body"], ops[0])
+ok("instance.protected and the like: nothing for the inboxes",
+   hc.case_ops([("instance.protected", "x", "y"), ("instance.released", "x", "y")], carep, None, HOST, BERLIN) == [])
+
+print("\n-- test 20: the case numbers travel with the plan")
+withc = dict(carep, cases={"vorgaenge": "V-2026-0007"})
+nxt, ev = hc.compute_plan(node(external=""), {}, withc, now=T0 + timedelta(minutes=3), tz=BERLIN)
+ok("same kernel plan a minute later: the cases carry over, no event",
+   nxt["cases"] == {"vorgaenge": "V-2026-0007"} and ev == [] and nxt["origin"] == "security", nxt)
+mv, ev = hc.compute_plan(node(external=""), live, withc, now=T0 + timedelta(minutes=3), tz=BERLIN)
+ok("… and across a move", mv["cases"] == {"vorgaenge": "V-2026-0007"} and ev[0][0] == "reboot.moved", mv)
+mw, ev = hc.compute_plan(node(running="6.12.115+deb13.1-amd64", external=""), live, dict(m, cases={"vorgaenge": "V-1"}),
+                         now=T0, tz=BERLIN)
+ok("a hand-made plan carries them too", mw["cases"] == {"vorgaenge": "V-1"}, mw)
+ok("the ref of the moved plan is the ref of the first announcement",
+   hc.plan_ref(mv) == hc.plan_ref(carep))
 
 print()
 print("FAILED" if fails else "ALL PASS", f"({fails} failing)")

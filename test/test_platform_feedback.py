@@ -17,6 +17,11 @@ Was hier gehalten wird:
 5. Das Manifest lehnt App-Routen unter /platform/ und /auth/ ab.
 6. Die Migration bringt den Block in Sites, die schon auf der Platte
    liegen, und schweigt beim zweiten Lauf.
+8. RFC-0069 Stufe 2 (0.1.222): die Site eines `vorgaenge` traegt die Tuer
+   des Knotens, /platform/cases/node, die nur den Schluessel von
+   platform:<diese Instanz> annimmt; keine andere Site traegt sie. Der
+   Schluessel je Posteingang wird einmal gepraegt und erneuert, und die
+   Vorgaenge gehen in jeden Produktions-Eingang, einen je Mandant.
 """
 import contextlib
 import io as _io
@@ -322,6 +327,135 @@ ok("nur ein woertliches true verlangt den Schluessel",
                                         {"cases": []}, {})] == [True, False, False, False])
 ok("OAAP_CASES_KEY und _URL sind Plattformvariablen",
    {"OAAP_CASES_KEY", "OAAP_CASES_URL"} <= m.RESERVED_ENV)
+
+print("")
+print("8. Die Tuer des Knotens auf der Site des Posteingangs (RFC-0069 Stufe 2)")
+reg = m.load_registry()
+m.write_app_caddy("vorgaenge", reg["instances"]["vorgaenge"])
+m.refresh_cases_sites()
+body = site("vorgaenge")
+nb = block(body, "handle /platform/cases/node {")
+ok("die Site des vorgaenge reserviert /platform/cases/node", nb is not None, body[:400])
+ok("/platform/cases/node landet in genau diesem Block",
+   route_for(body, "/platform/cases/node") == "handle /platform/cases/node {")
+ok("… gefragt wird der Schluessel des Knotens FUER DIESEN Posteingang, keine Rolle",
+   nb and f"uri /verify?roles=&tenant={tid}&instance=oaap.cases.node:vorgaenge" in nb, nb)
+ok("… die Herkunft ist der Posteingang selbst, das Ziel er selbst",
+   nb and "header_up X-OAAP-Source-Instance vorgaenge" in nb
+   and "header_up X-OAAP-Source-App vorgaenge" in nb
+   and "reverse_proxy oaap-app-vorgaenge:8000 {" in nb, nb)
+ok("der Block steht vor /platform/* und vor der App-Route",
+   body.index("handle /platform/cases/node {") < body.index("handle /platform/* {")
+   and body.index("handle /platform/cases/node {") < body.index("\thandle {"))
+ok("eine App-Site traegt die Tuer NICHT",
+   block(site("hbvp-portal"), "handle /platform/cases/node {") is None
+   and block(site("fremd"), "handle /platform/cases/node {") is None)
+ok("der Marker zaehlt das Format 5, damit Sites auf der Platte nachgezogen werden",
+   m.CASES_BLOCK_FORMAT == 5 and f"{m.CASES_MARKER}5 " in body)
+ok("die Migration (Abschnitt 5) findet nichts mehr zu tun", m._cases_sites_behind() == [])
+
+print("")
+print("   der Schluessel je Posteingang")
+MINTED = []
+
+
+def fake_identity_exec(script, env=None):
+    MINTED.append(dict(env or {}))
+    n = len(MINTED)
+    return json.dumps({"secret": f"oaapk_id{n}_s{n}", "id": f"id{n}",
+                       "expires": "2027-11-05T10:00:00"}) + "\n"
+
+
+m._identity_exec = fake_identity_exec
+k1 = m._node_case_key("vorgaenge", tid)
+ok("erster Gebrauch: gepraegt fuer platform:vorgaenge im Mandanten, Scope oaap.cases.node:vorgaenge",
+   k1 == "oaapk_id1_s1" and MINTED[-1]["OAAP_T_NAME"] == "platform:vorgaenge"
+   and MINTED[-1]["OAAP_T_TENANT"] == tid and MINTED[-1]["OAAP_T_SCOPE"] == "oaap.cases.node:vorgaenge"
+   and MINTED[-1]["OAAP_T_OLD"] == "", MINTED)
+ok("zweiter Gebrauch: derselbe Schluessel, nichts gepraegt",
+   m._node_case_key("vorgaenge", tid) == k1 and len(MINTED) == 1)
+with open(m.NODE_CASE_KEYS, encoding="utf-8") as f:
+    keys = json.load(f)
+ok("die Datei traegt Schluessel, Kennung, Ablauf, Prinzipal",
+   keys["vorgaenge"]["id"] == "id1" and keys["vorgaenge"]["expires"].startswith("2027")
+   and keys["vorgaenge"]["principal"] == "platform:vorgaenge", keys)
+if os.name == "posix":
+    ok("… nur fuer root lesbar", oct(os.stat(m.NODE_CASE_KEYS).st_mode & 0o777) == "0o600")
+import datetime as _dt  # noqa: E402
+late = _dt.datetime(2027, 10, 20, tzinfo=_dt.timezone.utc)
+k2 = m._node_case_key("vorgaenge", tid, now=late)
+ok("laeuft binnen 30 Tagen ab: neu gepraegt, der alte widerrufen",
+   k2 == "oaapk_id2_s2" and MINTED[-1]["OAAP_T_OLD"] == "id1" and len(MINTED) == 2, MINTED)
+m._node_case_key_forget("vorgaenge")
+with open(m.NODE_CASE_KEYS, encoding="utf-8") as f:
+    ok("ein entfernter Posteingang nimmt seinen Schluessel mit", "vorgaenge" not in json.load(f))
+
+print("")
+print("   die Vorgaenge gehen in jeden Produktions-Eingang")
+reg = m.load_registry()
+reg["instances"]["vorgaenge-test"] = record("vorgaenge-test", tid, "vorgaenge", "test", 8111)
+reg["instances"]["fremd-vorgaenge"] = record("fremd-vorgaenge", OTHER, "vorgaenge", port=8112)
+reg["instances"]["fremd-vorgaenge-b"] = record("fremd-vorgaenge-b", OTHER, "vorgaenge", port=8113)
+reg["instances"]["probe-vorgaenge"] = dict(record("probe-vorgaenge", tid, "vorgaenge", port=8114),
+                                           rehearsal={"of": "vorgaenge", "expires": "2099-01-01T00:00:00Z"})
+reg["instances"]["schlaf-vorgaenge"] = dict(record("schlaf-vorgaenge", "t-sleep000000", "vorgaenge", port=8115),
+                                            state="standby")
+m.save_registry(reg)
+inb = m._care_inboxes()
+ok("Produktion, keine Generalprobe, nicht schlafend, einer je Mandant (der erste im Namen)",
+   sorted(inb) == ["fremd-vorgaenge", "vorgaenge"], sorted(inb))
+
+POSTS = []
+
+
+def fake_post(name, inst, doc):
+    POSTS.append((name, dict(doc)))
+    if name == "fremd-vorgaenge" and FAIL_FREMD[0]:
+        return 503, {"error": "schlaeft"}
+    if doc["op"] == "open":
+        return 201, {"ok": True, "number": f"V-{name}-{len(POSTS)}"}
+    return 200, {"ok": True, "number": doc["number"]}
+
+
+FAIL_FREMD = [True]
+m._node_case_post = fake_post
+import host_care as hc  # noqa: E402
+plan = {"source": "kernel", "kernel": "6.12.115", "origin": "security", "urgency": "care",
+        "reason": "r", "announced": "2026-11-06T10:00:00Z", "at": "2026-11-08T03:15:00Z",
+        "at_local": "2026-11-08 04:15 CET", "held_by": [], "overridden": [], "by": "", "state": "planned"}
+errs = _io.StringIO()
+with contextlib.redirect_stderr(errs):
+    m._care_cases([("reboot.planned", "kernel", "x")], plan, None)
+ok("angekuendigt: ein open je Eingang; der Eingang, der nicht antwortet, fehlt im Plan und steht im Journal",
+   [p[0] for p in POSTS] == ["fremd-vorgaenge", "vorgaenge"] and all(p[1]["op"] == "open" for p in POSTS)
+   and plan["cases"] == {"vorgaenge": "V-vorgaenge-2"} and "fremd-vorgaenge: open answered 503" in errs.getvalue(),
+   (POSTS, plan.get("cases"), errs.getvalue()))
+ok("das open traegt Bezug, Knoten, Betreff, Text",
+   POSTS[1][1]["ref"] == "kernel:6.12.115:2026-11-06T10:00:00Z" and POSTS[1][1]["node"]
+   and POSTS[1][1]["title"].startswith("Neustart des Knotens") and "startet am" in POSTS[1][1]["body"], POSTS[1])
+FAIL_FREMD[0] = False
+del POSTS[:]
+moved = dict(plan, at_local="2026-11-14 04:15 CET",
+             held_by=[{"instance": "joerg-desk", "until": "2026-11-13", "reason": "Schulung"}])
+m._care_cases([("reboot.moved", "kernel", "x")], moved, plan)
+ok("verschoben: der fehlende Eingang bekommt sein open nachgeholt, dann die Notiz; der andere nur die Notiz",
+   [(p[0], p[1]["op"]) for p in POSTS] == [("fremd-vorgaenge", "open"), ("fremd-vorgaenge", "note"),
+                                           ("vorgaenge", "note")]
+   and POSTS[2][1]["number"] == "V-vorgaenge-2" and "Verschoben auf 2026-11-14" in POSTS[2][1]["text"]
+   and moved["cases"] == {"vorgaenge": "V-vorgaenge-2", "fremd-vorgaenge": "V-fremd-vorgaenge-1"}, (POSTS, moved["cases"]))
+del POSTS[:]
+m._care_cases([("reboot.done", "kernel", "rebooted after x; running 6.12.115")], None, moved)
+ok("geschlossen aus dem Plan, der eben zu Ende ging (der neue ist None): ein close je Eingang mit seiner Nummer",
+   sorted((p[0], p[1]["op"], p[1]["number"]) for p in POSTS)
+   == [("fremd-vorgaenge", "close", "V-fremd-vorgaenge-1"), ("vorgaenge", "close", "V-vorgaenge-2")]
+   and "läuft wieder" in POSTS[0][1]["text"], POSTS)
+del POSTS[:]
+m._care_cases([("instance.protected", "x", "y")], plan, None)
+ok("ein Ereignis ohne Vorgangsbelang: kein Aufruf", POSTS == [])
+del POSTS[:]
+m._care_announce([("reboot.cancelled", "kernel", "x cancelled")], stored=moved)
+ok("_care_announce mit stored: das Mandanten-Log UND die Eingaenge (close)",
+   [p[1]["op"] for p in POSTS] == ["close", "close"], POSTS)
 
 print("")
 print("ALLE PASS" if not fails else f"{fails} FAIL")

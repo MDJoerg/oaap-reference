@@ -48,6 +48,7 @@ import re
 import secrets
 import shutil
 import stat
+import socket
 import subprocess
 import sys
 import tempfile
@@ -8615,16 +8616,167 @@ def _care_tenant_of(name):
     return resolve_tenant(inst.get("tenant")) or ""
 
 
-def _care_announce(events, who="root", role="root", only_tenant=None):
+# ------------------------------------------- the node's cases (2.7.6)
+#
+# RFC-0069 stage 2: one case per plan in every inbox (`vorgaenge`) on the
+# node, through the gateway like an app's backend (RFC-0061 §3.2) -- the
+# gateway checks the key and attests the source, the app checks the
+# principal again. The key per inbox lives here, root only, and is
+# renewed RENEW_DAYS before it expires like an instance's own (RFC-0062).
+NODE_CASE_KEYS = os.path.join(APPS_DIR, "node-case-keys.json")
+
+
+def _node_case_keys_rw(update):
+    keys = host_care._read_json(NODE_CASE_KEYS) or {}
+    update(keys)
+    host_care._write_json(NODE_CASE_KEYS, keys, mode=0o600)
+
+
+def _node_case_key_forget(name):
+    def drop(keys):
+        keys.pop(name, None)
+    if os.path.exists(NODE_CASE_KEYS):
+        _node_case_keys_rw(drop)
+
+
+def _node_case_key(name, tenant_id, now=None):
+    """The bearer the node presents at /platform/cases/node of inbox
+    `name`: minted on first use for `platform:<name>` in the inbox's
+    tenant, limited to node_cases_scope(name); reissued when it expires
+    within RENEW_DAYS, the old one revoked."""
+    rec = (host_care._read_json(NODE_CASE_KEYS) or {}).get(name) or {}
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    horizon = (now + datetime.timedelta(days=RENEW_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    if rec.get("token") and (rec.get("expires") or "")[:19] > horizon:
+        return rec["token"]
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': 'Knoten ' + os.environ['OAAP_T_HOST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
+        "    'oaap.cases.node (RFC-0069 stage 2)', m.KEY_MAX_DAYS, 'root')\n"
+        "if os.environ.get('OAAP_T_OLD'):\n"
+        "    m.revoke_key(os.environ['OAAP_T_OLD'])\n"
+        "print(json.dumps({'secret': secret, 'id': rec['id'], 'expires': rec['expires']}))\n",
+        {"OAAP_T_NAME": node_principal(name), "OAAP_T_HOST": socket.gethostname(),
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": node_cases_scope(name),
+         "OAAP_T_OLD": rec.get("id") or ""})
+    made = json.loads(out.strip().splitlines()[-1])
+
+    def put(keys):
+        keys[name] = {"token": made["secret"], "id": made["id"], "expires": made["expires"],
+                      "principal": node_principal(name), "tenant": tenant_id}
+    _node_case_keys_rw(put)
+    return made["secret"]
+
+
+def _care_inboxes():
+    """{inbox instance: record}: every awake production `vorgaenge` on the
+    node, one per tenant. A production node never reports into a test
+    inbox (the cases_target rule); a rehearsal never receives."""
+    out, seen = {}, set()
+    for name, inst in sorted((load_registry().get("instances") or {}).items()):
+        if inst.get("app_id") != CASES_APP_ID or is_rehearsal(inst):
+            continue
+        if (inst.get("channel") or "production") != "production" or not inst.get("port"):
+            continue
+        if inst.get("state") in ("standby", "waking"):
+            continue
+        tid = instance_tenant_ref(inst)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        out[name] = inst
+    return out
+
+
+def _node_case_post(name, inst, doc):
+    """POST to the inbox's own door through the gateway's published port
+    -- the way an app's backend goes, from the host. (status, answer)."""
+    token = _node_case_key(name, _instance_tenant_id(inst))
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{inst['port']}/platform/cases/node",
+        data=json.dumps(doc, ensure_ascii=False).encode("utf-8"), method="POST",
+        headers={"Authorization": "Bearer " + token,
+                 "Content-Type": "application/json; charset=utf-8"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(req, timeout=10) as r:
+            return r.status, json.loads(r.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8") or "{}")
+        except ValueError:
+            return e.code, {}
+
+
+def _care_cases(events, plan, stored):
+    """2.7.6: the node's cases in every inbox, from the plan's events.
+    Writes plan['cases'] (inbox -> case number); the caller saves the
+    plan. An inbox that does not answer is said on stderr (the minute
+    job's journal) and tried again at the next event -- the plan itself
+    never waits for an inbox."""
+    host = socket.gethostname()
+    ops = host_care.case_ops(events, plan, stored, host, host_care.local_tz())
+    if not ops:
+        return
+    cases = dict((plan or stored or {}).get("cases") or {})
+    for name, inst in _care_inboxes().items():
+        for op in ops:
+            try:
+                if op["op"] == "open":
+                    st, ans = _node_case_post(name, inst, {
+                        "op": "open", "ref": op["ref"], "node": host,
+                        "title": op["title"], "body": op["body"]})
+                    if st in (200, 201) and ans.get("number"):
+                        cases[name] = ans["number"]
+                    else:
+                        print(f"node care: inbox {name}: open answered {st} "
+                              f"{ans.get('error', '')}", file=sys.stderr)
+                    continue
+                if not cases.get(name) and op["op"] == "note" and plan:
+                    # an inbox that came later, or an open that failed:
+                    # the case opens now, with the plan as it is
+                    st, ans = _node_case_post(name, inst, {
+                        "op": "open", "ref": host_care.plan_ref(plan), "node": host,
+                        "title": host_care.case_title(plan, host),
+                        "body": host_care.case_body(plan, host, host_care.local_tz())})
+                    if st in (200, 201) and ans.get("number"):
+                        cases[name] = ans["number"]
+                if not cases.get(name):
+                    continue
+                st, ans = _node_case_post(name, inst, {
+                    "op": op["op"], "number": cases[name], "node": host, "text": op["text"]})
+                if st != 200:
+                    print(f"node care: inbox {name}: {op['op']} answered {st} "
+                          f"{ans.get('error', '')}", file=sys.stderr)
+            except (OSError, ValueError, subprocess.CalledProcessError) as e:
+                print(f"node care: inbox {name}: {e}", file=sys.stderr)
+    if plan is not None:
+        plan["cases"] = cases
+
+
+def _care_announce(events, who="root", role="root", only_tenant=None, plan=None, stored=None):
     """File the plan's events (oaap.core.tenant 1.7, `reboot.*`) in EVERY
     tenant's log on the node -- a reboot concerns all of them -- or, for
-    an instance's own entries, in its tenant only."""
+    an instance's own entries, in its tenant only. With a plan (or the
+    plan that just closed) the inboxes hear it too (2.7.6)."""
     if not events:
         return
     tenants = [only_tenant] if only_tenant else list(load_tenants().keys())
     for action, subject, detail in events:
         for tid in tenants:
             audit_tenant(action, tid, subject, "ok", who=who, role=role, detail=detail)
+    if plan is not None or stored is not None:
+        _care_cases(events, plan, stored)
 
 
 def _care_evaluate(facts, now=None, who="root", role="root"):
@@ -8637,7 +8789,7 @@ def _care_evaluate(facts, now=None, who="root", role="root"):
                                       _care_known_instances(), now.astimezone(tz).date())
     stored = host_care.load_plan(APPS_DIR)
     plan, events = host_care.compute_plan(facts, live, stored, now=now, tz=tz)
-    _care_announce(events, who=who, role=role)
+    _care_announce(events, who=who, role=role, plan=plan, stored=stored)
     if plan:
         host_care.save_plan(plan, APPS_DIR)
     elif stored:
@@ -8677,11 +8829,13 @@ def _care_reboot_if_due(facts):
         return False
     plan["state"] = "rebooting"
     plan["rebooting_at"] = host_care.now_iso()
+    # Said before it is written: the inboxes may add a case number the
+    # saved plan must carry into the next boot.
+    _care_announce([("reboot.started", plan.get("source", ""),
+                     f"{plan.get('at_local')} ({plan.get('urgency')}): {why}")], plan=plan)
     host_care.save_plan(plan, APPS_DIR)
     facts["plan"] = plan
     host_care.write(facts, APPS_DIR)
-    _care_announce([("reboot.started", plan.get("source", ""),
-                     f"{plan.get('at_local')} ({plan.get('urgency')}): {why}")])
     subprocess.run(["systemctl", "reboot"], capture_output=True, text=True)
     return True
 
@@ -8755,7 +8909,7 @@ def cmd_node_care(args):
                 _care_announce([("reboot.cancelled", stored.get("source", ""),
                                  f"{stored.get('at_local')} cancelled"
                                  + (": " + reason if reason else ""))],
-                               who=who, role="server_admin")
+                               who=who, role="server_admin", stored=stored)
                 print(f"Plan for {stored.get('at_local')} cancelled"
                       + (" -- a computed plan returns next minute with a fresh lead "
                          "while the kernel waits." if stored.get("source") == "kernel"
@@ -8767,11 +8921,12 @@ def cmd_node_care(args):
                                              tz=host_care.local_tz())
             except ValueError as e:
                 die(str(e))
-            host_care.save_plan(plan, APPS_DIR)
             _care_announce([("reboot.planned", "manual",
                              f"{plan['at_local']} ({plan['urgency']}, by hand"
                              + (", sooner than 24 h" if plan.get("shortened") else "")
-                             + f"): {plan['reason']}")], who=who, role="server_admin")
+                             + f"): {plan['reason']}")], who=who, role="server_admin",
+                           plan=plan)
+            host_care.save_plan(plan, APPS_DIR)
             print(f"Reboot planned by hand: {plan['at_local']} ({plan['urgency']}).")
             facts = _care_fresh(who=who, role="server_admin")
             if host_care.due(facts.get("plan")):
@@ -10784,16 +10939,20 @@ def instance_keys_retire(name, keep_authz=False):
         "import json, os, app as m\n"
         "inst = os.environ['OAAP_T_INST']\n"
         "p = 'instance:' + inst\n"
+        # RFC-0069 stage 2: the node's own principal for this inbox goes
+        # with it -- a key that outlives its inbox is the 0.1.202 lesson.
+        "both = (p, 'platform:' + inst)\n"
         "revoked = [k['id'] for k in m.load_keys()\n"
-        "           if k['principal'] == p and not k['revoked']]\n"
+        "           if k['principal'] in both and not k['revoked']]\n"
         "for kid in revoked:\n"
         "    m.revoke_key(kid)\n"
         "deleted = False\n"
         "with m.users_rw() as users:\n"
-        "    u = m.find_user(users, p)\n"
-        "    if u and u.get('kind') == 'machine':\n"
-        "        res = m._delete_user(p, users, 'oaap (RFC-0062)', 'server_admin', '')\n"
-        "        deleted = not isinstance(res, tuple)\n"
+        "    for pp in both:\n"
+        "        u = m.find_user(users, pp)\n"
+        "        if u and u.get('kind') == 'machine':\n"
+        "            res = m._delete_user(pp, users, 'oaap (RFC-0062)', 'server_admin', '')\n"
+        "            deleted = deleted or (pp == p and not isinstance(res, tuple))\n"
         "rec = None\n"
         "if os.environ.get('OAAP_T_KEEP') != '1':\n"
         "    with m.authz_rw() as st:\n"
@@ -10802,6 +10961,7 @@ def instance_keys_retire(name, keep_authz=False):
         "            m.save_authz(st)\n"
         "print(json.dumps({'revoked': revoked, 'deleted': deleted, 'authz': rec}))\n",
         {"OAAP_T_INST": name, "OAAP_T_KEEP": "1" if keep_authz else "0"})
+    _node_case_key_forget(name)
     return json.loads(out.strip().splitlines()[-1])
 
 
@@ -11626,7 +11786,25 @@ CASES_MARKER = "# platform-feedback "
 # on oaap-test, 2026-10-16, before any release). 3: the path is passed
 # on unchanged -- a stripped one became the login's return target.
 # 4: /platform/cases/submit, the backend's door (RFC-0061 §3.2).
-CASES_BLOCK_FORMAT = 4
+# 5: /platform/cases/node on a `vorgaenge` site, the node's own door
+#    (RFC-0069 stage 2, oaap.core.updates 2.7.6).
+CASES_BLOCK_FORMAT = 5
+
+# RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
+# inbox on it. The credential is a key of the machine principal
+# `platform:<inbox instance>`, minted by the platform for that one inbox
+# and limited to this scope -- so it opens /platform/cases/node on THAT
+# inbox's site and nothing else (the D5 rule, a third time). The app
+# behind checks the same principal against the source the gateway set.
+NODE_CASES_SCOPE = "oaap.cases.node"
+
+
+def node_cases_scope(name):
+    return f"{NODE_CASES_SCOPE}:{name}"
+
+
+def node_principal(name):
+    return f"platform:{name}"
 
 _CASES_CACHE = {"stamp": None, "insts": {}}
 
@@ -11771,6 +11949,27 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
         lines += _proxy(target, "\t\t", extra=[
             f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
     lines.append("\t}")
+    # RFC-0069 stage 2: on a `vorgaenge` site only, the node's door. The
+    # gateway asks for the key of platform:<this instance>, no roles, and
+    # names this instance as the source; the app refuses anything else.
+    if me.get("app_id") == CASES_APP_ID:
+        lines.append("\thandle /platform/cases/node {")
+        if not target:
+            lines += login_lines() if login_only else strip_identity()
+            lines.append("\t\trespond 404")
+        else:
+            uri = "/verify?roles="
+            if tenant:
+                uri += f"&tenant={tenant}"
+            uri += f"&instance={node_cases_scope(scope or '-')}"
+            lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
+                      "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
+            source = (scope or "-", me.get("app_id") or "-",
+                      me.get("version") or "-",
+                      tenant or (instance_tenant_ref(me) if me else "-"))
+            lines += _proxy(target, "\t\t", extra=[
+                f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
+        lines.append("\t}")
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
     lines.append("\t\turi strip_prefix /platform")

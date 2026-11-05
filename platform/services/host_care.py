@@ -101,14 +101,39 @@ def parse_iso(s):
         return None
 
 
-def local_tz(timezone_file="/etc/timezone"):
-    """The node's own clock: the window is a local hour (2.6.3)."""
+def local_tz(timezone_file="/etc/timezone", localtime="/etc/localtime"):
+    """The node's own clock: the window is a local hour (2.6.3).
+
+    Debian 13 no longer writes /etc/timezone (measured 2026-11-05 on
+    oaap-bernd, then on every node of the fleet): the zone is the target
+    of the /etc/localtime link, `.../zoneinfo/Europe/Berlin`. Read the
+    file first, then the link; only without both the offset of now,
+    which carries no DST rule -- a plan across the switch night would be
+    an hour off."""
+    fallback = datetime.now().astimezone().tzinfo
     try:
         from zoneinfo import ZoneInfo
+    except ImportError:
+        return fallback
+    name = zone_name(timezone_file, localtime)
+    try:
+        return ZoneInfo(name) if name else fallback
+    except Exception:  # noqa: BLE001 -- a name the zoneinfo does not know
+        return fallback
+
+
+def zone_name(timezone_file="/etc/timezone", localtime="/etc/localtime"):
+    """The zone's name ('Europe/Berlin') from the file, else from the
+    link's target; '' when neither says."""
+    try:
         with open(timezone_file, encoding="utf-8") as f:
-            return ZoneInfo(f.read().strip())
-    except Exception:  # noqa: BLE001 -- no file, no zoneinfo: the offset of now
-        return datetime.now().astimezone().tzinfo
+            name = f.read().strip()
+            if name:
+                return name
+    except OSError:
+        pass
+    target = os.path.realpath(localtime).replace("\\", "/")
+    return target.split("/zoneinfo/", 1)[1] if "/zoneinfo/" in target else ""
 
 
 # --- the kernel ------------------------------------------------------------
@@ -739,6 +764,7 @@ def compute_plan(facts, live, stored, now=None, tz=None):
                       not_before_day=day_after if urgency == "care" else None)
     plan = {
         "source": "kernel", "kernel": k.get("installed", ""),
+        "origin": k.get("origin", ""),
         "urgency": urgency, "reason": why,
         "announced": iso(announced), "at": iso(at), "at_local": local_text(at, tz),
         "held_by": _held_rows(live) if urgency == "care" and live else [],
@@ -747,8 +773,11 @@ def compute_plan(facts, live, stored, now=None, tz=None):
     }
     if same:
         # What was already said stays said: the state carries over, so an
-        # overdue plan is not announced overdue every minute.
+        # overdue plan is not announced overdue every minute -- and so do
+        # the cases the announcement opened (2.7.6).
         plan["state"] = stored.get("state", "planned")
+        if stored.get("cases"):
+            plan["cases"] = stored["cases"]
     if not same:
         events.append(("reboot.planned", "kernel",
                        f"{plan['at_local']} ({urgency}): {why}"))
@@ -838,6 +867,111 @@ def may_reboot(facts, plan, live):
     if plan.get("urgency") == "care" and live:
         return False, "held by " + ", ".join(sorted(live))
     return True, plan.get("reason", "")
+
+
+# --- the cases (2.7.6, RFC-0069 stage 2) -----------------------------------
+#
+# One case per plan in every inbox (`vorgaenge`) on the node, opened with
+# the announcement, written on at every move, closed with the proof. The
+# texts are the tenants' (German, like the band on their place) and carry
+# NO kernel version: an inbox says when and why in words, `oaap status`
+# and the fleet document say which kernel. The reason in the operator's
+# own words only where the operator wrote one (a plan by hand).
+
+ORIGIN_DE = {"security": "aus dem Sicherheitsarchiv der Distribution",
+             "distribution": "ein Punktrelease aus dem Hauptarchiv",
+             "vendor": "ein Hersteller-Kernel"}
+
+
+def plan_ref(plan):
+    """What makes two announcements the same plan: source, kernel and the
+    announcement time -- stable across minutes, new with every plan."""
+    return f"{plan.get('source', '')}:{plan.get('kernel') or 'hand'}:{plan.get('announced', '')}"
+
+
+def _held_de(rows):
+    return ", ".join(f"{r['instance']} bis {r.get('until', '')}"
+                     + (f" ({r['reason']})" if r.get("reason") else "")
+                     for r in rows or [])
+
+
+def case_title(plan, host):
+    u = "kritisch" if plan.get("urgency") == "critical" else "Pflege"
+    return f"Neustart des Knotens {host}: {plan.get('at_local')} ({u})"
+
+
+def case_body(plan, host, tz=None):
+    tz = tz or timezone.utc
+    lines = [f"Der Knoten {host} startet am {plan.get('at_local')} neu."]
+    if plan.get("urgency") == "critical":
+        lines.append("Dringlichkeit: kritisch — ein Kernel aus dem Sicherheitsarchiv auf einem "
+                     "exponierten Knoten. Ein Schutz hält diesen Neustart nicht; er wird gezeigt "
+                     "und überstimmt.")
+    else:
+        lines.append("Dringlichkeit: Pflege — ein Schutz je Instanz (mit Begründung und Ende) "
+                     "hält den Neustart bis zum Tag nach seinem Ende.")
+    if plan.get("source") == "manual":
+        lines.append(f"Grund ({plan.get('by') or 'root'}, von Hand geplant): {plan.get('reason', '')}")
+    else:
+        lines.append("Grund: ein Kernel-Update wartet ("
+                     + ORIGIN_DE.get(plan.get("origin", ""), "Herkunft unbekannt") + ").")
+    if plan.get("held_by"):
+        lines.append("Gehalten durch Schutz: " + _held_de(plan["held_by"]) + ".")
+    if plan.get("overridden"):
+        lines.append("Schutz überstimmt (kritisch): " + _held_de(plan["overridden"]) + ".")
+    ann = parse_iso(plan.get("announced"))
+    if plan.get("shortened"):
+        lines.append("Vom Betreiber ausdrücklich kürzer als 24 Stunden angesetzt.")
+    elif ann:
+        lines.append(f"Angekündigt am {local_text(ann, tz)}; der Termin liegt mindestens "
+                     "24 Stunden danach.")
+    lines.append("Der Knoten schreibt diesen Vorgang bei jeder Änderung fort und schließt ihn "
+                 "nach dem Neustart. Sitzungen in Apps auf diesem Knoten enden mit dem Neustart; "
+                 "einen Schutz für eine Instanz setzt der Betreiber.")
+    return "\n".join(lines)
+
+
+def case_ops(events, plan, stored, host, tz=None):
+    """(op dicts) for the inboxes, from the events compute_plan produced:
+    `open` (ref, title, body) once per plan, `note` (text) per move,
+    override, overdue and start, `close` (text) with the proof or the
+    cancellation. `plan` is the plan now, `stored` the one before -- a
+    closing event has only the latter."""
+    tz = tz or timezone.utc
+    cur = plan or stored or {}
+    ops = []
+    for action, subject, detail in events:
+        if action == "reboot.planned" and plan:
+            ops.append({"op": "open", "ref": plan_ref(plan), "title": case_title(plan, host),
+                        "body": case_body(plan, host, tz)})
+        elif action == "reboot.moved" and plan:
+            held = _held_de(plan.get("held_by"))
+            ops.append({"op": "note", "text": f"Verschoben auf {plan.get('at_local')}: "
+                        + (f"gehalten durch {held}" if held else "nicht mehr gehalten") + "."})
+        elif action == "reboot.override":
+            r = next((r for r in cur.get("overridden") or [] if r.get("instance") == subject), {})
+            ops.append({"op": "note", "text": f"Schutz von {subject}"
+                        + (f" bis {r['until']}" if r.get("until") else "")
+                        + " überstimmt: der Neustart ist kritisch und wartet nicht."})
+        elif action == "reboot.overdue":
+            ops.append({"op": "note", "text": f"Überfällig: geplant {cur.get('at_local')}, "
+                        + ("der Knoten ist seit dem Start nicht wieder hochgekommen."
+                           if "started" in detail else "kein Neustart erfolgt. Läuft der Minutenlauf?")})
+        elif action == "reboot.started":
+            ops.append({"op": "note", "text": "Der Knoten startet jetzt neu."})
+        elif action == "reboot.done":
+            ops.append({"op": "close", "text": f"Neustart erfolgt nach {cur.get('at_local')}; "
+                        f"der Knoten {host} läuft wieder."
+                        + (" Ein weiterer Kernel wartet; ein neuer Plan folgt."
+                           if "still waits" in detail else "")})
+        elif action == "reboot.cancelled":
+            if detail == "the reboot window was removed":
+                why = "das Neustart-Fenster wurde entfernt"
+            else:
+                tail = detail.split("cancelled", 1)[1].lstrip(": ").strip() if "cancelled" in detail else ""
+                why = "vom Betreiber zurückgenommen" + (f": {tail}" if tail else "")
+            ops.append({"op": "close", "text": f"Abgesagt — {why}."})
+    return ops
 
 
 # --- the three readers -----------------------------------------------------
