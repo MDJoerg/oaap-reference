@@ -81,6 +81,16 @@ except Exception:
   # containers in a restart loop, which then counted as running (0.1.141).
   apps_running="$(docker ps -q --filter 'name=^oaap-app-' --filter status=running | wc -l)"
   echo ""
+  # oaap.core.updates 2.6: the care state of the machine under the
+  # platform, from the node's last measurement -- no measuring here, so
+  # this block and the portal's band can never disagree.
+  python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+import host_care
+host_care.print_status(host_care.read(sys.argv[2]))' "$APP_DIR/services" "$OAAP_DATA_DIR/apps" 2>/dev/null \
+    || echo "Host care: not available (platform files incomplete?)"
+  echo ""
   df -Ph "$OAAP_DATA_DIR" | awk 'NR==2 {printf "Disk: %s free of %s (%s used)\n", $4, $2, $5}'
   # RFC-0068: what Docker and the node say now; nothing on an open node.
   egress="$(python3 "$APP_DIR/appctl.py" egress-faults 2>/dev/null || true)"

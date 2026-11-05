@@ -6,6 +6,13 @@ services:
   gateway:
     image: caddy:2
     restart: unless-stopped
+    # oaap.core.gateway 0.2.18: the listeners are plain TCP. Caddy is Go,
+    # and Go >= 1.24 makes every listener accept Multipath TCP by default
+    # -- the exploit path of CVE-2026-98432 (2026-11-05). The switch must
+    # be set in the container's own namespace AT START: a running
+    # listener keeps what it was created with (measured on oaap-test).
+    sysctls:
+      - net.mptcp.enabled=0
     logging:
       driver: json-file
       options:

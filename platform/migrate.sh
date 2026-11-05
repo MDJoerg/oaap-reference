@@ -556,6 +556,10 @@ ExecStart=-$PYTHON3 $APP_DIR/appctl.py metrics sample
 ExecStart=-$PYTHON3 $APP_DIR/appctl.py broker sync
 # Closed egress (RFC-0068): a closed instance not closed in fact is stopped.
 ExecStart=-$PYTHON3 $APP_DIR/appctl.py egress-sweep
+# Host care (oaap.core.updates 2.6): kernel, auto-updates, gateway
+# listeners -- re-measured when the last measurement is older than ten
+# minutes.
+ExecStart=-$PYTHON3 $APP_DIR/appctl.py node care sample
 EOF
   cat > /etc/systemd/system/oaap-instance-watch.timer <<'EOF'
 [Unit]
@@ -714,3 +718,12 @@ fi
 # that changes nothing after the update can still draw the form -- same
 # reason as apps/artifacts.json above.
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" rehearsal-index   2>&1 | sed 's/^/  /' || say "  WARNING: the rehearsal view could not be written."
+
+# --- the host's care state (oaap.core.updates 2.6) ---
+# Measured once here so the file exists the moment a node can show it --
+# `oaap status`, the portal band and /fleet/status all read it, none
+# measures. The minute job keeps it fresh from here on. Nothing is
+# switched on behind the operator's back: a node without automatic
+# updates is TOLD so in the status, not changed (2.6.3).
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" node care measure 2>&1 | sed 's/^/  /' \
+  || say "  WARNING: the care state could not be measured — run 'sudo oaap node care'."

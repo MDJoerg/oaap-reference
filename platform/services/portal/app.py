@@ -41,6 +41,10 @@ import idp  # noqa: E402
 import relay_view
 import twin_view
 import metrics_view
+# The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
+# gateway listeners -- measured on the machine, read here. The module
+# renders the same facts for the CLI, so the two can never disagree.
+import host_care  # noqa: E402
 
 IDENTITY = "http://identity:8000"
 TWIN = "http://twin:8000"
@@ -234,6 +238,7 @@ STYLE = """
   .badge.off{background:#f3f4f6;color:#6b7280}
   .badge.todo{background:#fee2e2;color:#991b1b}
   .dot{display:inline-block;width:.65rem;height:.65rem;border-radius:50%;margin-right:.45rem}
+  ul.care{list-style:none;padding:0;margin:.4rem 0} ul.care li{margin:.3rem 0}
   .dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
   .dot.warn{background:var(--warn)} .dot.unknown{background:#9ca3af}
   a.btn{display:inline-block;padding:.6rem 1.3rem;border-radius:.4rem;
@@ -349,6 +354,18 @@ DASHBOARD_BODY = """
    kuerzer ist als an der Wurzel. #}
 {% if place_title %}
 <p class="muted">Die Apps dieses Mandanten, so weit Ihre Rollen reichen.</p>
+{% endif %}
+{# oaap.core.updates 2.6.2: the care band -- only a server_admin, only
+   when something needs a hand (a reboot, auto-updates, the gateway). #}
+{% if care %}
+<div class="card warn">
+  <h2>Pflegestand des Knotens</h2>
+  <ul class="care">
+  {% for s, t in care %}<li><span class="dot {{ s }}"></span>{{ t }}</li>{% endfor %}
+  </ul>
+  <p class="muted">Gemessen {{ care_when }} UTC auf der Maschine · mehr unter
+     <a href="/health">Gesundheit</a>.</p>
+</div>
 {% endif %}
 {% if sections %}
   {% for label, tiles in sections %}
@@ -993,6 +1010,18 @@ HEALTH_BODY = """
         <td class="muted">{{ n.detail }}</td></tr>
     {% endfor %}
   </table>
+</div>
+{# oaap.core.updates 2.6.2: the same three lines the CLI prints, with
+   the recommendation on every line that is not fine. #}
+<div class="card{% if care_warn %} warn{% endif %}">
+  <h2>Pflegestand</h2>
+  <ul class="care">
+  {% for s, t in care %}<li><span class="dot {{ s }}"></span>{{ t }}</li>{% endfor %}
+  </ul>
+  <p class="muted">{% if care_when %}Gemessen {{ care_when }} UTC auf der Maschine
+     (der Minutenlauf misst alle zehn Minuten neu).{% endif %}
+     Einstellungen an der Maschine: <code>sudo oaap node care auto-updates on</code>,
+     <code>sudo oaap node care reboot-window HH:MM | off</code>.</p>
 </div>
 <div class="card">
   <h2>Kernservices</h2>
@@ -4353,9 +4382,16 @@ def dashboard():
     # only ones who can do anything about it, and everybody else would
     # be told to miss something they were never meant to operate.
     place_title = tenant_name(place) if place else ""
+    # The care band (oaap.core.updates 2.6.2): the operator's machine, so
+    # only server_admin -- and only when a line asks for a hand.
+    care, care_when = ([], "")
+    if "server_admin" in roles:
+        care, care_when = care_state()
+        if host_care.worst(care) not in ("warn", "err"):
+            care = []
     return page(DASHBOARD_BODY, place_title or "Apps", "apps",
                 sections=iv.grouped_tiles(tiles),
-                place_title=place_title,
+                place_title=place_title, care=care, care_when=care_when,
                 hidden_count=hidden if "server_admin" in roles else 0)
 
 
@@ -5277,6 +5313,53 @@ def _gb(n_bytes):
     return f"{n_bytes / 1024**3:.1f}".replace(".", ",") + " GB"
 
 
+CARE_FILE = "/apps-registry/host-care.json"
+
+
+def care_facts():
+    """The node's last care measurement (oaap.core.updates 2.6), or None."""
+    return _read_json(CARE_FILE)
+
+
+def care_state():
+    """([(state, text)], measured-at) -- the German lines of 2.6.2."""
+    facts = care_facts()
+    when = ((facts or {}).get("measured") or "")[:16].replace("T", " ")
+    return host_care.status_lines(facts, de=True), when
+
+
+def care_rows(facts):
+    """The facts of the care state as rows of the node table."""
+    if not facts:
+        return []
+    k = facts.get("kernel", {})
+    a = facts.get("auto_updates", {})
+    g = facts.get("gateway", {})
+    win = facts.get("reboot_window", "off")
+    rows = [{
+        "name": "Kernel",
+        "state": "warn" if k.get("reboot_required") else "ok",
+        "label": k.get("running", "?"),
+        "detail": (f"installiert ist {k.get('installed')} — Neustart nötig"
+                   if k.get("reboot_required") else "der neueste installierte"),
+    }, {
+        "name": "Automatische Updates",
+        "state": {"ok": "ok", "warn": "warn", "error": "err"}.get(a.get("state"), "unknown"),
+        "label": {"ok": "an", "warn": "aus", "error": "nicht installiert"}.get(
+            a.get("state"), "unbekannt"),
+        "detail": (a.get("detail", "")
+                   + (f"; letzter Lauf {(a.get('last_run') or '')[:16].replace('T', ' ')} UTC"
+                      if a.get("last_run") else "")
+                   + (f"; Neustart-Fenster {win}" if win != "off" else "; kein Neustart-Fenster")),
+    }, {
+        "name": "Gateway-Listener",
+        "state": {"off": "ok", "on": "warn"}.get(g.get("mptcp"), "unknown"),
+        "label": {"off": "reines TCP", "on": "MPTCP"}.get(g.get("mptcp"), "unbekannt"),
+        "detail": g.get("detail", ""),
+    }]
+    return rows
+
+
 def node_values():
     """Host-level readings, visible from inside the container.
 
@@ -5287,6 +5370,10 @@ def node_values():
     rows = []
     rows.append({"name": "Plattformversion", "state": "ok", "label": VERSION,
                  "detail": ""})
+    # oaap.core.updates 2.6: what the NODE measured on the machine (a
+    # container cannot read the package database) -- facts here, the
+    # recommendations in the care card below the table.
+    rows.extend(care_rows(care_facts()))
     # RFC-0011: nobody should have to guess why this node behaves
     # differently from its neighbour.
     profiles = node_profiles()
@@ -5819,7 +5906,10 @@ def health():
             "channel_label": CHANNEL_LABELS.get(channel, channel),
             "state": state, "label": label, "detail": detail,
         })
+    care, care_when = care_state()
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
+                care=care, care_when=care_when,
+                care_warn=host_care.worst(care) in ("warn", "err"),
                 mx=Markup(metrics_view.block(METRICS_DIR,
                                              request.args.get("w", ""))),
                 mx_style=Markup(metrics_view.STYLE),
@@ -5972,7 +6062,11 @@ def fleet_status():
         if _pending_envelope(name):
             pending.append(name)
     dns = dns_check() or {}
+    # 0.5: the care state of the machine, whitelisted (oaap.core.updates
+    # 2.6) -- the view that was missing on 2026-11-05.
+    facts = care_facts()
     return fleet_view.build_document(
+        host=host_care.fleet_host(facts),
         node=ext or request.host.split(":")[0],
         version=VERSION,
         profiles=node_profiles(),
@@ -5982,7 +6076,8 @@ def fleet_status():
         dns_rows=dns.get("rows"),
         pending_names=pending,
         public_ip=dns.get("public_ip", ""),
-        extra_attention=connect_attention(),
+        extra_attention=list(connect_attention())
+                        + host_care.fleet_attention(facts),
     )
 
 

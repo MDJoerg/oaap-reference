@@ -99,6 +99,10 @@ import disks  # noqa: E402
 import metrics  # noqa: E402
 import traffic  # noqa: E402
 import idle  # noqa: E402
+# Host care (oaap.core.updates 2.6): the operating system under the
+# platform -- kernel, automatic updates, the gateway's listeners. Pure
+# rules plus the two settings the platform writes; the acting is cmd_node.
+import host_care  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -8602,6 +8606,64 @@ def cmd_broker(args):
         print("  plain port 1883: not published (profile 'broker-plain')")
 
 
+def cmd_node_care(args):
+    """`oaap node care [measure | sample | auto-updates on |
+    reboot-window HH:MM|off]` (oaap.core.updates 2.6, oaap.core.host 2.3).
+
+    Without a verb: measure afresh when root, else show the last
+    measurement. `measure` is quiet (migrate.sh); `sample` is the minute
+    job and re-measures only past ten minutes. The two settings require
+    root like everything that changes the node (main's rule), and both
+    re-measure when done so the status answers the change at once.
+    """
+    verb = (args.profile or "").strip().lower()
+    rest = [r.strip().lower() for r in (getattr(args, "rest", None) or [])]
+    root = not hasattr(os, "geteuid") or os.geteuid() == 0
+
+    def fresh():
+        facts = host_care.measure()
+        host_care.write(facts, APPS_DIR)
+        if host_care.ensure_marker(facts):
+            print(f"Reboot marker written ({host_care.REBOOT_MARKER}): the "
+                  f"node reboots at {facts['reboot_window']}.")
+        return facts
+
+    if verb == "sample":
+        facts = host_care.read(APPS_DIR)
+        if facts and not host_care.is_stale(facts):
+            return
+        fresh()
+        return
+    if verb == "measure":
+        fresh()
+        return
+    if verb == "":
+        facts = fresh() if root else host_care.read(APPS_DIR)
+        host_care.print_status(facts)
+        if not root:
+            print("  (last measurement; 'sudo oaap node care' measures afresh)")
+        return
+    if verb == "auto-updates":
+        if rest != ["on"]:
+            die("usage: oaap node care auto-updates on")
+        try:
+            host_care.auto_updates_enable()
+        except RuntimeError as e:
+            die(str(e))
+    elif verb == "reboot-window":
+        if len(rest) != 1:
+            die("usage: oaap node care reboot-window HH:MM | off")
+        try:
+            host_care.reboot_window_set(rest[0])
+        except ValueError as e:
+            die(str(e))
+    else:
+        die("usage: oaap node care [measure | sample | auto-updates on | "
+            "reboot-window HH:MM|off]")
+    print("")
+    host_care.print_status(fresh())
+
+
 def cmd_node(args):
     """Show or change what this node is for (RFC-0011).
 
@@ -8611,6 +8673,8 @@ def cmd_node(args):
     itself the `dev` profile and with it the very powers the profile is
     meant to be a deliberate, per-node decision about.
     """
+    if args.action == "care":
+        return cmd_node_care(args)
     profiles = load_profiles()
     if args.action == "show":
         print("Node profiles: " + (", ".join(profiles) if profiles else "(none)"))
@@ -28308,9 +28372,13 @@ def main():
                     help="trust class for a new source (default: unverified)")
     ps.set_defaults(fn=cmd_store)
     pn = sub.add_parser("node")
-    pn.add_argument("action", choices=["show", "add-profile", "remove-profile"])
+    pn.add_argument("action", choices=["show", "add-profile", "remove-profile",
+                                       "care"])
     pn.add_argument("profile", nargs="?",
-                    help="node profile, e.g. dev (RFC-0011)")
+                    help="node profile, e.g. dev (RFC-0011); for 'care': "
+                         "measure | sample | auto-updates | reboot-window")
+    pn.add_argument("rest", nargs="*",
+                    help="care auto-updates on | care reboot-window HH:MM|off")
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "
@@ -28371,6 +28439,10 @@ def main():
     # what 'oaap status' prints anyway — everything else changes the node.
     read_only = (args.cmd == "convert"
                  or (args.cmd == "node" and args.action == "show")
+                 # `node care` without a verb shows the last measurement
+                 # (oaap.core.host 2.3); with root it measures afresh first.
+                 or (args.cmd == "node" and args.action == "care"
+                     and not getattr(args, "profile", None))
                  or (args.cmd == "store" and args.action == "list")
                  # `data store status`/`schemas` only read (oaap.data.store
                  # 0.1) -- create/copy/drop/restore change the node and
