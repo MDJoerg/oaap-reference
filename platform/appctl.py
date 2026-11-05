@@ -8642,6 +8642,73 @@ def _care_tenant_of(name):
     return resolve_tenant(inst.get("tenant")) or ""
 
 
+def care_protect_instance(name, reason, who, role, until=None):
+    """2.7.2: protect `name` against a care reboot -- the reason, the
+    end, the tenant's log. One function for both doors (the command line
+    and the instance page): (record, sentence); ValueError says why not."""
+    prot = host_care.load_protections(APPS_DIR)
+    tid = _care_tenant_of(name)
+    rec = host_care.protect(prot, name, reason, who, tid, until=until)
+    host_care.save_protections(prot, APPS_DIR)
+    _care_announce([("instance.protected", name,
+                     f"until {rec['until']}: {rec['reason']}")],
+                   who=who, role=role, only_tenant=tid)
+    return rec, (f"{name} protected against a care reboot until {rec['until']}: "
+                 f"{rec['reason']}")
+
+
+def care_release_instance(name, who, role):
+    """2.7.2: the protection of `name` ends now. (released?, sentence)"""
+    prot = host_care.load_protections(APPS_DIR)
+    if not host_care.release(prot, name):
+        return False, f"{name} was not protected."
+    host_care.save_protections(prot, APPS_DIR)
+    _care_announce([("instance.released", name, "released")],
+                   who=who, role=role, only_tenant=_care_tenant_of(name))
+    return True, f"{name} released."
+
+
+CARE_JOB_OPS = ("protect", "release")
+
+
+def care_job(req, name, inst, act_tenant, role, actor):
+    """RFC-0069 stage 5: one act of the instance page -> (ok, sentence,
+    tenant id). A tenant_admin protects an instance of their own tenant
+    only; one of another tenant is answered as one the node does not
+    have. Role and tenant come from the ACTOR's record, never from the
+    request. After a done act the plan is recomputed at once, so the
+    page (and everyone else) sees the move now, not next minute."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    if role not in ("server_admin", "tenant_admin"):
+        u = next((x for x in (_read_identity_users() or [])
+                  if x.get("username") == (actor or "")), None)
+        return (False, "a reboot protection is its tenant admin's or the server admin's",
+                resolve_tenant((u or {}).get("tenant")) or None)
+    if op not in CARE_JOB_OPS:
+        return False, f"unknown care operation '{op}'", act_tenant
+    if inst is None or (role != "server_admin" and _care_tenant_of(name) != act_tenant):
+        # The worker's own sentence for another tenant's instance: one that
+        # does not exist (spec 2.3 rule 2) -- and the same for one that
+        # really does not.
+        return False, cross_tenant_refusal("care", name), act_tenant
+    tid = _care_tenant_of(name)
+    who = actor or "portal"
+    try:
+        if op == "protect":
+            _rec, msg = care_protect_instance(
+                name, str(a.get("reason") or ""), who, role,
+                until=str(a.get("until") or "") or None)
+        else:
+            done, msg = care_release_instance(name, who, role)
+            if not done:
+                return True, msg, tid
+    except ValueError as e:
+        return False, str(e), tid
+    _care_fresh(who=who, role=role)
+    return True, msg, tid
+
+
 # ------------------------------------------- the node's cases (2.7.6)
 #
 # RFC-0069 stage 2: one case per plan in every inbox (`vorgaenge`) on the
@@ -9087,28 +9154,16 @@ def cmd_node_care(args):
         name = rest[0]
         if name not in _care_known_instances():
             die(f"no instance '{name}' on this node")
-        prot = host_care.load_protections(APPS_DIR)
-        tid = _care_tenant_of(name)
-        if verb == "protect":
-            try:
-                rec = host_care.protect(prot, name, reason, who, tid,
-                                        until=getattr(args, "care_until", None))
-            except ValueError as e:
-                die(str(e))
-            host_care.save_protections(prot, APPS_DIR)
-            _care_announce([("instance.protected", name,
-                             f"until {rec['until']}: {rec['reason']}")],
-                           who=who, role="server_admin", only_tenant=tid)
-            print(f"{name} protected against a care reboot until {rec['until']}: "
-                  f"{rec['reason']}")
-        else:
-            if host_care.release(prot, name):
-                host_care.save_protections(prot, APPS_DIR)
-                _care_announce([("instance.released", name, "released")],
-                               who=who, role="server_admin", only_tenant=tid)
-                print(f"{name} released.")
+        try:
+            if verb == "protect":
+                _rec, msg = care_protect_instance(
+                    name, reason, who, "server_admin",
+                    until=getattr(args, "care_until", None))
             else:
-                print(f"{name} was not protected.")
+                _done, msg = care_release_instance(name, who, "server_admin")
+        except ValueError as e:
+            die(str(e))
+        print(msg)
     else:
         die("usage: oaap node care [measure | sample | auto-updates on | "
             "reboot-window HH:MM|off | reboot at <time>|cancel | "
@@ -25526,6 +25581,17 @@ def cmd_process_deploys(_args):
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
             egress_view_write()
+        elif action == "care":
+            # RFC-0069 stage 5: the instance page's door to protect. The
+            # function the command line calls does the act; a refusal is
+            # recorded in the tenant it was meant for, with the person.
+            ok, msg, _ctid = care_job(req, name, inst, act_tenant, act_role, actor)
+            if not ok:
+                audit_tenant("instance.protected" if req.get("op") != "release"
+                             else "instance.released",
+                             _ctid or ensure_default_tenant(), subject=name,
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -25619,7 +25685,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal",
+               "disk": "portal", "egress": "portal", "care": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(

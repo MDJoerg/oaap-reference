@@ -363,8 +363,9 @@ DASHBOARD_BODY = """
   <h2>Geplanter Neustart dieses Knotens</h2>
   <p>{{ plan_text }}</p>
   <p class="muted">Ein Neustart des Knotens trifft jede App darauf; offene Arbeit
-     vorher sichern. Ein Schutz je Instanz ist am Knoten möglich
-     (<code>sudo oaap node care protect &lt;instanz&gt; --reason …</code>).</p>
+     vorher sichern. Ein Schutz je Instanz: auf der Seite der Instanz, Reiter
+     „Diagnose“, Karte „Neustart-Schutz“ (Mandanten- oder Server-Admin) — oder
+     am Knoten (<code>sudo oaap node care protect &lt;instanz&gt; --reason …</code>).</p>
 </div>
 {% endif %}
 {# oaap.core.updates 2.6.2: the care band -- only a server_admin, only
@@ -2417,6 +2418,65 @@ INSTANCE_NEW_BODY = """
 # Alle Abschnitte stehen IMMER im Dokument, nur der gewählte ist
 # sichtbar. Das kostet ein paar Kilobyte und spart JavaScript, einen
 # zweiten Zustand und die Frage, was ohne Stylesheet passiert.
+# RFC-0069 stage 5 (oaap.core.updates 2.7.2): the instance's own door to
+# protect. The page reads the care file the node writes and offers what the
+# worker accepts: protect (a reason, an end), extend (the same, again),
+# release. The host judges role and tenant again from the actor's record.
+CARE_CARD = """
+<div class="card{% if i.care.held %} warn{% endif %}">
+  <h2>Neustart-Schutz</h2>
+  {% if not i.care.known %}
+  <p class="muted">Der Knoten hat seinen Pflegestand noch nicht gemessen; die
+     Karte kommt mit dem nächsten Minutenlauf.</p>
+  {% endif %}
+  {% if i.care.held %}
+  <p><span class="badge todo">GESCHÜTZT</span> bis {{ i.care.held.until }}
+     (einschließlich): {{ i.care.held.reason }}</p>
+  {% if i.care.overridden %}
+  <p class="err">Der Schutz hält nicht: der geplante Neustart ist dringend
+     (Sicherheits-Kernel auf einem exponierten Knoten) und überstimmt ihn.
+     {{ i.care.plan_text }}</p>
+  {% elif i.care.plan_text %}
+  <p>{{ i.care.plan_text }}</p>
+  {% else %}
+  <p class="muted">Zurzeit ist kein Neustart geplant. Kommt einer, der warten
+     kann, wartet er auf das Ende dieses Schutzes.</p>
+  {% endif %}
+  <form method="post" action="/instances/{{ i.key }}/care/protect">
+    <input type="hidden" name="tab" value="diagnose">
+    <label>Verlängern — Begründung (noch einmal)
+      <input type="text" name="reason" maxlength="300" required
+             value="{{ i.care.held.reason }}"></label>
+    <label>Bis (einschließlich; leer = {{ i.care.default_days }} Tage ab heute, höchstens {{ i.care.max_days }})
+      <input type="date" name="until" min="{{ i.care.today }}" max="{{ i.care.max_day }}"></label>
+    <button class="secondary">Schutz verlängern</button>
+  </form>
+  <form method="post" action="/instances/{{ i.key }}/care/release">
+    <input type="hidden" name="tab" value="diagnose">
+    <button>Schutz aufheben</button>
+  </form>
+  {% else %}
+  <p>Ein Schutz hält einen geplanten Neustart des Knotens auf, der warten
+     kann — bis zu einem Tag, den Du nennst, mit einer Begründung, die im
+     Protokoll des Mandanten steht. Einen <strong>dringenden</strong> Neustart
+     (Sicherheits-Kernel auf einem exponierten Knoten) hält er nicht; diese
+     Karte sagt es dann.</p>
+  {% if i.care.plan_text %}<p>{{ i.care.plan_text }}</p>{% endif %}
+  <form method="post" action="/instances/{{ i.key }}/care/protect">
+    <input type="hidden" name="tab" value="diagnose">
+    <label>Begründung, in Worten, die der Mandant lesen kann
+      <input type="text" name="reason" maxlength="300" required
+             placeholder="z. B. Schulung bis Freitag, offene Sitzungen"></label>
+    <label>Bis (einschließlich; leer = {{ i.care.default_days }} Tage ab heute, höchstens {{ i.care.max_days }})
+      <input type="date" name="until" min="{{ i.care.today }}" max="{{ i.care.max_day }}"></label>
+    <button>Schützen</button>
+  </form>
+  {% endif %}
+  <p class="muted">Am Knoten dasselbe: <code>sudo oaap node care protect {{ i.key }}
+     --reason … [--until JJJJ-MM-TT]</code> und <code>release {{ i.key }}</code>.</p>
+</div>
+"""
+
 INSTANCE_EDIT_BODY = """
 <a class="back" href="/instances">← Zurück zur Liste</a>
 <div class="objhead">
@@ -3324,6 +3384,7 @@ INSTANCE_EDIT_BODY = """
   {% endif %}
 </div>
 
+""" + CARE_CARD + """
 <form method="post" action="/instances/{{ i.key }}/restart">
   <input type="hidden" name="tab" value="diagnose">
   <div class="card">
@@ -7934,6 +7995,9 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # Instanz-Eintrag; die Karte zeigt ihn und bietet nur den Schritt an,
          # der jetzt möglich ist.
          "mode": _mode_view(inst),
+         # Neustart-Schutz (RFC-0069 Stufe 5): der Plan des Knotens und der
+         # Schutz dieser Instanz, aus der Pflegedatei; die Tür ist der Spool.
+         "care": _care_view(name),
          # Fernzugang (RFC-0044, oaap.net.remote-access 0.2): eigener
          # Schlüssel wie "diag" -- ein anderes Objekt, kein Feld der
          # Instanz.
@@ -9179,6 +9243,66 @@ def instance_wake(name):
 STANDBY_WAIT_SECONDS = 90       # Gateway umschreiben, Container anhalten
 WAKE_WAIT_SECONDS = 200         # Container starten, auf die erste Antwort warten
 MAINTENANCE_WAIT_SECONDS = 60   # Gateway-Site und Modus-Datei schreiben
+
+
+CARE_WAIT_SECONDS = 20          # Schutz eintragen, Plan neu rechnen, Pflegedatei schreiben
+_CARE_DAY = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _care_view(name):
+    """Der Neustart-Plan des Knotens und der Schutz DIESER Instanz, aus der
+    Pflegedatei (oaap.core.updates 2.7.2, 2.7.5) -- für die Karte."""
+    facts = care_facts() or {}
+    plan = facts.get("plan") or {}
+    held = next((r for r in facts.get("protections") or []
+                 if r.get("instance") == name), None)
+    today = date.today()
+    return {
+        "known": bool(facts),
+        "held": held,
+        "plan_text": host_care.plan_text(plan, de=True) if plan else "",
+        "overridden": any(r.get("instance") == name for r in plan.get("overridden") or []),
+        "default_days": host_care.PROTECT_DEFAULT_DAYS,
+        "max_days": host_care.PROTECT_MAX_DAYS,
+        "today": today.isoformat(),
+        "max_day": (today + timedelta(days=host_care.PROTECT_MAX_DAYS)).isoformat(),
+    }
+
+
+@app.post("/instances/<name>/care/<op>")
+def instance_care_act(name, op):
+    """Schützen, verlängern, aufheben (RFC-0069 Stufe 5): ein Auftrag durch den
+    Spool, der Knoten urteilt noch einmal -- Rolle und Mandant aus dem Datensatz
+    des Handelnden, nicht aus dieser Anfrage."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    if op not in ("protect", "release"):
+        return _inst_back(name)
+    args = {}
+    if op == "protect":
+        reason = (request.form.get("reason") or "").strip()[:300]
+        if not reason:
+            return _inst_back(name, err="Bitte eine Begründung angeben — sie steht im "
+                                        "Protokoll des Mandanten.", keep=("until",))
+        until = (request.form.get("until") or "").strip()
+        if until and not _CARE_DAY.match(until):
+            return _inst_back(name, err="Das Ende ist ein Tag als JJJJ-MM-TT.",
+                              keep=("reason",))
+        args = {"reason": reason, "until": until}
+    res = _queue_and_wait(name, {"action": "care", "op": op, "args": args},
+                          CARE_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Der Knoten hat noch nicht geantwortet — was er "
+                                    "entschieden hat, zeigt diese Karte nach dem "
+                                    "nächsten Minutenlauf.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message") or "Abgewiesen.")
+    return _inst_back(name, msg=res.get("message") or "Erledigt.")
 
 
 def _mode_view(inst):
