@@ -1172,6 +1172,56 @@ IMAGE_WORDS_DE = {"fresh": "frisch", "behind": "Basis weitergezogen",
                   "open": "offene Sicherheitsmeldungen"}
 
 
+# --------------------------------------------- what a rebuild stands on
+# RFC-0071 §15 (stage 2b). One rule for the CLI, the worker and the card:
+# a built service is rebuilt only from bytes that cannot have moved since
+# the install -- the retained package, or the commit the Git install
+# checked out. A branch, a working copy, or a Git install from before the
+# commit was recorded are refused: a rebuild must not be a silent update.
+
+REBUILD_DECLARED = ("self", "release")
+
+
+def _built(inst):
+    return any(str(s.get("image", "")).startswith("oaap-app/")
+               for s in (inst.get("services") or [{"image": inst.get("image", "")}]))
+
+
+def rebuild_source(inst, package_present=True):
+    """(kind, why): kind is 'artifact', 'git', 'pull' (foreign images only)
+    or '' with the sentence why the instance cannot be rebuilt."""
+    if not _built(inst):
+        return "pull", ""
+    src = inst.get("source") or {}
+    kind = src.get("kind") or ""
+    if kind == "artifact":
+        if src.get("stored") and package_present:
+            return "artifact", ""
+        return "", "the retained package is missing"
+    if kind == "git":
+        if re.fullmatch(r"[0-9a-f]{40}", str(src.get("commit") or "")):
+            return "git", ""
+        return "", ("installed from Git before the commit was recorded -- one "
+                    "store update or reinstall records it, then the rebuild works")
+    return "", (f"installed from a {kind or 'unknown'} source that may have moved "
+                "since -- a rebuild builds only from the retained package or the "
+                "recorded commit (RFC-0071 §8.1)")
+
+
+def self_heal(inst, package_present=True):
+    """(possible, why) -- whether the NODE may rebuild this instance by itself
+    (stage 3). The author's promise (manifest care.rebuild: self) and a source
+    the rebuild can use; a person may rebuild by hand without the promise."""
+    kind, why = rebuild_source(inst, package_present)
+    if not kind:
+        return False, why
+    if (inst.get("care_rebuild") or "") != "self":
+        return False, ("the app does not declare care.rebuild: self -- its "
+                       "author has not promised that a rebuild changes nothing "
+                       "but the base")
+    return True, ""
+
+
 def images_line(img, de=False):
     """(state, text) of 2.9: the images the instances run (RFC-0071 stage 1).
     Counts only -- which instance is the instance page's and the CLI's."""

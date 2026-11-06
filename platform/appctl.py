@@ -3515,7 +3515,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 9      # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 10     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -3527,7 +3527,9 @@ MANIFEST_MINOR = 9      # 0.2 adds app.class (runtime spec 2.10);
                         # 0.8 adds services.<name>.tun (runtime spec 2.23,
                         # RFC-0060 -- a VPN client needs it);
                         # 0.9 adds cases.submit (RFC-0061 §3.2 -- an app's
-                        # backend opens a case in its tenant)
+                        # backend opens a case in its tenant);
+                        # 0.10 adds care.rebuild (RFC-0071 §15 -- the
+                        # author promises a rebuild changes only the base)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -8718,8 +8720,9 @@ def care_job(req, name, inst, act_tenant, role, actor):
 #
 # The same package on a freshly pulled base (D1), the running image kept as
 # the ONE predecessor (D2), back to it when the new container does not
-# answer (D5). Built from the retained package only (§8.1): a working copy
-# or a branch may have moved since the instance was installed, and a
+# answer (D5). Built from the bytes in service only (§8.1, §15): the retained
+# package or the commit a Git install recorded -- a working copy or a branch
+# may have moved since the instance was installed, and a
 # rebuild must not be a silent update. A service that runs a foreign image
 # needs no package -- its rebuild is a pull.
 
@@ -8755,16 +8758,65 @@ def _rebuild_sibling(reg, name, inst):
     return None
 
 
+REBUILD_GIT_SECONDS = 300
+
+
+def _redact_url(text):
+    """A Git URL may carry a credential; it never goes into a sentence."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1***@", str(text or ""))
+
+
+def _git_at_commit(src, tmp):
+    """Check out exactly the recorded commit (RFC-0071 §15). A blobless
+    clone carries every commit and tree but fetches file contents only for
+    the checkout; a server that cannot filter sends everything, which is
+    slower and still right."""
+    commit = src["commit"]
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+    def git(*a):
+        r = subprocess.run(["git", *a], capture_output=True, text=True,
+                           timeout=REBUILD_GIT_SECONDS, env=env)
+        if r.returncode != 0:
+            last = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1]
+            raise RebuildRefused(_redact_url(last)[:300] or "git failed")
+        return r.stdout.strip()
+    if not shutil.which("git"):
+        raise RebuildRefused("a rebuild from Git needs git on this node")
+    try:
+        git("clone", "--quiet", "--filter=blob:none", "--no-checkout", src["url"], tmp)
+    except RebuildRefused as e:
+        raise RebuildRefused(f"the Git source cannot be fetched ({e}) -- nothing changed")
+    try:
+        git("-C", tmp, "checkout", "--quiet", "--detach", commit)
+    except RebuildRefused:
+        raise RebuildRefused(f"commit {commit[:12]} is no longer in the repository "
+                             "(rewritten history?) -- a store update installs what "
+                             "is there now")
+    if git("-C", tmp, "rev-parse", "HEAD") != commit:
+        raise RebuildRefused("the checkout is not the recorded commit -- nothing changed")
+    # The bytes, not the repository: a build context at the repository's
+    # root must not carry .git (its config holds the URL) into the image.
+    shutil.rmtree(os.path.join(tmp, ".git"), ignore_errors=True)
+    return os.path.join(tmp, src.get("path") or "")
+
+
 def _rebuild_package(name, inst, tmp):
-    """The retained package's root, or None when the instance has none."""
+    """The root of the bytes in service: the retained package, or the
+    recorded commit of a Git install. RebuildRefused says why not."""
     src = inst.get("source") or {}
-    if src.get("kind") != "artifact":
-        return None
-    zip_path = source_package_arg(name, src)
-    if not os.path.isfile(zip_path):
-        return None
-    extract_artifact(zip_path, tmp)
-    return package_root(tmp, src.get("path") or "")
+    zip_path = source_package_arg(name, src) if src.get("kind") == "artifact" else ""
+    kind, why = host_care.rebuild_source(
+        inst, package_present=bool(zip_path) and os.path.isfile(zip_path))
+    if kind == "artifact":
+        extract_artifact(zip_path, tmp)
+        return package_root(tmp, src.get("path") or "")
+    if kind == "git":
+        return _git_at_commit(src, tmp)
+    if kind == "" and "store update" in why:
+        raise RebuildRefused(why + ".")
+    raise RebuildRefused(f"{why}. Reinstall it from its source, or deliver it as a "
+                         "package; the next build records what it stands on.")
 
 
 def _rebuild_record(name, rec):
@@ -8845,13 +8897,9 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
             pkg = _rebuild_package(name, inst, tmp)
         except ArtifactRejected as e:
             raise RebuildRefused(f"the retained package is unusable ({e})")
-        if not pkg:
-            kind = (inst.get("source") or {}).get("kind") or "unknown"
-            raise RebuildRefused(
-                f"no retained package -- this instance was installed from a {kind} "
-                "source, and a rebuild builds only from the package in service "
-                "(RFC-0071 §8.1). Reinstall it from its source, or deliver it as a "
-                "package; the next build records its base.")
+        if not pkg or not os.path.isdir(pkg):
+            raise RebuildRefused("the package path of the source is not in the "
+                                 "bytes in service -- nothing changed")
     # 2. Pull every base (and every foreign image) -- the point of a rebuild.
     plan = []
     for s in services:
@@ -8925,6 +8973,9 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
     detail = "; ".join(f"{p['svc'] or 'service'} {p['ref']}: "
                        f"{(p['old'] or '?')[7:19]} -> {(p['new'] or '?')[7:19]}"
                        for p in plan)
+    commit = (inst.get("source") or {}).get("commit") if built else ""
+    if commit and (inst.get("source") or {}).get("kind") == "git":
+        detail = f"commit {commit[:12]}; {detail}"
     say("Recreating and waiting for the instance to answer ...")
     if _rebuild_recreate_and_wait(name):
         _rebuild_record(name, {"at": _iso_now(), "state": "done", "by": who,
@@ -9441,10 +9492,24 @@ def cmd_node_care(args):
             names = [i["package"] for i in images.names_for(st, r.get("image_id"))]
             if names:
                 print(f"  {'':<30} open: " + ", ".join(names))
+        insts = load_registry().get("instances", {})
         for name, e in sorted((img.get("instances") or {}).items()):
             for s in e["services"]:
                 show(name + (f"/{s['service']}" if s["service"] else ""), s,
                      (name, s["service"]))
+            # RFC-0071 §15: what a rebuild would build from, and whether the
+            # node may do it by itself.
+            inst = insts.get(name) or {}
+            src = inst.get("source") or {}
+            zp = source_package_arg(name, src) if src.get("kind") == "artifact" else ""
+            present = bool(zp) and os.path.isfile(zp)
+            kind, why = host_care.rebuild_source(inst, present)
+            heal, hwhy = host_care.self_heal(inst, present)
+            print(f"  {'':<30} rebuild: "
+                  + (f"from {kind}" + (f" {src['commit'][:12]}" if kind == "git" else "")
+                     if kind else f"no -- {why}")
+                  + f"; self-heal: {'yes' if heal else 'no'}"
+                  + ("" if heal or not kind else f" -- {hwhy}"))
         for cname, s in sorted((img.get("core") or {}).items()):
             show("[platform] " + cname, s, ("", cname))
         return
@@ -10536,6 +10601,14 @@ def validate_manifest(m):
                 errs.append("cases: object expected")
             elif "submit" in m["cases"] and not isinstance(m["cases"]["submit"], bool):
                 errs.append("cases.submit: true or false")
+        # Manifest 0.10 (RFC-0071 §15): one of two words. A typo must not
+        # decide whether the node rebuilds an instance by itself.
+        if "care" in m:
+            if not isinstance(m["care"], dict):
+                errs.append("care: object expected")
+            elif ("rebuild" in m["care"]
+                  and m["care"]["rebuild"] not in host_care.REBUILD_DECLARED):
+                errs.append("care.rebuild: self | release")
         multi = len(services) > 1
         routes = m.get("routes") or []
         if not routes:
@@ -17239,6 +17312,15 @@ def cmd_install(args):
             die(f"git clone failed: {e.stderr.strip()}")
         pkg = os.path.join(tmp_clone, args.path) if args.path else tmp_clone
         source = {"kind": "git", "url": args.package, "path": args.path, "ref": ref}
+        # RFC-0071 §15: the commit this install checked out. A rebuild
+        # builds exactly these bytes again on a fresh base; the branch
+        # name alone may point elsewhere by then.
+        try:
+            head = run(["git", "-C", tmp_clone, "rev-parse", "HEAD"]).stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{40}", head):
+                source["commit"] = head
+        except (subprocess.CalledProcessError, OSError):
+            pass
         if getattr(args, "store_source", ""):
             # Which list this instance came from (RFC-0012 §3). A later
             # resolution prefers it, so an app installed from the
@@ -17891,6 +17973,10 @@ def _install_from_dir(pkg, args, source):
         # for restore (oaap.data.backup) and the deploy hook (runtime
         # spec 2.5): where the package came from and how to rebuild it
         "source": source,
+        # Manifest 0.10 (RFC-0071 §15): the author's promise that a
+        # rebuild on a fresh base changes nothing else. Verbatim; ''
+        # when the manifest is silent, which counts as 'release'.
+        "care_rebuild": str((m.get("care") or {}).get("rebuild") or ""),
         "build": primary["build"],
         "storage": m.get("storage") or [],
         # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the

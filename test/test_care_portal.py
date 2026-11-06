@@ -257,23 +257,47 @@ h = ICARD.render(i={"key": "x", "imgcare": {"known": False, "services": [], "sta
 ok("Abbild: noch nicht gelesen", "noch nicht gelesen" in h, h)
 
 
-def irender2(artifact, state="", text=""):
+# RFC-0071 §15: woraus gebaut wird, und die Selbstheilung -- die Funktion der Seite.
+RV = {"host_care": host_care}
+for node in tree.body:
+    if ((isinstance(node, ast.FunctionDef) and node.name == "_rebuild_view")
+            or (isinstance(node, ast.Assign)
+                and any(getattr(t, "id", "") == "SOURCE_WORDS" for t in node.targets))):
+        exec(compile(ast.Module([node], []), APP_PY, "exec"), RV)
+ART = {"services": [{"image": "oaap-app/w:1"}], "source": {"kind": "artifact", "stored": "1.zip"}}
+GIT_OLD = {"services": [{"image": "oaap-app/s:1"}], "source": {"kind": "git", "url": "https://x"}}
+GIT = {"services": [{"image": "oaap-app/s:1"}], "care_rebuild": "self",
+       "source": {"kind": "git", "url": "https://x", "commit": "ab" * 20}}
+LOCAL = {"services": [{"image": "oaap-app/l:1"}], "source": {"kind": "local", "url": "/srv"}}
+
+
+def irender2(inst, state="", text=""):
     return ICARD.render(i={"key": "x", "imgcare": {
         "known": True, "services": [SVC], "state": "open", "word": "w", "computed": "c",
-        "artifact": artifact, "rebuild": {"state": state, "at": "2026-11-06 09:00", "by": "anna",
-                                          "why": "", "text": text}}})
+        "rebuild": {"state": state, "at": "2026-11-06 09:00", "by": "anna",
+                    "why": "", "text": text}, **RV["_rebuild_view"](inst)}})
 
 
-h = irender2(True)
+h = irender2(ART)
 ok("Abbild (Stufe 2): mit Paket der Knopf Neu bauen, kein Zurück ohne Vorgänger",
-   "/rebuild/start" in h and "/rebuild/back" not in h, h)
-h = irender2(False)
-ok("Abbild: ohne zurückbehaltenes Paket kein Knopf, der Grund steht da",
-   "/rebuild/start" not in h and "zurückbehaltenen Paket" in h, h)
-h = irender2(True, "fallback", "Neu gebaut, aber ... vorigen Abbild.")
+   "/rebuild/start" in h and "/rebuild/back" not in h and "zurückbehaltenen Paket" in h, h)
+ok("Abbild (2b): ohne Zusage Selbstheilung nicht möglich, von Hand geht",
+   "Selbstheilung: nicht möglich" in h and "care.rebuild: self" in h
+   and "Von Hand neu bauen geht" in h, h)
+h = irender2(LOCAL)
+ok("Abbild: aus einem Pfad kein Knopf, der Grund steht da",
+   "/rebuild/start" not in h and "festgehaltenen Git-Commit" in h and "§8.1" in h, h)
+h = irender2(GIT_OLD)
+ok("Abbild (2b): Git von vor dem Commit -- kein Knopf, Store-Update hält ihn fest",
+   "/rebuild/start" not in h and "Store-Update" in h, h)
+h = irender2(GIT)
+ok("Abbild (2b): Git mit Commit -- Knopf, der Commit steht da, Selbstheilung möglich",
+   "/rebuild/start" in h and "abababababab" in h and "Git-Commit" in h
+   and "Selbstheilung: möglich" in h, h)
+h = irender2(ART, "fallback", "Neu gebaut, aber ... vorigen Abbild.")
 ok("Abbild: nach dem Rückfall rot, mit Zurück-Knopf",
    'class="err"' in h and "/rebuild/back" in h and "anna" in h, h)
-h = irender2(True, "running", "Der Neubau läuft gerade.")
+h = irender2(ART, "running", "Der Neubau läuft gerade.")
 ok("Abbild: während des Neubaus kein zweiter Knopf", "/rebuild/start" not in h, h)
 ok("die Tür der Seite ist die Spool-Aktion rebuild",
    "\"action\": \"rebuild\"" in io.open(APP_PY, encoding="utf-8").read())

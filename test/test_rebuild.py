@@ -2,8 +2,8 @@
 """The rebuild (RFC-0071 stage 2, 0.1.228) -- executed against a recorded
 Docker, no node:
 
-1. only from the retained package: a git/local source with a built service
-   is refused before anything is pulled (§8.1); a foreign-only instance
+1. only from the bytes in service (§8.1, §15): a git source without a
+   recorded commit, or a local source, with a built service is refused before anything is pulled (§8.1); a foreign-only instance
    needs no package (its rebuild is a pull);
 2. a held instance is not rebuilt (RFC-0069), the card does not stay "running";
 3. the happy path: pull, the running image kept as the predecessor (D2),
@@ -97,7 +97,9 @@ def recreate(name):
 m._rebuild_recreate_and_wait = recreate
 PKG = tempfile.mkdtemp()
 open(os.path.join(PKG, "Dockerfile"), "w").write("FROM python:3.13-slim\nCOPY . /app\n")
-m._rebuild_package = lambda name, inst, tmp: PKG if (inst.get("source") or {}).get("kind") == "artifact" else None
+_REAL_PACKAGE = m._rebuild_package
+m._rebuild_package = lambda name, inst, tmp: (
+    PKG if (inst.get("source") or {}).get("kind") == "artifact" else _REAL_PACKAGE(name, inst, tmp))
 AUDIT = []
 m.audit_tenant = lambda action, tid, subject="", result="ok", **kw: AUDIT.append(
     (action, subject, result, kw.get("who"), kw.get("detail", "")))
@@ -156,8 +158,8 @@ def refused(fn):
 # 1. the package rule
 CALLS.clear()
 why = refused(lambda: m.rebuild_instance("studio", say=lambda *_: None))
-ok("1 a git source with a built service: refused, the reason names §8.1",
-   why and "retained package" in why and "§8.1" in why, why)
+ok("1 a git source from before the commit was recorded: refused, a store update records it",
+   why and "before the commit was recorded" in why and "store update" in why, why)
 ok("1 ... before anything was pulled", not any(c[1] == "pull" for c in CALLS), CALLS)
 ok("1 ... and the card does not stay 'running'", not (inst("studio").get("rebuild") or {}).get("state"))
 

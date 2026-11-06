@@ -2501,8 +2501,10 @@ IMAGE_CARD = """
      {{ rb.text }} <span class="muted">({{ rb.at }} UTC{% if rb.by %}, {{ rb.by }}{% endif %})</span>
      {% if rb.why %}<br><span class="muted">{{ rb.why }}</span>{% endif %}</p>
   {% endif %}
-  {% if i.imgcare.artifact %}
-  <p>Neu bauen nimmt dasselbe Paket auf einer frisch geholten Basis; das
+  <p>Selbstheilung: {{ i.imgcare.self_heal_text }}</p>
+  {% if i.imgcare.rebuildable %}
+  <p>Neu bauen nimmt dieselben Bytes {{ i.imgcare.source_text }}{% if i.imgcare.commit %}
+     (<code>{{ i.imgcare.commit }}</code>){% endif %} auf einer frisch geholten Basis; das
      laufende Abbild bleibt als Vorgänger. Antwortet der neue Container nicht,
      läuft die Instanz von selbst wieder auf dem Vorgänger. Gibt es eine
      Testinstanz derselben App, kommt sie zuerst dran.</p>
@@ -2519,8 +2521,7 @@ IMAGE_CARD = """
   </form>
   {% endif %}
   {% else %}
-  <p class="muted">Neu bauen geht nur aus dem zurückbehaltenen Paket (RFC-0071 §8.1);
-     diese Instanz kam aus einer Quelle, die sich seither geändert haben kann.</p>
+  <p class="muted">{{ i.imgcare.why_not }}</p>
   {% endif %}
   <p class="muted">Am Knoten: <code>sudo oaap node care images</code> (mit Paketnamen),
      <code>sudo oaap app rebuild {{ i.key }} [--back]</code>.</p>
@@ -9375,8 +9376,40 @@ def _image_view(name):
             "rebuild": {"state": rb.get("state", ""), "at": str(rb.get("at", ""))[:16].replace("T", " "),
                         "by": rb.get("by", ""), "why": rb.get("why", ""),
                         "text": REBUILD_WORDS.get(rb.get("state", ""), "")},
-            "artifact": ((load_instances().get(name) or {}).get("source") or {}).get("kind") == "artifact"
-                        or all(not str(s.get("image", "")).startswith("oaap-app/") for s in rows)}
+            # RFC-0071 §15: woraus ein Neubau baut, und ob der Knoten selbst darf.
+            **_rebuild_view(load_instances().get(name) or {})}
+
+
+SOURCE_WORDS = {"artifact": "aus dem zurückbehaltenen Paket",
+                "git": "aus dem festgehaltenen Git-Commit",
+                "pull": "durch neues Holen des fremden Abbilds"}
+
+
+def _rebuild_view(inst):
+    kind, why = host_care.rebuild_source(inst)
+    heal, heal_why = host_care.self_heal(inst)
+    commit = ((inst.get("source") or {}).get("commit") or "")[:12]
+    if kind:
+        why_de = ""
+    elif "before the commit was recorded" in why:
+        why_de = ("Diese Instanz kam aus Git, bevor der Commit festgehalten wurde. "
+                  "Ein Store-Update hält ihn fest; danach geht der Neubau.")
+    elif "package is missing" in why:
+        why_de = "Das zurückbehaltene Paket fehlt."
+    else:
+        why_de = ("Neu bauen geht nur aus dem zurückbehaltenen Paket oder dem "
+                  "festgehaltenen Git-Commit (RFC-0071 §8.1); diese Instanz kam aus "
+                  "einer Quelle, die sich seither geändert haben kann.")
+    if heal:
+        heal_de = "möglich — die App sagt zu, dass ein Neubau nur die Basis ändert."
+    elif not kind:
+        heal_de = "nicht möglich — " + why_de[0].lower() + why_de[1:]
+    else:
+        heal_de = ("nicht möglich — die App sagt nicht zu, dass ein Neubau nur die "
+                   "Basis ändert (Manifest care.rebuild: self). Von Hand neu bauen geht.")
+    return {"artifact": bool(kind), "rebuildable": bool(kind), "source": kind,
+            "source_text": SOURCE_WORDS.get(kind, ""), "commit": commit,
+            "why_not": why_de, "self_heal": heal, "self_heal_text": heal_de}
 
 
 REBUILD_WORDS = {
