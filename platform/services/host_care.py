@@ -1222,6 +1222,40 @@ def self_heal(inst, package_present=True):
     return True, ""
 
 
+def rebuild_helps(services, de=False):
+    """(word, text) -- whether a rebuild can be EXPECTED to clear the open
+    advisories of an instance, from what the image reading knows.
+
+    "May the node rebuild" (self_heal) is not "will it help": a pinned base
+    that upstream never rebuilds comes back with the same packages (the
+    code-server case, oaapx01 06.11.). Words: "" (nothing open), "likely"
+    (the base moved upstream), "only-upgrade" (the base equals upstream --
+    only a build that upgrades packages helps), "unknown" (the node does
+    not know the upstream digest)."""
+    opened = [s for s in services or [] if s.get("open")]
+    if not opened:
+        return "", ""
+    if any(s.get("behind") is True for s in opened):
+        return "likely", ("Die Basis ist upstream weitergezogen — ein Neubau holt sie "
+                          "und heilt voraussichtlich." if de else
+                          "the base moved upstream -- a rebuild fetches it and "
+                          "should clear them")
+    if all(s.get("behind") is False for s in opened):
+        return "only-upgrade", (
+            "Die Basis ist upstream unverändert — ein Neubau heilt nur, wenn die App "
+            "beim Bau die Pakete aktualisiert (z. B. apt-get upgrade); sonst braucht "
+            "es eine neue Version der App." if de else
+            "the base equals upstream -- a rebuild clears them only if the app "
+            "upgrades packages while building (apt-get upgrade); otherwise a new "
+            "app version is needed")
+    return "unknown", (
+        "Ob die Basis upstream weitergezogen ist, weiß der Knoten nicht (festgenagelte "
+        "oder nicht lesbare Basis) — ein Neubau heilt nur, wenn upstream neu gebaut hat "
+        "oder die App beim Bau die Pakete aktualisiert (z. B. apt-get upgrade)." if de else
+        "the node does not know whether the base moved upstream -- a rebuild clears "
+        "them only if upstream rebuilt it or the app upgrades packages while building")
+
+
 def images_line(img, de=False):
     """(state, text) of 2.9: the images the instances run (RFC-0071 stage 1).
     Counts only -- which instance is the instance page's and the CLI's."""

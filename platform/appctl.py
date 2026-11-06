@@ -9505,6 +9505,9 @@ def cmd_node_care(args):
             present = bool(zp) and os.path.isfile(zp)
             kind, why = host_care.rebuild_source(inst, present)
             heal, hwhy = host_care.self_heal(inst, present)
+            helps, htext = host_care.rebuild_helps(e["services"])
+            if helps:
+                print(f"  {'':<30} will a rebuild help: {helps} -- {htext}")
             print(f"  {'':<30} rebuild: "
                   + (f"from {kind}" + (f" {src['commit'][:12]}" if kind == "git" else "")
                      if kind else f"no -- {why}")
@@ -11890,6 +11893,8 @@ def authz_admin_refusal(app_id, administer, door_open, confirmed):
     if not administer or door_open or confirmed:
         return ""
     return (f"'{app_id}' asks to ADMINISTER the business authorization of "
+            # ADMINISTER_MARK: the spool worker recognises this refusal by it
+            # and tells the portal a server_admin may confirm (spec 2.10).
             "its tenant (authorization.administer: true). Its key can create "
             "roles and collections, give and end assignments and map groups "
             "-- for ONE tenant, in the name of the tenant administrator who "
@@ -11897,7 +11902,14 @@ def authz_admin_refusal(app_id, administer, door_open, confirmed):
             "user, register a declaration or reach another tenant. Whoever "
             "holds the container holds that power over grants. Nothing was "
             "built. Install again with --confirm-administer to accept "
-            "(oaap.core.authorization 2.10).")
+            "-- or, as server_admin, confirm it in the portal's store "
+            f"(oaap.core.authorization 2.10). {ADMINISTER_MARK}")
+
+
+# The tail of the refusal above. The worker finds it in an install's last
+# line and answers `needs: confirm_administer`, so the portal can ask the
+# operator instead of only printing the CLI flag.
+ADMINISTER_MARK = "[needs: confirm-administer]"
 
 
 AUTHZ_STATE_FILE = os.path.join(DATA_DIR, "data", "identity",
@@ -24578,6 +24590,14 @@ def cmd_process_deploys(_args):
                 # sides cannot drift (RFC-0025 8.1).
                 name=local_name, channel=channel,
                 store_source=src.get("store_source", ""),
+                # oaap.core.authorization 2.10: the operator's yes to an app
+                # that administers its tenant's grants. From the portal it
+                # counts only if the actor IS a server_admin by their own
+                # record (never by the request) and the yes names exactly
+                # this app -- a brake against a stale or replayed form.
+                confirm_administer=(act_role == "server_admin"
+                                    and bool(lookup_id)
+                                    and req.get("confirm_administer") == lookup_id),
                 # Only consulted when the instance is NEW: a redeploy
                 # keeps whatever the instance already says, so this can
                 # never move one between tenants. An update names the
@@ -26232,6 +26252,9 @@ def cmd_process_deploys(_args):
                 # made.
                 res_body = {"ok": ok, "message": msg, "revision": revision,
                             "version": version, "id": rid, "key": name}
+                if not ok and ADMINISTER_MARK in str(msg or ""):
+                    res_body["needs"] = "confirm_administer"
+                    res_body["message"] = str(msg).replace(ADMINISTER_MARK, "").strip()
                 if detail is not None:
                     res_body["detail"] = detail
                 json.dump(res_body, f)

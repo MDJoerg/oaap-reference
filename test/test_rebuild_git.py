@@ -179,6 +179,22 @@ ok("5 the Git install reads the commit it checked out into source.commit",
 ok("5 the instance record keeps care.rebuild verbatim",
    '"care_rebuild": str((m.get("care") or {}).get("rebuild") or "")' in src)
 
+# 6. "may the node rebuild" is not "will it help" (code-server, oaapx01 06.11.)
+rh = hc.rebuild_helps
+ok("6 nothing open: nothing to say", rh([{"open": 0, "behind": False}]) == ("", ""))
+ok("6 the base moved upstream: likely",
+   rh([{"open": 3, "behind": True}, {"open": 0, "behind": False}])[0] == "likely")
+w, t = rh([{"open": 9, "behind": False}], de=True)
+ok("6 base = upstream: only a build that upgrades helps",
+   w == "only-upgrade" and "apt-get upgrade" in t and "neue Version" in t, t)
+ok("6 upstream unknown (pinned ghcr tag): said as unknown",
+   rh([{"open": 9, "behind": None}])[0] == "unknown")
+ok("6 the CLI and the card use the same function",
+   "host_care.rebuild_helps(e[\"services\"])" in src
+   and "host_care.rebuild_helps(e[\"services\"], de=True)" in open(
+       os.path.join(HERE, "..", "platform", "services", "portal", "app.py"),
+       encoding="utf-8").read())
+
 print()
 print("FAILED" if fails else "ALL PASS", f"({fails} failing)")
 sys.exit(1 if fails else 0)

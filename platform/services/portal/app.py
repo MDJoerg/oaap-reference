@@ -1701,6 +1701,46 @@ STORE_APP_BODY = """
   .icon-lg{width:3rem;height:3rem;object-fit:contain;flex:none}
 </style>
 <a class="back" href="/store">← Zurück zum Store</a>
+{% if need %}
+<div class="card warn" id="bestaetigen">
+  <h2 style="margin-top:0">Diese App verwaltet Rechte — bitte bestätigen</h2>
+  <p>„{{ a.name }}“ bittet darum, die <strong>fachlichen Berechtigungen ihres
+    Mandanten zu verwalten</strong> (<code>authorization.administer: true</code>).
+    Der Knoten hat deshalb noch nichts gebaut.</p>
+  <p><strong>Ihr Schlüssel kann</strong> — für <em>einen</em> Mandanten, im Namen
+    des Mandanten-Admins, der sie benutzt: Rollen und Berechtigungspakete anlegen,
+    Zuordnungen geben und beenden, Gruppen zuordnen.</p>
+  <p><strong>Er kann nie</strong>: eine Plattform-Rolle vergeben oder lesen,
+    Benutzer anlegen, ändern oder löschen, eine Deklaration registrieren oder
+    einen anderen Mandanten erreichen. Jeder Schritt steht mit der handelnden
+    Person im Protokoll des Mandanten.</p>
+  <p class="muted">Wer den Container hält, hält diese Macht über die Rechte —
+    deshalb fragt der Knoten einmal, beim ersten Installieren. Ein späteres
+    Update derselben Instanz fragt nicht noch einmal (oaap.core.authorization
+    2.10).</p>
+  {% if need.can_confirm %}
+  <form method="post" action="/store/install"
+        onsubmit="this.querySelector('button').disabled=true;
+                  this.querySelector('button').textContent='Wird installiert …'">
+    <input type="hidden" name="app_id" value="{{ a.id }}">
+    <input type="hidden" name="source_id" value="{{ a.source.id }}">
+    {% if need.update %}<input type="hidden" name="update" value="{{ need.update }}">{% endif %}
+    {% if need.new_name %}<input type="hidden" name="new" value="1">
+    <input type="hidden" name="name" value="{{ need.new_name }}">{% endif %}
+    {% if need.channel %}<input type="hidden" name="channel" value="test">{% endif %}
+    {% if need.confirm_source %}<input type="hidden" name="confirm_source" value="{{ need.confirm_source }}">{% endif %}
+    <label class="checkline"><input type="checkbox" name="confirm_administer"
+           value="{{ a.id }}" required> Ich bestätige als Server-Admin: diese App
+           darf die Rechte ihres Mandanten verwalten.</label>
+    <button>Mit Bestätigung installieren</button>
+    <a class="rowaction" href="/store/{{ a.source.id }}/{{ a.id }}" style="margin-left:.8rem">Abbrechen</a>
+  </form>
+  {% else %}
+  <p style="margin:0">Das bestätigt der <strong>Server-Admin</strong> des Knotens —
+    bitte ihn, die App hier im Store zu installieren.</p>
+  {% endif %}
+</div>
+{% endif %}
 {% if msg %}
 <div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
 {% endif %}
@@ -2575,6 +2615,8 @@ IMAGE_CARD = """
      {% if rb.why %}<br><span class="muted">{{ rb.why }}</span>{% endif %}</p>
   {% endif %}
   <p>Selbstheilung: {{ i.imgcare.self_heal_text }}</p>
+  {% if i.imgcare.helps %}<p class="{{ 'muted' if i.imgcare.helps == 'likely' }}">Hilft ein Neubau?
+     {{ i.imgcare.helps_text }}</p>{% endif %}
   {% if i.imgcare.rebuildable %}
   <p>Neu bauen nimmt dieselben Bytes {{ i.imgcare.source_text }}{% if i.imgcare.commit %}
      (<code>{{ i.imgcare.commit }}</code>){% endif %} auf einer frisch geholten Basis; das
@@ -7298,7 +7340,18 @@ def store_app(source_id, app_id):
         return redirect("/store?err=1&msg="
                         + quote("Diese App steht in keiner eingetragenen "
                                 "Quelle (mehr)."), code=303)
-    return page(STORE_APP_BODY, a["name"], "store", a=a,
+    need = None
+    if request.args.get("need") == "administer":
+        upd = request.args.get("upd", "")
+        nn = request.args.get("nn", "")
+        own = visible_instances()
+        need = {"update": upd if (upd and (own.get(upd) or {}).get("app_id") == a["id"]) else "",
+                "new_name": nn if _re.fullmatch(r"[a-z0-9][a-z0-9-]*", nn or "") else "",
+                "channel": "test" if request.args.get("ch") == "test" else "",
+                "confirm_source": request.args.get("cs", "")
+                if request.args.get("cs", "") == a["source"]["id"] else "",
+                "can_confirm": "server_admin" in caller_roles()}
+    return page(STORE_APP_BODY, a["name"], "store", a=a, need=need,
                 instances=_app_instances(a["id"]),
                 profiles=node_profiles(),
                 msg=request.args.get("msg"),
@@ -7364,6 +7417,13 @@ def store_install():
                    **({"new": True} if wants_new else {}),
                    "action": "install",
                    "source_id": source_id, "confirm_source": confirm,
+                   # oaap.core.authorization 2.10: the operator's yes to an
+                   # app that administers its tenant's grants, naming the
+                   # app. Sent only by a server_admin; the host checks the
+                   # actor's record again and ignores it for anyone else.
+                   **({"confirm_administer": app_id}
+                      if (request.form.get("confirm_administer") == app_id
+                          and "server_admin" in caller_roles()) else {}),
                    # Only "test" is a choice; anything else is production.
                    # The host decides again, and an existing instance keeps
                    # the channel it has (RFC-0050 4).
@@ -7386,6 +7446,17 @@ def store_install():
                 return back(f"'{app_id}' wurde installiert"
                             + (f" (Version {v})" if v else "")
                             + " — die Kachel erscheint im Launchpad.")
+            if res.get("needs") == "confirm_administer":
+                # Not a failure to report, a question to ask: the object
+                # page shows what the app's key can and cannot do, and --
+                # to a server_admin -- the same install once more with the
+                # tick box. The form state travels in the link.
+                where = f"/store/{source_id}/{app_id}" if source_id else "/store"
+                return redirect(where + "?need=administer"
+                                + (f"&upd={quote(update)}" if update else "")
+                                + (f"&nn={quote(new_name)}" if wants_new else "")
+                                + ("&ch=test" if request.form.get("channel") == "test" else "")
+                                + (f"&cs={quote(confirm)}" if confirm else ""), code=303)
             return back(f"Installation von '{app_id}' fehlgeschlagen: "
                         f"{res.get('message', 'unbekannter Fehler')}", ok=False)
         _time.sleep(2)
@@ -9490,7 +9561,11 @@ def _image_view(name):
             "why": s.get("why", ""),
         })
     rb = (load_instances().get(name) or {}).get("rebuild") or {}
+    helps = host_care.rebuild_helps(e["services"], de=True)
     return {"known": True, "services": rows, "state": e["state"],
+            # Darf der Knoten neu bauen ist nicht: hilft es. Eine festgenagelte
+            # Basis kommt mit denselben Paketen zurück (code-server, 06.11.).
+            "helps": helps[0], "helps_text": helps[1],
             "word": host_care.IMAGE_WORDS_DE.get(e["state"], e["state"]),
             "computed": (img.get("computed") or "")[:16].replace("T", " "),
             # RFC-0071 Stufe 2: der letzte Neubau, in Worten.
