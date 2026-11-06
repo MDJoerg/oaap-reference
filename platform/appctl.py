@@ -7227,6 +7227,24 @@ class _BuildDrivers:
             return PRESENT_, f"the instance '{a['name']}' exists in this tenant"
         return ABSENT_, f"no instance '{a['name']}' in this tenant yet"
 
+    def _administer_confirmed(self, a):
+        """The step's tick confirms an app that administers its tenant's
+        grants (oaap.core.authorization 2.10) -- counted only for the
+        server_admin (or root) driving this build, judged from their own
+        record by the worker; the profile itself never confirms."""
+        return (self.role in ("root", "server_admin")
+                and a.get("confirm_administer") == "true")
+
+    @staticmethod
+    def _administer_note(note, raw=""):
+        """The refusal ends with the portal's mark; the short note may have
+        cut it off, so the whole output is asked too."""
+        if ADMINISTER_MARK not in note and ADMINISTER_MARK not in raw:
+            return note
+        return (note.replace(ADMINISTER_MARK, "").strip()
+                + " -- in a profile, the step's tick confirms it "
+                "(confirm_administer)")
+
     def _do_app_install(self, a, ctx):
         if a.get("app"):
             return self._install_from_catalogue(a)
@@ -7236,7 +7254,13 @@ class _BuildDrivers:
             argv += ["--path", a["path"]]
         if a.get("ref"):
             argv += ["--ref", a["ref"]]
-        ok, note = self._verb(argv, f"'{a['name']}' was installed")
+        if self._administer_confirmed(a):
+            argv += ["--confirm-administer"]
+        code, out = _run_verb(argv)
+        ok = code == 0
+        note = (f"'{a['name']}' was installed" if ok else
+                (_brief(out, 3) or f"the verb stopped with {code}"))
+        note = self._administer_note(note, "" if ok else out)
         key = self._instance_key(a["name"])
         return ok, note, ([f"instance:{key}"] if ok and key else [])
 
@@ -7259,7 +7283,8 @@ class _BuildDrivers:
         ns = argparse.Namespace(
             package=src["url"], path=src.get("path", ""), ref=src.get("ref", ""),
             name=a["name"], channel=a.get("channel") or "production",
-            store_source=store["id"], tenant=self.label)
+            store_source=store["id"], tenant=self.label,
+            confirm_administer=self._administer_confirmed(a))
         buf = io.StringIO()
         try:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -7271,6 +7296,7 @@ class _BuildDrivers:
         except subprocess.CalledProcessError as exc:
             ok, note = False, ((exc.stderr or "").strip().splitlines() or
                                [str(exc)])[-1]
+        note = self._administer_note(note, "" if ok else buf.getvalue())
         key = self._instance_key(a["name"])
         return ok, note, ([f"instance:{key}"] if ok and key else [])
 
@@ -7644,6 +7670,12 @@ def tenant_request_submit(a, now):
             not isinstance(k, str) or not isinstance(v, str)
             for k, v in given.items()):
         raise tenant_request.Refusal("'params' must be an object of text values")
+    # A tick that confirms an app administering the tenant's grants is the
+    # operator's, never an applicant's (oaap.core.authorization 2.10): the
+    # public form does not show it, and here it is "no" whatever was sent.
+    given = dict(given)
+    for k in tenant_build.administer_params(profile):
+        given[k] = "false"
     values, problems = tenant_build.param_values(
         profile, given, label_check=_request_label_check)
     if problems:

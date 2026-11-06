@@ -52,8 +52,12 @@ STEP_TYPES = {
     # Exactly one of `source` (a path or URL, for a profile the operator wrote
     # on the node) and `app` (an id in a configured store source, the only
     # form an UPLOADED profile may use -- see upload_problems).
+    # `confirm_administer` (oaap.core.authorization 2.10): "{p}" naming the
+    # SAME bool parameter as the step's `when`. One tick then installs an app
+    # that administers its tenant's grants AND is the operator's confirmation;
+    # a profile can never confirm in advance (no literal "true").
     "app.install":    (("name",), ("source", "app", "source_id", "channel",
-                                   "path", "ref")),
+                                   "path", "ref", "confirm_administer")),
     # oaap.core.authorization 0.4 section 2.11: roles, collections, mappings
     # and realm groups from the templates of one app. `only`/`skip` are
     # comma-separated template keys, `groups` is KEY=PATH[,KEY=PATH] and
@@ -211,9 +215,30 @@ def profile_problems(doc):
             if ("source" in st) == ("app" in st):
                 out.append(f"{where} ('{sid}'): app.install needs exactly one "
                            "of 'source' and 'app'")
+            if "confirm_administer" in st:
+                m = TEMPLATE_RE.fullmatch(str(st["confirm_administer"]))
+                if not m or m.group(1) != st.get("when"):
+                    out.append(f"{where} ('{sid}'): confirm_administer is "
+                               "'{p}' naming the same bool parameter as "
+                               "'when' -- the tick that installs is the "
+                               "confirmation, a profile never confirms in "
+                               "advance")
         if typ == "manual" and st.get("done_when") not in DONE_WHEN:
             out.append(f"{where} ('{sid}'): done_when is one of "
                        + ", ".join(DONE_WHEN))
+    return out
+
+
+def administer_params(profile):
+    """The bool parameters whose tick confirms an app that administers its
+    tenant's grants (oaap.core.authorization 2.10) -> set of names. Only a
+    server_admin starting a build may give them; an applicant's form never."""
+    out = set()
+    for st in (profile or {}).get("steps") or []:
+        if isinstance(st, dict) and st.get("type") == "app.install":
+            m = TEMPLATE_RE.fullmatch(str(st.get("confirm_administer") or ""))
+            if m:
+                out.add(m.group(1))
     return out
 
 

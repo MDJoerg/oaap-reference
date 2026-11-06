@@ -96,12 +96,31 @@ def open_for(view, label):
 
 # ------------------------------------------------------------- the form
 
+ADMIN_REF_RE = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
+
+
+def administer_fields(profile):
+    """Haken, die eine App installieren UND zusagen, dass sie die Rechte des
+    Mandanten verwaltet (oaap.core.authorization 2.10) -> {Name: App-Id}.
+    Gelesen aus der vollen Datei (`doc`), die die Sicht mitführt."""
+    doc = profile.get("doc") if isinstance(profile.get("doc"), dict) else profile
+    out = {}
+    for st in doc.get("steps") or []:
+        if isinstance(st, dict) and st.get("type") == "app.install":
+            m = ADMIN_REF_RE.match(str(st.get("confirm_administer") or ""))
+            if m:
+                out[m.group(1)] = str(st.get("app") or st.get("name") or "")
+    return out
+
+
 def fields(profile):
     """Die Formularfelder aus den Parametern des Profils.
 
     Jedes Feld: name, kind, label (die eigene Beschriftung des Profils oder
-    der Name), required, default, max. Die Reihenfolge ist die der Datei.
+    der Name), required, default, max, administer (die App-Id, wenn der
+    Haken eine Rechte-App zusagt, sonst ""). Die Reihenfolge ist die der Datei.
     """
+    admin = administer_fields(profile)
     out = []
     for name, spec in (profile.get("params") or {}).items():
         spec = spec if isinstance(spec, dict) else {}
@@ -109,21 +128,32 @@ def fields(profile):
                     "label": spec.get("label") or name,
                     "required": bool(spec.get("required")),
                     "default": spec.get("default"),
-                    "max": spec.get("max")})
+                    "max": spec.get("max"),
+                    "administer": admin.get(name, "")})
     return out
+
+
+def public_fields(profile):
+    """Das Formular des Interessenten: ohne die Haken einer Rechte-App --
+    die Zusage gibt nur der Server-Admin (der Host setzt sie dort ohnehin
+    auf „nein“)."""
+    return [f for f in fields(profile) if not f["administer"]]
 
 
 def plan(profile):
     """Die Schritte in Klartext; ein Menschenschritt ist gekennzeichnet."""
     out = []
     params = profile.get("params") or {}
-    for s in profile.get("steps") or []:
+    doc = profile.get("doc") if isinstance(profile.get("doc"), dict) else profile
+    for s in doc.get("steps") or []:
         typ = s.get("type", "")
         when = s.get("when") or ""
         ask = (params.get(when) or {}).get("label") or when
         out.append({"id": s.get("id", ""), "text": STEP_TYPE.get(typ, typ),
                     "human": typ == "manual",
-                    "when": (ask if isinstance(ask, str) else when)})
+                    "when": (ask if isinstance(ask, str) else when),
+                    "administer": bool(ADMIN_REF_RE.match(
+                        str(s.get("confirm_administer") or "")))})
     return out
 
 
@@ -263,6 +293,9 @@ def public_params(profile, form):
     schon hier, die Adresse sieht aus wie eine Adresse. Der Host urteilt noch
     einmal (und kennt, was nur er weiß: ob das Kürzel frei ist)."""
     params, missing = start_params(profile, form)
+    for f in fields(profile):
+        if f["administer"]:
+            params[f["name"]] = "false"
     errors = []
     if missing:
         errors.append("Bitte ausfüllen: " + ", ".join(missing))
@@ -299,19 +332,28 @@ TEMPLATE = {
         "tenant.policy, tenant.face, app.install, authz.setup, manual, backup.check. app.install "
         "nennt in einem hochgeladenen Profil eine App des Katalogs ('app'), nie einen "
         "Pfad; ersetze 'webseite' durch eine ID aus deinem Katalog. Platzhalter wie "
-        "{label} setzt der Knoten ein, er wertet sie nie als Befehl aus."),
+        "{label} setzt der Knoten ein, er wertet sie nie als Befehl aus. Eine App, die "
+        "die Rechte des Mandanten verwaltet (z. B. 'rollen-rechte'), braucht "
+        "'confirm_administer': '{<derselbe Parameter wie when>}': der Haken des "
+        "Server-Admins beim Start ist die Zusage; im Antragsformular erscheint er nie."),
     "params": {
         "label": {"kind": "label", "required": True, "label": "Kürzel des Mandanten"},
         "title": {"kind": "text", "required": True, "max": 60, "label": "Name des Kunden"},
         "color": {"kind": "color", "default": None, "label": "Hauptfarbe"},
         "with_web": {"kind": "bool", "default": True, "label": "Mit Webseite"},
+        "with_rights": {"kind": "bool", "default": False,
+                        "label": "Mit „Rollen & Rechte“ (der Mandanten-Admin pflegt "
+                                 "Rollen und Zuordnungen selbst)"},
     },
     "steps": [
         {"id": "tenant", "type": "tenant.create", "label": "{label}", "title": "{title}"},
         {"id": "face", "type": "tenant.face", "title": "{title}",
          "color_primary": "{color}"},
         {"id": "web", "type": "app.install", "app": "webseite",
-         "name": "{label}-webseite", "when": "with_web"},
+         "name": "webseite", "when": "with_web"},
+        {"id": "rights", "type": "app.install", "app": "rollen-rechte",
+         "name": "rechte", "when": "with_rights",
+         "confirm_administer": "{with_rights}"},
         {"id": "admin", "type": "manual", "done_when": "role.tenant_admin",
          "text": "Ersten Verwalter im Anmeldedienst des Kunden anlegen, "
                  "dann im Portal die Rolle tenant_admin vergeben."},

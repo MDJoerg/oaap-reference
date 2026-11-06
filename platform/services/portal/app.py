@@ -11065,6 +11065,16 @@ BUILD_NEW_BODY = """
       <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="1"
         {% if (values and values.get(f.name)) or (not values and f.default) %}checked{% endif %}>
         {{ f.label }}</label>
+      {% if f.administer %}<span class="muted administer-note" id="administer-{{ f.name }}">
+        <strong>Dieser Haken ist deine Zusage als Server-Admin</strong>: „{{ f.administer }}“
+        verwaltet die fachlichen Berechtigungen des neuen Mandanten
+        (<code>authorization.administer: true</code>). Ihr Schlüssel kann für diesen einen
+        Mandanten, im Namen des Mandanten-Admins, der sie benutzt, Rollen und
+        Berechtigungspakete anlegen, Zuordnungen geben und beenden und Gruppen zuordnen.
+        Er kann nie eine Plattform-Rolle vergeben oder lesen, Benutzer anlegen, ändern oder
+        löschen, eine Deklaration registrieren oder einen anderen Mandanten erreichen.
+        Ohne Haken wird die App nicht installiert. Im Antragsformular für Interessenten
+        erscheint dieser Haken nie.</span>{% endif %}
     {% else %}
       <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
         <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
@@ -11084,7 +11094,7 @@ BUILD_NEW_BODY = """
 <div class="card">
   <h2>Was geschieht</h2>
   <ol>
-    {% for s in plan %}<li>{{ s.text }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}{% if s.when %} <span class="badge off">nur mit „{{ s.when }}“</span>{% endif %}
+    {% for s in plan %}<li>{{ s.text }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}{% if s.when %} <span class="badge off">nur mit „{{ s.when }}“</span>{% endif %}{% if s.administer %} <span class="badge todo">verwaltet Rechte</span>{% endif %}
       <span class="muted">({{ s.id }})</span></li>{% endfor %}
   </ol>
   <p class="muted">Der Aufbau hält an, wo ein Mensch etwas tun muss (zum Beispiel den ersten Verwalter im
@@ -11393,7 +11403,7 @@ def _public_gone():
 def _public_form(token, prof, values=None, error=None, status=200):
     resp = make_response(render_template_string(
         PUBLIC_REQUEST_PAGE, state="form", token=token,
-        fields=build_view.fields(prof), values=values or {}, keep=30,
+        fields=build_view.public_fields(prof), values=values or {}, keep=30,
         error=error), status)
     resp.headers["Cache-Control"] = "no-store"
     return resp

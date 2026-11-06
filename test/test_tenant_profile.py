@@ -101,7 +101,7 @@ for d in ("queue", "claims", "results", "jobs"):
     os.makedirs(os.path.join(a.SPOOL_DIR, d), exist_ok=True)
 os.makedirs(a.PROFILE_DIR, exist_ok=True)
 
-CAT = {"webseite": ("verified", "plattform"), "fremd": ("unverified", "fremdliste")}
+CAT = {"webseite": ("verified", "plattform"), "rollen-rechte": ("verified", "plattform"), "fremd": ("unverified", "fremdliste")}
 LOOKUPS, INSTALLS = [], []
 
 
@@ -271,7 +271,7 @@ st = a.tenant_build_start("lauf", {"label": "vweb", "title": "Mit Web", "with_we
 by_id = {r["id"]: r for r in st["steps"]}
 ok("mit Haken erreicht der Aufbau den App-Schritt und ruft die Installation mit der Katalog-App auf",
    INSTALLS and INSTALLS[-1].package == "https://git.example/webseite"
-   and INSTALLS[-1].tenant == "vweb" and INSTALLS[-1].name == "vweb-webseite",
+   and INSTALLS[-1].tenant == "vweb" and INSTALLS[-1].name == "webseite",
    [(r["id"], r["state"], r["note"]) for r in st["steps"]])
 ok("(die Attrappe legt keine Instanz an, darum meldet der Schritt, dass sein Ergebnis fehlt)",
    by_id["web"]["state"] == "failed" and "not on the node" in by_id["web"]["note"],
