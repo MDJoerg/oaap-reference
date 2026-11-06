@@ -63,6 +63,9 @@ STEP_TYPES = {
     # comma-separated template keys, `groups` is KEY=PATH[,KEY=PATH] and
     # `names` is KEY=NAME[,KEY=NAME] (a name holds no comma).
     "authz.setup":    (("app",), ("only", "skip", "groups", "names")),
+    # RFC-0056 inside a build: the group the tenant's own administrator
+    # belongs in, in the tenant's realm (a group, never a person).
+    "idp.admin_group": ((), ()),
     "manual":         (("text", "done_when"), ()),
     "backup.check":   ((), ()),
 }

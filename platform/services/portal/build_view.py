@@ -25,6 +25,7 @@ STEP_TYPE = {
     "address.ensure": "Adresse veröffentlichen",
     "address.wait": "Warten, bis die Adresse antwortet",
     "idp.provision": "Anmeldedienst (Realm) einrichten",
+    "idp.admin_group": "Verwaltergruppe im Realm vorbereiten",
     "tenant.policy": "Richtlinie für die erste Anmeldung",
     "tenant.face": "Gesicht (Titel, Farben)",
     "app.install": "Anwendung installieren",
@@ -329,7 +330,8 @@ TEMPLATE = {
         "label, text, color, word, connector oder bool (Haken). Ein Schritt mit "
         "'when': '<bool-Parameter>' läuft nur, wenn der Haken gesetzt ist. "
         "Schrittarten: tenant.create, address.ensure, address.wait, idp.provision, "
-        "tenant.policy, tenant.face, app.install, authz.setup, manual, backup.check. app.install "
+        "idp.admin_group, tenant.policy, tenant.face, app.install, authz.setup, manual, "
+        "backup.check. app.install "
         "nennt in einem hochgeladenen Profil eine App des Katalogs ('app'), nie einen "
         "Pfad; ersetze 'webseite' durch eine ID aus deinem Katalog. Platzhalter wie "
         "{label} setzt der Knoten ein, er wertet sie nie als Befehl aus. Eine App, die "

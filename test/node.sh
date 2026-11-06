@@ -12,7 +12,14 @@
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$DIR/.env" ] || { echo "Missing $DIR/.env (copy .env.example and adjust)"; exit 1; }
-. "$DIR/.env"
+# Read only the connection settings, literally -- never run the file as
+# shell: it also holds passwords, and an unquoted value with a space was
+# executed as a command and shown in the error (2026-11-06).
+while IFS='=' read -r k v; do
+  case "$k" in *_HOST|*_USER|*_SSH_KEY|*_PORT) ;; *) continue ;; esac
+  v="${v%$'\r'}"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+  printf -v "$k" '%s' "$v"
+done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$DIR/.env")
 NODE="${1:-}"; [ -n "$NODE" ] || { echo "Usage: test/node.sh <node> run|ssh|push|update ..." >&2; exit 2; }
 P="$(printf '%s' "$NODE" | tr '[:lower:]-' '[:upper:]_')"
 HOST="$(eval "printf '%s' \"\${${P}_HOST:-}\"")"

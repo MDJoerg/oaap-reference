@@ -227,7 +227,7 @@ CONNECTOR_KINDS = {
             "people_key": "users",
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
-                  "export", "admin_group", "groups"),
+                  "export", "admin_group", "groups", "mail"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
@@ -244,7 +244,7 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
-OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups")
+OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups", "mail")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -808,7 +808,55 @@ def _keycloak_space_body(space, title=""):
         "loginWithEmailAllowed": True,
         "duplicateEmailsAllowed": False,
         "sslRequired": "external",
+        **KEYCLOAK_LANGUAGE,
     }
+
+
+# RFC-0072 D5: the login page and the mails a realm sends are German, with
+# English offered. A node default, set when OAAP makes a realm and again when
+# it writes the mailbox into one -- a club's own later choice in the console
+# is overwritten only by an explicit `oaap idp mail`.
+KEYCLOAK_LANGUAGE = {"internationalizationEnabled": True,
+                     "supportedLocales": ["de", "en"],
+                     "defaultLocale": "de"}
+
+
+def _keycloak_mail_body(space, mail, title=""):
+    """The PARTIAL realm update that gives a realm its mailbox (RFC-0072
+    stage 1): the realm's name, the `smtpServer` block and the language --
+    nothing else, for the reason `_keycloak_settings_write` gives. Keycloak
+    keeps every value of the block as a string."""
+    tls = mail.get("tls")
+    smtp = {"host": mail["host"], "port": str(mail["port"]),
+            "from": mail["from"],
+            "fromDisplayName": (title or mail.get("from_name") or "").strip(),
+            "ssl": "true" if tls == "tls" else "false",
+            "starttls": "true" if tls == "starttls" else "false",
+            "auth": "true" if mail.get("user") else "false"}
+    if mail.get("user"):
+        smtp["user"] = mail["user"]
+        smtp["password"] = mail.get("password") or ""
+    if mail.get("reply_to"):
+        smtp["replyTo"] = mail["reply_to"]
+    return {"realm": space, "smtpServer": smtp, **KEYCLOAK_LANGUAGE}
+
+
+def _keycloak_mail_read(realm_doc):
+    """What a realm says about its mailbox, in OAAP's words, never the
+    password itself: {host, port, from, tls, user, password: masked |
+    clear | absent} or {} when the realm has none."""
+    smtp = (realm_doc or {}).get("smtpServer") or {}
+    if not smtp.get("host"):
+        return {}
+    pw = smtp.get("password")
+    return {"host": smtp.get("host"), "port": str(smtp.get("port") or ""),
+            "from": smtp.get("from") or "",
+            "tls": ("tls" if str(smtp.get("ssl")).lower() == "true" else
+                    "starttls" if str(smtp.get("starttls")).lower() == "true"
+                    else "none"),
+            "user": smtp.get("user") or "",
+            "password": ("absent" if not pw else
+                         "masked" if set(str(pw)) <= {"*"} else "clear")}
 
 
 def _keycloak_group_mapper():
@@ -1315,6 +1363,24 @@ def export_plan(kind, space):
                 "and do not fail (measured) -- so the file is counted, "
                 "never trusted"},
     ]
+
+
+_MAIL = {"keycloak": (_keycloak_mail_body, _keycloak_mail_read)}
+
+
+def mail_refusal(kind):
+    """Why this connector cannot give a space a mailbox."""
+    return verb_refusal(kind, "mail")
+
+
+def mail_body(kind, space, mail, title=""):
+    maker = _MAIL.get((kind or "").strip().lower())
+    return maker[0](space, mail, title) if maker else {}
+
+
+def mail_read(kind, space_doc):
+    maker = _MAIL.get((kind or "").strip().lower())
+    return maker[1](space_doc) if maker else {}
 
 
 def space_body(kind, space, title=""):
@@ -1973,6 +2039,100 @@ class Admin:
             return None, (f"{self.decl['product']} answered something "
                           f"other than a number when asked how many "
                           f"people are in '{space}'")
+
+    def admin_group_state(self, space, accept_version=""):
+        """(present, sentence): is the administrator group there with all
+        its roles? Reads only -- the check of the build step."""
+        self._space_now = space
+        bad = admin_group_refusal(self.kind)
+        if bad:
+            return False, bad
+        ok, msg = self.login()
+        if not ok:
+            return False, msg
+        said, err = self.version()
+        if err:
+            return False, err
+        _how, bad = version_check(self.kind, said, accept_version)
+        if bad:
+            return False, bad
+        g = admin_group_of(self.kind)
+        exists, err = self.find_space(space)
+        if err or not exists:
+            return False, err or f"there is no {self.decl['space_word']} '{space}'"
+        mgmt, _doc, err = self.find_client(space, g["roles_client"])
+        if err or not mgmt:
+            return False, err or f"the client '{g['roles_client']}' is missing"
+        gid, err = self._find_group(space, g["name"])
+        if err:
+            return False, err
+        if not gid:
+            return False, f"no group '{g['name']}' in the {self.decl['space_word']} yet"
+        held, err = self._read_list(
+            self._path("group_client_roles", space=space, uuid=gid, client=mgmt),
+            "reading the group's roles")
+        if err:
+            return False, err
+        have = {r.get("name") for r in held if isinstance(r, dict)}
+        lack = [n for n in g["roles"] if n not in have]
+        if lack:
+            return False, f"the group '{g['name']}' lacks " + ", ".join(lack)
+        return True, f"the group '{g['name']}' is there with its roles"
+
+    def write_mail(self, space, mail, title="", accept_version=""):
+        """Give a space its mailbox (RFC-0072 stage 1) -> (ok, read-back,
+        sentence). Version, the space, ONE partial write, then the read
+        that says what the product now holds -- the password only as
+        masked / clear / absent, never its value. The trace names the
+        server and the sender, never the password."""
+        self._space_now = space
+        bad = mail_refusal(self.kind)
+        if bad:
+            return False, {}, bad
+        bad = space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        ok, msg = self.login()
+        if not ok:
+            return False, {}, msg
+        said, err = self.version()
+        if err:
+            return False, {}, err
+        how, bad = version_check(self.kind, said, accept_version)
+        if bad:
+            return False, {}, bad
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        if not exists:
+            return False, {}, (f"there is no {self.decl['space_word']} "
+                               f"'{space}' at {self.base}")
+        path = self._path("space", space=space)
+        status, got, err = self._call("PUT", path,
+                                      body=mail_body(self.kind, space, mail,
+                                                     title))
+        if err:
+            return False, {}, err
+        if status == 403:
+            return False, {}, self._not_ours(space, "give it a mailbox")
+        if status not in (200, 204):
+            return False, {}, (f"writing the mailbox answered {status}"
+                               + (f": {got.get('errorMessage')}"
+                                  if isinstance(got, dict)
+                                  and got.get("errorMessage") else ""))
+        status, doc, err = self._call("GET", path)
+        if err or status != 200:
+            return False, {}, (err or f"reading the {self.decl['space_word']} "
+                               f"back answered {status}")
+        back = mail_read(self.kind, doc)
+        if back.get("host") != mail["host"] or back.get("from") != mail["from"]:
+            return False, back, ("the provider accepted the mailbox and does "
+                                 "not show it back -- refusing to call it done")
+        self._note(f"wrote the mailbox {mail['host']}:{mail['port']} "
+                   f"({mail.get('tls')}), sender {mail['from']}, into the "
+                   f"{self.decl['space_word']} '{space}'; the provider shows "
+                   f"the password {back.get('password')}")
+        return True, back, ""
 
     def write_switch(self, space, switch, value, doc):
         """(ok, sentence). Move one switch, and touch nothing else."""

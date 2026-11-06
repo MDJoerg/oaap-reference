@@ -1980,6 +1980,273 @@ def propagation_claim_check(tid, claims):
     return said, f"read from {c['base_url']} realm '{space}' at {_iso_now()}"
 
 
+# RFC-0072 stage 1 (oaap.net.destinations 0.8, 2.11): a mailbox is a
+# destination of its own kind, `smtp`. The node's mailbox is the `smtp`
+# destination named `mail` of the default tenant; every realm OAAP makes gets
+# it written in. `smtp` is deliberately NOT in DEST_KINDS: that tuple also
+# judges what a MANIFEST may ask for, and in stage 1 no app asks for mail
+# (D7: the node's mailbox is never an app's).
+MAIL_DEST = "mail"
+MAIL_SCHEMES = {"smtps": "tls", "smtp": "starttls"}
+MAIL_DEFAULT_PORT = {"smtps": 465, "smtp": 587}
+MAIL_ADDR_RE = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+
+
+def parse_mail_target(target):
+    """-> (tls, host, port, scheme). `smtps://` is TLS from the first byte,
+    `smtp://` is STARTTLS and REQUIRED; there is no unencrypted mailbox --
+    the password would cross the network in clear."""
+    import urllib.parse
+    t = (target or "").strip()
+    u = urllib.parse.urlsplit(t)
+    if u.scheme not in MAIL_SCHEMES:
+        raise DestinationRefused(
+            "a mailbox is smtps://<host>:465 (TLS from the start) or "
+            "smtp://<host>:587 (STARTTLS, required) -- there is no "
+            f"unencrypted one (got '{t}')")
+    if u.username or u.password or "@" in u.netloc:
+        raise DestinationRefused("the mailbox address must not carry a user or "
+                                 "password -- give them with --user and the "
+                                 "password file")
+    if u.path not in ("", "/") or u.query or u.fragment:
+        raise DestinationRefused("a mailbox address is smtps://<host>:<port>, "
+                                 "nothing after it")
+    host = (u.hostname or "").lower()
+    if not host or not re.fullmatch(r"[a-z0-9.:-]+", host):
+        raise DestinationRefused(f"the mailbox has no usable host ('{t}')")
+    try:
+        port = u.port or MAIL_DEFAULT_PORT[u.scheme]
+    except ValueError:
+        raise DestinationRefused(f"the port is not a number ('{t}')") from None
+    why = dest_target_refusal(host)
+    if why:
+        raise DestinationRefused(why)
+    return MAIL_SCHEMES[u.scheme], host, port, u.scheme
+
+
+def mail_secret_refusal(secret):
+    """Why this mail password cannot be kept, or "". Unlike a header
+    secret it never reaches the gateway's configuration, so braces and
+    quotes are fine; control characters and an empty value are not."""
+    if not secret:
+        return "the mailbox has a user, so it needs a password"
+    if len(secret) > 512 or any(ord(ch) < 32 or ord(ch) == 127 for ch in secret):
+        return "the password holds control characters or is longer than 512"
+    return ""
+
+
+def mail_set(target, sender, sender_name="", user="", secret="", reply_to="",
+             who="root", role="root"):
+    """Record (or replace) the node's mailbox -> the record, never the
+    password. server_admin territory (RFC-0072 D6)."""
+    tls, host, port, scheme = parse_mail_target(target)
+    if not re.fullmatch(MAIL_ADDR_RE, sender or ""):
+        raise DestinationRefused("the sender is an address like "
+                                 "noreply@example.org")
+    if reply_to and not re.fullmatch(MAIL_ADDR_RE, reply_to):
+        raise DestinationRefused("the reply-to is an address like "
+                                 "verein@example.org")
+    if sender_name and (len(sender_name) > 80
+                        or any(ord(ch) < 32 for ch in sender_name)):
+        raise DestinationRefused("the sender's name is at most 80 printable "
+                                 "characters")
+    if user:
+        if not re.fullmatch(r"[\x21-\x7e]{1,254}", user):
+            raise DestinationRefused("the user has no spaces or control "
+                                     "characters")
+        bad = mail_secret_refusal(secret)
+        if bad:
+            raise DestinationRefused(bad)
+    tid = default_tenant_id()
+    dests = load_destinations()
+    own = dests.setdefault(tid, {})
+    old = own.get(MAIL_DEST) or {}
+    if old and old.get("kind") != "smtp":
+        raise DestinationRefused(
+            f"the default tenant has a destination '{MAIL_DEST}' that is not a "
+            "mailbox; remove or rename it first")
+    now = _iso_now()
+    rec = {"kind": "smtp", "target": {"direct": f"{scheme}://{host}:{port}"},
+           "auth": ({"type": "basic", "user": user} if user
+                    else {"type": "none"}),
+           "secret": bool(user),
+           "mail": {"from": sender, "from_name": sender_name or "",
+                    "reply_to": reply_to or ""},
+           "created": old.get("created") or now,
+           "created_by": old.get("created_by") or who}
+    if old:
+        rec["changed"] = now
+    own[MAIL_DEST] = rec
+    sec = load_dest_secrets()
+    if user:
+        sec.setdefault(tid, {})[MAIL_DEST] = secret
+    else:
+        (sec.get(tid) or {}).pop(MAIL_DEST, None)
+    save_dest_secrets(sec)
+    save_destinations(dests)
+    audit_tenant("mail.set", tid, subject=MAIL_DEST, who=who, role=role,
+                 detail=f"{host}:{port} {tls}, sender {sender}"
+                 + (f", user {user}" if user else ", no login"))
+    return rec
+
+
+def mail_clear(who="root", role="root"):
+    tid = default_tenant_id()
+    dests = load_destinations()
+    rec = (dests.get(tid) or {}).get(MAIL_DEST)
+    if not rec or rec.get("kind") != "smtp":
+        raise DestinationRefused("this node has no mailbox")
+    del dests[tid][MAIL_DEST]
+    sec = load_dest_secrets()
+    (sec.get(tid) or {}).pop(MAIL_DEST, None)
+    save_dest_secrets(sec)
+    save_destinations(dests)
+    audit_tenant("mail.clear", tid, subject=MAIL_DEST, who=who, role=role)
+
+
+def node_mailbox():
+    """(mail, record) of the node's mailbox -- `mail` holds the password and
+    is for the one call that hands it on -- or (None, None)."""
+    tid = default_tenant_id()
+    rec = (load_destinations().get(tid) or {}).get(MAIL_DEST)
+    if not rec or rec.get("kind") != "smtp":
+        return None, None
+    try:
+        tls, host, port, _sch = parse_mail_target(
+            (rec.get("target") or {}).get("direct", ""))
+    except DestinationRefused:
+        return None, None
+    m = rec.get("mail") or {}
+    user = (rec.get("auth") or {}).get("user", "")
+    return ({"host": host, "port": port, "tls": tls, "from": m.get("from", ""),
+             "from_name": m.get("from_name", ""),
+             "reply_to": m.get("reply_to", ""), "user": user,
+             "password": ((load_dest_secrets().get(tid) or {}).get(MAIL_DEST, "")
+                          if user else "")}, rec)
+
+
+def mail_for_tenant(tid):
+    """The mailbox a tenant's realm sends with -> (mail, record). Stage 1:
+    the node's. Stage 2 asks the tenant's own `smtp` destination first."""
+    return node_mailbox()
+
+
+def mail_test(to, mail=None):
+    """Send one plain test mail from the host -> (ok, [lines]). The lines
+    hold the server's answers, never the password."""
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    from email.utils import formataddr, make_msgid
+    mail = mail or node_mailbox()[0]
+    if not mail:
+        return False, ["this node has no mailbox: `oaap mail set` first"]
+    if not re.fullmatch(MAIL_ADDR_RE, to or ""):
+        return False, [f"'{to}' is not an address"]
+    msg = EmailMessage()
+    msg["From"] = formataddr((mail.get("from_name") or "OAAP", mail["from"]))
+    msg["To"] = to
+    node = load_external() or socket.gethostname()
+    msg["Subject"] = f"OAAP: Testmail vom Knoten {node}"
+    msg["Message-ID"] = make_msgid(domain=mail["from"].split("@", 1)[1])
+    msg.set_content(f"Diese Mail hat der Knoten {node} mit `oaap mail test` "
+                    "verschickt (RFC-0072).\n\nThis is a test mail.\n")
+    lines = []
+    ctx = ssl.create_default_context()
+    try:
+        if mail["tls"] == "tls":
+            srv = smtplib.SMTP_SSL(mail["host"], mail["port"], context=ctx,
+                                   timeout=20)
+        else:
+            srv = smtplib.SMTP(mail["host"], mail["port"], timeout=20)
+        with srv:
+            code, _ = srv.ehlo()
+            lines.append(f"connected to {mail['host']}:{mail['port']} "
+                         f"({mail['tls']}), EHLO {code}")
+            if mail["tls"] == "starttls":
+                code, _ = srv.starttls(context=ctx)
+                srv.ehlo()
+                lines.append(f"STARTTLS {code}")
+            if mail.get("user"):
+                code, _ = srv.login(mail["user"], mail["password"])
+                lines.append(f"login as {mail['user']}: {code}")
+            refused = srv.send_message(msg)
+            lines.append("accepted for " + to if not refused
+                         else f"refused: {sorted(refused)}")
+            return not refused, lines
+    except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
+        text = str(exc)
+        if mail.get("password"):
+            text = text.replace(mail["password"], "***")
+        lines.append(f"failed: {type(exc).__name__}: {text[:300]}")
+        return False, lines
+
+
+def cmd_mail(args):
+    """`oaap mail set|show|test|clear` -- the node's mailbox (RFC-0072)."""
+    who = _dest_who()
+    try:
+        if args.action == "set":
+            secret = ""
+            if args.user:
+                if args.password_file:
+                    with open(args.password_file, encoding="utf-8") as f:
+                        secret = f.read().rstrip("\r\n")
+                elif sys.stdin.isatty():
+                    secret = getpass.getpass("password of the mailbox: ")
+                else:
+                    die("the password comes from --password-file or the "
+                        "terminal, never from the command line")
+            rec = mail_set(args.target or die("--target smtps://host:465"),
+                           args.sender or die("--from noreply@…"),
+                           args.from_name or "", args.user or "", secret,
+                           args.reply_to or "", who=who)
+            print(f"The node's mailbox is {rec['target']['direct']}, sender "
+                  f"{rec['mail']['from']}.")
+            print("Every realm OAAP makes from now on gets it. Existing "
+                  "realms: `oaap idp mail <connector> --all`.")
+            print("Try it: `oaap mail test <your address>`.")
+            return
+        if args.action == "show":
+            mail, rec = node_mailbox()
+            if not rec:
+                print("This node has no mailbox (`oaap mail set`).")
+                return
+            print(f"  address   {rec['target']['direct']} ({mail['tls']})")
+            print(f"  sender    {mail['from']}"
+                  + (f" ({mail['from_name']})" if mail["from_name"] else ""))
+            if mail["reply_to"]:
+                print(f"  reply-to  {mail['reply_to']}")
+            print(f"  login     " + (f"{mail['user']}, password "
+                                     + ("set" if mail["password"]
+                                        else "MISSING")
+                                     if mail["user"] else "none"))
+            print(f"  since     {rec.get('changed') or rec.get('created')}")
+            return
+        if args.action == "test":
+            ok, lines = mail_test(args.to or die("which address? "
+                                                 "`oaap mail test you@…`"))
+            for line in lines:
+                print("  " + line)
+            audit_tenant("mail.test", default_tenant_id(), subject=MAIL_DEST,
+                         who=who, role="root", result="ok" if ok else "failed",
+                         detail=f"to {args.to}")
+            if not ok:
+                sys.exit(1)
+            print("Sent. Look into the mailbox (and its spam folder).")
+            return
+        if args.action == "clear":
+            if not args.yes:
+                die("this removes the node's mailbox; realms keep what was "
+                    "written into them. Say --yes")
+            mail_clear(who=who)
+            print("The node's mailbox is removed.")
+            return
+    except DestinationRefused as exc:
+        die(str(exc))
+    die(f"unknown action '{args.action}'")
+
+
 def destination_add(tid, name, kind, target, auth_type="none", user="",
                     header="", secret="", who="root", role="root",
                     accept_sha256="", claims=(), name_check="",
@@ -2254,6 +2521,11 @@ def destination_bind(reg, key, name, need="", rehearsal_exception=False,
         # one that does not exist -- "that is someone else's" is already
         # an answer across the boundary.
         raise DestinationRefused(f"no destination '{name}' in this instance's tenant")
+    if d.get("kind") == "smtp":
+        raise DestinationRefused(
+            f"'{name}' is a mailbox; apps get mail only from a tenant's own "
+            "mailbox, which is RFC-0072 stage 3 -- the node's mailbox never "
+            "(D7)")
     why = egress_destination_refusal(inst, name, d)
     if why:
         raise DestinationRefused(why)
@@ -2321,7 +2593,10 @@ def _dest_line(tid, name, d, dest_secrets, reg):
     if d.get("secret"):
         a += (", secret set" if (dest_secrets.get(tid) or {}).get(name)
               else ", SECRET MISSING -- calls are refused until it is set")
-    mode = "proxy" if d["kind"] == "http" else "handover"
+    mode = ("proxy" if d["kind"] == "http" else
+            "realms" if d["kind"] == "smtp" else "handover")
+    if d["kind"] == "smtp":
+        a += f", sender {(d.get('mail') or {}).get('from', '')}"
     bound = destination_bindings(reg, tid, name)
     return (f"  {name:<20} {d['kind']:<4} {mode:<8} {dest_target_text(d)}\n"
             f"  {'':<20} auth {a}\n"
@@ -5696,6 +5971,23 @@ def cmd_idp(args):
         print("  secret       fetched from the provider and held 0600 on "
               "this node")
         print("")
+        # RFC-0072 D2: every realm OAAP makes gets the mailbox. A failure
+        # here does not undo the provider (it works without mail); it is
+        # said, and `oaap idp mail` writes it again.
+        mail, _mrec = mail_for_tenant(tid)
+        if mail and not idp_admin.mail_refusal(c["kind"]):
+            mok, mlines, _sp = _idp_write_mail(name, c, label, t, mail,
+                                               args.accept_version)
+            for line in mlines:
+                print("  " + line)
+            if not mok:
+                print(f"  -> `oaap idp mail {name} --tenant {label}` "
+                      "writes it again")
+        elif not mail:
+            print("  This node has no mailbox, so the realm sends no mail "
+                  "(no password reset): `oaap mail set`, then "
+                  f"`oaap idp mail {name} --tenant {label}`.")
+        print("")
         print("The redirect URIs above are registered at the client.")
         if plain:
             print("Both schemes, on the operator's word (--plain-callback).")
@@ -5737,7 +6029,72 @@ def cmd_idp(args):
     if action == "admin-group":
         return _idp_admin_group(args, name, c)
 
+    if action == "mail":
+        return _idp_mail(args, name, c)
+
     die(f"unknown action '{action}'")
+
+
+def _idp_write_mail(name, c, label, t, mail, accept_version=""):
+    """Write a mailbox into one tenant's realm -> (ok, lines)."""
+    provider = idp.provider_of(t) or {}
+    space = (provider.get("space") or idp_admin.space_for(label)).strip().lower()
+    admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"], c["admin_id"],
+                            c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    ok, back, msg = admin.write_mail(
+        space, mail, title=t.get("name") or t.get("label", ""),
+        accept_version=(accept_version or c.get("accept_version", "")))
+    lines = list(admin.trace)
+    if not ok:
+        lines.append("the mailbox was NOT written: " + msg)
+    return ok, lines, space
+
+
+def _idp_mail(args, name, c):
+    """`oaap idp mail <connector> --tenant <label> | --all` (RFC-0072)."""
+    bad = idp_admin.mail_refusal(c["kind"])
+    if bad:
+        die(bad)
+    if args.all and args.tenant:
+        die("either --tenant or --all")
+    if args.all:
+        labels = sorted(t.get("label") for t in load_tenants().values()
+                        if (t.get("idp") or {}).get("connector") == name
+                        and t.get("label"))
+        if not labels:
+            die(f"no tenant signs in through '{name}'")
+    else:
+        label = (args.tenant or "").strip().lower()
+        if not label:
+            die(f"which tenant? `oaap idp mail {name} --tenant <label>` or --all")
+        labels = [label]
+    failed = 0
+    who = os.environ.get("SUDO_USER") or getpass.getuser()
+    for label in labels:
+        tid, t = tenant_by_label(label, include_former=False)
+        if not tid:
+            print(f"'{label}': no such tenant")
+            failed += 1
+            continue
+        mail, _rec = mail_for_tenant(tid)
+        if not mail:
+            die("this node has no mailbox: `oaap mail set` first")
+        if args.dry_run:
+            print(f"'{label}': would write {mail['host']}:{mail['port']}, "
+                  f"sender {mail['from']}")
+            continue
+        ok, lines, space = _idp_write_mail(name, c, label, t, mail,
+                                           args.accept_version)
+        print(f"'{label}' (realm '{space}'):")
+        for line in lines:
+            print("  " + line)
+        audit_tenant("tenant.idp-mail", tid, subject=space, who=who,
+                     role="root", result="ok" if ok else "failed",
+                     detail=f"{mail['host']}:{mail['port']}, sender {mail['from']}")
+        failed += not ok
+    if failed:
+        sys.exit(1)
 
 
 def _connector_instance(kind):
@@ -7161,6 +7518,39 @@ class _BuildDrivers:
                               "the realm and every person in it stay")
         return ok, note
 
+    # idp.admin_group (RFC-0056 inside a build) ------------------------------
+    def _tenant_connector(self):
+        """(name, connector record, space) of the tenant's provider, or
+        ("", None, "")."""
+        _tid, t = self._tenant()
+        prov = idp.provider_of(t) if t else None
+        name = (prov or {}).get("connector") or ""
+        c = load_idp_connectors().get(name) if name else None
+        space = ((prov or {}).get("space")
+                 or idp_admin.space_for(self.label)).strip().lower()
+        return name, c, space
+
+    def _check_idp_admin_group(self, a, ctx):
+        name, c, space = self._tenant_connector()
+        if not c:
+            return ABSENT_, ("the tenant signs in through no connector of this "
+                             "node yet (idp.provision comes first)")
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        present, note = admin.admin_group_state(
+            space, accept_version=c.get("accept_version", ""))
+        return (PRESENT_ if present else ABSENT_), note
+
+    def _do_idp_admin_group(self, a, ctx):
+        name, c, _space = self._tenant_connector()
+        if not c:
+            return False, "the tenant signs in through no connector yet", []
+        ok, note = self._verb(["idp", "admin-group", name, "--tenant", self.label],
+                              "the administrator group is ready in the realm; "
+                              "put the club's administrator into it")
+        return ok, note, []
+
     # tenant.policy -------------------------------------------------------
     def _check_tenant_policy(self, a, ctx):
         tid, t = self._tenant()
@@ -7529,12 +7919,18 @@ def _catalogue_app_ids():
     source could be read (then an upload cannot be checked and is refused)."""
     ids, seen_any = set(), False
     for src in [x for x in load_sources()[0] if x.get("enabled", True)]:
-        data = fetch_store_list(src["url"])
+        # The same reading as _store_lookup: a package catalog on this node
+        # (RFC-0050) names ZIPs, a list from the network names Git. Until
+        # 2026-11-06 only Git counted, so an uploaded profile naming an app
+        # of the node's own catalog was refused as "not in any source".
+        is_cat = catalog_source.is_catalog_url(src.get("url"))
+        data = _catalog_read(src) if is_cat else fetch_store_list(src["url"])
         if not data:
             continue
         seen_any = True
         for app_ in data.get("apps", []):
-            if (app_.get("package") or {}).get("git") and app_.get("id"):
+            pkg = app_.get("package") or {}
+            if app_.get("id") and (pkg.get("git") or (is_cat and pkg.get("zip"))):
                 ids.add(app_["id"])
     return ids if seen_any else None
 
@@ -29020,7 +29416,10 @@ def main():
                                       "(RFC-0041 K3)")
     pidp.add_argument("action",
                       choices=["list", "add", "remove", "check", "provision",
-                               "settings", "export", "admin-group"])
+                               "settings", "export", "admin-group", "mail"])
+    pidp.add_argument("--all", action="store_true",
+                      help="for 'mail': every tenant that signs in through "
+                           "this connector")
     pidp.add_argument("name", nargs="?", help="the connector's short name")
     pidp.add_argument("--kind", dest="idp_kind_admin", default="keycloak",
                       choices=list(idp_admin.connector_kinds()),
@@ -29090,6 +29489,24 @@ def main():
     pidp.add_argument("--dry-run", dest="dry_run", action="store_true",
                       help="print every call this would make, and make none")
     pidp.set_defaults(fn=cmd_idp)
+    pmail = sub.add_parser("mail", help="the node's mailbox: realms send "
+                                        "password resets with it (RFC-0072)")
+    pmail.add_argument("action", choices=["set", "show", "test", "clear"])
+    pmail.add_argument("to", nargs="?", help="for 'test': the address")
+    pmail.add_argument("--target", default=None,
+                       help="smtps://host:465 (TLS) or smtp://host:587 "
+                            "(STARTTLS, required)")
+    pmail.add_argument("--from", dest="sender", default=None,
+                       help="the sender address the mail server allows")
+    pmail.add_argument("--from-name", dest="from_name", default=None,
+                       help="the sender's name (a realm uses its tenant's)")
+    pmail.add_argument("--reply-to", dest="reply_to", default=None)
+    pmail.add_argument("--user", default=None, help="the login at the server")
+    pmail.add_argument("--password-file", dest="password_file", default=None,
+                       help="a file holding the password (never the "
+                            "command line)")
+    pmail.add_argument("--yes", action="store_true", help="for 'clear'")
+    pmail.set_defaults(fn=cmd_mail)
     pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
