@@ -53,7 +53,7 @@ import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 
-SCHEMA = "oaap.host-care/0.2"
+SCHEMA = "oaap.host-care/0.3"
 PLAN_SCHEMA = "oaap.reboot-plan/0.1"
 FILE_NAME = "host-care.json"
 PLAN_FILE_NAME = "reboot-plan.json"
@@ -63,7 +63,11 @@ PROTECTIONS_FILE_NAME = "reboot-protections.json"
 APT_CONF = "/etc/apt/apt.conf.d/52oaap-care"
 WINDOW_KEY = "OAAP::Care::Reboot-Window"
 REBOOT_MARKER = "/var/run/reboot-required"
-STAMP = "/var/lib/apt/periodic/unattended-upgrades-stamp"
+# 2.8 / 4.7: the TIMER's stamp. apt.systemd.daily writes it after a real
+# run; the program's own `unattended-upgrades-stamp` is touched by every
+# invocation, a dry run included -- on 2026-11-05 the care line showed
+# "last run 13:17" for a node on which nothing had ever been installed.
+STAMP = "/var/lib/apt/periodic/upgrade-stamp"
 GATEWAY_CONTAINER = "oaap-gateway-1"
 STALE_AFTER = 600           # the minute job re-measures past this
 OLD_AFTER = 86400           # a reader says so past this
@@ -348,7 +352,7 @@ def gateway_facts(run=sh):
 
 # --- the measurement -------------------------------------------------------
 
-def measure(run=sh, os_release="/etc/os-release", external="", **probes):
+def measure(run=sh, os_release="/etc/os-release", external="", advisories=None, **probes):
     """The facts of 2.6.1 plus, for 2.7.3, whether the node is exposed:
     `external` is the node's registered external hostname ('' when it
     has none) -- the caller knows the registry, this module does not."""
@@ -371,6 +375,9 @@ def measure(run=sh, os_release="/etc/os-release", external="", **probes):
         "reboot_window": auto["window"],
         "gateway": gateway_facts(run),
         "external_name": external or "",
+        # 2.8: the reading the caller made (advisories.care_block) --
+        # None when the node never had a list, which is not "0 open".
+        "advisories": advisories,
     }
 
 
@@ -1118,6 +1125,44 @@ def protections_text(rows, de=False):
     return ("Neustart-Schutz: " if de else "Reboot protection: ") + "; ".join(parts)
 
 
+def advisory_line(adv, de=False, now=None):
+    """(state, text) of 2.8.2: the fact the auto-update line cannot say.
+
+    No reading at all is `unknown` ("not read yet"), never "0 open"; a
+    reading older than two days says `stale` with its age; packages from
+    an archive the list does not cover are counted as unknown, never as
+    clean."""
+    if not adv:
+        return ("unknown", "Sicherheitsmeldungen: noch nicht gelesen — liest der "
+                "Minutenlauf, oder: sudo oaap node care advisories --read" if de else
+                "Advisories: not read yet — the minute job reads them, or: "
+                "sudo oaap node care advisories --read")
+    when = (adv.get("read_at") or "")[:16].replace("T", " ")
+    if adv.get("open") is None:
+        return ("warn", (f"Sicherheitsmeldungen: Liste nicht lesbar ({adv.get('error', '')})"
+                         if de else
+                         f"Advisories: the list could not be read ({adv.get('error', '')})"))
+    n, unk = adv["open"], len(adv.get("unknown") or [])
+    tail_de = (f" — {unk} Paket(e) aus fremden Archiven nicht abgedeckt" if unk else "")
+    tail_en = (f" — {unk} package(s) from other archives not covered" if unk else "")
+    if adv.get("stale"):
+        return ("warn", (f"Sicherheitsmeldungen: Liste VERALTET (gelesen {when} UTC) — "
+                         f"zuletzt {n} offen{tail_de}. Quelle erreichbar? "
+                         "sudo oaap node care advisories --read") if de else (
+                         f"Advisories: list STALE (read {when} UTC) — last {n} open{tail_en}. "
+                         "Source reachable? sudo oaap node care advisories --read"))
+    if n:
+        old, pkg = adv.get("oldest", ""), adv.get("oldest_package", "")
+        return ("warn", (f"Sicherheitsmeldungen: {n} offen, die älteste seit {old} ({pkg}) — "
+                         f"Liste gelesen {when} UTC{tail_de}. Welche: "
+                         "sudo oaap node care advisories") if de else (
+                         f"Advisories: {n} open, the oldest since {old} ({pkg}) — "
+                         f"list read {when} UTC{tail_en}. Which: "
+                         "sudo oaap node care advisories"))
+    return ("ok", (f"Sicherheitsmeldungen: 0 offen — Liste gelesen {when} UTC{tail_de}"
+                   if de else f"Advisories: 0 open — list read {when} UTC{tail_en}"))
+
+
 def status_lines(facts, now=None, de=False):
     """[(state, text)] -- the kernel line, the plan line (2.7), the
     auto-update line, the gateway line, each with its recommendation
@@ -1163,13 +1208,13 @@ def status_lines(facts, now=None, de=False):
     if st == "ok":
         if de:
             t = ("Automatische Sicherheitsupdates: an"
-                 + (f", letzter Lauf {last} UTC" if last else "")
+                 + (f", letzter Lauf {last} UTC" if last else ", noch kein Lauf")
                  + (f"; Neustart-Fenster {win}" if win != "off" else
                     "; kein Neustart-Fenster — ein neuer Kernel wartet auf einen "
                     "Neustart von Hand (sudo oaap node care reboot-window HH:MM)"))
         else:
             t = ("Auto-updates: on"
-                 + (f", last run {last} UTC" if last else "")
+                 + (f", last run {last} UTC" if last else ", no run yet")
                  + (f"; reboot window {win}" if win != "off" else
                     "; no reboot window — a new kernel waits for a manual "
                     "reboot (sudo oaap node care reboot-window HH:MM)"))
@@ -1190,6 +1235,17 @@ def status_lines(facts, now=None, de=False):
     else:
         out.append(("unknown", "Automatische Updates: nicht messbar" if de
                     else "Auto-updates: not measurable"))
+    out.append(advisory_line(facts.get("advisories"), de, now))
+    if k.get("marker") and not k.get("reboot_required"):
+        # 2.6.1 lets the marker be a hint, never the verdict. Measured
+        # 2026-11-06 on oaap-demo: the first real run set it for a
+        # library (the package list beside it was empty), the kernel
+        # pair said no reboot -- both are true, and both are said.
+        out.append(("ok", (
+            "Die Distribution wünscht einen Neustart für eine Bibliothek (nicht den "
+            "Kernel) — bei Gelegenheit, kein Plan") if de else (
+            "The distribution asks for a reboot for a library (not the kernel) — "
+            "when convenient, no plan")))
     if a.get("distribution_reboot"):
         out.append(("warn", (
             "Die Distribution würde selbst neu starten (Automatic-Reboot an) — zwei "
@@ -1257,6 +1313,13 @@ def fleet_host(facts):
     }
     if a.get("last_run"):
         block["auto_updates_last_run"] = a["last_run"]
+    adv = facts.get("advisories")
+    if adv:
+        # 0.7 / 4.5: count, oldest date, stale -- never a package name.
+        block["advisories"] = {"open": adv.get("open"), "oldest": adv.get("oldest", ""),
+                               "stale": bool(adv.get("stale")),
+                               "read_at": adv.get("read_at", ""),
+                               "unknown": len(adv.get("unknown") or [])}
     plan = facts.get("plan")
     if plan:
         block["reboot_plan"] = {
@@ -1284,6 +1347,13 @@ def fleet_attention(facts):
     a = facts.get("auto_updates", {})
     if a.get("state") in ("warn", "error"):
         items.append({"kind": "auto_updates_off", "detail": a.get("detail", "")})
+    adv = facts.get("advisories")
+    if adv and adv.get("open"):
+        items.append({"kind": "advisories_open",
+                      "detail": f"{adv['open']} open, the oldest since {adv.get('oldest', '')}"})
+    if adv and adv.get("stale"):
+        items.append({"kind": "advisories_stale",
+                      "detail": "list read " + (adv.get("read_at") or "never")})
     g = facts.get("gateway", {})
     if g.get("mptcp") == "on":
         items.append({"kind": "gateway_mptcp",

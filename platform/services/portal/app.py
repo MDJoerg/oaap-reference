@@ -5445,6 +5445,18 @@ def care_rows(facts):
             "label": f"{len(facts['protections'])} Instanz(en)",
             "detail": host_care.protections_text(facts["protections"], de=True),
         })
+    # 2.8.2: the advisories, with the names -- this table is server_admin's.
+    adv = facts.get("advisories")
+    st, text = host_care.advisory_line(adv, de=True)
+    names = ", ".join(f"{i['package']} ({i['dsa']}, {i['published']})"
+                      for i in (adv or {}).get("items") or [])
+    rows.append({
+        "name": "Sicherheitsmeldungen",
+        "state": {"ok": "ok", "warn": "warn"}.get(st, "unknown"),
+        "label": ("unbekannt" if not adv or adv.get("open") is None
+                  else f"{adv['open']} offen" + (" (veraltet)" if adv.get("stale") else "")),
+        "detail": text + (f" — offen: {names}" if names else ""),
+    })
     rows += [{
         "name": "Gateway-Listener",
         "state": {"off": "ok", "on": "warn"}.get(g.get("mptcp"), "unknown"),

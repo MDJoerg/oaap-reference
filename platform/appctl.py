@@ -104,6 +104,9 @@ import idle  # noqa: E402
 # platform -- kernel, automatic updates, the gateway's listeners. Pure
 # rules plus the two settings the platform writes; the acting is cmd_node.
 import host_care  # noqa: E402
+# ... and what is known about what it runs (2.8, RFC-0070): Debian's
+# advisories against the installed packages. Read on the node only.
+import advisories  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -9007,10 +9010,21 @@ def _care_evaluate(facts, now=None, who="root", role="root"):
     return facts
 
 
+def _care_advisories(force=False):
+    """2.8.1: read the list when due (daily, after an automatic-update
+    run, or forced), compare when anything changed; the block host care
+    carries. Root only -- a reader without rights keeps what is there."""
+    root = not hasattr(os, "geteuid") or os.geteuid() == 0
+    state = (advisories.refresh(APPS_DIR, force=force) if root
+             else advisories.load(APPS_DIR))
+    return advisories.care_block(state)
+
+
 def _care_fresh(who="root", role="root"):
     """Measure, evaluate, write -- the one path every verb ends in."""
     host_care.migrate_conf()
-    facts = host_care.measure(external=load_external() or "")
+    facts = host_care.measure(external=load_external() or "",
+                              advisories=_care_advisories())
     facts = _care_evaluate(facts, who=who, role=role)
     host_care.write(facts, APPS_DIR)
     return facts
@@ -9084,6 +9098,32 @@ def cmd_node_care(args):
         return
     if verb == "measure":
         _care_fresh()
+        return
+    if verb == "advisories":
+        # 2.8.2: the names are the server_admin's, on the node.
+        if not root:
+            die("oaap node care advisories needs root (sudo): the package names "
+                "of open advisories are the operator's")
+        if getattr(args, "care_read", False):
+            advisories.refresh(APPS_DIR, force=True)
+        facts = _care_fresh()
+        adv = facts.get("advisories") or {}
+        print(host_care.advisory_line(adv or None)[1])
+        for it in adv.get("items") or []:
+            print(f"  {it['package']:<22} {it['dsa']:<12} {it['published']}  "
+                  f"installed {it['installed']}  fixed {it['fixed']}  ({it['cves']} CVE)")
+        if adv.get("unknown"):
+            print(f"  Not covered by the list ({len(adv['unknown'])}, other archives): "
+                  + ", ".join(adv["unknown"][:20])
+                  + (" ..." if len(adv["unknown"]) > 20 else ""))
+        if adv.get("local"):
+            print(f"  In no archive at all ({len(adv['local'])}): "
+                  + ", ".join(adv["local"][:20]))
+        if adv.get("security_candidates"):
+            print(f"  apt would install {adv['security_candidates']} package(s) "
+                  "from the security archive now.")
+        if adv.get("skipped"):
+            print(f"  ({adv['skipped']} line(s) of the list not understood and skipped)")
         return
     if verb == "":
         facts = _care_fresh() if root else host_care.read(APPS_DIR)
@@ -9167,7 +9207,7 @@ def cmd_node_care(args):
     else:
         die("usage: oaap node care [measure | sample | auto-updates on | "
             "reboot-window HH:MM|off | reboot at <time>|cancel | "
-            "protect <instance> | release <instance>]")
+            "protect <instance> | release <instance> | advisories [--read]]")
     print("")
     host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
@@ -29005,6 +29045,8 @@ def main():
                     help="for care protect: the last day (YYYY-MM-DD, default 7 days)")
     pn.add_argument("--critical", dest="care_critical", action="store_true",
                     help="for care reboot at: urgency critical (overrides protections)")
+    pn.add_argument("--read", dest="care_read", action="store_true",
+                    help="for care advisories: read the list now, not only when due")
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "

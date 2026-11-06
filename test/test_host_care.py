@@ -245,7 +245,7 @@ back = hc.read(tmp)
 ok("written and read back identical", back == facts)
 en = hc.status_lines(back)
 de = hc.status_lines(back, de=True)
-ok("three lines each", len(en) == 3 and len(de) == 3, (en, de))
+ok("four lines each (kernel, auto-updates, advisories 2.8, gateway)", len(en) == 4 and len(de) == 4 and en[2][0] == "unknown", (en, de))
 ok("CLI: reboot line carries both kernels and the command",
    en[0][0] == "warn" and "6.12.111" in en[0][1] and "6.12.115" in en[0][1]
    and "systemctl reboot" in en[0][1], en[0])
@@ -254,7 +254,7 @@ ok("portal: same facts in German", de[0][0] == "warn" and "6.12.115" in de[0][1]
 ok("auto-updates not installed: err with the switch-on command",
    en[1][0] == "err" and "auto-updates on" in en[1][1] and de[1][0] == "err")
 ok("gateway MPTCP on: warn naming the ports and oaap update",
-   en[2][0] == "warn" and "*:443" in en[2][1] and "oaap update" in en[2][1])
+   en[3][0] == "warn" and "*:443" in en[3][1] and "oaap update" in en[3][1])
 ok("worst of the lines", hc.worst(en) == "err")
 blk = hc.fleet_host(back)
 ok("fleet block: the whitelist of 0.5, no plan, no protections", blk == {
@@ -268,7 +268,7 @@ ok("three attention kinds", [x["kind"] for x in att]
 doc = fv.build_document(node="n", version="v", profiles=[], now_iso="t", core=[],
                         instances=[], dns_rows=None, pending_names=[],
                         extra_attention=att, host=blk)
-ok("document 0.6 carries host and the kinds", doc["schema"] == "oaap.fleet.status/0.6"
+ok("document 0.7 carries host and the kinds", doc["schema"] == "oaap.fleet.status/0.7"
    and doc["host"]["reboot_required"] is True
    and {a["kind"] for a in doc["attention"]} >= {"reboot_required", "gateway_mptcp"})
 ok("no measurement -> no host block, no kinds, one honest line",
@@ -277,10 +277,12 @@ ok("no measurement -> no host block, no kinds, one honest line",
                                    pending_names=[], host=hc.fleet_host(None))
    and hc.fleet_attention(None) == []
    and hc.status_lines(None)[0][0] == "unknown")
+OK_ADV = {"source": "debian-dsa", "read_at": "2026-11-06T06:00:00Z", "stale": False, "open": 0,
+          "oldest": "", "oldest_package": "", "items": [], "unknown": [], "local": [], "security_candidates": 0}
 healthy = hc.measure(machine("6.12.115+deb13.1-amd64", DPKG_X02, APT_WINDOW, ss=""),
-                     os_release=osr, marker_exists=False, stamp_mtime=1793860920)
+                     os_release=osr, marker_exists=False, stamp_mtime=1793860920, advisories=OK_ADV)
 hl = hc.status_lines(healthy)
-ok("a healthy node: three ok lines, window named",
+ok("a healthy node: four ok lines (0 advisories open), window named",
    all(s == "ok" for s, _ in hl) and "04:15" in hl[1][1], hl)
 ok("healthy fleet block has no attention", hc.fleet_attention(healthy) == [])
 legacy = hc.measure(machine("6.12.115+deb13.1-amd64", DPKG_X02, APT_LEGACY, ss=""),
@@ -294,8 +296,8 @@ ok("stale after ten minutes, not before",
 out = io.StringIO()
 with redirect_stdout(out):
     hc.print_status(back)
-ok("print_status: header with the time, three indented lines",
-   out.getvalue().startswith("Host care (measured ") and out.getvalue().count("\n  ") == 3, out.getvalue())
+ok("print_status: header with the time, four indented lines",
+   out.getvalue().startswith("Host care (measured ") and out.getvalue().count("\n  ") == 4, out.getvalue())
 
 print("\n-- the settings file (2.6.3, 2.7.4, tests 12, 13 and 18)")
 conf = os.path.join(tmp, "52oaap-care")
@@ -494,8 +496,8 @@ print("\n-- the readers carry the plan and the protections (2.7.5, 0.6)")
 f = dict(node(external=""), plan=held, protections=hc._held_rows(live))
 en = hc.status_lines(f)
 de = hc.status_lines(f, de=True)
-ok("four lines: the plan line after the kernel line, warn",
-   len(en) == 4 and en[1][0] == "warn" and en[1][1].startswith("Reboot planned: 2026-11-14 04:15 CET (care)")
+ok("five lines: the plan line after the kernel line, warn",
+   len(en) == 5 and en[1][0] == "warn" and en[1][1].startswith("Reboot planned: 2026-11-14 04:15 CET (care)")
    and "held by joerg-desk until 2026-11-13" in en[1][1], en)
 ok("German: Geplanter Neustart ... Pflege ... gehalten durch",
    de[1][1].startswith("Geplanter Neustart: 2026-11-14 04:15 CET (Pflege)")

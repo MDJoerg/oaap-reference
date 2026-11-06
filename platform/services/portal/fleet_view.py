@@ -14,7 +14,7 @@ import hashlib
 import hmac
 from concurrent.futures import ThreadPoolExecutor, wait
 
-SCHEMA = "oaap.fleet.status/0.6"
+SCHEMA = "oaap.fleet.status/0.7"
 
 # The document's state vocabulary. The health page grew two spellings
 # ("err" from probes, "error" from the worker); consumers get one.
