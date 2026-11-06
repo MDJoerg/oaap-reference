@@ -320,6 +320,7 @@ LAYOUT = STYLE + """
     {% if has_cohorts %}<a href="/kohorten" class="{{ 'active' if active == 'cohorts' }}">Kohorten</a>{% endif %}
     {% if can_build %}<a href="/aufbau" class="{{ 'active' if active == 'build' }}">Aufbau</a>{% endif %}
     {% if can_build %}<a href="/datentraeger" class="{{ 'active' if active == 'disks' }}">Datenträger</a>{% endif %}
+    {% if is_user_admin %}<a href="/nachrichten" class="{{ 'active' if active == 'messages' }}">Nachrichten</a>{% endif %}
     {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
     {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
   </nav>
@@ -11910,6 +11911,204 @@ def disks_act(verb):
         return redirect("/datentraeger?err=" + quote(str(e)))
     rid = management_api.enqueue(sc[0], sc[1], verb, args, action="disk")
     return redirect(f"/datentraeger?job={rid}")
+
+
+# --- Nachrichten (RFC-0072 stage 2, oaap.core.portal 2.15) --------------------
+#
+# Today one section, "Postausgang": which mailbox a tenant's realm sends with,
+# and the tenant's own mailbox (tenant_admin) or the node's (server_admin at
+# the node). The page reads the destinations file (objects, never a secret);
+# every button is one request (action `mail`) the host judges again from the
+# actor's own record. Incoming mail and messengers come as further sections,
+# each specified first (D16) -- nothing is shown for them before.
+MAIL_WAIT_SECONDS = 45
+MAIL_DEST_NAME = "mail"
+MAIL_OPS = ("set", "remove", "test")
+
+
+def _messages_target():
+    """(tenant_id, label, role) or (None, None, refusal) -- as the page
+    "Abfluss": a tenant_admin reads their own tenant, a label naming another
+    one is answered as a tenant that does not exist; a server_admin without
+    a label is at the node."""
+    role, mine = caller_scope()
+    want = (request.values.get("tenant") or "").strip().lower()
+    if role == "server_admin" and not want:
+        tid = default_tenant_id()
+    else:
+        tid = tenant_id_by_label(want) if want else mine
+    tenants = load_tenants()
+    if not tid or tid not in tenants or (role != "server_admin" and tid != mine):
+        return None, None, ("Diesen Mandanten gibt es auf diesem Knoten nicht.", 404)
+    return tid, tenants[tid].get("label", ""), role
+
+
+def _mailbox_view(dests, tid):
+    """The mailbox record of one tenant for the page, or None."""
+    rec = ((dests or {}).get(tid) or {}).get(MAIL_DEST_NAME) or {}
+    if rec.get("kind") != "smtp":
+        return None
+    m = rec.get("mail") or {}
+    return {"target": (rec.get("target") or {}).get("direct", ""),
+            "from": m.get("from", ""), "from_name": m.get("from_name", ""),
+            "reply_to": m.get("reply_to", ""),
+            "user": (rec.get("auth") or {}).get("user", ""),
+            "secret": bool(rec.get("secret")),
+            "since": rec.get("changed") or rec.get("created") or ""}
+
+
+def _messages_facts(tid):
+    try:
+        with open(DESTINATIONS_FILE, encoding="utf-8") as f:
+            dests = (json.load(f) or {}).get("destinations") or {}
+    except (OSError, ValueError):
+        dests = {}
+    dflt = default_tenant_id()
+    tenants = load_tenants()
+    node = _mailbox_view(dests, dflt)
+    own = _mailbox_view(dests, tid) if tid != dflt else None
+    t = tenants.get(tid) or {}
+    realm = bool((t.get("idp") or {}).get("connector"))
+    rows = []
+    if tid == dflt:
+        for xid, x in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
+            if xid == dflt:
+                continue
+            mine = _mailbox_view(dests, xid)
+            rows.append({"label": x.get("label", ""),
+                         "realm": bool((x.get("idp") or {}).get("connector")),
+                         "uses": ("eigenes Postfach (" + mine["from"] + ")" if mine
+                                  else "Postfach des Knotens" if node else "keines")})
+    return {"node": node, "own": own, "realm": realm, "rows": rows,
+            "is_node": tid == dflt}
+
+
+MESSAGES_BODY = """
+<div class="pagehead"><h1>Nachrichten{% if not f.is_node %}: {{ label }}{% endif %}</h1></div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+
+<div class="card">
+  <h2>Postausgang</h2>
+  {% if f.is_node %}
+  <p>Das <strong>Postfach des Knotens</strong> verschickt die Mails jedes Realms, dessen Mandant
+  kein eigenes hat: „Passwort vergessen“, Bestätigungen, Einladungen — auf Deutsch, mit dem
+  Namen des Mandanten als Absendername. Apps bekommen es nie.</p>
+  {% set box = f.node %}
+  {% else %}
+  <p>{{ "Euer Realm verschickt" if f.realm else "Ein Realm dieses Mandanten verschickte" }} Mails
+  („Passwort vergessen“, Bestätigungen, Einladungen) mit:
+  <strong>{% if f.own %}eurem eigenen Postfach ({{ f.own.from }}){% elif f.node %}dem Postfach
+  des Knotens (Absender {{ f.node.from }}){% else %}keinem Postfach — {{ "er verschickt" if f.realm else "er verschickte" }} keine Mail{% endif %}</strong>.
+  {% if not f.realm %}<span class="muted">Dieser Mandant meldet sich noch nicht über einen
+  eigenen Realm an; das Postfach wird wirksam, sobald es einen gibt.</span>{% endif %}</p>
+  {% set box = f.own %}
+  {% endif %}
+
+  <h3>{% if f.is_node %}Postfach des Knotens{% else %}Eigenes Postfach{% endif %}</h3>
+  {% if box %}<p class="muted">Eingetragen: {{ box.target }}, Absender {{ box.from }}{% if box.user %},
+    Login {{ box.user }}, Passwort {{ "gesetzt" if box.secret else "FEHLT" }}{% endif %}
+    <small>(seit {{ box.since[:16] }})</small></p>{% endif %}
+  <form method="post" action="/nachrichten/postausgang/set{{ q }}">
+    <p><label>Adresse des Mailservers
+      <input name="target" required value="{{ box.target if box else '' }}"
+        placeholder="smtps://mail.verein.de:465" pattern="smtps?://[^/@?#]+"></label>
+      <span class="muted"><code>smtps://…:465</code> heißt TLS von Anfang an,
+      <code>smtp://…:587</code> STARTTLS. Unverschlüsselt gibt es nicht.{% if not f.is_node %}
+      Der Server muss im Internet stehen (der Knoten prüft das bei jedem Speichern, Testen
+      und Eintragen).{% endif %}</span></p>
+    <p><label>Absender <input name="sender" type="email" required value="{{ box.from if box else '' }}"
+        placeholder="info@verein.de"></label>
+      <label>Absendername <input name="from_name" maxlength="80" value="{{ box.from_name if box else '' }}"
+        placeholder="{{ 'wird je Mandant gesetzt' if f.is_node else label }}"></label></p>
+    <p><label>Antwort an (optional) <input name="reply_to" type="email" value="{{ box.reply_to if box else '' }}"></label></p>
+    <p><label>Login <input name="user" value="{{ box.user if box else '' }}" autocomplete="off"></label>
+      <label>Passwort <input name="password" type="password" autocomplete="new-password"
+        placeholder="{{ 'gesetzt — leer lassen = unverändert' if box and box.secret else '' }}"></label></p>
+    <p class="muted">Speichern meldet sich zuerst probeweise am Server an. Nur was dort
+      funktioniert, wird gespeichert und {% if f.is_node %}in die Realms eingetragen, die das
+      Postfach des Knotens benutzen{% else %}in euren Realm eingetragen{% endif %}. Das Passwort
+      wird danach nie wieder angezeigt.</p>
+    <button class="btn">Speichern</button>
+  </form>
+  {% if box %}
+  <form method="post" action="/nachrichten/postausgang/test{{ q }}" style="margin-top:1rem">
+    <label>Testmail an <input name="to" type="email" required></label>
+    <button class="btn">Testmail senden</button>
+  </form>
+  <form method="post" action="/nachrichten/postausgang/remove{{ q }}" style="margin-top:1rem">
+    <label class="seatopt"><input type="checkbox" name="confirm" value="1" required>
+      {% if f.is_node %}Postfach des Knotens entfernen (die Realms behalten, was eingetragen ist){% else %}Eigenes
+      Postfach entfernen — der Realm verschickt dann {% if f.node %}mit dem Postfach des Knotens{% else %}keine Mail mehr{% endif %}{% endif %}</label>
+    <button class="btn">Entfernen</button>
+  </form>
+  {% endif %}
+
+  {% if f.is_node and f.rows %}
+  <h3>Womit die Mandanten verschicken</h3>
+  <table class="list"><tr><th>Mandant</th><th>Realm</th><th>Postfach</th><th></th></tr>
+  {% for r in f.rows %}<tr><td>{{ r.label }}</td><td>{{ "ja" if r.realm else "—" }}</td>
+    <td>{{ r.uses }}</td><td><a class="rowaction" href="/nachrichten?tenant={{ r.label }}">Ansehen</a></td></tr>{% endfor %}
+  </table>
+  {% endif %}
+</div>
+"""
+
+
+@app.get("/nachrichten")
+def messages_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    named = role == "server_admin" and tid != default_tenant_id()
+    return page(MESSAGES_BODY, "Nachrichten", "messages", label=label,
+                f=_messages_facts(tid), q=(f"?tenant={quote(label)}" if named else ""),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.post("/nachrichten/postausgang/<op>")
+def messages_outgoing(op):
+    """One button, one request through the spool; the host judges it again
+    (RFC-0072 stage 2). The password goes into the request file (0600) and
+    from there into the secret store -- the portal keeps nothing."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    named = role == "server_admin" and tid != default_tenant_id()
+    back = "/nachrichten" + (f"?tenant={quote(label)}" if named else "")
+    joiner = "&" if "?" in back else "?"
+    if op not in MAIL_OPS:
+        return redirect(back, code=303)
+    args = {}
+    if role == "server_admin":
+        args["tenant"] = tid          # only a server_admin names a tenant
+    if op == "set":
+        for k, mx in (("target", 300), ("sender", 254), ("from_name", 80),
+                      ("reply_to", 254), ("user", 254), ("password", 512)):
+            args[k] = (request.form.get(k) or "")[:mx]
+            if k != "password":
+                args[k] = args[k].strip()
+    elif op == "test":
+        args["to"] = (request.form.get("to") or "").strip()[:254]
+    elif op == "remove" and not request.form.get("confirm"):
+        return redirect(f"{back}{joiner}err=" + quote("Bitte bestätigen."), code=303)
+    res = _queue_with_id(_uuid.uuid4().hex, "",
+                         {"action": "mail", "op": op, "args": args},
+                         MAIL_WAIT_SECONDS)
+    if res is None:
+        return redirect(f"{back}{joiner}err=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    key = "msg" if res.get("ok") else "err"
+    return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]),
+                    code=303)
 
 
 # --- Abfluss: every way out of a tenant (RFC-0068 §5, §6) -------------------

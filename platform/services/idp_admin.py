@@ -825,7 +825,10 @@ def _keycloak_mail_body(space, mail, title=""):
     """The PARTIAL realm update that gives a realm its mailbox (RFC-0072
     stage 1): the realm's name, the `smtpServer` block and the language --
     nothing else, for the reason `_keycloak_settings_write` gives. Keycloak
-    keeps every value of the block as a string."""
+    keeps every value of the block as a string. `mail` None EMPTIES the
+    block (a tenant removed its own mailbox and the node has none)."""
+    if not mail:
+        return {"realm": space, "smtpServer": {}}
     tls = mail.get("tls")
     smtp = {"host": mail["host"], "port": str(mail["port"]),
             "from": mail["from"],
@@ -2125,6 +2128,13 @@ class Admin:
             return False, {}, (err or f"reading the {self.decl['space_word']} "
                                f"back answered {status}")
         back = mail_read(self.kind, doc)
+        if not mail:
+            if back:
+                return False, back, ("the provider accepted emptying the "
+                                     "mailbox and still shows one")
+            self._note(f"emptied the mailbox of the {self.decl['space_word']} "
+                       f"'{space}' -- it sends no mail now")
+            return True, back, ""
         if back.get("host") != mail["host"] or back.get("from") != mail["from"]:
             return False, back, ("the provider accepted the mailbox and does "
                                  "not show it back -- refusing to call it done")

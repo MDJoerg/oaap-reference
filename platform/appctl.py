@@ -2035,11 +2035,84 @@ def mail_secret_refusal(secret):
     return ""
 
 
+MAIL_TENANT_PORTS = (465, 587)
+
+
+def mail_public_refusal(host, port):
+    """RFC-0072 D10: why a TENANT's mailbox may not be used, or "".
+
+    A tenant administrator writes this target, and Keycloak (on the platform
+    network) and the host connect to it. So: only the two mail submission
+    ports, and the name must resolve to public addresses only -- asked at
+    save, at test and at every write into a realm, not once. What stays is a
+    name that turns inward after the check; TLS with certificate checking is
+    what makes that a failed handshake rather than a conversation."""
+    import ipaddress
+    if int(port) not in MAIL_TENANT_PORTS:
+        return ("a tenant's mailbox uses port 465 (TLS) or 587 (STARTTLS) "
+                "-- nothing else")
+    try:
+        infos = socket.getaddrinfo(host, int(port), proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError):
+        return f"'{host}' does not resolve"
+    addrs = sorted({i[4][0] for i in infos})
+    if not addrs:
+        return f"'{host}' does not resolve"
+    nets = docker_subnets()
+    for a_ in addrs:
+        ip = ipaddress.ip_address(a_.split("%")[0])
+        if not ip.is_global or any(ip.version == n.version and ip in n for n in nets):
+            return (f"'{host}' resolves to {a_}, which is not a public address "
+                    "-- a tenant's mailbox must be a server on the internet")
+    return ""
+
+
+def mail_login_check(mail):
+    """RFC-0072 D11: can the host log in with this mailbox? -> (ok, sentence).
+    Logs in and leaves; sends nothing. The password never appears in the
+    sentence."""
+    import smtplib
+    import ssl
+    ctx = ssl.create_default_context()
+    try:
+        if mail["tls"] == "tls":
+            srv = smtplib.SMTP_SSL(mail["host"], mail["port"], context=ctx,
+                                   timeout=20)
+        else:
+            srv = smtplib.SMTP(mail["host"], mail["port"], timeout=20)
+        with srv:
+            srv.ehlo()
+            if mail["tls"] == "starttls":
+                srv.starttls(context=ctx)
+                srv.ehlo()
+            if mail.get("user"):
+                srv.login(mail["user"], mail.get("password") or "")
+        return True, (f"the server {mail['host']}:{mail['port']} accepted the "
+                      "login" if mail.get("user") else "the server answered")
+    except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
+        text = str(exc)
+        if mail.get("password"):
+            text = text.replace(mail["password"], "***")
+        return False, f"the server refused or could not be reached: {type(exc).__name__}: {text[:200]}"
+
+
 def mail_set(target, sender, sender_name="", user="", secret="", reply_to="",
-             who="root", role="root"):
-    """Record (or replace) the node's mailbox -> the record, never the
-    password. server_admin territory (RFC-0072 D6)."""
+             who="root", role="root", tid=None, check_login=False,
+             keep_secret=False):
+    """Record (or replace) a mailbox -> the record, never the password.
+
+    `tid` None is the node's mailbox (server_admin, RFC-0072 D6); any other
+    tenant's is its own (stage 2, D10: the public-address check applies).
+    `keep_secret` keeps a stored password when none is typed (the portal's
+    "leave empty = unchanged"). `check_login` logs in first (D11) and stores
+    nothing when that fails."""
+    tid = tid or default_tenant_id()
+    is_node = tid == default_tenant_id()
     tls, host, port, scheme = parse_mail_target(target)
+    if not is_node:
+        bad = mail_public_refusal(host, port)
+        if bad:
+            raise DestinationRefused(bad)
     if not re.fullmatch(MAIL_ADDR_RE, sender or ""):
         raise DestinationRefused("the sender is an address like "
                                  "noreply@example.org")
@@ -2054,10 +2127,18 @@ def mail_set(target, sender, sender_name="", user="", secret="", reply_to="",
         if not re.fullmatch(r"[\x21-\x7e]{1,254}", user):
             raise DestinationRefused("the user has no spaces or control "
                                      "characters")
+        if not secret and keep_secret:
+            old_rec = (load_destinations().get(tid) or {}).get(MAIL_DEST) or {}
+            if (old_rec.get("auth") or {}).get("user") == user:
+                secret = (load_dest_secrets().get(tid) or {}).get(MAIL_DEST, "")
         bad = mail_secret_refusal(secret)
         if bad:
             raise DestinationRefused(bad)
-    tid = default_tenant_id()
+    if check_login:
+        okl, said = mail_login_check({"host": host, "port": port, "tls": tls,
+                                      "user": user, "password": secret})
+        if not okl:
+            raise DestinationRefused(said + " -- nothing was stored")
     dests = load_destinations()
     own = dests.setdefault(tid, {})
     old = own.get(MAIL_DEST) or {}
@@ -2090,12 +2171,14 @@ def mail_set(target, sender, sender_name="", user="", secret="", reply_to="",
     return rec
 
 
-def mail_clear(who="root", role="root"):
-    tid = default_tenant_id()
+def mail_clear(who="root", role="root", tid=None):
+    tid = tid or default_tenant_id()
     dests = load_destinations()
     rec = (dests.get(tid) or {}).get(MAIL_DEST)
     if not rec or rec.get("kind") != "smtp":
-        raise DestinationRefused("this node has no mailbox")
+        raise DestinationRefused("this node has no mailbox"
+                                 if tid == default_tenant_id()
+                                 else "this tenant has no mailbox of its own")
     del dests[tid][MAIL_DEST]
     sec = load_dest_secrets()
     (sec.get(tid) or {}).pop(MAIL_DEST, None)
@@ -2107,7 +2190,12 @@ def mail_clear(who="root", role="root"):
 def node_mailbox():
     """(mail, record) of the node's mailbox -- `mail` holds the password and
     is for the one call that hands it on -- or (None, None)."""
-    tid = default_tenant_id()
+    return mailbox_of(default_tenant_id())
+
+
+def mailbox_of(tid):
+    """(mail, record) of exactly this tenant's own mailbox, or (None, None).
+    `mail["owner"]` says whose: "node" or "tenant"."""
     rec = (load_destinations().get(tid) or {}).get(MAIL_DEST)
     if not rec or rec.get("kind") != "smtp":
         return None, None
@@ -2121,14 +2209,106 @@ def node_mailbox():
     return ({"host": host, "port": port, "tls": tls, "from": m.get("from", ""),
              "from_name": m.get("from_name", ""),
              "reply_to": m.get("reply_to", ""), "user": user,
+             "owner": "node" if tid == default_tenant_id() else "tenant",
              "password": ((load_dest_secrets().get(tid) or {}).get(MAIL_DEST, "")
                           if user else "")}, rec)
 
 
 def mail_for_tenant(tid):
-    """The mailbox a tenant's realm sends with -> (mail, record). Stage 1:
-    the node's. Stage 2 asks the tenant's own `smtp` destination first."""
-    return node_mailbox()
+    """The mailbox a tenant's realm sends with -> (mail, record): its own
+    (RFC-0072 stage 2), else the node's, else (None, None)."""
+    own = mailbox_of(tid) if tid and tid != default_tenant_id() else (None, None)
+    return own if own[0] else node_mailbox()
+
+
+def tenant_realm_mail_sync(tid, who="root"):
+    """Write into this tenant's realm the mailbox it now sends with (its
+    own, the node's, or none -- then the realm's mail block is emptied).
+    -> (ok, sentence). A tenant without a provider through a connector that
+    declares `mail` has nothing to write, which is not a failure."""
+    t = load_tenants().get(tid) or {}
+    label = t.get("label", "")
+    prov = idp.provider_of(t) or {}
+    name = prov.get("connector") or ""
+    c = load_idp_connectors().get(name) if name else None
+    if not c or idp_admin.mail_refusal(c["kind"]):
+        return True, "the tenant signs in through no connector that takes a mailbox"
+    mail, _rec = mail_for_tenant(tid)
+    if mail and mail.get("owner") == "tenant":
+        bad = mail_public_refusal(mail["host"], mail["port"])
+        if bad:
+            return False, bad
+    ok, lines, space = _idp_write_mail(name, c, label, t, mail)
+    audit_tenant("tenant.idp-mail", tid, subject=space, who=who, role="-",
+                 result="ok" if ok else "failed",
+                 detail=(f"{mail['host']}:{mail['port']}, sender {mail['from']} "
+                         f"({mail['owner']})" if mail else "mail block emptied"))
+    return ok, (f"realm '{space}': " + ("written" if ok else lines[-1] if lines
+                                         else "not written"))
+
+
+def mail_job(req, actor):
+    """The portal's page "Nachrichten" (RFC-0072 stage 2) -> (ok, sentence).
+
+    Role and tenant come from the ACTOR's own record (acting_tenant); only a
+    server_admin names a tenant, and only a server_admin touches the node's
+    mailbox. The password arrives in the request (written 0600 by the
+    portal, deleted by the worker) and goes into the secret store; no
+    sentence and no log line carries it."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
+    if not tid:
+        return False, err or "requires server_admin or tenant_admin"
+    is_node = tid == default_tenant_id()
+    if is_node and role != "server_admin":
+        return False, "the node's mailbox is the server_admin's"
+    try:
+        if op == "set":
+            mail_set(str(a.get("target") or ""), str(a.get("sender") or ""),
+                     str(a.get("from_name") or ""), str(a.get("user") or ""),
+                     str(a.get("password") or ""), str(a.get("reply_to") or ""),
+                     who=actor, role=role, tid=tid, check_login=True,
+                     keep_secret=True)
+            said = ["saved; the server accepted the login"]
+        elif op == "remove":
+            mail_clear(who=actor, role=role, tid=tid)
+            said = ["removed"]
+        elif op == "test":
+            mail, _rec = mailbox_of(tid)
+            if not mail:
+                return False, ("there is no mailbox here to test"
+                               if is_node else "this tenant has no mailbox of its own")
+            if not is_node:
+                bad = mail_public_refusal(mail["host"], mail["port"])
+                if bad:
+                    return False, bad
+            ok, lines = mail_test(str(a.get("to") or ""), mail)
+            audit_tenant("mail.test", tid, subject=MAIL_DEST, who=actor,
+                         role=role, result="ok" if ok else "failed",
+                         detail=f"to {a.get('to')}")
+            return ok, "; ".join(lines)
+        else:
+            return False, f"unknown mail operation '{op}'"
+    except DestinationRefused as exc:
+        return False, str(exc)
+    # The realms follow what they now send with: the tenant's own realm, or
+    # -- when the node's mailbox changed -- every realm that uses the node's.
+    if is_node:
+        targets = [t_ for t_ in sorted(load_tenants()) if t_ != tid
+                   and not mailbox_of(t_)[0]
+                   and (idp.provider_of(load_tenants()[t_]) or {}).get("connector")]
+        if op == "remove":
+            targets = []          # realms keep what was written (as the CLI)
+            said.append("realms keep what was written into them")
+    else:
+        targets = [tid]
+    for t_ in targets:
+        okr, line = tenant_realm_mail_sync(t_, who=actor)
+        said.append(line)
+        if not okr:
+            return False, "; ".join(said)
+    return True, "; ".join(said)
 
 
 def mail_test(to, mail=None):
@@ -6042,8 +6222,10 @@ def _idp_write_mail(name, c, label, t, mail, accept_version=""):
     admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"], c["admin_id"],
                             c["admin_secret"],
                             auth_realm=c.get("auth_realm", ""))
+    title = ((mail or {}).get("from_name") if (mail or {}).get("owner") == "tenant"
+             else "") or t.get("name") or t.get("label", "")
     ok, back, msg = admin.write_mail(
-        space, mail, title=t.get("name") or t.get("label", ""),
+        space, mail, title=title,
         accept_version=(accept_version or c.get("accept_version", "")))
     lines = list(admin.trace)
     if not ok:
@@ -26396,6 +26578,17 @@ def cmd_process_deploys(_args):
                              subject=str((req.get("args") or {}).get("cohort") or ""),
                              result="denied", who=actor or "api",
                              role=act_role or "-", detail=msg)
+        elif action == "mail":
+            # RFC-0072 stage 2: the page "Nachrichten". Role and tenant from
+            # the ACTOR's record (mail_job); the password in this request is
+            # stored and the request file goes with the claim below.
+            ok, msg = mail_job(req, actor)
+            if not ok:
+                audit_tenant("mail." + str(req.get("op") or "?"),
+                             act_tenant or ensure_default_tenant(),
+                             subject=MAIL_DEST, result="denied",
+                             who=actor or "portal", role=act_role or "-",
+                             detail=msg[:200])
         elif action == "tenant-build":
             # RFC-0055 stage 2: a tenant build from the portal or the
             # operator API -- the very core `oaap tenant build` uses. Who
