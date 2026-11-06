@@ -107,6 +107,8 @@ import host_care  # noqa: E402
 # ... and what is known about what it runs (2.8, RFC-0070): Debian's
 # advisories against the installed packages. Read on the node only.
 import advisories  # noqa: E402
+# ... and what the instances' images stand on (RFC-0071 stage 1).
+import images  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -9020,11 +9022,29 @@ def _care_advisories(force=False):
     return advisories.care_block(state)
 
 
-def _care_fresh(who="root", role="root"):
+def _care_images(read=False, force=False):
+    """2.9: the images' reading. Read (within the minute job's budget) only
+    when asked -- a portal action must not wait for `docker run`s; every
+    other path carries the last reading."""
+    root = not hasattr(os, "geteuid") or os.geteuid() == 0
+    if read and root:
+        try:
+            state = images.refresh(APPS_DIR, load_registry().get("instances", {}),
+                                   force=force, budget=900 if force else images.BUDGET)
+        except Exception as e:  # noqa: BLE001 -- a reading never breaks care
+            print(f"node care: images: {e}", file=sys.stderr)
+            state = images.load(APPS_DIR)
+    else:
+        state = images.load(APPS_DIR)
+    return images.summary(state)
+
+
+def _care_fresh(who="root", role="root", read_images=False):
     """Measure, evaluate, write -- the one path every verb ends in."""
     host_care.migrate_conf()
     facts = host_care.measure(external=load_external() or "",
-                              advisories=_care_advisories())
+                              advisories=_care_advisories(),
+                              images=_care_images(read_images))
     facts = _care_evaluate(facts, who=who, role=role)
     host_care.write(facts, APPS_DIR)
     return facts
@@ -9088,7 +9108,7 @@ def cmd_node_care(args):
         # The boot time is the fact that says so.
         if (not facts or host_care.is_stale(facts)
                 or facts.get("boot_time") != host_care.boot_time()):
-            facts = _care_fresh()
+            facts = _care_fresh(read_images=True)
         else:
             before = json.dumps(facts.get("plan"), sort_keys=True)
             facts = _care_evaluate(facts)
@@ -9097,7 +9117,7 @@ def cmd_node_care(args):
         _care_reboot_if_due(facts)
         return
     if verb == "measure":
-        _care_fresh()
+        _care_fresh(read_images=True)
         return
     if verb == "advisories":
         # 2.8.2: the names are the server_admin's, on the node.
@@ -9125,8 +9145,41 @@ def cmd_node_care(args):
         if adv.get("skipped"):
             print(f"  ({adv['skipped']} line(s) of the list not understood and skipped)")
         return
+    if verb == "images":
+        # 2.9 / RFC-0071 stage 1: per instance the base and the advisories
+        # inside its image; the names are the server_admin's, on the node.
+        if not root:
+            die("oaap node care images needs root (sudo): it reads images and names "
+                "their open packages")
+        _care_images(read=True, force=bool(getattr(args, "care_read", False)))
+        facts = _care_fresh()
+        img = facts.get("images") or {}
+        line = host_care.images_line(img)
+        print(line[1] if line else "Images: not read yet — sudo oaap node care images --read")
+        st = images.load(APPS_DIR)
+        rows = {(r["instance"], r["service"]): r for r in st.get("rows", [])}
+
+        def show(label, s, key):
+            r = rows.get(key) or {}
+            base = s["base"] or "base not recorded (built before 0.1.227)"
+            beh = {True: "behind upstream", False: "= upstream", None: ""}[s["behind"]]
+            opn = ("?" if s["open"] is None else str(s["open"]))
+            print(f"  {label:<30} {s['state']:<8} open {opn:<3}"
+                  + (f" since {s['oldest']}" if s["oldest"] else "")
+                  + f"  {s['image']}  [{base}{', ' + beh if beh else ''}]"
+                  + (f"  ({s['why']})" if s["why"] else ""))
+            names = [i["package"] for i in images.names_for(st, r.get("image_id"))]
+            if names:
+                print(f"  {'':<30} open: " + ", ".join(names))
+        for name, e in sorted((img.get("instances") or {}).items()):
+            for s in e["services"]:
+                show(name + (f"/{s['service']}" if s["service"] else ""), s,
+                     (name, s["service"]))
+        for cname, s in sorted((img.get("core") or {}).items()):
+            show("[platform] " + cname, s, ("", cname))
+        return
     if verb == "":
-        facts = _care_fresh() if root else host_care.read(APPS_DIR)
+        facts = _care_fresh(read_images=True) if root else host_care.read(APPS_DIR)
         host_care.print_status(facts)
         if not root:
             print("  (last measurement; 'sudo oaap node care' measures afresh)")
@@ -9207,7 +9260,7 @@ def cmd_node_care(args):
     else:
         die("usage: oaap node care [measure | sample | auto-updates on | "
             "reboot-window HH:MM|off | reboot at <time>|cancel | "
-            "protect <instance> | release <instance> | advisories [--read]]")
+            "protect <instance> | release <instance> | advisories [--read] | images [--read]]")
     print("")
     host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
@@ -17294,13 +17347,19 @@ def _install_from_dir(pkg, args, source):
             run(["docker", "build", "-q", "-t", img,
                  os.path.join(pkg, svc.get("build", "."))])
             build = svc.get("build", "")
+            # RFC-0071 §3: the base this build used -- the node's local image
+            # of the FROM reference, read right after the build.
+            base = images.base_record(os.path.join(pkg, svc.get("build", ".")))
         else:
             img = svc["image"]
             print(f"Pulling {img} ...")
             run(["docker", "pull", "-q", img])
             build = ""
+            base = None
         rec = {"service": sname if multi else "", "container": cname,
                "image": img, "build": build, "port": svc["port"]}
+        if base:
+            rec["base"] = base
         # Manifest 0.7 (2.20): what the service declared is what the
         # container gets, at every (re)creation, from this record.
         if svc.get("shm") is not None:
@@ -26834,6 +26893,7 @@ def _deploy_from_registry(name, inst):
                 print(f"Building {s['image']} ...")
                 run(["docker", "build", "-q", "-t", s["image"],
                      os.path.join(pkg, s.get("build") or ".")])
+                s["base"] = images.base_record(os.path.join(pkg, s.get("build") or "."))
             else:
                 print(f"Pulling {s['image']} ...")
                 run(["docker", "pull", "-q", s["image"]])
@@ -29046,7 +29106,7 @@ def main():
     pn.add_argument("--critical", dest="care_critical", action="store_true",
                     help="for care reboot at: urgency critical (overrides protections)")
     pn.add_argument("--read", dest="care_read", action="store_true",
-                    help="for care advisories: read the list now, not only when due")
+                    help="for care advisories | images: read now, not only when due")
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "

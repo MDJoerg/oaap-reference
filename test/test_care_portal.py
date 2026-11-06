@@ -224,9 +224,37 @@ def const(name, env=None):
 
 
 CARD = Environment(autoescape=True).from_string(const("CARE_CARD"))
-body = const("INSTANCE_EDIT_BODY", {"CARE_CARD": "<!--care-->"})
+body = const("INSTANCE_EDIT_BODY", {"CARE_CARD": "<!--care-->", "IMAGE_CARD": "<!--image-->"})
 ok("die Karte steht auf der Instanzseite, im Reiter Diagnose",
    "<!--care-->" in body.split("tab == 'diagnose'")[1].split("tab == 'fernzugang'")[0])
+ok("die Karte Abbild steht daneben (RFC-0071 Stufe 1)",
+   "<!--care--><!--image-->" in body)
+
+# RFC-0071 Stufe 1: die Karte Abbild -- Wort, Anzahl, Datum, Basis; kein Paketname.
+ICARD = Environment(autoescape=True).from_string(const("IMAGE_CARD"))
+
+
+def irender(services, state="open"):
+    return ICARD.render(i={"key": "x", "imgcare": {
+        "known": True, "services": services, "state": state,
+        "word": host_care.IMAGE_WORDS_DE.get(state, state), "computed": "2026-11-06 07:35"}})
+
+
+SVC = {"service": "", "image": "oaap-app/studio:0.4.3", "word": "", "state": "open", "open": 5,
+       "oldest": "2026-09-29", "base": "", "built": "", "behind": None, "why": ""}
+h = irender([SVC])
+ok("Abbild: offen mit Anzahl und Datum, Basis nicht aufgezeichnet",
+   "5 offene Sicherheitsmeldung(en)" in h and "2026-09-29" in h and "nicht aufgezeichnet" in h
+   and "card warn" in h, h)
+h = irender([dict(SVC, open=None, why="no dpkg in the image", base="caddy:2", behind=True)], "unknown")
+ok("Abbild: nicht lesbar mit Grund, nie 0; Upstream weitergezogen",
+   "nicht lesbar" in h and "no dpkg" in h and "Keine offene" not in h
+   and "weitergezogen" in h, h)
+h = irender([dict(SVC, open=0, base="python:3.13-slim", built="2026-11-06", behind=False)], "fresh")
+ok("Abbild: frisch, entspricht Upstream", "Keine offene" in h and "entspricht Upstream" in h
+   and "frisch" in h, h)
+h = ICARD.render(i={"key": "x", "imgcare": {"known": False, "services": [], "state": ""}})
+ok("Abbild: noch nicht gelesen", "noch nicht gelesen" in h, h)
 
 
 def view(held=None, plan=None, overridden=False, known=True):

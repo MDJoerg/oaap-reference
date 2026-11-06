@@ -352,7 +352,8 @@ def gateway_facts(run=sh):
 
 # --- the measurement -------------------------------------------------------
 
-def measure(run=sh, os_release="/etc/os-release", external="", advisories=None, **probes):
+def measure(run=sh, os_release="/etc/os-release", external="", advisories=None,
+            images=None, **probes):
     """The facts of 2.6.1 plus, for 2.7.3, whether the node is exposed:
     `external` is the node's registered external hostname ('' when it
     has none) -- the caller knows the registry, this module does not."""
@@ -378,6 +379,9 @@ def measure(run=sh, os_release="/etc/os-release", external="", advisories=None, 
         # 2.8: the reading the caller made (advisories.care_block) --
         # None when the node never had a list, which is not "0 open".
         "advisories": advisories,
+        # 2.9 (RFC-0071 stage 1): images.summary -- states and counts per
+        # instance, no package names.
+        "images": images,
     }
 
 
@@ -1163,6 +1167,34 @@ def advisory_line(adv, de=False, now=None):
                    if de else f"Advisories: 0 open — list read {when} UTC{tail_en}"))
 
 
+IMAGE_WORDS_DE = {"fresh": "frisch", "behind": "Basis weitergezogen",
+                  "stale": "Upstream-Antwort alt", "unknown": "unbekannt",
+                  "open": "offene Sicherheitsmeldungen"}
+
+
+def images_line(img, de=False):
+    """(state, text) of 2.9: the images the instances run (RFC-0071 stage 1).
+    Counts only -- which instance is the instance page's and the CLI's."""
+    if not img or not img.get("counts", {}).get("instances"):
+        return None
+    c = img["counts"]
+    n, o, b, u = c["instances"], c.get("open", 0), c.get("behind", 0), c.get("unknown", 0)
+    core = c.get("core_open", 0)
+    if de:
+        t = (f"Abbilder: {n} Instanzen — {o} mit offenen Sicherheitsmeldungen"
+             + (f" (die älteste seit {c['oldest']})" if c.get("oldest") else "")
+             + f", {b} Basis weitergezogen, {u} unbekannt"
+             + (f"; {core} Plattform-Container mit offenen Meldungen" if core else "")
+             + ". Welche: sudo oaap node care images")
+    else:
+        t = (f"Images: {n} instances — {o} with open advisories"
+             + (f" (the oldest since {c['oldest']})" if c.get("oldest") else "")
+             + f", {b} behind upstream, {u} unknown"
+             + (f"; {core} platform container(s) with open advisories" if core else "")
+             + ". Which: sudo oaap node care images")
+    return ("warn" if o or core else "ok", t)
+
+
 def status_lines(facts, now=None, de=False):
     """[(state, text)] -- the kernel line, the plan line (2.7), the
     auto-update line, the gateway line, each with its recommendation
@@ -1236,6 +1268,9 @@ def status_lines(facts, now=None, de=False):
         out.append(("unknown", "Automatische Updates: nicht messbar" if de
                     else "Auto-updates: not measurable"))
     out.append(advisory_line(facts.get("advisories"), de, now))
+    il = images_line(facts.get("images"), de)
+    if il:
+        out.append(il)
     if k.get("marker") and not k.get("reboot_required"):
         # 2.6.1 lets the marker be a hint, never the verdict. Measured
         # 2026-11-06 on oaap-demo: the first real run set it for a
@@ -1320,6 +1355,15 @@ def fleet_host(facts):
                                "stale": bool(adv.get("stale")),
                                "read_at": adv.get("read_at", ""),
                                "unknown": len(adv.get("unknown") or [])}
+    img = facts.get("images")
+    if img and img.get("counts", {}).get("instances"):
+        # 0.8 / RFC-0071 §8.5: counts and the oldest date -- no instance,
+        # no base, no package.
+        c = img["counts"]
+        block["images"] = {k: c.get(k, 0) for k in
+                           ("instances", "open", "behind", "unknown", "fresh", "stale",
+                            "core_open")}
+        block["images"]["oldest"] = c.get("oldest", "")
     plan = facts.get("plan")
     if plan:
         block["reboot_plan"] = {
@@ -1354,6 +1398,11 @@ def fleet_attention(facts):
     if adv and adv.get("stale"):
         items.append({"kind": "advisories_stale",
                       "detail": "list read " + (adv.get("read_at") or "never")})
+    c = (facts.get("images") or {}).get("counts") or {}
+    if c.get("open") or c.get("core_open"):
+        items.append({"kind": "images_open",
+                      "detail": f"{c.get('open', 0)} instance(s), {c.get('core_open', 0)} "
+                                f"platform container(s); the oldest since {c.get('oldest', '')}"})
     g = facts.get("gateway", {})
     if g.get("mptcp") == "on":
         items.append({"kind": "gateway_mptcp",

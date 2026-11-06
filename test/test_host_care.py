@@ -268,7 +268,7 @@ ok("three attention kinds", [x["kind"] for x in att]
 doc = fv.build_document(node="n", version="v", profiles=[], now_iso="t", core=[],
                         instances=[], dns_rows=None, pending_names=[],
                         extra_attention=att, host=blk)
-ok("document 0.7 carries host and the kinds", doc["schema"] == "oaap.fleet.status/0.7"
+ok("document 0.8 carries host and the kinds", doc["schema"] == "oaap.fleet.status/0.8"
    and doc["host"]["reboot_required"] is True
    and {a["kind"] for a in doc["attention"]} >= {"reboot_required", "gateway_mptcp"})
 ok("no measurement -> no host block, no kinds, one honest line",

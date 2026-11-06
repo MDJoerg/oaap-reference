@@ -2477,6 +2477,31 @@ CARE_CARD = """
 </div>
 """
 
+# RFC-0071 stage 1: what the instance's image stands on and what is open in
+# it -- read by the node, shown here; the rebuild comes with stage 2.
+IMAGE_CARD = """
+<div class="card{% if i.imgcare.state == 'open' %} warn{% endif %}">
+  <h2>Abbild</h2>
+  {% if not i.imgcare.services %}
+  <p class="muted">Der Knoten hat die Abbilder noch nicht gelesen; die Karte
+     kommt mit dem nächsten Minutenlauf.</p>
+  {% else %}
+  <p><span class="badge {% if i.imgcare.state == 'open' %}todo{% elif i.imgcare.state == 'fresh' %}ok{% else %}muted{% endif %}">{{ i.imgcare.word }}</span>
+     <span class="muted">gelesen {{ i.imgcare.computed }} UTC</span></p>
+  {% for s in i.imgcare.services %}
+  <p>{% if s.service %}<strong>{{ s.service }}</strong>: {% endif %}<code>{{ s.image }}</code><br>
+     {% if s.open is none %}Sicherheitsmeldungen im Abbild: nicht lesbar{% if s.why %} ({{ s.why }}){% endif %}.
+     {% elif s.open %}<span class="err">{{ s.open }} offene Sicherheitsmeldung(en) im Abbild, die älteste seit {{ s.oldest }}.</span>
+     {% else %}Keine offene Sicherheitsmeldung im Abbild.{% endif %}<br>
+     {% if s.base %}Basis <code>{{ s.base }}</code>{% if s.built %}, gebaut {{ s.built }}{% endif %}{% if s.behind %} — Upstream ist weitergezogen{% elif s.behind == false %} — entspricht Upstream{% endif %}.
+     {% else %}<span class="muted">Basis nicht aufgezeichnet (gebaut vor 0.1.227) — der nächste Bau zeichnet sie auf.</span>{% endif %}</p>
+  {% endfor %}
+  <p class="muted">Neu bauen auf frischer Basis kommt mit der nächsten Stufe
+     (RFC-0071). Am Knoten mit Paketnamen: <code>sudo oaap node care images</code>.</p>
+  {% endif %}
+</div>
+"""
+
 INSTANCE_EDIT_BODY = """
 <a class="back" href="/instances">← Zurück zur Liste</a>
 <div class="objhead">
@@ -3384,7 +3409,7 @@ INSTANCE_EDIT_BODY = """
   {% endif %}
 </div>
 
-""" + CARE_CARD + """
+""" + CARE_CARD + IMAGE_CARD + """
 <form method="post" action="/instances/{{ i.key }}/restart">
   <input type="hidden" name="tab" value="diagnose">
   <div class="card">
@@ -5457,6 +5482,16 @@ def care_rows(facts):
                   else f"{adv['open']} offen" + (" (veraltet)" if adv.get("stale") else "")),
         "detail": text + (f" — offen: {names}" if names else ""),
     })
+    # 2.9 (RFC-0071 Stufe 1): die Abbilder der Instanzen, in Zahlen.
+    il = host_care.images_line(facts.get("images"), de=True)
+    if il:
+        c = facts["images"]["counts"]
+        rows.append({
+            "name": "Abbilder",
+            "state": il[0],
+            "label": f"{c.get('open', 0)} von {c['instances']} offen",
+            "detail": il[1] + " — je Instanz auf ihrer Seite, Karte „Abbild“",
+        })
     rows += [{
         "name": "Gateway-Listener",
         "state": {"off": "ok", "on": "warn"}.get(g.get("mptcp"), "unknown"),
@@ -8010,6 +8045,10 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # Neustart-Schutz (RFC-0069 Stufe 5): der Plan des Knotens und der
          # Schutz dieser Instanz, aus der Pflegedatei; die Tür ist der Spool.
          "care": _care_view(name),
+         # Abbild (RFC-0071 Stufe 1): worauf das Abbild steht und was darin
+         # offen ist -- Zahlen und Worte, keine Paketnamen. Eigener Schlüssel:
+         # "image" ist ein Feld der Instanz.
+         "imgcare": _image_view(name),
          # Fernzugang (RFC-0044, oaap.net.remote-access 0.2): eigener
          # Schlüssel wie "diag" -- ein anderes Objekt, kein Feld der
          # Instanz.
@@ -9279,6 +9318,32 @@ def _care_view(name):
         "today": today.isoformat(),
         "max_day": (today + timedelta(days=host_care.PROTECT_MAX_DAYS)).isoformat(),
     }
+
+
+def _image_view(name):
+    """Die Abbild-Lesung DIESER Instanz aus der Pflegedatei (RFC-0071 §3)."""
+    facts = care_facts() or {}
+    img = facts.get("images") or {}
+    e = (img.get("instances") or {}).get(name)
+    if not e:
+        return {"known": bool(img), "services": [], "state": ""}
+    rows = []
+    for s in e["services"]:
+        rows.append({
+            "service": s.get("service") or "",
+            "image": s.get("image", ""),
+            "word": host_care.IMAGE_WORDS_DE.get(s["state"], s["state"]),
+            "state": s["state"],
+            "open": s["open"],
+            "oldest": s.get("oldest", ""),
+            "base": s.get("base") or "",
+            "built": (s.get("built") or "")[:10],
+            "behind": s.get("behind"),
+            "why": s.get("why", ""),
+        })
+    return {"known": True, "services": rows, "state": e["state"],
+            "word": host_care.IMAGE_WORDS_DE.get(e["state"], e["state"]),
+            "computed": (img.get("computed") or "")[:16].replace("T", " ")}
 
 
 @app.post("/instances/<name>/care/<op>")

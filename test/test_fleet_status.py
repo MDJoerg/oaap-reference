@@ -198,7 +198,7 @@ doc = fv.build_document(node="oaap.joomp.de", version="0.1.41",
                         profiles=["dev"], now_iso="2026-08-23T10:15:00Z",
                         core=core, instances=instances, dns_rows=dns,
                         pending_names=["b-test"], public_ip="203.0.113.7")
-check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.7")
+check("schema is versioned", doc["schema"] == "oaap.fleet.status/0.8")
 check("no care measurement -> no host block (0.5)", "host" not in doc)
 check("names and public_ip carried",
       len(doc["names"]) == 3 and doc["public_ip"] == "203.0.113.7")
