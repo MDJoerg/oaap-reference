@@ -2496,8 +2496,34 @@ IMAGE_CARD = """
      {% if s.base %}Basis <code>{{ s.base }}</code>{% if s.built %}, gebaut {{ s.built }}{% endif %}{% if s.behind %} — Upstream ist weitergezogen{% elif s.behind == false %} — entspricht Upstream{% endif %}.
      {% else %}<span class="muted">Basis nicht aufgezeichnet (gebaut vor 0.1.227) — der nächste Bau zeichnet sie auf.</span>{% endif %}</p>
   {% endfor %}
-  <p class="muted">Neu bauen auf frischer Basis kommt mit der nächsten Stufe
-     (RFC-0071). Am Knoten mit Paketnamen: <code>sudo oaap node care images</code>.</p>
+  {% set rb = i.imgcare.rebuild or {} %}{% if rb.text %}
+  <p{% if rb.state in ("fallback", "build-failed", "error") %} class="err"{% endif %}>
+     {{ rb.text }} <span class="muted">({{ rb.at }} UTC{% if rb.by %}, {{ rb.by }}{% endif %})</span>
+     {% if rb.why %}<br><span class="muted">{{ rb.why }}</span>{% endif %}</p>
+  {% endif %}
+  {% if i.imgcare.artifact %}
+  <p>Neu bauen nimmt dasselbe Paket auf einer frisch geholten Basis; das
+     laufende Abbild bleibt als Vorgänger. Antwortet der neue Container nicht,
+     läuft die Instanz von selbst wieder auf dem Vorgänger. Gibt es eine
+     Testinstanz derselben App, kommt sie zuerst dran.</p>
+  {% if rb.state != "running" %}
+  <form method="post" action="/instances/{{ i.key }}/rebuild/start">
+    <input type="hidden" name="tab" value="diagnose">
+    <button>Neu bauen</button>
+  </form>
+  {% endif %}
+  {% if rb.state in ("done", "fallback", "back") %}
+  <form method="post" action="/instances/{{ i.key }}/rebuild/back">
+    <input type="hidden" name="tab" value="diagnose">
+    <button class="secondary">Zurück auf das vorige Abbild</button>
+  </form>
+  {% endif %}
+  {% else %}
+  <p class="muted">Neu bauen geht nur aus dem zurückbehaltenen Paket (RFC-0071 §8.1);
+     diese Instanz kam aus einer Quelle, die sich seither geändert haben kann.</p>
+  {% endif %}
+  <p class="muted">Am Knoten: <code>sudo oaap node care images</code> (mit Paketnamen),
+     <code>sudo oaap app rebuild {{ i.key }} [--back]</code>.</p>
   {% endif %}
 </div>
 """
@@ -9341,9 +9367,50 @@ def _image_view(name):
             "behind": s.get("behind"),
             "why": s.get("why", ""),
         })
+    rb = (load_instances().get(name) or {}).get("rebuild") or {}
     return {"known": True, "services": rows, "state": e["state"],
             "word": host_care.IMAGE_WORDS_DE.get(e["state"], e["state"]),
-            "computed": (img.get("computed") or "")[:16].replace("T", " ")}
+            "computed": (img.get("computed") or "")[:16].replace("T", " "),
+            # RFC-0071 Stufe 2: der letzte Neubau, in Worten.
+            "rebuild": {"state": rb.get("state", ""), "at": str(rb.get("at", ""))[:16].replace("T", " "),
+                        "by": rb.get("by", ""), "why": rb.get("why", ""),
+                        "text": REBUILD_WORDS.get(rb.get("state", ""), "")},
+            "artifact": ((load_instances().get(name) or {}).get("source") or {}).get("kind") == "artifact"
+                        or all(not str(s.get("image", "")).startswith("oaap-app/") for s in rows)}
+
+
+REBUILD_WORDS = {
+    "running": "Der Neubau läuft gerade.",
+    "done": "Auf frischer Basis neu gebaut; die Instanz antwortet.",
+    "unchanged": "Nichts neu zu bauen: die Basis ist upstream nicht weitergezogen.",
+    "build-failed": "Der Bau auf der neuen Basis ist gescheitert — die Instanz lief unverändert weiter.",
+    "fallback": "Neu gebaut, aber der neue Container antwortete nicht — die Instanz läuft wieder auf dem vorigen Abbild.",
+    "back": "Von Hand zurück auf das vorige Abbild.",
+    "error": "Der Neubau brach mit einem Fehler ab.",
+}
+REBUILD_WAIT_SECONDS = 8
+
+
+@app.post("/instances/<name>/rebuild/<op>")
+def instance_rebuild_act(name, op):
+    """Neu bauen / zurück (RFC-0071 Stufe 2): ein Auftrag durch den Spool; der
+    Knoten urteilt über Rolle, Mandant, Schutz und Testinstanz noch einmal."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    if op not in ("start", "back"):
+        return _inst_back(name)
+    res = _queue_and_wait(name, {"action": "rebuild", "op": op}, REBUILD_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, msg="Der Neubau läuft — das Ergebnis steht in ein bis zwei "
+                                    "Minuten auf der Karte „Abbild“.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message") or "Abgewiesen.")
+    return _inst_back(name, msg=res.get("message") or "Erledigt.")
 
 
 @app.post("/instances/<name>/care/<op>")

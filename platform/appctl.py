@@ -8714,6 +8714,276 @@ def care_job(req, name, inst, act_tenant, role, actor):
     return True, msg, tid
 
 
+# ------------------------------------------- the rebuild (RFC-0071 stage 2)
+#
+# The same package on a freshly pulled base (D1), the running image kept as
+# the ONE predecessor (D2), back to it when the new container does not
+# answer (D5). Built from the retained package only (§8.1): a working copy
+# or a branch may have moved since the instance was installed, and a
+# rebuild must not be a silent update. A service that runs a foreign image
+# needs no package -- its rebuild is a pull.
+
+REBUILD_HEALTH_SECONDS = 120
+
+
+class RebuildRefused(Exception):
+    pass
+
+
+def _prev_tag(name, service):
+    return f"oaap-prev/{name}{('-' + service) if service else ''}:prev"
+
+
+def _docker_ok(cmd, timeout=900):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return r.returncode == 0, ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1][:300]
+
+
+def _rebuild_sibling(reg, name, inst):
+    """The test instance of the same app in the same tenant (RFC-0050's
+    rule: test first, where a test instance exists); a rehearsal does not
+    count."""
+    if inst.get("channel") == "test":
+        return None
+    app_id = inst.get("app") or inst.get("app_id")
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    for k, v in sorted((reg.get("instances") or {}).items()):
+        if (k != name and v.get("channel") == "test" and not v.get("rehearsal")
+                and (v.get("app") or v.get("app_id")) == app_id
+                and (resolve_tenant(v.get("tenant")) or "") == tid):
+            return k
+    return None
+
+
+def _rebuild_package(name, inst, tmp):
+    """The retained package's root, or None when the instance has none."""
+    src = inst.get("source") or {}
+    if src.get("kind") != "artifact":
+        return None
+    zip_path = source_package_arg(name, src)
+    if not os.path.isfile(zip_path):
+        return None
+    extract_artifact(zip_path, tmp)
+    return package_root(tmp, src.get("path") or "")
+
+
+def _rebuild_record(name, rec):
+    reg = load_registry()
+    cur = reg["instances"].get(name)
+    if cur is None:
+        return
+    cur["rebuild"] = rec
+    save_registry(reg)
+
+
+def _rebuild_recreate_and_wait(name):
+    inst = load_registry()["instances"][name]
+    recreate_instance_containers(name, instance_services(inst),
+                                 inst.get("storage") or [], inst.get("endpoints") or [],
+                                 inst=inst)
+    return _answers(inst, REBUILD_HEALTH_SECONDS)
+
+
+def rebuild_instance(name, who="root", role="server_admin", back=False, say=print):
+    """RFC-0071 §4/§5, one function behind both doors. Returns (ok, sentence);
+    RebuildRefused says why nothing was touched."""
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(name)
+    if inst is None:
+        raise RebuildRefused(f"no instance '{name}' on this node")
+    if deployment_in_flight(name):
+        raise RebuildRefused("a deployment of this instance is queued or running")
+    if is_standby(inst):
+        raise RebuildRefused("the instance is in standby -- wake it first")
+    tid = resolve_tenant(inst.get("tenant")) or ensure_default_tenant()
+    services = instance_services(inst)
+    if back:
+        missing = [s["container"] for s in services
+                   if not images.inspect_image(_prev_tag(name, s.get("service", "")))]
+        if missing:
+            raise RebuildRefused("there is no previous image to go back to "
+                                 "(no rebuild has kept one)")
+        for s in services:
+            _docker_ok(["docker", "tag", _prev_tag(name, s.get("service", "")), s["image"]])
+        healthy = _rebuild_recreate_and_wait(name)
+        _rebuild_record(name, {"at": _iso_now(), "state": "back", "by": who,
+                               "healthy": healthy})
+        audit_tenant("instance.rebuild", tid, name, "ok" if healthy else "failed",
+                     who=who, role=role, detail="back to the previous image"
+                     + ("" if healthy else "; it does not answer either"))
+        return healthy, (f"{name} runs on the previous image again."
+                         if healthy else f"{name} is on the previous image, but it does "
+                         "not answer within the time either.")
+    # 1. Protection (RFC-0069): a held instance is not rebuilt.
+    live = host_care.live_protections(host_care.load_protections(APPS_DIR),
+                                      _care_known_instances())
+    if name in live:
+        r = live[name]
+        raise RebuildRefused(f"held by a reboot protection until {r.get('until')} "
+                             f"({r.get('reason', '')}) -- the rebuild waits for its end")
+    built = [s for s in services if str(s.get("image", "")).startswith("oaap-app/")]
+    prev_state = inst.get("rebuild")
+    _rebuild_record(name, {"at": _iso_now(), "state": "running", "by": who})
+    tmp = tempfile.mkdtemp(prefix="oaap-rebuild-")
+    try:
+        return _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say)
+    except RebuildRefused:
+        _rebuild_record(name, prev_state)
+        raise
+    except Exception as e:  # noqa: BLE001 -- the card must not stay "running"
+        _rebuild_record(name, {"at": _iso_now(), "state": "error", "by": who,
+                               "why": f"{type(e).__name__}: {e}"[:300]})
+        raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
+    pkg = None
+    if built:
+        try:
+            pkg = _rebuild_package(name, inst, tmp)
+        except ArtifactRejected as e:
+            raise RebuildRefused(f"the retained package is unusable ({e})")
+        if not pkg:
+            kind = (inst.get("source") or {}).get("kind") or "unknown"
+            raise RebuildRefused(
+                f"no retained package -- this instance was installed from a {kind} "
+                "source, and a rebuild builds only from the package in service "
+                "(RFC-0071 §8.1). Reinstall it from its source, or deliver it as a "
+                "package; the next build records its base.")
+    # 2. Pull every base (and every foreign image) -- the point of a rebuild.
+    plan = []
+    for s in services:
+        svc = s.get("service", "")
+        old_id = images.container_image_id(s.get("container", ""), s["image"])
+        if s in built:
+            ctx = os.path.join(pkg, s.get("build") or ".")
+            try:
+                with open(os.path.join(ctx, "Dockerfile"), encoding="utf-8") as f:
+                    ref = images.dockerfile_base(f.read())
+            except OSError:
+                ref = ""
+            if not ref:
+                raise RebuildRefused(f"the base of service '{svc or s['container']}' "
+                                     "cannot be read from its Dockerfile")
+        else:
+            ctx, ref = "", s["image"]
+        say(f"Pulling {ref} ...")
+        ok, why = _docker_ok(["docker", "pull", "-q", ref])
+        if not ok:
+            raise RebuildRefused(f"pulling {ref} was refused ({why}) -- nothing changed")
+        digest = images.local_digest(images.inspect_image(ref).get("RepoDigests"), ref)
+        plan.append({"s": s, "svc": svc, "ctx": ctx, "ref": ref, "old": old_id,
+                     "digest": digest})
+    # 3. Test first (RFC-0050): the test instance must stand on these bases.
+    sib = _rebuild_sibling(reg, name, inst)
+    if sib and built:
+        sib_bases = {(x.get("base") or {}).get("ref"): (x.get("base") or {}).get("digest")
+                     for x in instance_services(reg["instances"][sib])}
+        behind = [p["ref"] for p in plan if p["s"] in built
+                  and sib_bases.get(p["ref"]) != p["digest"]]
+        if behind:
+            raise RebuildRefused(
+                f"test first: rebuild '{sib}' on {', '.join(behind)} first and look at "
+                "it -- then this one (RFC-0050)")
+    # 4. The predecessor: the image running now, one per service (D2).
+    for p in plan:
+        if p["old"]:
+            _docker_ok(["docker", "tag", p["old"], _prev_tag(name, p["svc"])])
+    # 5. Build. A failing build changes nothing: the old container never stopped.
+    for p in plan:
+        if p["s"] in built:
+            say(f"Building {p['s']['image']} on {p['ref']} ...")
+            ok, why = _docker_ok(["docker", "build", "-q", "-t", p["s"]["image"], p["ctx"]])
+            if not ok:
+                _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["s"]["image"]])
+                _rebuild_record(name, {"at": _iso_now(), "state": "build-failed",
+                                       "by": who, "why": why})
+                audit_tenant("instance.rebuild", tid, name, "failed", who=who, role=role,
+                             detail=f"build failed on {p['ref']}: {why}; nothing changed")
+                return False, (f"the build on the new base failed ({why}) -- "
+                               f"{name} keeps running unchanged")
+            rec = images.base_record(p["ctx"])
+            if rec.get("digest") != p["digest"]:
+                raise RebuildRefused("the build did not use the base just pulled (§8.2)")
+            p["base"] = rec
+        p["new"] = images.inspect_image(p["s"]["image"]).get("Id", "")
+    if all(p["new"] == p["old"] for p in plan):
+        _rebuild_record(name, {"at": _iso_now(), "state": "unchanged", "by": who})
+        return True, (f"nothing to rebuild on: the base of {name} has not moved "
+                      "upstream -- the image stays as it is")
+    # 6. Recreate, health; the ladder of §5 when it does not answer.
+    reg = load_registry()
+    old_bases = {}
+    for s in reg["instances"][name].get("services") or []:
+        old_bases[s.get("container")] = s.get("base")
+        for p in plan:
+            if s.get("container") == p["s"].get("container") and p.get("base"):
+                s["base"] = p["base"]
+    save_registry(reg)
+    detail = "; ".join(f"{p['svc'] or 'service'} {p['ref']}: "
+                       f"{(p['old'] or '?')[7:19]} -> {(p['new'] or '?')[7:19]}"
+                       for p in plan)
+    say("Recreating and waiting for the instance to answer ...")
+    if _rebuild_recreate_and_wait(name):
+        _rebuild_record(name, {"at": _iso_now(), "state": "done", "by": who,
+                               "digests": {p["ref"]: p["digest"] for p in plan}})
+        audit_tenant("instance.rebuild", tid, name, "ok", who=who, role=role,
+                     detail=detail)
+        return True, f"{name} rebuilt on a fresh base and answers ({detail})."
+    say("Not answering -- back to the previous image ...")
+    for p in plan:
+        _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["s"]["image"]])
+    reg = load_registry()
+    for s in reg["instances"][name].get("services") or []:
+        # The previous image's record comes back with it (none, if it
+        # was built before 0.1.227).
+        if old_bases.get(s.get("container")) is None:
+            s.pop("base", None)
+        else:
+            s["base"] = old_bases[s.get("container")]
+    save_registry(reg)
+    back_ok = _rebuild_recreate_and_wait(name)
+    _rebuild_record(name, {"at": _iso_now(), "state": "fallback", "by": who,
+                           "healthy": back_ok,
+                           "tried": {p["ref"]: p["digest"] for p in plan}})
+    audit_tenant("instance.rebuild", tid, name, "failed", who=who, role=role,
+                 detail=f"{detail}; not answering within {REBUILD_HEALTH_SECONDS} s, "
+                 "back on the previous image" + ("" if back_ok else " (which does not "
+                                                 "answer either)"))
+    return False, (f"rebuilt, but the new container did not answer within "
+                   f"{REBUILD_HEALTH_SECONDS} s -- {name} runs on the previous image "
+                   "again" + ("." if back_ok else ", which does not answer either."))
+
+
+def rebuild_job(req, name, inst, act_tenant, role, actor):
+    """The instance page's door (RFC-0071 §7): a tenant_admin of the
+    instance's tenant, or the server_admin. (ok, sentence, tenant id).
+    A refusal is filed here, in the tenant it was meant for; an act that
+    ran is filed by rebuild_instance."""
+    def refuse(msg, tid):
+        audit_tenant("instance.rebuild", tid or ensure_default_tenant(), subject=name,
+                     result="denied", who=actor or "portal", role=role or "-", detail=msg)
+        return False, msg, tid
+    if role not in ("server_admin", "tenant_admin"):
+        return refuse("a rebuild is its tenant admin's or the server admin's", act_tenant)
+    if inst is None or (role != "server_admin" and _care_tenant_of(name) != act_tenant):
+        return refuse(cross_tenant_refusal("rebuild", name), act_tenant)
+    tid = _care_tenant_of(name)
+    try:
+        ok, msg = rebuild_instance(name, who=actor or "portal", role=role,
+                                   back=req.get("op") == "back", say=lambda *_: None)
+    except RebuildRefused as e:
+        return refuse(str(e), tid)
+    try:
+        _care_images(read=True)
+        _care_fresh(who=actor or "portal", role=role)
+    except Exception as e:  # noqa: BLE001
+        print(f"rebuild: the reading afterwards failed: {e}", file=sys.stderr)
+    return ok, msg, tid
+
+
 # ------------------------------------------- the node's cases (2.7.6)
 #
 # RFC-0069 stage 2: one case per plan in every inbox (`vorgaenge`) on the
@@ -16139,6 +16409,27 @@ def cmd_logs(args):
                         s["container"]])
 
 
+def cmd_rebuild(args):
+    """`oaap app rebuild <instance> [--back]` (RFC-0071 stage 2)."""
+    who = os.environ.get("SUDO_USER") or "root"
+    try:
+        ok, msg = rebuild_instance(args.name, who=who, role="server_admin",
+                                   back=bool(getattr(args, "back", False)))
+    except RebuildRefused as e:
+        tid = _care_tenant_of(args.name) if args.name in _care_known_instances() else ""
+        audit_tenant("instance.rebuild", tid or ensure_default_tenant(), subject=args.name,
+                     result="denied", who=who, role="server_admin", detail=str(e))
+        die(f"Not rebuilt: {e}")
+    print(msg)
+    try:
+        _care_images(read=True)
+        _care_fresh(who=who, role="server_admin")
+    except Exception as e:  # noqa: BLE001
+        print(f"(the reading afterwards failed: {e})", file=sys.stderr)
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_restart(args):
     """`oaap app restart <instance>`."""
     reg = load_registry()
@@ -17798,6 +18089,10 @@ def remove_instance(reg, name, purge):
     # remove every service container of the instance (RFC-0016)
     for s in instance_services(inst):
         subprocess.run(["docker", "rm", "-f", s["container"]],
+                       capture_output=True, text=True)
+        # RFC-0071 D2: the predecessor goes with the instance -- the tag
+        # only; Docker keeps the bytes while another image still uses them.
+        subprocess.run(["docker", "rmi", _prev_tag(name, s.get("service", ""))],
                        capture_output=True, text=True)
     # RFC-0063 §4.9: the grants go with the instance, and so does its base
     if inst.get("id") and os.path.isdir(disks.grant_base(inst["id"])):
@@ -25691,6 +25986,11 @@ def cmd_process_deploys(_args):
                              _ctid or ensure_default_tenant(), subject=name,
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
+        elif action == "rebuild":
+            # RFC-0071 stage 2: the card "Abbild". The same function as
+            # `oaap app rebuild`; a refusal lands in the tenant's log
+            # (a rebuild that ran is filed by the function itself).
+            ok, msg, _rtid = rebuild_job(req, name, inst, act_tenant, act_role, actor)
         elif action == "restart":
             # Restart = recreate (RFC-0038 D4). Exactly the operation a
             # configuration save runs, on purpose: one path for install,
@@ -25784,7 +26084,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal", "care": "portal",
+               "disk": "portal", "egress": "portal", "care": "portal", "rebuild": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -28424,6 +28724,13 @@ def main():
                          help="recreate an instance's containers (RFC-0038 D4)")
     prs.add_argument("name")
     prs.set_defaults(fn=cmd_restart)
+    prb = sub.add_parser("rebuild",
+                         help="build an instance again on a freshly pulled base, "
+                              "falling back to the previous image (RFC-0071)")
+    prb.add_argument("name")
+    prb.add_argument("--back", action="store_true",
+                     help="go back to the image the last rebuild kept")
+    prb.set_defaults(fn=cmd_rebuild)
     psb = sub.add_parser("standby",
                          help="put an instance to sleep: containers stopped, "
                               "data kept, stays asleep over update and reboot "

@@ -257,6 +257,28 @@ h = ICARD.render(i={"key": "x", "imgcare": {"known": False, "services": [], "sta
 ok("Abbild: noch nicht gelesen", "noch nicht gelesen" in h, h)
 
 
+def irender2(artifact, state="", text=""):
+    return ICARD.render(i={"key": "x", "imgcare": {
+        "known": True, "services": [SVC], "state": "open", "word": "w", "computed": "c",
+        "artifact": artifact, "rebuild": {"state": state, "at": "2026-11-06 09:00", "by": "anna",
+                                          "why": "", "text": text}}})
+
+
+h = irender2(True)
+ok("Abbild (Stufe 2): mit Paket der Knopf Neu bauen, kein Zurück ohne Vorgänger",
+   "/rebuild/start" in h and "/rebuild/back" not in h, h)
+h = irender2(False)
+ok("Abbild: ohne zurückbehaltenes Paket kein Knopf, der Grund steht da",
+   "/rebuild/start" not in h and "zurückbehaltenen Paket" in h, h)
+h = irender2(True, "fallback", "Neu gebaut, aber ... vorigen Abbild.")
+ok("Abbild: nach dem Rückfall rot, mit Zurück-Knopf",
+   'class="err"' in h and "/rebuild/back" in h and "anna" in h, h)
+h = irender2(True, "running", "Der Neubau läuft gerade.")
+ok("Abbild: während des Neubaus kein zweiter Knopf", "/rebuild/start" not in h, h)
+ok("die Tür der Seite ist die Spool-Aktion rebuild",
+   "\"action\": \"rebuild\"" in io.open(APP_PY, encoding="utf-8").read())
+
+
 def view(held=None, plan=None, overridden=False, known=True):
     return {"known": known, "held": held,
             "plan_text": host_care.plan_text(plan, de=True) if plan else "",

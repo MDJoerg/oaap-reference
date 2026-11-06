@@ -1175,9 +1175,18 @@ IMAGE_WORDS_DE = {"fresh": "frisch", "behind": "Basis weitergezogen",
 def images_line(img, de=False):
     """(state, text) of 2.9: the images the instances run (RFC-0071 stage 1).
     Counts only -- which instance is the instance page's and the CLI's."""
-    if not img or not img.get("counts", {}).get("instances"):
+    if not img or not (img.get("counts", {}).get("instances") or img.get("core")):
         return None
     c = img["counts"]
+    if not c.get("instances"):
+        # A node without instances (raspberrypi, 06.11.): the platform's own
+        # containers are still read and still said.
+        k, core = len(img.get("core") or {}), c.get("core_open", 0)
+        return ("warn" if core else "ok",
+                (f"Abbilder: keine Instanzen; {k} Plattform-Container, {core} mit offenen "
+                 "Sicherheitsmeldungen. Welche: sudo oaap node care images") if de else
+                (f"Images: no instances; {k} platform container(s), {core} with open "
+                 "advisories. Which: sudo oaap node care images"))
     n, o, b, u = c["instances"], c.get("open", 0), c.get("behind", 0), c.get("unknown", 0)
     core = c.get("core_open", 0)
     if de:
