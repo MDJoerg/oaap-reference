@@ -233,5 +233,83 @@ ok("the portal labels every profile the CLI knows", cli <= portal,
 ok("and invents none of its own", portal <= cli,
    f"unknown to the CLI: {sorted(portal - cli)}")
 
+
+print("=== care at a glance: update and advisories (store filter, instance list) ===")
+ok("a newer catalogue version is an update", sv.update_to("0.2.1", "0.5.3") == "0.5.3")
+ok("numbers compare as numbers (0.1.10 > 0.1.9)", sv.update_to("0.1.9", "0.1.10") == "0.1.10")
+ok("an older catalogue entry is no update", sv.update_to("0.4.4", "0.4.3") == "")
+ok("the same version is no update", sv.update_to("1.0.0", "1.0.0") == "")
+ok("a pre-release falls back to 'differs'", sv.update_to("1.0.0", "1.1.0-rc1") == "1.1.0-rc1")
+ok("nothing in the catalogue, nothing offered", sv.update_to("1.0.0", "") == "")
+
+IMAGES = {"instances": {
+    "ai-gateway": {"state": "open", "services": [{"state": "open", "open": 4},
+                                                 {"state": "open", "open": 2}]},
+    "fleetview": {"state": "fresh", "services": [{"state": "fresh", "open": 0}]},
+    "ollama": {"state": "behind", "services": [{"state": "behind", "open": 0}]},
+}}
+INSTS = {
+    "ai-gateway": {"app_id": "ai-gateway", "version": "0.2.1"},
+    "fleetview": {"app_id": "fleetview", "version": "0.3.4"},
+    "ollama": {"app_id": "ollama", "version": "0.1.0"},
+    "ai-gateway-test": {"app_id": "ai-gateway", "version": "0.5.3"},
+}
+CAT = {"ai-gateway": {"version": "0.5.3", "source_id": "oaap.platform"},
+       "fleetview": {"version": "0.3.4", "source_id": "oaap.platform"}}
+c = {k: sv.instance_care(k, i, CAT, IMAGES) for k, i in INSTS.items()}
+ok("old instance: update and the advisories of all services summed",
+   c["ai-gateway"]["newer"] == "0.5.3" and c["ai-gateway"]["open"] == 6
+   and c["ai-gateway"]["update_source"] == "oaap.platform", str(c["ai-gateway"]))
+ok("up to date and fresh: nothing to say",
+   not c["fleetview"]["attention"] and not c["fleetview"]["behind"], str(c["fleetview"]))
+ok("a moved base is said, but is no attention",
+   c["ollama"]["behind"] and not c["ollama"]["attention"], str(c["ollama"]))
+ok("an instance the image reading does not know has 0 open",
+   c["ai-gateway-test"]["open"] == 0 and not c["ai-gateway-test"]["newer"])
+ok("an app not in the catalogue offers no update", c["ollama"]["newer"] == "")
+
+entries = build([(PLATFORM, {"apps": [app_entry("ai-gateway", version="0.5.3"),
+                                      app_entry("fleetview", version="0.3.4"),
+                                      app_entry("raci", version="0.1.2",
+                                                status="archived")]})])
+sv.annotate_care(entries, INSTS, IMAGES)
+e = {x["id"]: x for x in entries}
+ok("store card: one of two instances has an update",
+   e["ai-gateway"]["update_count"] == 1 and e["ai-gateway"]["open_count"] == 6
+   and e["ai-gateway"]["open_instances"] == 1, str(e["ai-gateway"]))
+ok("store card: an app without instances counts nothing",
+   e["raci"]["update_count"] == 0 and e["raci"]["open_count"] == 0)
+ok("filter 'update' keeps only the app with an update",
+   [x["id"] for x in entries if sv.matches(x, {"care": "update"})] == ["ai-gateway"])
+ok("filter 'security' keeps only the app with advisories",
+   [x["id"] for x in entries if sv.matches(x, {"care": "security"})] == ["ai-gateway"])
+ok("no care filter: the defaults stay (archived hidden)",
+   [x["id"] for x in entries if sv.matches(x, {})] == ["ai-gateway", "fleetview"])
+bare = {k: v for k, v in e["ai-gateway"].items() if k != "update_count"}
+ok("a care filter on an unannotated entry keeps nothing",
+   not sv.matches(bare, {"care": "attention"}))
+
+
+def row(key, care, state="ok", channel="production", tenant="", app="App"):
+    return {"key": key, "name": key, "app_name": app, "tenant": tenant,
+            "status": {"state": state}, "channel": channel, "care": care}
+
+
+rows = [row("ai-gateway", c["ai-gateway"], tenant="pxx", app="KI-Gateway"),
+        row("fleetview", c["fleetview"], channel="test"),
+        row("ollama", c["ollama"], state="down")]
+
+
+def pick(f):
+    return [r["key"] for r in rows if sv.instance_matches(r, f)]
+
+
+ok("instance list: no filter shows all", pick({}) == ["ai-gateway", "fleetview", "ollama"])
+ok("instance list: 'attention'", pick({"care": "attention"}) == ["ai-gateway"])
+ok("instance list: search reaches the app name", pick({"q": "ki-gat"}) == ["ai-gateway"])
+ok("instance list: status, channel, tenant",
+   pick({"state": "down"}) == ["ollama"] and pick({"channel": "test"}) == ["fleetview"]
+   and pick({"tenant": "pxx"}) == ["ai-gateway"])
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)

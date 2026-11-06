@@ -1445,6 +1445,15 @@ STORE_BODY = """
   nicht lesbar: {{ e.error }}</p>
   <p class="muted" style="margin:.3rem 0 0">{{ e.url }}</p></div>
 {% endfor %}
+{% if care_counts.newer or care_counts.security %}
+<div class="card warn"><p style="margin:0">Deine Instanzen:
+  {% if care_counts.newer %}<a href="/store?care=update">{{ care_counts.newer }}
+    App{{ 's' if care_counts.newer != 1 }} mit Update</a>{% endif %}
+  {% if care_counts.newer and care_counts.security %} · {% endif %}
+  {% if care_counts.security %}<a href="/store?care=security">{{ care_counts.security }}
+    App{{ 's' if care_counts.security != 1 }} mit offenen Sicherheitsmeldungen</a>{% endif %}
+  {% if f.care %} — <a class="rowaction" href="/store">alle zeigen</a>{% endif %}</p></div>
+{% endif %}
 
 <form class="card" method="get" action="/store">
   <div class="filters">
@@ -1490,6 +1499,11 @@ STORE_BODY = """
       <select id="installed" name="installed"><option value="">egal</option>
         <option value="yes" {{ 'selected' if f.installed == 'yes' }}>ja</option>
         <option value="no" {{ 'selected' if f.installed == 'no' }}>nein</option>
+      </select></div>
+    <div><label for="care">Pflege</label>
+      <select id="care" name="care"><option value="">egal</option>
+      {% for k, l in care_labels.items() %}<option value="{{ k }}"
+        {{ 'selected' if f.care == k }}>{{ l }}</option>{% endfor %}
       </select></div>
   </div>
   <label class="checkline"><input type="checkbox" name="all_profiles" value="1"
@@ -1549,6 +1563,10 @@ STORE_BODY = """
       <span class="badge">v{{ a.version }}</span>
       {% if a.is_new %}<span class="badge">neu</span>{% endif %}
       {% if a.installed %}<span class="badge test">installiert ({{ a.installed }})</span>{% endif %}
+      {% if a.update_count %}<span class="badge todo">Update für {{ a.update_count }}
+        Instanz{{ 'en' if a.update_count != 1 }}</span>{% endif %}
+      {% if a.open_count %}<span class="badge todo">{{ a.open_count }}
+        Sicherheitsmeldung{{ 'en' if a.open_count != 1 }}</span>{% endif %}
       {% if a.maturity and a.maturity != 'stable' %}<span class="badge test">{{ a.maturity_label }}</span>{% endif %}
       {% if a.status == 'deprecated' %}<span class="badge test">veraltet</span>{% endif %}
       {% if a.status == 'archived' %}<span class="badge off">archiviert</span>{% endif %}
@@ -2242,10 +2260,50 @@ INSTANCES_LIST_BODY = """
 {% endif %}
 {% if scope_note %}<p class="muted">Mandant <strong>{{ scope_note }}</strong> —
    Du siehst und verwaltest die Instanzen dieses Mandanten.</p>{% endif %}
+{% if care_counts.newer or care_counts.security %}
+<div class="card warn"><p style="margin:0">
+  {% if care_counts.newer %}<a href="/instances?care=update">{{ care_counts.newer }}
+    Instanz{{ 'en' if care_counts.newer != 1 }} mit Update im Store</a>{% endif %}
+  {% if care_counts.newer and care_counts.security %} · {% endif %}
+  {% if care_counts.security %}<a href="/instances?care=security">{{ care_counts.security }}
+    Instanz{{ 'en' if care_counts.security != 1 }} mit offenen Sicherheitsmeldungen</a>{% endif %}
+  {% if f.care %} — <a class="rowaction" href="/instances">alle zeigen</a>{% endif %}</p></div>
+{% endif %}
+{% if total %}
+<form class="card" method="get" action="/instances">
+<style>.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));
+   gap:.2rem .8rem;align-items:end}
+  .filters label{font-size:.82rem;color:var(--oaap-muted);display:block}
+  .filters select,.filters input{margin:.2rem 0 .6rem}</style>
+  <div class="filters">
+    <div style="grid-column:1/-1"><label for="q">Suche</label>
+      <input id="q" name="q" value="{{ f.q }}" placeholder="Instanz oder App"></div>
+    <div><label for="state">Status</label>
+      <select id="state" name="state"><option value="">alle</option>
+      {% for v, l in opt_state %}<option value="{{ v }}"
+        {{ 'selected' if f.state == v }}>{{ l }}</option>{% endfor %}</select></div>
+    <div><label for="channel">Kanal</label>
+      <select id="channel" name="channel"><option value="">alle</option>
+      {% for v, l in opt_channel %}<option value="{{ v }}"
+        {{ 'selected' if f.channel == v }}>{{ l }}</option>{% endfor %}</select></div>
+    {% if show_tenant %}<div><label for="tenant">Mandant</label>
+      <select id="tenant" name="tenant"><option value="">alle</option>
+      {% for t in opt_tenant %}<option value="{{ t }}"
+        {{ 'selected' if f.tenant == t }}>{{ t }}</option>{% endfor %}</select></div>{% endif %}
+    <div><label for="care">Pflege</label>
+      <select id="care" name="care"><option value="">egal</option>
+      {% for k, l in care_labels.items() %}<option value="{{ k }}"
+        {{ 'selected' if f.care == k }}>{{ l }}</option>{% endfor %}</select></div>
+  </div>
+  <button>Filtern</button>
+  {% if filtered %}<a class="rowaction" href="/instances" style="margin-left:.8rem">Zurücksetzen</a>
+  <span class="muted" style="margin-left:.8rem">{{ instances|length }} von {{ total }}</span>{% endif %}
+</form>
+{% endif %}
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Instanz</th><th>Status</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
+  <tr><th>Instanz</th><th>Status</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Pflege</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/instances/{{ i.key }}">{{ i.name }}</a></td>
@@ -2257,6 +2315,14 @@ INSTANCES_LIST_BODY = """
         {% if i.rehearsal %}<span class="badge todo"
            title="{{ i.rehearsal.left }}">{{ i.rehearsal.badge }} ·
            {{ i.rehearsal.left_short }}</span>{% endif %}</td>
+    <td>{% if i.care.newer %}<a class="badge todo" href="/store/{{ i.care.update_source }}/{{ i.app_id }}"
+           title="Im Store steht v{{ i.care.newer }}">Update v{{ i.care.newer }}</a>{% endif %}
+        {% if i.care.open %}<a class="badge todo" href="/instances/{{ i.key }}?tab=diagnose#abbild"
+           title="Die Abbild-Lesung meldet offene Sicherheitsmeldungen">{{ i.care.open }}
+           Sicherheitsmeldung{{ 'en' if i.care.open != 1 }}</a>
+        {% elif i.care.behind %}<a class="badge off" href="/instances/{{ i.key }}?tab=diagnose#abbild"
+           title="Die Basis des Abbilds ist upstream weitergezogen">Basis weitergezogen</a>{% endif %}
+        {% if not i.care.newer and not i.care.open and not i.care.behind %}<span class="muted">—</span>{% endif %}</td>
     <td>{{ i.visibility_label }}</td>
     <td>{{ "ja" if i.tile_visible else "nein" }}{% if i.tile_mode != "auto" %}
         <span class="muted">(fest)</span>{% endif %}</td>
@@ -2265,9 +2331,16 @@ INSTANCES_LIST_BODY = """
   {% endfor %}
 </table>
 </div>
+{% elif total %}
+<div class="card"><p class="muted" style="margin:0">Kein Treffer — mit
+  „Zurücksetzen" siehst Du wieder alle {{ total }} Instanzen.</p></div>
 {% else %}
 <div class="card"><p class="muted">Noch keine Apps installiert.</p></div>
 {% endif %}
+<p class="muted"><strong>Pflege</strong>: „Update" heißt, der Store führt eine
+neuere Version dieser App; „Sicherheitsmeldungen" kommen aus der Abbild-Lesung
+des Knotens (RFC-0071) — was dort hilft, Neubau oder neue Version, sagt die
+Karte „Abbild" der Instanz.</p>
 <p class="muted">Sichtbarkeit schränkt zusätzlich zur Rolle ein, wer eine
 installierte Instanz sehen und öffnen darf (RFC-0007) — <code>server_admin</code>
 sieht immer alle Instanzen, unabhängig davon.</p>
@@ -2480,7 +2553,7 @@ CARE_CARD = """
 # RFC-0071 stage 1: what the instance's image stands on and what is open in
 # it -- read by the node, shown here; the rebuild comes with stage 2.
 IMAGE_CARD = """
-<div class="card{% if i.imgcare.state == 'open' %} warn{% endif %}">
+<div class="card{% if i.imgcare.state == 'open' %} warn{% endif %}" id="abbild">
   <h2>Abbild</h2>
   {% if not i.imgcare.services %}
   <p class="muted">Der Knoten hat die Abbilder noch nicht gelesen; die Karte
@@ -6871,8 +6944,9 @@ INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 # paths and the filter defaults are decisions RFC-0012 makes, and they
 # are readable and testable there without Flask around them.
 from store_view import (AUDIENCE_LABEL, CATEGORY_LABEL, CLASS_LABEL,
-                        MATURITY_LABEL, TRUST_LABEL,
-                        matches, merge_catalogue, options)
+                        MATURITY_LABEL, TRUST_LABEL, CARE_FILTER_LABEL,
+                        annotate_care, care_matches, instance_care,
+                        instance_matches, matches, merge_catalogue, options)
 
 def all_sources():
     """Every configured store source, in the object form of RFC-0012 §2.
@@ -7053,12 +7127,32 @@ def store_catalogue():
     # sees the node, so for them this is the whole registry.
     installed = {inst.get("app_id"): inst.get("version")
                  for inst in visible_instances().values()}
-    return merge_catalogue(fetched, installed, pending_installs(),
-                           node_profiles()), errors
+    entries = merge_catalogue(fetched, installed, pending_installs(),
+                              node_profiles())
+    # One read of the catalogue also serves the instance list for a while.
+    _CATALOGUE_CACHE.update(at=_time.time(), versions={
+        e["id"]: {"version": e["version"], "source_id": e["source"]["id"]}
+        for e in entries})
+    return entries, errors
+
+
+# {app_id: {version, source_id}} -- what the instance list compares against.
+# The versions are the same for every caller (only "installed" is not), so
+# one copy serves all; it is refreshed by any store read and after a minute.
+_CATALOGUE_CACHE = {"at": 0.0, "versions": {}}
+CATALOGUE_CACHE_SECONDS = 60
+
+
+def catalogue_versions():
+    if _time.time() - _CATALOGUE_CACHE["at"] > CATALOGUE_CACHE_SECONDS:
+        store_catalogue()
+    return _CATALOGUE_CACHE["versions"]
 
 
 def store_page(msg=None, msg_ok=True, status=200):
     entries, errors = store_catalogue()
+    annotate_care(entries, visible_instances(),
+                  (care_facts() or {}).get("images") or {})
     f = {
         "q": request.args.get("q", "").strip().lower(),
         "categories": request.args.get("categories", ""),
@@ -7069,10 +7163,14 @@ def store_page(msg=None, msg_ok=True, status=200):
         "source": request.args.get("source", ""),
         "license": request.args.get("license", ""),
         "installed": request.args.get("installed", ""),
+        "care": (request.args.get("care", "")
+                 if request.args.get("care", "") in CARE_FILTER_LABEL else ""),
         "all_status": request.args.get("all_status") == "1",
         "all_profiles": request.args.get("all_profiles") == "1",
     }
     shown = [e for e in entries if matches(e, f)]
+    care_counts = {"newer": sum(1 for e in entries if care_matches(e, "update")),
+                   "security": sum(1 for e in entries if care_matches(e, "security"))}
     hidden_profile = sum(1 for e in entries if not e["profile_fit"])
     hidden_archived = sum(1 for e in entries if e["status"] == "archived")
     return page(STORE_BODY, "Store", "store", status=status,
@@ -7081,6 +7179,7 @@ def store_page(msg=None, msg_ok=True, status=200):
                 filtered=any(v for k, v in f.items()
                              if k not in ("all_status", "all_profiles")),
                 hidden_profile=hidden_profile, hidden_archived=hidden_archived,
+                care_counts=care_counts, care_labels=CARE_FILTER_LABEL,
                 opt_categories=options(entries, "categories", CATEGORY_LABEL),
                 opt_class=options(entries, "app_class", CLASS_LABEL),
                 opt_audience=options(entries, "audience", AUDIENCE_LABEL),
@@ -7421,6 +7520,8 @@ def instances_list():
     # status: the record for the sleeping ones, one probe round for the rest
     probed = fleet_view.probe_all(
         [(n, i) for n, i in shown if not _sleep_status(i)], _instance_probe)
+    catalogue = catalogue_versions()
+    images = (care_facts() or {}).get("images") or {}
     for name, inst in shown:
         groups = _instance_groups(inst)
         channel = inst.get("channel", "production")
@@ -7439,8 +7540,28 @@ def instances_list():
             # RFC-0030: eine Generalprobe darf in einer Liste nie wie
             # eine gewoehnliche Produktiv-Instanz aussehen.
             "rehearsal": iv.rehearsal_view(inst),
+            # Update im Store / offene Sicherheitsmeldungen im Abbild
+            "app_id": inst.get("app_id", ""),
+            "care": instance_care(name, inst, catalogue, images),
         })
+    f = {"q": request.args.get("q", "").strip().lower(),
+         "state": request.args.get("state", ""),
+         "channel": request.args.get("channel", ""),
+         "tenant": request.args.get("tenant", ""),
+         "care": (request.args.get("care", "")
+                  if request.args.get("care", "") in CARE_FILTER_LABEL else "")}
+    opt_state = sorted({(r["status"]["state"], r["status"]["label"]) for r in rows},
+                       key=lambda s: s[1])
+    opt_channel = sorted({(r["channel"], r["channel_label"]) for r in rows})
+    opt_tenant = sorted({r["tenant"] for r in rows if r["tenant"]})
+    care_counts = {"newer": sum(1 for r in rows if r["care"]["newer"]),
+                   "security": sum(1 for r in rows if r["care"]["open"])}
+    total = len(rows)
+    rows = [r for r in rows if instance_matches(r, f)]
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
+                total=total, f=f, filtered=any(f.values()),
+                opt_state=opt_state, opt_channel=opt_channel, opt_tenant=opt_tenant,
+                care_counts=care_counts, care_labels=CARE_FILTER_LABEL,
                 can_create="dev" in node_profiles(),
                 show_tenant=multi_tenant() and role == "server_admin",
                 scope_note=(tenant_name(mine) if role == "tenant_admin"

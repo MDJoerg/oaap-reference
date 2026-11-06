@@ -203,6 +203,11 @@ def matches(e, f):
         return False
     if f.get("installed") == "no" and e["installed"]:
         return False
+    # Care (update / advisories) is about the caller's instances, so it
+    # wins over the two defaults below: an app with an open advisory must
+    # not disappear because it is archived or wants another profile.
+    if f.get("care"):
+        return "update_count" in e and care_matches(e, f["care"])
     # Two defaults, each reversible with one click (§6): an archived
     # entry, and an app meant for a profile this node does not have, are
     # FILTERED, not hidden. `expert` is deliberately not filtered — it is
@@ -213,3 +218,100 @@ def matches(e, f):
     if not f.get("all_profiles") and not e["profile_fit"]:
         return False
     return True
+
+
+# ---- care at a glance (store filter, instance list) ------------------------
+# Two questions an operator asks of a whole list, not of one page: "is a
+# newer version in the catalogue?" and "does the node's image reading
+# (RFC-0071 §3) report open advisories?". One rule for the store cards,
+# the store filter and the instance list, so the three never disagree.
+
+CARE_FILTER_LABEL = {"update": "Update verfügbar",
+                     "security": "Sicherheitsmeldungen",
+                     "attention": "Update oder Sicherheitsmeldungen"}
+
+
+def _numeric(v):
+    parts = str(v or "").split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def update_to(installed, offered):
+    """The catalogue version if it is an update for `installed`, else "".
+
+    Plain dotted numbers compare as numbers, so an OLDER catalogue entry
+    (a test instance ahead of the list) is not called an update. Anything
+    else -- a pre-release, a word -- falls back to "differs", the rule the
+    store's object page has always used.
+    """
+    if not offered or not installed or offered == installed:
+        return ""
+    a, b = _numeric(installed), _numeric(offered)
+    if a is not None and b is not None:
+        return offered if b > a else ""
+    return offered
+
+
+def instance_care(key, inst, catalogue, images):
+    """Care facts of one instance for a list row.
+
+    `catalogue` is {app_id: {"version", "source_id"}} (the merged store),
+    `images` the `images` block of the node's care file.
+    """
+    c = catalogue.get(inst.get("app_id") or "") or {}
+    upd = update_to(str(inst.get("version") or ""), str(c.get("version") or ""))
+    e = ((images or {}).get("instances") or {}).get(key) or {}
+    services = e.get("services") or []
+    open_n = sum(int(s.get("open") or 0) for s in services)
+    behind = (e.get("state") == "behind"
+              or any(s.get("state") == "behind" for s in services))
+    return {"newer": upd, "update_source": c.get("source_id", "") if upd else "",
+            "open": open_n, "behind": behind and not open_n,
+            "image_state": e.get("state", ""),
+            "attention": bool(upd or open_n)}
+
+
+def annotate_care(entries, instances, images):
+    """Per store entry: how many of the caller's instances have an update
+    waiting, and how many open advisories they carry together."""
+    catalogue = {e["id"]: {"version": e["version"], "source_id": e["source"]["id"]}
+                 for e in entries}
+    by_app = {}
+    for key, inst in instances.items():
+        by_app.setdefault(inst.get("app_id") or "", []).append(
+            instance_care(key, inst, catalogue, images))
+    for e in entries:
+        rows = by_app.get(e["id"], [])
+        e["update_count"] = sum(1 for r in rows if r["newer"])
+        e["open_count"] = sum(r["open"] for r in rows)
+        e["open_instances"] = sum(1 for r in rows if r["open"])
+    return entries
+
+
+def care_matches(item, want):
+    """`want` is "", "update", "security" or "attention"; `item` a store
+    entry (counts) or an instance row (care dict)."""
+    if not want:
+        return True
+    if "update_count" in item:
+        upd, sec = item["update_count"] > 0, item["open_count"] > 0
+    else:
+        upd, sec = bool(item["care"]["newer"]), item["care"]["open"] > 0
+    return {"update": upd, "security": sec, "attention": upd or sec}.get(want, True)
+
+
+def instance_matches(row, f):
+    """Whether one instance-list row survives the filter state `f`."""
+    if f.get("q"):
+        hay = " ".join([row["key"], row["name"], row["app_name"]]).lower()
+        if f["q"] not in hay:
+            return False
+    if f.get("state") and row["status"]["state"] != f["state"]:
+        return False
+    if f.get("channel") and row["channel"] != f["channel"]:
+        return False
+    if f.get("tenant") and (row.get("tenant") or "") != f["tenant"]:
+        return False
+    return care_matches(row, f.get("care", ""))
