@@ -131,12 +131,16 @@ ok("laufende Installationen ebenso", "visible_instances()" in pend, pend)
 
 print("\nDie Navigation zeigt, was das Recht hergibt")
 
+# Seit 0.1.235 steht das Menue in der Seitenleiste (nav_view.GROUPS).
+sys.path.insert(0, os.path.dirname(APP_PY))
+import nav_view                                               # noqa: E402
 ok("der Menuepunkt Store haengt an can_store",
-   '{% if can_store %}<a href="/store"' in SRC)
+   ("store", "/store", "Store", "can_store") in
+   [i for _, items in nav_view.GROUPS for i in items])
 ok("der Knopf 'Quellen' haengt an can_sources",
    "{% if can_sources %}" in SRC and 'href="/store/sources">Quellen' in SRC)
 ok("can_store meint server_admin oder tenant_admin",
-   'can_store=bool(caller & {"server_admin", "tenant_admin"})' in SRC)
+   '"can_store": bool(caller & {"server_admin", "tenant_admin"})' in SRC)
 ok("can_sources meint nur server_admin",
    'can_sources="server_admin" in caller_roles()' in SRC)
 

@@ -306,13 +306,16 @@ for anchor, flag in FLAG_USING_BODIES.items():
 print("\n=== Die Navigation zeigt 'Zwilling' nur mit einer Mandantenrolle "
       "-- ein server_admin ohne eigenen Mandanten sieht keinen Zwilling "
       "eines Mandanten, den er nicht hat ===")
+# Seit 0.1.235 steht das Menue in der Seitenleiste (nav_view.GROUPS).
+import nav_view                                               # noqa: E402
 ok("can_twin in der Navigation verdrahtet",
-   '{% if can_twin %}<a href="/zwilling"' in SRC)
+   ("twin", "/zwilling", "Zwilling", "can_twin") in
+   [i for _, items in nav_view.GROUPS for i in items])
 page_fn = body_of("page")
 ok("page() setzt can_twin/can_twin_write/can_twin_admin aus denselben "
    "Rollen wie die drei Wächter oben, nicht aus einer eigenen Liste",
-   "can_twin=" in page_fn and "can_twin_write=" in page_fn
-   and "can_twin_admin=" in page_fn)
+   '"can_twin": bool(caller & {"user", "keyuser", "admin", "tenant_admin"})' in page_fn
+   and "can_twin_write=" in page_fn and "can_twin_admin=" in page_fn)
 
 print("\n=== Dockerfile: jedes 'import <lokales Modul>' in app.py hat "
       "eine eigene COPY-Zeile -- live auf oaap-test gefunden (2026-09-10): "

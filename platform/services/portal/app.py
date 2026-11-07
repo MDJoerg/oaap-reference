@@ -41,6 +41,7 @@ import idp  # noqa: E402
 import relay_view
 import twin_view
 import metrics_view
+import nav_view
 # The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
@@ -151,34 +152,74 @@ STYLE = """
   *{box-sizing:border-box}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
        margin:0;background:var(--oaap-bg);color:var(--oaap-text)}
+  /* Layout (design guidelines §5): the header carries only the mark and
+     the user menu and stays fixed; administration lives in the side bar
+     on the left; the work area gets the width. --hdr-h is what every
+     other sticky bar (jump marks, tabs) has to stay below. */
+  :root{--hdr-h:3.6rem}
   header.oaap{background:linear-gradient(135deg,var(--oaap-blue-900),var(--oaap-blue-950));
-       color:var(--oaap-header-text);display:flex;align-items:center;gap:1rem;flex-wrap:wrap;
-       padding:.6rem 1.2rem}
+       color:var(--oaap-header-text);display:flex;align-items:center;gap:1rem;
+       padding:0 1.2rem;min-height:var(--hdr-h);position:sticky;top:0;z-index:20}
   .brand{display:flex;align-items:center;gap:.6rem;text-decoration:none;
        color:var(--oaap-header-text)}
   .brand img{height:34px;width:auto;max-width:10rem;border-radius:.25rem;
        background:rgba(255,255,255,.9);padding:.15rem}
   .brand b{font-size:1.15rem;letter-spacing:.08em}
   .brand small{display:block;font-size:.62rem;opacity:.75;letter-spacing:.02em}
-  nav.main{display:flex;gap:.25rem;margin-left:1rem;flex:1}
-  nav.main a{color:var(--oaap-header-text);text-decoration:none;
-       padding:.55rem .9rem;border-radius:.4rem;
-       opacity:.85;border-bottom:3px solid transparent}
-  /* A neutral grey, not white: the header may now be light (a theme
-     with a pale primary flips its text to dark), and a white veil on
-     a white header is a hover nobody can see. */
-  nav.main a:hover{background:rgba(127,127,127,.25);opacity:1}
-  nav.main a.active{border-bottom-color:var(--oaap-blue-100);opacity:1;font-weight:600}
-  .userbox{display:flex;align-items:center;gap:.7rem;font-size:.9rem}
-  .userbox .who{text-align:right;line-height:1.2}
-  .userbox .who small{opacity:.75}
-  .userbox a{color:var(--oaap-header-text);opacity:.85}
-  .userbox form{margin:0}
-  .userbox button{background:rgba(127,127,127,.22);color:var(--oaap-header-text);
-       border:1px solid rgba(127,127,127,.45);
-       border-radius:.4rem;padding:.45rem .9rem;font-size:.85rem;cursor:pointer}
-  .userbox button:hover{background:rgba(127,127,127,.38)}
-  main{max-width:62rem;margin:1.6rem auto;padding:0 1.2rem}
+  /* User menu: a <details>, so it opens without JavaScript. The grey
+     veil, not white: a theme with a pale primary makes the header light,
+     and a white veil on a white header is invisible. */
+  .usermenu{margin-left:auto;position:relative;font-size:.9rem}
+  .usermenu summary{list-style:none;cursor:pointer;display:flex;align-items:center;
+       gap:.5rem;min-height:44px;padding:0 .9rem;border-radius:.4rem;
+       background:rgba(127,127,127,.22);border:1px solid rgba(127,127,127,.45)}
+  .usermenu summary::-webkit-details-marker{display:none}
+  .usermenu summary:hover{background:rgba(127,127,127,.38)}
+  .usermenu .menu{position:absolute;right:0;top:calc(100% + .4rem);min-width:15rem;
+       background:var(--oaap-surface);color:var(--oaap-text);
+       border:1px solid var(--oaap-border);border-radius:.5rem;
+       box-shadow:0 6px 20px rgba(23,37,84,.18);padding:.3rem 0;z-index:30}
+  .usermenu .rolesline{padding:.6rem 1rem;font-size:.8rem;color:var(--oaap-muted);
+       border-bottom:1px solid var(--oaap-border);word-break:break-word}
+  .usermenu .menu a,.usermenu .menu button{display:flex;align-items:center;width:100%;
+       min-height:44px;padding:0 1rem;margin:0;color:var(--oaap-text);
+       text-decoration:none;background:none;border:0;border-radius:0;
+       font-size:.95rem;text-align:left}
+  .usermenu .menu a:hover,.usermenu .menu button:hover{background:var(--oaap-bg)}
+  .usermenu form{margin:0;border-top:1px solid var(--oaap-border)}
+  /* Side bar toggle for narrow screens: a checkbox and its label, so it
+     works without JavaScript. Hidden on wide screens. */
+  .navtoggle{position:absolute;opacity:0;width:1px;height:1px}
+  .navbtn{display:none}
+  .shell{display:flex;align-items:flex-start}
+  nav.side{flex:none;width:15rem;position:sticky;top:var(--hdr-h);
+       height:calc(100vh - var(--hdr-h));overflow-y:auto;
+       background:var(--oaap-surface);border-right:1px solid var(--oaap-border);
+       padding:.8rem 0 1.5rem}
+  nav.side h3{font-size:.7rem;font-weight:600;text-transform:uppercase;
+       letter-spacing:.06em;color:var(--oaap-muted);margin:1.2rem 1.2rem .3rem}
+  nav.side h3:first-child{margin-top:.3rem}
+  nav.side a{display:flex;align-items:center;min-height:44px;padding:0 1.2rem;
+       color:var(--oaap-text);text-decoration:none;border-left:3px solid transparent}
+  nav.side a:hover{background:var(--oaap-bg)}
+  nav.side a.active{background:var(--oaap-blue-100);color:var(--oaap-ink);
+       border-left-color:var(--oaap-blue-600);font-weight:600}
+  .work{flex:1;min-width:0}
+  main{max-width:80rem;margin:1.6rem auto;padding:0 1.6rem}
+  /* Wider work area for tables -- running text stays readable. */
+  .card > p,.card > ul,.objhead .sub{max-width:75ch}
+  /* Jump marks (guidelines 6.2.3): one sticky bar per page. */
+  nav.jumps{position:sticky;top:var(--hdr-h);z-index:5;background:var(--oaap-bg);
+       /* offsetLeft of the marks is measured from here */
+       display:flex;gap:.2rem;overflow-x:auto;margin:0 0 1.2rem;
+       border-bottom:1px solid var(--oaap-border)}
+  nav.jumps a{flex:none;display:flex;align-items:center;min-height:44px;padding:0 .9rem;
+       color:var(--oaap-muted);text-decoration:none;white-space:nowrap;
+       border-bottom:3px solid transparent}
+  nav.jumps a:hover{color:var(--oaap-text);background:rgba(37,99,235,.06)}
+  nav.jumps a.active{color:var(--oaap-blue-700);font-weight:600;
+       border-bottom-color:var(--oaap-blue-600)}
+  h2[id^="abschnitt-"]{scroll-margin-top:calc(var(--hdr-h) + 4rem)}
   h1{font-size:1.35rem;margin:.2rem 0 1rem}
   h2{font-size:1.02rem;margin:0 0 .8rem}
   .pagehead{display:flex;align-items:center;justify-content:space-between;gap:1rem;
@@ -188,7 +229,11 @@ STYLE = """
   .back:hover{text-decoration:underline}
   .card{background:var(--oaap-surface);border:1px solid var(--oaap-border);
        border-radius:.6rem;padding:1.4rem;box-shadow:0 1px 3px rgba(23,37,84,.06);
-       margin-bottom:1.2rem}
+       margin-bottom:1.6rem}
+  /* Sections set apart (guidelines 6.2): the heading of a card is its
+     title bar, ruled off from the content. */
+  .card > h2:first-child{padding-bottom:.6rem;margin-bottom:1rem;
+       border-bottom:1px solid var(--oaap-border);color:var(--oaap-ink)}
   /* a card that is asking for a decision, not merely reporting */
   .card.warn{border-color:var(--warn);border-left-width:4px}
   /* Objektkopf + Reiter (design guidelines 6.2.1/6.2.2): a page with a
@@ -209,7 +254,7 @@ STYLE = """
        letter-spacing:.04em;color:var(--oaap-muted)}
   .facts .v{display:block;font-size:.95rem;word-break:break-word}
   .tabs{display:flex;gap:.2rem;flex-wrap:wrap;margin-bottom:1.2rem;
-       border-bottom:1px solid var(--oaap-border);position:sticky;top:0;
+       border-bottom:1px solid var(--oaap-border);position:sticky;top:var(--hdr-h);
        background:var(--oaap-bg);z-index:5}
   .tabs a{display:flex;align-items:center;padding:.7rem 1rem;min-height:44px;
        text-decoration:none;color:var(--oaap-muted);
@@ -278,11 +323,25 @@ STYLE = """
   .cfgsave{border-top:1px solid var(--oaap-border);margin-top:1.2rem;padding-top:1rem}
   .cfgsave p{margin:0 0 .8rem}
   .cfgdefault{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
-  footer.oaap{max-width:62rem;margin:2rem auto 1.2rem;padding:0 1.2rem;
+  footer.oaap{max-width:80rem;margin:2rem auto 1.2rem;padding:0 1.6rem;
        color:var(--oaap-muted);font-size:.8rem;display:flex;gap:.5rem;align-items:center}
+  /* Narrow screens (tablet portrait, phone): the header scrolls away,
+     so the sticky bars sit at the top; the side bar folds behind the
+     menu button and opens above the content. */
+  @media (max-width:900px){
+    :root{--hdr-h:0px}
+    header.oaap{position:static;padding:.4rem 1rem;min-height:3.4rem}
+    .navbtn{display:flex;align-items:center;gap:.4rem;min-height:44px;padding:0 .8rem;
+         border-radius:.4rem;cursor:pointer;border:1px solid rgba(127,127,127,.45)}
+    .navtoggle:focus-visible + header .navbtn{outline:2px solid currentColor}
+    .shell{display:block}
+    nav.side{display:none;position:static;width:auto;height:auto;
+         border-right:0;border-bottom:1px solid var(--oaap-border)}
+    .navtoggle:checked ~ .shell nav.side{display:block}
+    main,footer.oaap{padding:0 1rem}
+  }
   @media (max-width:640px){
-    nav.main{order:3;flex-basis:100%;margin-left:0}
-    .userbox .who{display:none}
+    .brand small,.usermenu .who{display:none}
   }
 </style>
 """
@@ -293,7 +352,9 @@ LAYOUT = STYLE + """
 <link rel="icon" href=\"""" + FAVICON + """\">
 <title>{{ title }} — {{ place.title if at_place else "OAAP" }}</title>
 {{ theme_style }}
+{% if show_side %}<input type="checkbox" id="navtoggle" class="navtoggle" aria-label="Menü ein- und ausblenden">{% endif %}
 <header class="oaap">
+  {% if show_side %}<label for="navtoggle" class="navbtn" title="Menü">&#9776; Menü</label>{% endif %}
   {# RFC-0042 T3, rule two. The face a tenant chose is the TITLE and the
      picture; the anchor beside it is the ADDRESS, which is built from
      the label and can therefore not be chosen freely -- a label is
@@ -310,33 +371,56 @@ LAYOUT = STYLE + """
     <span><b>OAAP</b><small>Open Application &amp; Automation Platform</small></span>
     {% endif %}
   </a>
-  <nav class="main">
-    <a href="/" class="{{ 'active' if active == 'apps' }}">Apps</a>
-    {% if is_user_admin %}<a href="/users" class="{{ 'active' if active == 'users' }}">Benutzer</a>{% endif %}
-    {% if can_health %}<a href="/health" class="{{ 'active' if active == 'health' }}">Gesundheit</a>{% endif %}
-    {% if can_store %}<a href="/store" class="{{ 'active' if active == 'store' }}">Store</a>{% endif %}
-    {% if can_twin %}<a href="/zwilling" class="{{ 'active' if active == 'twin' }}">Zwilling</a>{% endif %}
-    {% if is_user_admin %}<a href="/instances" class="{{ 'active' if active == 'instances' }}">Instanzen</a>{% endif %}
-    {% if has_cohorts %}<a href="/kohorten" class="{{ 'active' if active == 'cohorts' }}">Kohorten</a>{% endif %}
-    {% if can_build %}<a href="/aufbau" class="{{ 'active' if active == 'build' }}">Aufbau</a>{% endif %}
-    {% if can_build %}<a href="/datentraeger" class="{{ 'active' if active == 'disks' }}">Datenträger</a>{% endif %}
-    {% if is_user_admin %}<a href="/nachrichten" class="{{ 'active' if active == 'messages' }}">Nachrichten</a>{% endif %}
-    {% if is_user_admin %}<a href="/keys" class="{{ 'active' if active == 'keys' }}">Zugänge</a>{% endif %}
-    {% if show_tenant and is_user_admin %}<a href="/tenant" class="{{ 'active' if active == 'tenant' }}">Mandant</a>{% endif %}
-  </nav>
-  <div class="userbox">
-    <span class="who">{{ user }}<br><small>{{ roles }}</small></span>
-    <a href="/auth/profile" title="Anzeigenamen ändern">Profil</a>
-    <a href="/auth/password" title="Passwort ändern">Passwort</a>
-    <form method="post" action="/auth/logout"><button>Abmelden</button></form>
-  </div>
+  <details class="usermenu">
+    <summary><span class="who">{{ user }}</span> <span aria-hidden="true">&#9662;</span></summary>
+    <div class="menu">
+      <div class="rolesline">{{ user }}<br>{{ roles }}</div>
+      <a href="/auth/profile" title="Anzeigenamen ändern">Profil</a>
+      <a href="/auth/password" title="Passwort ändern">Passwort</a>
+      <form method="post" action="/auth/logout"><button>Abmelden</button></form>
+    </div>
+  </details>
 </header>
-<main>{{ body }}</main>
-<footer class="oaap">
-  <svg viewBox="0 0 100 100" width="14" height="14" aria-hidden="true">
-    <polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="#2563eb"/></svg>
-  OAAP-Plattform {{ version }}
-</footer>
+<div class="shell">
+  {% if show_side %}
+  <nav class="side" aria-label="Verwaltung">
+    {% for g in nav_groups %}
+    <h3>{{ g.title }}</h3>
+    {% for l in g.links %}<a href="{{ l.href }}" class="{{ 'active' if l.active }}">{{ l.label }}</a>
+    {% endfor %}{% endfor %}
+  </nav>
+  {% endif %}
+  <div class="work">
+    <main>{{ body }}</main>
+    <footer class="oaap">
+      <svg viewBox="0 0 100 100" width="14" height="14" aria-hidden="true">
+        <polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="#2563eb"/></svg>
+      OAAP-Plattform {{ version }}
+    </footer>
+  </div>
+</div>
+{% if jumps %}
+{# The marks work as plain anchors; this only lights the one whose
+   section is on screen. Without it the page loses nothing. #}
+<script>
+(function(){
+  var bar=document.querySelector('nav.jumps');
+  if(!bar||!('IntersectionObserver' in window))return;
+  var links={};
+  bar.querySelectorAll('a').forEach(function(a){links[a.getAttribute('href').slice(1)]=a;});
+  var obs=new IntersectionObserver(function(es){es.forEach(function(e){
+    if(!e.isIntersecting)return;
+    for(var k in links)links[k].classList.remove('active');
+    var a=links[e.target.id];
+    if(!a)return;
+    a.classList.add('active');
+    if(a.offsetLeft<bar.scrollLeft||a.offsetLeft+a.offsetWidth>bar.scrollLeft+bar.clientWidth)
+      bar.scrollLeft=a.offsetLeft-16;
+  });},{rootMargin:'-15% 0px -70% 0px'});
+  Object.keys(links).forEach(function(id){var el=document.getElementById(id);if(el)obs.observe(el);});
+})();
+</script>
+{% endif %}
 </html>
 """
 
@@ -4086,34 +4170,45 @@ def page(body_template, title, active, status=200, **ctx):
     # do not get is the club's colours.
     at, face = request_place()
     show_face = bool(at and face["themed"] and not place.platform_chrome(caller))
+    # Who sees which entry -- ONE place for the rule, read by the side
+    # bar (nav_view sorts the entries into groups, guidelines §5). The
+    # filter is UX only; every route checks again (spec §4).
+    flags = {
+        # User administration and the instance list -- the node's
+        # administrator or a tenant's. On a single-tenant node nobody
+        # holds tenant_admin, so this reads exactly as before.
+        "is_user_admin": bool(caller & {"server_admin", "tenant_admin"}),
+        "can_health": bool(caller & {"server_admin", "support"}),
+        # The catalogue is for whoever may install into a tenant
+        # (RFC-0022 §4); the SOURCES stay the node operator's
+        # (oaap.core.portal 2.6). Two rights, therefore two flags.
+        "can_store": bool(caller & {"server_admin", "tenant_admin"}),
+        # The twin browser (RFC-0031 Bauplan Schritt 5): every tenant
+        # role sees it ("user sieht"); a server_admin with no tenant
+        # role of their own does not, because there is no tenant whose
+        # twin they would be looking at.
+        "can_twin": bool(caller & {"user", "keyuser", "admin", "tenant_admin"}),
+        # The tenant build pages (RFC-0055 stage 3): an operator at the
+        # node's own address, nobody else, nowhere else.
+        "can_build": _can_build(),
+        "has_cohorts": _has_cohorts(),
+        "show_tenant_admin": multi and bool(caller & {"server_admin", "tenant_admin"}),
+    }
+    groups = nav_view.nav_groups(flags, active)
+    # Long pages without tabs: jump marks from what THIS caller sees (6.2.3).
+    body, jumps = nav_view.jump_sections(body)
     return render_template_string(
         LAYOUT,
+        nav_groups=groups, show_side=nav_view.show_side(groups), jumps=jumps,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
         place=face, at_place=bool(at), show_face=show_face,
         theme_style=Markup(place.theme_style(face) if show_face else ""),
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
         is_server_admin="server_admin" in caller,
-        # Who may reach user administration and the instance list — the
-        # node's administrator or a tenant's. On a single-tenant node
-        # nobody holds tenant_admin, so this reads exactly as before.
-        is_user_admin=bool(caller & {"server_admin", "tenant_admin"}),
-        # The catalogue is for whoever may install into a tenant
-        # (RFC-0022 §4); the SOURCES stay the node operator's
-        # (oaap.core.portal 2.6). Two rights, therefore two flags.
-        can_store=bool(caller & {"server_admin", "tenant_admin"}),
         show_tenant=multi,
-        has_cohorts=_has_cohorts(),
-        # The tenant build pages (RFC-0055 stage 3): an operator at the
-        # node's own address, nobody else, nowhere else.
-        can_build=_can_build(),
-        can_health=bool(caller & {"server_admin", "support"}),
-        # The twin browser (RFC-0031 Bauplan Schritt 5): every tenant
-        # role sees it ("user sieht"); a server_admin with no tenant
-        # role of their own does not, because there is no tenant whose
-        # twin they would be looking at.
-        can_twin=bool(caller & {"user", "keyuser", "admin", "tenant_admin"}),
         can_twin_write=bool(caller & {"admin", "keyuser", "tenant_admin"}),
         can_twin_admin="tenant_admin" in caller,
+        **flags,
         version=VERSION,
     ), status
 

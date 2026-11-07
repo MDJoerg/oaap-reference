@@ -13,7 +13,7 @@ COPY traffic.py .
 # oaap.core.updates 2.6: the host's care state, read from the file the
 # node writes; the module renders the same facts the CLI renders.
 COPY host_care.py .
-COPY portal/app.py portal/store_view.py portal/instance_view.py portal/fleet_view.py portal/deploy_state.py portal/twin_view.py portal/relay_view.py portal/diagnose_view.py portal/management_api.py portal/cohort_view.py portal/metrics_view.py portal/build_view.py portal/disk_view.py ./
+COPY portal/app.py portal/store_view.py portal/instance_view.py portal/fleet_view.py portal/deploy_state.py portal/twin_view.py portal/relay_view.py portal/diagnose_view.py portal/management_api.py portal/cohort_view.py portal/metrics_view.py portal/build_view.py portal/disk_view.py portal/nav_view.py ./
 EXPOSE 8000
 # --timeout above the deploy hook's synchronous wait (120s), so a
 # worker waiting for a build result is not killed mid-request
