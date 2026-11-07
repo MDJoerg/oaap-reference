@@ -35,7 +35,14 @@ COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 BUILD_ID_RE = re.compile(r"^b-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
 TEMPLATE_RE = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 
-PARAM_KINDS = ("label", "text", "color", "connector", "word", "bool")
+PARAM_KINDS = ("label", "text", "color", "connector", "word", "bool", "apps")
+# kind `apps` (RFC-0055 section 15): the apps chosen at the start, as ids of
+# the catalogue. An `app.install` whose `app` is exactly "{p}" of this kind
+# becomes one step per chosen app before anything runs; inside that step
+# `{app}` is the id of the app at hand.
+APPS_MAX_DEFAULT = 12
+APPS_MAX = 30
+SELECTION_REF = "app"
 TRUE_WORDS = ("true", "1", "yes", "on")
 FALSE_WORDS = ("false", "0", "no", "off", "")
 
@@ -160,11 +167,13 @@ def profile_problems(doc):
         out.append("'params' must be an object")
         params = {}
     for name, spec in params.items():
-        if not PARAM_RE.match(name):
+        if not PARAM_RE.match(name) or name == SELECTION_REF:
             out.append(f"parameter name '{name}' is not allowed")
         if not isinstance(spec, dict) or spec.get("kind") not in PARAM_KINDS:
             out.append(f"parameter '{name}' needs a kind of "
                        + "/".join(PARAM_KINDS))
+        elif spec["kind"] == "apps":
+            out += _apps_spec_problems(name, spec)
     if "label" not in params or (params.get("label") or {}).get("kind") != "label":
         out.append("a profile needs a parameter 'label' of kind label")
     steps = doc.get("steps")
@@ -194,14 +203,22 @@ def profile_problems(doc):
             if k not in req + opt + COMMON_KEYS:
                 out.append(f"{where} ('{sid}', {typ}): '{k}' is not an "
                            f"argument of this step type")
+        chooser = selection_param(st, params)
         for k, v in st.items():
             if k in ("id", "type"):
                 continue
             if isinstance(v, str):
                 for ref in TEMPLATE_RE.findall(v):
+                    if ref == SELECTION_REF and chooser and k != "app":
+                        continue
                     if ref not in params:
                         out.append(f"{where} ('{sid}'): '{{{ref}}}' is not a "
                                    f"declared parameter")
+                    elif (params[ref] or {}).get("kind") == "apps" \
+                            and not (chooser == ref and k == "app"):
+                        out.append(f"{where} ('{sid}'): '{{{ref}}}' is a choice "
+                                   "of apps; it stands only as the whole 'app' "
+                                   "of an app.install")
             elif k == "timeout":
                 if not (isinstance(v, int) and not isinstance(v, bool)
                         and 1 <= v <= 900):
@@ -218,7 +235,16 @@ def profile_problems(doc):
             if ("source" in st) == ("app" in st):
                 out.append(f"{where} ('{sid}'): app.install needs exactly one "
                            "of 'source' and 'app'")
-            if "confirm_administer" in st:
+            if chooser and SELECTION_REF not in TEMPLATE_RE.findall(
+                    str(st.get("name") or "")):
+                out.append(f"{where} ('{sid}'): an app.install over a choice "
+                           "of apps needs '{app}' in its 'name' -- every "
+                           "chosen app gets its own instance")
+            if chooser and "confirm_administer" in st:
+                out.append(f"{where} ('{sid}'): an app that administers its "
+                           "tenant's grants is not chosen from a list; it "
+                           "gets its own step with its own tick")
+            elif "confirm_administer" in st:
                 m = TEMPLATE_RE.fullmatch(str(st["confirm_administer"]))
                 if not m or m.group(1) != st.get("when"):
                     out.append(f"{where} ('{sid}'): confirm_administer is "
@@ -229,6 +255,103 @@ def profile_problems(doc):
         if typ == "manual" and st.get("done_when") not in DONE_WHEN:
             out.append(f"{where} ('{sid}'): done_when is one of "
                        + ", ".join(DONE_WHEN))
+    return out
+
+
+def _apps_spec_problems(name, spec):
+    out = []
+    mx = spec.get("max", APPS_MAX_DEFAULT)
+    if not (isinstance(mx, int) and not isinstance(mx, bool)
+            and 1 <= mx <= APPS_MAX):
+        out.append(f"parameter '{name}': max is 1 to {APPS_MAX}")
+    ch = spec.get("choices")
+    if ch is not None and (not isinstance(ch, list) or not ch
+                           or len(ch) > 200
+                           or not all(isinstance(c, str) and WORD_RE.match(c)
+                                      for c in ch)):
+        out.append(f"parameter '{name}': choices is a list of app ids")
+    d = spec.get("default")
+    if d is not None:
+        ids, bad = _apps_list(d)
+        if bad:
+            out.append(f"parameter '{name}': default {bad}")
+        elif isinstance(ch, list) and any(i not in ch for i in ids):
+            out.append(f"parameter '{name}': default names an app outside "
+                       "its choices")
+    return out
+
+
+def _apps_list(val):
+    """A choice of apps as given -> ([ids in order, no repeats], problem).
+    Accepts a list or a comma-separated text; empty is no app."""
+    items = val if isinstance(val, list) else str(val).split(",")
+    ids = []
+    for it in items:
+        if not isinstance(it, str):
+            return [], "is not a list of app ids"
+        it = it.strip().lower()
+        if not it:
+            continue
+        if not WORD_RE.match(it):
+            return [], f"'{it[:40]}' is not an app id"
+        if it not in ids:
+            ids.append(it)
+    return ids, ""
+
+
+def selection_param(step, params):
+    """The `apps` parameter this step is spread over, or None: an
+    app.install whose `app` is exactly "{p}" with p of kind apps."""
+    if not isinstance(step, dict) or step.get("type") != "app.install":
+        return None
+    m = TEMPLATE_RE.fullmatch(str(step.get("app") or ""))
+    if m and ((params or {}).get(m.group(1)) or {}).get("kind") == "apps":
+        return m.group(1)
+    return None
+
+
+def selected_apps(profile, values):
+    """{parameter: [app ids]} for every `apps` parameter (judged values)."""
+    out = {}
+    for name, spec in (profile.get("params") or {}).items():
+        if isinstance(spec, dict) and spec.get("kind") == "apps":
+            out[name] = [i for i in str(values.get(name) or "").split(",") if i]
+    return out
+
+
+def steps_of(profile, values):
+    """The profile's steps with every choice of apps spread out.
+
+    A step over a choice becomes one step per chosen app, in the order
+    chosen, with the id '<step>-<app>', `app` set to the id and `{app}`
+    filled in its other texts. Pure and repeatable: a build keeps its
+    values, so continue and rollback find the same steps again. Nothing
+    chosen is no step at all. An id that collides with another step is a
+    refusal before anything runs.
+    """
+    params = profile.get("params") or {}
+    out, seen = [], set()
+    for st in profile["steps"]:
+        p = selection_param(st, params)
+        if not p:
+            out.append(st)
+            continue
+        for app in [i for i in str(values.get(p) or "").split(",") if i]:
+            one = {}
+            for k, v in st.items():
+                if k == "app":
+                    one[k] = app
+                elif isinstance(v, str) and k not in ("id", "type", "when"):
+                    one[k] = v.replace("{" + SELECTION_REF + "}", app)
+                else:
+                    one[k] = v
+            one["id"] = f"{st['id']}-{app}"
+            out.append(one)
+    for st in out:
+        if st["id"] in seen:
+            raise Refusal(f"the step id '{st['id']}' occurs twice once the "
+                          "chosen apps are spread out; rename a step")
+        seen.add(st["id"])
     return out
 
 
@@ -267,6 +390,24 @@ def param_values(profile, given, label_check=None):
             continue
         else:
             val = None
+        if spec.get("kind") == "apps":
+            ids, bad = _apps_list(val if val is not None else "")
+            ch = spec.get("choices")
+            if not bad and isinstance(ch, list):
+                outside = [i for i in ids if i not in ch]
+                if outside:
+                    bad = ("names an app this profile does not offer: "
+                           + ", ".join(outside[:5]))
+            mx = spec.get("max", APPS_MAX_DEFAULT)
+            if not bad and isinstance(mx, int) and len(ids) > mx:
+                bad = f"at most {mx} apps"
+            if not bad and spec.get("required") and not ids:
+                bad = "choose at least one app"
+            if bad:
+                problems.append(f"parameter '{name}': {bad}")
+            else:
+                values[name] = ",".join(ids)
+            continue
         if spec.get("kind") == "bool":
             word = str(val).strip().lower() if val is not None else ""
             if word in TRUE_WORDS:
@@ -344,7 +485,7 @@ def render_step(step, values):
 def plan(profile, values):
     """[(id, type, rendered args)] -- what a build would do, nothing done."""
     return [(s["id"], s["type"], render_step(s, values))
-            for s in profile["steps"] if step_active(s, values)]
+            for s in steps_of(profile, values) if step_active(s, values)]
 
 
 def step_active(step, values):
@@ -381,7 +522,7 @@ def new_state(profile, digest, values, by, now=None):
         "id": new_build_id(label, now), "profile": profile["id"],
         "digest": digest, "label": label, "params": dict(values),
         "by": by, "created": iso_now(), "state": "running",
-        "steps": [_new_step(s, values) for s in profile["steps"]],
+        "steps": [_new_step(s, values) for s in steps_of(profile, values)],
     }
 
 
@@ -548,8 +689,8 @@ def run(state, profile, drivers, root, now=iso_now):
     somebody may have removed it on purpose, and a second create is not
     what the operator asked for.
     """
-    steps = {s["id"]: s for s in profile["steps"]}
     values = state["params"]
+    steps = {s["id"]: s for s in steps_of(profile, values)}
     ctx = {"label": state["label"], "started": state["created"],
            "state": state, "values": values}
     state["state"] = "running"
@@ -669,8 +810,8 @@ def rollback(state, profile, drivers, root, now=iso_now):
     refuses (a tenant that holds something) stops the rollback there and
     says so; the remaining `made` entries stay for a later continue.
     """
-    steps = {s["id"]: s for s in profile["steps"]}
     values = state["params"]
+    steps = {s["id"]: s for s in steps_of(profile, values)}
     ctx = {"label": state["label"], "started": state["created"],
            "state": state, "values": values}
     # A rollback that is certain to stop half way is refused BEFORE it

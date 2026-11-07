@@ -8117,6 +8117,29 @@ def _catalogue_app_ids():
     return ids if seen_any else None
 
 
+def tenant_build_apps_refusal(profile, values, catalogue=None):
+    """The chosen apps (RFC-0055 section 15) must be in a configured store
+    source BEFORE the first step runs -> one sentence, or "".
+
+    Judged at the start and when a prospect's form arrives: an id that no
+    source lists would otherwise stop the build half way, after the tenant
+    was made. No readable source is a refusal too -- an unchecked choice is
+    not run."""
+    chosen = {k: v for k, v in tenant_build.selected_apps(profile, values).items()
+              if v}
+    if not chosen:
+        return ""
+    ids = catalogue if catalogue is not None else _catalogue_app_ids()
+    if ids is None:
+        return ("no store source can be read, so the chosen apps cannot be "
+                "checked; nothing was started")
+    unknown = [a for v in chosen.values() for a in v if a not in ids]
+    if unknown:
+        return ("not listed in any configured store source: "
+                + ", ".join(unknown[:5]))
+    return ""
+
+
 def tenant_profile_job(req, role, actor):
     """Put a profile on the node or take one away -> (ok, sentence, id).
 
@@ -8254,10 +8277,20 @@ def tenant_request_submit(a, now):
     given = dict(given)
     for k in tenant_build.administer_params(profile):
         given[k] = "false"
+    # A choice of apps without `choices` is the operator's alone: the public
+    # form does not show it, and whatever arrives here, the default applies
+    # (RFC-0055 section 15).
+    for k, spec in (profile.get("params") or {}).items():
+        if (isinstance(spec, dict) and spec.get("kind") == "apps"
+                and not isinstance(spec.get("choices"), list)):
+            given.pop(k, None)
     values, problems = tenant_build.param_values(
         profile, given, label_check=_request_label_check)
     if problems:
         raise tenant_request.Refusal("; ".join(problems))
+    bad = tenant_build_apps_refusal(profile, values)
+    if bad:
+        raise tenant_request.Refusal(bad)
     values = {k: v for k, v in values.items() if v is not None}
     values["label"] = values["label"].strip().lower()
     req = tenant_request.submit(REQUEST_DIR, token, values,
@@ -8371,6 +8404,9 @@ def tenant_build_start(pid, given, who, role, dry_run=False, drivers=None):
         raise tenant_build.Refusal("; ".join(problems))
     label = values["label"].strip().lower()
     values["label"] = label
+    bad = tenant_build_apps_refusal(profile, values)
+    if bad:
+        raise tenant_build.Refusal(bad)
     # every step is rendered once now: a refusal in step nine is found
     # before step one creates anything
     steps = tenant_build.plan(profile, values)

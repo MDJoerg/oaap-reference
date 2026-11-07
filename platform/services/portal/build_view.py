@@ -114,22 +114,36 @@ def administer_fields(profile):
     return out
 
 
+def _app_ids(val):
+    """Eine App-Auswahl (Liste oder Komma-Text) -> Liste von IDs."""
+    items = val if isinstance(val, list) else str(val or "").split(",")
+    return [str(i).strip().lower() for i in items if str(i).strip()]
+
+
 def fields(profile):
     """Die Formularfelder aus den Parametern des Profils.
 
     Jedes Feld: name, kind, label (die eigene Beschriftung des Profils oder
     der Name), required, default, max, administer (die App-Id, wenn der
-    Haken eine Rechte-App zusagt, sonst ""). Die Reihenfolge ist die der Datei.
+    Haken eine Rechte-App zusagt, sonst ""), choices (bei einer App-Auswahl
+    die Liste des Profils oder None = der ganze Katalog). Die Reihenfolge ist
+    die der Datei.
     """
     admin = administer_fields(profile)
     out = []
     for name, spec in (profile.get("params") or {}).items():
         spec = spec if isinstance(spec, dict) else {}
-        out.append({"name": name, "kind": spec.get("kind", "text"),
+        kind = spec.get("kind", "text")
+        default = spec.get("default")
+        if kind == "apps":
+            default = _app_ids(default)
+        out.append({"name": name, "kind": kind,
                     "label": spec.get("label") or name,
                     "required": bool(spec.get("required")),
-                    "default": spec.get("default"),
+                    "default": default,
                     "max": spec.get("max"),
+                    "choices": (spec.get("choices")
+                                if isinstance(spec.get("choices"), list) else None),
                     "administer": admin.get(name, "")})
     return out
 
@@ -137,8 +151,37 @@ def fields(profile):
 def public_fields(profile):
     """Das Formular des Interessenten: ohne die Haken einer Rechte-App --
     die Zusage gibt nur der Server-Admin (der Host setzt sie dort ohnehin
-    auf „nein“)."""
-    return [f for f in fields(profile) if not f["administer"]]
+    auf „nein“) -- und ohne eine App-Auswahl, die keine `choices` nennt:
+    den ganzen Katalog wählt nur der Betreiber (RFC-0055 §15)."""
+    return [f for f in fields(profile) if not f["administer"]
+            and not (f["kind"] == "apps" and f["choices"] is None)]
+
+
+def app_offer(field, entries, chosen=None):
+    """Die Haken einer App-Auswahl -> [{id, name, summary, checked, known}].
+
+    `entries` ist der Katalog, wie ihn der Store zeigt. Nennt das Profil
+    `choices`, stehen genau diese da, in seiner Reihenfolge (eine ID, die kein
+    Katalog kennt, mit `known` False -- der Host lehnt sie beim Start ab).
+    Sonst der ganze Katalog, ohne Archiviertes und ohne Apps für ein Profil,
+    das dieser Knoten nicht hat. `chosen` (nach einem Fehler) geht vor dem
+    Standard des Profils."""
+    by_id = {e.get("id"): e for e in entries or [] if e.get("id")}
+    picked = set(_app_ids(chosen) if chosen is not None else field["default"] or [])
+    if field.get("choices") is not None:
+        ids = list(field["choices"])
+    else:
+        ids = [e["id"] for e in entries or []
+               if e.get("id") and e.get("status") != "archived"
+               and e.get("profile_fit", True)]
+        ids += [i for i in sorted(picked) if i not in ids]
+    out = []
+    for i in ids:
+        e = by_id.get(i) or {}
+        out.append({"id": i, "name": e.get("name") or i,
+                    "summary": e.get("summary") or "",
+                    "checked": i in picked, "known": bool(e)})
+    return out
 
 
 def plan(profile):
@@ -150,7 +193,15 @@ def plan(profile):
         typ = s.get("type", "")
         when = s.get("when") or ""
         ask = (params.get(when) or {}).get("label") or when
-        out.append({"id": s.get("id", ""), "text": STEP_TYPE.get(typ, typ),
+        text = STEP_TYPE.get(typ, typ)
+        m = ADMIN_REF_RE.match(str(s.get("app") or "")) if typ == "app.install" else None
+        over = params.get(m.group(1)) if m else None
+        if isinstance(over, dict) and over.get("kind") == "apps":
+            ch = s.get("channel") or "production"
+            text = ("Je gewählte App eine Instanz installieren"
+                    + (" (Test)" if ch == "test" else " (Produktiv)")
+                    + f" — aus „{over.get('label') or m.group(1)}“")
+        out.append({"id": s.get("id", ""), "text": text,
                     "human": typ == "manual",
                     "when": (ask if isinstance(ask, str) else when),
                     "administer": bool(ADMIN_REF_RE.match(
@@ -170,6 +221,15 @@ def start_params(profile, form):
         if f["kind"] == "bool":
             # an unticked box is not sent by a browser: say "no" explicitly
             params[f["name"]] = "true" if form.get(f["name"]) else "false"
+            continue
+        if f["kind"] == "apps":
+            # one box per app, all under the field's name; none ticked is
+            # an empty choice, said explicitly (not "take the default")
+            got = (form.getlist(f["name"]) if hasattr(form, "getlist")
+                   else _app_ids(form.get(f["name"])))
+            params[f["name"]] = ",".join(_app_ids(got))
+            if f["required"] and not params[f["name"]]:
+                missing.append(f["name"])
             continue
         raw = str(form.get(f["name"], "") or "").strip()
         if f["kind"] == "color" and form.get(f["name"] + "__none"):
@@ -297,6 +357,11 @@ def public_params(profile, form):
     for f in fields(profile):
         if f["administer"]:
             params[f["name"]] = "false"
+        if f["kind"] == "apps" and f["choices"] is None:
+            # not on this form: the profile's default applies (the host
+            # drops it too)
+            params.pop(f["name"], None)
+            missing = [m for m in missing if m != f["name"]]
     errors = []
     if missing:
         errors.append("Bitte ausfüllen: " + ", ".join(missing))
@@ -327,7 +392,8 @@ TEMPLATE = {
     "description": (
         "Vorlage. 'id' ist der Dateiname des Profils auf dem Knoten. 'params' sind die "
         "Angaben, die beim Start (und im Einladungsformular) gefragt werden: kind ist "
-        "label, text, color, word, connector oder bool (Haken). Ein Schritt mit "
+        "label, text, color, word, connector, bool (Haken) oder apps (Auswahl aus dem "
+        "Katalog, optional begrenzt durch 'choices'). Ein Schritt mit "
         "'when': '<bool-Parameter>' läuft nur, wenn der Haken gesetzt ist. "
         "Schrittarten: tenant.create, address.ensure, address.wait, idp.provision, "
         "idp.admin_group, tenant.policy, tenant.face, app.install, authz.setup, manual, "

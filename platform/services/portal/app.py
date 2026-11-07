@@ -11171,6 +11171,19 @@ BUILD_NEW_BODY = """
         löschen, eine Deklaration registrieren oder einen anderen Mandanten erreichen.
         Ohne Haken wird die App nicht installiert. Im Antragsformular für Interessenten
         erscheint dieser Haken nie.</span>{% endif %}
+    {% elif f.kind == 'apps' %}
+      <fieldset class="appchoice"><legend>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}</legend>
+      {% for a in offers.get(f.name, []) %}
+        <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="{{ a.id }}" {% if a.checked %}checked{% endif %}>
+          <strong>{{ a.name }}</strong> <code>{{ a.id }}</code>{% if not a.known %} <span class="badge todo">nicht im Katalog</span>{% endif %}
+          {% if a.summary %}<span class="muted">— {{ a.summary }}</span>{% endif %}</label>
+      {% else %}
+        <span class="muted">Der Katalog ist leer oder nicht lesbar — unter „Store“ die Quellen prüfen.</span>
+      {% endfor %}
+      <span class="muted">Jede gewählte App bekommt die Instanzen, die das Profil für sie vorsieht
+        (zum Beispiel Test und Produktiv){% if f.max %}; höchstens {{ f.max }} Apps{% endif %}.
+        {% if f.choices is none %}Angeboten wird der ganze Katalog dieses Knotens.{% endif %}</span>
+      </fieldset>
     {% else %}
       <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
         <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
@@ -11307,10 +11320,31 @@ def _build_new(pid, values=None, error=None, status=200):
         return page(BUILD_LIST_BODY, "Aufbau", "build", status=404,
                     rows=build_view.rows(view), profiles=build_view.profiles(view),
                     job=None, error="Dieses Profil gibt es nicht (oder der Knoten hat es abgelehnt).")
+    fields = build_view.fields(prof)
     return page(BUILD_NEW_BODY, "Aufbau starten", "build", status=status,
-                profile=prof, fields=build_view.fields(prof),
+                profile=prof, fields=fields, offers=_app_offers(fields),
                 plan=build_view.plan(prof), values=values or {}, job=None,
                 error=error)
+
+
+def _app_offers(fields, catalogue=True):
+    """The boxes of every choice of apps (RFC-0055 section 15). The
+    operator's form shows the store's catalogue (names and short texts);
+    the prospect's form only the ids the profile offers, without a fetch.
+    After a refused POST the boxes keep what was ticked."""
+    picks = [f for f in fields if f["kind"] == "apps"]
+    if not picks:
+        return {}
+    entries = []
+    if catalogue:
+        try:
+            entries = store_catalogue()[0]
+        except Exception:  # noqa: BLE001 -- an empty list says "check the store"
+            entries = []
+    posted = request.method == "POST"
+    return {f["name"]: build_view.app_offer(
+        f, entries, request.form.getlist(f["name"]) if posted else None)
+        for f in picks}
 
 
 @app.get("/aufbau/neu")
@@ -11463,6 +11497,13 @@ PUBLIC_REQUEST_PAGE = STYLE + """
         <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="1"
           {% if (values and values.get(f.name)) or (not values and f.default) %}checked{% endif %}>
           {{ f.label }}</label>
+      {% elif f.kind == 'apps' %}
+        <fieldset class="appchoice"><legend>{{ f.label }}</legend>
+        {% for a in offers.get(f.name, []) %}
+          <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="{{ a.id }}" {% if a.checked %}checked{% endif %}>
+            {{ a.id }}</label>
+        {% endfor %}
+        </fieldset>
       {% else %}
         <label>{{ f.label }}{% if f.required %} <span class="muted">(Pflicht)</span>{% endif %}
           <input type="text" name="{{ f.name }}" value="{{ values.get(f.name, '') }}"
@@ -11491,7 +11532,7 @@ def _public_gone():
     revoked and expired are not told apart to a stranger."""
     resp = make_response(render_template_string(
         PUBLIC_REQUEST_PAGE, state="dead", token="", fields=[], values={},
-        keep=30, error=None), 404)
+        keep=30, offers={}, error=None), 404)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -11500,6 +11541,7 @@ def _public_form(token, prof, values=None, error=None, status=200):
     resp = make_response(render_template_string(
         PUBLIC_REQUEST_PAGE, state="form", token=token,
         fields=build_view.public_fields(prof), values=values or {}, keep=30,
+        offers=_app_offers(build_view.public_fields(prof), catalogue=False),
         error=error), status)
     resp.headers["Cache-Control"] = "no-store"
     return resp

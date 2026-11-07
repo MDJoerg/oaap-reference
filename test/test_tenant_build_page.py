@@ -18,6 +18,7 @@ Braucht Flask; der Knoten ist ersetzt (Sicht-Datei und Spool sind Attrappen).
 Aufruf: python3 test/test_tenant_build_page.py
 """
 import json
+import re
 import os
 import sys
 import tempfile
@@ -343,6 +344,47 @@ ok("ein unbekannter Aufbau: zurueck zur Liste, nichts im Spool",
    r.status_code == 302 and len(QUEUED) == n)
 r = c.post(f"/aufbau/{bid}/continue", headers=dict(H, Origin="http://boese.example"))
 ok("fremde Herkunft: 403, nichts im Spool", r.status_code == 403 and len(QUEUED) == n)
+
+print("=== freie App-Auswahl (RFC-0055 §15) ===")
+KUNDE = {"profile": "oaap.tenant-profile/1", "id": "kunde", "title": "Kunde",
+         "params": {"label": {"kind": "label", "required": True},
+                    "apps": {"kind": "apps", "default": ["n8n"], "label": "Apps aus dem Store"}},
+         "steps": [{"id": "tenant", "type": "tenant.create", "label": "{label}"},
+                   {"id": "test", "type": "app.install", "app": "{apps}",
+                    "name": "{app}-test", "channel": "test"},
+                   {"id": "prod", "type": "app.install", "app": "{apps}", "name": "{app}"}]}
+view2 = json.load(open(VF))
+view2["profiles"].append({"id": "kunde", "title": "Kunde", "problem": "",
+                          "params": KUNDE["params"], "steps": [], "doc": KUNDE})
+json.dump(view2, open(VF, "w"))
+portal.store_catalogue = lambda: ([
+    {"id": "forgejo", "name": "Forgejo", "summary": "Git-Dienst", "status": "stable",
+     "profile_fit": True},
+    {"id": "n8n", "name": "n8n", "summary": "Abläufe", "status": "stable", "profile_fit": True},
+    {"id": "alt", "name": "Altlast", "summary": "", "status": "archived", "profile_fit": True}],
+    [])
+t = c.get("/aufbau/neu?profil=kunde", headers=H).get_data(as_text=True)
+ok("die Startseite zeigt je Katalog-App einen Haken mit Namen, der Standard ist angehakt",
+   'name="apps" value="forgejo"' in t and "Forgejo" in t and "Git-Dienst" in t
+   and re.search(r'name="apps" value="n8n"\s+checked', t) is not None, t[-3000:])
+ok("archivierte Apps stehen nicht zur Wahl", 'value="alt"' not in t)
+ok("der Plan nennt Test und Produktiv je gewählte App",
+   "Je gewählte App eine Instanz installieren (Test)" in t
+   and "Je gewählte App eine Instanz installieren (Produktiv)" in t)
+n = len(QUEUED)
+r = c.post("/aufbau/neu", headers=H, data={"profil": "kunde", "label": "kd",
+                                             "apps": ["forgejo", "n8n"]})
+ok("zwei Haken gehen als eine Auswahl in die Anfrage",
+   r.status_code == 302 and len(QUEUED) == n + 1
+   and QUEUED[-1]["args"]["params"] == {"label": "kd", "apps": "forgejo,n8n"},
+   QUEUED[-1:] if QUEUED else r.status_code)
+r = c.post("/aufbau/neu", headers=H, data={"profil": "kunde", "label": "kd2"})
+ok("kein Haken: die Auswahl ist ausdrücklich leer",
+   QUEUED[-1]["args"]["params"] == {"label": "kd2", "apps": ""}, QUEUED[-1])
+portal.store_catalogue = lambda: (_ for _ in ()).throw(RuntimeError("weg"))
+t = c.get("/aufbau/neu?profil=kunde", headers=H).get_data(as_text=True)
+ok("ein nicht lesbarer Katalog bricht die Seite nicht, sie sagt es",
+   "Katalog ist leer oder nicht lesbar" in t or 'value="n8n"' in t)
 
 print("=== eine fehlende Sichtdatei ist eine leere Liste ===")
 os.remove(VF)
