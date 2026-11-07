@@ -92,6 +92,12 @@ for name in ("external.caddy", "edge.caddy"):
     n_logs = body.count("output file /logs/external-access.log")
     ok(f"{name}: jedes Dauerprotokoll gefiltert ({n_logs} Stueck)",
        n_logs > 0 and body.count("request>uri regexp") == n_logs, body)
+body = read("edge.caddy")
+ok("edge.caddy: die Route traegt zwei Ebenen (Instanz eines Mandanten)",
+   "https://kunde.example, https://*.kunde.example, https://*.*.kunde.example {" in body
+   and "http://kunde.example, http://*.kunde.example, http://*.*.kunde.example {" in body, body)
+ok("... und keine dritte (nichts, was die Plattform benennt, liegt tiefer)",
+   "*.*.*." not in body, body)
 body = read("instance-addresses.caddy")
 n_logs = body.count("output file /logs/external-access.log")
 ok(f"instance-addresses.caddy: gefiltert ({n_logs} Stueck)",
@@ -112,6 +118,18 @@ m.cmd_migrate_stream_close(None)
 for name in ("external.caddy", "instance-addresses.caddy", "edge.caddy"):
     ok(f"{name} danach gefiltert", "request>uri regexp" in read(name))
 ok("genau ein Neuladen", len(reloads) == 1, reloads)
+m.cmd_migrate_stream_close(None)
+ok("zweiter Lauf tut nichts", len(reloads) == 1, reloads)
+
+print("\n=== Edge von vor 0.1.240: nur eine Ebene ===")
+body = read("edge.caddy")
+with open(os.path.join(m.CADDY_APPS_DIR, "edge.caddy"), "w", encoding="utf-8") as f:
+    f.write(body.replace(", https://*.*.kunde.example", "").replace(", http://*.*.kunde.example", ""))
+ok("Ausgangslage: eine Ebene", "*.*." not in read("edge.caddy"))
+reloads.clear()
+m.cmd_migrate_stream_close(None)
+ok("danach zwei Ebenen, einmal neu geladen",
+   "https://*.*.kunde.example" in read("edge.caddy") and len(reloads) == 1, reloads)
 m.cmd_migrate_stream_close(None)
 ok("zweiter Lauf tut nichts", len(reloads) == 1, reloads)
 

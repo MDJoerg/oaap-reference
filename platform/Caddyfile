@@ -16,6 +16,11 @@
 		metrics {
 			per_host
 		}
+		# Behind an edge: `trusted_proxies static <edge>`, written by
+		# appctl (write_edge_trust) -- without it every app believes it is
+		# served over plain http. No file on any other node; an import
+		# pattern that matches nothing is no error.
+		import /etc/caddy/apps/*.servers
 	}
 }
 #
