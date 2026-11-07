@@ -505,3 +505,67 @@ def rehearsal_offer(name, inst, view, local=""):
         "days": view.get("default_days") or 7,
         "suggestion": f"{base}-probe",
     }
+
+
+# ------------------------------------------- MCP (portal 2.16, RFC-0073 Stufe 3)
+#
+# Eine Anzeige aus dem Register, dieselben Regeln wie im Host
+# (appctl.mcp_sources_of): derselbe Mandant, dieser Knoten, keine
+# Generalprobe. Ob der Knopf erscheint, entscheidet die Rolle und ob der
+# Realm des Mandanten von einem Konnektor stammt; der Host prueft beides
+# noch einmal -- der Knopf ist nicht die Grenze.
+
+def mcp_path(inst):
+    d = (inst or {}).get("mcp")
+    return str(d.get("path") or "") if isinstance(d, dict) else ""
+
+
+def _stamp(s):
+    return str(s or "")[:16].replace("T", " ")
+
+
+def mcp_view(name, inst, instances, tenants, server_admin=False, default_tid=""):
+    """Die Karte MCP, oder None fuer eine Instanz ohne MCP."""
+    door, reads = mcp_path(inst), bool((inst or {}).get("mcp_sources"))
+    if not door and not reads:
+        return None
+    tref = (inst or {}).get("tenant") or default_tid
+    reh = is_rehearsal(inst)
+
+    def same(i):
+        return ((i.get("tenant") or default_tid) == tref) and not is_rehearsal(i)
+
+    out = {"door": door, "reads": reads, "rehearsal": reh, "readers": [],
+           "sources": [], "idp": None, "can_manage": False, "why_not": ""}
+    if reh:
+        return out
+    if door:
+        out["readers"] = sorted(k for k, i in instances.items()
+                                if k != name and i.get("mcp_sources") and same(i))
+    if reads:
+        for k, i in sorted(instances.items()):
+            p = mcp_path(i)
+            if k == name or not p or not i.get("port") or not same(i):
+                continue
+            out["sources"].append({
+                "name": k, "path": p,
+                "door": bool(inst.get("port") and i.get("container") and i.get("svc_port"))})
+        rec = inst.get("mcp_idp") or {}
+        out["idp"] = {
+            "state": "off" if rec.get("off") else ("on" if rec else "none"),
+            "issuer": rec.get("issuer", ""), "audience": rec.get("audience", ""),
+            "signin": rec.get("signin", ""),
+            "platform_audience": rec.get("platform_audience", ""),
+            "connector": rec.get("connector", ""), "space": rec.get("space", ""),
+            "at": _stamp(rec.get("at")), "by": rec.get("by", ""),
+            "off_at": _stamp(rec.get("off")), "off_by": rec.get("off_by", "")}
+        prov = ((tenants or {}).get(tref) or {}).get("idp") or {}
+        if not prov.get("issuer"):
+            out["why_not"] = ("Der Mandant hat noch keinen Anmeldedienst "
+                              "(oaap idp provision).")
+        elif not prov.get("connector"):
+            out["why_not"] = ("Der Anmeldedienst des Mandanten wurde von Hand "
+                              "eingetragen: die Clients von Hand anlegen und "
+                              "MCPGW_* setzen.")
+        out["can_manage"] = bool(server_admin and not out["why_not"])
+    return out

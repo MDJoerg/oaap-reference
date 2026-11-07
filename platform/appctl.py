@@ -6215,6 +6215,32 @@ def cmd_idp(args):
     if action == "mail":
         return _idp_mail(args, name, c)
 
+    if action == "mcp":
+        # RFC-0073 stage 3, oaap.core.tenant 2.9.1: a gateway's two
+        # clients in its tenant's space, or --off to disable them.
+        gw = (args.instance or "").strip()
+        if not gw:
+            die("which gateway? `oaap idp mcp <connector> --instance <name>`")
+        ok, said = mcp_idp_apply(
+            gw, connector_name=name, off=bool(args.off),
+            dry_run=bool(args.dry_run),
+            accept_version=args.accept_version or "",
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            print("")
+            for line in textwrap.wrap(said, 68):
+                print(line)
+            sys.exit(1)
+        if not args.dry_run:
+            print("")
+            print(said[0].upper() + said[1:] + ".")
+            if not args.off:
+                print("")
+                print("The secret went into the instance's environment and")
+                print("nowhere else. Settings typed in by hand (MCPGW_*) still")
+                print("win; empty ones now come from the platform.")
+        return
+
     die(f"unknown action '{action}'")
 
 
@@ -8948,17 +8974,38 @@ def cmd_tenant(args):
             if resolve_tenant(ref) is None:
                 problems.append(f"creation permit for '{g.get('instance','?')}' "
                                 f"names an unknown tenant ({ref})")
-        if not problems:
+        at_provider, unasked = tenant_check_providers(tenants)
+        if not problems and not at_provider and not unasked:
             print(f"All records resolve. Tenants on this node: {len(tenants)}.")
+            asked = sum(1 for t in tenants.values()
+                        if (t.get("idp") or {}).get("connector"))
+            if asked:
+                print(f"The provider was asked for the clients of {asked} "
+                      "tenant(s): all there and enabled.")
             return
-        print("Records naming a tenant this node does not have:")
-        for line in problems:
-            print(f"  {line}")
-        print("")
-        print("Nothing was changed. An unknown tenant is never mapped onto the")
-        print("default one -- that would move somebody's data into the")
-        print("operator's own tenant. Restore the tenant store, or reassign")
-        print("these records deliberately.")
+        if problems:
+            print("Records naming a tenant this node does not have:")
+            for line in problems:
+                print(f"  {line}")
+            print("")
+            print("Nothing was changed. An unknown tenant is never mapped onto the")
+            print("default one -- that would move somebody's data into the")
+            print("operator's own tenant. Restore the tenant store, or reassign")
+            print("these records deliberately.")
+        if at_provider:
+            if problems:
+                print("")
+            print("Clients a record names and the provider does not have "
+                  "(enabled):")
+            for line in at_provider:
+                print(f"  {line}")
+        if unasked:
+            if problems or at_provider:
+                print("")
+            print("Providers that could not be asked -- so nothing is said "
+                  "about their clients:")
+            for line in unasked:
+                print(f"  {line}")
         sys.exit(1)
 
     # action == "show"
@@ -12428,6 +12475,256 @@ def cases_submit_wanted(m):
         m.get("cases"), dict) else False
 
 
+# ------------------------------- a gateway's sign-in (RFC-0073 stage 3)
+# The two clients a gateway instance needs in its tenant's space are made
+# by the connector that made that space (oaap.core.tenant 2.9.1), on an
+# operator's request -- `oaap idp mcp` or the portal's button, never at
+# install. What they produce reaches the instance as five platform-owned
+# variables (runtime 2.32.2); the gateway takes them as defaults, so a
+# gateway set up by hand before stage 3 keeps what it has. The registry
+# record `mcp_idp` says what was made, never the secret.
+MCP_IDP_VARS = {"issuer": "OAAP_MCP_IDP_ISSUER",
+                "audience": "OAAP_MCP_IDP_AUDIENCE",
+                "secret": "OAAP_MCP_IDP_SECRET",
+                "signin": "OAAP_MCP_IDP_SIGNIN",
+                "platform_audience": "OAAP_MCP_IDP_PLATFORM_AUDIENCE"}
+
+
+def tenant_check_providers(tenants):
+    """Ask each connector whether the clients its tenants' records name are
+    there and enabled (oaap.core.tenant 1.5, 2.1). ([finding], [unasked]).
+
+    The finding of RFC-0073 §13: `vuebung` named a client its realm no
+    longer had, every browser sign-in through its place would have
+    failed, and this check said "All records resolve". Read only."""
+    findings, unasked = [], []
+    held = load_idp_connectors()
+    insts = load_registry().get("instances", {})
+    for tid, t in sorted(tenants.items()):
+        prov = t.get("idp") or {}
+        cname = prov.get("connector") or ""
+        if not cname or not prov.get("client_id"):
+            continue
+        label = t.get("label") or tid
+        c = held.get(cname)
+        if not c:
+            unasked.append(f"tenant '{label}': the connector '{cname}' that "
+                           "made its provider is not on this node")
+            continue
+        space = prov.get("space") or idp_admin.space_for(label)
+        word = idp_admin.connector_of(c["kind"]).get("space_word", "space")
+        want = {prov["client_id"]: "the tenant's own client"}
+        for k, i in sorted(insts.items()):
+            r = i.get("mcp_idp") or {}
+            if r and not r.get("off") and resolve_tenant(i.get("tenant")) == tid:
+                for cid in (r.get("audience"), r.get("signin")):
+                    if cid:
+                        want[cid] = f"a sign-in client of '{k}'"
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        states, err = admin.client_states(space, list(want))
+        if err:
+            unasked.append(f"tenant '{label}' ({cname}): {err}")
+            continue
+        for cid, st in states.items():
+            if st == "enabled":
+                continue
+            line = f"tenant '{label}': {want[cid]} '{cid}' is {st} in the {word} '{space}'"
+            if cid == prov["client_id"]:
+                line += (" -- every sign-in through the tenant's place fails; "
+                         f"`oaap idp provision {cname} --tenant {label}` "
+                         "makes it again")
+            findings.append(line)
+    return findings, unasked
+
+
+def mcp_idp_target(name, connector_name=""):
+    """What a gateway's sign-in would be made with, or why not.
+
+    Returns (inst, tid, tenant, connector name, connector, refusal)."""
+    inst = load_registry().get("instances", {}).get(name)
+    none = (None, "", {}, "", {})
+    if not inst:
+        return none + (f"no instance called '{name}' on this node",)
+    if not inst.get("mcp_sources"):
+        return none + (f"'{name}' does not read MCP sources (its manifest has "
+                       "no `mcp_sources: {read: true}`), so it has no use for "
+                       "a gateway's clients",)
+    if is_rehearsal(inst):
+        return none + (f"'{name}' is a rehearsal (RFC-0030): it gets no "
+                       "sign-in of its own",)
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    t = load_tenants().get(tid) or {}
+    label = t.get("label") or tid
+    prov = t.get("idp") or {}
+    if not prov.get("issuer") or not prov.get("client_id"):
+        return none + (f"the tenant '{label}' has no provider yet -- "
+                       f"`oaap idp provision <connector> --tenant {label}` "
+                       "first",)
+    by = prov.get("connector") or ""
+    if not by:
+        return none + (f"the tenant '{label}''s provider was named by hand "
+                       "(`oaap tenant idp`), so OAAP did not make its space "
+                       "and makes no clients in it: create them by hand and "
+                       "set MCPGW_* (oaap.core.tenant 2.9.1)",)
+    if connector_name and connector_name != by:
+        return none + (f"the tenant '{label}''s provider was made by the "
+                       f"connector '{by}', not by '{connector_name}'",)
+    c = load_idp_connectors().get(by)
+    if not c:
+        return none + (f"the connector '{by}' that made the tenant '{label}''s "
+                       "provider is no longer on this node (`oaap idp list`)",)
+    return inst, tid, t, by, c, ""
+
+
+def _mcp_idp_env(name, inst, values):
+    """Write (values) or drop (None) the five variables; recreate the
+    container when anything changed. Returns whether it did."""
+    env = load_env(name, inst)
+    before = dict(env)
+    for field, var in MCP_IDP_VARS.items():
+        if values is None:
+            env.pop(var, None)
+        else:
+            env[var] = str(values.get(field) or "")
+    if env == before:
+        return False
+    save_env(name, env, inst)
+    recreate_instance_containers(name, instance_services(inst),
+                                 inst.get("storage") or [])
+    return True
+
+
+def mcp_idp_apply(name, connector_name="", off=False, dry_run=False,
+                  accept_version="", who="root", role="root", out=print):
+    """Make (or switch off) a gateway's sign-in. (ok, sentence).
+
+    One function for the CLI and the portal's worker, so the checks are
+    the same ones on both doors."""
+    inst, tid, t, cname, c, bad = mcp_idp_target(name, connector_name)
+    if bad:
+        return False, bad
+    prov = t["idp"]
+    label = t.get("label") or tid
+    space = prov.get("space") or idp_admin.space_for(label)
+    platform = prov["client_id"]
+    rec = dict(inst.get("mcp_idp") or {})
+    gw, si = idp_admin.mcp_clients_for(instance_name(name, inst))
+    if off:
+        ids = [x for x in (rec.get("audience") or gw, rec.get("signin") or si) if x]
+        plan = idp_admin.mcp_off_plan(c["kind"], space, ids)
+    else:
+        plan = idp_admin.mcp_clients_plan(c["kind"], space, gw, si, platform)
+    bad = idp_admin.mcp_refusal(c["kind"]) or idp_admin.plan_refusal(plan)
+    if bad:
+        return False, bad
+    word = idp_admin.connector_of(c["kind"])["space_word"]
+    out(f"'{name}' -> {word} '{space}' at {c['base_url']} "
+        f"(connector '{cname}', tenant '{label}')")
+    if off:
+        out("  disable      " + ", ".join(ids))
+    else:
+        out(f"  gateway      {gw}  (confidential, exchange only)")
+        out(f"  sign-in      {si}  (public, PKCE, back to "
+            + ", ".join(idp_admin.MCP_SIGNIN_REDIRECTS) + ")")
+        out(f"  exchange to  {platform}  (the tenant's own client)")
+    out("")
+    out("What this may call, in order:")
+    for line in idp_admin.plan_lines(plan):
+        out(line)
+    out("")
+    if dry_run:
+        out("Nothing was called: --dry-run.")
+        return True, "nothing was called (--dry-run)"
+    admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                            c["admin_id"], c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    accept = accept_version or c.get("accept_version", "")
+    reg = load_registry()
+    inst = reg["instances"][name]
+    if off:
+        ok, msg = admin.mcp_clients_off(space, ids, accept)
+        for line in admin.trace:
+            out("  " + line)
+        if not ok:
+            audit_tenant("mcp.idp", tid, name, "failed", who=who, role=role,
+                         detail="off · " + msg)
+            return False, msg
+        changed = _mcp_idp_env(name, inst, None)
+        if rec:
+            rec["off"] = _iso_now()
+            rec["off_by"] = who
+            inst["mcp_idp"] = rec
+            save_registry(reg)
+        audit_tenant("mcp.idp", tid, name, who=who, role=role,
+                     detail=f"off · {space} · " + ", ".join(ids)
+                            + " disabled, none deleted")
+        return True, (f"the sign-in of '{name}' is off: " + ", ".join(ids)
+                      + f" disabled in the {word} '{space}', none deleted"
+                      + ("; the container was recreated without the "
+                         "settings" if changed else ""))
+    ok, got, msg = admin.mcp_clients(
+        space, gw, si, platform,
+        title="", accept_version=accept)
+    for line in admin.trace:
+        out("  " + line)
+    if not ok:
+        audit_tenant("mcp.idp", tid, name, "failed", who=who, role=role,
+                     detail="on · " + msg)
+        return False, msg
+    changed = _mcp_idp_env(name, inst, got)
+    inst["mcp_idp"] = {"connector": cname, "space": space,
+                       "issuer": got["issuer"], "audience": gw, "signin": si,
+                       "platform_audience": platform,
+                       "redirect_uris": got["redirect_uris"],
+                       "at": _iso_now(), "by": who}
+    save_registry(reg)
+    audit_tenant("mcp.idp", tid, name, who=who, role=role,
+                 detail=f"on · {space} · {gw}, {si} -> {platform}")
+    return True, (f"'{name}' signs persons in through {got['issuer']}: "
+                  f"{gw} and {si} are ready"
+                  + ("; the container was recreated with the settings"
+                     if changed else "; the settings were already in place"))
+
+
+def mcp_idp_retire(name, inst, who="root"):
+    """At removal (or a redeploy without `mcp_sources`): disable the
+    clients, never delete them, best effort. Returns whether it did.
+
+    A provider that cannot be reached must not block a removal; the
+    operator is told which two clients still sign somebody in."""
+    rec = (inst or {}).get("mcp_idp") or {}
+    if not rec or rec.get("off"):
+        return True
+    ids = [x for x in (rec.get("audience"), rec.get("signin")) if x]
+    c = load_idp_connectors().get(rec.get("connector") or "")
+    why = ""
+    if not c:
+        why = f"the connector '{rec.get('connector')}' is no longer on this node"
+    else:
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        try:
+            ok, msg = admin.mcp_clients_off(rec.get("space") or "", ids,
+                                            c.get("accept_version", ""))
+        except Exception as e:                # noqa: BLE001
+            ok, msg = False, str(e)
+        if ok:
+            print(f"The sign-in clients of '{name}' are disabled in "
+                  f"'{rec.get('space')}', none deleted: " + ", ".join(ids) + ".")
+            audit_tenant("mcp.idp", resolve_tenant(inst.get("tenant")) or "",
+                         name, who=who, detail="off · "
+                         + ", ".join(ids) + " disabled, none deleted")
+            return True
+        why = msg
+    print(f"WARNING: the sign-in clients of '{name}' could not be disabled "
+          f"({why}). Disable them by hand in '{rec.get('space')}': "
+          + ", ".join(ids) + ".")
+    return False
+
+
 # ------------------------------------------------ MCP sources (RFC-0073)
 # An app declares ONE MCP door (`mcp: {path}`); a gateway app declares that
 # it reads the sources of its tenant (`mcp_sources: {read: true}`). The
@@ -14495,6 +14792,10 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_INSTANCE_NAMES",
                 "OAAP_CASES_KEY", "OAAP_CASES_URL",
                 "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_SOURCES_URL",
+                # RFC-0073 stage 3: written by `oaap idp mcp` only
+                "OAAP_MCP_IDP_ISSUER", "OAAP_MCP_IDP_AUDIENCE",
+                "OAAP_MCP_IDP_SECRET", "OAAP_MCP_IDP_SIGNIN",
+                "OAAP_MCP_IDP_PLATFORM_AUDIENCE",
                 "OAAP_CARE_URL"}  # platform-owned, never operator-editable
 
 
@@ -18754,6 +19055,14 @@ def _install_from_dir(pkg, args, source):
         env.pop("OAAP_MCP_SOURCES_URL", None)
         print(f"'{name}' no longer reads MCP sources: its key is no longer "
               "handed to the app.")
+    # RFC-0073 stage 3 (runtime 2.32.2): the sign-in settings are written
+    # by `oaap idp mcp` alone. A redeploy keeps them (they are in the
+    # loaded env); a rehearsal or a manifest without mcp_sources does not.
+    if not (mcp_sources_wanted(m) and not is_artefact and not rehearsal)             and any(v in env for v in MCP_IDP_VARS.values()):
+        for v in MCP_IDP_VARS.values():
+            env.pop(v, None)
+        print(f"'{name}' gets no sign-in settings (no mcp_sources, or a "
+              "rehearsal): OAAP_MCP_IDP_* are no longer handed to the app.")
     # RFC-0069 stage 3 (runtime 2.28): every instance is told where the node
     # says when it reboots. An address, not a credential -- a rehearsal gets
     # it too, its desk session ends with the same reboot.
@@ -18984,6 +19293,14 @@ def _install_from_dir(pkg, args, source):
     if (inst or {}).get("cohort") or preset.get("cohort"):
         reg["instances"][name]["cohort"] = dict(
             (inst or {}).get("cohort") or preset["cohort"])
+    # RFC-0073 stage 3: what a connector made for this gateway is a fact
+    # about the provider, not about the manifest -- kept. A redeploy that
+    # drops `mcp_sources` disables the clients, like a removal (2.9.1).
+    if inst and inst.get("mcp_idp") and not rehearsal:
+        rec = dict(inst["mcp_idp"])
+        if not reg["instances"][name].get("mcp_sources") and not rec.get("off")                 and mcp_idp_retire(name, inst):
+            rec["off"], rec["off_by"] = _iso_now(), "redeploy without mcp_sources"
+        reg["instances"][name]["mcp_idp"] = rec
     # a granted non-HTTP endpoint (RFC-0015) is the operator's decision to
     # open a port — it survives redeploy like the address. The container
     # was already recreated with its publish mapping (via `granted`).
@@ -19148,6 +19465,12 @@ def remove_instance(reg, name, purge):
     except (Exception, SystemExit) as e:        # noqa: BLE001
         print(f"WARNING: could not retire the keys of '{local}': {e}. "
               "The next `oaap update` clears them (RFC-0062 D4).")
+    # RFC-0073 stage 3 / oaap.core.tenant 2.9.1: the gateway's sign-in
+    # clients are disabled, never deleted. Best effort, like the keys.
+    try:
+        mcp_idp_retire(name, inst)
+    except (Exception, SystemExit) as e:        # noqa: BLE001
+        print(f"WARNING: the sign-in clients of '{local}' were not disabled: {e}.")
     if not purge:
         # The kept instance.env is what a reinstall under this name reads.
         # Without its keys the reinstall mints fresh ones (it does so for
@@ -19156,6 +19479,7 @@ def remove_instance(reg, name, purge):
         env = load_env(name, inst)
         kept_env = {k: v for k, v in env.items()
                     if k not in INSTANCE_KEY_VARS
+                    and k not in MCP_IDP_VARS.values()
                     and k not in ("OAAP_CASES_URL", "OAAP_CARE_URL",
                                   "OAAP_MCP_SOURCES_URL")}
         if kept_env != env:
@@ -26434,6 +26758,32 @@ def cmd_process_deploys(_args):
                         msg = f"unknown destination op '{op}'"
                 except DestinationRefused as e:
                     msg = str(e)
+        elif action == "mcp_idp":
+            # A gateway's sign-in from the portal (oaap.core.portal 2.16,
+            # RFC-0073 stage 3). server_admin's alone: the connector's
+            # credential creates clients at somebody else's server and is
+            # the operator's (oaap.core.tenant 2.9). The same function as
+            # `oaap idp mcp`, which writes its own tenant-log line; a
+            # refused request is written here, because nothing ran.
+            op = str(req.get("op") or "")
+            who = actor or "portal"
+            tid_here = (resolve_tenant((inst or {}).get("tenant"))
+                        or ensure_default_tenant())
+            if not inst:
+                msg = "unknown instance"
+            elif op not in ("on", "off"):
+                msg = f"unknown mcp_idp op '{op}'"
+            elif act_role != "server_admin":
+                msg = ("making or disabling a gateway's sign-in clients "
+                       "requires server_admin -- the connector's credential "
+                       "is the operator's (oaap.core.tenant 2.9)")
+                audit_tenant("mcp.idp", tid_here, subject=name,
+                             result="denied", who=who,
+                             role=act_role or "-", detail=msg)
+            else:
+                lines = []
+                ok, msg = mcp_idp_apply(name, off=(op == "off"), who=who,
+                                        role=act_role, out=lines.append)
         elif action == "exposure":
             # Freigaben aus dem Portal (oaap.net.connector 2.8.10): open,
             # extend, let go (inner node) and close (outer node). The
@@ -29898,7 +30248,8 @@ def main():
                                       "(RFC-0041 K3)")
     pidp.add_argument("action",
                       choices=["list", "add", "remove", "check", "provision",
-                               "settings", "export", "admin-group", "mail"])
+                               "settings", "export", "admin-group", "mail",
+                               "mcp"])
     pidp.add_argument("--all", action="store_true",
                       help="for 'mail': every tenant that signs in through "
                            "this connector")
@@ -29958,7 +30309,11 @@ def main():
     pidp.add_argument("--instance", default=None,
                       help="for 'export': which instance of this product "
                            "serves the connector (only needed when there "
-                           "is more than one)")
+                           "is more than one); for 'mcp': the gateway "
+                           "instance whose clients to make")
+    pidp.add_argument("--off", action="store_true",
+                      help="for 'mcp': disable the gateway's clients (never "
+                           "delete them) and take the settings away")
     # The second half of the 2026-09-23 finding: a node with an
     # external name is reached over TLS in both modes this software
     # generates sites for, so `provision` registered a callback

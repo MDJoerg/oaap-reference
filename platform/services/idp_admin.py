@@ -27,6 +27,9 @@ A connector is these verbs and nothing else:
               for (RFC-0041 step 6, built 2026-09-23)
     export    that space and its people in one file, for the move
               (RFC-0041 K6, step 7, built 2026-09-23)
+    mcp_clients  the two clients of an MCP gateway in a tenant's space,
+              made on request and only ever disabled (RFC-0073 stage 3,
+              oaap.core.tenant 2.9.1, built 2026-11-07)
 
 The first four are required of any connector; `settings` and `export`
 are optional and declared, so a product that cannot do one says so
@@ -227,7 +230,7 @@ CONNECTOR_KINDS = {
             "people_key": "users",
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
-                  "export", "admin_group", "groups", "mail"),
+                  "export", "admin_group", "groups", "mail", "mcp_clients"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
@@ -244,7 +247,8 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
-OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups", "mail")
+OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups", "mail",
+                  "mcp_clients")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -1665,6 +1669,266 @@ def admin_group_words(kind, result):
     return out
 
 
+# ---------------------------------------------------------------------------
+# The clients of an MCP gateway (RFC-0073 stage 3, oaap.core.tenant 2.9.1)
+#
+# Two clients per gateway instance, in the tenant's space. Until stage 3
+# they were made by hand for every measurement (the scratch script of
+# stage 2), with five settings typed into the gateway after them. The
+# shapes below are the ones measured there against 26.7.4:
+#
+#   oaap-mcp-<instance>        confidential, nothing but the exchange;
+#                              its tokens are addressed to the tenant's
+#                              own client, which is what identity's act
+#                              check wants (`/verify?act=`)
+#   oaap-mcp-<instance>-login  public, code + PKCE, back only to a fixed
+#                              port on localhost (Claude Code's
+#                              --callback-port), its tokens addressed to
+#                              the gateway client -- the one condition
+#                              under which Keycloak grants that client
+#                              the exchange
+#
+# The space is NOT made here and the tenant's client is NOT made here:
+# both are `provision`'s, and a gateway whose tenant has neither has no
+# business creating them through a side door.
+#
+# Disabling is the one write on a client beyond "extend" that the
+# contract allows, and only on these two names: removing a gateway must
+# leave nothing that still signs anybody in, and K3.3 still forbids the
+# DELETE that would have been the obvious tidy-up.
+
+MCP_SIGNIN_PORT = 33418
+MCP_SIGNIN_REDIRECTS = (f"http://localhost:{MCP_SIGNIN_PORT}/callback",)
+
+
+def mcp_clients_for(instance):
+    """(gateway client, sign-in client) for a gateway instance, or ('', '').
+
+    Named after the INSTANCE: a node's gateways sit side by side in one
+    space, each with its own pair, and the name says whose they are to
+    whoever opens the product's console.
+    """
+    base = re.sub(r"[^a-z0-9._-]", "-",
+                  (instance or "").strip().lower()).strip("-")
+    if not base:
+        return "", ""
+    gw = ("oaap-mcp-" + base)[:58]
+    return gw, gw + "-login"
+
+
+def _keycloak_audience_mapper(target):
+    """Puts `target` into the ACCESS token's audience, nothing else."""
+    return {"name": f"oaap-aud-{target}", "protocol": "openid-connect",
+            "protocolMapper": "oidc-audience-mapper",
+            "config": {"included.client.audience": target,
+                       "access.token.claim": "true",
+                       "id.token.claim": "false",
+                       "introspection.token.claim": "true"}}
+
+
+def has_audience_mapper(kind, client_doc, target):
+    """Whether a client already puts `target` into its access tokens --
+    by what the mapper DOES, so one somebody made by hand counts."""
+    if (kind or "").strip().lower() != "keycloak":
+        return False
+    for mp in (client_doc or {}).get("protocolMappers") or ():
+        cfg = mp.get("config") or {}
+        if mp.get("protocolMapper") == "oidc-audience-mapper" \
+                and cfg.get("included.client.audience") == target \
+                and str(cfg.get("access.token.claim", "")).lower() == "true":
+            return True
+    return False
+
+
+KEYCLOAK_EXCHANGE = "standard.token.exchange.enabled"
+KEYCLOAK_PKCE = "pkce.code.challenge.method"
+
+
+def _keycloak_mcp_gateway_body(client_id, platform_client, name=""):
+    """The gateway's own client: it exchanges, and does nothing else.
+
+    No browser flow, no password grant, no service account -- a client
+    secret that leaks from a gateway can then do one thing, exchange a
+    token somebody else already holds, and only for the tenant's client.
+    """
+    return {
+        "clientId": client_id,
+        "name": (name or "").strip() or f"OAAP MCP-Gateway ({client_id})",
+        "protocol": "openid-connect",
+        "enabled": True,
+        "publicClient": False,
+        "clientAuthenticatorType": "client-secret",
+        "standardFlowEnabled": False,
+        "implicitFlowEnabled": False,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": False,
+        "redirectUris": [],
+        "webOrigins": [],
+        "attributes": {KEYCLOAK_EXCHANGE: "true"},
+        "protocolMappers": [_keycloak_audience_mapper(platform_client)],
+    }
+
+
+def _keycloak_mcp_signin_body(client_id, gateway_client, redirect_uris,
+                              name=""):
+    """The client persons sign in with: public, PKCE, localhost only.
+
+    Public because the program that uses it (Claude Code on somebody's
+    laptop) cannot keep a secret. What keeps it narrow instead is where
+    it may send a code (one port on localhost) and the PKCE proof that
+    the program which asked is the one that redeems.
+    """
+    return {
+        "clientId": client_id,
+        "name": (name or "").strip() or f"OAAP MCP-Anmeldung ({client_id})",
+        "protocol": "openid-connect",
+        "enabled": True,
+        "publicClient": True,
+        "standardFlowEnabled": True,
+        "implicitFlowEnabled": False,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": False,
+        "redirectUris": list(redirect_uris or []),
+        "webOrigins": [],
+        "attributes": {KEYCLOAK_PKCE: "S256"},
+        "protocolMappers": [_keycloak_audience_mapper(gateway_client)],
+    }
+
+
+def _keycloak_mcp_repair(role, doc, target, redirects):
+    """What a FOUND client of this name needs. (refusal, put_body, changes).
+
+    The kind is not repaired: a public client under the gateway's name
+    (or a confidential one under the sign-in name) is somebody else's
+    arrangement and is refused, unchanged. Otherwise only what 2.9.1
+    allows: enabled again, the exchange switch, our redirect. The
+    audience mapper is a separate call (`has_audience_mapper`).
+    """
+    doc = dict(doc or {})
+    public = bool(doc.get("publicClient"))
+    if role == "gateway" and public:
+        return (f"a PUBLIC client called '{doc.get('clientId')}' is already "
+                "in this space -- the gateway's client must be confidential, "
+                "and OAAP does not turn somebody else's client into another "
+                "kind (RFC-0041 K3.3)"), None, []
+    if role == "signin" and not public:
+        return (f"a CONFIDENTIAL client called '{doc.get('clientId')}' is "
+                "already in this space -- the sign-in client must be public, "
+                "and OAAP does not turn somebody else's client into another "
+                "kind (RFC-0041 K3.3)"), None, []
+    want, changes = dict(doc), []
+    if doc.get("enabled") is False:
+        want["enabled"] = True
+        changes.append("enabled again")
+    if role == "gateway":
+        attrs = dict(doc.get("attributes") or {})
+        if str(attrs.get(KEYCLOAK_EXCHANGE, "")).lower() != "true":
+            attrs[KEYCLOAK_EXCHANGE] = "true"
+            want["attributes"] = attrs
+            changes.append("token exchange switched on")
+    else:
+        absent = missing_redirects(doc, redirects)
+        if absent:
+            want["redirectUris"] = list(doc.get("redirectUris") or []) + absent
+            changes.append("redirect " + ", ".join(absent) + " added")
+    return "", (want if changes else None), changes
+
+
+# A second product is a file with these three functions and a row.
+_MCP_BODIES = {
+    "keycloak": (_keycloak_mcp_gateway_body, _keycloak_mcp_signin_body,
+                 _keycloak_mcp_repair, _keycloak_audience_mapper),
+}
+
+
+def mcp_refusal(kind):
+    """Why this connector cannot make a gateway's clients."""
+    bad = verb_refusal(kind, "mcp_clients")
+    if bad:
+        return bad
+    if (kind or "").strip().lower() not in _MCP_BODIES:
+        return (f"the connector '{kind}' declares mcp_clients and has no "
+                "requests for it")
+    return ""
+
+
+def mcp_clients_plan(kind, space, gateway, signin, platform):
+    """Every call making a gateway's clients may make, in order."""
+    if mcp_refusal(kind):
+        return []
+    c = connector_of(kind)
+    word = c["space_word"]
+
+    def p(name, **kw):
+        return path_of(kind, name, space=space, **kw)
+
+    plan = [
+        {"verb": "version", "method": "GET", "when": "always", "writes": False,
+         "path": c["version_path"],
+         "why": f"which {c['product']} is this? checked against the pinned "
+                f"{c['pinned']} BEFORE anything is created"},
+        {"verb": "space", "method": "GET", "when": "always", "writes": False,
+         "path": p("space"),
+         "why": f"the tenant's {word} must be there -- this makes none"},
+        {"verb": "client", "method": "GET", "when": "always", "writes": False,
+         "path": p("clients", query={"clientId": platform}),
+         "why": f"the tenant's own client '{platform}' must be there: the "
+                "exchange is addressed to it"},
+    ]
+    for cid, role in ((gateway, "gateway"), (signin, "signin")):
+        what = ("the gateway's confidential client (exchange only)"
+                if role == "gateway" else
+                "the public client persons sign in with (PKCE, localhost)")
+        plan += [
+            {"verb": "mcp_clients", "method": "GET", "when": "always",
+             "writes": False, "path": p("clients", query={"clientId": cid}),
+             "why": f"is '{cid}' already in this {word}?"},
+            {"verb": "mcp_clients", "method": "POST", "when": "absent",
+             "writes": True, "path": p("clients"), "why": "create " + what},
+            {"verb": "mcp_clients", "method": "PUT", "when": "found",
+             "writes": True, "path": p("client", uuid="<id>"),
+             "why": ("enable it again and switch the exchange on -- "
+                     "whichever is missing, nothing else"
+                     if role == "gateway" else
+                     "enable it again and add the redirect -- whichever "
+                     "is missing, nothing else")},
+            {"verb": "mcp_clients", "method": "POST", "when": "different",
+             "writes": True, "path": p("client_mappers", uuid="<id>"),
+             "why": "add the audience mapper, if it has none"},
+        ]
+        if role == "gateway":
+            plan.append(
+                {"verb": "mcp_clients", "method": "GET", "when": "always",
+                 "writes": False, "path": p("client_secret", uuid="<id>"),
+                 "why": "fetch the gateway client's secret, handed to the "
+                        "instance and kept nowhere else"})
+    return plan
+
+
+def mcp_off_plan(kind, space, client_ids):
+    """Disabling a gateway's clients: GET each, PUT `enabled: false`."""
+    if mcp_refusal(kind):
+        return []
+    c = connector_of(kind)
+    plan = [{"verb": "version", "method": "GET", "when": "always",
+             "writes": False, "path": c["version_path"],
+             "why": f"which {c['product']} is this? checked before anything "
+                    "is changed"}]
+    for cid in client_ids:
+        plan += [
+            {"verb": "mcp_clients", "method": "GET", "when": "always",
+             "writes": False,
+             "path": path_of(kind, "clients", space=space,
+                             query={"clientId": cid}),
+             "why": f"is '{cid}' there?"},
+            {"verb": "mcp_clients", "method": "PUT", "when": "found",
+             "writes": True,
+             "path": path_of(kind, "client", space=space, uuid="<id>"),
+             "why": "disable it -- never delete (RFC-0041 K3.3)"},
+        ]
+    return plan
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """An admin call is never followed anywhere.
 
@@ -2646,3 +2910,205 @@ class Admin:
             "version_how": how,
             "space": space,
         }, f"'{space}' is ready at {self.base}"
+
+    # -- the clients of an MCP gateway (RFC-0073 stage 3) -----------
+    def _ready(self, accept_version=""):
+        """(how, seen, error): logged in and the version checked."""
+        ok, msg = self.login()
+        if not ok:
+            return "", "", msg
+        said, err = self.version()
+        if err:
+            return "", "", err
+        how, bad = version_check(self.kind, said, accept_version)
+        if bad:
+            return "", "", bad
+        seen = said or (accept_version or "").strip()
+        self._note(f"{self.decl['product']} "
+                   + version_words(how, seen, self.kind))
+        return how, seen, ""
+
+    def _put_client(self, space, uuid, body, doing):
+        status, _doc, err = self._call(
+            "PUT", self._path("client", space=space, uuid=uuid), body=body)
+        if err:
+            return err
+        if status == 403:
+            return self._not_ours(space, doing)
+        if status not in (200, 204):
+            return f"{doing} answered {status}"
+        return ""
+
+    def _add_mapper(self, space, uuid, mapper, client_id):
+        status, _doc, err = self._call(
+            "POST", self._path("client_mappers", space=space, uuid=uuid),
+            body=mapper)
+        if err:
+            return err
+        if status == 403:
+            return self._not_ours(space, "give a client a mapper")
+        if status == 409:
+            return (f"'{client_id}' already has a mapper named "
+                    f"'{mapper['name']}' that does not put the audience "
+                    "into the access token -- OAAP does not change somebody "
+                    "else's mapper; fix or remove it in the product and run "
+                    "this again")
+        if status not in (201, 204):
+            return f"adding the audience mapper to '{client_id}' answered {status}"
+        self._note(f"added the audience mapper to '{client_id}'")
+        return ""
+
+    def mcp_clients(self, space, gateway, signin, platform,
+                    redirect_uris=MCP_SIGNIN_REDIRECTS, title="",
+                    accept_version=""):
+        """Make (or complete) a gateway's two clients. (ok, result, sentence).
+
+        Both found clients are judged BEFORE anything is written, so a
+        wrong kind under the second name does not leave the first one
+        made: nothing is half-made (K3.2).
+        """
+        bad = mcp_refusal(self.kind) or plan_refusal(
+            mcp_clients_plan(self.kind, space, gateway, signin, platform))
+        if bad:
+            return False, {}, bad
+        bad = space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        if not (gateway and signin and platform):
+            return False, {}, "a gateway, a sign-in client and the tenant's client are needed"
+        gw_body, si_body, repair, aud = _MCP_BODIES[self.kind]
+        how, seen, err = self._ready(accept_version)
+        if err:
+            return False, {}, err
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        word = self.decl["space_word"]
+        if not exists:
+            return False, {}, (f"there is no {word} '{space}' at {self.base} "
+                               "-- this makes no space; the tenant's provider "
+                               "comes first (`oaap idp provision`)")
+        puuid, _pdoc, err = self.find_client(space, platform)
+        if err:
+            return False, {}, err
+        if not puuid:
+            return False, {}, (f"the tenant's own client '{platform}' is not in "
+                               f"the {word} '{space}' -- every sign-in through "
+                               "the tenant's place would fail, and the exchange "
+                               "would have no target. `oaap idp provision "
+                               "<connector> --tenant <label>` makes it again "
+                               "(RFC-0073 §13, finding 1)")
+        found = {}
+        for cid, role, target in ((gateway, "gateway", platform),
+                                  (signin, "signin", gateway)):
+            uuid, doc, err = self.find_client(space, cid)
+            if err:
+                return False, {}, err
+            fix = ("", None, [])
+            if uuid:
+                fix = repair(role, doc, target, list(redirect_uris))
+                if fix[0]:
+                    return False, {}, fix[0]
+            found[role] = (uuid, doc, fix)
+        made = {}
+        for cid, role, target in ((gateway, "gateway", platform),
+                                  (signin, "signin", gateway)):
+            uuid, doc, (_bad, put, changes) = found[role]
+            if not uuid:
+                body = (gw_body(cid, platform, title) if role == "gateway"
+                        else si_body(cid, gateway, list(redirect_uris), title))
+                status, answer, err = self._call(
+                    "POST", self._path("clients", space=space), body=body)
+                if err:
+                    return False, {}, err
+                if status == 403:
+                    return False, {}, self._not_ours(space, "create a client")
+                if status not in (201, 204):
+                    return False, {}, (
+                        f"creating the client '{cid}' answered {status}"
+                        + (f": {answer.get('errorMessage')}"
+                           if isinstance(answer, dict)
+                           and answer.get("errorMessage") else ""))
+                self._note(f"created the client '{cid}'")
+                uuid, doc, err = self.find_client(space, cid)
+                if err:
+                    return False, {}, err
+                if not uuid:
+                    return False, {}, (f"the client '{cid}' was created and "
+                                       "cannot be found again -- refusing to "
+                                       "guess")
+            else:
+                self._note(f"the client '{cid}' was already there")
+                if put is not None:
+                    err = self._put_client(space, uuid, put, "change a client")
+                    if err:
+                        return False, {}, err
+                    self._note(f"'{cid}': " + "; ".join(changes))
+                    doc = put
+                if not has_audience_mapper(self.kind, doc, target):
+                    err = self._add_mapper(space, uuid, aud(target), cid)
+                    if err:
+                        return False, {}, err
+            made[role] = uuid
+        secret, err = self.client_secret(space, made["gateway"])
+        if err:
+            return False, {}, err
+        return True, {
+            "issuer": issuer_for(self.kind, self.base, space),
+            "audience": gateway, "signin": signin, "secret": secret,
+            "platform_audience": platform, "space": space,
+            "redirect_uris": list(redirect_uris),
+            "version": seen, "version_how": how,
+        }, f"the clients of '{gateway}' are ready in the {word} '{space}'"
+
+    def mcp_clients_off(self, space, client_ids, accept_version=""):
+        """Disable these clients, never delete them. (ok, sentence).
+
+        A client that is not there is said and is not an error: the
+        purpose -- nothing signs anybody in through it -- holds.
+        """
+        bad = mcp_refusal(self.kind) or plan_refusal(
+            mcp_off_plan(self.kind, space, client_ids))
+        if bad:
+            return False, bad
+        _how, _seen, err = self._ready(accept_version)
+        if err:
+            return False, err
+        for cid in client_ids:
+            uuid, doc, err = self.find_client(space, cid)
+            if err:
+                return False, err
+            if not uuid:
+                self._note(f"'{cid}' is not in the {self.decl['space_word']} "
+                           f"'{space}' -- nothing to disable")
+                continue
+            if doc.get("enabled") is False:
+                self._note(f"'{cid}' was already disabled")
+                continue
+            err = self._put_client(space, uuid, dict(doc, enabled=False),
+                                   "disable a client")
+            if err:
+                return False, err
+            self._note(f"disabled '{cid}' (not deleted)")
+        return True, "disabled, none deleted"
+
+    def client_states(self, space, client_ids):
+        """{client id: 'enabled' | 'disabled' | 'absent'}, error.
+
+        Read only, for `oaap tenant check`: no version gate, because
+        nothing is written, and a check that refused to look at an
+        unpinned server would say nothing where it matters most.
+        """
+        if not self.token:
+            ok, msg = self.login()
+            if not ok:
+                return {}, msg
+        out = {}
+        for cid in client_ids:
+            uuid, doc, err = self.find_client(space, cid)
+            if err:
+                return out, err
+            out[cid] = ("absent" if not uuid else
+                        "disabled" if doc.get("enabled") is False else
+                        "enabled")
+        return out, ""

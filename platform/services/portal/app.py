@@ -2729,6 +2729,82 @@ IMAGE_CARD = """
 </div>
 """
 
+# MCP (Portal 2.16, RFC-0073 Stufe 3): eigene Konstante wie CARE_CARD, damit
+# ein Test sie ohne Flask rendern kann.
+MCP_CARD = """
+{% if i.mcp %}
+<div class="card" id="mcp">
+  <h2>MCP</h2>
+  {% if i.mcp.rehearsal %}
+  <p class="muted">Eine Generalprobe ist keine MCP-Quelle und liest keine Quellen
+     (RFC-0073).</p>
+  {% else %}
+  {% if i.mcp.door %}
+  <p>Diese App ist eine <strong>MCP-Quelle</strong>: Tür <code>{{ i.mcp.door }}</code>,
+     geschützt von den Rollen ihrer Route.</p>
+  {% if i.mcp.readers %}
+  <p>Gelesen von: {% for r in i.mcp.readers %}<a href="/instances/{{ r }}#mcp">{{ r }}</a>{{ ", " if not loop.last }}{% endfor %}.
+     In einer Sicht erscheint sie erst, wenn der Betreiber des Gateways freigibt.</p>
+  {% else %}
+  <p class="muted">Noch kein Gateway des Mandanten liest diese Quelle.</p>
+  {% endif %}
+  {% endif %}
+  {% if i.mcp.reads %}
+  <p>Dieses Gateway liest die <strong>MCP-Quellen seines Mandanten</strong> auf diesem Knoten.</p>
+  {% if i.mcp.sources %}
+  <table class="mini">
+    <tr><th>Quelle</th><th>Pfad</th><th>Tür für Personen</th></tr>
+    {% for q in i.mcp.sources %}
+    <tr><td><a href="/instances/{{ q.name }}#mcp">{{ q.name }}</a></td><td><code>{{ q.path }}</code></td>
+        <td>{{ "ja" if q.door else "nein" }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Keine Quelle: keine App des Mandanten auf diesem Knoten erklärt eine MCP-Tür.</p>
+  {% endif %}
+  <h3>Anmeldung von Personen</h3>
+  {% if i.mcp.idp.state == "on" %}
+  <p>Eingerichtet am {{ i.mcp.idp.at }} von {{ i.mcp.idp.by }} über den Konnektor
+     <code>{{ i.mcp.idp.connector }}</code>, Realm <code>{{ i.mcp.idp.space }}</code>.</p>
+  <table class="mini">
+    <tr><td>Issuer</td><td><code>{{ i.mcp.idp.issuer }}</code></td></tr>
+    <tr><td>Gateway-Client (vertraulich, nur Tausch)</td><td><code>{{ i.mcp.idp.audience }}</code></td></tr>
+    <tr><td>Anmelde-Client (öffentlich, für <code>--client-id</code>)</td><td><code>{{ i.mcp.idp.signin }}</code></td></tr>
+    <tr><td>Tausch zum Plattform-Client</td><td><code>{{ i.mcp.idp.platform_audience }}</code></td></tr>
+  </table>
+  <p class="muted">Das Geheimnis des Gateway-Clients steht nur in der Umgebung der Instanz.
+     Von Hand gesetzte Werte (MCPGW_*) gewinnen.</p>
+  {% elif i.mcp.idp.state == "off" %}
+  <p>Abgeschaltet am {{ i.mcp.idp.off_at }}{% if i.mcp.idp.off_by %} ({{ i.mcp.idp.off_by }}){% endif %}:
+     <code>{{ i.mcp.idp.audience }}</code> und <code>{{ i.mcp.idp.signin }}</code> sind im Realm
+     deaktiviert, nicht gelöscht.</p>
+  {% else %}
+  <p class="muted">Nicht eingerichtet. Ohne Anmeldung erreicht dieses Gateway Quellen nur mit
+     Agentenschlüsseln (Verfahren T).</p>
+  {% endif %}
+  {% if i.mcp.can_manage %}
+  <form method="post" action="/instances/{{ i.key }}/mcp-idp" class="inline">
+    {% if i.mcp.idp.state == "on" %}
+    <input type="hidden" name="op" value="off">
+    <button type="submit" class="secondary">Anmeldung abschalten</button>
+    <span class="muted">Deaktiviert beide Clients im Realm; gelöscht wird nichts.</span>
+    {% else %}
+    <input type="hidden" name="op" value="on">
+    <button type="submit">Anmeldung einrichten</button>
+    <span class="muted">Legt im Realm des Mandanten zwei Clients an (oder schaltet sie wieder ein)
+       und gibt dem Gateway die Werte.</span>
+    {% endif %}
+  </form>
+  {% elif i.mcp.why_not %}
+  <p class="muted">{{ i.mcp.why_not }}</p>
+  {% endif %}
+  {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+"""
+
+
 INSTANCE_EDIT_BODY = """
 <a class="back" href="/instances">← Zurück zur Liste</a>
 <div class="objhead">
@@ -2856,7 +2932,7 @@ INSTANCE_EDIT_BODY = """
      {% else %}Produktiv-Instanzen bekommen kein Deploy-Token; sie werden über
      den Store aktualisiert.{% endif %}</p>
 </div>
-</section>
+""" + MCP_CARD + """</section>
 
 <section class="panel {{ 'active' if tab == 'zugang' }}">
 <div class="card">
@@ -8372,6 +8448,11 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # operator's, on their own page.
          "disk_grants": disk_view.grants_of(_disk_view(), name,
                                             inst.get("disk_grants")),
+         # MCP (Portal 2.16, RFC-0073 Stufe 3): Quelle und Leser, die
+         # Quellen eines Gateways und seine Anmeldung -- aus dem Register.
+         "mcp": iv.mcp_view(name, inst, load_instances(), load_tenants(),
+                            server_admin="server_admin" in caller_roles(),
+                            default_tid=default_tenant_id()),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
@@ -8475,6 +8556,37 @@ def instance_destination(name):
         name, {"action": "destination", "op": op, "need": need,
                "destination": dest if op == "bind" else ""},
         DESTINATION_WAIT_SECONDS)
+
+
+MCP_IDP_WAIT_SECONDS = 120  # the provider's calls, then the container is recreated
+
+
+@app.post("/instances/<name>/mcp-idp")
+def instance_mcp_idp(name):
+    """A gateway's sign-in clients (oaap.core.portal 2.16, RFC-0073 stage 3).
+
+    server_admin's alone: the connector's credential creates clients at
+    somebody else's server and is the operator's (oaap.core.tenant 2.9).
+    Queued; the worker asks the role again and runs the same function as
+    `oaap idp mcp` -- the button is not the boundary."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: Clients beim Anmeldedienst anlegen ist "
+                "Sache des Server-Admins.", 403)
+    if not load_instances().get(name):
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    op = request.form.get("op", "")
+    if op not in ("on", "off"):
+        return _inst_back(name, err="Unbekannte Aktion.")
+    res = _queue_and_wait(name, {"action": "mcp_idp", "op": op}, MCP_IDP_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Der Anmeldedienst antwortet noch — bitte gleich erneut prüfen.")
+    if res.get("ok"):
+        return _inst_back(name, msg=("Anmeldung eingerichtet." if op == "on"
+                                     else "Anmeldung abgeschaltet: beide Clients deaktiviert, nichts gelöscht."))
+    return _inst_back(name, err=res.get("message", "Fehlgeschlagen."))
 
 
 @app.post("/instances/<name>/visibility")

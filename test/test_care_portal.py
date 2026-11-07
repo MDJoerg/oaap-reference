@@ -224,7 +224,10 @@ def const(name, env=None):
 
 
 CARD = Environment(autoescape=True).from_string(const("CARE_CARD"))
-body = const("INSTANCE_EDIT_BODY", {"CARE_CARD": "<!--care-->", "IMAGE_CARD": "<!--image-->"})
+body = const("INSTANCE_EDIT_BODY", {"CARE_CARD": "<!--care-->", "IMAGE_CARD": "<!--image-->",
+                                    "MCP_CARD": "<!--mcp-->"})
+ok("die Karte MCP steht im Reiter Ueberblick (Portal 2.16)",
+   "<!--mcp-->" in body.split("tab == 'ueberblick'")[1].split("tab == 'zugang'")[0])
 ok("die Karte steht auf der Instanzseite, im Reiter Diagnose",
    "<!--care-->" in body.split("tab == 'diagnose'")[1].split("tab == 'fernzugang'")[0])
 ok("die Karte Abbild steht daneben (RFC-0071 Stufe 1)",
