@@ -131,7 +131,7 @@ def connector(base, name="kc"):
 def provision(name="kc", tenant="verein"):
     m.cmd_idp(types.SimpleNamespace(
         action="provision", name=name, tenant=tenant, space="verein",
-        client_id="oaap-knoten", idp_label="", accept_version=None,
+        client_id="oaap-knoten", idp_label=None, accept_version=None,
         dry_run=False, plain_callback=False))
 
 
@@ -235,6 +235,22 @@ p = providers()
 ok("enge Vollmacht (403): niemand wird umgehaengt",
    all(p[n] == key_of(OLD_BASE) for n in ("anna", "bert", "geist")), p)
 STATE["users_forbidden"] = False
+
+print("\n=== 0.1.242: der Knopftext bleibt ===")
+m.cmd_idp(types.SimpleNamespace(
+    action="provision", name="kc", tenant="verein", space="verein",
+    client_id="oaap-knoten", idp_label="Vereinskonto", accept_version=None,
+    dry_run=False, plain_callback=False))
+provision()                                    # idp_label=None: nicht angegeben
+ok("ein zweites provision ohne --idp-label behaelt den Text",
+   m.load_tenants()[tid]["idp"].get("label") == "Vereinskonto",
+   m.load_tenants()[tid]["idp"])
+m.cmd_idp(types.SimpleNamespace(
+    action="provision", name="kc", tenant="verein", space="verein",
+    client_id="oaap-knoten", idp_label="", accept_version=None,
+    dry_run=False, plain_callback=False))
+ok("--idp-label \"\" leert ihn ausdruecklich",
+   m.load_tenants()[tid]["idp"].get("label") == "", m.load_tenants()[tid]["idp"])
 
 print("\n=== die Regel selbst ===")
 import move                                                   # noqa: E402

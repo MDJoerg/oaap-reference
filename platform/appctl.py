@@ -6152,7 +6152,7 @@ def cmd_idp(args):
         space_id, _sid_err = admin.space_id(space)
         ok, said = tenant_set_provider(
             tid, got["kind"], got["issuer"], got["client_id"],
-            got["client_secret"], label=args.idp_label or "",
+            got["client_secret"], label=args.idp_label,
             version=got["version"], version_how=got.get("version_how", ""),
             connector=name, space=space, space_id=space_id,
             who=os.environ.get("SUDO_USER") or getpass.getuser())
@@ -8813,7 +8813,7 @@ def cmd_tenant(args):
         version = (args.idp_version or idp.KEYCLOAK_PINNED).strip()
         ok, msg = tenant_set_provider(
             tid, args.idp_kind, args.issuer or "", args.client_id or "",
-            args.client_secret or "", label=args.idp_label or "",
+            args.client_secret or "", label=args.idp_label,
             version=version,
             who=os.environ.get("SUDO_USER") or getpass.getuser())
         if not ok:
@@ -15724,7 +15724,7 @@ def ensure_idp_dir():
 
 
 def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
-                        label="", version="", who="root", role="root",
+                        label=None, version="", who="root", role="root",
                         connector="", space="", version_how="", space_id=""):
     """Attach or change a tenant's identity provider. (ok, sentence).
 
@@ -15743,6 +15743,13 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
     if bad:
         return False, bad
     before = idp.provider_key(idp.provider_of(t))
+    # The text on the login button. Not given (None) keeps what is
+    # there: until 0.1.242 a second `oaap idp provision` without
+    # --idp-label quietly emptied it (found on oaapx01, 2026-11-08,
+    # in a dry run, before it happened). An empty string still empties
+    # it -- that is somebody asking for it.
+    if label is None:
+        label = (t.get("idp") or {}).get("label") or ""
     t["idp"] = {"kind": kind, "issuer": issuer.strip(),
                 "client_id": client_id.strip(),
                 "version": (version or "").strip(),
