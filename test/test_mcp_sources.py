@@ -164,7 +164,8 @@ ok("die Liste: nur kp (derselbe Mandant, Tuer, keine Generalprobe, nicht sich se
 src = (listed("gw") or [{}])[0]
 ok("… mit App, Version, Kanal, Pfad und der Adresse am Plattform-Gateway",
    src == {"name": "kp", "app": "kontext-probe", "version": "1.0.0", "channel": "production",
-           "path": "/mcp", "address": f"http://{m.GATEWAY_CONTAINER}:8121/mcp"}, src)
+           "path": "/mcp", "address": f"http://{m.GATEWAY_CONTAINER}:8121/mcp",
+           "door": f"http://{m.GATEWAY_CONTAINER}:8120/platform/mcp/to/kp"}, src)
 ok("das Gateway des anderen Mandanten sieht nur seine eigene Quelle",
    [s["name"] for s in listed("fremd-gw") or []] == ["fremd-kp"], listed("fremd-gw"))
 ok("eine Quelle ohne mcp_sources traegt keine Liste",
@@ -172,6 +173,60 @@ ok("eine Quelle ohne mcp_sources traegt keine Liste",
    and block(site("crm"), "handle /platform/mcp/sources {") is None)
 ok("eine Generalprobe eines Gateways traegt keine Liste (D8)",
    block(site("gw-probe"), "handle /platform/mcp/sources {") is None)
+
+# ----------------------------------------------- 7. Die Tuer (Verfahren I)
+print("")
+print("7. Stufe 2: die Tuer /platform/mcp/to/<quelle> auf der Site des Gateways")
+d = block(site("gw"), "handle /platform/mcp/to/kp {")
+d2 = block(site("gw"), "handle /platform/mcp/to/kp/ {")
+ok("die Site des Gateways traegt die Tuer zu kp, mit und ohne Schraegstrich",
+   d is not None and d2 is not None and d == d2, site("gw")[:600])
+ok("… fragt identity mit act=Scope DIESES Gateways, Ziel kp, Rollen der Route von kp, Mandant",
+   d and f"uri /verify?roles=user&tenant={tid}&instance=kp&act=oaap.mcp.sources:gw" in d, d)
+ok("… kopiert die sechs Kopfzeilen der Person", d and m._COPY_IDENTITY.strip() in d, d)
+ok("… nimmt Schluessel und Act-Token weg, bevor die App sie sieht",
+   d and "request_header -Authorization" in d and "request_header -X-OAAP-Act-Token" in d, d)
+ok("… schreibt auf den erklaerten MCP-Pfad um und geht zum Container von kp",
+   d and "rewrite * /mcp" in d and "reverse_proxy oaap-app-kp:8000 {" in d, d)
+ok("… in Caddys Reihenfolge: forward_auth vor dem Wegnehmen (sonst saehe identity nichts)",
+   d and d.index("forward_auth identity:8000 {") < d.index("request_header -Authorization"), d)
+body = site("gw")
+ok("die Tuer steht vor /platform/* und vor der App-Route",
+   body.index("handle /platform/mcp/to/kp {") < body.index("handle /platform/* {")
+   and body.index("handle /platform/mcp/to/kp {") < body.index("\thandle {"))
+ok("die Site mit Tuer gilt nicht als veraltet (Act-Token ist keine Identitaets-Kopfzeile)",
+   not m._site_identity_stale(site("gw")))
+for n in ("crm", "kp-probe", "fremd-kp", "gw"):
+    ok(f"keine Tuer zu {n} auf der Site des Gateways",
+       block(body, f"handle /platform/mcp/to/{n} {{") is None)
+ok("das Gateway des anderen Mandanten hat nur die Tuer zu seiner Quelle",
+   block(site("fremd-gw"), "handle /platform/mcp/to/fremd-kp {") is not None
+   and block(site("fremd-gw"), "handle /platform/mcp/to/kp {") is None)
+ok("eine Quelle selbst und eine Generalprobe eines Gateways tragen keine Tuer",
+   "/platform/mcp/to/" not in site("kp") and "/platform/mcp/to/" not in site("gw-probe"))
+reg = m.load_registry()
+reg["instances"]["kp3"] = record("kp3", tid, "kontext-probe", 8128, mcp="/api/mcp",
+                                 routes=[{"path": "/api", "roles": ["admin", "public"]},
+                                         {"path": "/", "roles": ["public"]}],
+                                 visibility={"groups": ["vorstand", "kasse"]})
+m.save_registry(reg)
+m.refresh_cases_sites()
+d = block(site("gw"), "handle /platform/mcp/to/kp3 {") or []
+ok("die Rollen kommen von der Route, die den MCP-Pfad traegt (laengster Praefix, ohne public)",
+   any(x.startswith("uri /verify?roles=admin&groups=kasse,vorstand&") for x in d), d)
+reg = m.load_registry()
+reg["instances"]["kp3"]["routes"][0]["roles"] = ["tenant_admin"]
+m.save_registry(reg)
+ok("aendert die Quelle die Rollen ihrer Route, ist die Site des Gateways hinter",
+   "gw" in m._cases_sites_behind(), m._cases_sites_behind())
+m.refresh_cases_sites()
+d = block(site("gw"), "handle /platform/mcp/to/kp3 {") or []
+ok("… und fragt danach die neue Rolle", any("roles=tenant_admin&" in x for x in d), d)
+reg = m.load_registry()
+del reg["instances"]["kp3"]
+m.save_registry(reg)
+m.refresh_cases_sites()
+ok("eine Quelle geht: ihre Tuer geht mit", "/platform/mcp/to/kp3" not in site("gw"))
 
 # ------------------------------------------------------------ 5. Marker
 print("")

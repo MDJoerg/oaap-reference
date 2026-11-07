@@ -12508,9 +12508,10 @@ def mcp_sources_of(insts, scope):
     Same tenant, this node (the registry is this node's), declares a door,
     not a rehearsal, not the gateway itself. Sorted, so the digest in the
     site marker only changes when the list does. Each entry names where
-    the platform gateway serves the door today: the source's own LAN
-    port, behind its routes' roles (stage 1; procedure I replaces the
-    address with the door on the gateway's own site in stage 2)."""
+    the platform gateway serves the door: `address` is the source's own
+    LAN port behind its routes' roles (procedure T with an agent key,
+    RFC-0073 §6), `door` the block on the gateway's OWN site that carries
+    a signed-in person (procedure I, §4)."""
     me = insts.get(scope) or {}
     if not me.get("mcp_sources") or is_rehearsal(me):
         return []
@@ -12525,15 +12526,79 @@ def mcp_sources_of(insts, scope):
                     "version": i.get("version") or "",
                     "channel": i.get("channel") or "",
                     "path": path,
-                    "address": f"http://{GATEWAY_CONTAINER}:{i['port']}{path}"})
+                    "address": f"http://{GATEWAY_CONTAINER}:{i['port']}{path}",
+                    "door": (f"http://{GATEWAY_CONTAINER}:{me['port']}"
+                             f"{MCP_DOOR_PREFIX}{k}") if me.get("port") else ""})
     return out
 
 
+MCP_DOOR_PREFIX = "/platform/mcp/to/"
+
+
+def mcp_door_specs(insts, scope):
+    """What each door block on gateway `scope`'s site asks and where it goes.
+
+    Per source: the roles of the source's route that covers its MCP path
+    (the longest matching prefix, as the site itself picks it), the
+    source's visibility groups, its tenant, and the container behind that
+    route. All of it ends up in the forward_auth call, so the person meets
+    exactly the rules a browser session meets on the source's own site."""
+    out = []
+    for s in mcp_sources_of(insts, scope):
+        i = insts.get(s["name"]) or {}
+        path = s["path"]
+        routes = sorted(i.get("routes") or [], key=lambda r: len(r["path"]),
+                        reverse=True)
+        r = next((r for r in routes if r["path"] == "/" or path == r["path"]
+                  or path.startswith(r["path"].rstrip("/") + "/")), None)
+        if r is None or not i.get("container") or not i.get("svc_port"):
+            continue
+        c, p = i["container"], i["svc_port"]
+        svcs = route_targets(i)
+        if svcs and r.get("service") in svcs:
+            c, p = svcs[r["service"]]
+        out.append({"name": s["name"], "path": path,
+                    "roles": sorted({x for x in r["roles"] if x != "public"}),
+                    "groups": sorted(set((i.get("visibility") or {}).get("groups") or [])),
+                    "tenant": instance_tenant_ref(i), "target": f"{c}:{p}"})
+    return out
+
+
+def mcp_door_lines(insts, scope):
+    """The door blocks of procedure I on a consuming gateway's own site.
+
+    Order in Caddy: rewrite -> forward_auth -> request_header -> proxy, so
+    identity sees the gateway's key and the act token, and the source sees
+    neither -- only the six headers forward_auth copied (§8.6)."""
+    lines = []
+    for d in mcp_door_specs(insts, scope):
+        uri = f"/verify?roles={','.join(d['roles'])}"
+        if d["groups"]:
+            uri += f"&groups={','.join(d['groups'])}"
+        if d["tenant"]:
+            uri += f"&tenant={d['tenant']}"
+        uri += f"&instance={d['name']}&act={mcp_sources_scope(scope)}"
+        door = MCP_DOOR_PREFIX + d["name"]
+        for matcher in (door, door + "/"):
+            lines.append(f"\thandle {matcher} {{")
+            lines.append(f"\t\trewrite * {d['path']}")
+            lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
+                      "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
+            lines.append("\t\trequest_header -Authorization")
+            lines.append("\t\trequest_header -X-OAAP-Act-Token")
+            lines += _proxy(d["target"], "\t\t")
+            lines.append("\t}")
+    return lines
+
+
 def mcp_sources_digest(insts, scope):
+    """Changes when the list OR what a door asks changes (roles, groups,
+    target) -- either makes the gateway's written site stale."""
     srcs = mcp_sources_of(insts, scope)
     if not srcs:
         return "-"
-    return hashlib.sha256(json.dumps(srcs, sort_keys=True).encode()).hexdigest()[:12]
+    return hashlib.sha256(json.dumps([srcs, mcp_door_specs(insts, scope)],
+                                     sort_keys=True).encode()).hexdigest()[:12]
 
 
 # ----------------------- business authorization (oaap.core.authorization 0.1)
@@ -13047,8 +13112,10 @@ def _site_identity_stale(body):
     lines = [ln.strip() for ln in (body or "").splitlines()]
     # The source headers of RFC-0061 are stripped the same way and are
     # not identity headers; counting them would call every new site stale.
+    # Neither is the act token of RFC-0073, stripped on an MCP door.
     strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")
-              and not ln.startswith("request_header -X-OAAP-Source-")}
+              and not ln.startswith("request_header -X-OAAP-Source-")
+              and ln != "request_header -X-OAAP-Act-Token"}
     if strips and strips != {f"request_header -{h}" for h in IDENTITY_HEADERS}:
         return True
     return any(ln.startswith("copy_headers ") and ln != _COPY_IDENTITY
@@ -13423,6 +13490,8 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
         assert "`" not in body
         lines.append(f"\t\trespond `{body}` 200")
         lines.append("\t}")
+        # RFC-0073 stage 2: procedure I, one door per source.
+        lines += mcp_door_lines(insts, scope)
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
     lines.append("\t\turi strip_prefix /platform")

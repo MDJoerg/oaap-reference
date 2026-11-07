@@ -254,6 +254,14 @@ headers = verify[verify.find(", 204"):]
 check("keine App erfaehrt je ihren Mandanten",
       "X-OAAP-Tenant" not in ident and "tenant" not in headers,
       "die Kopfzeilen an die App tragen Benutzer und Rollen, sonst nichts")
+# RFC-0073: die Tuer eines MCP-Gateways (Verfahren I) ist ein zweiter Weg,
+# auf dem Identitaet eine App erreicht -- dieselbe Regel, eigene Pruefung.
+act_fn = ident[ident.find("def _verify_act("):]
+act_fn = act_fn[:act_fn.find("\n@app.")]
+act_headers = act_fn[act_fn.rfind(", 204"):]
+check("… auch nicht durch die Tuer eines MCP-Gateways (Verfahren I)",
+      "def _verify_act(" in ident and act_headers.startswith(", 204, identity_headers(")
+      and "tenant" not in act_headers, act_headers[:120])
 check("aber das Portal erfaehrt ihn — sonst koennte es nicht filtern",
       "u.get(\"tenant\", \"\")" in ident,
       "es muss einem tenant_admin dessen eigenen Mandanten zeigen koennen")

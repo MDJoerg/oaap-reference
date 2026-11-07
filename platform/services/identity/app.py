@@ -57,6 +57,8 @@ import mqtt_acl  # noqa: E402
 # Business authorization (RFC-0045): the pure half, beside idp.py.
 import authorization as authz  # noqa: E402
 import assertion  # noqa: E402
+# RFC-0073 procedure I: checking an act token (RS256 against the realm's keys).
+import act  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -1690,6 +1692,123 @@ def cors_on_refusal(resp):
     return resp
 
 
+# ---------------------------------------------------------------------------
+# PROCEDURE I (RFC-0073 §4): a person through an MCP gateway, carried by
+# the platform. The door /platform/mcp/to/<source> exists only on a
+# consuming gateway's own site, one block per source of its tenant, and
+# its forward_auth asks /verify?act=oaap.mcp.sources:<gateway>&instance=
+# <source>&tenant=...&roles=... -- all of it written by appctl, which only
+# writes a door for a source of the same tenant that declares `mcp:` and
+# is not a rehearsal (RFC-0073 §4.1 check 4 is enforced where the door is
+# written; here the tenant is compared once more).
+#
+# Two credentials, both required, neither enough alone:
+#   * the gateway's sources key, limited to EXACTLY that scope -- an
+#     unlimited key of an operator does not open the door;
+#   * the act token: the person's provider token, exchanged by the gateway
+#     for one addressed to the platform's own client of the realm.
+# The person comes from the binding {provider, sub} and from nothing the
+# gateway says (D4). No binding: refused, nothing created (D5). Any
+# failure is a refusal, never a call as the gateway (§8.5).
+ACT_KEYS = {}
+_ACT_KEYS_LOCK = __import__("threading").Lock()
+
+
+def _act_keys(issuer):
+    """The verifier's key cache for one issuer (one per worker)."""
+    with _ACT_KEYS_LOCK:
+        keys = ACT_KEYS.get(issuer)
+        if keys is None:
+            def fetch():
+                doc, bad = _discovery(issuer)
+                if bad:
+                    raise act.Invalid(f"the provider is not readable: {bad}")
+                uri = str(doc.get("jwks_uri") or "")
+                if not act.same_origin(uri, issuer):
+                    raise act.Invalid("the provider names keys on another origin")
+                jwks, bad = _back_channel(uri)
+                if bad:
+                    raise act.Invalid(f"the provider's keys are not readable: {bad}")
+                return jwks
+            keys = ACT_KEYS[issuer] = act.Keys(fetch)
+        return keys
+
+
+def _verify_act(scope):
+    """The forward-auth answer at an MCP gateway's door (procedure I)."""
+    target = request.args.get("instance", "")
+    gw = act.gateway_of(scope)
+    if not gw or not target:
+        return "Forbidden: not an MCP door", 403
+    # 1. The gateway's own key, limited to exactly this door's scope.
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() != "bearer ":
+        return _key_refusal("invalid_token", "the gateway's sources key is missing")
+    token = auth[7:].strip()
+    gwuser, _m, refusal = _by_key(token, scope)
+    if refusal is not None:
+        return refusal
+    m = KEY_TOKEN_RE.fullmatch(token)
+    rec = next((k for k in load_keys() if m and k["id"] == m.group(1)), None)
+    if not rec or rec.get("instance") != scope \
+            or gwuser.get("username") != f"instance:{gw}" \
+            or gwuser.get("kind") != "machine":
+        return _key_refusal("insufficient_scope",
+                            "only this gateway's sources key opens this door", 403)
+    want = resolve_tenant(request.args.get("tenant", ""))
+    if want is None or resolve_tenant(gwuser.get("tenant")) != want:
+        return "Forbidden: the gateway and the source belong to different tenants", 403
+    # 2. The act token, checked like any token addressed to the platform.
+    raw = request.headers.get(act.HEADER, "").strip()
+    if not raw:
+        return _key_refusal("invalid_token", "no act token: procedure I needs a "
+                            "signed-in person's token, exchanged for the platform")
+    provider, _secret = tenant_provider(want)
+    if not provider:
+        return "Forbidden: this tenant has no identity provider", 403
+    try:
+        claims = act.check(raw, _act_keys(provider["issuer"]),
+                           provider["issuer"], provider.get("client_id", ""))
+    except act.Invalid as e:
+        audit("mcp.act", want, target, result="denied", who=f"instance:{gw}",
+              detail=f"act token refused: {e}")
+        return _key_refusal("invalid_token", f"act token refused: {e}")
+    # 3. The person behind it: the binding, and nothing else (D4, D5).
+    person = idp.find_binding(load_users(), idp.provider_key(provider),
+                              str(claims.get("sub") or ""), want)
+    if person is None:
+        audit("mcp.act", want, target, result="denied", who=f"instance:{gw}",
+              detail="no binding on this node")
+        return ("Diese Person hat sich an diesem Ort noch nie angemeldet "
+                "— einmal im Portal anmelden.", 403)
+    if not person.get("active") or person.get("kind", "human") != "human":
+        return "Forbidden: this person is deactivated", 403
+    maint = maintenance_of(target)
+    if maint is not None and not may_pass_maintenance(person, maint):
+        return maintenance_response(maint)
+    # 4. The source's route, exactly as for a session (fresh, every call).
+    required = request.args.get("roles", "")
+    groups = request.args.get("groups", "")
+    route_refusal = ""
+    if required and not set(required.split(",")) & set(person["roles"]):
+        route_refusal = "Forbidden: missing role"
+    elif (groups and "server_admin" not in person["roles"]
+            and not set(groups.split(",")) & set(person.get("groups") or [])):
+        route_refusal = "Forbidden: not in a visibility group for this app"
+    elif resolve_tenant(person.get("tenant")) != want:
+        route_refusal = "Forbidden: this app belongs to another tenant"
+    if route_refusal:
+        # Every act is in the tenant's log (§8.7), the refused ones too.
+        audit("mcp.act", want, target, result="denied", who=f"instance:{gw}",
+              detail=f"for {person['username']}: {route_refusal}")
+        return route_refusal, 403
+    audit("mcp.act", want, target, who=f"instance:{gw}",
+          detail=f"for {person['username']}")
+    # The six headers of a person (spec 2.3), the assertion addressed to
+    # the source -- built by the same function as for a session.
+    return "", 204, identity_headers(person, target)
+
+
 @app.get("/verify")
 def verify():
     """Forward-auth endpoint for the gateway (RFC-0002 default deny).
@@ -1709,6 +1828,11 @@ def verify():
     EVERYTHING BELOW IS UNCHANGED for both. Optional ?instance=<key>
     lets a key be limited to one app.
     """
+    # RFC-0073 procedure I: an MCP gateway's door. The parameter comes from
+    # the generated gateway config, never from a client (forward_auth's
+    # `uri` is written by appctl), and it switches to a check of its own.
+    if request.args.get("act"):
+        return _verify_act(request.args.get("act", ""))
     user, _method, refusal = resolve_principal(
         request.args.get("instance", ""))
     # RFC-0059: before anything else, so an anonymous visitor sees the
