@@ -163,11 +163,14 @@ def install(name, port, app_id=None, admin=False, **extra):
 SCOPE = {"OAAP_PLATFORM_KEY": lambda n: m.TWIN_KEY_SCOPE,
          "OAAP_AUTHZ_KEY": lambda n: m.AUTHZ_KEY_SCOPE,
          "OAAP_AUTHZ_ADMIN_KEY": lambda n: m.AUTHZ_ADMIN_KEY_SCOPE,
-         "OAAP_CASES_KEY": lambda n: m.cases_submit_scope(n)}
+         "OAAP_CASES_KEY": lambda n: m.cases_submit_scope(n),
+         "OAAP_MCP_SOURCES_KEY": lambda n: m.mcp_sources_scope(n)}
 
 
 def all_speak(env, name):
-    return {v: speaks(env[v], SCOPE[v](name)) for v in m.INSTANCE_KEY_VARS}
+    # the keys this instance HAS -- a probe without `mcp_sources` (RFC-0073)
+    # holds none of that kind, and that is not a failure to speak
+    return {v: speaks(env[v], SCOPE[v](name)) for v in m.INSTANCE_KEY_VARS if v in env}
 
 
 def quiet(fn, *a, **k):
@@ -180,7 +183,7 @@ def quiet(fn, *a, **k):
 print("")
 print("0. Ausgangslage")
 env = install("probe", 8150, app_id="probe-a", admin=True)
-ok("alle vier Schluessel sprechen", all(all_speak(env, "probe").values()), all_speak(env, "probe"))
+ok("alle Schluessel sprechen", all(all_speak(env, "probe").values()), all_speak(env, "probe"))
 ok("Fachrechte-Eintrag und Prinzipal da",
    ident.load_authz()["instances"].get("probe", {}).get("app") == "probe-a"
    and principal_exists("probe"))
@@ -243,7 +246,7 @@ reg = m.load_registry()
 quiet(m.rekey_instance, reg, "ren-b", "ren-c", 0)
 ok("… auch wenn die alte Site schon fehlte",
    os.path.isfile(os.path.join(m.CADDY_APPS_DIR, "ren-c.caddy")))
-ok("die Ausgabe sagt es", "Reissued 4 platform key(s)" in out, out)
+ok("die Ausgabe sagt es", f"Reissued {len(m.INSTANCE_KEY_VARS)} platform key(s)" in out, out)
 
 print("")
 print("4. D3 -- Erneuerung")

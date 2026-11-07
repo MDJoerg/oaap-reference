@@ -104,7 +104,7 @@ ok("3 care.rebuild: release is valid", not errs(care={"rebuild": "release"}))
 ok("3 no care at all is valid", not errs())
 ok("3 any other word is an error", any("care.rebuild" in e for e in errs(care={"rebuild": "yes"})))
 ok("3 care must be an object", any("care:" in e for e in errs(care="self")))
-ok("3 the platform reads manifest 0.10 without the 'newer' note", m.MANIFEST_MINOR == 10)
+ok("3 the platform reads manifest 0.10 without the 'newer' note", m.MANIFEST_MINOR >= 10)
 
 # 4. the checkout against a real repository
 if not shutil.which("git"):

@@ -3970,7 +3970,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 10     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 11     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -3984,7 +3984,10 @@ MANIFEST_MINOR = 10     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.9 adds cases.submit (RFC-0061 §3.2 -- an app's
                         # backend opens a case in its tenant);
                         # 0.10 adds care.rebuild (RFC-0071 §15 -- the
-                        # author promises a rebuild changes only the base)
+                        # author promises a rebuild changes only the base);
+                        # 0.11 adds mcp.path and mcp_sources.read
+                        # (RFC-0073 -- an app is an MCP source, a
+                        # gateway finds the sources of its tenant)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -11250,6 +11253,24 @@ def validate_manifest(m):
                 errs.append("cases: object expected")
             elif "submit" in m["cases"] and not isinstance(m["cases"]["submit"], bool):
                 errs.append("cases.submit: true or false")
+        # Manifest 0.11 (RFC-0073 D1): one MCP door, a local path under
+        # one of the app's own routes. The platform interprets nothing
+        # else -- and `openapi:` is reserved until I-39 has its RFC, so a
+        # manifest relying on it learns that now, not by silence.
+        if "mcp" in m:
+            err = mcp_door_error(m)
+            if err:
+                errs.append(err)
+        if "openapi" in m:
+            errs.append("openapi: reserved (RFC-0073 D1) -- REST/OData as MCP "
+                        "tools needs its own RFC first (capability idea I-39)")
+        if "mcp_sources" in m:
+            if not isinstance(m["mcp_sources"], dict):
+                errs.append("mcp_sources: object expected")
+            elif set(m["mcp_sources"]) - {"read"}:
+                errs.append("mcp_sources: only 'read' is known")
+            elif "read" in m["mcp_sources"] and not isinstance(m["mcp_sources"]["read"], bool):
+                errs.append("mcp_sources.read: true or false")
         # Manifest 0.10 (RFC-0071 §15): one of two words. A typo must not
         # decide whether the node rebuilds an instance by itself.
         if "care" in m:
@@ -12202,7 +12223,8 @@ def _cases_issue_submit_key(name, tenant_id):
 
 # env variable -> what it is. One table, read by every step above.
 INSTANCE_KEY_VARS = ("OAAP_PLATFORM_KEY", "OAAP_AUTHZ_KEY",
-                     "OAAP_AUTHZ_ADMIN_KEY", "OAAP_CASES_KEY")
+                     "OAAP_AUTHZ_ADMIN_KEY", "OAAP_CASES_KEY",
+                     "OAAP_MCP_SOURCES_KEY")
 RENEW_DAYS = 30
 
 
@@ -12266,6 +12288,11 @@ def instance_keys_issue(name, tenant_id, app_id, which, administer=False, port=N
             if port:
                 out["OAAP_CASES_URL"] = (f"http://{GATEWAY_CONTAINER}:{port}"
                                          "/platform/cases/submit")
+        elif var == "OAAP_MCP_SOURCES_KEY":
+            out[var] = _mcp_issue_sources_key(name, tenant_id)
+            if port:
+                out["OAAP_MCP_SOURCES_URL"] = (f"http://{GATEWAY_CONTAINER}:{port}"
+                                               "/platform/mcp/sources")
     return out
 
 
@@ -12399,6 +12426,114 @@ def cases_submit_wanted(m):
     literal `cases: {submit: true}` -- "yes" is a typo, not a request."""
     return (m.get("cases") or {}).get("submit") is True if isinstance(
         m.get("cases"), dict) else False
+
+
+# ------------------------------------------------ MCP sources (RFC-0073)
+# An app declares ONE MCP door (`mcp: {path}`); a gateway app declares that
+# it reads the sources of its tenant (`mcp_sources: {read: true}`). The
+# gateway instance gets a key limited to `oaap.mcp.sources:<name>`, which
+# opens /platform/mcp/sources on its OWN site and nothing else (the D5
+# rule of the cases door). The list itself is written into that site by
+# the generator, so no service has to answer it, and it is rewritten
+# whenever a source comes, goes or changes (the site marker carries a
+# digest of it, refresh_cases_sites does the rest).
+MCP_SOURCES_SCOPE = "oaap.mcp.sources"
+MCP_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{0,200}$")
+
+
+def mcp_sources_scope(name):
+    return f"{MCP_SOURCES_SCOPE}:{name}"
+
+
+def mcp_door_error(m):
+    """'' when `mcp:` is a valid door, else the sentence for the operator.
+
+    A local path, nothing a URL could smuggle (no scheme, no `//`, no
+    `..`, no query), and under one of the app's own routes -- a door the
+    gateway's routes do not carry would be a door to nowhere, or one the
+    route's roles do not guard."""
+    d = m.get("mcp")
+    if not isinstance(d, dict):
+        return "mcp: object expected"
+    if set(d) - {"path"}:
+        return "mcp: only 'path' is known (one door per app, RFC-0073 D1)"
+    p = d.get("path")
+    if not isinstance(p, str) or not MCP_PATH_RE.match(p) or "//" in p \
+            or "/../" in p + "/" or p.endswith("/.."):
+        return "mcp.path: a local path such as /mcp"
+    for r in m.get("routes") or []:
+        rp = str((r or {}).get("path") or "")
+        if rp == "/" or p == rp or p.startswith(rp.rstrip("/") + "/"):
+            return ""
+    return f"mcp.path: {p} lies under none of the app's routes"
+
+
+def mcp_door(m_or_inst):
+    """The declared MCP path of a manifest or a registry record, or ''."""
+    d = (m_or_inst or {}).get("mcp")
+    return str(d.get("path") or "") if isinstance(d, dict) else ""
+
+
+def mcp_sources_wanted(m):
+    """Only a literal `mcp_sources: {read: true}`."""
+    d = m.get("mcp_sources")
+    return isinstance(d, dict) and d.get("read") is True
+
+
+def _mcp_issue_sources_key(name, tenant_id):
+    """Key for 'instance:<name>', limited to mcp_sources_scope(name)."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_T_INST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
+        "    'oaap.mcp.sources (RFC-0073)', m.KEY_MAX_DAYS, 'root')\n"
+        "print(json.dumps(secret))\n",
+        {"OAAP_T_NAME": f"instance:{name}", "OAAP_T_INST": name,
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": mcp_sources_scope(name)})
+    return json.loads(out)
+
+
+def mcp_sources_of(insts, scope):
+    """The sources a consuming gateway instance `scope` may see (D2, D7, D8).
+
+    Same tenant, this node (the registry is this node's), declares a door,
+    not a rehearsal, not the gateway itself. Sorted, so the digest in the
+    site marker only changes when the list does. Each entry names where
+    the platform gateway serves the door today: the source's own LAN
+    port, behind its routes' roles (stage 1; procedure I replaces the
+    address with the door on the gateway's own site in stage 2)."""
+    me = insts.get(scope) or {}
+    if not me.get("mcp_sources") or is_rehearsal(me):
+        return []
+    tenant = instance_tenant_ref(me)
+    out = []
+    for k, i in sorted(insts.items()):
+        path = mcp_door(i)
+        if k == scope or not path or is_rehearsal(i) or not i.get("port") \
+                or instance_tenant_ref(i) != tenant:
+            continue
+        out.append({"name": k, "app": i.get("app_id") or "",
+                    "version": i.get("version") or "",
+                    "channel": i.get("channel") or "",
+                    "path": path,
+                    "address": f"http://{GATEWAY_CONTAINER}:{i['port']}{path}"})
+    return out
+
+
+def mcp_sources_digest(insts, scope):
+    srcs = mcp_sources_of(insts, scope)
+    if not srcs:
+        return "-"
+    return hashlib.sha256(json.dumps(srcs, sort_keys=True).encode()).hexdigest()[:12]
 
 
 # ----------------------- business authorization (oaap.core.authorization 0.1)
@@ -13078,7 +13213,8 @@ CASES_MARKER = "# platform-feedback "
 # 4: /platform/cases/submit, the backend's door (RFC-0061 §3.2).
 # 5: /platform/cases/node on a `vorgaenge` site, the node's own door
 #    (RFC-0069 stage 2, oaap.core.updates 2.7.6).
-CASES_BLOCK_FORMAT = 5
+# 6: /platform/mcp/sources on a consuming gateway's site (RFC-0073).
+CASES_BLOCK_FORMAT = 6
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -13151,7 +13287,11 @@ def cases_marker(insts, scope):
     me = insts.get(scope) or {}
     return (f"{CASES_MARKER}{CASES_BLOCK_FORMAT} "
             f"{cases_target(insts, scope) or '-'} "
-            f"{me.get('app_id') or '-'}@{me.get('version') or '-'}")
+            f"{me.get('app_id') or '-'}@{me.get('version') or '-'}"
+            # RFC-0073: a consuming gateway's site carries its sources list,
+            # so it goes stale when another instance comes, goes or moves
+            + (f" mcp:{mcp_sources_digest(insts, scope)}"
+               if me.get("mcp_sources") else ""))
 
 
 def _platform_site_lines(routes, groups, scope, tenant, login_only):
@@ -13259,6 +13399,29 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
                       tenant or (instance_tenant_ref(me) if me else "-"))
             lines += _proxy(target, "\t\t", extra=[
                 f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
+        lines.append("\t}")
+    # RFC-0073 D2: on a consuming gateway's site only, the list of its
+    # tenant's MCP sources. The one credential that passes is the key
+    # limited to mcp_sources_scope(this instance); the answer is written
+    # here, so no service has to know the registry. A rehearsal or an
+    # instance in maintenance (login_only) serves none of it.
+    if me.get("mcp_sources") and not login_only and not is_rehearsal(me):
+        uri = "/verify?roles="
+        if tenant:
+            uri += f"&tenant={tenant}"
+        uri += f"&instance={mcp_sources_scope(scope or '-')}"
+        body = json.dumps({"v": 1, "sources": mcp_sources_of(insts, scope)},
+                          sort_keys=True, separators=(",", ":"))
+        lines.append("\thandle /platform/mcp/sources {")
+        lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
+                  "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
+        lines.append("\t\theader Content-Type application/json")
+        lines.append("\t\theader Cache-Control no-store")
+        # Backticks quote the body for Caddy; the values are instance
+        # names, app ids, versions and paths -- MCP_PATH_RE and the name
+        # rules leave no backtick in any of them.
+        assert "`" not in body
+        lines.append(f"\t\trespond `{body}` 200")
         lines.append("\t}")
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
@@ -14262,6 +14425,7 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_ADMIN_KEY", "OAAP_AUTHZ_URL",
                 "OAAP_INSTANCE_NAMES",
                 "OAAP_CASES_KEY", "OAAP_CASES_URL",
+                "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_SOURCES_URL",
                 "OAAP_CARE_URL"}  # platform-owned, never operator-editable
 
 
@@ -18507,6 +18671,20 @@ def _install_from_dir(pkg, args, source):
         env.pop("OAAP_CASES_URL", None)
         print(f"'{name}' no longer asks to open cases: its key is no longer "
               "handed to the app.")
+    # RFC-0073 D2/D8: a gateway app reads the MCP sources of its tenant
+    # through its own site. Minted once; never for a rehearsal.
+    if mcp_sources_wanted(m) and not is_artefact and not rehearsal:
+        if "OAAP_MCP_SOURCES_KEY" not in env:
+            env["OAAP_MCP_SOURCES_KEY"] = _mcp_issue_sources_key(name, twin_tenant)
+            print(f"Issued an MCP-sources key for '{name}' (RFC-0073) -- "
+                  "OAAP_MCP_SOURCES_KEY/OAAP_MCP_SOURCES_URL are in its environment.")
+        env["OAAP_MCP_SOURCES_URL"] = (f"http://{GATEWAY_CONTAINER}:{port}"
+                                       "/platform/mcp/sources")
+    elif "OAAP_MCP_SOURCES_KEY" in env:
+        env.pop("OAAP_MCP_SOURCES_KEY", None)
+        env.pop("OAAP_MCP_SOURCES_URL", None)
+        print(f"'{name}' no longer reads MCP sources: its key is no longer "
+              "handed to the app.")
     # RFC-0069 stage 3 (runtime 2.28): every instance is told where the node
     # says when it reboots. An address, not a credential -- a rehearsal gets
     # it too, its desk session ends with the same reboot.
@@ -18635,6 +18813,11 @@ def _install_from_dir(pkg, args, source):
         # rebuild on a fresh base changes nothing else. Verbatim; ''
         # when the manifest is silent, which counts as 'release'.
         "care_rebuild": str((m.get("care") or {}).get("rebuild") or ""),
+        # Manifest 0.11 (RFC-0073): the declared MCP door and whether this
+        # app reads its tenant's sources. Re-read on every install: both
+        # describe the app, neither is an operator's decision.
+        "mcp": ({"path": mcp_door(m)} if mcp_door(m) else {}),
+        "mcp_sources": mcp_sources_wanted(m),
         "build": primary["build"],
         "storage": m.get("storage") or [],
         # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the
@@ -18904,7 +19087,8 @@ def remove_instance(reg, name, purge):
         env = load_env(name, inst)
         kept_env = {k: v for k, v in env.items()
                     if k not in INSTANCE_KEY_VARS
-                    and k not in ("OAAP_CASES_URL", "OAAP_CARE_URL")}
+                    and k not in ("OAAP_CASES_URL", "OAAP_CARE_URL",
+                                  "OAAP_MCP_SOURCES_URL")}
         if kept_env != env:
             save_env(name, kept_env, inst)
     if purge:
