@@ -147,7 +147,17 @@ CONNECTOR_KINDS = {
             # RFC-0066 / destinations 2.9.6: who may edit an attribute a
             # destination acts on. Read only, never written.
             "user_profile": "/admin/realms/{space}/users/profile",
+            # RFC-0073 T6: is the person behind a binding's subject in
+            # this space? Read only, one record by its id, never a list
+            # and never written -- `never` below still holds. A narrow
+            # credential gets 403 here, and then nothing is re-pointed.
+            "user": "/admin/realms/{space}/users/{uuid}",
         },
+        # The provider's own id of a space, in the space document. It
+        # survives a new address and does NOT survive deleting and making
+        # the space again -- which is what makes it the proof of RFC-0073
+        # T6 that a space at a new issuer is the same space.
+        "space_id_field": "id",
         # RFC-0056: the narrow door for the customer's own
         # administrator. A GROUP that carries these roles of
         # `roles_client` and nothing else -- not a user, because
@@ -2085,6 +2095,25 @@ class Admin:
                 "not ours: on a shared server that is somebody else's club, "
                 "and OAAP manages only what it is allowed to manage "
                 "(RFC-0041 K3.3)")
+
+    def space_id(self, space):
+        """(id, error). The provider's own id of the space (RFC-0073 T6)."""
+        status, doc, err = self._call("GET", self._path("space", space=space))
+        if err:
+            return "", err
+        if status != 200 or not isinstance(doc, dict):
+            return "", f"the {self.decl['space_word']} '{space}' answered {status}"
+        return str(doc.get(self.decl.get("space_id_field", "id")) or ""), ""
+
+    def subject_known(self, space, subject):
+        """True / False / None (may not look). One record, by its id."""
+        if not subject or "/" in subject or "?" in subject:
+            return False
+        status, doc, err = self._call("GET", self._path("user", space=space,
+                                                          uuid=subject))
+        if err or status in (401, 403):
+            return None
+        return status == 200 and isinstance(doc, dict) and doc.get("id") == subject
 
     def find_space(self, space):
         """(exists, error). A 403 here is not "absent" -- see _not_ours."""

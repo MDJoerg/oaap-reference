@@ -421,17 +421,26 @@ ok("... und was ohne das passiert waere",
 ok("die Regel nennt die Messung, die sie widerlegt hat",
    "5.0" in MOVE_SRC.split("def rebind_refusal")[1][:2500])
 
-ok("umgehaengt wird nur beim Abloesen eines MITGEBRACHTEN Anbieters",
+# Zwei Stellen und keine dritte: der Umzug (rebind_refusal) und seit
+# 0.1.241 derselbe Realm an neuer Adresse (RFC-0073 T6,
+# same_space_rebind_refusal). Jede fragt ihre Regel in move.py.
+_t6 = APPCTL_SRC.split("def rebind_same_space")[1].split("\ndef ")[0]
+ok("umgehaengt wird nur beim Abloesen eines MITGEBRACHTEN Anbieters "
+   "oder bei DEMSELBEN Realm an neuer Adresse (T6)",
    "move.rebind_refusal" in APPCTL_SRC
-   and APPCTL_SRC.count("tenant_repoint_bindings(") == 2)
+   and "move.same_space_rebind_refusal" in _t6
+   and APPCTL_SRC.count("tenant_repoint_bindings(") == 3)
 ok("... und nur fuer die Menschen DIESES Mandanten",
    'resolve_tenant(u.get("tenant")) != tid'
    in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
 ok("... und nur fuer Bindungen mit GENAU dem alten Schluessel",
    'b.get("provider") != old_key'
    in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
+# Gelesen werden darf er (T6 filtert danach), geschrieben nie.
+_rp = APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500]
 ok("... der subject wird nicht angefasst",
-   '"subject"' not in APPCTL_SRC.split("def tenant_repoint_bindings")[1][:2500])
+   not re.search(r'\[\s*"subject"\s*\]\s*=|"subject"\s*:', _rp)
+   and 'b["provider"] = new_key' in _rp, _rp[:400])
 ok("... und es steht im Protokoll des Mandanten",
    "tenant.idp-repointed" in APPCTL_SRC)
 ok("die widerlegte Zusage steht nicht mehr als Zusage im Code",

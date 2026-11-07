@@ -382,6 +382,44 @@ def rebind_refusal(carried, old_key, new_key, tenant_label=""):
     return ""
 
 
+def same_space_rebind_refusal(before, connector, space, space_id_now,
+                              old_key, new_key):
+    """Why the bindings may NOT follow an issuer change in place (RFC-0073 T6).
+
+    The second situation, beside the move, in which OAAP knows that the
+    people behind the subjects are the same people: the SAME connector
+    provisioned the SAME space, and the provider's own id of that space
+    is unchanged -- only the address in front of it moved (measured on
+    2026-11-07: oaap-test went public, the realm got an https issuer,
+    every binding went void, and anna and bert would have come back as
+    strangers without their rights).
+
+    The id is the proof, not the name: a realm deleted and made again
+    under the same name gets a new id, and its people are other people
+    even where a name matches. Without a recorded id (a provider set
+    before 0.1.241) this answers with a reason, and the caller may ask
+    the provider for each subject instead -- that, too, only finds the
+    record of the same person, never somebody else's.
+    """
+    before = before or {}
+    if not old_key or not new_key or old_key == new_key:
+        return "the issuer did not change -- there is nothing to re-point"
+    if not before.get("connector") or before.get("connector") != connector:
+        return ("the provider was not made by this connector before, so "
+                "OAAP does not know it is the same space")
+    if not before.get("space") or before.get("space") != space:
+        return ("it is a different space at the provider, so the people "
+                "behind these subjects are not known to be the same")
+    if not before.get("space_id"):
+        return "no-recorded-id"
+    if not space_id_now:
+        return "the provider did not say the id of the space"
+    if before["space_id"] != space_id_now:
+        return ("the space has the same name but a NEW id at the provider "
+                "-- it was made again, and its people are other people")
+    return ""
+
+
 def rebind_words(old_key, new_key, count):
     """What an operator is told when bindings were re-pointed."""
     return [

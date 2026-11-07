@@ -6147,16 +6147,26 @@ def cmd_idp(args):
             print("in a state nobody asked for (RFC-0041 K3.2).")
             sys.exit(1)
 
+        before_rec = dict(t.get("idp") or {})
+        before_key = idp.provider_key(idp.provider_of(t))
+        space_id, _sid_err = admin.space_id(space)
         ok, said = tenant_set_provider(
             tid, got["kind"], got["issuer"], got["client_id"],
             got["client_secret"], label=args.idp_label or "",
             version=got["version"], version_how=got.get("version_how", ""),
-            connector=name, space=space,
+            connector=name, space=space, space_id=space_id,
             who=os.environ.get("SUDO_USER") or getpass.getuser())
         if not ok:
             die("the provider was made and OAAP will not record it: " + said)
         print("")
         print(said[0].upper() + said[1:] + ".")
+        after_key = idp.provider_key(idp.provider_of(load_tenants()[tid]))
+        if before_key and before_key != after_key:
+            for line in rebind_same_space(
+                    tid, before_rec, before_key, after_key, admin, name,
+                    space, space_id,
+                    who=os.environ.get("SUDO_USER") or getpass.getuser()):
+                print(line)
         print("")
         print(f"  issuer       {got['issuer']}")
         print(f"  client       {got['client_id']}")
@@ -7121,7 +7131,66 @@ def _adopt_users(users):
         lambda have: (have + list(users), len(users)), "for the user merge")
 
 
-def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
+def rebind_same_space(tid, before_rec, old_key, new_key, admin, connector,
+                      space, space_id, who="root", role="root"):
+    """RFC-0073 T6: the bindings follow an issuer change IN PLACE. Lines.
+
+    Only when services/move.py says it is the same space (same
+    connector, same name, same id at the provider). For a provider
+    recorded before the id was (0.1.241), each bound subject is looked
+    up at the provider instead, and only those it finds are re-pointed;
+    a credential that may not look re-points nobody.
+    """
+    why = move.same_space_rebind_refusal(before_rec, connector, space,
+                                         space_id, old_key, new_key)
+    subjects = None
+    lines = [""]
+    if why == "no-recorded-id":
+        bound = [((u.get("idp") or {}).get("subject") or "")
+                 for u in (_read_identity_users() or [])
+                 if resolve_tenant(u.get("tenant")) == tid
+                 and (u.get("idp") or {}).get("provider") == old_key]
+        found, cannot = set(), 0
+        for sub in bound:
+            known = admin.subject_known(space, sub)
+            if known is None:
+                cannot += 1
+            elif known:
+                found.add(sub)
+        if cannot:
+            return lines + [
+                f"{len(bound)} binding(s) still name the old issuer and stay "
+                "void:",
+                "  the provider has no recorded id for this space (made before "
+                "0.1.241), and",
+                "  this credential may not look up a person to prove it is the "
+                "same space.",
+                f"  `oaap user unbind` breaks a binding; nothing was re-pointed."]
+        subjects = found
+        why = ""
+        lines.append(f"Same connector, same {admin.decl['space_word']} "
+                     f"'{space}': {len(found)} of {len(bound)} bound "
+                     "subject(s) found there by id.")
+    elif why:
+        return lines + ["The bindings under the old issuer stay void: " + why
+                        + "."]
+    else:
+        lines.append(f"Same connector, same {admin.decl['space_word']} "
+                     f"'{space}', same id at the provider: the bindings "
+                     "follow.")
+    count, err = tenant_repoint_bindings(
+        tid, old_key, new_key, who=who, role=role, subjects=subjects,
+        why="space, whose address changed while it stayed the same space "
+            "(RFC-0073 T6)")
+    if err:
+        return lines + ["The bindings could not be re-pointed: " + err]
+    return lines + [f"{count} binding(s) re-pointed: nobody signs in as a "
+                    "stranger, nobody lost a role.",
+                    f"  was   {old_key}", f"  is    {new_key}"]
+
+
+def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root",
+                            subjects=None, why=""):
     """(count, sentence). Move a club's bindings onto the new node.
 
     K4 binds a person to the PAIR `(issuer, sub)`. A move changes the
@@ -7143,6 +7212,8 @@ def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
             b = u.get("idp") or {}
             if b.get("provider") != old_key:
                 continue
+            if subjects is not None and b.get("subject") not in subjects:
+                continue
             b["provider"] = new_key
             b["repointed"] = _iso_now()
             u["idp"] = b
@@ -7159,7 +7230,7 @@ def tenant_repoint_bindings(tid, old_key, new_key, who="root", role="root"):
                      detail=f"{count} binding(s) moved from {old_key} -- "
                             "the subject of each is unchanged; only the "
                             "provider half, which is the address of the "
-                            "node that moved (RFC-0041 K6)")
+                            + (why or "node that moved (RFC-0041 K6)"))
     return count, ""
 
 
@@ -15654,7 +15725,7 @@ def ensure_idp_dir():
 
 def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                         label="", version="", who="root", role="root",
-                        connector="", space="", version_how=""):
+                        connector="", space="", version_how="", space_id=""):
     """Attach or change a tenant's identity provider. (ok, sentence).
 
     Refused for the DEFAULT tenant? No -- deliberately allowed. The
@@ -15677,11 +15748,15 @@ def tenant_set_provider(tid, kind, issuer, client_id, client_secret,
                 "version": (version or "").strip(),
                 "label": (label or "").strip(),
                 # Which connector made this, and what it is called at
-                # the provider. Both are for a human reading `tenant
-                # idp` later; neither is ever used to FIND anything,
-                # because the binding is the issuer and nothing else.
+                # the provider. None of the three is ever used to FIND
+                # a person -- the binding is the issuer and nothing
+                # else. They answer one question only (RFC-0073 T6):
+                # when the issuer changes, is it still the SAME space?
+                # `space_id` is the provider's own id of the space,
+                # which survives a new address.
                 "connector": (connector or "").strip(),
                 "space": (space or "").strip(),
+                "space_id": (space_id or "").strip(),
                 "version_how": (version_how or "").strip(),
                 "added": (t.get("idp") or {}).get("added") or _iso_now()}
     tenants[tid] = t
