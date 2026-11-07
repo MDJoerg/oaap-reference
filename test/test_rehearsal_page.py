@@ -25,6 +25,7 @@ gerendert — ohne Flask, ohne Container, ohne Knoten.
 Aufruf: python3 test/test_rehearsal_page.py
 """
 import ast
+from template_src import resolve  # noqa: E402
 import datetime
 import io
 import os
@@ -59,7 +60,7 @@ def template(name):
     for node in tree.body:
         if (isinstance(node, ast.Assign)
                 and any(getattr(t, "id", "") == name for t in node.targets)):
-            return ast.literal_eval(node.value)
+            return resolve(tree, node.value)
     raise AssertionError(f"{name} nicht in app.py gefunden")
 
 

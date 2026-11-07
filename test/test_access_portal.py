@@ -26,6 +26,7 @@ Daten ist, kein Vertrauen. Braucht kein Docker und keinen Knoten.
 Aufruf: python3 test/test_access_portal.py
 """
 import ast
+from template_src import resolve  # noqa: E402
 import contextlib
 import io
 import json
@@ -337,7 +338,7 @@ ok("ein eigener Reiter 'fernzugang', nicht der API-Schluessel-Reiter 'zugang'",
 tree = ast.parse(src)
 
 def template_const(name):
-    return next(ast.literal_eval(n.value) for n in tree.body
+    return next(resolve(tree, n.value) for n in tree.body
                if isinstance(n, ast.Assign)
                and any(getattr(t, "id", "") == name for t in n.targets))
 

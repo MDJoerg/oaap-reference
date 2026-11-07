@@ -27,6 +27,7 @@ Aufruf: python3 test/test_destinations_portal.py
 """
 import argparse
 import ast
+from template_src import resolve  # noqa: E402
 import contextlib
 import io
 import ipaddress
@@ -258,7 +259,7 @@ print("")
 print("=== die Seite bietet an, was der Worker annimmt ===")
 APP_PY = os.path.join(HERE, "..", "platform", "services", "portal", "app.py")
 tree = ast.parse(io.open(APP_PY, encoding="utf-8").read())
-body = next(ast.literal_eval(n.value) for n in tree.body
+body = next(resolve(tree, n.value) for n in tree.body
             if isinstance(n, ast.Assign)
             and any(getattr(t, "id", "") == "INSTANCE_EDIT_BODY" for t in n.targets))
 card = body.split("<h2>Destinationen</h2>")[1].split("</section>")[0]

@@ -33,6 +33,7 @@ Dateien. Braucht PyYAML (appctl) und jinja2, kein Docker, keinen Knoten.
 Aufruf: python3 test/test_diagnose.py
 """
 import ast
+from template_src import resolve  # noqa: E402
 import importlib
 import json
 import os
@@ -458,7 +459,7 @@ print("")
 print("Die Seite und die Kommandozeile")
 
 tree = ast.parse(SRC)
-BODY = next(ast.literal_eval(n.value) for n in tree.body
+BODY = next(resolve(tree, n.value) for n in tree.body
             if isinstance(n, ast.Assign)
             and any(getattr(t, "id", "") == "INSTANCE_EDIT_BODY"
                     for t in n.targets))
@@ -479,7 +480,14 @@ def render(diag, tab="diagnose"):
            "config": [], "endpoints": [], "links": [], "link_candidates": [],
            "groups": [], "roles": [], "storage": [], "services": [],
            "route_rows": [], "source_lines": [], "aliases": [],
-           "artifacts": [], "diag": diag},
+           "artifacts": [], "diag": diag,
+           # page() setzt "mode" immer (_mode_view, RFC-0059).
+           "mode": {"state": "", "maintenance": False},
+           # Neustart-Schutz und Abbild ohne Pflegedatei (0.1.227/0.1.228).
+           "care": {"known": False, "held": None, "plan_text": "", "overridden": False,
+                    "default_days": 7, "max_days": 30, "today": "2026-11-07",
+                    "max_day": "2026-12-07"},
+           "imgcare": {"known": False, "services": [], "state": ""}},
         tabs=iv.TABS, tab=tab, msg=None, error=None)
 
 
@@ -527,8 +535,11 @@ ok("die Maschine kennt beide Befehle",
 ok("logs, restart und diagnose sind Unterbefehle",
    all(f'sub.add_parser("{c}"' in APPCTL
        for c in ("logs", "restart", "diagnose", "state-index")))
+# Je Befehl, nicht als eine Zeichenfolge: seit 0.1.228 steht "rebuild"
+# dazwischen, und die Pruefung schlug an, obwohl alle drei da waren.
+_usage = next((l for l in OAAP_BIN.splitlines() if "Usage: oaap [" in l), "")
 ok("und stehen in der Hilfe des Wrappers",
-   "logs|restart|diagnose" in OAAP_BIN)
+   all(f"|{c}|" in _usage for c in ("logs", "restart", "diagnose")), _usage[:200])
 ok("an der Maschine braucht es kein Fenster",
    "whoever is at the machine" in APPCTL,
    "wer dort steht, hat Docker -- das Fenster ist fuer das PORTAL")

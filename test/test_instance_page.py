@@ -20,6 +20,7 @@ Festgehalten wird bewusst die REGEL, nicht das heutige Aussehen:
 Aufruf: python3 test/test_instance_page.py
 """
 import ast
+from template_src import resolve  # noqa: E402
 import io
 import os
 import re
@@ -60,7 +61,7 @@ def template(name):
     for node in tree.body:
         if (isinstance(node, ast.Assign)
                 and any(getattr(t, "id", "") == name for t in node.targets)):
-            return ast.literal_eval(node.value)
+            return resolve(tree, node.value)
     raise AssertionError(f"{name} nicht in app.py gefunden")
 
 
@@ -123,6 +124,15 @@ def render(tab, inst=None, **over):
         "endpoints": [], "node_exposed": False, "promote": None,
         "throttle_mode": "default", "throttle_rate": "",
         "throttle_default": "300 Anfragen pro 60 Sekunden",
+        # Standby/Wartung (RFC-0059): page() setzt "mode" immer
+        # (_mode_view); leer = wach und offen.
+        "mode": {"state": "", "maintenance": False},
+        # Neustart-Schutz und Abbild (0.1.227/0.1.228): so sehen _care_view
+        # und _image_view aus, solange der Knoten keine Pflegedatei hat.
+        "care": {"known": False, "held": None, "plan_text": "", "overridden": False,
+                 "default_days": 7, "max_days": 30, "today": "2026-11-07",
+                 "max_day": "2026-12-07"},
+        "imgcare": {"known": False, "services": [], "state": ""},
         # Instanz-Diagnose (RFC-0038). Kein Platzhalter: der Reiter
         # gehoert zu den Abschnitten, die diese Datei prueft, und der
         # Zustand steht im Objektkopf.

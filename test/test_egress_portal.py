@@ -33,6 +33,9 @@ os.environ["OAAP_DATA_DIR"] = DATA
 sys.path.insert(0, os.path.join(HERE, "..", "platform"))
 
 import appctl as m                                            # noqa: E402
+# Eine Destination pruefen fragt Docker nach seinen Netzen (dest_target_refusal);
+# der Test braucht laut Kopf kein Docker -- also keine.
+m.docker_subnets = lambda net=None: []
 
 try:
     from jinja2 import Environment

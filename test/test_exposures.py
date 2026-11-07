@@ -60,6 +60,9 @@ m.reload_gateway = lambda: RELOADS.append(1)
 m.docker_subnets = lambda net=None: []
 m.container_env = lambda container: None
 m.recreate_instance_containers = lambda name, *a, **kw: None
+# `connect exposures` fragt Docker, ob der Connect-Dienst laeuft -- ohne
+# Docker (im Portal-Abbild) brach der Test hier ab.
+m.connect_service_running = lambda: True
 os.makedirs(m.CADDY_APPS_DIR, exist_ok=True)
 os.makedirs(m.APPS_DIR, exist_ok=True)
 DEFAULT = m.ensure_default_tenant()

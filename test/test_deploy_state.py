@@ -256,9 +256,10 @@ print()
 print("=== Die Instanzseite zeigt es (§3/§4) ===")
 try:
     import ast
+    from template_src import resolve
     from jinja2 import Environment
     tree = ast.parse(app_py)
-    body = next(ast.literal_eval(n.value) for n in tree.body
+    body = next(resolve(tree, n.value) for n in tree.body
                 if isinstance(n, ast.Assign)
                 and any(getattr(t, "id", "") == "INSTANCE_EDIT_BODY"
                         for t in n.targets))
