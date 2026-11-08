@@ -132,6 +132,18 @@ ok("... einbetten dürfen nur die eigenen Adressen der Instanz",
 ok("... und der Block der Chat-Adresse selbst bleibt unverändert geschützt",
    "forward_auth" in site.split("https://chat.kunde.node.example {")[1].split("\n}\n")[0])
 
+m.load_external_conf = lambda: ("node.example", "10.0.0.1")
+m.write_external_caddy()
+site_e = io.open(os.path.join(m.CADDY_APPS_DIR, "external.caddy"), encoding="utf-8").read()
+block_e = site_e.split("http://chat--ui.kunde.node.example {")[1].split("\n}\n")[0] \
+    if "http://chat--ui.kunde.node.example {" in site_e else ""
+reg = m.load_registry()
+ok("hinter einem Edge: OAAP_UI_SANDBOX_ORIGINS nennt die Herkunft des Browsers (https)",
+   m.sandbox_origins_env(CHAT, reg["instances"][CHAT], ("node.example", "10.0.0.1"), reg) == "https://chat--ui.kunde.node.example")
+ok("... und frame-ancestors erlaubt https (was der Browser sieht) und http (was der Knoten bedient)",
+   "frame-ancestors https://chat.kunde.node.example http://chat.kunde.node.example" in block_e, block_e)
+m.load_external_conf = lambda: ("node.example", "")
+
 print("")
 print("=== reservierte Endung ===")
 X, out = install("chat", "spiel--ui")

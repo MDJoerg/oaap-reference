@@ -14683,8 +14683,10 @@ def write_external_caddy():
                                tenant=instance_tenant_ref(inst),
                                login_only=is_rehearsal(inst))
             lines.append("}")
-        own = " ".join(f"{scheme}://{h}" for h in
-                       dict.fromkeys(instance_names(inst) + instance_auto_hosts(name, inst, ext_host=host)))
+        # frame-ancestors compares what the BROWSER sees: https always (an edge
+        # terminates TLS), and behind an edge also the plain form the node serves.
+        hosts_ = list(dict.fromkeys(instance_names(inst) + instance_auto_hosts(name, inst, ext_host=host)))
+        own = " ".join([f"https://{h}" for h in hosts_] + ([f"http://{h}" for h in hosts_] if edge else []))
         for sbox in instance_sandbox_hosts(name, inst, ext_host=host, reg=reg):
             lines += sandbox_site(scheme, sbox, ui_sandbox_path(inst), inst["container"],
                                   inst["svc_port"], own, edge)
@@ -14788,11 +14790,16 @@ def instance_names_env(name, inst, ext_conf=None):
 
 
 def sandbox_origins_env(name, inst, ext_conf=None, reg=None):
-    """`OAAP_UI_SANDBOX_ORIGINS`: the sandbox origin(s) of an instance, as the
-    gateway serves them (RFC-0075); '' when it declares no sandbox."""
-    host, edge = load_external_conf() if ext_conf is None else ext_conf
-    scheme = "http" if edge else "https"
-    return ",".join(f"{scheme}://{h}" for h in instance_sandbox_hosts(name, inst, ext_host=host, reg=reg))
+    """`OAAP_UI_SANDBOX_ORIGINS`: the sandbox origin(s) of an instance AS THE BROWSER
+    SEES THEM (RFC-0075) -- always https: behind an edge the node speaks plain HTTP,
+    but the edge terminates TLS (RFC-0006), and an origin the browser compares is
+    the public one. '' when the instance declares no sandbox.
+
+    Unlike OAAP_INSTANCE_NAMES, which names the scheme the gateway serves: measured
+    on oaap-test (behind oaap-demo) 2026-11-08 -- with http here, frame-ancestors
+    and the sandbox's own check would never match the https page."""
+    host, _edge = load_external_conf() if ext_conf is None else ext_conf
+    return ",".join(f"https://{h}" for h in instance_sandbox_hosts(name, inst, ext_host=host, reg=reg))
 
 
 def container_env(container):
