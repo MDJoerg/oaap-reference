@@ -1758,35 +1758,92 @@ def _verify_act(scope):
     want = resolve_tenant(request.args.get("tenant", ""))
     if want is None or resolve_tenant(gwuser.get("tenant")) != want:
         return "Forbidden: the gateway and the source belong to different tenants", 403
-    # 2. The act token, checked like any token addressed to the platform.
+    # 2. The person's credential -- one of two, never both:
+    #    the act token (a provider token exchanged for the platform), or
+    #    since RFC-0074 the platform's OWN assertion addressed to this
+    #    gateway, which the gateway got at a chat's via door (procedure A).
     raw = request.headers.get(act.HEADER, "").strip()
+    own = request.headers.get(ACT_ASSERTION_HEADER, "").strip()
+    if raw and own:
+        return _key_refusal("invalid_request", "an act token and an act "
+                            "assertion together: one credential per call")
+    if own:
+        person, refusal = _act_assertion_person(own, gw, want, target, "mcp.act")
+        if refusal is not None:
+            return refusal
+    else:
+        person, refusal = _act_token_person(raw, gw, want, target)
+        if refusal is not None:
+            return refusal
+    if not person.get("active") or person.get("kind", "human") != "human":
+        return "Forbidden: this person is deactivated", 403
+    return _act_answer(person, target, want, f"instance:{gw}", "mcp.act",
+                       "A" if own else "I")
+
+
+def _act_token_person(raw, gw, want, target):
+    """(person, None) from a provider's act token, or (None, refusal)."""
     if not raw:
-        return _key_refusal("invalid_token", "no act token: procedure I needs a "
-                            "signed-in person's token, exchanged for the platform")
+        return None, _key_refusal("invalid_token", "no act token: procedure I "
+                                  "needs a signed-in person's token, exchanged "
+                                  "for the platform")
     provider, _secret = tenant_provider(want)
     if not provider:
-        return "Forbidden: this tenant has no identity provider", 403
+        return None, ("Forbidden: this tenant has no identity provider", 403)
     try:
         claims = act.check(raw, _act_keys(provider["issuer"]),
                            provider["issuer"], provider.get("client_id", ""))
     except act.Invalid as e:
         audit("mcp.act", want, target, result="denied", who=f"instance:{gw}",
               detail=f"act token refused: {e}")
-        return _key_refusal("invalid_token", f"act token refused: {e}")
-    # 3. The person behind it: the binding, and nothing else (D4, D5).
+        return None, _key_refusal("invalid_token", f"act token refused: {e}")
+    # The person behind it: the binding, and nothing else (D4, D5).
     person = idp.find_binding(load_users(), idp.provider_key(provider),
                               str(claims.get("sub") or ""), want)
     if person is None:
         audit("mcp.act", want, target, result="denied", who=f"instance:{gw}",
               detail="no binding on this node")
-        return ("Diese Person hat sich an diesem Ort noch nie angemeldet "
-                "— einmal im Portal anmelden.", 403)
-    if not person.get("active") or person.get("kind", "human") != "human":
-        return "Forbidden: this person is deactivated", 403
+        return None, ("Diese Person hat sich an diesem Ort noch nie angemeldet "
+                      "— einmal im Portal anmelden.", 403)
+    return person, None
+
+
+def _act_assertion_person(raw, audience, want, target, event):
+    """(person, None) from the platform's own assertion, or (None, refusal).
+
+    RFC-0074 §3.2: a token the platform addressed to `audience` -- the
+    instance presenting it -- checked with the platform's own key. The
+    person is the record with that id in that tenant; a person, active.
+    No fallback: anything else is 401/403, never the caller itself."""
+    claims, why = assertion.check(assertion_key(), raw, audience)
+    if claims is None:
+        audit(event, want, target, result="denied", who=f"instance:{audience}",
+              detail=f"act assertion refused: {why}")
+        return None, _key_refusal("invalid_token", f"act assertion refused: {why}")
+    if claims.get("ten") != want:
+        audit(event, want, target, result="denied", who=f"instance:{audience}",
+              detail="act assertion of another tenant")
+        return None, _key_refusal("invalid_token", "act assertion refused: it "
+                                  "belongs to another tenant")
+    person = next((u for u in load_users() if u.get("id") == claims.get("sub")),
+                  None)
+    if (not person or person.get("kind", "human") != "human"
+            or not person.get("active", True)
+            or resolve_tenant(person.get("tenant")) != want):
+        audit(event, want, target, result="denied", who=f"instance:{audience}",
+              detail="the person of the assertion is not here, not active, "
+                     "or not a person")
+        return None, ("Forbidden: this person is not entitled here", 403)
+    return person, None
+
+
+def _act_answer(person, target, want, who, event, procedure):
+    """Maintenance and route of `target` against the person, the audit
+    line, and the six headers with the assertion addressed to `target`."""
     maint = maintenance_of(target)
     if maint is not None and not may_pass_maintenance(person, maint):
         return maintenance_response(maint)
-    # 4. The source's route, exactly as for a session (fresh, every call).
+    # The target's route, exactly as for a session (fresh, every call).
     required = request.args.get("roles", "")
     groups = request.args.get("groups", "")
     route_refusal = ""
@@ -1799,14 +1856,70 @@ def _verify_act(scope):
         route_refusal = "Forbidden: this app belongs to another tenant"
     if route_refusal:
         # Every act is in the tenant's log (§8.7), the refused ones too.
-        audit("mcp.act", want, target, result="denied", who=f"instance:{gw}",
-              detail=f"for {person['username']}: {route_refusal}")
+        audit(event, want, target, result="denied", who=who,
+              detail=f"for {person['username']} ({procedure}): {route_refusal}")
         return route_refusal, 403
-    audit("mcp.act", want, target, who=f"instance:{gw}",
-          detail=f"for {person['username']}")
+    audit(event, want, target, who=who,
+          detail=f"for {person['username']} ({procedure})")
     # The six headers of a person (spec 2.3), the assertion addressed to
-    # the source -- built by the same function as for a session.
+    # the target -- built by the same function as for a session.
     return "", 204, identity_headers(person, target)
+
+
+# ---------------------------------------------------------------------------
+# PROCEDURE A (RFC-0074 §3.2): a chat acts at its tenant's MCP gateway as
+# the person speaking to it. The door /platform/mcp/via/<gateway>/ exists
+# only on the site of an instance declaring `mcp_client`, one block per
+# gateway of its tenant; its forward_auth asks /verify?via=oaap.mcp.client:
+# <chat>&instance=<gateway>&tenant=...&roles=... -- all of it written by
+# appctl. Two credentials, both required, neither enough alone:
+#   * the chat's client key, limited to EXACTLY that scope;
+#   * the assertion the platform gave the chat for this person, addressed
+#     to the chat, copied unchanged into X-OAAP-Act-Assertion.
+# The answer carries the person's six headers with a NEW assertion
+# addressed to the gateway: a credential addressed to the chat is never
+# used at the gateway (the rule of RFC-0073 §4.2).
+ACT_ASSERTION_HEADER = "X-OAAP-Act-Assertion"
+MCP_CLIENT_PREFIX = "oaap.mcp.client:"
+
+
+def _verify_via(scope):
+    """The forward-auth answer at a chat's via door (procedure A)."""
+    target = request.args.get("instance", "")
+    chat = act.gateway_of(scope, MCP_CLIENT_PREFIX)
+    if not chat or not target:
+        return "Forbidden: not an MCP client door", 403
+    # 1. The chat's own key, limited to exactly this door's scope.
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() != "bearer ":
+        return _key_refusal("invalid_token", "the chat's client key is missing")
+    token = auth[7:].strip()
+    chatuser, _m, refusal = _by_key(token, scope)
+    if refusal is not None:
+        return refusal
+    m = KEY_TOKEN_RE.fullmatch(token)
+    rec = next((k for k in load_keys() if m and k["id"] == m.group(1)), None)
+    if not rec or rec.get("instance") != scope \
+            or chatuser.get("username") != f"instance:{chat}" \
+            or chatuser.get("kind") != "machine":
+        return _key_refusal("insufficient_scope",
+                            "only this chat's client key opens this door", 403)
+    want = resolve_tenant(request.args.get("tenant", ""))
+    if want is None or resolve_tenant(chatuser.get("tenant")) != want:
+        return "Forbidden: the chat and the gateway belong to different tenants", 403
+    # 2. The person: the platform's assertion, addressed to the chat (§5.1),
+    #    never an act token -- a provider token has no business here.
+    if request.headers.get(act.HEADER, "").strip():
+        return _key_refusal("invalid_request", "procedure A takes the "
+                            "platform's assertion, not a provider token")
+    own = request.headers.get(ACT_ASSERTION_HEADER, "").strip()
+    if not own:
+        return _key_refusal("invalid_token", "no act assertion: procedure A "
+                            "needs the assertion of the person speaking to the chat")
+    person, refusal = _act_assertion_person(own, chat, want, target, "mcp.via")
+    if refusal is not None:
+        return refusal
+    return _act_answer(person, target, want, f"instance:{chat}", "mcp.via", "A")
 
 
 @app.get("/verify")
@@ -1833,6 +1946,8 @@ def verify():
     # `uri` is written by appctl), and it switches to a check of its own.
     if request.args.get("act"):
         return _verify_act(request.args.get("act", ""))
+    if request.args.get("via"):
+        return _verify_via(request.args.get("via", ""))
     user, _method, refusal = resolve_principal(
         request.args.get("instance", ""))
     # RFC-0059: before anything else, so an anonymous visitor sees the
