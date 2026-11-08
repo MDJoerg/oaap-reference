@@ -4011,7 +4011,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 12     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 13     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -4030,7 +4030,9 @@ MANIFEST_MINOR = 12     # 0.2 adds app.class (runtime spec 2.10);
                         # (RFC-0073 -- an app is an MCP source, a
                         # gateway finds the sources of its tenant);
                         # 0.12 adds mcp_client.use (RFC-0074 -- a chat
-                        # acts at its tenant's gateways as the person)
+                        # acts at its tenant's gateways as the person);
+                        # 0.13 adds ui_sandbox.path (RFC-0075 -- a second,
+                        # cookie-less origin for the views of MCP Apps)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -11434,6 +11436,12 @@ def validate_manifest(m):
             err = mcp_door_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.13 (RFC-0075 D6): the app serves a sandbox page for the
+        # views of MCP Apps; the platform gives it a second origin.
+        if "ui_sandbox" in m:
+            err = ui_sandbox_error(m)
+            if err:
+                errs.append(err)
         if "openapi" in m:
             errs.append("openapi: reserved (RFC-0073 D1) -- REST/OData as MCP "
                         "tools needs its own RFC first (capability idea I-39)")
@@ -12902,6 +12910,60 @@ def mcp_door_error(m):
         if rp == "/" or p == rp or p.startswith(rp.rstrip("/") + "/"):
             return ""
     return f"mcp.path: {p} lies under none of the app's routes"
+
+
+UI_SANDBOX_SUFFIX = "--ui"
+UI_SANDBOX_ENV = "OAAP_UI_SANDBOX_ORIGINS"
+
+
+def ui_sandbox_error(m):
+    """'' when `ui_sandbox:` is valid, else the sentence (manifest 0.13, RFC-0075)."""
+    d = m.get("ui_sandbox")
+    if not isinstance(d, dict):
+        return "ui_sandbox: object expected"
+    if set(d) - {"path"}:
+        return "ui_sandbox: only 'path' is known"
+    p = d.get("path")
+    if not isinstance(p, str) or not MCP_PATH_RE.match(p) or p == "/" or "//" in p \
+            or "/../" in p + "/" or p.endswith("/.."):
+        return "ui_sandbox.path: a local path such as /ui-sandbox (not /)"
+    return ""
+
+
+def ui_sandbox_path(m_or_inst):
+    """The declared sandbox path of a manifest or a registry record, or ''."""
+    d = (m_or_inst or {}).get("ui_sandbox")
+    return str(d.get("path") or "") if isinstance(d, dict) else ""
+
+
+def instance_sandbox_hosts(name, inst, ext_host=None, reg=None):
+    """The second origin(s) of an instance that serves a sandbox (RFC-0075 D6).
+
+    One per automatic address: `<local>--ui.<rest>`. The suffix is reserved
+    (no instance may be named `...--ui`); a name another instance holds as
+    its automatic address anyway is left out -- fail closed, never two apps
+    behind one name. A rehearsal gets none (spec 2.15.2)."""
+    if not ui_sandbox_path(inst) or is_rehearsal(inst or {}):
+        return []
+    autos = instance_auto_hosts(name, inst, ext_host=ext_host)
+    reg = reg or load_registry()
+    taken = {h for k, i in reg["instances"].items() if k != name
+             for h in instance_auto_hosts(k, i, ext_host=ext_host)}
+    out = []
+    for h in autos:
+        local, _, rest = h.partition(".")
+        cand = f"{local}{UI_SANDBOX_SUFFIX}.{rest}"
+        if cand not in taken:
+            out.append(cand)
+    return out
+
+
+def reserved_name_error(local):
+    """A name that would collide with sandbox origins (RFC-0075)."""
+    if (local or "").endswith(UI_SANDBOX_SUFFIX):
+        return (f"instance name: '{UI_SANDBOX_SUFFIX}' at the end is reserved for the "
+                "second origin of apps that show MCP App views (RFC-0075)")
+    return ""
 
 
 def mcp_door(m_or_inst):
@@ -14621,9 +14683,43 @@ def write_external_caddy():
                                tenant=instance_tenant_ref(inst),
                                login_only=is_rehearsal(inst))
             lines.append("}")
+        own = " ".join(f"{scheme}://{h}" for h in
+                       dict.fromkeys(instance_names(inst) + instance_auto_hosts(name, inst, ext_host=host)))
+        for sbox in instance_sandbox_hosts(name, inst, ext_host=host, reg=reg):
+            lines += sandbox_site(scheme, sbox, ui_sandbox_path(inst), inst["container"],
+                                  inst["svc_port"], own, edge)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return skipped
+
+
+def sandbox_site(scheme, host, path, container, port, frame_origins, edge=""):
+    """The second origin of an app showing MCP App views (RFC-0075 D6).
+
+    Only the declared sandbox path is passed on; everything else is 404. No
+    login, and nothing that could carry one: client-sent identity headers,
+    Cookie and Authorization are removed before the app, Set-Cookie after it
+    -- the view never shares the chat's session. Only the instance's own
+    names may frame the page (frame-ancestors)."""
+    lines = [f"{scheme}://{host} {{"]
+    if edge:
+        lines += _edge_guard(edge)
+    lines += _LOG_BLOCK
+    lines.append(f"\t@sandbox path {path} {path.rstrip('/')}/*")
+    lines.append("\thandle @sandbox {")
+    lines += strip_identity()
+    lines.append("\t\trequest_header -Cookie")
+    lines.append("\t\trequest_header -Authorization")
+    lines.append("\t\theader -Set-Cookie")
+    ancestors = frame_origins or "'none'"
+    lines.append(f'\t\theader Content-Security-Policy "frame-ancestors {ancestors}"')
+    lines += _proxy(f"{container}:{port}", "\t\t")
+    lines.append("\t}")
+    lines.append("\thandle {")
+    lines.append("\t\trespond 404")
+    lines.append("\t}")
+    lines.append("}")
+    return lines
 
 
 def tenant_place_hosts(ext_host=None):
@@ -14691,6 +14787,14 @@ def instance_names_env(name, inst, ext_conf=None):
     return ",".join(f"{scheme}://{h}" for h in dict.fromkeys(names))
 
 
+def sandbox_origins_env(name, inst, ext_conf=None, reg=None):
+    """`OAAP_UI_SANDBOX_ORIGINS`: the sandbox origin(s) of an instance, as the
+    gateway serves them (RFC-0075); '' when it declares no sandbox."""
+    host, edge = load_external_conf() if ext_conf is None else ext_conf
+    scheme = "http" if edge else "https"
+    return ",".join(f"{scheme}://{h}" for h in instance_sandbox_hosts(name, inst, ext_host=host, reg=reg))
+
+
 def container_env(container):
     """The environment a container really carries, or None when there is
     no such container. RFC-0043 §4 step 4: what the app reads is the
@@ -14727,15 +14831,18 @@ def sync_instance_names(reg, only=None, recreate=True):
         if only and name != only:
             continue
         value = instance_names_env(name, inst, ext)
+        sbox = sandbox_origins_env(name, inst, ext, reg)
         env = load_env(name, inst)
-        if (env.get(INSTANCE_NAMES_ENV) or "") != value:
-            if value:
-                env[INSTANCE_NAMES_ENV] = value
-            else:
-                env.pop(INSTANCE_NAMES_ENV, None)
+        if (env.get(INSTANCE_NAMES_ENV) or "") != value or (env.get(UI_SANDBOX_ENV) or "") != sbox:
+            for key, val in ((INSTANCE_NAMES_ENV, value), (UI_SANDBOX_ENV, sbox)):
+                if val:
+                    env[key] = val
+                else:
+                    env.pop(key, None)
             save_env(name, env, inst)
         have = container_env(inst.get("container", ""))
-        if have is None or (have.get(INSTANCE_NAMES_ENV) or "") == value:
+        if have is None or ((have.get(INSTANCE_NAMES_ENV) or "") == value
+                            and (have.get(UI_SANDBOX_ENV) or "") == sbox):
             continue
         if recreate:
             recreate_instance_containers(name, instance_services(inst),
@@ -19052,6 +19159,8 @@ def _install_from_dir(pkg, args, source):
     local = args.name or app["id"]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", local):
         die("instance name: lowercase [a-z0-9-]")
+    if reserved_name_error(local):
+        die(reserved_name_error(local))
     # A tenant chosen for this install: a label from the command line, an
     # id from a creation permit, or nothing. Only consulted for a NEW
     # instance -- what an existing one says always wins, so a redeploy
@@ -19587,6 +19696,9 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.12 (RFC-0074): this app acts at its tenant's MCP
         # gateways as the person speaking to it.
         "mcp_client": mcp_client_wanted(m),
+        # Manifest 0.13 (RFC-0075): the sandbox page for MCP App views; the
+        # gateway gives it a second, cookie-less origin.
+        "ui_sandbox": ({"path": ui_sandbox_path(m)} if ui_sandbox_path(m) else {}),
         "build": primary["build"],
         "storage": m.get("storage") or [],
         # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the
@@ -20076,6 +20188,8 @@ def rename_check(reg, given, new):
     """
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", new or ""):
         return "", "instance name: lowercase letters, digits and hyphens"
+    if reserved_name_error(new):
+        return "", reserved_name_error(new)
     key = given if given in reg["instances"] else ""
     if not key:
         for k, i in reg["instances"].items():
