@@ -2247,6 +2247,47 @@ def tenant_realm_mail_sync(tid, who="root"):
                                          else "not written"))
 
 
+def destination_admin_job(req, actor):
+    """The portal's page "Destinationen" (oaap.net.destinations 0.10 §2.7) -> (ok, sentence).
+
+    server_admin only, judged from the ACTOR's own record (acting_tenant), never
+    from the request. The same functions as `oaap destination add|set-secret|
+    remove`, with every check they make. The secret arrives in the request file
+    (0600, removed with the claim) and goes into the secret store; no sentence
+    and no log line carries it."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
+    if not tid:
+        return False, err or "requires server_admin"
+    if role != "server_admin":
+        return False, "adding, changing and removing destinations is the server_admin's (spec 2.7)"
+    name = str(a.get("name") or "")
+    try:
+        if op == "add":
+            auth = str(a.get("auth") or "none")
+            if auth not in ("none", "basic", "bearer", "header"):
+                return False, ("this page adds destinations with none, basic, bearer or header; "
+                               "principal propagation is the command line's")
+            destination_add(tid, name, str(a.get("kind") or "http"), str(a.get("target") or ""),
+                            auth, str(a.get("user") or ""), str(a.get("header") or ""),
+                            str(a.get("secret") or "") if auth != "none" else "",
+                            who=actor, role=role)
+            return True, (f"Destination „{name}“ angelegt. Erreichbar wird sie erst, wenn eine "
+                          "Instanz sie zugeordnet bekommt (Instanz → Destinationen).")
+        if op == "secret":
+            read = destination_set_secret(tid, name, str(a.get("secret") or ""), who=actor, role=role)
+            return True, (f"Geheimnis von „{name}“ gesetzt; das Gateway und jede zugeordnete "
+                          "Instanz haben es jetzt." + (f" Für den geschlossenen Mandanten neu gelesen: "
+                                                        f"{read}" if read else ""))
+        if op == "remove":
+            destination_remove(tid, name, who=actor, role=role)
+            return True, f"Destination „{name}“ entfernt, mit ihrem Geheimnis."
+        return False, f"unknown destination operation '{op}'"
+    except DestinationRefused as exc:
+        return False, str(exc)
+
+
 def mail_job(req, actor):
     """The portal's page "Nachrichten" (RFC-0072 stage 2) -> (ok, sentence).
 
@@ -27568,6 +27609,16 @@ def cmd_process_deploys(_args):
                              subject=str((req.get("args") or {}).get("cohort") or ""),
                              result="denied", who=actor or "api",
                              role=act_role or "-", detail=msg)
+        elif action == "destination-admin":
+            # oaap.net.destinations 0.10: the page "Destinationen". Role from the
+            # ACTOR's record; the secret in this request goes with the claim.
+            ok, msg = destination_admin_job(req, actor)
+            if not ok:
+                audit_tenant("destination." + str(req.get("op") or "?"),
+                             act_tenant or ensure_default_tenant(),
+                             subject=str((req.get("args") or {}).get("name") or ""),
+                             result="denied", who=actor or "portal", role=act_role or "-",
+                             detail=msg[:200])
         elif action == "mail":
             # RFC-0072 stage 2: the page "Nachrichten". Role and tenant from
             # the ACTOR's record (mail_job); the password in this request is

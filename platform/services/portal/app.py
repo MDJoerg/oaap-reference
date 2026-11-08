@@ -3214,8 +3214,9 @@ INSTANCE_EDIT_BODY = """
      das Protokoll des Mandanten vermerkt es.</p>
   {% else %}
   <p class="muted">Zuordnen und Lösen dauert einen Moment: Die App wird dabei mit der
-     neuen Umgebung neu gestartet. Ein Bedarf, den das Manifest nicht nennt, und ein
-     Anlegen neuer Destinationen laufen über die Kommandozeile:
+     neuen Umgebung neu gestartet. Neue Destinationen legt der Server-Admin auf der Seite
+     <a href="/destinationen">Destinationen</a> an. Ein Bedarf, den das Manifest nicht nennt, läuft
+     über die Kommandozeile:
      <code>oaap destination bind {{ i.key }} &lt;destination&gt; --as &lt;bedarf&gt;</code></p>
   {% endif %}
 </div>
@@ -12358,6 +12359,171 @@ def messages_outgoing(op):
     key = "msg" if res.get("ok") else "err"
     return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]),
                     code=303)
+
+
+# --- Destinationen (oaap.net.destinations 0.10 §2.7, oaap.core.portal 2.17) ----------
+#
+# The objects a tenant's apps may be bound to. A tenant_admin READS their own
+# tenant's list (what exists, what it is bound to); a server_admin also adds,
+# sets the secret and removes -- the same functions as `oaap destination`,
+# queued through the spool and judged again by the host from the actor's own
+# record. The secret travels in the request file (0600) into the secret store;
+# this page never shows one and the portal keeps none. Writing a target stays
+# the operator's (spec 2.7: a target a tenant writes would be a way into the
+# node's own networks until the check runs at connection time).
+
+DEST_WAIT_SECONDS = 90
+DEST_OPS = ("add", "secret", "remove")
+DEST_AUTH_WORDS = {"none": "keine", "basic": "Benutzer + Passwort", "bearer": "Bearer-Token",
+                   "header": "eigene Kopfzeile", "principal_propagation": "Person durchreichen (Zertifikat)"}
+
+
+def _destinations_facts(tid):
+    try:
+        with open(DESTINATIONS_FILE, encoding="utf-8") as f:
+            dests = (json.load(f) or {}).get("destinations") or {}
+    except (OSError, ValueError):
+        dests = {}
+    bound = {}
+    for key, inst in sorted(load_instances().items()):
+        if (inst.get("tenant") or default_tenant_id()) not in (tid,) and \
+                tenant_id_by_label(inst.get("tenant") or "") != tid:
+            continue
+        for need, name in sorted((inst.get("destinations") or {}).items()):
+            bound.setdefault(name, []).append(f"{key} (als {need})")
+    rows = []
+    for name, d in sorted((dests.get(tid) or {}).items()):
+        t = d.get("target") or {}
+        target = (t.get("direct") or (("über Tunnel " + t["via"]) if t.get("via") else "")
+                  or (("über Tunnel-App " + t["through"]) if t.get("through") else ""))
+        auth = (d.get("auth") or {})
+        rows.append({"name": name, "kind": d.get("kind", ""), "target": target,
+                     "auth": DEST_AUTH_WORDS.get(auth.get("type", "none"), auth.get("type", "")),
+                     "has_secret": auth.get("type", "none") not in ("none", "principal_propagation"),
+                     "mail": d.get("kind") == "smtp",
+                     "bound": bound.get(name, []),
+                     "allowed": bool(d.get("closed_allow")) if "closed_allow" in d else None,
+                     "created": (d.get("created") or "")[:16], "by": d.get("created_by", "")})
+    return {"rows": rows}
+
+
+DESTINATIONS_BODY = """
+<div class="pagehead"><h1>Destinationen{% if label %}: {{ label }}{% endif %}</h1></div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+<div class="card">
+  <h2>Ziele dieses Mandanten</h2>
+  <p class="muted">Eine Destination ist ein Ziel außerhalb der Apps — ein KI-Gateway, ein ERP, ein
+  Mailserver. Eine App erreicht es nur, wenn es ihr zugeordnet ist (Instanz → Destinationen →
+  Zuordnen). Die Zugangsdaten bleiben bei der Plattform; diese Seite zeigt sie nie.</p>
+  {% if f.rows %}
+  <table class="list"><tr><th>Name</th><th>Ziel</th><th>Anmeldung</th><th>Zugeordnet</th>{% if admin %}<th></th>{% endif %}</tr>
+  {% for r in f.rows %}<tr>
+    <td><code>{{ r.name }}</code><br><span class="muted">{{ r.kind }}{% if r.created %} · {{ r.created }}{% endif %}</span></td>
+    <td>{{ r.target or "—" }}</td>
+    <td>{{ r.auth }}</td>
+    <td>{% if r.bound %}{{ r.bound | join(", ") }}{% else %}<span class="muted">nichts</span>{% endif %}</td>
+    {% if admin %}<td>{% if r.mail %}<a class="rowaction" href="/nachrichten{{ q }}">auf „Nachrichten“</a>{% else %}
+      {% if r.has_secret %}<details><summary class="rowaction">Geheimnis setzen</summary>
+        <form method="post" action="/destinationen/secret{{ q }}">
+          <input type="hidden" name="name" value="{{ r.name }}">
+          <p><label>Neuer Wert<input type="password" name="secret" autocomplete="new-password" required></label></p>
+          <button class="btn">Setzen</button></form></details>{% endif %}
+      {% if not r.bound %}<form method="post" action="/destinationen/remove{{ q }}" style="margin-top:.4rem">
+          <input type="hidden" name="name" value="{{ r.name }}">
+          <label><input type="checkbox" name="confirm" value="1"> wirklich</label>
+          <button class="btn secondary">Entfernen</button></form>{% else %}<span class="muted">erst lösen, dann entfernen</span>{% endif %}
+    {% endif %}</td>{% endif %}
+  </tr>{% endfor %}
+  </table>
+  {% else %}<p class="muted">Dieser Mandant hat keine Destination.</p>{% endif %}
+  {% if not admin %}<p class="muted">Anlegen kann eine Destination der Betreiber des Knotens
+  (Server-Admin) — auf dieser Seite oder mit <code>oaap destination add</code>.</p>{% endif %}
+</div>
+{% if admin %}
+<div class="card">
+  <h2>Destination anlegen</h2>
+  <form method="post" action="/destinationen/add{{ q }}">
+    <p><label>Name (klein, Ziffern, Bindestrich)<input name="name" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"></label></p>
+    <p><label>Art<select name="kind"><option value="http">http (über das Gateway, Proxy)</option>
+      <option value="tcp">tcp (Übergabe: Adresse und Zugangsdaten in der App)</option></select></label></p>
+    <p><label>Ziel<input name="target" required placeholder="https://host[:port][/basis], tcp://host:port, via:&lt;tunnel&gt;/&lt;angebot&gt;"></label></p>
+    <p><label>Anmeldung<select name="auth">
+      <option value="none">keine</option><option value="bearer">Bearer-Token</option>
+      <option value="basic">Benutzer + Passwort</option><option value="header">eigene Kopfzeile</option></select></label></p>
+    <p><label>Benutzer (bei Benutzer + Passwort)<input name="user"></label></p>
+    <p><label>Name der Kopfzeile (bei eigener Kopfzeile)<input name="header" placeholder="X-Api-Key"></label></p>
+    <p><label>Geheimnis (Passwort, Token oder Wert der Kopfzeile)<input type="password" name="secret" autocomplete="new-password"></label></p>
+    <button class="btn">Anlegen</button>
+  </form>
+  <p class="muted">Dieselben Prüfungen wie <code>oaap destination add</code>: Ziele in den eigenen Netzen des
+  Knotens werden abgewiesen. Personen durchreichen (Zertifikat) und SAP-Regeln gibt es nur an der
+  Kommandozeile. Für einen geschlossenen Mandanten liest der Knoten ein KI-Gateway beim Anlegen
+  und erlaubt nur Ampel grün.</p>
+</div>
+{% endif %}
+"""
+
+
+def _destinations_target():
+    """Like the page Nachrichten: a tenant_admin reads their own tenant, a
+    server_admin names one with ?tenant= (without it, the node's)."""
+    return _messages_target()
+
+
+@app.get("/destinationen")
+def destinations_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label, role = _destinations_target()
+    if tid is None:
+        return role
+    named = role == "server_admin" and tid != default_tenant_id()
+    return page(DESTINATIONS_BODY, "Destinationen", "destinations",
+                label=(label if tid != default_tenant_id() else ""),
+                f=_destinations_facts(tid), admin=role == "server_admin",
+                q=(f"?tenant={quote(label)}" if named else ""),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.post("/destinationen/<op>")
+def destinations_post(op):
+    """One button, one request; the host asks the role again (server_admin)
+    and runs the same function as the command line."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _destinations_target()
+    if tid is None:
+        return role
+    named = role == "server_admin" and tid != default_tenant_id()
+    back = "/destinationen" + (f"?tenant={quote(label)}" if named else "")
+    joiner = "&" if "?" in back else "?"
+    if role != "server_admin":
+        return ("Zugriff verweigert: Destinationen anlegen und ändern ist Sache des "
+                "Server-Admins (oaap.net.destinations 2.7).", 403)
+    if op not in DEST_OPS:
+        return redirect(back, code=303)
+    args = {"tenant": tid, "name": (request.form.get("name") or "").strip()[:40]}
+    if op == "add":
+        for k, mx in (("kind", 8), ("target", 500), ("auth", 24), ("user", 254), ("header", 80)):
+            args[k] = (request.form.get(k) or "").strip()[:mx]
+        args["secret"] = (request.form.get("secret") or "")[:4096]
+    elif op == "secret":
+        args["secret"] = (request.form.get("secret") or "")[:4096]
+    elif op == "remove" and not request.form.get("confirm"):
+        return redirect(f"{back}{joiner}err=" + quote("Bitte „wirklich“ ankreuzen."), code=303)
+    res = _queue_with_id(_uuid.uuid4().hex, "",
+                         {"action": "destination-admin", "op": op, "args": args},
+                         DEST_WAIT_SECONDS)
+    if res is None:
+        return redirect(f"{back}{joiner}err=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    key = "msg" if res.get("ok") else "err"
+    return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]), code=303)
 
 
 # --- Abfluss: every way out of a tenant (RFC-0068 §5, §6) -------------------
