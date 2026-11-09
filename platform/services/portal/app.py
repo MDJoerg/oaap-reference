@@ -203,9 +203,17 @@ STYLE = """
        padding:.8rem 0 1rem}
   nav.side .navfoot{flex:none;padding:.6rem 1.2rem;font-size:.75rem;
        color:var(--oaap-muted);border-top:1px solid var(--oaap-border)}
-  nav.side h3{font-size:.7rem;font-weight:600;text-transform:uppercase;
-       letter-spacing:.06em;color:var(--oaap-muted);margin:1.2rem 1.2rem .3rem}
-  nav.side h3:first-child{margin-top:.3rem}
+  /* Groups fold (a <details>, works without JavaScript); the group of the
+     active page is always open, the others remember their state. */
+  nav.side summary{font-size:.7rem;font-weight:600;text-transform:uppercase;
+       letter-spacing:.06em;color:var(--oaap-muted);margin:.9rem 0 .2rem;
+       padding:.3rem 1.2rem;cursor:pointer;list-style:none;display:flex;
+       align-items:center;gap:.4rem;user-select:none}
+  nav.side summary::-webkit-details-marker{display:none}
+  nav.side summary::before{content:"▸";font-size:.8rem;transition:transform .15s}
+  nav.side details[open]>summary::before{transform:rotate(90deg)}
+  nav.side summary:hover{color:var(--oaap-text)}
+  nav.side details:first-child>summary{margin-top:.1rem}
   nav.side a{display:flex;align-items:center;min-height:44px;padding:0 1.2rem;
        color:var(--oaap-text);text-decoration:none;border-left:3px solid transparent}
   nav.side a:hover{background:var(--oaap-bg)}
@@ -393,9 +401,10 @@ LAYOUT = STYLE + """
   <nav class="side" aria-label="Verwaltung">
     <div class="links">
     {% for g in nav_groups %}
-    <h3>{{ g.title }}</h3>
+    <details open data-group="{{ g.title }}"{% if g.links|selectattr('active')|list %} data-active="1"{% endif %}>
+    <summary>{{ g.title }}</summary>
     {% for l in g.links %}<a href="{{ l.href }}" class="{{ 'active' if l.active }}">{{ l.label }}</a>
-    {% endfor %}{% endfor %}
+    {% endfor %}</details>{% endfor %}
     </div>
     <div class="navfoot">OAAP-Plattform {{ version }}</div>
   </nav>
@@ -403,7 +412,14 @@ LAYOUT = STYLE + """
   (function(){var h=document.querySelector('header.oaap');
     function fit(){if(innerWidth>900)document.documentElement.style.setProperty('--hdr-h',h.offsetHeight+'px');
       else document.documentElement.style.removeProperty('--hdr-h');}
-    fit();addEventListener('resize',fit);})();
+    fit();addEventListener('resize',fit);
+    var K='oaap.nav.folded',f=[];try{f=JSON.parse(localStorage.getItem(K)||'[]')}catch(e){}
+    document.querySelectorAll('nav.side details').forEach(function(d){
+      if(!d.dataset.active&&f.indexOf(d.dataset.group)>=0)d.open=false;
+      d.addEventListener('toggle',function(){
+        var i=f.indexOf(d.dataset.group);
+        if(d.open&&i>=0)f.splice(i,1);else if(!d.open&&i<0)f.push(d.dataset.group);
+        try{localStorage.setItem(K,JSON.stringify(f))}catch(e){}});});})();
   </script>
   {% endif %}
   <div class="work">

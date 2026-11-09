@@ -73,8 +73,13 @@ ok("Kopfzeile: Benutzermenue mit Profil, Passwort, Abmelden",
 ok("Abmelden ist ein POST und das einzige Formular des Geruests",
    h.count("<form") == 1 and '<form method="post" action="/auth/logout">' in h)
 ok("Seitenleiste mit Gruppen",
-   all(f"<h3>{g}</h3>" in side for g in ("Betrieb", "Menschen &amp; Zugänge",
-                                          "Katalog &amp; Daten", "Kommunikation")), side)
+   all(f"<summary>{g}</summary>" in side for g in ("Betrieb", "Menschen &amp; Zugänge",
+                                                    "Katalog &amp; Daten", "Kommunikation")), side)
+# 0.1.246: Gruppen klappen ein (<details>, ohne JavaScript offen); die Gruppe
+# der aktiven Seite traegt data-active und bleibt offen.
+ok("Gruppen einklappbar, ohne Skript offen", side.count("<details open") == 4, side)
+ok("nur die Gruppe der aktiven Seite ist markiert",
+   re.findall(r'data-group="([^"]+)" data-active="1"', side) == ["Betrieb"], side)
 ok("Gesundheit ist aktiv, sonst keiner",
    re.findall(r'<a href="([^"]+)" class="active"', side) == ["/health"], side)
 ok("kein Zwilling ohne Mandantenrolle", 'href="/zwilling"' not in side)
