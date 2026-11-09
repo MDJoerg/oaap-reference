@@ -2047,13 +2047,22 @@ def mail_public_refusal(host, port):
     save, at test and at every write into a realm, not once. What stays is a
     name that turns inward after the check; TLS with certificate checking is
     what makes that a failed handshake rather than a conversation."""
-    import ipaddress
     if int(port) not in MAIL_TENANT_PORTS:
         return ("a tenant's mailbox uses port 465 (TLS) or 587 (STARTTLS) "
                 "-- nothing else")
+    return public_host_refusal(host, port, "a tenant's mailbox must be a server "
+                                           "on the internet")
+
+
+def public_host_refusal(host, port, what):
+    """Why `host` is not a server on the internet, or "" (RFC-0072 D10, and
+    since oaap.net.destinations 0.11 a tenant's own http destination): every
+    address it resolves to must be global and outside the container runtime's
+    ranges. `what` ends the sentence -- who needs a public server."""
+    import ipaddress
     try:
         infos = socket.getaddrinfo(host, int(port), proto=socket.IPPROTO_TCP)
-    except (socket.gaierror, UnicodeError, OSError):
+    except (socket.gaierror, UnicodeError, OSError, ValueError):
         return f"'{host}' does not resolve"
     addrs = sorted({i[4][0] for i in infos})
     if not addrs:
@@ -2062,8 +2071,7 @@ def mail_public_refusal(host, port):
     for a_ in addrs:
         ip = ipaddress.ip_address(a_.split("%")[0])
         if not ip.is_global or any(ip.version == n.version and ip in n for n in nets):
-            return (f"'{host}' resolves to {a_}, which is not a public address "
-                    "-- a tenant's mailbox must be a server on the internet")
+            return f"'{host}' resolves to {a_}, which is not a public address -- {what}"
     return ""
 
 
@@ -2247,6 +2255,95 @@ def tenant_realm_mail_sync(tid, who="root"):
                                          else "not written"))
 
 
+# oaap.core.tenant 1.7: rights a server_admin hands to the tenant_admin of ONE
+# tenant. One table -- a right nobody listed here cannot be switched on by a
+# typo, and `oaap tenant show` and the portal read the same words.
+TENANT_ADMIN_MAY = {
+    "destinations": "add, give a secret to and remove the tenant's own "
+                    "destinations (https targets on public addresses only, "
+                    "oaap.net.destinations 2.7.1)",
+}
+
+
+def tenant_admin_may(tid, what):
+    """Has the server_admin handed `what` to this tenant's tenant_admin?"""
+    return what in ((load_tenants().get(tid) or {}).get("tenant_admin_may") or [])
+
+
+def tenant_set_admin_may(tid, what, on, who="root", role="root"):
+    """Switch one right of TENANT_ADMIN_MAY for one tenant -> (ok, sentence).
+
+    The server_admin's alone, judged HERE: the CLI (root), the portal's job
+    and any later caller come through this function. Switching off takes
+    the right, not what was made with it -- those destinations keep working,
+    and from then on only the server_admin changes them."""
+    if role not in ("root", "server_admin"):
+        return False, "only the server_admin moves this switch (oaap.core.tenant 1.7)"
+    if what not in TENANT_ADMIN_MAY:
+        return False, (f"there is no right '{what}' to hand over -- known: "
+                       + ", ".join(sorted(TENANT_ADMIN_MAY)))
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    if tid == default_tenant_id():
+        return False, ("the node's own tenant is the operator's -- there is no "
+                       "tenant_admin to hand this to")
+    label = t.get("label", "?")
+    have = set(t.get("tenant_admin_may") or [])
+    if (what in have) == bool(on):
+        return True, (f"unchanged: the tenant_admin of '{label}' "
+                      f"{'may' if on else 'may not'} {what}")
+    if on:
+        have.add(what)
+    else:
+        have.discard(what)
+    t["tenant_admin_may"] = sorted(have)
+    tenants[tid] = t
+    save_tenants(tenants)
+    audit_tenant("tenant.allow" if on else "tenant.disallow", tid, subject=what,
+                 who=who, role=role, detail=TENANT_ADMIN_MAY[what])
+    if on:
+        return True, f"the tenant_admin of '{label}' may now {what}"
+    return True, (f"the tenant_admin of '{label}' may no longer {what}; what they "
+                  "made stays and works, and only the server_admin changes it")
+
+
+DEST_TENANT_AUTH = ("none", "basic", "bearer", "header")
+
+
+def dest_tenant_refusal(name, kind, target, auth_type):
+    """oaap.net.destinations 2.7.1: why a tenant_admin may not write this
+    destination, or "".
+
+    A target a tenant writes is a place the platform's gateway connects to
+    from inside the node. So: http only, https only, never a tunnel, and the
+    name resolves to public addresses only -- asked at save. What stays is a
+    name that turns inward later; the gateway checks the server certificate
+    against the name (Caddy's default for an https upstream), and a service
+    on the node's own networks has none for a public name, so that is a
+    failed handshake, not a conversation. The same argument as a tenant's
+    mailbox (2.11), measured there."""
+    if name == MAIL_DEST:
+        return "'mail' is the tenant's mailbox -- that is the page Nachrichten"
+    if kind != "http":
+        return ("a tenant_admin adds http destinations only: a tcp destination "
+                "hands the address to the app, and nothing between them checks it")
+    t = (target or "").strip()
+    if t.startswith(("via:", "through:")):
+        return "destinations through a tunnel stay the server_admin's"
+    if not t.lower().startswith("https://"):
+        return ("a tenant_admin's target starts with https:// -- the certificate "
+                "check is what turns a name that later points inward into a "
+                "failed handshake")
+    if auth_type not in DEST_TENANT_AUTH:
+        return ("a tenant_admin's destination authenticates with "
+                + ", ".join(DEST_TENANT_AUTH))
+    _s, host, port, _b = parse_dest_target("http", t)
+    return public_host_refusal(host, port or 443,
+                               "a tenant's destination must be a server on the internet")
+
+
 def destination_admin_job(req, actor):
     """The portal's page "Destinationen" (oaap.net.destinations 0.10 §2.7) -> (ok, sentence).
 
@@ -2260,19 +2357,44 @@ def destination_admin_job(req, actor):
     tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
     if not tid:
         return False, err or "requires server_admin"
-    if role != "server_admin":
-        return False, "adding, changing and removing destinations is the server_admin's (spec 2.7)"
+    if op == "allow":
+        # oaap.core.tenant 1.7: the switch itself is the server_admin's.
+        if role != "server_admin":
+            return False, "only the server_admin moves this switch (oaap.core.tenant 1.7)"
+        on = bool(a.get("on"))
+        ok, said = tenant_set_admin_may(tid, "destinations", on, who=actor, role=role)
+        if not ok:
+            return False, said
+        return True, ("Gespeichert: der Mandanten-Admin darf jetzt Destinationen selbst anlegen "
+                      "(nur https, nur öffentliche Adressen)." if on else
+                      "Gespeichert: der Mandanten-Admin legt keine Destinationen mehr an. Was er "
+                      "angelegt hat, bleibt und funktioniert; ändern kann es nur der Server-Admin.")
+    by_tenant = role == "tenant_admin" and tenant_admin_may(tid, "destinations")
+    if role != "server_admin" and not by_tenant:
+        return False, ("adding, changing and removing destinations is the server_admin's "
+                       "(spec 2.7), unless the server_admin handed it to this tenant (2.7.1)")
     name = str(a.get("name") or "")
+    if by_tenant and op in ("secret", "remove"):
+        d = (load_destinations().get(tid) or {}).get(name)
+        if d is not None and d.get("author") != "tenant_admin":
+            return False, ("the operator made this destination -- changing or removing it "
+                           "stays the server_admin's (2.7.1)")
     try:
         if op == "add":
             auth = str(a.get("auth") or "none")
             if auth not in ("none", "basic", "bearer", "header"):
                 return False, ("this page adds destinations with none, basic, bearer or header; "
                                "principal propagation is the command line's")
-            destination_add(tid, name, str(a.get("kind") or "http"), str(a.get("target") or ""),
+            kind = str(a.get("kind") or "http")
+            if by_tenant:
+                bad = dest_tenant_refusal(name, kind, str(a.get("target") or ""), auth)
+                if bad:
+                    return False, bad
+            destination_add(tid, name, kind, str(a.get("target") or ""),
                             auth, str(a.get("user") or ""), str(a.get("header") or ""),
                             str(a.get("secret") or "") if auth != "none" else "",
-                            who=actor, role=role)
+                            who=actor, role=role,
+                            author="tenant_admin" if by_tenant else "")
             return True, (f"Destination „{name}“ angelegt. Erreichbar wird sie erst, wenn eine "
                           "Instanz sie zugeordnet bekommt (Instanz → Destinationen).")
         if op == "secret":
@@ -2471,7 +2593,7 @@ def cmd_mail(args):
 def destination_add(tid, name, kind, target, auth_type="none", user="",
                     header="", secret="", who="root", role="root",
                     accept_sha256="", claims=(), name_check="",
-                    lifetime=10, unchecked_claim=""):
+                    lifetime=10, unchecked_claim="", author=""):
     if not re.fullmatch(DEST_NAME_RE, name or ""):
         raise DestinationRefused("a destination name is [a-z0-9-], 2-40 "
                                  "characters, starting and ending with a "
@@ -2539,6 +2661,10 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
                  "auth": auth,
                  "secret": auth_type not in ("none", "principal_propagation"),
                  "created": _iso_now(), "created_by": who}
+    if author:
+        # oaap.net.destinations 2.7.1: a target a tenant_admin wrote. Only
+        # such a destination may that tenant_admin change or remove again.
+        own[name]["author"] = author
     if auth_type == "principal_propagation":
         ensure_assertion_key()
     if auth_type not in ("none", "principal_propagation"):
@@ -8896,6 +9022,23 @@ def cmd_tenant(args):
             print("the Eingang. Change it with `oaap tenant policy`.")
         return
 
+    if args.action in ("allow", "disallow"):
+        # oaap.core.tenant 1.7: hand one right to this tenant's tenant_admin.
+        label = (args.name or "").strip().lower()
+        tid, _t = tenant_by_label(label, include_former=False)
+        if not tid:
+            die(f"no tenant with the label '{label}'")
+        what = (args.target or "").strip()
+        if not what:
+            die(f"which right? oaap tenant {args.action} {label} <right> -- known: "
+                + ", ".join(f"{k} ({v})" for k, v in sorted(TENANT_ADMIN_MAY.items())))
+        ok, msg = tenant_set_admin_may(tid, what, args.action == "allow",
+                                       who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            die(msg)
+        print(msg[0].upper() + msg[1:] + ".")
+        print(f"In this tenant's log: sudo oaap tenant log {label}")
+        return
     if args.action == "policy":
         label = (args.name or "").strip().lower()
         tid, t = tenant_by_label(label, include_former=False)
@@ -9158,6 +9301,9 @@ def cmd_tenant(args):
     # Counts, not names: this is an inventory, not a data export.
     print(f"Users:     {users}")
     print(f"Instances: {instances}")
+    # oaap.core.tenant 1.7: what the server_admin handed to its tenant_admin.
+    may = t.get("tenant_admin_may") or []
+    print(f"Tenant admin may also: {', '.join(may) if may else '(nothing beyond the role)'}")
 
 
 # ------------------------------------------------ node profiles (RFC-0011)
@@ -30872,7 +31018,7 @@ def main():
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
-                               "build", "egress"])
+                               "build", "egress", "allow", "disallow"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "

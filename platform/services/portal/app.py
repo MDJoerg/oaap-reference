@@ -12401,11 +12401,13 @@ def messages_outgoing(op):
 # queued through the spool and judged again by the host from the actor's own
 # record. The secret travels in the request file (0600) into the secret store;
 # this page never shows one and the portal keeps none. Writing a target stays
-# the operator's (spec 2.7: a target a tenant writes would be a way into the
-# node's own networks until the check runs at connection time).
+# the operator's (spec 2.7) -- unless the server_admin switched it on for this
+# one tenant (2.7.1, oaap.core.tenant 1.7): then its tenant_admin adds https
+# targets on public addresses and changes only what they added. The switch
+# sits on this page, for the server_admin; the host judges both again.
 
 DEST_WAIT_SECONDS = 90
-DEST_OPS = ("add", "secret", "remove")
+DEST_OPS = ("add", "secret", "remove", "allow")
 DEST_AUTH_WORDS = {"none": "keine", "basic": "Benutzer + Passwort", "bearer": "Bearer-Token",
                    "header": "eigene Kopfzeile", "principal_propagation": "Person durchreichen (Zertifikat)"}
 
@@ -12435,8 +12437,10 @@ def _destinations_facts(tid):
                      "mail": d.get("kind") == "smtp",
                      "bound": bound.get(name, []),
                      "allowed": bool(d.get("closed_allow")) if "closed_allow" in d else None,
-                     "created": (d.get("created") or "")[:16], "by": d.get("created_by", "")})
-    return {"rows": rows}
+                     "created": (d.get("created") or "")[:16], "by": d.get("created_by", ""),
+                     "own": d.get("author") == "tenant_admin"})
+    may = "destinations" in ((load_tenants().get(tid) or {}).get("tenant_admin_may") or [])
+    return {"rows": rows, "may": may}
 
 
 DESTINATIONS_BODY = """
@@ -12449,13 +12453,13 @@ DESTINATIONS_BODY = """
   Mailserver. Eine App erreicht es nur, wenn es ihr zugeordnet ist (Instanz → Destinationen →
   Zuordnen). Die Zugangsdaten bleiben bei der Plattform; diese Seite zeigt sie nie.</p>
   {% if f.rows %}
-  <table class="list"><tr><th>Name</th><th>Ziel</th><th>Anmeldung</th><th>Zugeordnet</th>{% if admin %}<th></th>{% endif %}</tr>
+  <table class="list"><tr><th>Name</th><th>Ziel</th><th>Anmeldung</th><th>Zugeordnet</th>{% if admin or self_admin %}<th></th>{% endif %}</tr>
   {% for r in f.rows %}<tr>
-    <td><code>{{ r.name }}</code><br><span class="muted">{{ r.kind }}{% if r.created %} · {{ r.created }}{% endif %}</span></td>
+    <td><code>{{ r.name }}</code><br><span class="muted">{{ r.kind }}{% if r.created %} · {{ r.created }}{% endif %}{% if r.own %} · vom Mandanten{% endif %}</span></td>
     <td>{{ r.target or "—" }}</td>
     <td>{{ r.auth }}</td>
     <td>{% if r.bound %}{{ r.bound | join(", ") }}{% else %}<span class="muted">nichts</span>{% endif %}</td>
-    {% if admin %}<td>{% if r.mail %}<a class="rowaction" href="/nachrichten{{ q }}">auf „Nachrichten“</a>{% else %}
+    {% if admin or self_admin %}<td>{% if r.mail %}<a class="rowaction" href="/nachrichten{{ q }}">auf „Nachrichten“</a>{% elif self_admin and not r.own %}<span class="muted">vom Betreiber angelegt</span>{% else %}
       {% if r.has_secret %}<details><summary class="rowaction">Geheimnis setzen</summary>
         <form method="post" action="/destinationen/secret{{ q }}">
           <input type="hidden" name="name" value="{{ r.name }}">
@@ -12469,9 +12473,45 @@ DESTINATIONS_BODY = """
   </tr>{% endfor %}
   </table>
   {% else %}<p class="muted">Dieser Mandant hat keine Destination.</p>{% endif %}
-  {% if not admin %}<p class="muted">Anlegen kann eine Destination der Betreiber des Knotens
-  (Server-Admin) — auf dieser Seite oder mit <code>oaap destination add</code>.</p>{% endif %}
+  {% if not admin and not self_admin %}<p class="muted">Anlegen kann eine Destination der Betreiber des Knotens
+  (Server-Admin) — auf dieser Seite oder mit <code>oaap destination add</code>. Er kann es diesem
+  Mandanten auch selbst erlauben.</p>{% endif %}
 </div>
+{% if switch %}
+<div class="card">
+  <h2>Einstellung des Mandanten</h2>
+  <form method="post" action="/destinationen/allow{{ q }}">
+    <input type="hidden" name="on" value="{{ '0' if f.may else '1' }}">
+    <p>Der Mandanten-Admin <b>{{ "darf" if f.may else "darf nicht" }}</b> Destinationen selbst anlegen.
+    <button class="btn secondary">{{ "Nicht mehr erlauben" if f.may else "Erlauben" }}</button></p>
+  </form>
+  <p class="muted">Erlaubt legt er nur <code>https</code>-Ziele auf öffentlichen Adressen an und ändert nur,
+  was er selbst angelegt hat — kein <code>tcp</code>, kein Tunnel, keine internen Adressen. Was nach dem
+  Speichern noch bleibt: ein Name, der später auf eine interne Adresse zeigt. Dann scheitert die
+  Verbindung an der Zertifikatsprüfung des Gateways. Wer das nicht will, lässt es aus. Nimmt man die
+  Erlaubnis zurück, bleiben seine Destinationen und funktionieren weiter.</p>
+</div>
+{% endif %}
+{% if self_admin %}
+<div class="card">
+  <h2>Destination anlegen</h2>
+  <form method="post" action="/destinationen/add">
+    <input type="hidden" name="kind" value="http">
+    <p><label>Name (klein, Ziffern, Bindestrich)<input name="name" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"></label></p>
+    <p><label>Ziel<input name="target" required pattern="https://.+" placeholder="https://host[:port][/basis]"></label></p>
+    <p><label>Anmeldung<select name="auth">
+      <option value="none">keine</option><option value="bearer">Bearer-Token</option>
+      <option value="basic">Benutzer + Passwort</option><option value="header">eigene Kopfzeile</option></select></label></p>
+    <p><label>Benutzer (bei Benutzer + Passwort)<input name="user"></label></p>
+    <p><label>Name der Kopfzeile (bei eigener Kopfzeile)<input name="header" placeholder="X-Api-Key"></label></p>
+    <p><label>Geheimnis (Passwort, Token oder Wert der Kopfzeile)<input type="password" name="secret" autocomplete="new-password"></label></p>
+    <button class="btn">Anlegen</button>
+  </form>
+  <p class="muted">Der Betreiber hat diesem Mandanten das Anlegen erlaubt: nur <code>https</code>, und der Name muss
+  auf öffentliche Adressen zeigen — der Knoten prüft das beim Speichern. Ändern und entfernen kannst du
+  nur, was du selbst angelegt hast.</p>
+</div>
+{% endif %}
 {% if admin %}
 <div class="card">
   <h2>Destination anlegen</h2>
@@ -12512,9 +12552,11 @@ def destinations_page():
     if tid is None:
         return role
     named = role == "server_admin" and tid != default_tenant_id()
+    f = _destinations_facts(tid)
     return page(DESTINATIONS_BODY, "Destinationen", "destinations",
                 label=(label if tid != default_tenant_id() else ""),
-                f=_destinations_facts(tid), admin=role == "server_admin",
+                f=f, admin=role == "server_admin",
+                self_admin=role == "tenant_admin" and f["may"], switch=named,
                 q=(f"?tenant={quote(label)}" if named else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
@@ -12534,12 +12576,17 @@ def destinations_post(op):
     named = role == "server_admin" and tid != default_tenant_id()
     back = "/destinationen" + (f"?tenant={quote(label)}" if named else "")
     joiner = "&" if "?" in back else "?"
-    if role != "server_admin":
+    # 2.7.1: a tenant_admin whom the server_admin allowed it -- but never the
+    # switch itself. The host asks both questions again.
+    may = role == "tenant_admin" and _destinations_facts(tid)["may"] and op != "allow"
+    if role != "server_admin" and not may:
         return ("Zugriff verweigert: Destinationen anlegen und ändern ist Sache des "
                 "Server-Admins (oaap.net.destinations 2.7).", 403)
     if op not in DEST_OPS:
         return redirect(back, code=303)
     args = {"tenant": tid, "name": (request.form.get("name") or "").strip()[:40]}
+    if op == "allow":
+        args = {"tenant": tid, "on": request.form.get("on") == "1"}
     if op == "add":
         for k, mx in (("kind", 8), ("target", 500), ("auth", 24), ("user", 254), ("header", 80)):
             args[k] = (request.form.get(k) or "").strip()[:mx]
