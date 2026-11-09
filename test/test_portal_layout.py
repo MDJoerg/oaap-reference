@@ -79,6 +79,12 @@ ok("Gesundheit ist aktiv, sonst keiner",
    re.findall(r'<a href="([^"]+)" class="active"', side) == ["/health"], side)
 ok("kein Zwilling ohne Mandantenrolle", 'href="/zwilling"' not in side)
 ok("Menueknopf fuer schmale Bildschirme", 'for="navtoggle"' in h and 'id="navtoggle"' in h)
+# 0.1.246 (Joergs Browsertest 08.11.): die Eintraege scrollen fuer sich, die
+# Plattformversion steht als Fusszeile der Leiste, die Kopfhoehe wird gemessen.
+ok("Seitenleiste: Eintraege in eigenem Scrollbereich", '<div class="links">' in side, side)
+ok("Seitenleiste: Plattformversion als Fusszeile",
+   re.search(r'<div class="navfoot">OAAP-Plattform [^<]+</div>', side) is not None, side)
+ok("Kopfhoehe gemessen statt angenommen", "--hdr-h',h.offsetHeight" in h)
 
 print("\nEinfacher Benutzer")
 h = render(SHORT, "apps", ["user"])

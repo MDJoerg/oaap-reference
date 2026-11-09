@@ -192,10 +192,17 @@ STYLE = """
   .navtoggle{position:absolute;opacity:0;width:1px;height:1px}
   .navbtn{display:none}
   .shell{display:flex;align-items:flex-start}
+  /* The side bar scrolls on its own; 100dvh, not 100vh, so a phone's
+     address bar does not hide the last entries. The script below sets
+     --hdr-h from the header's real height (a long tenant title wraps). */
   nav.side{flex:none;width:15rem;position:sticky;top:var(--hdr-h);
-       height:calc(100vh - var(--hdr-h));overflow-y:auto;
-       background:var(--oaap-surface);border-right:1px solid var(--oaap-border);
-       padding:.8rem 0 1.5rem}
+       height:calc(100vh - var(--hdr-h));height:calc(100dvh - var(--hdr-h));
+       display:flex;flex-direction:column;
+       background:var(--oaap-surface);border-right:1px solid var(--oaap-border)}
+  nav.side .links{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+       padding:.8rem 0 1rem}
+  nav.side .navfoot{flex:none;padding:.6rem 1.2rem;font-size:.75rem;
+       color:var(--oaap-muted);border-top:1px solid var(--oaap-border)}
   nav.side h3{font-size:.7rem;font-weight:600;text-transform:uppercase;
        letter-spacing:.06em;color:var(--oaap-muted);margin:1.2rem 1.2rem .3rem}
   nav.side h3:first-child{margin-top:.3rem}
@@ -384,11 +391,20 @@ LAYOUT = STYLE + """
 <div class="shell">
   {% if show_side %}
   <nav class="side" aria-label="Verwaltung">
+    <div class="links">
     {% for g in nav_groups %}
     <h3>{{ g.title }}</h3>
     {% for l in g.links %}<a href="{{ l.href }}" class="{{ 'active' if l.active }}">{{ l.label }}</a>
     {% endfor %}{% endfor %}
+    </div>
+    <div class="navfoot">OAAP-Plattform {{ version }}</div>
   </nav>
+  <script>
+  (function(){var h=document.querySelector('header.oaap');
+    function fit(){if(innerWidth>900)document.documentElement.style.setProperty('--hdr-h',h.offsetHeight+'px');
+      else document.documentElement.style.removeProperty('--hdr-h');}
+    fit();addEventListener('resize',fit);})();
+  </script>
   {% endif %}
   <div class="work">
     <main>{{ body }}</main>
