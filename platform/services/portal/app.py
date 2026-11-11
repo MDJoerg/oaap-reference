@@ -7654,7 +7654,7 @@ BULK_PLAN_WAIT = 90
 BULK_PLAN_BODY = """
 <a class="back" href="/store?back=1">← Zurück zum Store</a>
 <div class="card">
-  <h1 style="margin-top:0">{{ title }}</h1>
+  <h1 style="margin-top:0">{{ heading }}</h1>
   <p class="muted">{{ intro }} Der Lauf arbeitet eine Instanz nach der anderen ab,
      schreibt ein Protokoll und <strong>hält beim ersten Fehler an</strong> — auch wenn
      ein Update den Rahmen einer Produktiv-Instanz erweitern würde: das bestätigst Du
@@ -7670,7 +7670,7 @@ BULK_PLAN_BODY = """
   </table>
   <form method="post" action="/store/alle/{{ kind }}"
         onsubmit="this.querySelector('button').disabled=true">
-    <button>{{ title }} ({{ steps|length }}) starten</button>
+    <button>{{ heading }} ({{ steps|length }}) starten</button>
   </form>
   {% elif not err %}<p>Nichts zu tun.</p>{% endif %}
   {% if notes %}<p class="muted">Nicht dabei:</p><ul class="muted">{% for n in notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
@@ -7681,7 +7681,7 @@ BULK_RUN_BODY = """
 {% if job.state in ("planned", "running") %}<meta http-equiv="refresh" content="4">{% endif %}
 <a class="back" href="/store/laeufe">← Alle Läufe</a>
 <div class="card{% if job.state in ('stopped', 'failed') %} warn{% endif %}">
-  <h1 style="margin-top:0">{{ title }}</h1>
+  <h1 style="margin-top:0">{{ heading }}</h1>
   <p><span class="badge {% if job.state == 'done' %}ok{% elif job.state in ('stopped', 'failed') %}todo{% else %}muted{% endif %}">{{ states.get(job.state, job.state) }}</span>
      <span class="muted">{{ done }}/{{ job.steps|length }} erledigt · gestartet {{ (job.started or job.created or '')[:16]|replace('T', ' ') }} UTC
      von {{ job.by }}{% if job.finished %} · beendet {{ job.finished[:16]|replace('T', ' ') }} UTC{% endif %}</span></p>
@@ -7729,7 +7729,7 @@ def store_bulk_plan(kind):
     err = ("Der Knoten hat nicht rechtzeitig geantwortet — gleich noch einmal versuchen."
            if res is None else ("" if res.get("ok") else res.get("message", "")))
     return page(BULK_PLAN_BODY, BULK_TITLE[kind], "store", kind=kind,
-                title=BULK_TITLE[kind], intro=BULK_INTRO[kind], err=err,
+                heading=BULK_TITLE[kind], intro=BULK_INTRO[kind], err=err,
                 steps=d.get("steps") or [], notes=d.get("notes") or [])
 
 
@@ -7750,7 +7750,7 @@ def store_bulk_start(kind):
     if _re.fullmatch(BULK_ID, jid):     # one is already running: show it
         return redirect(f"/store/lauf/{jid}", code=303)
     return page(BULK_PLAN_BODY, BULK_TITLE[kind], "store", kind=kind,
-                title=BULK_TITLE[kind], intro=BULK_INTRO[kind],
+                heading=BULK_TITLE[kind], intro=BULK_INTRO[kind],
                 err=(res or {}).get("message") or "Der Knoten hat nicht geantwortet.",
                 steps=[], notes=((res or {}).get("detail") or {}).get("notes") or [])
 
@@ -7767,7 +7767,7 @@ def store_bulk_run(jid):
     done = sum(1 for st in job.get("steps") or [] if st.get("state") == "ok")
     return page(BULK_RUN_BODY, BULK_TITLE.get(job.get("kind"), "Lauf"), "store",
                 job=job, done=done, states=BULK_STATE,
-                title=BULK_TITLE.get(job.get("kind"), "Lauf") + " — " + jid)
+                heading=BULK_TITLE.get(job.get("kind"), "Lauf") + " — " + jid)
 
 
 @app.post("/store/lauf/<jid>/stop")

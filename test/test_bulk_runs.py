@@ -20,6 +20,7 @@ Run: python3 test/test_bulk_runs.py   (no Docker, no node)
 import ast
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -189,7 +190,7 @@ for n in tree.body:
 from jinja2 import Environment  # noqa: E402
 env = Environment(autoescape=True)
 h = env.from_string(T["BULK_PLAN_BODY"]).render(
-    kind="update", title="Alle aktualisieren", intro="x", err="",
+    kind="update", heading="Alle aktualisieren", intro="x", err="",
     steps=[{"instance": "alpha-test", "name": "alpha-test", "channel": "test",
             "from": "0.1.0", "to": "0.2.0"}], notes=["alpha: über die Test-Instanz"])
 ok("6 the plan page lists the steps and has one start button",
@@ -197,14 +198,21 @@ ok("6 the plan page lists the steps and has one start button",
    and "starten" in h and "Nicht dabei" in h, h[:600])
 job = m.bulk_load(jid)
 h = env.from_string(T["BULK_RUN_BODY"]).render(job=job, done=1, states=T["BULK_STATE"],
-                                                title="Alle aktualisieren — " + jid)
+                                                heading="Alle aktualisieren — " + jid)
 ok("6 the protocol: state, step results, the reason, no refresh once stopped",
    "angehalten" in h and "erledigt" in h and "Angehalten bei" in h
    and 'http-equiv="refresh"' not in h, h[:800])
 job["state"] = "running"
-h = env.from_string(T["BULK_RUN_BODY"]).render(job=job, done=1, states=T["BULK_STATE"], title="t")
+h = env.from_string(T["BULK_RUN_BODY"]).render(job=job, done=1, states=T["BULK_STATE"], heading="t")
 ok("6 while running: it refreshes itself and offers to stop",
    'http-equiv="refresh"' in h and "/stop" in h)
+
+psrc = open(APP_PY, encoding="utf-8").read()
+blk = psrc[psrc.index('@app.get("/store/alle/<kind>")'):psrc.index('@app.post("/store/install")')]
+ok("6 no route hands 'title=' to page() (it is page's own argument -- 500 on oaap-test)",
+   not re.search(r"title=", blk), re.findall(r".{30}title=.{20}", blk))
+ok("6 the templates use 'heading'", "{{ heading }}" in T["BULK_PLAN_BODY"]
+   and "{{ heading }}" in T["BULK_RUN_BODY"] and "{{ title }}" not in T["BULK_RUN_BODY"])
 
 print()
 print("ALL PASS (0 failing)" if not fails else f"FAIL ({fails} failing)")
