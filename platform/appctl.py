@@ -24200,12 +24200,12 @@ def envelope_gate(hard, confirm, channel, confirmed):
     if channel == "production":
         notes = confirm + [h for h in hard if "version" not in h]
         for line in notes:
-            print(f"NOTE: {line}")
+            print(f"NOTE: {line}", flush=True)
         if notes and not confirmed:
             die(ENVELOPE_REFUSAL)
         return notes
     for line in hard + confirm:
-        print(f"NOTE: {line}")
+        print(f"NOTE: {line}", flush=True)
     return hard + confirm
 
 
