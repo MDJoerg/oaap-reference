@@ -19,6 +19,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
+from urllib.parse import parse_qsl as _parse_qsl, urlencode as _urlencode
 
 import requests
 from flask import (Flask, g, make_response, redirect, render_template_string,
@@ -1716,7 +1717,7 @@ Vertrauensklasse — nicht die zuerst eingetragene Quelle (RFC-0012 §3).
 # only; every change goes through the host-side worker, like every other
 # portal-side registry write.
 STORE_SOURCES_BODY = """
-<a class="back" href="/store">← Zurück zum Store</a>
+<a class="back" href="/store?back=1">← Zurück zum Store</a>
 <h1>Store-Quellen</h1>
 {% if msg %}
 <div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
@@ -1826,7 +1827,7 @@ STORE_APP_BODY = """
   .facts dd{margin:0}
   .icon-lg{width:3rem;height:3rem;object-fit:contain;flex:none}
 </style>
-<a class="back" href="/store">← Zurück zum Store</a>
+<a class="back" href="/store?back=1">← Zurück zum Store</a>
 {% if need %}
 <div class="card warn" id="bestaetigen">
   <h2 style="margin-top:0">Diese App verwaltet Rechte — bitte bestätigen</h2>
@@ -1996,7 +1997,7 @@ STORE_APP_BODY = """
     <label class="checkline"><input type="radio" name="channel" value="production" checked>
       Direkt in Produktion</label>
     <label class="checkline"><input type="radio" name="channel" value="test">
-      Mit einer Test-Instanz (<code>{{ '&lt;Name&gt;' if instances else a.id }}-test</code>) — später
+      Mit einer Test-Instanz (<code>{% if instances %}&lt;Name&gt;{% else %}{{ a.id }}{% endif %}-test</code>) — später
       „nach Produktiv übernehmen“</label>
     <button>Installieren</button>
   </form>
@@ -3379,11 +3380,13 @@ INSTANCE_EDIT_BODY = """
 {% if i.promote %}
 <div class="card">
   <h2>Nach Produktiv übernehmen</h2>
-  <p class="muted">Diese Test-Instanz läuft aus einem hochgeladenen Paket
+  <p class="muted">Diese Test-Instanz läuft {% if i.promote.commit %}aus Git, Commit
+     <code>{{ i.promote.commit }}</code>{% else %}aus einem hochgeladenen Paket{% endif %}
      (Version <strong>{{ i.version }}</strong>). „Übernehmen" installiert
-     <strong>genau dieses Paket</strong> in einer Produktiv-Instanz:
-     <strong>dieselben Bytes</strong>, keine erneute Übertragung, keine
-     Zugangsdaten. Was produktiv geht, ist damit nachweislich das, was Du
+     <strong>genau {{ "diesen Commit" if i.promote.commit else "dieses Paket" }}</strong> in einer Produktiv-Instanz:
+     <strong>dieselben Bytes</strong>{% if i.promote.commit %} — der Knoten holt genau
+     diesen Commit noch einmal, nie den neueren Stand des Zweigs{% else %}, keine erneute
+     Übertragung, keine Zugangsdaten{% endif %}. Was produktiv geht, ist damit nachweislich das, was Du
      getestet hast (RFC-0020).</p>
   <form method="post" action="/instances/{{ i.key }}/promote">
     <input type="hidden" name="tab" value="deployment">
@@ -7482,12 +7485,35 @@ def store_page(msg=None, msg_ok=True, status=200):
                 msg_ok=msg_ok and request.args.get("err") is None)
 
 
+STORE_FILTER_COOKIE = "oaap_store_filter"
+STORE_FILTER_KEYS = ("q", "categories", "app_class", "audience", "maturity", "trust",
+                     "source", "license", "installed", "care", "all_status",
+                     "all_profiles")
+
+
 @app.get("/store")
 def store():
+    """The store list. It remembers its filter (Jörg, 11.11.: "der Filter geht
+    bei Rücksprüngen verloren") in a cookie of this browser; every way back
+    from an app page goes to /store?back=1, which restores it. "alle zeigen"
+    is a plain /store and clears it."""
     denied = require_store()
     if denied:
         return denied
-    return store_page()
+    if request.args.get("back") == "1":
+        saved = request.cookies.get(STORE_FILTER_COOKIE, "")
+        keep = [(k, v) for k, v in _parse_qsl(saved) if k in STORE_FILTER_KEYS]
+        extra = [(k, v) for k, v in request.args.items(multi=True)
+                 if k in ("msg", "err")]
+        q = _urlencode(keep + extra)
+        return redirect("/store" + ("?" + q if q else ""), code=303)
+    resp = make_response(store_page())
+    cur = _urlencode([(k, v) for k, v in request.args.items(multi=True)
+                      if k in STORE_FILTER_KEYS and v])
+    resp.set_cookie(STORE_FILTER_COOKIE, cur, max_age=7 * 86400, path="/store",
+                    httponly=True, samesite="Lax",
+                    secure=request.headers.get("X-Forwarded-Proto", "https") == "https")
+    return resp
 
 
 SOURCE_WAIT_SECONDS = 20   # a small JSON file, no docker work
@@ -8164,7 +8190,7 @@ def _new_error(text):
 
 SIDELOAD_BODY = """
 <div class="pagehead"><h1>Paket hochladen</h1>
-  <a class="btn" href="/store">Zurück zum Store</a></div>
+  <a class="btn" href="/store?back=1">Zurück zum Store</a></div>
 {% if not on %}
 <div class="card">
   <p class="err" style="margin:0"><strong>Dieser Knoten hat das Profil
@@ -9041,7 +9067,12 @@ def _promote_view(name, inst):
     """
     if inst.get("channel") != "test":
         return None
-    if (inst.get("source") or {}).get("kind") != "artifact":
+    src = inst.get("source") or {}
+    # A retained package, or (0.1.253) the recorded commit of a Git install:
+    # both prove "the same bytes". Without the Git case a store app with a
+    # test instance could not be updated at all (vorgaenge, 2026-11-11).
+    git_commit = (str(src.get("commit") or "") if src.get("kind") == "git" else "")
+    if src.get("kind") != "artifact" and not _re.fullmatch(r"[0-9a-f]{40}", git_commit):
         return None
     app_id = inst.get("app_id", "")
     mine = resolve_tenant(inst.get("tenant")) or ""
@@ -9057,7 +9088,7 @@ def _promote_view(name, inst):
     label = ("" if (not multi_tenant() or mine == default_tenant_id())
              else tenant_label(mine))
     return {"targets": targets, "suggestion": suggestion,
-            "tenant": label, "local": base}
+            "tenant": label, "local": base, "commit": git_commit[:12]}
 
 
 PROMOTE_WAIT_SECONDS = 180  # builds an image, like any other installation

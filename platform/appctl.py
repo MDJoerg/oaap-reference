@@ -24817,22 +24817,42 @@ def promotion_review(reg, source, target_name):
             "redeployable. Promote into the production instance it was "
             "copied from, or delete the rehearsal and build a new one.")
     stored = (src.get("source") or {})
-    if stored.get("kind") != "artifact":
+    kind = stored.get("kind")
+    # Since 0.1.253 a test instance from Git promotes too: the commit its
+    # install recorded (RFC-0071 §15) proves the same bytes as well as a
+    # retained package does. Found 2026-11-11 (Jörg, vorgaenge from a
+    # build): the store refused the production update because a test
+    # instance exists, and the test instance offered no promotion -- a
+    # dead end for every app installed from the store's Git sources.
+    if kind == "git":
+        if not re.fullmatch(r"[0-9a-f]{40}", str(stored.get("commit") or "")):
+            raise PromotionRefused(
+                f"'{source}' came from Git before the commit was recorded — one "
+                "store update of the test instance records it, then promote")
+        path = ""
+    elif kind != "artifact":
         raise PromotionRefused(
-            f"'{source}' does not run from an uploaded package — promotion "
-            "guarantees the same BYTES, which only a retained artifact can "
-            "prove. Install the production instance from its own source "
-            "instead (store or 'oaap app install')")
-    path = source_package_arg(source, stored)
-    if not path or not os.path.isfile(path):
-        raise PromotionRefused(
-            f"the retained package of '{source}' is gone — deploy it once "
-            "more, then promote")
+            f"'{source}' does not run from an uploaded package or a recorded "
+            "Git commit — promotion guarantees the same BYTES, which only "
+            "those two can prove. Install the production instance from its "
+            "own source instead (store or 'oaap app install')")
+    else:
+        path = source_package_arg(source, stored)
+        if not path or not os.path.isfile(path):
+            raise PromotionRefused(
+                f"the retained package of '{source}' is gone — deploy it once "
+                "more, then promote")
 
     unpacked = tempfile.mkdtemp(prefix="oaap-promote-")
     try:
-        extract_artifact(path, unpacked)
-        pkg = package_root(unpacked, stored.get("path", ""))
+        if kind == "git":
+            try:
+                pkg = _git_at_commit(stored, unpacked)
+            except RebuildRefused as e:
+                raise PromotionRefused(str(e).replace(" -- nothing changed", ""))
+        else:
+            extract_artifact(path, unpacked)
+            pkg = package_root(unpacked, stored.get("path", ""))
         mf = os.path.join(pkg, "oaap-app.yaml")
         if not os.path.isfile(mf):
             raise PromotionRefused("the retained package has no oaap-app.yaml")
@@ -24889,8 +24909,11 @@ def promote_artifact(source, target_name, confirmed=False):
             "this promotion would widen what the production instance may "
             "reach or who may reach it (" + "; ".join(notes)
             + ") — read it and confirm it explicitly")
-    src_path = (reg["instances"][source].get("source") or {}).get("path", "")
+    src_rec = reg["instances"][source].get("source") or {}
+    src_path = src_rec.get("path", "")
     key, tenant, _existing = promotion_target(reg, source, target_name)
+    if src_rec.get("kind") == "git":
+        return _promote_git(source, src_rec, key, tenant, target_name, m) + (notes, key)
     version, sha = install_artifact(key, path, None,
                                     channel="production", path=src_path,
                                     origin=source,
@@ -24906,6 +24929,33 @@ def promote_artifact(source, target_name, confirmed=False):
                                     permit={"tenant": tenant,
                                             "name": target_name})
     return version, sha, notes, key
+
+
+def _promote_git(source, src_rec, key, tenant, target_name, m):
+    """The Git half of a promotion: check out exactly the commit the test
+    instance runs and install it into production, recording that commit
+    (so the production instance can be rebuilt from it, RFC-0071 §15).
+    The envelope was weighed by promote_artifact. Returns (version, commit)."""
+    tmp = tempfile.mkdtemp(prefix="oaap-promote-git-")
+    try:
+        try:
+            pkg = _git_at_commit(src_rec, tmp)
+        except RebuildRefused as e:
+            raise PromotionRefused(str(e).replace(" -- nothing changed", ""))
+        rec = {"kind": "git", "url": src_rec.get("url", ""),
+               "path": src_rec.get("path", ""), "ref": src_rec.get("ref", ""),
+               "commit": src_rec["commit"], "promoted_from": source}
+        if src_rec.get("store_source"):
+            rec["store_source"] = src_rec["store_source"]
+        ns = argparse.Namespace(package=pkg, path="", ref="", ident=None, key=key,
+                                name=target_name, channel="production",
+                                store_source=rec.get("store_source", ""),
+                                tenant=tenant, rehearsal=None,
+                                envelope_checked=True)
+        _install_from_dir(pkg, ns, rec)
+    finally:
+        _rmtree_writable(tmp)
+    return m["app"]["version"], src_rec["commit"]
 
 
 def cmd_promote(args):

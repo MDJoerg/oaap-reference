@@ -461,8 +461,10 @@ def refuses(label, source, target, needle):
 
 
 refuses("production cannot be promoted from", "shop", "shop", "not a test instance")
-refuses("a git-installed test instance cannot be promoted",
-        "git-test", "shop", "same BYTES")
+# 0.1.253: Git promotes from its recorded commit (test_promote_git.py);
+# without one it is still refused, and says how to get one.
+refuses("a git-installed test instance without a recorded commit cannot be promoted",
+        "git-test", "shop", "store update of the test instance records it")
 refuses("promoting into another app is refused", "shop-test", "fremd",
         "never turns one app into another")
 refuses("promoting into a test instance is refused", "shop-test", "git-test",
