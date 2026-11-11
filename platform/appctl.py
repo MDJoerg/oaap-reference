@@ -30484,10 +30484,11 @@ def disk_job(req, role, actor):
     return ok, text or ("done" if ok else "refused")
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser(prog="oaap app")
     sub = p.add_subparsers(dest="cmd", required=True)
-    pi = sub.add_parser("install")
+    pi = sub.add_parser("install",
+                        help="install an app package as a new instance, or redeploy an existing one")
     pi.add_argument("package", help="package directory or Git URL")
     pi.add_argument("--path", default="", help="package path inside the directory/repo")
     pi.add_argument("--ref", default="", help="git branch/tag to install from (git sources)")
@@ -30525,7 +30526,8 @@ def main():
                          "declared for business authorization "
                          "(oaap.core.authorization 2.2)")
     pi.set_defaults(fn=cmd_install)
-    pl = sub.add_parser("list")
+    pl = sub.add_parser("list",
+                        help="list the app instances of this node")
     pl.set_defaults(fn=cmd_list)
     prn = sub.add_parser("rename",
                          help="give an instance a different name (RFC-0026)")
@@ -30538,7 +30540,8 @@ def main():
     prn.add_argument("--yes", action="store_true",
                      help="carry it out after reading the consequences")
     prn.set_defaults(fn=cmd_rename)
-    pr = sub.add_parser("remove")
+    pr = sub.add_parser("remove",
+                        help="remove an instance (--purge also deletes its data)")
     pr.add_argument("name")
     pr.add_argument("--purge", action="store_true")
     pr.set_defaults(fn=cmd_remove)
@@ -30548,7 +30551,8 @@ def main():
     ppu.add_argument("--yes", action="store_true",
                      help="carry it out after reading what is deleted")
     ppu.set_defaults(fn=cmd_purge)
-    pv = sub.add_parser("visibility")
+    pv = sub.add_parser("visibility",
+                        help="who sees an instance: everybody, or only some groups (RFC-0007)")
     pv.add_argument("name")
     pv.add_argument("mode", choices=["all", "groups"])
     pv.add_argument("groups", nargs="?", default="",
@@ -30738,7 +30742,7 @@ def main():
                          help="internal: isolate app networks + reconnect the gateway (RFC-0016)")
     pmn.set_defaults(fn=cmd_migrate_networks)
     pmi = sub.add_parser("migrate-instance-dirs",
-                         help="move instance data under its tenant (RFC-0026)")
+                         help="internal: move instance data under its tenant (RFC-0026)")
     pmi.set_defaults(fn=cmd_migrate_instance_dirs)
     pmx = sub.add_parser("artifact-index",
                          help="internal: list retained packages where the "
@@ -31163,7 +31167,8 @@ def main():
     pep.add_argument("name", help="instance name")
     pep.add_argument("endpoint", nargs="?", help="endpoint name (for allow/deny)")
     pep.set_defaults(fn=cmd_endpoint)
-    pt = sub.add_parser("tile")
+    pt = sub.add_parser("tile",
+                        help="whether an instance shows a tile in the launchpad")
     pt.add_argument("name")
     # Deliberately no argparse `choices` here: whether it validates the
     # DEFAULT of an omitted optional positional differs between Python
@@ -31174,7 +31179,8 @@ def main():
                     help="auto = follow the app's own class (default), "
                          "on = always show, off = never show; omit to ask")
     pt.set_defaults(fn=cmd_tile)
-    pres = sub.add_parser("resources")
+    pres = sub.add_parser("resources",
+                          help="show or set memory, CPU and process limits of an instance (RFC-0046)")
     pres.add_argument("name")
     pres.add_argument("--memory", default="",
                       help="memory limit per container, e.g. 3g or 512m")
@@ -31183,7 +31189,8 @@ def main():
     pres.add_argument("--clear", action="store_true",
                       help="remove every limit")
     pres.set_defaults(fn=cmd_resources)
-    pcf = sub.add_parser("config")
+    pcf = sub.add_parser("config",
+                         help="list, set or unset the configuration values of an instance")
     pcf.add_argument("action", choices=["list", "set", "unset"])
     pcf.add_argument("name")
     pcf.add_argument("key", nargs="?")
@@ -31193,7 +31200,8 @@ def main():
                      help="with 'set': append to the current value with ';' "
                           "instead of replacing it (list-valued keys)")
     pcf.set_defaults(fn=cmd_config)
-    pa = sub.add_parser("address")
+    pa = sub.add_parser("address",
+                        help="an instance's own public hostname and its aliases (RFC-0009, RFC-0018)")
     pa.add_argument("action", choices=["show", "set", "remove",
                                        "alias-add", "alias-remove"])
     pa.add_argument("name")
@@ -31201,7 +31209,8 @@ def main():
                     help="public hostname of its own, e.g. hub.example.org; "
                          "with alias-add/alias-remove, the alias name")
     pa.set_defaults(fn=cmd_address)
-    pth = sub.add_parser("throttle")
+    pth = sub.add_parser("throttle",
+                         help="request limit per client address of an instance (RFC-0010)")
     pth.add_argument("action", choices=["show", "set", "off", "reset"])
     pth.add_argument("name")
     pth.add_argument("rate", nargs="?",
@@ -31304,7 +31313,8 @@ def main():
                     help="for --kind operator: FILTER:ACCESS, e.g. "
                          "'home/#:readwrite' (repeatable)")
     pk.set_defaults(fn=cmd_key)
-    pu = sub.add_parser("user")
+    pu = sub.add_parser("user",
+                        help="portal accounts of this node: list, add, delete, password")
     pu.add_argument("action", choices=["list", "add", "delete", "schedule",
                                        "password", "unbind"])
     pu.add_argument("--roles", default="user",
@@ -31345,12 +31355,14 @@ def main():
     pu.add_argument("password", nargs="?",
                     help="omit to be prompted (hidden input) -- 'password' action only")
     pu.set_defaults(fn=cmd_user)
-    pc = sub.add_parser("convert")
+    pc = sub.add_parser("convert",
+                        help="turn a docker-compose file into an OAAP package draft")
     pc.add_argument("compose")
     pc.add_argument("--out", default="./oaap-converted")
     pc.add_argument("--profile")
     pc.set_defaults(fn=cmd_convert)
-    pt = sub.add_parser("token")
+    pt = sub.add_parser("token",
+                        help="deploy tokens of an instance: create, list, revoke")
     pt.add_argument("action", choices=["create", "revoke", "list"])
     pt.add_argument("name", nargs="?")
 
@@ -31409,9 +31421,11 @@ def main():
     pf.add_argument("label", nargs="?",
                     help="who watches, e.g. fleetview@oaap-demo")
     pf.set_defaults(fn=cmd_fleet)
-    pd = sub.add_parser("process-deploys")
+    pd = sub.add_parser("process-deploys",
+                        help="internal: work the deploy spool (called by the path unit and the portal)")
     pd.set_defaults(fn=cmd_process_deploys)
-    pb = sub.add_parser("backup")
+    pb = sub.add_parser("backup",
+                        help="platform backup: create, schedule, status, exclude or include a tenant")
     pb.add_argument("action", choices=["create", "schedule", "exclude",
                                        "include", "status"])
     pb.add_argument("target", nargs="?", help="tenant label for "
@@ -31443,9 +31457,11 @@ def main():
                     help="put: the hash the caller believes it is storing; "
                          "a mismatch refuses")
     pf.set_defaults(fn=cmd_files)
-    pri = sub.add_parser("restore-instances")
+    pri = sub.add_parser("restore-instances",
+                         help="internal: bring instances back after a restore (called by install)")
     pri.set_defaults(fn=cmd_restore_instances)
-    ps = sub.add_parser("store")
+    ps = sub.add_parser("store",
+                        help="the app store: list apps, manage sources and catalogs")
     ps.add_argument("action", choices=["list", "add-source", "add-catalog",
                                        "remove-source",
                                        "enable", "disable", "trust", "rename",
@@ -31461,7 +31477,8 @@ def main():
     ps.add_argument("--trust", choices=["verified", "unverified"],
                     help="trust class for a new source (default: unverified)")
     ps.set_defaults(fn=cmd_store)
-    pn = sub.add_parser("node")
+    pn = sub.add_parser("node",
+                        help="this node: profiles (RFC-0011) and host care (oaap.core.host)")
     pn.add_argument("action", choices=["show", "add-profile", "remove-profile",
                                        "care"])
     pn.add_argument("profile", nargs="?",
@@ -31513,13 +31530,15 @@ def main():
     pdt.add_argument("--days", type=int, default=None,
                      help="twin add-reader: key validity in days (default 90, max 365)")
     pdt.set_defaults(fn=cmd_data)
-    pe = sub.add_parser("external")
+    pe = sub.add_parser("external",
+                        help="the node's public hostname and TLS, also behind an edge (RFC-0006)")
     pe.add_argument("action", choices=["show", "set", "remove"])
     pe.add_argument("hostname", nargs="?")
     pe.add_argument("--behind-edge", dest="behind_edge", default="",
                     help="edge node's IP address (RFC-0006: TLS terminates at the edge)")
     pe.set_defaults(fn=cmd_external)
-    pg = sub.add_parser("edge")
+    pg = sub.add_parser("edge",
+                        help="forward hostnames from this edge node to other nodes (RFC-0006)")
     pg.add_argument("action", choices=["add", "remove", "list"])
     pg.add_argument("hostname", nargs="?")
     pg.add_argument("target", nargs="?")
@@ -31533,10 +31552,68 @@ def main():
                  "tenant (also: <tenant>/<name>)")
     sub.choices["promote"].add_argument("--keep-name", action="store_true",
                     help="--to really starts with the tenant's label")
-    args = p.parse_args()
+    ph = sub.add_parser("help",
+                        help="list the commands, or write the CLI reference "
+                             "as Markdown (RFC-0078 stage 0)")
+    ph.add_argument("--markdown", metavar="DIR", default="",
+                    help="write one Markdown file per command into DIR "
+                         "(with front matter) instead of printing the list")
+    ph.set_defaults(fn=lambda a: cmd_help(a, p))
+    return p
+
+
+def cmd_help(args, parser):
+    """`oaap help` (RFC-0078 stage 0). The reference is read from the very
+    parser `main()` runs, and the sudo line of every command from the very
+    `is_read_only()` that enforces it -- a second description of either
+    would drift (see test/test_cli_routes.py for the first time it did)."""
+    import cli_reference
+    version = cli_reference.read_version(os.path.dirname(os.path.abspath(__file__)))
+    cmds = cli_reference.commands(parser, is_read_only, WRAPPER_GROUPS)
+    if args.markdown:
+        written = cli_reference.write_markdown(args.markdown, cmds, version,
+                                               WRAPPER_OWN)
+        print(f"wrote {len(written)} files to {args.markdown} "
+              f"(reference {version})")
+    else:
+        print(cli_reference.overview_text(cmds, version, WRAPPER_OWN), end="")
+
+
+# The commands `bin/oaap` hands to appctl.py under their OWN name
+# (`oaap tenant ...` rather than `oaap app tenant ...`). Everything else
+# appctl.py knows is reached as `oaap app <cmd>`. test/test_cli_reference.py
+# holds this list against the wrapper's `case`.
+WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
+                  "files", "user", "cohort", "disk", "machine", "authz", "key",
+                  "fleet", "tenant", "metrics", "broker", "idp", "mail",
+                  "destination", "connect", "connector", "help")
+
+# What `bin/oaap` does by itself, without appctl.py -- argparse cannot know
+# these, so the reference names them from here (same test as above).
+WRAPPER_OWN = {
+    "status": ("oaap status", False,
+               "node health without the portal: version, profiles, core "
+               "services, apps, host care, disk; ends HEALTHY or DEGRADED "
+               "(exit 1)"),
+    "version": ("oaap version", False, "the installed platform version"),
+    "setup-token": ("sudo oaap setup-token", True,
+                    "URL and one-time token to create the first admin, "
+                    "until setup is done"),
+    "update": ("sudo oaap update [--check]", True,
+               "update the platform from Git (--check: only say whether "
+               "there is a newer version)"),
+    "uninstall": ("sudo oaap uninstall [--purge] [--yes]", True,
+                  "remove the platform from this node; --purge also "
+                  "deletes all data"),
+}
+
+
+def is_read_only(args):
+    """Whether a parsed command may run without root. The one rule for
+    both `main()` (which refuses) and `oaap help` (which says so)."""
     # 'convert' works on files the caller owns; 'node show' only prints
     # what 'oaap status' prints anyway — everything else changes the node.
-    read_only = (args.cmd == "convert"
+    return (args.cmd in ("convert", "help")
                  or (args.cmd == "node" and args.action == "show")
                  # `node care` without a verb shows the last measurement
                  # (oaap.core.host 2.3); with root it measures afresh first.
@@ -31560,6 +31637,11 @@ def main():
                      and args.action in ("list", "show", "check", "log"))
                  or (args.cmd == "metrics"
                      and args.action in ("show", "queue")))
+
+
+def main():
+    args = build_parser().parse_args()
+    read_only = is_read_only(args)
     if not read_only and (not hasattr(os, "geteuid") or os.geteuid() != 0):
         die("requires root (sudo oaap app ...)")
     try:
