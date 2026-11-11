@@ -47,6 +47,8 @@ import nav_view
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
 import host_care  # noqa: E402
+# RFC-0080: the catalogue of message types, the same module the host routes with.
+import notify  # noqa: E402
 
 IDENTITY = "http://identity:8000"
 TWIN = "http://twin:8000"
@@ -12603,7 +12605,105 @@ def _messages_facts(tid):
                          "uses": ("eigenes Postfach (" + mine["from"] + ")" if mine
                                   else "Postfach des Knotens" if node else "keines")})
     return {"node": node, "own": own, "realm": realm, "rows": rows,
-            "is_node": tid == dflt}
+            "is_node": tid == dflt, "n": _notify_facts(tid, tid == dflt, tenants)}
+
+
+NOTIFY_FILE = "/apps-registry/notifications.json"
+NOTIFY_LOG_FILE = "/apps-registry/notify-log.jsonl"
+NOTIFY_VIEW_FILE = "/apps-registry/notify-view.json"
+NOTIFY_RESULT_WORDS = {"sent": "verschickt", "retry": "erneuter Versuch", "failed": "gescheitert",
+                       "limited": "Grenze erreicht", "nobody": "niemand erreichbar"}
+NOTIFY_OP_WORDS = {"event": "", "open": "beginnt", "remind": "Erinnerung", "close": "behoben",
+                   "test": "Probe"}
+
+
+def _notify_stored():
+    try:
+        with open(NOTIFY_FILE, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("scopes") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _notify_entry_word(e):
+    return (notify.FIELD_WORDS.get(e.get("to"), "?") + " "
+            + (e.get("address") or notify.ROLES.get(e.get("role"), e.get("role", "?"))))
+
+
+def _notify_facts(tid, is_node, tenants):
+    """Lists, routing and the log of one scope for the page. At the node,
+    the tenants' lists appear as names and counts only (RFC-0080 D8)."""
+    stored = _notify_stored()
+    scope = notify.scope_of(stored.get(tid), is_node)
+    try:
+        with open(NOTIFY_VIEW_FILE, encoding="utf-8") as f:
+            reach = ((json.load(f) or {}).get("reach") or {}).get(tid)
+    except (OSError, ValueError):
+        reach = None
+    lists = []
+    for name, l in sorted(scope["lists"].items(), key=lambda kv: (not kv[1].get("mandatory"), kv[0])):
+        ent = l.get("entries") or []
+
+        def field(f):
+            return ", ".join(e.get("address") or ("Mandanten-Admins" if e.get("role") == "tenant_admin"
+                                                  else "Server-Admins")
+                             for e in ent if e.get("to") == f)
+        lists.append({"name": name, "mandatory": bool(l.get("mandatory")),
+                      "words": "; ".join(_notify_entry_word(e) for e in ent),
+                      "to": field("to"), "cc": field("cc"), "bcc": field("bcc"),
+                      "prefix": l.get("subject_prefix", ""),
+                      "reach": None if reach is None else int(reach.get(name) or 0)})
+    rows = []
+    for key in notify.CATEGORIES:
+        r = scope["routes"].get(key) or {}
+        rows.append({"key": key, "word": notify.CATEGORY_WORDS[key], "is_cat": True,
+                     "lists": r.get("lists") or [], "subject": r.get("subject", ""),
+                     "default": "", "from_tenant": False})
+    for key in notify.types_for(is_node):
+        d = notify.CATALOGUE[key]
+        r = scope["routes"].get(key) or {}
+        rows.append({"key": key, "word": d["title"], "is_cat": False,
+                     "cat": notify.CATEGORY_WORDS[d["category"]],
+                     "lists": r.get("lists") or [], "subject": r.get("subject", ""),
+                     "default": d["subject"],
+                     "from_tenant": is_node and d["scope"] == "tenant"})
+    log = []
+    try:
+        with open(NOTIFY_LOG_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("tenant") == tid:
+                    log.append(e)
+    except OSError:
+        pass
+    log = [{"when": e.get("when", "")[:16].replace("T", " "),
+            "what": (notify.CATALOGUE.get(e.get("type"), {}).get("title", e.get("type", ""))
+                     if e.get("op") != "test" else "Probe"),
+            "op": NOTIFY_OP_WORDS.get(e.get("op"), e.get("op", "")) if e.get("op") != "test" else "",
+            "lists": ", ".join(e.get("lists") or []),
+            "about": (tenants.get(e.get("about")) or {}).get("label", "") if e.get("about") else "",
+            "n": f"{e.get('to', 0)} / {e.get('cc', 0)} / {e.get('bcc', 0)}",
+            "result": NOTIFY_RESULT_WORDS.get(e.get("result"), e.get("result", "")),
+            "bad": e.get("result") in ("failed", "limited", "nobody", "retry"),
+            "said": e.get("said", "")} for e in reversed(log[-30:])]
+    others = []
+    if is_node:
+        for xid, x in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
+            if xid == tid:
+                continue
+            xs = notify.scope_of(stored.get(xid), False)
+            others.append({"label": x.get("label", ""),
+                           "lists": ", ".join(f"{nm} ({len(l.get('entries') or [])})"
+                                              for nm, l in sorted(xs["lists"].items()))})
+    return {"lists": lists, "names": [l["name"] for l in lists], "rows": rows, "log": log,
+            "others": others, "later": notify.LATER, "max": notify.MAX_RECIPIENTS,
+            "per_hour": notify.NODE_PER_HOUR if is_node else notify.TENANT_PER_HOUR,
+            "placeholders": " ".join("{" + p + "}" for p in notify.PLACEHOLDERS),
+            "role_word": "Server-Admins" if is_node else "Mandanten-Admins",
+            "silent": bool(reach is not None and lists and not reach.get(lists[0]["name"]))}
 
 
 MESSAGES_BODY = """
@@ -12675,6 +12775,86 @@ MESSAGES_BODY = """
   </table>
   {% endif %}
 </div>
+
+{% set n = f.n %}
+<div class="card" id="verteiler">
+  <h2>Verteiler</h2>
+  <p>Ein Verteiler sagt, wer eine Benachrichtigung bekommt: E-Mail-Adressen oder eine Rolle
+  ({{ n.role_word }} — wer die Rolle beim Versand hat), jeweils unter An, Cc oder Bcc. Mindestens
+  ein Eintrag steht unter An; höchstens {{ n.max }} Adressen. Der Verteiler
+  <strong>{{ n.lists[0].name }}</strong> ist Pflicht: Was nirgends zugeordnet ist, kommt dort an.</p>
+  {% if n.silent %}<p class="err">Der Verteiler „{{ n.lists[0].name }}“ erreicht im Moment
+  <strong>niemanden</strong>: Keiner der {{ n.role_word }} hat eine E-Mail-Adresse{% if f.is_node %},
+  also gehen Meldungen des Servers ins Leere{% else %}; Meldungen gehen ersatzweise an die
+  Serverbesitzer{% endif %}. Tragt eine Adresse in den Verteiler ein oder hinterlegt sie beim Benutzer.</p>{% endif %}
+  <table class="list"><tr><th>Name</th><th>Empfänger</th><th>erreicht</th><th>Betreff-Präfix</th><th></th></tr>
+  {% for l in n.lists %}<tr><td><strong>{{ l.name }}</strong>{% if l.mandatory %} <small class="muted">(Pflicht)</small>{% endif %}</td>
+    <td>{{ l.words }}</td><td>{% if l.reach is none %}—{% elif l.reach %}{{ l.reach }}{% else %}<span class="err">niemanden</span>{% endif %}</td><td>{{ l.prefix or "—" }}</td>
+    <td><form method="post" action="/nachrichten/verteiler/test{{ q }}" style="display:inline">
+      <input type="hidden" name="name" value="{{ l.name }}"><button class="btn">Probe senden</button></form>
+    {% if not l.mandatory %}<form method="post" action="/nachrichten/verteiler/remove{{ q }}" style="display:inline">
+      <input type="hidden" name="name" value="{{ l.name }}">
+      <label class="seatopt"><input type="checkbox" name="confirm" value="1" required>entfernen</label>
+      <button class="btn">Entfernen</button></form>{% endif %}</td></tr>{% endfor %}
+  </table>
+  <h3>Verteiler anlegen oder ändern</h3>
+  <form method="post" action="/nachrichten/verteiler/set{{ q }}">
+    <p><label>Name <input name="name" required maxlength="40" list="vt-names"
+      placeholder="z. B. Servicepartner"></label>
+      <datalist id="vt-names">{% for l in n.lists %}<option value="{{ l.name }}">{% endfor %}</datalist>
+      <span class="muted">Ein vorhandener Name ersetzt diesen Verteiler.</span></p>
+    <p><label>An <textarea name="to" rows="2" required placeholder="vorstand@verein.de, {{ n.role_word }}"></textarea></label></p>
+    <p><label>Cc <textarea name="cc" rows="1"></textarea></label>
+      <label>Bcc <textarea name="bcc" rows="1"></textarea></label></p>
+    <p><label>Betreff-Präfix (optional) <input name="prefix" maxlength="40" placeholder="[Backup]"></label></p>
+    <p class="muted">Adressen getrennt durch Komma oder Zeilenumbruch. Das Wort
+      <code>{{ n.role_word }}</code> steht für die Rolle.</p>
+    <button class="btn">Speichern</button>
+  </form>
+  {% if n.others %}
+  <h3>Verteiler der Mandanten</h3>
+  <p class="muted">Hier nur Namen und Anzahl der Einträge; die Adressen pflegt der Mandant.</p>
+  <table class="list"><tr><th>Mandant</th><th>Verteiler (Einträge)</th><th></th></tr>
+  {% for o in n.others %}<tr><td>{{ o.label }}</td><td>{{ o.lists }}</td>
+    <td><a class="rowaction" href="/nachrichten?tenant={{ o.label }}#verteiler">Ansehen</a></td></tr>{% endfor %}
+  </table>
+  {% endif %}
+</div>
+
+<div class="card" id="benachrichtigungen">
+  <h2>Benachrichtigungen</h2>
+  <p>Welcher Verteiler welche Meldung bekommt. Eine Kategorie gilt für alle ihre Arten; eine
+  einzelne Art kann abweichen. Ohne Haken geht die Meldung an den Pflicht-Verteiler. Eine Lage
+  wird gemeldet, wenn sie beginnt und wenn sie behoben ist — Kritisches zusätzlich einmal täglich,
+  solange sie besteht. Höchstens {{ n.per_hour }} Mails je Stunde.</p>
+  <form method="post" action="/nachrichten/benachrichtigungen{{ q }}">
+  <table class="list"><tr><th>Meldung</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
+  {% for r in n.rows if r.is_cat %}<tr><td><strong>{{ r.word }}</strong></td>
+    {% for nm in n.names %}<td><input type="checkbox" name="r__{{ r.key }}" value="{{ nm }}"{% if nm in r.lists %} checked{% endif %}></td>{% endfor %}
+    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="je Art (siehe unten)"></td></tr>{% endfor %}
+  </table>
+  <details{% if n.rows|selectattr("lists")|rejectattr("is_cat")|list %} open{% endif %}><summary>Einzelne Arten</summary>
+  <table class="list"><tr><th>Art</th><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
+  {% for r in n.rows if not r.is_cat %}<tr><td>{{ r.word }}{% if r.from_tenant %}<br><small class="muted">von den Mandanten — nur mit eigenem Haken</small>{% endif %}</td>
+    <td>{{ r.cat }}</td>
+    {% for nm in n.names %}<td><input type="checkbox" name="r__{{ r.key }}" value="{{ nm }}"{% if nm in r.lists %} checked{% endif %}></td>{% endfor %}
+    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="{{ r.default }}"></td></tr>{% endfor %}
+  </table>
+  <p class="muted">Noch nicht gebaut: {% for k, w in n.later.items() %}{{ w }}{{ "; " if not loop.last }}{% endfor %}.</p>
+  </details>
+  <p class="muted">Platzhalter im Betreff: <code>{{ n.placeholders }}</code>.</p>
+  <button class="btn">Zuordnung speichern</button>
+  </form>
+
+  <h3>Zuletzt verschickt</h3>
+  {% if n.log %}
+  <table class="list"><tr><th>Zeit (UTC)</th><th>Meldung</th><th>Verteiler</th><th>An / Cc / Bcc</th><th>Ergebnis</th></tr>
+  {% for e in n.log %}<tr><td>{{ e.when }}</td><td>{{ e.what }}{% if e.op %} <small>({{ e.op }})</small>{% endif %}{% if e.about %} <small class="muted">— {{ e.about }}</small>{% endif %}</td>
+    <td>{{ e.lists }}</td><td>{{ e.n }}</td>
+    <td>{% if e.bad %}<span class="err">{{ e.result }}</span>{% else %}{{ e.result }}{% endif %}<br><small class="muted">{{ e.said }}</small></td></tr>{% endfor %}
+  </table>
+  {% else %}<p class="muted">Noch nichts verschickt.</p>{% endif %}
+</div>
 """
 
 
@@ -12732,6 +12912,85 @@ def messages_outgoing(op):
     key = "msg" if res.get("ok") else "err"
     return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]),
                     code=303)
+
+
+NOTIFY_WAIT_SECONDS = 45
+NOTIFY_LIST_OPS = ("set", "remove", "test")
+
+
+def _notify_queue(tid, label, role, op, args, anchor):
+    named = role == "server_admin" and tid != default_tenant_id()
+    back = "/nachrichten" + (f"?tenant={quote(label)}" if named else "")
+    joiner = "&" if "?" in back else "?"
+    if role == "server_admin":
+        args["tenant"] = tid          # only a server_admin names a tenant
+    res = _queue_with_id(_uuid.uuid4().hex, "", {"action": "notify", "op": op, "args": args},
+                         NOTIFY_WAIT_SECONDS)
+    if res is None:
+        return redirect(f"{back}{joiner}err=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden.") + anchor, code=303)
+    key = "msg" if res.get("ok") else "err"
+    return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]) + anchor,
+                    code=303)
+
+
+@app.post("/nachrichten/verteiler/<op>")
+def messages_lists(op):
+    """RFC-0080: a recipient list -- save, remove, test. One request each;
+    the host judges it again from the actor's own record."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    if op not in NOTIFY_LIST_OPS:
+        return redirect("/nachrichten", code=303)
+    args = {"name": (request.form.get("name") or "").strip()[:40]}
+    if op == "set":
+        for k, mx in (("to", 4000), ("cc", 4000), ("bcc", 4000), ("prefix", 40)):
+            args[k] = (request.form.get(k) or "")[:mx]
+        word = "Server-Admins" if tid == default_tenant_id() else "Mandanten-Admins"
+        for k in ("to", "cc", "bcc"):
+            # the page's role word, written as the host reads it
+            args[k] = args[k].replace(word, word.lower())
+        op = "list-set"
+    elif op == "remove":
+        if not request.form.get("confirm"):
+            return redirect("/nachrichten?err=" + quote("Bitte bestätigen.") + "#verteiler", code=303)
+        op = "list-remove"
+    return _notify_queue(tid, label, role, op, args, "#verteiler")
+
+
+@app.post("/nachrichten/benachrichtigungen")
+def messages_routes():
+    """RFC-0080: the routing table. Only the lines that changed travel; the
+    host checks every one of them again."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    is_node = tid == default_tenant_id()
+    scope = notify.scope_of(_notify_stored().get(tid), is_node)
+    routes = {}
+    for key in list(notify.CATEGORIES) + notify.types_for(is_node):
+        lists = [x for x in request.form.getlist("r__" + key) if x in scope["lists"]]
+        subject = (request.form.get("s__" + key) or "").strip()[:160]
+        old = scope["routes"].get(key) or {}
+        if lists != (old.get("lists") or []) or subject != (old.get("subject") or ""):
+            routes[key] = {"lists": lists, "subject": subject}
+    if not routes:
+        named = role == "server_admin" and not is_node
+        back = "/nachrichten" + (f"?tenant={quote(label)}" if named else "")
+        return redirect(back + ("&" if "?" in back else "?") + "msg="
+                        + quote("Nichts geändert.") + "#benachrichtigungen", code=303)
+    return _notify_queue(tid, label, role, "route-set", {"routes": routes}, "#benachrichtigungen")
 
 
 # --- Destinationen (oaap.net.destinations 0.10 §2.7, oaap.core.portal 2.17) ----------

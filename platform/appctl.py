@@ -110,6 +110,8 @@ import host_care  # noqa: E402
 import advisories  # noqa: E402
 # ... and what the instances' images stand on (RFC-0071 stage 1).
 import images  # noqa: E402
+# ... and who hears about it (RFC-0080): lists, catalogue, routing.
+import notify  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -2591,6 +2593,883 @@ def cmd_mail(args):
     die(f"unknown action '{args.action}'")
 
 
+# --------------------------------------------------- notifications (RFC-0080)
+#
+# oaap.core.notifications 0.1. The rules are notify.py's (pure); here are
+# the files, the outbox, the sending and the sources.
+#
+#   apps/notifications.json   lists and routing per tenant, 0644: the
+#                             portal reads it (addresses, never a secret)
+#   apps/notify-log.jsonl     what was sent, one line each, 0644: counts
+#                             and the server's answer, no address, no body
+#   data/notify/state.json    open matters and the hourly stamps, 0600
+#   data/notify/outbox/       one file per notification waiting, 0700 --
+#                             a directory, not a file, so the spool worker,
+#                             an audit line and the minute job each ADD a
+#                             file and never rewrite one another's list
+#   apps/notify-view.json     how many addresses each list reaches now,
+#                             0644, written only when it changes
+#
+# WHY data/notify and not apps/: the backup tars apps/ with the apps
+# stopped, and tar fails ("apps: file changed as we read it") when a file
+# appears in it meanwhile. Measured on oaap-test 2026-11-11: the first
+# build wrote state and view into apps/ every minute and the next backup
+# failed exactly so. What changes by itself every minute lives outside the
+# backup's list; and while a backup runs, the minute part waits (below).
+#
+# Every source only puts a notification into the outbox; the minute job
+# (`oaap node care sample`) sends. So an audit line never waits for a mail
+# server, and an unsent notification is tried again for an hour (2.4).
+NOTIFY_FILE = os.path.join(APPS_DIR, "notifications.json")
+NOTIFY_LOG_FILE = os.path.join(APPS_DIR, "notify-log.jsonl")
+NOTIFY_DIR = os.path.join(DATA_DIR, "data", "notify")
+NOTIFY_STATE_FILE = os.path.join(NOTIFY_DIR, "state.json")
+NOTIFY_OUTBOX_DIR = os.path.join(NOTIFY_DIR, "outbox")
+
+# audit action + result -> message type. One table: the audit line and the
+# notification come from the same call and cannot disagree (RFC-0080 2.4).
+NOTIFY_FROM_AUDIT = {
+    ("reboot.planned", "ok"): "reboot.planned",
+    ("reboot.started", "ok"): "reboot.started",
+    ("reboot.cancelled", "ok"): "reboot.cancelled",
+    ("instance.rebuild", "failed"): "rebuild.failed",
+}
+
+
+class NotifyRefused(Exception):
+    """A list or route that must not be kept, said in one sentence."""
+
+
+def notify_load():
+    try:
+        with open(NOTIFY_FILE, encoding="utf-8") as f:
+            d = json.load(f) or {}
+    except (OSError, ValueError):
+        d = {}
+    return d if isinstance(d.get("scopes"), dict) else {"schema": notify.SCHEMA,
+                                                        "scopes": {}}
+
+
+def notify_save(d):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    d["schema"] = notify.SCHEMA
+    tmp = NOTIFY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, NOTIFY_FILE)
+    os.chmod(NOTIFY_FILE, 0o644)
+
+
+def notify_scope(tid, data=None):
+    is_node = tid == default_tenant_id()
+    stored = ((data or notify_load()).get("scopes") or {}).get(tid)
+    return notify.scope_of(stored, is_node), is_node
+
+
+def notify_settings():
+    """The node's thresholds (D7) -- a node setting, kept with the node's scope."""
+    s = (((notify_load().get("scopes") or {}).get(default_tenant_id()) or {})
+         .get("settings") or {})
+    return {"disk_warn": float(s.get("disk_warn") or notify.DISK_WARN),
+            "disk_crit": float(s.get("disk_crit") or notify.DISK_CRIT)}
+
+
+def _notify_state_rw(fn=None):
+    try:
+        with open(NOTIFY_STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f) or {}
+    except (OSError, ValueError):
+        st = {}
+    if fn is None:
+        return st
+    before = json.dumps(st, sort_keys=True)
+    st = fn(st) or st
+    if json.dumps(st, sort_keys=True) == before and os.path.exists(NOTIFY_STATE_FILE):
+        return st
+    os.makedirs(NOTIFY_DIR, mode=0o700, exist_ok=True)
+    tmp = NOTIFY_STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(st, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, NOTIFY_STATE_FILE)
+    return st
+
+
+def notify_people_of_role(tid):
+    """role -> addresses of the active people who hold it NOW (D1): a
+    server_admin anywhere; a tenant_admin of exactly this tenant."""
+    users = _read_identity_users() or []
+
+    def of(role):
+        out = []
+        for u in users:
+            if not u.get("email") or u.get("active") is False:
+                continue
+            if role not in (u.get("roles") or []):
+                continue
+            if role == "tenant_admin" and resolve_tenant(u.get("tenant")) != tid:
+                continue
+            out.append(u["email"])
+        return out
+    return of
+
+
+def notify_link(tid, path):
+    ext = load_external()
+    if not ext:
+        return ""
+    if tid and tid != default_tenant_id():
+        prefix = next(iter(tenant_host_prefixes(tid)), "")
+        if prefix:
+            return f"https://{prefix}.{ext}{path}"
+    return f"https://{ext}{path}"
+
+
+# The portal page a mail points to. /health is the server_admin's (and
+# support's); a tenant's people get their place's start page instead.
+NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
+                "disk.full": "/health", "advisory.host": "/health",
+                "advisory.image": "/store", "reboot.planned": "/health",
+                "reboot.started": "/health", "reboot.cancelled": "/health",
+                "bulk.halted": "/store", "rebuild.failed": "/store",
+                "confirm.pending": "/store"}
+
+
+def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key=""):
+    """Put one notification into the outbox -> its file, or "" (never raises:
+    a notification that cannot be queued must not break what it reports)."""
+    if ntype not in notify.CATALOGUE:
+        return ""
+    try:
+        os.makedirs(NOTIFY_OUTBOX_DIR, mode=0o700, exist_ok=True)
+        tid = tid or default_tenant_id()
+        item = {"id": uuid.uuid4().hex, "created": _iso_now(), "tenant": tid,
+                "type": ntype, "op": op, "key": key, "instanz": instanz or "",
+                "kurz": (kurz or "")[:80], "text": (text or "")[:1500],
+                "attempts": 0}
+        name = f"{time.time():.6f}-{item['id']}.json"
+        tmp = os.path.join(NOTIFY_OUTBOX_DIR, "." + name)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(item, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(NOTIFY_OUTBOX_DIR, name))
+        return name
+    except OSError as e:
+        print(f"notify: not queued ({ntype}): {e}", file=sys.stderr)
+        return ""
+
+
+def _notify_from_audit(action, tenant, subject, result, detail):
+    ntype = NOTIFY_FROM_AUDIT.get((action, result))
+    if not ntype:
+        return
+    if ntype.startswith("reboot."):
+        notify_event(ntype, tenant, kurz=(detail or "")[:60], text=detail or "")
+    else:
+        notify_event(ntype, tenant, instanz=subject, text=detail or "")
+
+
+def _notify_log(entry):
+    try:
+        os.makedirs(APPS_DIR, exist_ok=True)
+        with open(NOTIFY_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dict({"when": _iso_now()}, **entry),
+                               ensure_ascii=False) + "\n")
+        os.chmod(NOTIFY_LOG_FILE, 0o644)
+    except OSError:
+        pass
+
+
+def notify_log_read(tid=None, limit=50):
+    out = []
+    try:
+        with open(NOTIFY_LOG_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if tid is None or e.get("tenant") == tid:
+                    out.append(e)
+    except OSError:
+        return []
+    return out[-limit:]
+
+
+def _notify_log_trim():
+    try:
+        with open(NOTIFY_LOG_FILE, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    keep = notify.LOG_KEEP * max(1, len(load_tenants()))
+    if len(lines) <= keep * 2:
+        return
+    tmp = NOTIFY_LOG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines[-keep:])
+    os.replace(tmp, NOTIFY_LOG_FILE)
+    os.chmod(NOTIFY_LOG_FILE, 0o644)
+
+
+def notify_mailbox(tid):
+    """(mail, sender name) a scope sends with, or (None, why). Node: the
+    node's mailbox. Tenant: its own, else the node's under its title."""
+    if tid == default_tenant_id():
+        mail, _r = node_mailbox()
+        if not mail:
+            return None, "this node has no mailbox (`oaap mail set`)"
+        return mail, mail.get("from_name") or "OAAP " + (load_external()
+                                                         or socket.gethostname())
+    mail, _r = mail_for_tenant(tid)
+    if not mail:
+        return None, "neither the tenant nor the node has a mailbox"
+    if mail.get("owner") == "tenant":
+        bad = mail_public_refusal(mail["host"], mail["port"])
+        if bad:
+            return None, bad
+        return mail, mail.get("from_name") or _notify_title(tid)
+    return mail, _notify_title(tid)
+
+
+def _notify_title(tid):
+    t = load_tenants().get(tid) or {}
+    return t.get("name") or t.get("label") or "OAAP"
+
+
+NOTIFY_SEND = None      # tests replace it: (mail, sender_name, rcpts, subject, body)
+#                         -> (ok, said) or (ok, said, final)
+
+
+def notify_smtp(mail, sender_name, rcpts, subject, body):
+    """Send one plain mail from the host -> (ok, sentence, final). `final`
+    says a failure will not get better by trying again: the server refused
+    with a 5xx (measured on oaap-test 2026-11-11: "521 5.1.2 Domain does not
+    exist" was retried every minute). A connection that broke, a 4xx: not
+    final. The password never reaches the sentence; Bcc never a header."""
+    if NOTIFY_SEND:
+        got = NOTIFY_SEND(mail, sender_name, rcpts, subject, body)
+        return got if len(got) == 3 else (got[0], got[1], False)
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    from email.utils import formataddr, make_msgid
+    msg = EmailMessage()
+    msg["From"] = formataddr((sender_name or "OAAP", mail["from"]))
+    if rcpts["to"]:
+        msg["To"] = ", ".join(rcpts["to"])
+    if rcpts["cc"]:
+        msg["Cc"] = ", ".join(rcpts["cc"])
+    if mail.get("reply_to"):
+        msg["Reply-To"] = mail["reply_to"]
+    msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid(domain=mail["from"].split("@", 1)[1])
+    msg["Auto-Submitted"] = "auto-generated"
+    msg.set_content(body)
+    every = rcpts["to"] + rcpts["cc"] + rcpts["bcc"]
+    ctx = ssl.create_default_context()
+    try:
+        if mail["tls"] == "tls":
+            srv = smtplib.SMTP_SSL(mail["host"], mail["port"], context=ctx, timeout=20)
+        else:
+            srv = smtplib.SMTP(mail["host"], mail["port"], timeout=20)
+        with srv:
+            srv.ehlo()
+            if mail["tls"] == "starttls":
+                srv.starttls(context=ctx)
+                srv.ehlo()
+            if mail.get("user"):
+                srv.login(mail["user"], mail.get("password") or "")
+            refused = srv.send_message(msg, to_addrs=every)
+        if refused:
+            return True, (f"accepted for {len(every) - len(refused)}, refused for "
+                          f"{len(refused)}: " + "; ".join(
+                              f"{c} {(m or b'').decode('utf-8', 'replace')[:80]}"
+                              for c, m in list(refused.values())[:3])), False
+        return True, f"accepted for {len(every)}", False
+    except smtplib.SMTPRecipientsRefused as exc:
+        codes = [c for c, _m in exc.recipients.values()]
+        said = "every recipient refused: " + "; ".join(
+            f"{c} {(m or b'').decode('utf-8', 'replace')[:80]}"
+            for c, m in list(exc.recipients.values())[:3])
+        return False, said, all(c >= 500 for c in codes)
+    except smtplib.SMTPResponseException as exc:
+        text = (exc.smtp_error or b"").decode("utf-8", "replace")
+        if mail.get("password"):
+            text = text.replace(mail["password"], "***")
+        return False, f"{exc.smtp_code} {text[:200]}", exc.smtp_code >= 500
+    except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
+        text = str(exc)
+        if mail.get("password"):
+            text = text.replace(mail["password"], "***")
+        return False, f"{type(exc).__name__}: {text[:200]}", False
+
+
+def _notify_values(item, tid):
+    t = load_tenants().get(item["tenant"]) or {}
+    return {"knoten": load_external() or socket.gethostname(),
+            "mandant": ("" if item["tenant"] == default_tenant_id()
+                        else t.get("name") or t.get("label", "")),
+            "instanz": item.get("instanz", ""), "typ": item["type"],
+            "kurz": item.get("kurz", "")}
+
+
+def _notify_one(item, tid, from_tenant, state, now, lists=None):
+    """Send one notification in one scope -> "sent" | "retry" | a final
+    word (nobody, limited, skipped, failed). Logs every outcome but skipped."""
+    scope, is_node = notify_scope(tid)
+    ntype, op = item["type"], item.get("op", "event")
+    if op == "test":
+        tpl = notify.TEST_SUBJECT
+    elif lists is None:
+        lists, tpl = notify.route_for(scope, ntype, is_node, from_tenant=from_tenant)
+    else:
+        tpl = notify.CATALOGUE[ntype]["subject"]
+    if not lists:
+        return "skipped"            # a tenant's event the node did not ask for
+    values = _notify_values(item, tid)
+    rcpts = notify.resolve(lists, scope, notify_people_of_role(tid))
+    log = {"tenant": tid, "type": ntype, "op": op, "lists": lists,
+           "about": item["tenant"] if from_tenant else "",
+           "to": len(rcpts["to"]), "cc": len(rcpts["cc"]), "bcc": len(rcpts["bcc"])}
+    if not (rcpts["to"] or rcpts["cc"] or rcpts["bcc"]):
+        if (not is_node and not from_tenant and op != "test"
+                and notify.CATALOGUE[ntype]["scope"] != "both"):
+            # Nobody with an address in the tenant's lists: the node's
+            # owners hear it rather than nobody (RFC-0080 2.1). Not for a
+            # type the node hears itself anyway ("both": a failed backup,
+            # a reboot) -- ten silent tenants would be ten copies of it.
+            _notify_log(dict(log, result="nobody",
+                             said="no address in the lists -- given to the node's owners"))
+            fallback = dict(item, text=(item.get("text", "") + "\n\nIm Verteiler des "
+                                        "Mandanten steht niemand mit E-Mail-Adresse.").strip())
+            return _notify_one(fallback, default_tenant_id(), True, state, now,
+                               lists=[notify.NODE_MANDATORY])
+        _notify_log(dict(log, result="nobody", said="no address in the lists"))
+        return "nobody"
+    per_hour = (notify.TESTS_PER_HOUR if op == "test"
+                else notify.NODE_PER_HOUR if is_node else notify.TENANT_PER_HOUR)
+    bucket = ("tests:" if op == "test" else "sent:") + tid
+    stamps = (state.setdefault("stamps", {})).get(bucket) or []
+    allowed, kept = notify.within_limit(stamps, now, per_hour)
+    if not allowed:
+        state["stamps"][bucket] = kept
+        _notify_log(dict(log, result="limited",
+                         said=f"more than {per_hour} in one hour -- not sent"))
+        return "limited"
+    mail, sender = notify_mailbox(tid)
+    if not mail:
+        _notify_log(dict(log, result="failed", said=sender))
+        return "failed"
+    if not values["mandant"]:
+        # the node's own instances: "[oaap.example] …", never "[] …"
+        tpl = tpl.replace("{mandant}", "{knoten}")
+    subject = notify.subject_with_prefix(lists, scope, notify.subject_for(
+        op, notify.expand(tpl, values)))
+    page = "/nachrichten" if op == "test" else NOTIFY_PAGES.get(ntype, "/")
+    if page == "/health" and not is_node:
+        page = "/"
+    body = notify.body(ntype, op, values, item.get("text", ""),
+                       notify_link(item["tenant"] if not is_node or from_tenant else tid, page))
+    ok, said, final = notify_smtp(mail, sender, rcpts, subject, body)
+    if ok:
+        state["stamps"][bucket] = kept + [now.isoformat()]
+        _notify_log(dict(log, result="sent", said=said))
+        return "sent"
+    if final or op == "test":
+        _notify_log(dict(log, result="failed", said=said))
+        return "failed"
+    if not item.get("attempts"):
+        # once, at the first attempt -- not one line a minute for an hour
+        _notify_log(dict(log, result="retry", said=said + " -- tried again for an hour"))
+    return "retry"
+
+
+def notify_deliver(now=None):
+    """Send what waits in the outbox, oldest first -> {outcome: count}.
+    A notification the mail server did not take stays for an hour, then
+    it is marked failed -- and a failed notification never notifies."""
+    now = now or notify.now_utc()
+    counts = {}
+    try:
+        names = sorted(n for n in os.listdir(NOTIFY_OUTBOX_DIR)
+                       if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        return counts
+    if not names:
+        return counts
+    dflt = default_tenant_id()
+
+    def run(state):
+        for n in names:
+            path = os.path.join(NOTIFY_OUTBOX_DIR, n)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    item = json.load(f)
+            except (OSError, ValueError):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if item.get("type") not in notify.CATALOGUE:
+                os.remove(path)
+                continue
+            done = set(item.get("done") or [])
+            targets = [(item["tenant"], False)]
+            if (notify.CATALOGUE[item["type"]]["scope"] == "tenant"
+                    and item["tenant"] != dflt):
+                targets.append((dflt, True))
+            retry = False
+            for tid, from_tenant in targets:
+                k = f"{tid}:{int(from_tenant)}"
+                if k in done:
+                    continue
+                if tid not in load_tenants():
+                    done.add(k)
+                    continue
+                res = _notify_one(item, tid, from_tenant, state, now)
+                counts[res] = counts.get(res, 0) + 1
+                if res == "retry":
+                    retry = True
+                else:
+                    done.add(k)
+            created = notify._parse(item.get("created")) or now
+            if retry and (now - created).total_seconds() < notify.RETRY_SECONDS:
+                item["done"] = sorted(done)
+                item["attempts"] = int(item.get("attempts") or 0) + 1
+                tmp = os.path.join(NOTIFY_OUTBOX_DIR, "." + n)
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(item, f, ensure_ascii=False)
+                os.replace(tmp, path)
+                continue
+            if retry:
+                state["last_failure"] = {"when": now.isoformat(), "type": item["type"],
+                                         "tenant": item["tenant"]}
+                _notify_log({"tenant": item["tenant"], "type": item["type"],
+                             "op": item.get("op", "event"), "result": "failed",
+                             "said": "the mail server did not take it within an hour"})
+            os.remove(path)
+        return state
+    _notify_state_rw(run)
+    _notify_log_trim()
+    return counts
+
+
+# ------------------------------------------------- conditions (matters)
+
+def _notify_backup_conditions(now):
+    """-> (failed condition or None, missing condition or None)."""
+    run = last_backup_run() or {}
+    failed = None
+    if run.get("state") == "failed":
+        failed = {"type": "backup.failed", "kurz": "",
+                  "text": "Die nächtliche Sicherung des Servers ist fehlgeschlagen"
+                  + (f" ({run.get('finished', '')[:16].replace('T', ' ')} UTC)"
+                     if run.get("finished") else "") + ":\n"
+                  + str(run.get("message") or "ohne Begründung")[:600]}
+    missing = None
+    try:
+        with open(BACKUP_SCHEDULE_FILE, encoding="utf-8") as f:
+            sched = json.load(f) or {}
+    except (OSError, ValueError):
+        sched = {}
+    if sched and not failed:
+        # Only a node that HAS a schedule can miss a backup; a node nobody
+        # set up for backups is the portal's to say, not a daily alarm.
+        last_ok = run.get("finished") if run.get("state") == "ok" else run.get("last_ok")
+        when = notify._parse(last_ok) if last_ok else None
+        if not sched.get("enabled"):
+            missing = {"type": "backup.missing", "kurz": "Zeitplan aus",
+                       "text": "Der Zeitplan der nächtlichen Sicherung ist ausgeschaltet."}
+        elif run.get("state") != "running" and (
+                when is None or (now - when).total_seconds()
+                > notify.BACKUP_STALE_HOURS * 3600):
+            missing = {"type": "backup.missing", "kurz": "",
+                       "text": "Seit über 26 Stunden gibt es keine erfolgreiche "
+                               "Sicherung" + (f" (zuletzt {last_ok[:16].replace('T', ' ')} UTC)."
+                                              if last_ok else ".")}
+    return failed, missing
+
+
+def notify_conditions(facts=None, now=None):
+    """The conditions true now, per scope: {tid: {key: condition}}."""
+    now = now or notify.now_utc()
+    facts = facts or {}
+    dflt = default_tenant_id()
+    cur = {tid: {} for tid in load_tenants()}
+    cur.setdefault(dflt, {})
+    failed, missing = _notify_backup_conditions(now)
+    if failed:
+        for tid in cur:
+            cur[tid]["backup.failed"] = dict(failed)
+    if missing:
+        cur[dflt]["backup.missing"] = missing
+    pct = metrics.read_disk_percent(DATA_DIR)
+    if pct is not None:
+        s = notify_settings()
+        open_before = "disk.full" in ((_notify_state_rw().get("matters") or {})
+                                      .get(dflt) or {})
+        # Two points of hysteresis: a disk at 89.9/90.1 % must not mail
+        # every minute (D6 is "begins and ends", not "flickers").
+        if pct >= s["disk_warn"] or (open_before and pct >= s["disk_warn"] - 2):
+            level = "kritisch" if pct >= s["disk_crit"] else "Warnung"
+            cur[dflt]["disk.full"] = {
+                "type": "disk.full", "kurz": f"zu {pct:.0f} % voll",
+                "text": f"Die Datenplatte des Servers ist zu {pct:.1f} % belegt "
+                        f"({level}; Schwellen {s['disk_warn']:.0f} % / "
+                        f"{s['disk_crit']:.0f} %)."}
+    adv = facts.get("advisories") or {}
+    if adv.get("open"):
+        cur[dflt]["advisory.host"] = {
+            "type": "advisory.host", "kurz": str(adv["open"]),
+            "text": f"Für {adv['open']} Paket(e) des Servers gibt es Sicherheitskorrekturen, "
+                    "die noch nicht eingespielt sind"
+                    + (f" (das älteste: {adv.get('oldest_package')}, seit "
+                       f"{str(adv.get('oldest', ''))[:10]})." if adv.get("oldest_package")
+                       else ".")}
+    # ONE matter per tenant, not one per instance: measured on oaap-test
+    # (2026-11-11) the first minute opened one per instance -- on a node with
+    # twenty apps that is twenty mails at the rollout. The text names them.
+    imgs = ((facts.get("images") or {}).get("instances") or {})
+    reg = (load_registry().get("instances") or {})
+    per = {}
+    for name, e in sorted(imgs.items()):
+        if e.get("state") != "open":
+            continue
+        tid = resolve_tenant((reg.get(name) or {}).get("tenant")) or dflt
+        per.setdefault(tid, []).append((name, e.get("open")))
+    for tid, rows in per.items():
+        cur.setdefault(tid, {})["advisory.image"] = {
+            "type": "advisory.image", "kurz": str(len(rows)),
+            "instanz": rows[0][0] if len(rows) == 1 else f"{len(rows)} Instanzen",
+            "text": "In den Abbildern dieser Instanzen sind Sicherheitskorrekturen offen:\n"
+                    + "\n".join(f"  - {nm}: {n_ or 'einige'}" for nm, n_ in rows)
+                    + "\n„Neu bauen“ im Store hilft, wenn die Karte „Abbild“ das sagt."}
+    return cur
+
+
+def notify_matters(facts=None, now=None):
+    """Compare the conditions with the open matters; queue open, remind
+    and close (D6). -> number queued."""
+    now = now or notify.now_utc()
+    cur = notify_conditions(facts, now)
+    queued = []
+
+    def run(state):
+        matters = state.setdefault("matters", {})
+        for tid in sorted(set(cur) | set(matters)):
+            ops, new = notify.matter_ops(cur.get(tid) or {}, matters.get(tid) or {}, now)
+            for op, key, rec in ops:
+                queued.append(notify_event(rec["type"], tid, instanz=rec.get("instanz", ""),
+                                           kurz=rec.get("kurz", ""), text=rec.get("text", ""),
+                                           op=op, key=key))
+            if new:
+                matters[tid] = new
+            else:
+                matters.pop(tid, None)
+        return state
+    _notify_state_rw(run)
+    return len([q for q in queued if q])
+
+
+NOTIFY_VIEW_FILE = os.path.join(APPS_DIR, "notify-view.json")
+
+
+def notify_view_write():
+    """{tid: {list: number of addresses it reaches now}} for the portal, which
+    cannot read identity's store: a mandatory list that reaches nobody must be
+    seen (measured on oaap-test 2026-11-11: its server_admin had no address)."""
+    data = notify_load()
+    view = {}
+    for tid in load_tenants():
+        scope, _n = notify_scope(tid, data)
+        people = notify_people_of_role(tid)
+        view[tid] = {name: sum(len(v) for v in notify.resolve([name], scope, people).values())
+                     for name in scope["lists"]}
+    try:
+        with open(NOTIFY_VIEW_FILE, encoding="utf-8") as f:
+            if (json.load(f) or {}).get("reach") == view:
+                return view           # unchanged: apps/ is not touched
+    except (OSError, ValueError):
+        pass
+    tmp = NOTIFY_VIEW_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"written": _iso_now(), "reach": view}, f)
+    os.replace(tmp, NOTIFY_VIEW_FILE)
+    os.chmod(NOTIFY_VIEW_FILE, 0o644)
+    return view
+
+
+NOTIFY_BACKUP_PAUSE_HOURS = 6
+
+
+def notify_paused_by_backup(now=None):
+    """While a backup runs, the minute part waits: it would write into apps/
+    under tar's feet, and a running backup is neither failed nor fixed (a
+    "Behoben" was mailed mid-run on oaap-test 2026-11-11). A run that
+    claims to have started more than six hours ago is a crashed one; then
+    nothing waits for it."""
+    run = last_backup_run() or {}
+    if run.get("state") != "running":
+        return False
+    started = notify._parse(run.get("started")) if run.get("started") else None
+    now = now or notify.now_utc()
+    return bool(started and (now - started).total_seconds()
+                < NOTIFY_BACKUP_PAUSE_HOURS * 3600)
+
+
+def notify_minute(facts=None):
+    """The minute job's part: matters, then the outbox. Never raises."""
+    try:
+        if notify_paused_by_backup():
+            return {}
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: backup check: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
+        notify_view_write()
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: view: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
+        notify_matters(facts)
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: conditions: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
+        return notify_deliver()
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: delivery: {type(e).__name__}: {e}", file=sys.stderr)
+        return {}
+
+
+# ------------------------------------------------- writing lists and routes
+
+def notify_parse_entries(to="", cc="", bcc=""):
+    """The portal's and CLI's three fields -> entries. An item is an address,
+    `rolle:tenant_admin` / `rolle:server_admin`, or the German role word."""
+    words = {"rolle:tenant_admin": "tenant_admin", "rolle:server_admin": "server_admin",
+             "mandanten-admins": "tenant_admin", "server-admins": "server_admin"}
+    out = []
+    for field, text in (("to", to), ("cc", cc), ("bcc", bcc)):
+        for tok in re.split(r"[\s,;]+", text or ""):
+            tok = tok.strip()
+            if not tok:
+                continue
+            role = words.get(tok.lower())
+            out.append({"channel": "mail", "to": field,
+                        **({"role": role} if role else {"address": tok})})
+    return out
+
+
+def notify_list_set(tid, name, entries, prefix="", who="root", role="root"):
+    data = notify_load()
+    scope, is_node = notify_scope(tid, data)
+    name = (name or "").strip()
+    lst = {"entries": entries, "subject_prefix": (prefix or "").strip()}
+    bad = notify.list_refusal(name, lst, is_node)
+    if bad:
+        raise NotifyRefused(bad)
+    if name in scope["lists"] and scope["lists"][name].get("mandatory"):
+        lst["mandatory"] = True
+    stored = data["scopes"].setdefault(tid, {})
+    stored.setdefault("lists", {})[name] = lst
+    notify_save(data)
+    try:
+        notify_view_write()
+    except OSError:
+        pass
+    audit_tenant("notify.list.set", tid, subject=name, who=who, role=role,
+                 detail=f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
+    return lst
+
+
+def notify_list_remove(tid, name, who="root", role="root"):
+    data = notify_load()
+    scope, is_node = notify_scope(tid, data)
+    if name not in scope["lists"]:
+        raise NotifyRefused(f"there is no list '{name}'")
+    if scope["lists"][name].get("mandatory"):
+        raise NotifyRefused(f"'{name}' is the mandatory list -- it can be changed, "
+                            "not removed")
+    stored = data["scopes"].setdefault(tid, {})
+    (stored.get("lists") or {}).pop(name, None)
+    for k, r in list((stored.get("routes") or {}).items()):
+        r["lists"] = [n for n in r.get("lists") or [] if n != name]
+        if not r["lists"] and not r.get("subject"):
+            del stored["routes"][k]
+    notify_save(data)
+    audit_tenant("notify.list.remove", tid, subject=name, who=who, role=role)
+
+
+def notify_route_set(tid, key, lists, subject="", who="root", role="root"):
+    data = notify_load()
+    scope, is_node = notify_scope(tid, data)
+    route = {"lists": [n for n in (lists or []) if n], "subject": (subject or "").strip()}
+    bad = notify.route_refusal(key, route, scope, is_node)
+    if bad:
+        raise NotifyRefused(bad)
+    stored = data["scopes"].setdefault(tid, {}).setdefault("routes", {})
+    if route["lists"] or route["subject"]:
+        stored[key] = route
+    else:
+        stored.pop(key, None)
+    notify_save(data)
+    audit_tenant("notify.route", tid, subject=key, who=who, role=role,
+                 detail=(", ".join(route["lists"]) or "the mandatory list")
+                 + (f"; subject {route['subject']}" if route["subject"] else ""))
+    return route
+
+
+def notify_settings_set(disk_warn=None, disk_crit=None, who="root"):
+    s = notify_settings()
+    w = float(disk_warn) if disk_warn is not None else s["disk_warn"]
+    c = float(disk_crit) if disk_crit is not None else s["disk_crit"]
+    if not (1 <= w <= c <= 100):
+        raise NotifyRefused("thresholds are 1 <= warn <= critical <= 100")
+    data = notify_load()
+    data["scopes"].setdefault(default_tenant_id(), {})["settings"] = {
+        "disk_warn": w, "disk_crit": c}
+    notify_save(data)
+    audit_tenant("notify.settings", default_tenant_id(), subject="disk", who=who,
+                 detail=f"warn {w:g} %, critical {c:g} %")
+    return {"disk_warn": w, "disk_crit": c}
+
+
+def notify_test(tid, name, who="root", role="root"):
+    """Probe senden: one test mail to one list, now -> (ok, sentence)."""
+    scope, _is_node = notify_scope(tid)
+    if name not in scope["lists"]:
+        return False, f"there is no list '{name}'"
+    item = {"tenant": tid, "type": "backup.failed", "op": "test", "instanz": "",
+            "kurz": name, "text": f"Dies ist eine Probe für den Verteiler „{name}“. "
+                                "Es ist nichts passiert."}
+    out = {}
+
+    def run(state):
+        out["res"] = _notify_one(item, tid, False, state, notify.now_utc(), lists=[name])
+        return state
+    _notify_state_rw(run)
+    last = (notify_log_read(tid, 1) or [{}])[-1]
+    audit_tenant("notify.test", tid, subject=name, who=who, role=role,
+                 result="ok" if out["res"] == "sent" else "failed",
+                 detail=str(last.get("said", ""))[:200])
+    words = {"sent": "Probe verschickt", "nobody": "niemand im Verteiler hat eine Adresse",
+             "limited": f"höchstens {notify.TESTS_PER_HOUR} Proben je Stunde",
+             "failed": "nicht verschickt"}
+    return out["res"] == "sent", (words.get(out["res"], out["res"])
+                                  + (f" ({last.get('said')})" if last.get("said") else ""))
+
+
+def notify_job(req, actor):
+    """The portal's sections Verteiler and Benachrichtigungen -> (ok, sentence).
+    Role and tenant from the ACTOR's own record (acting_tenant)."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
+    if not tid:
+        return False, err or "requires server_admin or tenant_admin"
+    if tid == default_tenant_id() and role != "server_admin":
+        return False, "the node's lists are the server_admin's"
+    try:
+        if op == "list-set":
+            entries = notify_parse_entries(str(a.get("to") or ""), str(a.get("cc") or ""),
+                                           str(a.get("bcc") or ""))
+            notify_list_set(tid, str(a.get("name") or ""), entries,
+                            str(a.get("prefix") or ""), who=actor, role=role)
+            return True, f"Verteiler „{a.get('name')}“ gespeichert."
+        if op == "list-remove":
+            notify_list_remove(tid, str(a.get("name") or ""), who=actor, role=role)
+            return True, f"Verteiler „{a.get('name')}“ entfernt."
+        if op == "route-set":
+            routes = a.get("routes") if isinstance(a.get("routes"), dict) else {}
+            for key, r in sorted(routes.items()):
+                r = r if isinstance(r, dict) else {}
+                notify_route_set(tid, str(key), [str(x) for x in r.get("lists") or []],
+                                 str(r.get("subject") or ""), who=actor, role=role)
+            return True, "Zuordnung gespeichert."
+        if op == "test":
+            return notify_test(tid, str(a.get("name") or ""), who=actor, role=role)
+        return False, f"unknown notify operation '{op}'"
+    except NotifyRefused as exc:
+        return False, str(exc)
+
+
+def cmd_notify(args):
+    """`oaap notify show|list-set|list-remove|route|test|log|settings|run`
+    (RFC-0080, oaap.core.notifications 0.1)."""
+    who = _dest_who()
+    tid = default_tenant_id()
+    if args.tenant:
+        tid = resolve_tenant_arg(args.tenant)
+    act = args.action
+    try:
+        if act == "show":
+            scope, is_node = notify_scope(tid)
+            print(f"Lists ({'node' if is_node else 'tenant ' + tenant_label(tid)}):")
+            reach = notify_view_write().get(tid) or {}
+            for n, l in sorted(scope["lists"].items()):
+                ent = ", ".join(f"{notify.FIELD_WORDS[e['to']]} "
+                                + (e.get("address") or notify.ROLES.get(e.get("role"), "?"))
+                                for e in l.get("entries") or [])
+                print(f"  {n}{' (mandatory)' if l.get('mandatory') else ''}: {ent}"
+                      f"  -> reaches {reach.get(n, 0)} address(es) now"
+                      + ("  ** NOBODY **" if not reach.get(n) else ""))
+            print("Routing:")
+            for key in list(notify.CATEGORIES) + notify.types_for(is_node):
+                r = scope["routes"].get(key)
+                if r or key in notify.CATEGORIES:
+                    print(f"  {key:<18} -> " + (", ".join((r or {}).get("lists") or [])
+                                                 or "(mandatory list)")
+                          + (f"   subject: {r['subject']}" if (r or {}).get("subject") else ""))
+            if is_node:
+                s = notify_settings()
+                print(f"Disk: warn {s['disk_warn']:g} %, critical {s['disk_crit']:g} %")
+            return
+        if act == "list-set":
+            entries = notify_parse_entries(args.to or "", args.cc or "", args.bcc or "")
+            notify_list_set(tid, args.name or die("which list?"), entries,
+                            args.prefix or "", who=who)
+            print(f"List '{args.name}' saved ({len(entries)} entries).")
+            return
+        if act == "list-remove":
+            notify_list_remove(tid, args.name or die("which list?"), who=who)
+            print(f"List '{args.name}' removed.")
+            return
+        if act == "route":
+            key = args.name or die("which category or type?")
+            lists = [x.strip() for x in (args.lists or "").split(",") if x.strip()]
+            notify_route_set(tid, key, lists, args.subject or "", who=who)
+            print(f"{key} -> " + (", ".join(lists) or "the mandatory list"))
+            return
+        if act == "test":
+            ok, said = notify_test(tid, args.name or die("which list?"), who=who)
+            print(said)
+            if not ok:
+                sys.exit(1)
+            return
+        if act == "log":
+            for e in notify_log_read(None if args.all else tid, args.limit):
+                print(f"  {e.get('when', '')[:19]}  {tenant_label(e.get('tenant')) or '-':<10} "
+                      f"{e.get('type', ''):<16} {e.get('op', ''):<6} {e.get('result', ''):<8} "
+                      f"to {e.get('to', 0)} cc {e.get('cc', 0)} bcc {e.get('bcc', 0)}  "
+                      f"{e.get('said', '')}")
+            return
+        if act == "settings":
+            s = notify_settings_set(args.disk_warn, args.disk_crit, who=who)
+            print(f"Disk: warn {s['disk_warn']:g} %, critical {s['disk_crit']:g} %")
+            return
+        if act == "run":
+            if notify_paused_by_backup():
+                die("a backup is running -- notifications wait until it ends")
+            facts = host_care.read(APPS_DIR) or {}
+            n = notify_matters(facts)
+            print(f"{n} notification(s) queued from conditions; sent: {notify_deliver()}")
+            return
+    except NotifyRefused as exc:
+        die(str(exc))
+    die(f"unknown action '{act}'")
+
+
 def destination_add(tid, name, kind, target, auth_type="none", user="",
                     header="", secret="", who="root", role="root",
                     accept_sha256="", claims=(), name_check="",
@@ -4930,6 +5809,11 @@ def audit_tenant(action, tenant, subject="", result="ok", who="root",
         os.chmod(TENANT_LOG, 0o644)
     except OSError:
         pass
+    # RFC-0080 2.4: the notification comes from the same call as the line.
+    try:
+        _notify_from_audit(action, tenant, subject, result, detail)
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: {type(e).__name__}: {e}", file=sys.stderr)
     return entry
 
 
@@ -10538,6 +11422,10 @@ def _care_reboot_if_due(facts):
     host_care.save_plan(plan, APPS_DIR)
     facts["plan"] = plan
     host_care.write(facts, APPS_DIR)
+    try:
+        notify_deliver()      # "reboot.started" goes before the machine does
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: {e}", file=sys.stderr)
     subprocess.run(["systemctl", "reboot"], capture_output=True, text=True)
     return True
 
@@ -10574,6 +11462,8 @@ def cmd_node_care(args):
             facts = _care_evaluate(facts)
             if json.dumps(facts.get("plan"), sort_keys=True) != before:
                 host_care.write(facts, APPS_DIR)
+        # RFC-0080: conditions and the outbox, before a reboot can come.
+        notify_minute(facts)
         _care_reboot_if_due(facts)
         return
     if verb == "measure":
@@ -26866,6 +27756,11 @@ def bulk_run(jid, say=print):
         job["state"] = "done"
     job["finished"] = _iso_now()
     bulk_save(job)
+    if job["state"] == "stopped" and job.get("reason") != "angehalten von Hand":
+        notify_event("bulk.halted", resolve_tenant(job.get("tenant")) or default_tenant_id(),
+                     kurz={"update": "Alle aktualisieren", "promote": "Alle getesteten übernehmen",
+                           "rebuild": "Alle neu bauen"}.get(job.get("kind"), job.get("kind", "")),
+                     text=f"Der Lauf hielt beim ersten Fehler an: {job.get('reason', '')}")
     try:
         os.remove(stop_file)
     except OSError:
@@ -28575,6 +29470,16 @@ def cmd_process_deploys(_args):
                              subject=MAIL_DEST, result="denied",
                              who=actor or "portal", role=act_role or "-",
                              detail=msg[:200])
+        elif action == "notify":
+            # RFC-0080: the sections Verteiler and Benachrichtigungen of the
+            # page "Nachrichten". Role and tenant from the ACTOR's record.
+            ok, msg = notify_job(req, actor)
+            if not ok:
+                audit_tenant("notify." + str(req.get("op") or "?"),
+                             act_tenant or ensure_default_tenant(),
+                             subject=str((req.get("args") or {}).get("name") or ""),
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg[:200])
         elif action == "tenant-build":
             # RFC-0055 stage 2: a tenant build from the portal or the
             # operator API -- the very core `oaap tenant build` uses. Who
@@ -28871,6 +29776,13 @@ def cmd_process_deploys(_args):
                     res_body["needs"] = "confirm_envelope"
                     res_body["fingerprint"] = envelope_need["fingerprint"]
                     res_body["notes"] = envelope_need["notes"]
+                if res_body.get("needs") and not actor and not req.get("via"):
+                    # RFC-0080: a delivery nobody is watching (the deploy
+                    # hook) waits for a person -- tell the tenant's people.
+                    _n_inst = load_registry().get("instances", {}).get(name) or inst or {}
+                    notify_event("confirm.pending",
+                                 resolve_tenant(_n_inst.get("tenant")) or ensure_default_tenant(),
+                                 instanz=name, text=str(res_body.get("message") or "")[:800])
                 if detail is not None:
                     res_body["detail"] = detail
                 json.dump(res_body, f)
@@ -29660,9 +30572,16 @@ def cmd_backup(args):
     need = _dir_kbytes(DATA_DIR)
     free = shutil.disk_usage(out_dir).free // 1024
     if need and free < need * 12 // 10:
-        die(f"not enough room in {out_dir}: about {need // 1024} MB is copied "
-            f"there before it is compressed, and {free // 1024} MB is free. "
-            "Free some space, or choose another target with --to.")
+        reason = (f"not enough room in {out_dir}: about {need // 1024} MB is copied "
+                  f"there before it is compressed, and {free // 1024} MB is free. "
+                  "Free some space, or choose another target with --to.")
+        # Recorded like every other outcome (see _record_backup_run): measured
+        # on oaap-test 2026-11-11, this refusal left yesterday's "ok" standing,
+        # so a full target disk at 03:30 was invisible to the page and to the
+        # notifications until the 26-hour mark (RFC-0080).
+        _record_backup_run("failed", message=reason,
+                           target=os.path.join(out_dir, out_file))
+        die(reason)
     # Said out loud, because it is a real consequence of RFC-0030 and not
     # a detail: while a rehearsal exists, every archive carries a SECOND
     # copy of that production instance's data, and carries it for as long
@@ -31736,6 +32655,31 @@ def build_parser():
                             "command line)")
     pmail.add_argument("--yes", action="store_true", help="for 'clear'")
     pmail.set_defaults(fn=cmd_mail)
+    pnot = sub.add_parser("notify", help="recipient lists and notifications "
+                                         "(RFC-0080)")
+    pnot.add_argument("action", choices=["show", "list-set", "list-remove", "route",
+                                         "test", "log", "settings", "run"])
+    pnot.add_argument("name", nargs="?",
+                      help="the list (list-set, list-remove, test) or the "
+                           "category/type (route)")
+    pnot.add_argument("--tenant", default=None, help="a tenant's label (default: the node)")
+    pnot.add_argument("--to", default=None,
+                      help="addresses or rolle:server_admin / rolle:tenant_admin, "
+                           "comma separated")
+    pnot.add_argument("--cc", default=None)
+    pnot.add_argument("--bcc", default=None)
+    pnot.add_argument("--prefix", default=None, help="for list-set: a subject prefix")
+    pnot.add_argument("--lists", default=None,
+                      help="for route: list names, comma separated; empty = the "
+                           "mandatory list")
+    pnot.add_argument("--subject", default=None,
+                      help="for route: subject template ({knoten} {mandant} "
+                           "{instanz} {typ} {kurz})")
+    pnot.add_argument("--disk-warn", dest="disk_warn", type=float, default=None)
+    pnot.add_argument("--disk-crit", dest="disk_crit", type=float, default=None)
+    pnot.add_argument("--all", action="store_true", help="for log: every tenant")
+    pnot.add_argument("--limit", type=int, default=30)
+    pnot.set_defaults(fn=cmd_notify)
     pten =sub.add_parser("tenant", help="accounts and tenants of this node "
                                          "(oaap.core.tenant)")
     pten.add_argument("action",
@@ -32305,7 +33249,7 @@ def cmd_help(args, parser):
 WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
                   "files", "user", "cohort", "disk", "machine", "authz", "key",
                   "fleet", "tenant", "metrics", "broker", "idp", "mail",
-                  "destination", "connect", "connector", "help")
+                  "notify", "destination", "connect", "connector", "help")
 
 # What `bin/oaap` does by itself, without appctl.py -- argparse cannot know
 # these, so the reference names them from here (same test as above).

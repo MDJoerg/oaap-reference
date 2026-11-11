@@ -219,5 +219,57 @@ H = {"X-OAAP-User": "vorstand", "X-OAAP-Roles": "tenant_admin"}
 ok("tenant_admin mit fremdem Mandanten in der Adresse: 404",
    cl.get("/nachrichten?tenant=andere", headers=H).status_code == 404)
 
+print("\n=== Verteiler und Benachrichtigungen (RFC-0080) ===")
+portal.NOTIFY_FILE = a.NOTIFY_FILE
+portal.NOTIFY_LOG_FILE = a.NOTIFY_LOG_FILE
+portal.NOTIFY_WAIT_SECONDS = 3
+a.notify_list_set(tv, "Backup-Verantwortliche", a.notify_parse_entries(
+    "vorstand@verein.example", "mandanten-admins", "archiv@verein.example"))
+a.notify_route_set(tv, "backup.failed", ["Backup-Verantwortliche"], "[{mandant}] Backup")
+a.notify_list_set(other, "Geheim", a.notify_parse_entries("geheim@andere.example"))
+a._notify_log({"tenant": tv, "type": "backup.failed", "op": "open", "lists": ["Backup-Verantwortliche"],
+               "to": 1, "cc": 1, "bcc": 1, "result": "sent", "said": "accepted for 3"})
+t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
+ok("tenant_admin: Pflicht-Verteiler, eigener Verteiler mit An/Cc/Bcc, Probe-Knopf",
+   "Mandantenverwaltung" in t and "Backup-Verantwortliche" in t
+   and "Bcc archiv@verein.example" in t and "Probe senden" in t, t[-3000:])
+ok("die Zuordnung zeigt den Haken und den eigenen Betreff",
+   'name="r__backup.failed" value="Backup-Verantwortliche" checked' in t
+   and "[{mandant}] Backup" in t)
+ok("keine Knotenart (Platte) beim Mandanten, aber die Mandantenarten",
+   "Platte fast voll" not in t and "Neubau einer Instanz fehlgeschlagen" in t)
+ok("das Protokoll zeigt die Sendung ohne Adressen",
+   "verschickt" in t and "1 / 1 / 1" in t)
+ok("nichts vom fremden Mandanten", "geheim@andere.example" not in t and "Geheim" not in t)
+r = post("/nachrichten/verteiler/set", {"name": "Kasse", "to": "kasse@verein.example, Mandanten-Admins",
+                                        "cc": "", "bcc": "", "prefix": ""})
+req = SENT[-1][0]
+ok("Verteiler speichern: eine Anfrage `notify` list-set, ohne Mandant, Rollenwort umgesetzt",
+   req.get("action") == "notify" and req["op"] == "list-set" and "tenant" not in req["args"]
+   and "mandanten-admins" in req["args"]["to"], req)
+r = post("/nachrichten/benachrichtigungen", {"r__critical": "Backup-Verantwortliche",
+                                             "r__backup.failed": "Backup-Verantwortliche",
+                                             "s__backup.failed": "[{mandant}] Backup"})
+req = SENT[-1][0]
+ok("Zuordnung: nur die geänderte Zeile reist (Kritisch)",
+   req["op"] == "route-set" and list(req["args"]["routes"]) == ["critical"], req)
+WHO.update(role="server_admin", tenant=dflt)
+H = {"X-OAAP-User": "betreiber", "X-OAAP-Roles": "server_admin"}
+t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
+ok("server_admin am Knoten: Serverbesitzer, Knotenarten, Mandanten nur mit Namen und Anzahl",
+   "Serverbesitzer" in t and "Platte fast voll" in t and "Geheim (1)" in t
+   and "geheim@andere.example" not in t and "vorstand@verein.example" not in t, t[-2500:])
+ok("Mandantenarten am Knoten tragen den Hinweis „nur mit eigenem Haken“",
+   "nur mit eigenem Haken" in t)
+portal.NOTIFY_VIEW_FILE = a.NOTIFY_VIEW_FILE
+a.notify_view_write()        # no person in this test has an address
+t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
+ok("Serverbesitzer ohne Adresse: die Seite sagt es rot („erreicht niemanden“)",
+   "erreicht im Moment" in t and "niemanden" in t, t[-2500:])
+r = post("/nachrichten/verteiler/test?tenant=verein", {"name": "Backup-Verantwortliche"})
+req = SENT[-1][0]
+ok("Probe für einen Mandanten: der server_admin nennt ihn",
+   req["op"] == "test" and req["args"].get("tenant") == tv, req)
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)
