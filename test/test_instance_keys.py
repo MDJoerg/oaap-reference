@@ -164,7 +164,9 @@ SCOPE = {"OAAP_PLATFORM_KEY": lambda n: m.TWIN_KEY_SCOPE,
          "OAAP_AUTHZ_KEY": lambda n: m.AUTHZ_KEY_SCOPE,
          "OAAP_AUTHZ_ADMIN_KEY": lambda n: m.AUTHZ_ADMIN_KEY_SCOPE,
          "OAAP_CASES_KEY": lambda n: m.cases_submit_scope(n),
-         "OAAP_MCP_SOURCES_KEY": lambda n: m.mcp_sources_scope(n)}
+         "OAAP_MCP_SOURCES_KEY": lambda n: m.mcp_sources_scope(n),
+         # RFC-0074: the chat's key at its tenant's gateways
+         "OAAP_MCP_CLIENT_KEY": lambda n: m.mcp_client_scope(n)}
 
 
 def all_speak(env, name):

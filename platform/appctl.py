@@ -9812,8 +9812,27 @@ def _git_at_commit(src, tmp):
         raise RebuildRefused("the checkout is not the recorded commit -- nothing changed")
     # The bytes, not the repository: a build context at the repository's
     # root must not carry .git (its config holds the URL) into the image.
-    shutil.rmtree(os.path.join(tmp, ".git"), ignore_errors=True)
+    _rmtree_writable(os.path.join(tmp, ".git"))
     return os.path.join(tmp, src.get("path") or "")
+
+
+def _rmtree_writable(path):
+    """rmtree that also removes read-only files (git writes its objects
+    read-only; on Windows `ignore_errors=True` then left .git in place --
+    found by test_rebuild_git). Errors other than that stay ignored."""
+    import stat
+
+    def _again(fn, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            fn(p)
+        except OSError:
+            pass
+    if os.path.exists(path):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_again)
+        else:
+            shutil.rmtree(path, onerror=_again)
 
 
 def _rebuild_package(name, inst, tmp):

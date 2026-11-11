@@ -624,6 +624,10 @@ else:
     ENV = Environment(autoescape=True)
 
     def render(name, **ctx):
+        # Since the store care counts (RFC-0071) the list templates expect
+        # them; this test is about the tenant boundary, so none are open.
+        ctx.setdefault("care_counts", {})
+        ctx.setdefault("care_labels", {})
         return ENV.from_string(template(name)).render(**ctx)
 
     USERS = [{"username": "joerg", "display_name": "Joerg",
@@ -634,7 +638,10 @@ else:
     INST = [{"name": "viewer", "app_name": "Viewer", "version": "1.0",
              "channel": "test", "channel_label": "Test",
              "visibility_label": "Alle", "tile_visible": True,
-             "tile_mode": "auto", "tenant": "k7f3"}]
+             "tile_mode": "auto", "tenant": "k7f3", "key": "viewer",
+             "status": {"state": "ok", "label": "läuft", "detail": ""},
+             "app_id": "viewer",
+             "care": {"behind": 0, "newer": "", "open": 0, "update_source": ""}}]
     NEW_FORM = {"username": "", "display_name": "", "roles": [], "groups": [],
                 "tenant": ""}
 
