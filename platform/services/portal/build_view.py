@@ -56,9 +56,38 @@ def rows(view):
         label, tone = state_label(b.get("state"))
         out.append({"id": b.get("id", ""), "label": b.get("label", ""),
                     "profile": b.get("profile", ""), "state": label,
+                    "version": b.get("version", ""),
                     "tone": tone, "by": b.get("by", ""),
                     "created": _when(b.get("created"))})
     return out
+
+
+def version_text(v):
+    """„1.1.0“ oder „ohne Version“ (RFC-0079 D1)."""
+    return str(v) if v else "ohne Version"
+
+
+def history(view, pid):
+    """Die aufbewahrten Fassungen eines Profils, neueste zuerst (RFC-0079
+    D3): Version, Kurz-Prüfsumme, wann, ob aktuell."""
+    p = find_profile(view, pid)
+    out = []
+    for h in (p or {}).get("history") or []:
+        out.append({"version": version_text(h.get("version")),
+                    "digest": h.get("digest", ""),
+                    "short": str(h.get("digest", ""))[:12],
+                    "kept": _when(h.get("kept")), "by": h.get("by", ""),
+                    "current": bool(h.get("current"))})
+    return out
+
+
+def history_text(view, pid, digest):
+    """Eine aufbewahrte Fassung für „Herunterladen“, oder None."""
+    p = find_profile(view, pid)
+    for h in (p or {}).get("history") or []:
+        if h.get("digest") == digest and isinstance(h.get("doc"), dict):
+            return json.dumps(h["doc"], indent=2, ensure_ascii=False) + "\n"
+    return None
 
 
 def profiles(view):
@@ -68,6 +97,8 @@ def profiles(view):
     for p in (view or {}).get("profiles") or []:
         out.append({"id": p.get("id", ""), "title": p.get("title", ""),
                     "problem": p.get("problem", ""),
+                    "version": version_text(p.get("version")),
+                    "versions": len(p.get("history") or []),
                     "steps": len(p.get("steps") or [])})
     return out
 
@@ -267,6 +298,9 @@ def detail(build):
                          for m in r.get("made") or [])
     return {"id": build.get("id", ""), "label": build.get("label", ""),
             "profile": build.get("profile", ""), "state": label, "tone": tone,
+            # RFC-0079 D4: which file this build ran
+            "version": version_text(build.get("version")),
+            "digest": str(build.get("digest") or "")[:12],
             "raw_state": build.get("state", ""), "by": build.get("by", ""),
             "created": _when(build.get("created")), "steps": steps,
             "progress": f"{done} von {len(steps)}", "waiting": waiting,

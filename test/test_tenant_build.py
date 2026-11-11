@@ -565,8 +565,17 @@ changed = real_profile()
 changed["title"] = "Club (edited)"
 write_profile("club", changed)
 out, code = cli("continue", dig)
-ok("continue refuses when the profile file differs from the one the build "
-   "started with", code != 0 and "digest" in out, out)
+# RFC-0079 D5: the build continues with the file it began with, kept by
+# digest -- a newer file no longer strands it.
+st_dig = tb.load_state(m.BUILD_DIR, dig)
+ok("continue goes on with the version the build started with (kept by digest)",
+   code == 0 and "digest" not in out
+   and tb.history_path(m.PROFILE_DIR, "club", st_dig["digest"]) is not None, out)
+# Without the kept file (a build from before RFC-0079) the old refusal stands.
+tb.history_drop(m.PROFILE_DIR, "club")
+out, code = cli("continue", dig)
+ok("without the kept file, continue still refuses a changed profile",
+   code != 0 and "digest" in out, out)
 
 print("=== something already gone is not a failed undo ===")
 drv = m._BuildDrivers("vnogone")

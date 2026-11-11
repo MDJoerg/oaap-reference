@@ -107,7 +107,8 @@ ok("ein Profil mit app.config ist gueltig", tb.profile_problems(prof) == [],
    tb.profile_problems(prof))
 bad = dict(prof, steps=prof["steps"][:2] + [{"id": "x", "type": "app.config",
                                               "name": "portal", "key": "MODE"}])
-ok("ohne 'value' wird es abgelehnt", any("needs 'value'" in p for p in tb.profile_problems(bad)),
+ok("ohne 'value' (und ohne 'generate') wird es abgelehnt",
+   any("exactly one of 'value' and 'generate'" in p for p in tb.profile_problems(bad)),
    tb.profile_problems(bad))
 r = tb.render_step(prof["steps"][3], {"label": "k", "kontakt": None})
 ok("ein leerer Parameter laesst 'value' weg", "value" not in r, r)

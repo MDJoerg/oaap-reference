@@ -75,7 +75,10 @@ STEP_TYPES = {
     # its app.install, so the instance exists. One key per step: each is
     # checked, repeated and reported on its own, and a value stays text.
     # The value never appears in a note or the audit trail.
-    "app.config":     (("name", "key", "value"), ()),
+    # RFC-0079: `generate: true` instead of `value` -- the node produces the
+    # value, of the kind the APP's manifest declares, and only into an empty
+    # key. Exactly one of the two.
+    "app.config":     (("name", "key"), ("value", "generate")),
     # RFC-0056 inside a build: the group the tenant's own administrator
     # belongs in, in the tenant's realm (a group, never a person).
     "idp.admin_group": ((), ()),
@@ -107,6 +110,147 @@ class Refusal(Exception):
 
 def digest_of(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+# ------------------------------------------------- versions (RFC-0079)
+
+VERSION_RE = re.compile(r"^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}(-[0-9A-Za-z.]{1,20})?$")
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+HISTORY = ".history"
+
+
+def profile_version(doc):
+    """The profile's version, or "" for one without (shown as such)."""
+    v = str((doc or {}).get("version") or "")
+    return v if VERSION_RE.match(v) else ""
+
+
+def version_key(v):
+    """Numeric ordering: 1.2.10 after 1.2.9, 1.0.0 after 1.0.0-rc1 -- the
+    rule the marketplace orders releases by."""
+    core, _, pre = str(v).partition("-")
+    nums = tuple(int(x) for x in core.split("."))
+    parts = []
+    for p in pre.split(".") if pre else []:
+        parts.append((0, int(p), "") if p.isdigit() else (1, 0, p))
+    return nums + ((1,) if not pre else (0, tuple(parts)),)
+
+
+def upload_decision(new_doc, new_digest, cur_doc, cur_digest):
+    """What an upload of `new_doc` does next to the profile the node holds
+    under the same id -> "add" | "replace" | "same". Raises Refusal.
+
+    Same version, same bytes: nothing changes. Same version, other bytes:
+    refused -- one version names one file, or "built with 1.1.0" means
+    nothing. Lower: refused. Without a version over one with: refused.
+    """
+    if cur_doc is None:
+        return "add"
+    if new_digest == cur_digest:
+        return "same"
+    nv, cv = profile_version(new_doc), profile_version(cur_doc)
+    pid = new_doc.get("id", "?")
+    if not nv:
+        if cv:
+            raise Refusal(f"profile '{pid}' is held in version {cv}; an "
+                          "upload without a version cannot replace it -- "
+                          "give the file a higher 'version'")
+        return "replace"
+    if not cv:
+        return "replace"
+    if nv == cv:
+        raise Refusal(f"version {nv} of profile '{pid}' is already on the "
+                      "node with a different content -- raise the version")
+    if version_key(nv) < version_key(cv):
+        raise Refusal(f"profile '{pid}' is held in version {cv}; {nv} is "
+                      "older and is not taken")
+    return "replace"
+
+
+def history_dir(root, pid):
+    if not ID_RE.match(str(pid or "")):
+        raise Refusal(f"'{pid}' is not a profile name")
+    return os.path.join(root, HISTORY, pid)
+
+
+def history_put(root, pid, raw, by, now=None):
+    """Keep this file of profile `pid` under its digest -> digest.
+
+    Idempotent: a file already kept keeps its first record (who, when)."""
+    d = history_dir(root, pid)
+    os.makedirs(d, exist_ok=True)
+    dg = digest_of(raw)
+    path = os.path.join(d, dg + ".json")
+    if os.path.isfile(path):
+        return dg
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        doc = {}
+    meta = {"digest": dg, "version": profile_version(doc),
+            "title": str(doc.get("title") or "")[:200],
+            "kept": now or iso_now(), "by": str(by or "")}
+    for name, data in ((dg + ".meta.json",
+                        json.dumps(meta).encode("utf-8")), (dg + ".json", raw)):
+        tmp = os.path.join(d, name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(d, name))
+    return dg
+
+
+def history_list(root, pid):
+    """[meta] of every kept file of `pid`, newest version first."""
+    try:
+        d = history_dir(root, pid)
+        names = os.listdir(d)
+    except (OSError, Refusal):
+        return []
+    out = []
+    for n in names:
+        if not n.endswith(".meta.json") or not DIGEST_RE.match(n[:-10]):
+            continue
+        try:
+            with open(os.path.join(d, n), encoding="utf-8") as f:
+                m = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(m, dict) and m.get("digest") == n[:-10]:
+            out.append(m)
+
+    def order(m):
+        v = m.get("version") or ""
+        if v:
+            return (1, version_key(v), m.get("kept", ""))
+        return (0, (), m.get("kept", ""))
+    return sorted(out, key=order, reverse=True)
+
+
+def history_path(root, pid, digest):
+    """The kept file of `pid` with this digest, or None."""
+    if not DIGEST_RE.match(str(digest or "")):
+        return None
+    p = os.path.join(history_dir(root, pid), digest + ".json")
+    return p if os.path.isfile(p) else None
+
+
+def history_drop(root, pid):
+    """Remove every kept file of `pid` (deleting the profile)."""
+    d = history_dir(root, pid)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        try:
+            os.remove(os.path.join(d, n))
+        except OSError:
+            pass
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
 
 
 def upload_problems(doc, known_apps=None):
@@ -168,6 +312,8 @@ def profile_problems(doc):
         out.append(f"'profile' must say {PROFILE_FORMAT}")
     if not ID_RE.match(str(doc.get("id") or "")):
         out.append("'id' is a short lowercase word")
+    if "version" in doc and not VERSION_RE.match(str(doc.get("version") or "")):
+        out.append("'version' is x.y.z (e.g. 1.1.0), optionally -pre")
     params = doc.get("params")
     if not isinstance(params, dict):
         out.append("'params' must be an object")
@@ -225,6 +371,9 @@ def profile_problems(doc):
                         out.append(f"{where} ('{sid}'): '{{{ref}}}' is a choice "
                                    "of apps; it stands only as the whole 'app' "
                                    "of an app.install")
+            elif k == "generate":
+                if v is not True:
+                    out.append(f"{where} ('{sid}'): generate is true or absent")
             elif k == "timeout":
                 if not (isinstance(v, int) and not isinstance(v, bool)
                         and 1 <= v <= 900):
@@ -258,6 +407,14 @@ def profile_problems(doc):
                                "'when' -- the tick that installs is the "
                                "confirmation, a profile never confirms in "
                                "advance")
+        if "generate" in st and st["generate"] is not True \
+                and not isinstance(st["generate"], (bool, int)):
+            # text is not caught by the type check above (text is allowed
+            # everywhere else); the KIND belongs to the manifest, never here
+            out.append(f"{where} ('{sid}'): generate is true or absent")
+        if typ == "app.config" and ("value" in st) == ("generate" in st):
+            out.append(f"{where} ('{sid}', app.config) needs exactly one of "
+                       "'value' and 'generate'")
         if typ == "manual" and st.get("done_when") not in DONE_WHEN:
             out.append(f"{where} ('{sid}'): done_when is one of "
                        + ", ".join(DONE_WHEN))
@@ -526,6 +683,7 @@ def new_state(profile, digest, values, by, now=None):
     label = values["label"].strip().lower()
     return {
         "id": new_build_id(label, now), "profile": profile["id"],
+        "version": profile_version(profile),
         "digest": digest, "label": label, "params": dict(values),
         "by": by, "created": iso_now(), "state": "running",
         "steps": [_new_step(s, values) for s in steps_of(profile, values)],

@@ -76,6 +76,7 @@ import place  # noqa: E402  (after the path insert, necessarily)
 import idp  # noqa: E402
 # The tenant build profile (RFC-0055): the pure half of a build.
 import tenant_build  # noqa: E402
+import gen_values  # noqa: E402
 # Invitations and requests in front of a build (RFC-0055 stage 4).
 import tenant_request  # noqa: E402
 # Business authorization (oaap.core.authorization 0.1, RFC-0045): the
@@ -8262,7 +8263,7 @@ class _BuildDrivers:
         return key, inst, entry
 
     def _check_app_config(self, a, ctx):
-        if "value" not in a:
+        if "value" not in a and a.get("generate") is not True:
             # "{param}" with no value drops the argument: nothing was asked
             return PRESENT_, f"kein Wert für {a['key']} gewünscht"
         key, _inst, entry = self._config_entry(a)
@@ -8271,6 +8272,16 @@ class _BuildDrivers:
         if entry is None:
             return CONFLICT_, (f"'{a['name']}' erklärt keinen Konfigurationswert "
                                f"{a['key']}")
+        if a.get("generate") is True:
+            # RFC-0079 D7: a value that is there stays -- generated before,
+            # typed by hand, whatever. Replacing a push key would void every
+            # subscription of the instance.
+            if not gen_values.kind_of(entry.get("generate")):
+                return CONFLICT_, ("die App erlaubt nicht, dass der Knoten "
+                                   f"{a['key']} erzeugt")
+            if entry.get("value"):
+                return PRESENT_, f"{a['key']} ist gesetzt (wird nie ersetzt)"
+            return ABSENT_, f"{a['key']} ist noch leer"
         if (entry.get("value") or "") == str(a["value"]):
             return PRESENT_, f"{a['key']} ist wie gewünscht gesetzt"
         return ABSENT_, f"{a['key']} hat noch einen anderen Wert"
@@ -8283,8 +8294,20 @@ class _BuildDrivers:
         if entry is None:
             return False, (f"'{a['name']}' erklärt keinen Konfigurationswert "
                            f"{a['key']}"), []
+        made_by = ""
+        if a.get("generate") is True:
+            kind = gen_values.kind_of(entry.get("generate"))
+            if not kind:
+                return False, ("die App erlaubt nicht, dass der Knoten "
+                               f"{a['key']} erzeugt"), []
+            if entry.get("value"):
+                return True, f"{a['key']} war schon gesetzt (nie ersetzt)", []
+            value = gen_values.generate(kind)
+            made_by = f" (erzeugt: {kind})"
+        else:
+            value = str(a["value"])
         try:
-            msg = apply_config(key, inst, {a["key"]: str(a["value"])})
+            msg = apply_config(key, inst, {a["key"]: value})
         except ValueError as exc:
             return False, str(exc), []
         if msg != "no change":
@@ -8293,7 +8316,7 @@ class _BuildDrivers:
                           "via": "build"})
         # The key, never the value: it may be a secret, and the note goes
         # into the build's page and the tenant's audit log.
-        return True, f"{a['key']} gesetzt", []
+        return True, f"{a['key']} gesetzt{made_by}", []
 
     # backup.check ---------------------------------------------------------
     def _check_backup_check(self, a, ctx):
@@ -8340,6 +8363,25 @@ def tenant_build_view_write():
                                 for s_ in doc["steps"]]
                 row["description"] = str(doc.get("description") or "")[:500]
                 row["doc"] = doc          # what "Herunterladen" hands out
+                row["version"] = tenant_build.profile_version(doc)
+                row["digest"] = _d
+                # RFC-0079 D3: the kept versions, newest first, each with its
+                # file for "Herunterladen" (a profile is at most 64 KB)
+                hist = []
+                for m in tenant_build.history_list(PROFILE_DIR, pid)[:20]:
+                    hp = tenant_build.history_path(PROFILE_DIR, pid,
+                                                   m["digest"])
+                    try:
+                        with open(hp, encoding="utf-8") as f:
+                            hdoc = json.load(f)
+                    except (OSError, ValueError, TypeError):
+                        continue
+                    hist.append({"version": m.get("version", ""),
+                                 "digest": m["digest"],
+                                 "kept": m.get("kept", ""),
+                                 "by": m.get("by", ""),
+                                 "current": m["digest"] == _d, "doc": hdoc})
+                row["history"] = hist
             profiles.append(row)
         os.makedirs(APPS_DIR, exist_ok=True)
         tmp = BUILD_VIEW + ".tmp"
@@ -8513,17 +8555,41 @@ def tenant_profile_job(req, role, actor):
                                            + "; ".join(problems[:5]))
             pid = doc["id"]
             path = tenant_build_profile_path(pid)
-            existed = os.path.isfile(path)
+            # RFC-0079: the rules of a version, judged against what the node
+            # holds; the file it replaces is kept first (it may have been
+            # written on the machine and never seen by the history).
+            cur_doc, cur_digest, cur_raw = None, "", b""
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    cur_raw = f.read()
+                cur_digest = tenant_build.digest_of(cur_raw)
+                try:
+                    cur_doc = json.loads(cur_raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    cur_doc = {}
+            new_digest = tenant_build.digest_of(data)
+            what = tenant_build.upload_decision(doc, new_digest, cur_doc,
+                                                cur_digest)
+            ver = tenant_build.profile_version(doc) or "without a version"
             os.makedirs(PROFILE_DIR, exist_ok=True)
+            if what == "same":
+                tenant_build.history_put(PROFILE_DIR, pid, data, actor)
+                return True, (f"profile '{pid}' {ver} is already on the node "
+                              "(no change)"), pid
+            if cur_doc is not None:
+                tenant_build.history_put(PROFILE_DIR, pid, cur_raw, "")
+            tenant_build.history_put(PROFILE_DIR, pid, data, actor)
             tmp = path + ".tmp"
             with open(tmp, "wb") as f:
                 f.write(data)
             os.chmod(tmp, 0o644)
             os.replace(tmp, path)
-            return True, (f"profile '{pid}' was "
-                          + ("replaced; builds already started keep working "
-                             "with the file they began with" if existed
-                             else "added")), pid
+            if what == "add":
+                return True, f"profile '{pid}' {ver} was added", pid
+            old = tenant_build.profile_version(cur_doc) or "the unversioned file"
+            return True, (f"profile '{pid}' {ver} replaces {old}, which stays "
+                          "in the history; builds already started continue "
+                          "with the version they began with"), pid
         if op == "delete":
             pid = str(a.get("id") or "")
             path = tenant_build_profile_path(pid)
@@ -8537,7 +8603,8 @@ def tenant_profile_job(req, role, actor):
                     f"build {held[0]['id']} still uses this profile "
                     f"({held[0]['state']}); finish or roll it back first")
             os.remove(path)
-            return True, f"profile '{pid}' was deleted", pid
+            tenant_build.history_drop(PROFILE_DIR, pid)
+            return True, f"profile '{pid}' and its history were deleted", pid
     except tenant_build.Refusal as exc:
         return False, str(exc), str(a.get("id") or "")
     return False, f"unknown profile operation '{op}'", ""
@@ -8715,8 +8782,8 @@ def tenant_build_start(pid, given, who, role, dry_run=False, drivers=None):
     """
     if role not in ("root", "server_admin"):
         raise tenant_build.Refusal("building a tenant needs server_admin")
-    profile, digest = tenant_build.read_profile_file(
-        tenant_build_profile_path(pid))
+    path = tenant_build_profile_path(pid)
+    profile, digest = tenant_build.read_profile_file(path)
     # Named before the label is judged: "taken" would be true of the very
     # tenant the unfinished build made, and "continue it" is the better answer.
     held = tenant_build.open_build_for(
@@ -8741,6 +8808,15 @@ def tenant_build_start(pid, given, who, role, dry_run=False, drivers=None):
     if dry_run:
         return {"plan": steps, "profile": profile["id"], "label": label}
     state = tenant_build.new_state(profile, digest, values, who)
+    # RFC-0079 D5: the very file this build runs is kept under its digest,
+    # so it can be continued after a newer version replaced it.
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        if tenant_build.digest_of(raw) == digest:
+            tenant_build.history_put(PROFILE_DIR, pid, raw, "")
+    except OSError:
+        pass
     tenant_build.save_state(BUILD_DIR, state)
     return _build_drive(state, profile, who, role, drivers)
 
@@ -8755,8 +8831,12 @@ def _build_load(bid, who, role):
     if role not in ("root", "server_admin"):
         raise tenant_build.Refusal("building a tenant needs server_admin")
     state = tenant_build.load_state(BUILD_DIR, bid)
+    # RFC-0079 D5: by digest from the history first -- a newer version of
+    # the profile must not strand a build that began on an older one.
+    kept = tenant_build.history_path(PROFILE_DIR, state["profile"],
+                                     state.get("digest"))
     profile, digest = tenant_build.read_profile_file(
-        tenant_build_profile_path(state["profile"]))
+        kept or tenant_build_profile_path(state["profile"]))
     return state, profile, digest
 
 
@@ -19935,8 +20015,8 @@ def _install_from_dir(pkg, args, source):
                     # recorded as "no" -- a value we generate into a
                     # field meant for somebody else's credential is not
                     # a convenience, it is a wrong answer.
-                    "generate": ("token" if c.get("generate") == "token"
-                                 else ""),
+                    # RFC-0079: `vapid` beside `token` (gen_values.KINDS)
+                    "generate": gen_values.kind_of(c.get("generate")),
                     "default": c.get("default", "")}
                    for c in (m.get("config") or [])
                    if c["key"] not in RESERVED_ENV],

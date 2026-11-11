@@ -35,6 +35,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORTAL = os.path.join(HERE, "..", "platform", "services", "portal")
 sys.path.insert(0, os.path.join(HERE, "..", "platform"))
+sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))  # gen_values (RFC-0079)
 
 try:
     from jinja2 import Template
@@ -194,17 +195,23 @@ print("")
 print("Ein Manifest darf den Knopf nicht einfach behaupten")
 
 recorded = a.__dict__.get("validate_manifest") and True
+import gen_values  # noqa: E402  (RFC-0079: one rule for portal and host)
 cfg = [{"key": "A", "label": "a", "generate": "token"},
        {"key": "B", "label": "b", "generate": "beliebig"},
-       {"key": "C", "label": "c"}]
-kept = [("token" if c.get("generate") == "token" else "") for c in cfg]
+       {"key": "C", "label": "c"},
+       {"key": "D", "label": "d", "generate": "vapid"}]
+kept = [gen_values.kind_of(c.get("generate")) for c in cfg]
 ok("'token' wird uebernommen", kept[0] == "token")
 ok("alles andere wird zu 'nichts', nicht zu einem Knopf", kept[1] == "")
 ok("und ohne Angabe erst recht", kept[2] == "")
+ok("'vapid' wird uebernommen (RFC-0079)", kept[3] == "vapid")
 ok("(die Registry-Regel steht wirklich in appctl)",
-   '"token" if c.get("generate") == "token"' in
+   '"generate": gen_values.kind_of(c.get("generate"))' in
    open(os.path.join(HERE, "..", "platform", "appctl.py"),
         encoding="utf-8").read() and recorded)
+v = generated_value("vapid")
+ok("der Knopf erzeugt fuer 'vapid' einen gueltigen P-256-Schluessel",
+   gen_values.valid("vapid", v) and len(v) == 43, v)
 
 print("")
 print(f"{'ALLE PRUEFUNGEN BESTANDEN' if not fails else str(fails) + ' FEHLGESCHLAGEN'}")

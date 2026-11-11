@@ -3649,7 +3649,7 @@ INSTANCE_EDIT_BODY = """
       {% endif %}
       {% if c.generate %}
       <p class="gen"><button name="generate" value="{{ c.key }}" class="secondary"
-         >Wert erzeugen</button>
+         >{{ 'Push-Schlüssel (VAPID) erzeugen' if c.generate == 'vapid' else 'Wert erzeugen' }}</button>
          {% if c.fresh %}<span class="muted"><strong>Jetzt kopieren</strong> —
          gespeichert ist er noch nicht, und nach dem Speichern wird er
          <strong>nicht mehr angezeigt</strong>.</span>{% endif %}</p>
@@ -7734,10 +7734,13 @@ def _config_view(name):
 # randomness in url-safe base64 has none of those: it is safe in an env
 # file, in a ';'-list, in a URL and on a command line.
 GENERATED_BYTES = 32
+import gen_values  # noqa: E402  (RFC-0079: the host's build step uses it too)
 
 
-def generated_value():
-    return secrets.token_urlsafe(GENERATED_BYTES)
+def generated_value(kind="token"):
+    """A fresh value of the kind the app's manifest declares (`token`,
+    `vapid`); the same function the host's build step calls."""
+    return gen_values.generate(gen_values.kind_of(kind) or "token")
 
 
 def _instance_config(name, inst, fresh=None, typed=None):
@@ -7782,7 +7785,8 @@ def _instance_config(name, inst, fresh=None, typed=None):
             # Only where the app said its value is its own to define
             # (spec 2.8) -- never on a field holding somebody else's
             # credential, where a generated value is a wrong answer.
-            "generate": c.get("generate") == "token",
+            # RFC-0079: the kind, "" for no (`token`, `vapid`)
+            "generate": gen_values.kind_of(c.get("generate")),
             "fresh": key == fresh_key,
             "is_set": key in is_set,
             # What is stored, as the host reported it. Saving sends only a
@@ -9284,7 +9288,8 @@ def instance_config(name):
                                         "anderen System.")
         typed = {c["key"]: request.form.get(f"cfg-{c['key']}", "")
                  for c in rows if request.form.get(f"cfg-{c['key']}") is not None}
-        return _instance_page(name, inst, fresh=(wanted, generated_value()),
+        return _instance_page(name, inst,
+                              fresh=(wanted, generated_value(row["generate"])),
                               typed=typed,
                               msg=f"Ein Wert für {row['label']} ist erzeugt — "
                                   "gespeichert wird er erst mit „Speichern\".")
@@ -11238,10 +11243,11 @@ BUILD_LIST_BODY = """
 <h2>Profile</h2>
 {% if profiles %}
 <table>
-  <tr><th>Profil</th><th>Schritte</th><th></th></tr>
+  <tr><th>Profil</th><th>Version</th><th>Schritte</th><th></th></tr>
   {% for p in profiles %}
   <tr>
     <td><strong>{{ p.id }}</strong>{% if p.title %}<br><span class="muted">{{ p.title }}</span>{% endif %}</td>
+    <td>{{ p.version }}{% if p.versions > 1 %}<br><a class="rowaction" href="/aufbau/profile/{{ p.id }}/verlauf">Verlauf ({{ p.versions }})</a>{% endif %}</td>
     <td>{{ p.steps }}</td>
     <td>{% if p.problem %}<span class="err">abgelehnt: {{ p.problem }}</span>
         {% else %}<a class="btn" href="/aufbau/neu?profil={{ p.id }}">Aufbau starten</a>
@@ -11267,8 +11273,10 @@ Anleitung „Einen Mandanten aus einem Profil aufbauen“.</p>
 </form>
 <p class="muted">Der Knoten prüft die Datei vollständig, bevor er sie ablegt. Eine App darf darin nur
 mit ihrer ID aus einer eingerichteten Katalogquelle stehen, nie mit einem Pfad. Eine Datei mit gleicher
-<code>id</code> ersetzt das vorhandene Profil; Aufbauten, die schon laufen, arbeiten mit der Datei weiter,
-mit der sie begonnen haben.</p>
+<code>id</code> und <strong>höherer <code>version</code></strong> ersetzt das vorhandene Profil; die
+bisherige Fassung bleibt im Verlauf. Dieselbe Version mit anderem Inhalt und eine ältere Version nimmt
+der Knoten nicht an. Aufbauten, die schon laufen, arbeiten mit der Fassung weiter, mit der sie begonnen
+haben.</p>
 </div>
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <h2>Aufbauten</h2>
@@ -11278,7 +11286,7 @@ mit der sie begonnen haben.</p>
   {% for r in rows %}
   <tr class="rowlink">
     <td><a class="rowaction" href="/aufbau/{{ r.id }}">{{ r.label }}</a></td>
-    <td>{{ r.profile }}</td>
+    <td>{{ r.profile }}{% if r.version %} <span class="muted">{{ r.version }}</span>{% endif %}</td>
     <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span></td>
     <td>{{ r.created }}<br><span class="muted">{{ r.by }}</span></td>
     <td><a class="rowaction" href="/aufbau/{{ r.id }}">Ansehen</a></td>
@@ -11414,7 +11422,7 @@ BUILD_DETAIL_BODY = """
     <h1>{{ b.label }}</h1>
     <span class="badge {{ '' if b.tone == 'ok' else 'off' if b.tone == 'off' else 'todo' }}">{{ b.state }}</span>
   </div>
-  <p class="sub">Profil <code>{{ b.profile }}</code> · gestartet {{ b.created }} von {{ b.by }}</p>
+  <p class="sub">Profil <code>{{ b.profile }}</code> {{ b.version }}{% if b.digest %} <span class="muted" title="Prüfsumme der Profildatei (SHA-256)">({{ b.digest }})</span>{% endif %} · gestartet {{ b.created }} von {{ b.by }}</p>
   <div class="facts">
     <div><span class="k">Fortschritt</span><span class="v">{{ b.progress }} Schritten erledigt</span></div>
     <div><span class="k">Kennung</span><span class="v"><code>{{ b.id }}</code></span></div>
@@ -11932,6 +11940,51 @@ def _json_download(text, filename):
     resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+BUILD_HISTORY_BODY = """
+<div class="pagehead"><h1>Verlauf: {{ pid }}</h1></div>
+<p><a class="rowaction" href="/aufbau">&larr; Aufbau</a></p>
+<div class="card">
+<p class="muted">Jede Fassung, die der Knoten von diesem Profil angenommen hat oder mit der ein
+Aufbau lief, neueste zuerst. Ein Aufbau zeigt auf seiner Seite, mit welcher Fassung er lief.</p>
+<table>
+  <tr><th>Version</th><th>Prüfsumme</th><th>Aufbewahrt</th><th></th></tr>
+  {% for h in hist %}
+  <tr>
+    <td><strong>{{ h.version }}</strong>{% if h.current %} <span class="badge">aktuell</span>{% endif %}</td>
+    <td><code>{{ h.short }}</code></td>
+    <td>{{ h.kept }}{% if h.by %}<br><span class="muted">{{ h.by }}</span>{% endif %}</td>
+    <td><a class="rowaction" href="/aufbau/profile/{{ pid }}/{{ h.digest }}.json">Herunterladen</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+"""
+
+
+@app.get("/aufbau/profile/<pid>/verlauf")
+def build_profile_history(pid):
+    if _build_scope() is None:
+        return _build_denied()
+    view = _build_view()
+    if not build_view.PROFILE_RE.match(pid) or build_view.find_profile(view, pid) is None:
+        return "Dieses Profil gibt es nicht.", 404
+    return page(BUILD_HISTORY_BODY, "Verlauf " + pid, "build", pid=pid,
+                hist=build_view.history(view, pid))
+
+
+@app.get("/aufbau/profile/<pid>/<digest>.json")
+def build_profile_history_download(pid, digest):
+    if _build_scope() is None:
+        return _build_denied()
+    text = (build_view.history_text(_build_view(), pid, digest)
+            if build_view.PROFILE_RE.match(pid)
+            and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+            else None)
+    if text is None:
+        return "Diese Fassung gibt es nicht.", 404
+    return _json_download(text, f"{pid}-{digest[:12]}.json")
 
 
 @app.get("/aufbau/profile/<name>.json")

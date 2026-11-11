@@ -369,10 +369,13 @@ bid3 = res["build"]
 doc = club()
 doc["title"] = "edited"
 write_profile("club", doc)
+# RFC-0079 D5: the started file is kept by digest; drop it to see the
+# refusal that remains for builds from before the history existed.
+tb.history_drop(a.PROFILE_DIR, "club")
 st, res, _ = via_api(f"/tenant-builds/{bid3}/continue", {})
 act = via_action("continue", {"build": bid3})
 out, code = cli("continue", bid3)
-ok("a changed profile file is refused at all three doors on continue",
+ok("a changed profile file without its kept copy is refused at all three doors",
    res["ok"] is False and act["ok"] is False and code != 0
    and "digest" in res["message"], (res, act, code))
 write_profile("club", club())
