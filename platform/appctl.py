@@ -28276,6 +28276,33 @@ def _dir_kbytes(path):
         return 0
 
 
+# A socket in an instance's storage (code-server, webtop: selkies, keyring)
+# is skipped by tar with a line on stderr and exit 0 -- it is not data,
+# and a restore could not bring it back anyway. `--warning=no-file-ignored`
+# silences it; this pattern keeps such lines out of a failure reason on a
+# tar that still prints them.
+TAR_IGNORED = re.compile(r"socket ignored|Socket ignoriert", re.I)
+
+
+def backup_failure_reason(e):
+    """The sentence a failed backup leaves behind (portal, log, journal).
+
+    Before 0.1.249 this was the LAST stderr line without the exit code.
+    On oaap-test that line was a harmless "socket ignored" from a webtop
+    instance, four nights in a row (07.-11.11.) -- and the real cause,
+    printed earlier, never reached anyone. Now: the exit code, and the
+    first lines that are not about skipped sockets."""
+    if not isinstance(e, subprocess.CalledProcessError):
+        return str(e)
+    lines = [l.strip() for l in (e.stderr or "").splitlines() if l.strip()]
+    real = [l for l in lines if not TAR_IGNORED.search(l)]
+    head = f"{e.cmd[0]} exit {e.returncode}"
+    if real:
+        more = f" (+{len(real) - 3} more)" if len(real) > 3 else ""
+        return head + ": " + " | ".join(real[:3]) + more
+    return head + (" -- stderr held only skipped sockets" if lines else "")
+
+
 def _record_backup_run(state, **fields):
     """Write down what this node's backup is doing, or last did.
 
@@ -28786,7 +28813,8 @@ def _tenant_archive(tid, label, out_dir, out_file):
         try:
             if stop:
                 run(["docker", "stop", *stop])
-            args_tar = ["tar", "--numeric-owner", "-cpf", tmp_tar,
+            args_tar = ["tar", "--numeric-owner", "--warning=no-file-ignored",
+                        "-cpf", tmp_tar,
                         "-C", stage, *parts]
             if subtrees:
                 args_tar += ["-C", DATA_DIR, *subtrees]
@@ -28812,7 +28840,7 @@ def _tenant_archive(tid, label, out_dir, out_file):
         os.replace(tmp_out, out_path)
         written = True
     except (subprocess.CalledProcessError, OSError) as e:
-        die(f"tenant backup failed: {e}")
+        die(f"tenant backup failed: {backup_failure_reason(e)}")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
         if not written:
@@ -29061,7 +29089,8 @@ def cmd_backup(args):
                 stage_files.append("store-dump.sql")
             # No -z. Compression is CPU-bound and does not need the data
             # to hold still, so it happens after the apps are back.
-            run(["tar", "--numeric-owner", "-cpf", tmp_tar,
+            run(["tar", "--numeric-owner", "--warning=no-file-ignored",
+                 "-cpf", tmp_tar,
                  "--exclude=data/identity/login-throttle.json",
                  # node profiles stay with the machine (RFC-0011
                  # decision 4): a 'dev' backup restored onto a
@@ -29142,9 +29171,7 @@ def cmd_backup(args):
     except (subprocess.CalledProcessError, OSError, DeployTimeout) as e:
         # Recorded before the process ends, so the page shows a failure
         # rather than a run that started last night and never finished.
-        err = (getattr(e, "stderr", "") or "").strip().splitlines()
-        reason = (f"{e.cmd[0]}: " + (err[-1] if err else f"exit {e.returncode}")
-                  if isinstance(e, subprocess.CalledProcessError) else str(e))
+        reason = backup_failure_reason(e)
         _record_backup_run("failed", message=reason, target=out_path)
         die(f"backup failed: {reason}")
     finally:
