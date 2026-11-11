@@ -1867,6 +1867,31 @@ STORE_APP_BODY = """
   {% endif %}
 </div>
 {% endif %}
+{% if envelope %}
+<div class="card warn" id="rahmen">
+  <h2 style="margin-top:0">Dieses Update erweitert den Rahmen — bitte bestätigen</h2>
+  <p>Die Produktiv-Instanz <strong>{{ envelope.update_name }}</strong> dürfte danach
+    mehr als heute. Der Knoten hat deshalb noch nichts gebaut. Erweitert wird:</p>
+  <ul>{% for n in envelope.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+  <p class="muted">Der Haken gilt genau für diese Liste. Bringt ein neueres Paket etwas
+    anderes mit, fragt der Knoten noch einmal. Der andere Weg bleibt: erst eine
+    Test-Instanz aktualisieren, ansehen, dann übernehmen (RFC-0050).</p>
+  <form method="post" action="/store/install"
+        onsubmit="this.querySelector('button').disabled=true;
+                  this.querySelector('button').textContent='Wird aktualisiert …'">
+    <input type="hidden" name="app_id" value="{{ a.id }}">
+    <input type="hidden" name="source_id" value="{{ a.source.id }}">
+    <input type="hidden" name="update" value="{{ envelope.update }}">
+    {% if envelope.confirm_source %}<input type="hidden" name="confirm_source" value="{{ envelope.confirm_source }}">{% endif %}
+    {% if envelope.confirm_administer %}<input type="hidden" name="confirm_administer" value="{{ envelope.confirm_administer }}">{% endif %}
+    <label class="checkline"><input type="checkbox" name="confirm_envelope"
+           value="{{ envelope.fingerprint }}" required> Ich habe die Erweiterung gelesen
+           und will sie für diese Produktiv-Instanz.</label>
+    <button>Mit Bestätigung aktualisieren</button>
+    <a class="rowaction" href="/store/{{ a.source.id }}/{{ a.id }}" style="margin-left:.8rem">Abbrechen</a>
+  </form>
+</div>
+{% endif %}
 {% if msg %}
 <div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>
 {% endif %}
@@ -2732,6 +2757,9 @@ IMAGE_CARD = """
      {% if s.open is none %}Sicherheitsmeldungen im Abbild: nicht lesbar{% if s.why %} ({{ s.why }}){% endif %}.
      {% elif s.open %}<span class="err">{{ s.open }} offene Sicherheitsmeldung(en) im Abbild, die älteste seit {{ s.oldest }}.</span>
      {% else %}Keine offene Sicherheitsmeldung im Abbild.{% endif %}<br>
+     {% if s.pkgs %}<span class="muted">Betroffen:
+       {% for it in s.pkgs %}<code>{{ it.package }}</code> ({{ it.dsa }} vom {{ it.published }};
+       im Abbild {{ it.installed }}, bei Debian korrigiert in {{ it.fixed }}){{ "; " if not loop.last }}{% endfor %}.</span><br>{% endif %}
      {% if s.base %}Basis <code>{{ s.base }}</code>{% if s.built %}, gebaut {{ s.built }}{% endif %}{% if s.behind %} — Upstream ist weitergezogen{% elif s.behind == false %} — entspricht Upstream{% endif %}.
      {% else %}<span class="muted">Basis nicht aufgezeichnet (gebaut vor 0.1.227) — der nächste Bau zeichnet sie auf.</span>{% endif %}</p>
   {% endfor %}
@@ -7541,7 +7569,7 @@ def _app_instances(app_id):
 
 
 @app.get("/store/<source_id>/<app_id>")
-def store_app(source_id, app_id):
+def store_app(source_id, app_id, envelope=None):
     """Object page for one app (§6) — the reason the format carries
     presentation fields at all; without it they would be decoration."""
     denied = require_store()
@@ -7565,7 +7593,7 @@ def store_app(source_id, app_id):
                 "confirm_source": request.args.get("cs", "")
                 if request.args.get("cs", "") == a["source"]["id"] else "",
                 "can_confirm": "server_admin" in caller_roles()}
-    return page(STORE_APP_BODY, a["name"], "store", a=a, need=need,
+    return page(STORE_APP_BODY, a["name"], "store", a=a, need=need, envelope=envelope,
                 instances=_app_instances(a["id"]),
                 profiles=node_profiles(),
                 msg=request.args.get("msg"),
@@ -7638,6 +7666,11 @@ def store_install():
                    **({"confirm_administer": app_id}
                       if (request.form.get("confirm_administer") == app_id
                           and "server_admin" in caller_roles()) else {}),
+                   # I-43: the tick under the widenings, as their fingerprint.
+                   **({"confirm_envelope": request.form.get("confirm_envelope")}
+                      if update and _re.fullmatch(r"[0-9a-f]{16}",
+                                                  request.form.get("confirm_envelope") or "")
+                      else {}),
                    # Only "test" is a choice; anything else is production.
                    # The host decides again, and an existing instance keeps
                    # the channel it has (RFC-0050 4).
@@ -7671,6 +7704,18 @@ def store_install():
                                 + (f"&nn={quote(new_name)}" if wants_new else "")
                                 + ("&ch=test" if request.form.get("channel") == "test" else "")
                                 + (f"&cs={quote(confirm)}" if confirm else ""), code=303)
+            if (res.get("needs") == "confirm_envelope" and update
+                    and _re.fullmatch(r"[0-9a-f]{16}", str(res.get("fingerprint") or ""))):
+                # I-43: the update would widen what a production instance
+                # may do. Ask here, naming every widening; the tick sends
+                # back the fingerprint of exactly these lines, so a yes
+                # never covers a package that widens something else.
+                return store_app(source_id, app_id, envelope={
+                    "update": update, "update_name": local_name(update, own.get(update) or {}),
+                    "notes": [str(n) for n in (res.get("notes") or [])][:30],
+                    "fingerprint": res["fingerprint"], "confirm_source": confirm,
+                    "confirm_administer": (app_id if request.form.get("confirm_administer")
+                                           == app_id else "")})
             return back(f"Installation von '{app_id}' fehlgeschlagen: "
                         f"{res.get('message', 'unbekannter Fehler')}", ok=False)
         _time.sleep(2)
@@ -9802,8 +9847,12 @@ def _image_view(name):
     if not e:
         return {"known": bool(img), "services": [], "state": ""}
     rows = []
+    # RFC-0071 §3: package names are the server_admin's view only (the CLI's
+    # `oaap node care images`); a tenant admin sees the count and the date.
+    names = _image_names(name) if is_server_admin() else {}
     for s in e["services"]:
         rows.append({
+            "pkgs": names.get(s.get("service") or "", []),
             "service": s.get("service") or "",
             "image": s.get("image", ""),
             "word": host_care.IMAGE_WORDS_DE.get(s["state"], s["state"]),
@@ -9829,6 +9878,25 @@ def _image_view(name):
                         "text": REBUILD_WORDS.get(rb.get("state", ""), "")},
             # RFC-0071 §15: woraus ein Neubau baut, und ob der Knoten selbst darf.
             **_rebuild_view(load_instances().get(name) or {})}
+
+
+IMAGES_STATE_FILE = "/apps-registry/images-state.json"
+
+
+def _image_names(name):
+    """{service: [{package, dsa, published, fixed, installed}]} of one
+    instance, from the node's image reading (images-state.json)."""
+    st = _read_json(IMAGES_STATE_FILE) or {}
+    imgs = st.get("images") or {}
+    out = {}
+    for r in st.get("rows") or []:
+        if r.get("instance") != name:
+            continue
+        items = (imgs.get(r.get("image_id")) or {}).get("items") or []
+        out[r.get("service") or ""] = [
+            {k: str(i.get(k, "")) for k in ("package", "dsa", "published", "fixed",
+                                             "installed")} for i in items]
+    return out
 
 
 SOURCE_WORDS = {"artifact": "aus dem zurückbehaltenen Paket",

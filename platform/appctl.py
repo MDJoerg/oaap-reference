@@ -10004,6 +10004,17 @@ def rebuild_instance(name, who="root", role="server_admin", back=False, say=prin
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def docker_build_cmd(tag, ctx):
+    """The one `docker build` of an app image -- install, store update,
+    restore and rebuild (two paths, one rule). A Dockerfile that upgrades
+    OS packages is built with --no-cache: otherwise Docker takes that RUN
+    layer from the cache of any earlier build on the same base, and the
+    upgrade never runs again (2026-11-11, zlib DSA-6613-1)."""
+    return (["docker", "build", "-q"]
+            + (["--no-cache"] if images.build_dir_upgrades(ctx) else [])
+            + ["-t", tag, ctx])
+
+
 def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
     pkg = None
     if built:
@@ -10057,7 +10068,7 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
     for p in plan:
         if p["s"] in built:
             say(f"Building {p['s']['image']} on {p['ref']} ...")
-            ok, why = _docker_ok(["docker", "build", "-q", "-t", p["s"]["image"], p["ctx"]])
+            ok, why = _docker_ok(docker_build_cmd(p["s"]["image"], p["ctx"]))
             if not ok:
                 _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["s"]["image"]])
                 _rebuild_record(name, {"at": _iso_now(), "state": "build-failed",
@@ -10071,6 +10082,20 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
                 raise RebuildRefused("the build did not use the base just pulled (§8.2)")
             p["base"] = rec
         p["new"] = images.inspect_image(p["s"]["image"]).get("Id", "")
+        # The image id says little: a Dockerfile that upgrades packages is
+        # built with --no-cache, and even a cached build of a freshly
+        # unpacked package got a new id (measured 2026-11-11 on oaap-test:
+        # same base, same instructions, new id). The bytes in service are
+        # the same by definition, so the same base digest and the same dpkg
+        # list mean nothing changed: keep the running image, say "unchanged"
+        # -- a rebuild that changes nothing must not recreate.
+        old_digest = ((p["s"].get("base") or {}).get("digest") or "")
+        if (p["s"] in built and p["old"] and p["new"] != p["old"]
+                and old_digest and old_digest == p["digest"]):
+            new_pk = images.package_list(p["new"])
+            if new_pk and new_pk == images.package_list(p["old"]):
+                _docker_ok(["docker", "tag", p["old"], p["s"]["image"]])
+                p["new"] = p["old"]
     if all(p["new"] == p["old"] for p in plan):
         _rebuild_record(name, {"at": _iso_now(), "state": "unchanged", "by": who})
         return True, (f"nothing to rebuild on: the base of {name} has not moved "
@@ -10603,9 +10628,11 @@ def cmd_node_care(args):
                   + (f" since {s['oldest']}" if s["oldest"] else "")
                   + f"  {s['image']}  [{base}{', ' + beh if beh else ''}]"
                   + (f"  ({s['why']})" if s["why"] else ""))
-            names = [i["package"] for i in images.names_for(st, r.get("image_id"))]
+            names = [f"{i['package']} ({i.get('dsa', '?')} {i.get('published', '')}, "
+                     f"image {i.get('installed', '?')}, fixed in {i.get('fixed', '?')})"
+                     for i in images.names_for(st, r.get("image_id"))]
             if names:
-                print(f"  {'':<30} open: " + ", ".join(names))
+                print(f"  {'':<30} open: " + "; ".join(names))
         insts = load_registry().get("instances", {})
         for name, e in sorted((img.get("instances") or {}).items()):
             for s in e["services"]:
@@ -19528,7 +19555,7 @@ def _install_from_dir(pkg, args, source):
     # a directory or a Git URL -- the store's Git sources among them --
     # widened a production instance without a word (measured 2026-11-09
     # with keycloak 0.1.7 on oaap-test). One gate, every path.
-    if inst:
+    if inst and not getattr(args, "envelope_checked", False):
         hard, confirm = envelope_review(inst, m)
         # The artifact's version sentence is not this path's rule: a
         # same-version redeploy from a directory is refused above for
@@ -19689,8 +19716,7 @@ def _install_from_dir(pkg, args, source):
             img = (f"oaap-app/{app['id']}:{app['version']}" if not multi
                    else f"oaap-app/{app['id']}-{sname}:{app['version']}")
             print(f"Building {img} on this node ...")
-            run(["docker", "build", "-q", "-t", img,
-                 os.path.join(pkg, svc.get("build", "."))])
+            run(docker_build_cmd(img, os.path.join(pkg, svc.get("build", "."))))
             build = svc.get("build", "")
             # RFC-0071 §3: the base this build used -- the node's local image
             # of the FROM reference, read right after the build.
@@ -24287,12 +24313,24 @@ def envelope_notes_suffix(output):
     return (" (" + "; ".join(notes) + ")") if notes else ""
 
 
+ENVELOPE_FP_LINE = "ENVELOPE-FINGERPRINT: "
+
+
+def envelope_fingerprint(notes):
+    """16 hex digits over exactly these widenings. The portal's tick sends
+    it back (I-43): a yes counts for what the person read, never for a
+    newer package that widens something else."""
+    return hashlib.sha256(chr(10).join(sorted(notes)).encode("utf-8")).hexdigest()[:16]
+
+
 def envelope_gate(hard, confirm, channel, confirmed):
     """The one place that turns envelope_review's sentences into an
     answer, for every install path at the machine (I-43).
 
     Production: every widening is printed and needs --confirm (the
     version rule is each path's own and is left out by the caller).
+    `confirmed` is True from the terminal, or the fingerprint the portal's
+    tick sent back -- which counts only if it names these very widenings.
     Test: printed, not refused -- a person is at the machine, and the
     lines go into what the portal shows (see the worker's run_install).
     """
@@ -24300,8 +24338,12 @@ def envelope_gate(hard, confirm, channel, confirmed):
         notes = confirm + [h for h in hard if "version" not in h]
         for line in notes:
             print(f"NOTE: {line}", flush=True)
-        if notes and not confirmed:
-            die(ENVELOPE_REFUSAL)
+        if notes:
+            fp = envelope_fingerprint(notes)
+            if not (confirmed is True
+                    or (isinstance(confirmed, str) and confirmed == fp)):
+                print(ENVELOPE_FP_LINE + fp, flush=True)
+                die(ENVELOPE_REFUSAL)
         return notes
     for line in hard + confirm:
         print(f"NOTE: {line}", flush=True)
@@ -24653,7 +24695,17 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                                 # gateway site is written login-only from
                                 # the first second, not from the second
                                 # write after the record exists
-                                rehearsal=rehearsal)
+                                rehearsal=rehearsal,
+                                # Every caller of install_artifact has
+                                # already weighed the envelope with its own
+                                # confirmation (the ZIP branch of
+                                # cmd_install, promotion, sideloading, the
+                                # deploy token). Measured 2026-11-11: since
+                                # 0.1.250 the directory gate ran a second
+                                # time here, without that confirmation, and
+                                # refused every confirmed widening of a
+                                # production instance on these paths.
+                                envelope_checked=True)
         try:
             _install_from_dir(pkg, ns, source)
         except BaseException:
@@ -26642,8 +26694,15 @@ def cmd_process_deploys(_args):
                 .get("tenant"))
             cross_tenant = cross_tenant or src_tenant != act_tenant
 
+        # I-43: what a refused widening asks the portal to show with its tick.
+        envelope_need = {}
+
         def run_install(src, channel):
+            want = str(req.get("confirm_envelope") or "")
             ns = _argparse.Namespace(
+                # I-43: the portal's tick -- the fingerprint of the widenings
+                # the person was shown; envelope_gate compares it.
+                confirm=want if re.fullmatch(r"[0-9a-f]{16}", want) else False,
                 package=source_package_arg(name, src), path=src.get("path", ""),
                 ref=src.get("ref", ""),
                 # The tenant-local name, not the key: cmd_install
@@ -26676,12 +26735,23 @@ def cmd_process_deploys(_args):
                 last = out.splitlines()[-1] if out else "install failed"
                 if ENVELOPE_REFUSAL in last:
                     # The CLI's sentence names a flag nobody in a browser
-                    # can type. Say what widens, and the two ways that
-                    # exist from here (I-43).
+                    # can type. Say what widens, and the ways that exist
+                    # from here (I-43): since 0.1.252 the store page asks
+                    # with a tick that names exactly these widenings.
+                    fp = next((ln[len(ENVELOPE_FP_LINE):].strip()
+                               for ln in out.splitlines()
+                               if ln.startswith(ENVELOPE_FP_LINE)), "")
+                    if fp:
+                        envelope_need.update({
+                            "fingerprint": fp,
+                            "notes": [ln[len("NOTE: "):].strip()
+                                      for ln in out.splitlines()
+                                      if ln.startswith("NOTE: ")]})
                     last = ("refused: this update widens what the production "
                             "instance may do" + envelope_notes_suffix(out)
-                            + " -- update a test instance and promote it "
-                            "(the promotion asks), or confirm at the machine "
+                            + " -- confirm it with the tick on the store page, "
+                            "update a test instance and promote it (the "
+                            "promotion asks), or confirm at the machine "
                             "with 'oaap app install ... --confirm'")
                 return False, last
             except subprocess.CalledProcessError as e:
@@ -28373,6 +28443,11 @@ def cmd_process_deploys(_args):
                 if not ok and ADMINISTER_MARK in str(msg or ""):
                     res_body["needs"] = "confirm_administer"
                     res_body["message"] = str(msg).replace(ADMINISTER_MARK, "").strip()
+                elif not ok and envelope_need.get("fingerprint"):
+                    # I-43: not a failure to report, a question to ask.
+                    res_body["needs"] = "confirm_envelope"
+                    res_body["fingerprint"] = envelope_need["fingerprint"]
+                    res_body["notes"] = envelope_need["notes"]
                 if detail is not None:
                     res_body["detail"] = detail
                 json.dump(res_body, f)
@@ -29445,8 +29520,7 @@ def _deploy_from_registry(name, inst):
         for s in services:
             if s["image"].startswith("oaap-app/"):
                 print(f"Building {s['image']} ...")
-                run(["docker", "build", "-q", "-t", s["image"],
-                     os.path.join(pkg, s.get("build") or ".")])
+                run(docker_build_cmd(s["image"], os.path.join(pkg, s.get("build") or ".")))
                 s["base"] = images.base_record(os.path.join(pkg, s.get("build") or "."))
             else:
                 print(f"Pulling {s['image']} ...")

@@ -1231,7 +1231,12 @@ def rebuild_helps(services, de=False):
     code-server case, oaapx01 06.11.). Words: "" (nothing open), "likely"
     (the base moved upstream), "only-upgrade" (the base equals upstream --
     only a build that upgrades packages helps), "unknown" (the node does
-    not know the upstream digest)."""
+    not know the upstream digest).
+
+    Since 0.1.252 the base record says whether the build upgrades OS
+    packages itself (`upgrades`, images.dockerfile_upgrades): such an app
+    heals on a rebuild even while the base image lags behind Debian (the
+    zlib case, 2026-11-11) -- "likely" with its own sentence."""
     opened = [s for s in services or [] if s.get("open")]
     if not opened:
         return "", ""
@@ -1240,7 +1245,26 @@ def rebuild_helps(services, de=False):
                           "und heilt voraussichtlich." if de else
                           "the base moved upstream -- a rebuild fetches it and "
                           "should clear them")
+    if all(s.get("upgrades") is True for s in opened):
+        return "likely", (
+            "Diese App spielt beim Bau die Korrekturen von Debian ein (apt-get upgrade) — "
+            "ein Neubau heilt, auch solange das Basis-Abbild selbst noch nicht neu "
+            "erschienen ist." if de else
+            "the app upgrades OS packages while building -- a rebuild fetches Debian's "
+            "fixes even while the base image itself has not been republished")
     if all(s.get("behind") is False for s in opened):
+        if all(s.get("upgrades") is False for s in opened):
+            return "only-upgrade", (
+                "Nein. Debian hat die Korrektur schon, das Basis-Abbild ist aber noch "
+                "nicht neu erschienen (es entspricht Upstream), und diese App spielt beim "
+                "Bau keine Korrekturen ein — ein Neubau bringt dieselben Pakete zurück. "
+                "Es heilt, sobald das Basis-Abbild neu erscheint (die Karte sagt dann "
+                "„Upstream ist weitergezogen“), oder mit einer neuen Version der App, die "
+                "beim Bau aktualisiert (Store-Update)." if de else
+                "no -- Debian has the fix, the base image has not been republished yet "
+                "and this app does not upgrade packages while building, so a rebuild "
+                "brings the same packages back; it heals once the base image is "
+                "republished, or with an app version that upgrades while building")
         return "only-upgrade", (
             "Die Basis ist upstream unverändert — ein Neubau heilt nur, wenn die App "
             "beim Bau die Pakete aktualisiert (z. B. apt-get upgrade); sonst braucht "

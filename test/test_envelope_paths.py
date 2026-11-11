@@ -82,11 +82,11 @@ def package(version, public=False):
     return d
 
 
-def install(pkg, confirm=False):
+def install(pkg, confirm=False, **extra):
     args = argparse.Namespace(package=pkg, path="", ref="", name="demo",
                               channel=None, store_source="", tenant="",
                               key="", ident=None, rehearsal=None, bind=[],
-                              confirm=confirm)
+                              confirm=confirm, **extra)
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -130,7 +130,46 @@ src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").
 ok("der Worker haengt den Zusatz an 'deployed'",
    '"deployed" + envelope_notes_suffix(buf.getvalue())' in src)
 ok("eine Ablehnung im Portal nennt den Weg ueber Test und Uebernahme",
-   "update a test instance and promote it" in src)
+   "update a test instance and promote it" in src
+   and "confirm it with the tick on the store page" in src)
+
+print("")
+print("I-43 Haken im Portal: der Fingerabdruck genau dieser Erweiterung")
+put_instance("production")
+out, said = install(package("0.2.0", public=True))
+fpl = [ln for ln in said.splitlines() if ln.startswith(m.ENVELOPE_FP_LINE)]
+fp = fpl[0][len(m.ENVELOPE_FP_LINE):] if fpl else ""
+ok("die Ablehnung traegt den Fingerabdruck", out == "refused" and len(fp) == 16, said)
+ok("er ist der Fingerabdruck der NOTE-Zeilen",
+   fp == m.envelope_fingerprint(["routes become reachable without login: /fan"]), fp)
+out, said = install(package("0.2.0", public=True), confirm=fp)
+ok("mit dem passenden Fingerabdruck: durch", out == "past", (out, said))
+out, said = install(package("0.2.0", public=True), confirm="0" * 16)
+ok("mit einem anderen Fingerabdruck: abgelehnt (der Haken galt etwas anderem)",
+   out == "refused", (out, said))
+out, said = install(package("0.2.0", public=True), confirm="")
+ok("leerer Haken: abgelehnt", out == "refused", (out, said))
+ok("die Reihenfolge der Zeilen aendert den Fingerabdruck nicht",
+   m.envelope_fingerprint(["a", "b"]) == m.envelope_fingerprint(["b", "a"]))
+ok("der Worker reicht den Haken nur als 16 Hex-Zeichen weiter",
+   're.fullmatch(r"[0-9a-f]{16}", want)' in src)
+ok("der Worker meldet needs=confirm_envelope mit Fingerabdruck und Zeilen",
+   'res_body["needs"] = "confirm_envelope"' in src and 'res_body["notes"]' in src)
+psrc = open(os.path.join(HERE, "..", "platform", "services", "portal", "app.py"),
+            encoding="utf-8").read()
+ok("das Portal fragt auf der Store-Seite, nur bei einem Update",
+   'res.get("needs") == "confirm_envelope" and update' in psrc
+   and 'name="confirm_envelope"' in psrc and "{% for n in envelope.notes %}" in psrc)
+
+print("")
+print("Ein Weg, der schon geprueft hat, prueft nicht noch einmal (gemessen 11.11.)")
+put_instance("production")
+out, said = install(package("0.2.0", public=True), envelope_checked=True)
+ok("install_artifact hat geprueft und bestaetigt: der Verzeichnisweg laesst durch",
+   out == "past" and "NOTE" not in said, (out, said))
+ok("install_artifact sagt es dem Verzeichnisweg (Uebernahme, Sideload, ZIP, Token)",
+   "envelope_checked=True)" in src
+   and 'if inst and not getattr(args, "envelope_checked", False):' in src)
 
 print("")
 print("Der ZIP-Weg fragt dieselbe Funktion")

@@ -89,6 +89,44 @@ def dockerfile_base(text):
     return last
 
 
+_UPGRADE_RE = re.compile(
+    r"(?i)(?:\b(?:apt-get|apt|aptitude)\b(?:\s+-\S+)*\s+(?:-\S+\s+)*"
+    r"(?:upgrade|dist-upgrade|full-upgrade)\b)"
+    r"|(?:\bapk\b(?:\s+-\S+)*\s+upgrade\b)")
+
+
+def dockerfile_upgrades(text):
+    """True when a RUN instruction of the final stage upgrades the OS
+    packages (apt-get/apt upgrade, dist-upgrade, apk upgrade).
+
+    Why the node needs to know (2026-11-11, zlib DSA-6613-1): Debian fixes
+    a package days before the official base image is published again. An
+    app that upgrades while building heals on a rebuild in that gap -- but
+    only if the build does not take that RUN layer from Docker's cache,
+    which it would, because the base did not move. So: such a Dockerfile
+    is built with --no-cache (see appctl.docker_build_cmd), and the card
+    says a rebuild helps."""
+    lines, cur = [], ""
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if s.startswith("#") and not cur:
+            continue
+        if s.endswith("\\"):
+            cur += s[:-1] + " "
+            continue
+        lines.append(cur + s)
+        cur = ""
+    if cur:
+        lines.append(cur)
+    final = []
+    for line in lines:
+        if re.match(r"(?i)^FROM\s", line):
+            final = []
+        elif re.match(r"(?i)^RUN\s", line):
+            final.append(line)
+    return any(_UPGRADE_RE.search(line) for line in final)
+
+
 def repo_of(ref):
     """`python:3.13-slim` -> `python`; `quay.io/x/y:1@sha256:..` -> `quay.io/x/y`."""
     r = ref.split("@", 1)[0]
@@ -129,14 +167,34 @@ def base_record(build_dir, run=sh, now=None):
     base the build used is the node's local image of the FROM reference."""
     try:
         with open(os.path.join(build_dir, "Dockerfile"), encoding="utf-8") as f:
-            ref = dockerfile_base(f.read())
+            text = f.read()
     except OSError:
-        ref = ""
+        text = ""
+    ref = dockerfile_base(text)
     if not ref:
         return {"ref": "", "digest": "", "built": now_iso(now)}
     info = inspect_image(ref, run)
     return {"ref": ref, "digest": local_digest(info.get("RepoDigests"), ref),
-            "image": info.get("Id", ""), "built": now_iso(now)}
+            "image": info.get("Id", ""), "built": now_iso(now),
+            # the build upgrades OS packages itself (dockerfile_upgrades)
+            "upgrades": dockerfile_upgrades(text)}
+
+
+def build_dir_upgrades(build_dir):
+    try:
+        with open(os.path.join(build_dir, "Dockerfile"), encoding="utf-8") as f:
+            return dockerfile_upgrades(f.read())
+    except OSError:
+        return False
+
+
+def package_list(image_id, run=sh):
+    """The image's dpkg list, sorted -- '' when it cannot be read. Used to
+    tell a no-cache rebuild that brought nothing new from one that did."""
+    out = run(["docker", "run", "--rm", "--network", "none", "--read-only",
+               "--pull", "never", "--log-driver", "none", "--entrypoint",
+               "dpkg-query", image_id, "-W", "-f", DPKG_FORMAT], timeout=60)
+    return "\n".join(sorted((out or "").splitlines()))
 
 
 # --- upstream ---------------------------------------------------------------------
@@ -230,7 +288,9 @@ def targets(instances, run=sh):
                         "foreign": foreign,
                         "base_ref": img if foreign else base.get("ref", ""),
                         "base_digest": base.get("digest", ""),
-                        "built": base.get("built", "")})
+                        "built": base.get("built", ""),
+                        # None: recorded before 0.1.252 (or a foreign image)
+                        "upgrades": None if foreign else base.get("upgrades")})
     return out
 
 
@@ -351,7 +411,8 @@ def refresh(apps_dir, instances, now=None, budget=BUDGET, run=sh,
             imgs.pop(iid, None)
     state["rows"] = [{k: r[k] for k in ("instance", "service", "container", "image",
                                         "foreign", "base_ref", "base_digest", "built",
-                                        "image_id")} for r in rows]
+                                        "image_id")}
+                     | {"upgrades": r.get("upgrades")} for r in rows]
     state["computed"] = now_iso(now)
     try:
         save(apps_dir, state)
@@ -379,6 +440,7 @@ def summary(state, now=None):
         svc = {"service": r["service"], "image": r["image"], "state": word,
                "open": open_n, "oldest": im.get("oldest", ""),
                "base": r["base_ref"], "built": r["built"], "behind": behind,
+               "upgrades": r.get("upgrades"),
                "why": im.get("why", "") if open_n is None else ""}
         if r["instance"]:
             e = inst.setdefault(r["instance"], {"services": []})

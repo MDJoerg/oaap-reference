@@ -239,7 +239,8 @@ ok("...ein Profil ganz ohne App braucht den Katalog nicht", r.get("ok"), r)
 a.fetch_store_list = lambda url: {"apps": [{"id": k, "package": {"git": "x"}} for k in CAT]}
 
 r = put(json.dumps({**prof(id="verein-neu"), "title": "Neuer Titel"}))
-ok("gleiche id ersetzt das Profil und sagt es", r.get("ok") and "replaced" in r["message"]
+ok("gleiche id ersetzt das Profil und sagt es", r.get("ok") and "replaces" in r["message"]
+   and "stays in the history" in r["message"]  # RFC-0079: the old file is kept
    and json.load(open(os.path.join(a.PROFILE_DIR, "verein-neu.json")))["title"] == "Neuer Titel", r)
 
 # delete under an open build
