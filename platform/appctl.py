@@ -26536,6 +26536,375 @@ def shred_file(path):
         pass
 
 
+# --- bulk runs: "alle aktualisieren", "alle getesteten übernehmen", "alle neu
+# bauen" (Jörg, 2026-11-11: "mit Protokoll und Stopp bei Fehlern") ------------
+#
+# The node plans (never the request), a detached unit runs the plan step by
+# step, and every step is an ordinary spool request in the starting person's
+# name -- so each one meets exactly the rules a click meets: test first, the
+# envelope tick, the tenant boundary, the tenant's log. The run stops at the
+# first step that is refused or fails, and at a widening it never confirms.
+# Production instances with a test instance are never updated directly: the
+# update run takes the test instance, the promotion run takes production --
+# two buttons, so a person looks in between (RFC-0050).
+
+BULK_DIR = os.path.join(APPS_DIR, "bulk")
+BULK_KINDS = ("update", "promote", "rebuild")
+BULK_ID_RE = re.compile(r"^\d{8}-\d{6}-(update|promote|rebuild)$")
+BULK_STEP_SECONDS = DEPLOY_MAX_SECONDS + 300
+BULK_KEEP = 30
+
+
+class BulkRefused(Exception):
+    pass
+
+
+def _bulk_visible(reg, act_role, act_tenant):
+    out = {}
+    for k, i in reg["instances"].items():
+        if is_rehearsal(i) or not i.get("app_id"):
+            continue
+        if act_role != "server_admin" and resolve_tenant(i.get("tenant")) != act_tenant:
+            continue
+        out[k] = i
+    return out
+
+
+def _bulk_test_sibling(reg, key, inst):
+    t = resolve_tenant(inst.get("tenant")) or ""
+    return next(((k, i) for k, i in sorted(reg["instances"].items())
+                 if k != key and i.get("app_id") == inst.get("app_id")
+                 and i.get("channel") == "test" and not is_rehearsal(i)
+                 and (resolve_tenant(i.get("tenant")) or "") == t), (None, None))
+
+
+def _bulk_store_lists():
+    """[(source, position, {app_id: entry})] of the enabled sources -- read
+    once per plan; versions only, nothing is staged."""
+    out = []
+    for pos, src in enumerate(s for s in load_sources()[0] if s.get("enabled", True)):
+        is_cat = catalog_source.is_catalog_url(src.get("url"))
+        try:
+            data = _catalog_read(src) if is_cat else fetch_store_list(src["url"])
+        except Exception:  # an unreadable list plans nothing from it
+            data = None
+        apps = {}
+        for a in (data or {}).get("apps", []):
+            pkg = a.get("package") or {}
+            if a.get("id") and (pkg.get("git") or (is_cat and pkg.get("zip"))):
+                apps.setdefault(a["id"], a)
+        out.append((src, pos, apps))
+    return out
+
+
+def _bulk_listed(app_id, prefer, lists):
+    """(version, source id) the store would install -- the order of
+    _store_lookup: the instance's own source first, then trust, then place."""
+    hits = [(src, a, pos) for src, pos, apps in lists
+            for a in [apps.get(app_id)] if a]
+    if not hits:
+        return "", ""
+    hits.sort(key=lambda h: (h[0]["id"] != prefer,
+                             -TRUST_RANK.get(h[0].get("trust"), 0), h[2]))
+    return str(hits[0][1].get("version") or ""), hits[0][0]["id"]
+
+
+def bulk_plan(kind, act_role, act_tenant, lists=None, facts=None):
+    """The steps a bulk run of `kind` would take, test instances first.
+    Returns (steps, notes): notes are sentences about what is left out."""
+    if kind not in BULK_KINDS:
+        raise BulkRefused(f"unknown kind '{kind}'")
+    reg = load_registry()
+    vis = _bulk_visible(reg, act_role, act_tenant)
+    steps, notes = [], []
+    if kind == "update":
+        lists = _bulk_store_lists() if lists is None else lists
+        for k, i in sorted(vis.items()):
+            src = i.get("source") or {}
+            v, sid = _bulk_listed(i["app_id"], src.get("store_source", ""), lists)
+            if not v or not _version_gt(v, i.get("version", "")):
+                continue
+            row = {"instance": k, "name": instance_name(k, i), "app_id": i["app_id"],
+                   "channel": i.get("channel", "production"),
+                   "from": i.get("version", ""), "to": v, "source_id": sid}
+            if row["channel"] == "production" and _bulk_test_sibling(reg, k, i)[0]:
+                notes.append(f"{row['name']}: über die Test-Instanz -- danach "
+                             "„Alle getesteten übernehmen“")
+                continue
+            steps.append(row)
+    elif kind == "promote":
+        for k, i in sorted(vis.items()):
+            if i.get("channel") != "production":
+                continue
+            tk, t = _bulk_test_sibling(reg, k, i)
+            if not tk or not _version_gt(t.get("version", ""), i.get("version", "")):
+                continue
+            src = t.get("source") or {}
+            if not (src.get("kind") == "artifact"
+                    or (src.get("kind") == "git"
+                        and re.fullmatch(r"[0-9a-f]{40}", str(src.get("commit") or "")))):
+                notes.append(f"{instance_name(k, i)}: die Test-Instanz "
+                             f"{instance_name(tk, t)} kann nicht übernommen werden "
+                             "(kein Paket, kein festgehaltener Commit) -- erst ein "
+                             "Store-Update der Test-Instanz")
+                continue
+            steps.append({"instance": k, "name": instance_name(k, i),
+                          "app_id": i["app_id"], "channel": "production",
+                          "from": i.get("version", ""), "to": t.get("version", ""),
+                          "source": tk, "source_name": instance_name(tk, t)})
+    else:
+        facts = host_care.read(APPS_DIR) if facts is None else facts
+        img = ((facts or {}).get("images") or {}).get("instances") or {}
+        for k, i in sorted(vis.items()):
+            e = img.get(k)
+            if not e or host_care.rebuild_helps(e.get("services"))[0] != "likely":
+                continue
+            src = i.get("source") or {}
+            zp = source_package_arg(k, src) if src.get("kind") == "artifact" else ""
+            how, why = host_care.rebuild_source(i, bool(zp) and os.path.isfile(zp))
+            if not how:
+                notes.append(f"{instance_name(k, i)}: {why}")
+                continue
+            steps.append({"instance": k, "name": instance_name(k, i),
+                          "app_id": i["app_id"], "channel": i.get("channel", "production"),
+                          "from": i.get("version", ""), "to": i.get("version", "")})
+    # The same name may live in two tenants (vorgaenge, oaap-test 11.11.):
+    # the tenant's short name goes with every step outside the default one.
+    dflt = default_tenant_id()
+    for st in steps:
+        t = resolve_tenant((reg["instances"].get(st["instance"]) or {}).get("tenant"))
+        st["tenant"] = "" if (not t or t == dflt) else (tenant_slug(t) or "")
+    steps.sort(key=lambda r: (r["channel"] != "test", r["name"], r["tenant"]))
+    return steps, notes
+
+
+def _bulk_path(jid):
+    return os.path.join(BULK_DIR, f"{jid}.json")
+
+
+def bulk_load(jid):
+    if not BULK_ID_RE.match(jid or ""):
+        return None
+    try:
+        with open(_bulk_path(jid), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def bulk_save(job):
+    os.makedirs(BULK_DIR, exist_ok=True)
+    os.chmod(BULK_DIR, 0o755)
+    tmp = _bulk_path(job["id"]) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(job, f, indent=1, ensure_ascii=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, _bulk_path(job["id"]))
+
+
+def bulk_running():
+    try:
+        names = sorted(os.listdir(BULK_DIR))
+    except OSError:
+        return None
+    for n in names:
+        j = bulk_load(n[:-5]) if n.endswith(".json") else None
+        if j and j.get("state") in ("planned", "running"):
+            return j
+    return None
+
+
+def _bulk_spawn(jid):
+    oaap = shutil.which("oaap") or "/usr/local/bin/oaap"
+    run(["systemd-run", f"--unit=oaap-bulk-{jid}", "--collect",
+         "--property=TimeoutStopSec=30", oaap, "app", "bulk", "run", jid])
+
+
+BULK_SPAWN = _bulk_spawn
+
+
+def bulk_job(req, act_role, act_tenant, actor):
+    """The worker's 'bulk' action -> (ok, sentence, detail)."""
+    op, kind = str(req.get("op") or ""), str(req.get("kind") or "")
+    if act_role not in ("server_admin", "tenant_admin"):
+        return False, "bulk runs need server_admin or tenant_admin", None
+    try:
+        if op == "plan":
+            steps, notes = bulk_plan(kind, act_role, act_tenant)
+            return True, f"{len(steps)} step(s)", {"steps": steps, "notes": notes}
+        if op == "start":
+            cur = bulk_running()
+            if cur:
+                return False, (f"a bulk run is already going ({cur['id']}) -- one at "
+                               "a time"), {"job": cur["id"]}
+            steps, notes = bulk_plan(kind, act_role, act_tenant)
+            if not steps:
+                return False, "nothing to do", {"notes": notes}
+            jid = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + kind
+            for st in steps:
+                st.update({"state": "pending", "message": ""})
+            bulk_save({"id": jid, "kind": kind, "by": actor, "role": act_role,
+                       "tenant": act_tenant or "", "state": "planned",
+                       "created": _iso_now(), "steps": steps, "notes": notes,
+                       "reason": ""})
+            try:
+                BULK_SPAWN(jid)
+            except Exception as e:
+                j = bulk_load(jid)
+                j.update({"state": "failed", "reason": f"could not start: {e}"})
+                bulk_save(j)
+                return False, f"could not start the run: {e}", {"job": jid}
+            _bulk_prune()
+            return True, f"bulk run {jid} started ({len(steps)} step(s))", {"job": jid}
+        if op == "stop":
+            jid = str(req.get("job") or "")
+            j = bulk_load(jid)
+            if not j:
+                return False, "no such run", None
+            if act_role != "server_admin" and j.get("by") != actor:
+                return False, "no such run", None
+            if j.get("state") not in ("planned", "running"):
+                return False, f"the run is already {j.get('state')}", {"job": jid}
+            open(_bulk_path(jid)[:-5] + ".stop", "w").close()
+            return True, "the run stops after the current step", {"job": jid}
+    except BulkRefused as e:
+        return False, str(e), None
+    return False, f"unknown bulk operation '{op}'", None
+
+
+def _bulk_prune():
+    try:
+        names = sorted(n for n in os.listdir(BULK_DIR) if n.endswith(".json"))
+    except OSError:
+        return
+    for n in names[:-BULK_KEEP]:
+        j = bulk_load(n[:-5]) or {}
+        if j.get("state") not in ("planned", "running"):
+            for ext in (".json", ".stop"):
+                try:
+                    os.remove(os.path.join(BULK_DIR, n[:-5] + ext))
+                except OSError:
+                    pass
+
+
+def _bulk_request(job, st):
+    base = {"by": job["by"], "requested": _iso_now(), "via": f"bulk {job['id']}"}
+    if job["kind"] == "update":
+        return {**base, "instance": st["app_id"], "app_id": st["app_id"],
+                "update": st["instance"], "action": "install",
+                "source_id": st.get("source_id", ""), "channel": st["channel"]}
+    if job["kind"] == "promote":
+        # A widening is never confirmed by a run: it stops, the person decides.
+        return {**base, "instance": st["name"], "action": "promote",
+                "from": st["source"], "confirmed": False}
+    return {**base, "instance": st["instance"], "action": "rebuild", "op": "start"}
+
+
+def _bulk_submit(req, wait, poll=2.0):
+    """One spool request, the way the portal writes it; the worker's answer."""
+    rid = uuid.uuid4().hex
+    queue = os.path.join(SPOOL_DIR, "queue")
+    results = os.path.join(SPOOL_DIR, "results")
+    os.makedirs(queue, exist_ok=True)
+    tmp = os.path.join(SPOOL_DIR, f".req-{rid}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"id": rid, **req}, f)
+    os.replace(tmp, os.path.join(queue, f"{rid}.json"))
+    res_path = os.path.join(results, f"{rid}.json")
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if os.path.exists(res_path):
+            try:
+                with open(res_path, encoding="utf-8") as f:
+                    return json.load(f)
+            finally:
+                os.remove(res_path)
+        time.sleep(poll)
+    return None
+
+
+BULK_SUBMIT = _bulk_submit
+
+
+def bulk_run(jid, say=print):
+    """The detached unit: one step after another, stop at the first failure."""
+    job = bulk_load(jid)
+    if not job:
+        die(f"no bulk run '{jid}'")
+    if job.get("state") not in ("planned", "running"):
+        die(f"bulk run '{jid}' is already {job.get('state')}")
+    job.update({"state": "running", "started": _iso_now()})
+    bulk_save(job)
+    stop_file = _bulk_path(jid)[:-5] + ".stop"
+    for st in job["steps"]:
+        if os.path.exists(stop_file):
+            job.update({"state": "stopped", "reason": "angehalten von Hand"})
+            break
+        st.update({"state": "running", "started": _iso_now()})
+        bulk_save(job)
+        say(f"{st['name']}: {st['from']} -> {st['to']} ...")
+        res = BULK_SUBMIT(_bulk_request(job, st), BULK_STEP_SECONDS)
+        st["finished"] = _iso_now()
+        if res is None:
+            st.update({"state": "failed", "message": "keine Antwort des Knotens in der Zeit"})
+        else:
+            msg = str(res.get("message") or "")
+            if res.get("needs") == "confirm_envelope":
+                msg = ("erweitert den Rahmen der Produktiv-Instanz ("
+                       + "; ".join(res.get("notes") or []) + ") -- bitte einzeln im "
+                       "Store bestätigen")
+            elif res.get("needs") == "confirm_administer":
+                msg = "verwaltet Rechte -- bitte einzeln im Store bestätigen"
+            st.update({"state": "ok" if res.get("ok") else "failed", "message": msg[:600]})
+        say(f"  {st['state']}: {st['message']}")
+        bulk_save(job)
+        if st["state"] != "ok":
+            job.update({"state": "stopped", "reason": f"{st['name']}: {st['message']}"})
+            break
+    else:
+        job["state"] = "done"
+    job["finished"] = _iso_now()
+    bulk_save(job)
+    try:
+        os.remove(stop_file)
+    except OSError:
+        pass
+    return job
+
+
+def cmd_bulk(args):
+    """`oaap app bulk plan <kind> | start <kind> | run <id> | stop <id> | list`."""
+    # root: checked in main() like every writing command
+    verb, rest = args.verb, args.rest
+    if verb == "plan" and rest:
+        steps, notes = bulk_plan(rest[0], "server_admin", None)
+        for st in steps:
+            print(f"  {st['name'] + (' [' + st['tenant'] + ']' if st['tenant'] else ''):<32} "
+                  f"{st['channel']:<10} {st['from']} -> {st['to']}")
+        for n in notes:
+            print(f"  ({n})")
+        print(f"{len(steps)} step(s)")
+    elif verb == "start" and rest:
+        ok, msg, _d = bulk_job({"op": "start", "kind": rest[0]}, "server_admin", None,
+                               "root")
+        print(msg) if ok else die(msg)
+    elif verb == "run" and rest:
+        bulk_run(rest[0])
+    elif verb == "stop" and rest:
+        ok, msg, _d = bulk_job({"op": "stop", "job": rest[0]}, "server_admin", None, "root")
+        print(msg) if ok else die(msg)
+    elif verb == "list":
+        for n in sorted(os.listdir(BULK_DIR)) if os.path.isdir(BULK_DIR) else []:
+            j = bulk_load(n[:-5]) if n.endswith(".json") else None
+            if j:
+                done = sum(1 for s in j["steps"] if s.get("state") == "ok")
+                print(f"{j['id']}  {j['state']:<8} {done}/{len(j['steps'])}  {j.get('by', '')}"
+                      + (f"  -- {j['reason']}" if j.get("reason") else ""))
+    else:
+        die("usage: oaap app bulk plan|start <update|promote|rebuild> | run|stop <id> | list")
+
+
 def cmd_process_deploys(_args):
     """Run queued deploy requests (invoked by the oaap-deployd path unit)."""
     global DEADLINE
@@ -28330,6 +28699,10 @@ def cmd_process_deploys(_args):
                              _ctid or ensure_default_tenant(), subject=name,
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
+        elif action == "bulk":
+            # "Alle aktualisieren / übernehmen / neu bauen": the node plans,
+            # a detached unit runs the plan through this very spool.
+            ok, msg, detail = bulk_job(req, act_role, act_tenant, actor)
         elif action == "rebuild":
             # RFC-0071 stage 2: the card "Abbild". The same function as
             # `oaap app rebuild`; a refusal lands in the tenant's log
@@ -28428,7 +28801,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal", "care": "portal", "rebuild": "portal",
+               "disk": "portal", "egress": "portal", "care": "portal", "rebuild": "portal", "bulk": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -31113,6 +31486,12 @@ def build_parser():
     prb.add_argument("--back", action="store_true",
                      help="go back to the image the last rebuild kept")
     prb.set_defaults(fn=cmd_rebuild)
+    pbk = sub.add_parser("bulk",
+                         help="update, promote or rebuild everything that is due, one "
+                              "after another, stopping at the first failure")
+    pbk.add_argument("verb", choices=["plan", "start", "run", "stop", "list"])
+    pbk.add_argument("rest", nargs="*")
+    pbk.set_defaults(fn=cmd_bulk)
     psb = sub.add_parser("standby",
                          help="put an instance to sleep: containers stopped, "
                               "data kept, stays asleep over update and reboot "

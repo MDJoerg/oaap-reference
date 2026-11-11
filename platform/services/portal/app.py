@@ -1581,6 +1581,12 @@ STORE_BODY = """
     App{{ 's' if care_counts.security != 1 }} mit offenen Sicherheitsmeldungen</a>{% endif %}
   {% if f.care %} — <a class="rowaction" href="/store">alle zeigen</a>{% endif %}</p></div>
 {% endif %}
+<div class="card"><p style="margin:0">Alle auf einmal:
+  <a class="rowaction" href="/store/alle/update">Alle aktualisieren …</a> ·
+  <a class="rowaction" href="/store/alle/promote">Alle getesteten übernehmen …</a> ·
+  <a class="rowaction" href="/store/alle/rebuild">Alle neu bauen …</a> ·
+  <a class="rowaction" href="/store/laeufe">Läufe</a>
+  <span class="muted">— erst kommt der Plan, gestartet wird mit einem eigenen Knopf.</span></p></div>
 
 <form class="card" method="get" action="/store">
   <div class="filters">
@@ -7624,6 +7630,179 @@ def store_app(source_id, app_id, envelope=None):
                 profiles=node_profiles(),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
+
+
+BULK_DIR_RO = APPS_REGISTRY_DIR + "/bulk"
+BULK_ID = r"\d{8}-\d{6}-(update|promote|rebuild)"
+BULK_TITLE = {"update": "Alle aktualisieren", "promote": "Alle getesteten übernehmen",
+              "rebuild": "Alle neu bauen"}
+BULK_INTRO = {
+    "update": "Jede Instanz, für die der Store eine neuere Version hat — Test-Instanzen "
+              "zuerst. Eine Produktiv-Instanz mit Test-Instanz wird nicht direkt "
+              "aktualisiert: sie folgt mit „Alle getesteten übernehmen“, nachdem Du die "
+              "Test-Instanz angesehen hast.",
+    "promote": "Jede Produktiv-Instanz, deren Test-Instanz eine höhere Version läuft: "
+               "genau die getesteten Bytes (Paket oder Commit) gehen produktiv.",
+    "rebuild": "Jede Instanz, bei der die Karte „Abbild“ sagt, dass ein Neubau heilt — "
+               "Test-Instanzen zuerst.",
+}
+BULK_STATE = {"planned": "geplant", "running": "läuft", "done": "fertig",
+              "stopped": "angehalten", "failed": "fehlgeschlagen",
+              "pending": "wartet", "ok": "erledigt"}
+BULK_PLAN_WAIT = 90
+
+BULK_PLAN_BODY = """
+<a class="back" href="/store?back=1">← Zurück zum Store</a>
+<div class="card">
+  <h1 style="margin-top:0">{{ title }}</h1>
+  <p class="muted">{{ intro }} Der Lauf arbeitet eine Instanz nach der anderen ab,
+     schreibt ein Protokoll und <strong>hält beim ersten Fehler an</strong> — auch wenn
+     ein Update den Rahmen einer Produktiv-Instanz erweitern würde: das bestätigst Du
+     einzeln im Store.</p>
+  {% if err %}<p class="err">{{ err }}</p>{% endif %}
+  {% if steps %}
+  <table><tr><th>#</th><th>Instanz</th><th>Kanal</th><th>Version</th></tr>
+  {% for st in steps %}<tr><td>{{ loop.index }}</td><td><a href="/instances/{{ st.instance }}">{{ st.name }}</a>
+    {% if st.tenant %}<span class="badge muted">{{ st.tenant }}</span>{% endif %}
+    {% if st.source_name %}<span class="muted">aus {{ st.source_name }}</span>{% endif %}</td>
+    <td>{{ "Test" if st.channel == "test" else "Produktiv" }}</td>
+    <td>{% if st.from != st.to %}{{ st.from }} → {{ st.to }}{% else %}{{ st.from }} (neu bauen){% endif %}</td></tr>{% endfor %}
+  </table>
+  <form method="post" action="/store/alle/{{ kind }}"
+        onsubmit="this.querySelector('button').disabled=true">
+    <button>{{ title }} ({{ steps|length }}) starten</button>
+  </form>
+  {% elif not err %}<p>Nichts zu tun.</p>{% endif %}
+  {% if notes %}<p class="muted">Nicht dabei:</p><ul class="muted">{% for n in notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+</div>
+"""
+
+BULK_RUN_BODY = """
+{% if job.state in ("planned", "running") %}<meta http-equiv="refresh" content="4">{% endif %}
+<a class="back" href="/store/laeufe">← Alle Läufe</a>
+<div class="card{% if job.state in ('stopped', 'failed') %} warn{% endif %}">
+  <h1 style="margin-top:0">{{ title }}</h1>
+  <p><span class="badge {% if job.state == 'done' %}ok{% elif job.state in ('stopped', 'failed') %}todo{% else %}muted{% endif %}">{{ states.get(job.state, job.state) }}</span>
+     <span class="muted">{{ done }}/{{ job.steps|length }} erledigt · gestartet {{ (job.started or job.created or '')[:16]|replace('T', ' ') }} UTC
+     von {{ job.by }}{% if job.finished %} · beendet {{ job.finished[:16]|replace('T', ' ') }} UTC{% endif %}</span></p>
+  {% if job.reason %}<p class="err">Angehalten bei {{ job.reason }}</p>{% endif %}
+  <table><tr><th>#</th><th>Instanz</th><th>Version</th><th>Stand</th><th>Meldung</th></tr>
+  {% for st in job.steps %}<tr><td>{{ loop.index }}</td>
+    <td><a href="/instances/{{ st.instance }}">{{ st.name }}</a>{% if st.tenant %} <span class="badge muted">{{ st.tenant }}</span>{% endif %}</td>
+    <td>{% if st.from != st.to %}{{ st.from }} → {{ st.to }}{% else %}{{ st.from }}{% endif %}</td>
+    <td><span class="badge {% if st.state == 'ok' %}ok{% elif st.state == 'failed' %}todo{% else %}muted{% endif %}">{{ states.get(st.state, st.state) }}</span></td>
+    <td class="muted">{{ st.message }}</td></tr>{% endfor %}
+  </table>
+  {% if job.state in ("planned", "running") %}
+  <form method="post" action="/store/lauf/{{ job.id }}/stop"><button class="secondary">Nach dem laufenden Schritt anhalten</button></form>
+  {% endif %}
+</div>
+"""
+
+BULK_LIST_BODY = """
+<a class="back" href="/store?back=1">← Zurück zum Store</a>
+<div class="card"><h1 style="margin-top:0">Läufe</h1>
+  {% if jobs %}<table><tr><th>Lauf</th><th>Art</th><th>Stand</th><th>Schritte</th><th>von</th></tr>
+  {% for j in jobs %}<tr><td><a href="/store/lauf/{{ j.id }}">{{ j.id }}</a></td><td>{{ titles.get(j.kind, j.kind) }}</td>
+    <td>{{ states.get(j.state, j.state) }}</td><td>{{ j.done }}/{{ j.total }}</td><td>{{ j.by }}</td></tr>{% endfor %}
+  </table>{% else %}<p class="muted">Noch kein Lauf.</p>{% endif %}
+</div>
+"""
+
+
+def _bulk_job_visible(job):
+    return bool(job) and ("server_admin" in caller_roles()
+                          or job.get("by") == request.headers.get("X-OAAP-User", ""))
+
+
+@app.get("/store/alle/<kind>")
+def store_bulk_plan(kind):
+    """The plan of a bulk run -- made by the node, shown before anything runs."""
+    denied = require_store()
+    if denied:
+        return denied
+    if kind not in BULK_TITLE:
+        return redirect("/store?back=1", code=303)
+    res = _queue_and_wait("", {"action": "bulk", "op": "plan", "kind": kind},
+                          BULK_PLAN_WAIT)
+    d = (res or {}).get("detail") or {}
+    err = ("Der Knoten hat nicht rechtzeitig geantwortet — gleich noch einmal versuchen."
+           if res is None else ("" if res.get("ok") else res.get("message", "")))
+    return page(BULK_PLAN_BODY, BULK_TITLE[kind], "store", kind=kind,
+                title=BULK_TITLE[kind], intro=BULK_INTRO[kind], err=err,
+                steps=d.get("steps") or [], notes=d.get("notes") or [])
+
+
+@app.post("/store/alle/<kind>")
+def store_bulk_start(kind):
+    denied = require_store()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if kind not in BULK_TITLE:
+        return redirect("/store?back=1", code=303)
+    res = _queue_and_wait("", {"action": "bulk", "op": "start", "kind": kind},
+                          BULK_PLAN_WAIT)
+    jid = str(((res or {}).get("detail") or {}).get("job") or "")
+    if res and res.get("ok") and _re.fullmatch(BULK_ID, jid):
+        return redirect(f"/store/lauf/{jid}", code=303)
+    if _re.fullmatch(BULK_ID, jid):     # one is already running: show it
+        return redirect(f"/store/lauf/{jid}", code=303)
+    return page(BULK_PLAN_BODY, BULK_TITLE[kind], "store", kind=kind,
+                title=BULK_TITLE[kind], intro=BULK_INTRO[kind],
+                err=(res or {}).get("message") or "Der Knoten hat nicht geantwortet.",
+                steps=[], notes=((res or {}).get("detail") or {}).get("notes") or [])
+
+
+@app.get("/store/lauf/<jid>")
+def store_bulk_run(jid):
+    denied = require_store()
+    if denied:
+        return denied
+    job = (_read_json(f"{BULK_DIR_RO}/{jid}.json")
+           if _re.fullmatch(BULK_ID, jid) else None)
+    if not _bulk_job_visible(job):
+        return redirect("/store/laeufe", code=303)
+    done = sum(1 for st in job.get("steps") or [] if st.get("state") == "ok")
+    return page(BULK_RUN_BODY, BULK_TITLE.get(job.get("kind"), "Lauf"), "store",
+                job=job, done=done, states=BULK_STATE,
+                title=BULK_TITLE.get(job.get("kind"), "Lauf") + " — " + jid)
+
+
+@app.post("/store/lauf/<jid>/stop")
+def store_bulk_stop(jid):
+    denied = require_store()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if _re.fullmatch(BULK_ID, jid):
+        _queue_and_wait("", {"action": "bulk", "op": "stop", "job": jid}, 30)
+    return redirect(f"/store/lauf/{jid}", code=303)
+
+
+@app.get("/store/laeufe")
+def store_bulk_list():
+    denied = require_store()
+    if denied:
+        return denied
+    jobs = []
+    try:
+        names = sorted(os.listdir(BULK_DIR_RO), reverse=True)
+    except OSError:
+        names = []
+    for n in names:
+        if not (n.endswith(".json") and _re.fullmatch(BULK_ID, n[:-5])):
+            continue
+        j = _read_json(f"{BULK_DIR_RO}/{n}")
+        if _bulk_job_visible(j):
+            steps = j.get("steps") or []
+            jobs.append({"id": j.get("id"), "kind": j.get("kind"), "state": j.get("state"),
+                         "by": j.get("by", ""), "total": len(steps),
+                         "done": sum(1 for st in steps if st.get("state") == "ok")})
+    return page(BULK_LIST_BODY, "Läufe", "store", jobs=jobs[:30], titles=BULK_TITLE,
+                states=BULK_STATE)
 
 
 @app.post("/store/install")
