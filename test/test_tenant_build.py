@@ -223,7 +223,7 @@ class Liar(FakeNode):
 st = tb.run(st, prof, Liar(), root)
 ok("a verb that said ok and left nothing is a FAILED step",
    st["state"] == "failed" and st["steps"][0]["state"] == "failed"
-   and "not on the node" in st["steps"][0]["note"], st["steps"][0])
+   and "nicht auf dem Knoten" in st["steps"][0]["note"], st["steps"][0])
 
 print("=== failure stops; continue does not repeat; resume after a break ===")
 root, prof, st, node = fresh()
@@ -256,7 +256,7 @@ st = tb.run(on_disk, prof, node, root)
 ok("the interrupted step's result is claimed: a rollback can now find it",
    st["steps"][1]["made"] == ["app.install:one"], st["steps"][1])
 ok("continue after the break finds step two already in place, makes nothing twice",
-   st["state"] == "done" and "already in place" in st["steps"][1]["note"]
+   st["state"] == "done" and "schon vorhanden" in st["steps"][1]["note"]
    and [c for c in node.calls if c == ("do", "app.install")].count(
        ("do", "app.install")) == 2, st["steps"][1])
 
@@ -268,7 +268,7 @@ st = tb.run(st, prof, node, root)
 ok("a finished step that is no longer in place STOPS the build, it is not "
    "silently done over",
    st["state"] == "failed" and st["steps"][1]["state"] == "failed"
-   and "no longer in place" in st["steps"][1]["note"], st["steps"][1])
+   and "nicht mehr vorhanden" in st["steps"][1]["note"], st["steps"][1])
 
 print("=== a manual step waits, and only a read or a human ends it ===")
 root = tempfile.mkdtemp(prefix="oaap-bld-")
@@ -314,7 +314,7 @@ st = tb.run(st, prof, node, root)
 node.refuse_undo.add("tenant.create:pure")
 st = tb.rollback(st, prof, node, root)
 ok("a refused undo stops the rollback there and says so",
-   st["state"] == "failed" and "rollback stopped" in st["steps"][0]["note"]
+   st["state"] == "failed" and "Rückbau angehalten" in st["steps"][0]["note"]
    and st["steps"][0]["made"] == ["tenant.create:pure"], st["steps"][0])
 ok("the steps that were undone are not undone twice, the refused one stays",
    st["steps"][1]["made"] == [] and st["steps"][2]["made"] == [])
@@ -533,7 +533,7 @@ verdict, note = drv.check("tenant.create", {"label": "vold"},
                           {"started": "2999-01-01T00:00:00+00:00",
                            "state": st_fake})
 ok("the step itself also refuses a tenant it did not make (a race between "
-   "the start and the step)", verdict == tb.CONFLICT and "not touched" in note,
+   "the start and the step)", verdict == tb.CONFLICT and "nicht angefasst" in note,
    (verdict, note))
 verdict, _ = drv.check("tenant.create", {"label": "vold"},
                        {"started": "1999-01-01T00:00:00+00:00",

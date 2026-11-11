@@ -143,6 +143,7 @@ GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 # travels in clear so the audit log and the portal can name a key
 # without ever holding its secret; only a hash of the secret is stored.
 KEYS_FILE = os.path.join(DATA_DIR, "api-keys.json")
+KEY_PREFIX = "oaapk_"   # what makes a bearer OURS (I-44)
 KEY_TOKEN_RE = re.compile(r"^oaapk_([0-9a-f]{8})_([A-Za-z0-9_-]{22,})$")
 KEY_DEFAULT_DAYS, KEY_MAX_DAYS = 90, 365
 # RFC-0027 D2: no key ever carries platform authority. A leaked
@@ -1339,7 +1340,17 @@ def resolve_principal(instance=""):
     """
     auth = request.headers.get("Authorization", "")
     if auth[:7].lower() == "bearer ":
-        return _by_key(auth[7:].strip(), instance)
+        token = auth[7:].strip()
+        # I-44: a bearer that is not in OUR form belongs to the app (a
+        # Keycloak console, an SPA with its own OIDC tokens). With a
+        # session beside it the session decides -- the token is the app's
+        # business and travels on to it as before. Without a session it
+        # stays the machine's answer (401, never a redirect). Anything
+        # that LOOKS like ours stays a key, valid or not: a broken key is
+        # never rescued by a cookie that happens to come along.
+        if not token.startswith(KEY_PREFIX) and session_username():
+            return _by_session()
+        return _by_key(token, instance)
     return _by_session()
 
 

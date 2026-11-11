@@ -30,6 +30,7 @@ STEP_TYPE = {
     "tenant.face": "Gesicht (Titel, Farben)",
     "app.install": "Anwendung installieren",
     "authz.setup": "Rollen, Pakete und Gruppen aus den Vorlagen einrichten",
+    "app.config": "Konfigurationswert einer Instanz setzen",
     "manual": "Ein Mensch erledigt das",
     "backup.check": "Sicherung prüfen",
 }
@@ -396,8 +397,9 @@ TEMPLATE = {
         "Katalog, optional begrenzt durch 'choices'). Ein Schritt mit "
         "'when': '<bool-Parameter>' läuft nur, wenn der Haken gesetzt ist. "
         "Schrittarten: tenant.create, address.ensure, address.wait, idp.provision, "
-        "idp.admin_group, tenant.policy, tenant.face, app.install, authz.setup, manual, "
-        "backup.check. app.install "
+        "idp.admin_group, tenant.policy, tenant.face, app.install, app.config, authz.setup, "
+        "manual, backup.check. app.config setzt nach dem app.install einen Wert der "
+        "Instanz (name, key, value; value fest oder ein Parameter). app.install "
         "nennt in einem hochgeladenen Profil eine App des Katalogs ('app'), nie einen "
         "Pfad; ersetze 'webseite' durch eine ID aus deinem Katalog. Platzhalter wie "
         "{label} setzt der Knoten ein, er wertet sie nie als Befehl aus. Eine App, die "

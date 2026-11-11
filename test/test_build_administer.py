@@ -114,7 +114,7 @@ ok("server_admin + Haken: installiert, mit Zusage", okd and SEEN[-1] is True, (o
 okd, note, made = d._install_from_catalogue(dict(step, confirm_administer="false"))
 ok("ohne Haken: keine Zusage, abgelehnt", not okd and SEEN[-1] is False, note)
 ok("... die Meldung ohne Marke, mit Hinweis auf den Haken",
-   a.ADMINISTER_MARK not in note and "tick" in note, note)
+   a.ADMINISTER_MARK not in note and "Haken" in note, note)
 d2 = a._BuildDrivers("kunde", who="x", role="tenant_admin")
 d2._instance_key = lambda name: name
 okd, note, made = d2._install_from_catalogue(step)

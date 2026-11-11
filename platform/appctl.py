@@ -7822,7 +7822,7 @@ class _BuildDrivers:
     def undo(self, typ, a, made, ctx):
         fn = getattr(self, "_undo_" + typ.replace(".", "_"), None)
         if not fn:
-            return False, f"'{typ}' has nothing to undo"
+            return False, f"'{typ}' kennt keinen Rückbau"
         return fn(a, made[0], ctx)
 
     def saved(self, state):
@@ -7845,7 +7845,7 @@ class _BuildDrivers:
     def _verb(self, argv, ok_note):
         code, out = _run_verb(argv)
         if code != 0:
-            return False, _brief(out, 3) or f"the verb stopped with {code}"
+            return False, _brief(out, 3) or f"der Befehl endete mit {code}"
         return True, ok_note
 
     def claim(self, typ, a, ctx):
@@ -7875,58 +7875,58 @@ class _BuildDrivers:
                 and any(m.startswith("instance:") for m in made)):
             names = ", ".join(sorted(m.split(":", 1)[1] for m in made
                                      if m.startswith("instance:")))
-            return (f"this build made the tenant AND instance(s) ({names}); "
-                    "undoing the instance keeps its data, and kept data holds "
-                    "the tenant, so the rollback would stop half way. Say that "
-                    "the data of those instances may be deleted too "
-                    "(--purge-instances / the box on the page), or remove the "
-                    "instance(s) and their data yourself first")
+            return (f"dieser Aufbau hat den Mandanten UND Instanzen angelegt ({names}); "
+                    "der Rückbau einer Instanz behält ihre Daten, und behaltene "
+                    "Daten halten den Mandanten fest -- der Rückbau bliebe auf "
+                    "halbem Weg stehen. Erlaube, dass die Daten dieser Instanzen "
+                    "mit gelöscht werden (--purge-instances / der Haken auf der "
+                    "Seite), oder entferne die Instanzen und ihre Daten vorher selbst")
         return ""
 
     # tenant.create -------------------------------------------------------
     def _check_tenant_create(self, a, ctx):
         tid, t = self._tenant()
         if not t:
-            return ABSENT_, "no tenant with this label yet"
+            return ABSENT_, "noch kein Mandant mit diesem Kürzel"
         made = [m for r in ctx["state"]["steps"] for m in r.get("made") or []]
         if f"tenant:{tid}" in made or (t.get("created") or "") >= ctx["started"]:
-            return PRESENT_, "the tenant exists"
-        return CONFLICT_, (f"a tenant '{self.label}' already exists and was "
-                           "not made by this build; it is not touched")
+            return PRESENT_, "der Mandant besteht"
+        return CONFLICT_, (f"ein Mandant '{self.label}' besteht schon und stammt "
+                           "nicht aus diesem Aufbau; er wird nicht angefasst")
 
     def _do_tenant_create(self, a, ctx):
         argv = ["tenant", "create", a["label"].strip().lower()]
         if a.get("title"):
             argv += ["--name", a["title"]]
-        ok, note = self._verb(argv, "the tenant was created")
+        ok, note = self._verb(argv, "der Mandant wurde angelegt")
         tid, _t = self._tenant()
         return ok, note, ([f"tenant:{tid}"] if ok and tid else [])
 
     def _undo_tenant_create(self, a, item, ctx):
         if not self._tenant()[1]:
-            return True, "the tenant was already gone"
+            return True, "der Mandant war schon entfernt"
         return self._verb(["tenant", "remove", self.label, "--yes"],
-                          "the (empty) tenant was removed")
+                          "der (leere) Mandant wurde entfernt")
 
     # address.ensure / address.wait ----------------------------------------
     def _check_address_ensure(self, a, ctx):
         host = load_external()
         if not host:
-            return PRESENT_, ("this node has no external name; there is no "
-                              "address to publish")
+            return PRESENT_, ("dieser Knoten hat keinen externen Namen; es gibt "
+                              "keine Adresse zu veröffentlichen")
         try:
             with open(os.path.join(CADDY_APPS_DIR, "external.caddy"),
                       encoding="utf-8") as f:
                 text = f.read()
         except OSError:
-            return ABSENT_, "no generated gateway site yet"
+            return ABSENT_, "noch keine erzeugte Gateway-Site"
         if f"{self.label}.{host}" in text:
-            return PRESENT_, f"the gateway answers for {self.label}.{host}"
-        return ABSENT_, f"the gateway sites do not name {self.label}.{host}"
+            return PRESENT_, f"das Gateway antwortet für {self.label}.{host}"
+        return ABSENT_, f"die Gateway-Sites nennen {self.label}.{host} nicht"
 
     def _do_address_ensure(self, a, ctx):
         placed = publish_tenant_place(self.label)
-        return ("not published" not in placed), (placed or "nothing to publish"), []
+        return ("not published" not in placed), (placed or "nichts zu veröffentlichen"), []
 
     def _probe_url(self):
         host = load_external()
@@ -7935,11 +7935,11 @@ class _BuildDrivers:
     def _check_address_wait(self, a, ctx):
         url = self._probe_url()
         if not url:
-            return PRESENT_, "this node has no external name; nothing to probe"
+            return PRESENT_, "dieser Knoten hat keinen externen Namen; nichts zu prüfen"
         code = self.probe(url)
         if code in (200, 302, 303):
-            return PRESENT_, f"{url} answers {code}"
-        return ABSENT_, f"{url} answers {code or 'nothing'}"
+            return PRESENT_, f"{url} antwortet {code}"
+        return ABSENT_, f"{url} antwortet {code or 'nicht'}"
 
     def _do_address_wait(self, a, ctx):
         limit = int(a.get("timeout") or 120)
@@ -7949,7 +7949,7 @@ class _BuildDrivers:
             if verdict == PRESENT_:
                 return True, note, []
             if waited >= limit:
-                return False, f"after {limit} s: {note}", []
+                return False, f"nach {limit} s: {note}", []
             self.sleep(5)
             waited += 5
 
@@ -7957,30 +7957,30 @@ class _BuildDrivers:
     def _check_idp_provision(self, a, ctx):
         tid, t = self._tenant()
         if not t:
-            return ABSENT_, "there is no tenant yet"
+            return ABSENT_, "noch kein Mandant"
         prov = idp.provider_of(t)
         if not prov:
-            return ABSENT_, "the tenant has no identity provider yet"
+            return ABSENT_, "der Mandant hat noch keinen Anmeldedienst"
         if prov.get("connector") and prov["connector"] != a["connector"]:
-            return CONFLICT_, (f"the tenant already signs in through "
-                               f"'{prov['connector']}', not '{a['connector']}'")
-        return PRESENT_, (f"the tenant signs in through {prov['issuer']}")
+            return CONFLICT_, (f"der Mandant meldet sich schon über "
+                               f"'{prov['connector']}' an, nicht über '{a['connector']}'")
+        return PRESENT_, (f"der Mandant meldet sich über {prov['issuer']} an")
 
     def _do_idp_provision(self, a, ctx):
         argv = ["idp", "provision", a["connector"], "--tenant", self.label]
         if a.get("idp_label"):
             argv += ["--idp-label", a["idp_label"]]
-        ok, note = self._verb(argv, "the realm and the client were set up")
+        ok, note = self._verb(argv, "Realm und Client sind eingerichtet")
         tid, _t = self._tenant()
         return ok, note, ([f"provider:{tid}"] if ok and tid else [])
 
     def _undo_idp_provision(self, a, item, ctx):
         tid, t = self._tenant()
         if not t or not idp.provider_of(t):
-            return True, "the provider was already detached"
+            return True, "der Anmeldedienst war schon gelöst"
         ok, note = self._verb(["tenant", "idp", self.label, "--clear-idp"],
-                              "the provider was detached from the tenant; "
-                              "the realm and every person in it stay")
+                              "der Anmeldedienst ist vom Mandanten gelöst; "
+                              "der Realm und jede Person darin bleiben")
         return ok, note
 
     # idp.admin_group (RFC-0056 inside a build) ------------------------------
@@ -7998,8 +7998,8 @@ class _BuildDrivers:
     def _check_idp_admin_group(self, a, ctx):
         name, c, space = self._tenant_connector()
         if not c:
-            return ABSENT_, ("the tenant signs in through no connector of this "
-                             "node yet (idp.provision comes first)")
+            return ABSENT_, ("der Mandant meldet sich noch über keinen Konnektor "
+                             "dieses Knotens an (zuerst idp.provision)")
         admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
                                 c["admin_id"], c["admin_secret"],
                                 auth_realm=c.get("auth_realm", ""))
@@ -8010,28 +8010,28 @@ class _BuildDrivers:
     def _do_idp_admin_group(self, a, ctx):
         name, c, _space = self._tenant_connector()
         if not c:
-            return False, "the tenant signs in through no connector yet", []
+            return False, "der Mandant meldet sich noch über keinen Konnektor an", []
         ok, note = self._verb(["idp", "admin-group", name, "--tenant", self.label],
-                              "the administrator group is ready in the realm; "
-                              "put the club's administrator into it")
+                              "die Verwaltergruppe steht im Realm; "
+                              "nimm die Verwalterin oder den Verwalter des Vereins hinein")
         return ok, note, []
 
     # tenant.policy -------------------------------------------------------
     def _check_tenant_policy(self, a, ctx):
         tid, t = self._tenant()
         if not t:
-            return ABSENT_, "there is no tenant yet"
+            return ABSENT_, "noch kein Mandant"
         if not t.get("idp_policy"):
-            return ABSENT_, "no first-login policy has been written down"
+            return ABSENT_, "noch keine Regel für die erste Anmeldung festgelegt"
         pol = idp.policy_of(t)
         if "first_login" in a and pol["first_login"] != a["first_login"]:
-            return ABSENT_, f"first login is '{pol['first_login']}'"
+            return ABSENT_, f"erste Anmeldung ist '{pol['first_login']}'"
         if "default_role" in a and pol["default_role"] != a["default_role"]:
-            return ABSENT_, f"the default role is '{pol['default_role']}'"
+            return ABSENT_, f"die Vorgaberolle ist '{pol['default_role']}'"
         if "self_registration" in a and \
                 pol["self_registration"] != (a["self_registration"] == "on"):
-            return ABSENT_, "self-registration differs from the wish"
-        return PRESENT_, "the first-login policy is as wished"
+            return ABSENT_, "die Selbstregistrierung weicht vom Wunsch ab"
+        return PRESENT_, "die Regel für die erste Anmeldung ist wie gewünscht"
 
     def _do_tenant_policy(self, a, ctx):
         argv = ["tenant", "policy", self.label]
@@ -8040,19 +8040,19 @@ class _BuildDrivers:
                           ("self_registration", "--self-registration")):
             if key in a:
                 argv += [flag, a[key]]
-        ok, note = self._verb(argv, "the first-login policy was set")
+        ok, note = self._verb(argv, "die Regel für die erste Anmeldung ist gesetzt")
         return ok, note, []
 
     # tenant.face ---------------------------------------------------------
     def _check_tenant_face(self, a, ctx):
         tid, t = self._tenant()
         if not t:
-            return ABSENT_, "there is no tenant yet"
+            return ABSENT_, "noch kein Mandant"
         theme = t.get("theme") or {}
         for key in ("title", "color_primary", "color_accent"):
             if key in a and (theme.get(key) or "") != a[key]:
-                return ABSENT_, f"the face has a different {key.replace('_', ' ')}"
-        return PRESENT_, "the face is as wished"
+                return ABSENT_, f"das Gesicht hat einen anderen Wert für {key}"
+        return PRESENT_, "das Gesicht ist wie gewünscht"
 
     def _do_tenant_face(self, a, ctx):
         argv = ["tenant", "face", self.label]
@@ -8062,8 +8062,8 @@ class _BuildDrivers:
             if key in a:
                 argv += [flag, a[key]]
         if len(argv) == 3:
-            return True, "no face was asked for", []
-        ok, note = self._verb(argv, "the tenant's face was set")
+            return True, "kein Gesicht gewünscht", []
+        ok, note = self._verb(argv, "das Gesicht des Mandanten ist gesetzt")
         return ok, note, []
 
     # app.install ---------------------------------------------------------
@@ -8079,8 +8079,8 @@ class _BuildDrivers:
     def _check_app_install(self, a, ctx):
         key = self._instance_key(a["name"])
         if key:
-            return PRESENT_, f"the instance '{a['name']}' exists in this tenant"
-        return ABSENT_, f"no instance '{a['name']}' in this tenant yet"
+            return PRESENT_, f"die Instanz '{a['name']}' besteht in diesem Mandanten"
+        return ABSENT_, f"noch keine Instanz '{a['name']}' in diesem Mandanten"
 
     def _administer_confirmed(self, a):
         """The step's tick confirms an app that administers its tenant's
@@ -8097,7 +8097,7 @@ class _BuildDrivers:
         if ADMINISTER_MARK not in note and ADMINISTER_MARK not in raw:
             return note
         return (note.replace(ADMINISTER_MARK, "").strip()
-                + " -- in a profile, the step's tick confirms it "
+                + " -- in einem Profil bestätigt das der Haken des Schritts "
                 "(confirm_administer)")
 
     def _do_app_install(self, a, ctx):
@@ -8113,8 +8113,8 @@ class _BuildDrivers:
             argv += ["--confirm-administer"]
         code, out = _run_verb(argv)
         ok = code == 0
-        note = (f"'{a['name']}' was installed" if ok else
-                (_brief(out, 3) or f"the verb stopped with {code}"))
+        note = (f"'{a['name']}' ist installiert" if ok else
+                (_brief(out, 3) or f"der Befehl endete mit {code}"))
         note = self._administer_note(note, "" if ok else out)
         key = self._instance_key(a["name"])
         return ok, note, ([f"instance:{key}"] if ok and key else [])
@@ -8128,13 +8128,13 @@ class _BuildDrivers:
         import io
         src, _version, store = _store_lookup(a["app"], a.get("source_id") or "")
         if not src:
-            return False, (f"'{a['app']}' is not listed in any configured "
-                           "store source"), []
+            return False, (f"'{a['app']}' steht in keiner eingerichteten "
+                           "Store-Quelle"), []
         if store.get("trust") == "unverified":
-            return False, (f"'{store.get('name', store['id'])}' is an "
-                           "unverified source; a profile does not install from "
-                           "it -- install the app from the store page, where "
-                           "it can be confirmed"), []
+            return False, (f"'{store.get('name', store['id'])}' ist eine "
+                           "ungeprüfte Quelle; ein Profil installiert nicht "
+                           "daraus -- installiere die App auf der Store-Seite, "
+                           "dort lässt es sich bestätigen"), []
         ns = argparse.Namespace(
             package=src["url"], path=src.get("path", ""), ref=src.get("ref", ""),
             name=a["name"], channel=a.get("channel") or "production",
@@ -8144,10 +8144,10 @@ class _BuildDrivers:
         try:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 cmd_install(ns)
-            ok, note = True, f"'{a['name']}' was installed from '{store['id']}'"
+            ok, note = True, f"'{a['name']}' ist aus '{store['id']}' installiert"
         except SystemExit:
             out = buf.getvalue().strip()
-            ok, note = False, (_brief(out, 3) if out else "install failed")
+            ok, note = False, (_brief(out, 3) if out else "Installation fehlgeschlagen")
         except subprocess.CalledProcessError as exc:
             ok, note = False, ((exc.stderr or "").strip().splitlines() or
                                [str(exc)])[-1]
@@ -8159,33 +8159,32 @@ class _BuildDrivers:
         key = item.split(":", 1)[1]
         tid, _t = self._tenant()
         if not tid or key not in tenant_instances(load_registry(), tid):
-            return True, "the instance was already gone"
+            return True, "die Instanz war schon entfernt"
         if self.purge:
             return self._verb(["remove", key, "--purge"],
-                              "the instance and its data were removed")
+                              "die Instanz und ihre Daten sind entfernt")
         return self._verb(["remove", key],
-                          "the instance was removed; its data is kept "
-                          "(no --purge), and it keeps the tenant from "
-                          "being removed")
+                          "die Instanz ist entfernt; ihre Daten bleiben "
+                          "(ohne --purge) und halten den Mandanten fest")
 
     # manual --------------------------------------------------------------
     def _check_manual(self, a, ctx):
         when = a["done_when"]
         if when == "confirmed":
             if (ctx.get("step") or {}).get("confirmed"):
-                return PRESENT_, "a human confirmed it"
-            return ABSENT_, "waiting for a human to confirm"
+                return PRESENT_, "ein Mensch hat es bestätigt"
+            return ABSENT_, "wartet auf die Bestätigung durch einen Menschen"
         tid, _t = self._tenant()
         users = _read_identity_users()
         if users is None:
-            return ABSENT_, "the user store cannot be read (run as root)"
+            return ABSENT_, "die Benutzerliste ist nicht lesbar (als root ausführen)"
         mine = [u for u in users if tid and resolve_tenant(u.get("tenant")) == tid]
         if when == "user.exists":
-            return ((PRESENT_, f"{len(mine)} account(s) in this tenant")
-                    if mine else (ABSENT_, "no account in this tenant yet"))
+            return ((PRESENT_, f"{len(mine)} Konto/Konten in diesem Mandanten")
+                    if mine else (ABSENT_, "noch kein Konto in diesem Mandanten"))
         admins = [u for u in mine if "tenant_admin" in (u.get("roles") or [])]
-        return ((PRESENT_, "an account holds tenant_admin") if admins
-                else (ABSENT_, "no account holds tenant_admin yet"))
+        return ((PRESENT_, "ein Konto hat tenant_admin") if admins
+                else (ABSENT_, "noch kein Konto hat tenant_admin"))
 
     # authz.setup ----------------------------------------------------------
     def _setup_argv(self, a):
@@ -8203,7 +8202,7 @@ class _BuildDrivers:
     def _check_authz_setup(self, a, ctx):
         tid, _t = self._tenant()
         if not tid:
-            return ABSENT_, "there is no tenant yet"
+            return ABSENT_, "noch kein Mandant"
 
         def show(status, doc):
             if status >= 300:
@@ -8214,8 +8213,8 @@ class _BuildDrivers:
         q = "actor=root&operator=1&tenant=" + tid
         st = _authz_setup_state(tid, q, show)
         if a["app"] not in st["declarations"]:
-            return ABSENT_, (f"the app '{a['app']}' has registered no "
-                             "declaration yet (install it first)")
+            return ABSENT_, (f"die App '{a['app']}' hat noch keine "
+                             "Deklaration registriert (zuerst installieren)")
         groups = {}
         for pair in [x for x in (a.get("groups") or "").split(",") if x.strip()]:
             k, _s, v = pair.partition("=")
@@ -8236,34 +8235,80 @@ class _BuildDrivers:
             return CONFLICT_, str(e)
         clash = [r["template"] for r in plan["rows"] if r["state"] == "conflict"]
         if clash:
-            return CONFLICT_, ("a name is taken by something else for: "
+            return CONFLICT_, ("ein Name ist schon anders vergeben für: "
                                + ", ".join(clash))
         todo = [r["template"] for r in plan["rows"] if r["state"] == "ready"]
         if todo:
-            return ABSENT_, ("still to set up: " + ", ".join(todo))
-        return PRESENT_, ("every template of '" + a["app"] + "' is set up "
-                          "(or left to the tenant)")
+            return ABSENT_, ("noch einzurichten: " + ", ".join(todo))
+        return PRESENT_, ("jede Vorlage von '" + a["app"] + "' ist eingerichtet "
+                          "(oder dem Mandanten überlassen)")
 
     def _do_authz_setup(self, a, ctx):
         ok, note = self._verb(self._setup_argv(a),
-                              "roles, collections, mappings and realm groups "
-                              "were set up from the templates")
+                              "Rollen, Berechtigungspakete, Abbildungen und Realm-Gruppen "
+                              "sind aus den Vorlagen eingerichtet")
         return ok, note, []
+
+    # app.config (I-42) ----------------------------------------------------
+    def _config_entry(self, a):
+        """(instance key, instance, entry) -- entry None when the app does
+        not declare the key; key "" when there is no such instance."""
+        key = self._instance_key(a["name"])
+        if not key:
+            return "", None, None
+        inst = load_registry()["instances"].get(key) or {}
+        entry = next((e for e in config_entries(key, inst)
+                      if e["key"] == a["key"]), None)
+        return key, inst, entry
+
+    def _check_app_config(self, a, ctx):
+        if "value" not in a:
+            # "{param}" with no value drops the argument: nothing was asked
+            return PRESENT_, f"kein Wert für {a['key']} gewünscht"
+        key, _inst, entry = self._config_entry(a)
+        if not key:
+            return ABSENT_, f"noch keine Instanz '{a['name']}' in diesem Mandanten"
+        if entry is None:
+            return CONFLICT_, (f"'{a['name']}' erklärt keinen Konfigurationswert "
+                               f"{a['key']}")
+        if (entry.get("value") or "") == str(a["value"]):
+            return PRESENT_, f"{a['key']} ist wie gewünscht gesetzt"
+        return ABSENT_, f"{a['key']} hat noch einen anderen Wert"
+
+    def _do_app_config(self, a, ctx):
+        key, inst, entry = self._config_entry(a)
+        if not key:
+            return False, (f"keine Instanz '{a['name']}' in diesem Mandanten -- "
+                           "der Schritt gehört hinter ihr app.install"), []
+        if entry is None:
+            return False, (f"'{a['name']}' erklärt keinen Konfigurationswert "
+                           f"{a['key']}"), []
+        try:
+            msg = apply_config(key, inst, {a["key"]: str(a["value"])})
+        except ValueError as exc:
+            return False, str(exc), []
+        if msg != "no change":
+            audit_deploy({"instance": key, "ok": True, "message": f"config {msg}",
+                          "revision": "", "version": inst.get("version", ""),
+                          "via": "build"})
+        # The key, never the value: it may be a secret, and the note goes
+        # into the build's page and the tenant's audit log.
+        return True, f"{a['key']} gesetzt", []
 
     # backup.check ---------------------------------------------------------
     def _check_backup_check(self, a, ctx):
         tid, _t = self._tenant()
         if not tid:
-            return ABSENT_, "there is no tenant yet"
+            return ABSENT_, "noch kein Mandant"
         ex = excluded_tenants().get(tid)
         if ex:
-            return CONFLICT_, ("the tenant is EXCLUDED from the node backup: "
+            return CONFLICT_, ("der Mandant ist von der Knotensicherung AUSGENOMMEN: "
                                + str(ex.get("reason", "?")))
-        return PRESENT_, "the tenant is in the node backup"
+        return PRESENT_, "der Mandant ist in der Knotensicherung"
 
     def _do_backup_check(self, a, ctx):
-        return False, ("the tenant is not in the node backup and a build "
-                       "cannot change that"), []
+        return False, ("der Mandant ist nicht in der Knotensicherung, und ein Aufbau "
+                       "kann das nicht ändern"), []
 
 
 PRESENT_, ABSENT_, CONFLICT_ = (tenant_build.PRESENT, tenant_build.ABSENT,
@@ -19240,22 +19285,8 @@ def cmd_install(args):
                         "D2). Going back is a rollback ('oaap app artifact "
                         f"rollback {name}'), which is a different and "
                         "deliberate act")
-                # The version rule above is production's own, and the
-                # app-id rule is a refusal in any case -- what is left
-                # for a person to weigh is the widening.
-                notes = confirm + [h for h in hard if "version" not in h]
-                for line in notes:
-                    print(f"NOTE: {line}")
-                if notes and not getattr(args, "confirm", False):
-                    die("this package widens the envelope of a PRODUCTION "
-                        "instance (see NOTE above) — repeat with --confirm "
-                        "if that is intended (RFC-0037)")
-            else:
-                # Reported, not refused: the envelope rule protects the
-                # UNATTENDED path. Here a person is at the machine, and
-                # that person is the confirmation the rule asks for.
-                for line in hard + confirm:
-                    print(f"NOTE: {line}")
+            envelope_gate(hard, confirm, channel,
+                          getattr(args, "confirm", False))
         try:
             _v, _sha = install_artifact(
                 name, args.package, None, channel=channel,
@@ -19392,6 +19423,20 @@ def _install_from_dir(pkg, args, source):
     # copy did, and it is honest. A rehearsal that was patched until it
     # worked is no longer a rehearsal of anything -- and the thing it
     # would have been patched on is a copy of live customer data.
+    # I-43: the envelope rule on THIS path too. Until 0.1.250 only the ZIP
+    # path above (and promotion, sideloading, the deploy token) compared
+    # the package with what the instance already may do; an install from
+    # a directory or a Git URL -- the store's Git sources among them --
+    # widened a production instance without a word (measured 2026-11-09
+    # with keycloak 0.1.7 on oaap-test). One gate, every path.
+    if inst:
+        hard, confirm = envelope_review(inst, m)
+        # The artifact's version sentence is not this path's rule: a
+        # same-version redeploy from a directory is refused above for
+        # production and is the normal case on test.
+        envelope_gate([h for h in hard if "version" not in h], confirm,
+                      channel, getattr(args, "confirm", False))
+
     if inst and is_rehearsal(inst) and not getattr(args, "rehearsal", None):
         die(f"'{name}' is a rehearsal (RFC-0030) and cannot be redeployed. "
             f"Delete it ('oaap app remove {name} --purge') and build a new "
@@ -24129,6 +24174,41 @@ def envelope_review(inst, m):
     return hard, confirm
 
 
+ENVELOPE_REFUSAL = ("this package widens the envelope of a PRODUCTION "
+                    "instance (see NOTE above) — repeat with --confirm "
+                    "if that is intended (RFC-0037)")
+
+
+def envelope_notes_suffix(output):
+    """The NOTE lines of an install, as one clause for a portal message
+    (I-43: a widening on a test instance went through with nothing to see
+    in the portal, because the worker kept only "deployed")."""
+    notes = [ln[len("NOTE: "):].strip() for ln in (output or "").splitlines()
+             if ln.startswith("NOTE: ")]
+    return (" (" + "; ".join(notes) + ")") if notes else ""
+
+
+def envelope_gate(hard, confirm, channel, confirmed):
+    """The one place that turns envelope_review's sentences into an
+    answer, for every install path at the machine (I-43).
+
+    Production: every widening is printed and needs --confirm (the
+    version rule is each path's own and is left out by the caller).
+    Test: printed, not refused -- a person is at the machine, and the
+    lines go into what the portal shows (see the worker's run_install).
+    """
+    if channel == "production":
+        notes = confirm + [h for h in hard if "version" not in h]
+        for line in notes:
+            print(f"NOTE: {line}")
+        if notes and not confirmed:
+            die(ENVELOPE_REFUSAL)
+        return notes
+    for line in hard + confirm:
+        print(f"NOTE: {line}")
+    return hard + confirm
+
+
 # --- single-use grants -------------------------------------------------
 # Nothing here is long-lived, and nothing here is held by whoever uses
 # it: a grant is spent, not kept (RFC-0019, Studio section).
@@ -26491,10 +26571,20 @@ def cmd_process_deploys(_args):
             try:
                 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                     cmd_install(ns)
-                return True, "deployed"
+                return True, "deployed" + envelope_notes_suffix(buf.getvalue())
             except SystemExit:
                 out = buf.getvalue().strip()
-                return False, (out.splitlines()[-1] if out else "install failed")
+                last = out.splitlines()[-1] if out else "install failed"
+                if ENVELOPE_REFUSAL in last:
+                    # The CLI's sentence names a flag nobody in a browser
+                    # can type. Say what widens, and the two ways that
+                    # exist from here (I-43).
+                    last = ("refused: this update widens what the production "
+                            "instance may do" + envelope_notes_suffix(out)
+                            + " -- update a test instance and promote it "
+                            "(the promotion asks), or confirm at the machine "
+                            "with 'oaap app install ... --confirm'")
+                return False, last
             except subprocess.CalledProcessError as e:
                 err = (e.stderr or "").strip()
                 return False, (err.splitlines()[-1] if err else str(e))

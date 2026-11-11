@@ -70,6 +70,12 @@ STEP_TYPES = {
     # comma-separated template keys, `groups` is KEY=PATH[,KEY=PATH] and
     # `names` is KEY=NAME[,KEY=NAME] (a name holds no comma).
     "authz.setup":    (("app",), ("only", "skip", "groups", "names")),
+    # I-42: one configuration value of an instance this build installs
+    # (the operating mode, a contact address, an operator's name) -- after
+    # its app.install, so the instance exists. One key per step: each is
+    # checked, repeated and reported on its own, and a value stays text.
+    # The value never appears in a note or the audit trail.
+    "app.config":     (("name", "key", "value"), ()),
     # RFC-0056 inside a build: the group the tenant's own administrator
     # belongs in, in the tenant's realm (a group, never a person).
     "idp.admin_group": ((), ()),
@@ -509,9 +515,9 @@ def _new_step(s, values):
         # step: a page shows it without the profile file (which may have
         # changed since), and a waiting step is then a complete question.
         try:
-            rec["text"] = _sentence(render_step(s, values).get("text", ""))
+            rec["text"] = _sentence(render_step(s, values).get("text", ""), TEXT_LIMIT)
         except Refusal:
-            rec["text"] = _sentence(s.get("text", ""))
+            rec["text"] = _sentence(s.get("text", ""), TEXT_LIMIT)
         rec["done_when"] = s.get("done_when", "")
     return rec
 
@@ -666,9 +672,15 @@ def _audit(drivers, event, step, result, detail=""):
             pass
 
 
-def _sentence(text):
+def _sentence(text, limit=240):
     text = " ".join(str(text or "").split())
-    return text[:240]
+    return text[:limit]
+
+
+# What a person is asked to do is the profile author's text, written for a
+# person: it is not cut like a machine's note (I-45 -- "...danach neu
+# anmelde" was the 240th character).
+TEXT_LIMIT = 2000
 
 
 def _safe(call, *a):
@@ -677,7 +689,7 @@ def _safe(call, *a):
     except Refusal as exc:
         return None, str(exc)
     except Exception as exc:  # noqa: BLE001 -- the class name, not the message
-        return None, f"the step stopped with {type(exc).__name__}"
+        return None, f"der Schritt brach ab ({type(exc).__name__})"
 
 
 def run(state, profile, drivers, root, now=iso_now):
@@ -702,7 +714,7 @@ def run(state, profile, drivers, root, now=iso_now):
             # not asked for: decided before the step is even rendered, so a
             # parameter only that step needs cannot fail the build
             if rec["state"] != "skipped":
-                rec["state"], rec["note"] = "skipped", "not asked for"
+                rec["state"], rec["note"] = "skipped", "nicht gewünscht"
                 _save(root, state, drivers)
             continue
         args, bad = _safe(render_step, step, values)
@@ -713,7 +725,7 @@ def run(state, profile, drivers, root, now=iso_now):
             res, bad = _safe(drivers.check, typ, args, ctx)
             if res is None or res[0] != PRESENT:
                 return _stop(state, rec, "failed",
-                             "it was done, and is no longer in place: "
+                             "war erledigt und ist nicht mehr vorhanden: "
                              + _sentence(bad or res[1]), root, drivers, now)
             continue
         was_running = rec["state"] == "running"
@@ -739,11 +751,11 @@ def run(state, profile, drivers, root, now=iso_now):
                     rec["made"] = list(rec.get("made") or []) + [
                         g for g in got if g not in (rec.get("made") or [])]
                     _save(root, state, drivers)
-            _finish(state, rec, "already in place: " + _sentence(note), root,
+            _finish(state, rec, "schon vorhanden: " + _sentence(note), root,
                     drivers, now)
             continue
         if typ == "manual":
-            return _stop(state, rec, "waiting", _sentence(args["text"]),
+            return _stop(state, rec, "waiting", _sentence(args["text"], TEXT_LIMIT),
                          root, drivers, now)
         res, bad = _safe(drivers.do, typ, args, ctx)
         if res is None:
@@ -763,8 +775,8 @@ def run(state, profile, drivers, root, now=iso_now):
         verdict, after = res
         if verdict != PRESENT:
             return _stop(state, rec, "failed",
-                         "the step finished but its result is not on the "
-                         "node: " + _sentence(after), root, drivers, now)
+                         "der Schritt lief durch, aber sein Ergebnis ist "
+                         "nicht auf dem Knoten: " + _sentence(after), root, drivers, now)
         _finish(state, rec, _sentence(note) or _sentence(after), root,
                 drivers, now)
     state["state"] = "done"
@@ -780,7 +792,8 @@ def _finish(state, rec, note, root, drivers, now):
 
 
 def _stop(state, rec, kind, note, root, drivers, now):
-    rec["state"], rec["note"] = kind, _sentence(note)
+    rec["state"], rec["note"] = kind, _sentence(
+        note, TEXT_LIMIT if kind == "waiting" else 240)
     rec["finished"] = now() if kind == "failed" else ""
     state["state"] = "waiting" if kind == "waiting" else "failed"
     _save(root, state, drivers)
@@ -838,13 +851,13 @@ def rollback(state, profile, drivers, root, now=iso_now):
             res, bad = _safe(drivers.undo, rec["type"], args, [item], ctx)
             if res is None or not res[0]:
                 return _stop(state, rec, "failed",
-                             "rollback stopped: "
+                             "Rückbau angehalten: "
                              + _sentence(bad or res[1]), root, drivers, now)
             rec["made"].remove(item)
             _save(root, state, drivers)
             _audit(drivers, "tenant.build.rollback", rec["id"], "ok",
                    _sentence(res[1]))
-        rec["state"], rec["note"] = "pending", "rolled back"
+        rec["state"], rec["note"] = "pending", "zurückgebaut"
         _save(root, state, drivers)
     state["state"] = "rolled-back"
     state.pop("rolling_back", None)

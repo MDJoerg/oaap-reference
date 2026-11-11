@@ -135,10 +135,10 @@ ok("die App wird auf dem Host aufgeloest und mit Quelle, Pfad, Stand, Mandant un
 INSTALLS.clear()
 r = drv._install_from_catalogue({**good, "app": "fremd"})
 ok("eine Quelle, die eine Bestaetigung braucht, wird aus einem Profil nie bedient",
-   r[0] is False and "unverified" in r[1] and not INSTALLS, r)
+   r[0] is False and "ungeprüfte Quelle" in r[1] and not INSTALLS, r)
 r = drv._install_from_catalogue({**good, "app": "gibtsnicht"})
 ok("eine App, die kein Katalog kennt, scheitert mit Grund und installiert nichts",
-   r[0] is False and "not listed" in r[1] and not INSTALLS, r)
+   r[0] is False and "keiner eingerichteten" in r[1] and not INSTALLS, r)
 r = drv._install_from_catalogue({**good, "source_id": "plattform"})
 ok("eine bestimmte Katalogquelle laesst sich nennen", ("webseite", "plattform") in LOOKUPS)
 
@@ -274,7 +274,7 @@ ok("mit Haken erreicht der Aufbau den App-Schritt und ruft die Installation mit 
    and INSTALLS[-1].tenant == "vweb" and INSTALLS[-1].name == "webseite",
    [(r["id"], r["state"], r["note"]) for r in st["steps"]])
 ok("(die Attrappe legt keine Instanz an, darum meldet der Schritt, dass sein Ergebnis fehlt)",
-   by_id["web"]["state"] == "failed" and "not on the node" in by_id["web"]["note"],
+   by_id["web"]["state"] == "failed" and "nicht auf dem Knoten" in by_id["web"]["note"],
    by_id["web"])
 
 print()

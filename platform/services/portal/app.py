@@ -320,6 +320,15 @@ STYLE = """
   .roles label{display:inline-block;margin-right:.8rem;font-size:.95rem;white-space:nowrap}
   .roles input,.checkline input{width:auto;margin:0 .3rem 0 0}
   .checkline{display:block;margin:.3rem 0 1rem}
+  /* I-45: a checkbox beside its text and a colour field that shows its
+     colour -- on every page, not only where a page brought its own rule
+     (the cohort page did; the build pages did not, so the global
+     "inputs are 100% wide" stretched both). */
+  .seatopt{display:flex;align-items:flex-start;gap:.5rem;cursor:pointer;margin:.25rem 0}
+  .seatopt input{width:auto;margin:.2rem 0 0;flex:none}
+  input[type=checkbox],input[type=radio]{width:auto}
+  input[type=color]{width:4.5rem;height:2.6rem;padding:.15rem;cursor:pointer;
+       display:block}
   /* Diagnose (RFC-0038 D2): Log-Zeilen. Umbruch statt Abschneiden -- eine
      abgeschnittene Fehlermeldung ist die falsche Haelfte -- und eine feste
      Hoehe, damit 200 Zeilen die Seite nicht unlesbar machen. */
@@ -11414,9 +11423,10 @@ BUILD_DETAIL_BODY = """
 <div class="card" style="overflow-x:auto">
   <h2>Schritte</h2>
   <table>
-    <tr><th>Schritt</th><th>Zustand</th><th>Hinweis</th></tr>
+    <tr><th>#</th><th>Schritt</th><th>Zustand</th><th>Hinweis</th></tr>
     {% for s in b.steps %}
     <tr>
+      <td class="muted">{{ loop.index }}</td>
       <td>{{ s.type }}{% if s.human %} <span class="badge todo">ein Mensch</span>{% endif %}<br><span class="muted">{{ s.id }}</span></td>
       <td><span class="badge {{ '' if s.raw == 'done' else 'todo' if s.raw in ('failed','waiting','running') else 'off' }}">{{ s.state }}</span></td>
       <td>{{ s.note }}</td>
