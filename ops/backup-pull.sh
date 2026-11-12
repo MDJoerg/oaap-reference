@@ -22,6 +22,13 @@ LOCAL=0
 # a public key before it is written to TO. Only the PUBLIC half is ever
 # here; the private key is on paper (ops/vault-setup.sh).
 AGE=""; STAGING="/var/lib/oaap-vault/staging"; SFX=""; SRC_AGE=0
+# RFC-0082: this node's alias, once set, names its directory; else the hostname.
+node_alias() {
+  python3 -c 'import json,re,sys
+try: a=json.load(open(sys.argv[1])).get("alias") or ""
+except Exception: a=""
+print(a if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]",a) else "")'     "${OAAP_DATA_DIR:-/var/lib/oaap}/apps/node-identity.json" 2>/dev/null || true
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -58,7 +65,7 @@ if [ -n "$AGE" ]; then
   SFX=".age"
 fi
 if [ "$LOCAL" -eq 1 ]; then
-  NODE="${NODE:-$(hostname)}"; HOST="${HOST:-$(hostname)}"
+  NODE="${NODE:-$(node_alias)}"; NODE="${NODE:-$(hostname)}"; HOST="${HOST:-$(hostname)}"
 else
   [ -n "$NODE" ] && [ -n "$HOST" ] && [ -n "$KEY" ] || {
     echo "ERROR: --node, --host and --key are required (or --local)." >&2; exit 2; }

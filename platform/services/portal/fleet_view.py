@@ -14,7 +14,7 @@ import hashlib
 import hmac
 from concurrent.futures import ThreadPoolExecutor, wait
 
-SCHEMA = "oaap.fleet.status/0.8"
+SCHEMA = "oaap.fleet.status/0.9"
 
 # The document's state vocabulary. The health page grew two spellings
 # ("err" from probes, "error" from the worker); consumers get one.
@@ -180,7 +180,7 @@ def attention_items(core, instances, dns_rows, pending_names):
 
 def build_document(node, version, profiles, now_iso, core, instances,
                    dns_rows, pending_names, public_ip="", extra_attention=(),
-                   host=None):
+                   host=None, identity=None):
     """Assemble the versioned status document (RFC-0021 §1).
 
     Schema 0.2 adds `names` (published names with the node's own DNS
@@ -211,6 +211,12 @@ def build_document(node, version, profiles, now_iso, core, instances,
     # absent entirely while the node has not measured yet.
     if host:
         doc["host"] = dict(host)
+    # 0.9 (RFC-0082): what the node calls itself -- `node` stays what it
+    # was (the name it is reached by); `alias` is the identifier.
+    if identity:
+        doc["alias"] = identity.get("alias", "")
+        doc["place"] = identity.get("place", "")
+        doc["tags"] = list(identity.get("tags") or [])
     return doc
 
 

@@ -133,6 +133,8 @@ STORE_SOURCES = os.path.join(APPS_DIR, "store-sources.json")
 EXTERNAL_FILE = os.path.join(APPS_DIR, "external.json")
 EDGE_FILE = os.path.join(APPS_DIR, "edge.json")
 NODE_FILE = os.path.join(APPS_DIR, "node.json")   # node profiles (RFC-0011)
+# What the node calls itself inside the fleet (RFC-0082): alias, place, tags.
+NODE_IDENTITY_FILE = os.path.join(APPS_DIR, "node-identity.json")
 DISKS_FILE = os.path.join(APPS_DIR, "disks.json")  # disks and sources (RFC-0063)
 # accounts and tenants of THIS node (oaap.core.tenant 0.1, RFC-0022).
 # Lives beside the registry because identity and portal already mount
@@ -2493,7 +2495,7 @@ def mail_test(to, mail=None):
     msg = EmailMessage()
     msg["From"] = formataddr((mail.get("from_name") or "OAAP", mail["from"]))
     msg["To"] = to
-    node = load_external() or socket.gethostname()
+    node = node_mail_name()
     msg["Subject"] = f"OAAP: Testmail vom Knoten {node}"
     msg["Message-ID"] = make_msgid(domain=mail["from"].split("@", 1)[1])
     msg.set_content(f"Diese Mail hat der Knoten {node} mit `oaap mail test` "
@@ -2823,8 +2825,7 @@ def notify_mailbox(tid):
         mail, _r = node_mailbox()
         if not mail:
             return None, "this node has no mailbox (`oaap mail set`)"
-        return mail, mail.get("from_name") or "OAAP " + (load_external()
-                                                         or socket.gethostname())
+        return mail, mail.get("from_name") or "OAAP " + node_mail_name()
     mail, _r = mail_for_tenant(tid)
     if not mail:
         return None, "neither the tenant nor the node has a mailbox"
@@ -2911,7 +2912,11 @@ def notify_smtp(mail, sender_name, rcpts, subject, body):
 
 def _notify_values(item, tid):
     t = load_tenants().get(item["tenant"]) or {}
-    return {"knoten": load_external() or socket.gethostname(),
+    ident = node_identity()
+    return {"knoten": node_mail_name(),
+            # the body says both names once an alias is set (RFC-0082 D4)
+            "extern": (load_external() or socket.gethostname()) if ident["alias_set"] else "",
+            "ort": ident["place"],
             "mandant": ("" if item["tenant"] == default_tenant_id()
                         else t.get("name") or t.get("label", "")),
             "instanz": item.get("instanz", ""), "typ": item["type"],
@@ -3402,6 +3407,10 @@ def state_index_minute():
     a backup copies apps/ (they are rewritten the minute after)."""
     if backup_running_now():
         return False
+    try:
+        node_identity_refresh()
+    except Exception as e:                          # noqa: BLE001
+        print(f"node identity: {type(e).__name__}: {e}", file=sys.stderr)
     return state_view_write()
 
 
@@ -10594,6 +10603,180 @@ def has_profile(name):
     return name in load_profiles()
 
 
+# --- the node's own name inside the fleet (RFC-0082) -------------------------
+#
+# Before this, each feature picked a stand-in: mails the external host,
+# archives the OS hostname, the metrics sender a typed name, the fleet
+# document the host the poller addressed. One declaration now, read by all.
+
+NODE_ALIAS_RE = r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"     # the metrics sender's rule
+NODE_SEGMENT_RE = r"[a-z0-9][a-z0-9-]{0,30}"
+NODE_PLACE_MAX = 6
+NODE_TAGS_MAX = 10
+
+
+def alias_from_hostname(host=None):
+    """The default alias: the OS hostname's first label, lowercase, every
+    other character a hyphen -- so nothing changes on a node until someone
+    sets one (D1)."""
+    h = (host if host is not None else socket.gethostname()).split(".")[0].lower()
+    h = re.sub(r"[^a-z0-9-]+", "-", h).strip("-")[:40].strip("-")
+    return h if re.fullmatch(NODE_ALIAS_RE, h) else "oaap-node"
+
+
+def _node_identity_raw():
+    try:
+        with open(NODE_IDENTITY_FILE, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def node_identity():
+    """{alias, alias_set, default, place, tags, who, since}. A stored value
+    that breaks the rule is ignored, not trusted (as load_profiles does) --
+    a hand-edited or restored file must not put a slash into a topic."""
+    rec = _node_identity_raw()
+    alias = str(rec.get("alias") or "")
+    if not re.fullmatch(NODE_ALIAS_RE, alias):
+        alias = ""
+    segs = rec.get("place") if isinstance(rec.get("place"), list) else []
+    if len(segs) > NODE_PLACE_MAX or not all(
+            isinstance(x, str) and re.fullmatch(NODE_SEGMENT_RE, x) for x in segs):
+        segs = []
+    tags = rec.get("tags") if isinstance(rec.get("tags"), list) else []
+    tags = sorted({t for t in tags if isinstance(t, str)
+                   and re.fullmatch(NODE_SEGMENT_RE, t)})[:NODE_TAGS_MAX]
+    default = alias_from_hostname()
+    return {"alias": alias or default, "alias_set": bool(alias), "default": default,
+            "place": "/".join(segs), "tags": tags,
+            "who": rec.get("who", ""), "since": rec.get("since", "")}
+
+
+def node_alias():
+    return node_identity()["alias"]
+
+
+def node_mail_name():
+    """The node's name in mail subjects (D4): the alias once it is SET;
+    before that what mails always said (external host, else hostname)."""
+    ident = node_identity()
+    return ident["alias"] if ident["alias_set"] else (load_external()
+                                                       or socket.gethostname())
+
+
+def node_file_name():
+    """The name archives carry: the alias once set, else the raw hostname as
+    before -- a receiver matches on it (backup-receive.sh --source)."""
+    ident = node_identity()
+    return ident["alias"] if ident["alias_set"] else socket.gethostname()
+
+
+def parse_node_place(text):
+    """'de/datacenter1/group3' -> segments; '' -> []. ValueError otherwise."""
+    text = (text or "").strip().strip("/").lower()
+    if not text:
+        return []
+    segs = text.split("/")
+    if len(segs) > NODE_PLACE_MAX:
+        raise ValueError(f"a place has at most {NODE_PLACE_MAX} levels, "
+                         f"'{text}' has {len(segs)}")
+    for x in segs:
+        if not re.fullmatch(NODE_SEGMENT_RE, x):
+            raise ValueError(f"'{x}' is not a place level: lowercase letters, "
+                             "digits and '-', up to 31, starting with a letter or digit")
+    return segs
+
+
+def parse_node_tags(text):
+    """'kunde-cls, test' or a list -> sorted unique tags; ValueError otherwise."""
+    items = text if isinstance(text, list) else re.split(r"[\s,]+", text or "")
+    tags = sorted({t.strip().lower() for t in items if t and t.strip()})
+    for t in tags:
+        if not re.fullmatch(NODE_SEGMENT_RE, t):
+            raise ValueError(f"'{t}' is not a tag: lowercase letters, digits and "
+                             "'-', up to 31")
+    if len(tags) > NODE_TAGS_MAX:
+        raise ValueError(f"at most {NODE_TAGS_MAX} tags")
+    return tags
+
+
+def _node_identity_write(rec):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = NODE_IDENTITY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, NODE_IDENTITY_FILE)
+    os.chmod(NODE_IDENTITY_FILE, 0o644)       # the portal reads it; nothing secret
+
+
+def node_identity_set(alias=None, place_text=None, tags=None, who="root", role="root"):
+    """Change the declaration -> the sentence to print. None leaves a field
+    alone; '' resets it (alias back to the hostname, place and tags empty).
+    Written only on a change, every change in the node's log (D6)."""
+    raw = _node_identity_raw()
+    new = {k: raw[k] for k in ("alias", "place", "tags", "default") if k in raw}
+    if alias is not None:
+        a = alias.strip().lower()
+        if a and not re.fullmatch(NODE_ALIAS_RE, a):
+            raise ValueError(f"'{a}' is not an alias: 2-40 lowercase letters, digits "
+                             "and '-', starting and ending with a letter or digit")
+        if a:
+            new["alias"] = a
+        else:
+            new.pop("alias", None)
+    if place_text is not None:
+        segs = parse_node_place(place_text)
+        if segs:
+            new["place"] = segs
+        else:
+            new.pop("place", None)
+    if tags is not None:
+        tl = parse_node_tags(tags)
+        if tl:
+            new["tags"] = tl
+        else:
+            new.pop("tags", None)
+    new["default"] = alias_from_hostname()
+    old = {k: raw[k] for k in ("alias", "place", "tags", "default") if k in raw}
+    if new == old:
+        return "Unchanged."
+    new.update(who=who, since=_iso_now())
+    _node_identity_write(new)
+    ident = node_identity()
+    detail = (f"alias {ident['alias']}" + ("" if ident["alias_set"] else " (the hostname)")
+              + f"; place {ident['place'] or '(none)'}"
+              + f"; tags {', '.join(ident['tags']) or '(none)'}")
+    audit_tenant("node.identity", default_tenant_id(), subject="node", who=who,
+                 role=role, detail=detail)
+    return "This node: " + detail + "."
+
+
+def node_identity_refresh():
+    """Keep the file's `default` (the normalized hostname) current for the
+    portal, which cannot see the host's name from its container. Written
+    only when it differs -- once on a node, again after a rename."""
+    raw = _node_identity_raw()
+    d = alias_from_hostname()
+    if raw.get("default") == d:
+        return False
+    raw["default"] = d
+    try:
+        _node_identity_write(raw)
+    except OSError:
+        return False
+    return True
+
+
+def node_identity_lines(ident=None):
+    ident = ident or node_identity()
+    return [f"Alias: {ident['alias']}" + ("" if ident["alias_set"]
+                                         else " (the hostname -- none set)"),
+            f"Place: {ident['place'] or '(none)'}",
+            f"Tags:  {', '.join(ident['tags']) or '(none)'}"]
+
+
 def _set_platform_env(key, value):
     """Set (or, with value None, drop) one line of the platform .env."""
     path = os.path.join(APP_DIR, ".env")
@@ -11836,6 +12019,35 @@ def cmd_node_care(args):
     host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
 
+def cmd_node_identity(args):
+    """oaap node alias|place|tags [value] (RFC-0082 D6). Without a value:
+    show; '-' resets (alias back to the hostname, place/tags empty)."""
+    vals = [args.profile] + list(args.rest or []) if args.profile else []
+    if not vals:
+        for line in node_identity_lines():
+            print(line)
+        return
+    if os.geteuid() != 0:
+        die("changing what this node calls itself needs root (sudo oaap node ...)")
+    text = "" if vals == ["-"] else " ".join(vals)
+    before = node_identity()
+    try:
+        said = node_identity_set(
+            alias=text if args.action == "alias" else None,
+            place_text=text if args.action == "place" else None,
+            tags=text if args.action == "tags" else None,
+            who=os.environ.get("SUDO_USER") or "root")
+    except ValueError as e:
+        die(str(e))
+    print(said)
+    after = node_identity()
+    if args.action == "alias" and after["alias"] != before["alias"]:
+        print("From now on mail subjects read [" + node_mail_name() + "], new archives are "
+              "named oaap-backup-" + node_file_name() + "-....\n"
+              "A receiver that accepts this node's archives by name "
+              "(backup-receive.sh --source) must be told the new one.")
+
+
 def cmd_node(args):
     """Show or change what this node is for (RFC-0011).
 
@@ -11847,8 +12059,13 @@ def cmd_node(args):
     """
     if args.action == "care":
         return cmd_node_care(args)
+    if args.action in ("alias", "place", "tags"):
+        return cmd_node_identity(args)
     profiles = load_profiles()
     if args.action == "show":
+        for line in node_identity_lines():
+            print(line)
+        print("")
         print("Node profiles: " + (", ".join(profiles) if profiles else "(none)"))
         for p in profiles:
             print(f"  {p}: {PROFILES[p]}")
@@ -28579,6 +28796,21 @@ def cmd_process_deploys(_args):
                     ok = True
                 except (ValueError, OSError) as e:
                     msg = str(e)
+        elif action == "node-identity":
+            # RFC-0082 D6: alias, place, tags from the health page. The
+            # server_admin's alone, judged again from the actor's record.
+            if not actor or act_role != "server_admin":
+                msg = "what this node calls itself is set by server_admin"
+            else:
+                try:
+                    msg = node_identity_set(
+                        alias=str(req.get("alias") or "")[:40],
+                        place_text=str(req.get("place") or "")[:200],
+                        tags=str(req.get("tags") or "")[:400],
+                        who=actor, role=act_role)
+                    ok = True
+                except (ValueError, OSError) as e:
+                    msg = str(e)
         elif action == "backup-tenant":
             # RFC-0081 stage 2: a tenant's class (server_admin) or the hour
             # and count of its own archive (also its tenant_admin, D4).
@@ -30677,7 +30909,7 @@ def cmd_backup_tenant_run(tid):
     b = t.get("backup") or {}
     d = tenant_backup_target(tid)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out_file = f"oaap-tenant-{t.get('label', tid)}-{socket.gethostname()}-{stamp}.tar.gz"
+    out_file = f"oaap-tenant-{t.get('label', tid)}-{node_file_name()}-{stamp}.tar.gz"
     t0 = time.monotonic()
     try:
         with backup_lock():
@@ -30921,6 +31153,7 @@ def _tenant_archive(tid, label, out_dir, out_file):
         "created": datetime.datetime.now(datetime.timezone.utc)
                    .strftime("%Y-%m-%dT%H:%M:%SZ"),
         "hostname": socket.gethostname(),
+        "alias": node_alias(),
         "instances": {n: {"app_name": i.get("app_name", ""),
                           "version": i.get("version", ""),
                           "channel": i.get("channel", "")}
@@ -31137,9 +31370,9 @@ def cmd_backup(args):
     else:
         out_dir = os.path.abspath(target)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_file = (f"oaap-tenant-{want_tenant}-{socket.gethostname()}-"
+        out_file = (f"oaap-tenant-{want_tenant}-{node_file_name()}-"
                     f"{stamp}.tar.gz" if want_tenant else
-                    f"oaap-backup-{socket.gethostname()}-{stamp}.tar.gz")
+                    f"oaap-backup-{node_file_name()}-{stamp}.tar.gz")
     data_abs = os.path.abspath(DATA_DIR)
     if os.path.commonpath([out_dir, data_abs]) == data_abs:
         die(f"backup target {out_dir} lies inside the platform data directory "
@@ -31174,6 +31407,11 @@ def _node_archive(out_dir, out_file, out_path):
         "platform_version": env.get("OAAP_VERSION", "unknown"),
         "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "hostname": socket.gethostname(),
+        # RFC-0082 D5: the identity travels with the archive (it is in
+        # apps/ anyway); named here so a restore can say it.
+        "alias": node_alias(),
+        "alias_set": node_identity()["alias_set"],
+        "place": node_identity()["place"],
         "http_port": env.get("OAAP_HTTP_PORT", "80"),
         "external_host": load_external(),
         # Recorded for the operator, NOT restored (RFC-0011 decision 4):
@@ -31599,6 +31837,23 @@ def _report_dropped_profiles():
           f"with: sudo oaap node add-profile {profiles[0]}")
 
 
+def _report_restored_identity():
+    """RFC-0082 D5: the alias came back with apps/ -- right for a move,
+    wrong for a copy. Say it, never decide it."""
+    try:
+        with open(os.path.join(DATA_DIR, "last-restore-manifest.json"),
+                  encoding="utf-8") as f:
+            mf = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not mf.get("alias_set"):
+        return
+    print(f"Note: this node calls itself '{mf.get('alias')}'"
+          + (f" (place {mf['place']})" if mf.get("place") else "")
+          + " -- it came back with the archive. Right for a move; if this is a "
+          "COPY next to the original, give it its own: sudo oaap node alias <new>")
+
+
 def cmd_backup_schedule(args):
     """Show or change the nightly schedule (RFC-0029 D1)."""
     if args.refresh:
@@ -31664,6 +31919,7 @@ def restored_test_left_out():
 def cmd_restore_instances(_args):
     """Used by 'install.sh restore': re-create every registered instance."""
     _report_dropped_profiles()
+    _report_restored_identity()
     reg = load_registry()
     if not reg["instances"]:
         print("No app instances in the restored registry.")
@@ -33856,10 +34112,11 @@ def build_parser():
     pn = sub.add_parser("node",
                         help="this node: profiles (RFC-0011) and host care (oaap.core.host)")
     pn.add_argument("action", choices=["show", "add-profile", "remove-profile",
-                                       "care"])
+                                       "care", "alias", "place", "tags"])
     pn.add_argument("profile", nargs="?",
                     help="node profile, e.g. dev (RFC-0011); for 'care': "
-                         "measure | sample | auto-updates | reboot-window")
+                         "measure | sample | auto-updates | reboot-window; "
+                         "for alias|place|tags: the value, '-' resets (RFC-0082)")
     pn.add_argument("rest", nargs="*",
                     help="care auto-updates on | care reboot-window HH:MM|off | "
                          "care reboot at <time>|cancel | care protect|release <inst>")

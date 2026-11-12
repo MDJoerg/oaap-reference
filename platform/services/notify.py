@@ -73,7 +73,8 @@ LATER = {
     "intrusion.suspected": "eigenes RFC: heute erkennt nichts einen Einbruch",
 }
 
-PLACEHOLDERS = ("knoten", "mandant", "instanz", "typ", "kurz")
+# {ort}: the node's place in the fleet (RFC-0082), e.g. de/datacenter1/group3
+PLACEHOLDERS = ("knoten", "mandant", "instanz", "typ", "kurz", "ort")
 ROLES = {"server_admin": "Server-Admins", "tenant_admin": "Mandanten-Admins"}
 FIELDS = ("to", "cc", "bcc")
 FIELD_WORDS = {"to": "An", "cc": "Cc", "bcc": "Bcc"}
@@ -429,7 +430,12 @@ def body(ntype, op, values, text, link=""):
         lines = [head + d["title"], ""]
     if values.get("mandant"):
         lines.append(f"Mandant: {values['mandant']}")
-    lines.append(f"Server: {values.get('knoten', '')}")
+    server = values.get("knoten", "")
+    if values.get("extern") and values["extern"] != server:
+        server += f" ({values['extern']})"     # RFC-0082 D4: both names
+    lines.append(f"Server: {server}")
+    if values.get("ort"):
+        lines.append(f"Ort: {values['ort']}")
     if values.get("instanz"):
         lines.append(f"Instanz: {values['instanz']}")
     if text:

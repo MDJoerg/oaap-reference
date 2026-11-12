@@ -16,6 +16,7 @@ resources.
 
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
@@ -1152,6 +1153,23 @@ HEALTH_BODY = """
         <td class="muted">{{ n.detail }}</td></tr>
     {% endfor %}
   </table>
+  {% if is_server_admin %}
+  <details><summary>Name im Verbund ändern</summary>
+  <form method="post" action="/node/identity">
+    <p class="muted">Wie wir diesen Knoten intern führen — nicht extern bekannt. Der Alias steht in
+       Betreffzeilen der Meldungen (<code>[alias] …</code>), in Archivnamen und im Flottenstatus;
+       der Ort ist das Präfix im Topic-Baum (<code>de/datacenter1/group3</code>), Tags gruppieren quer
+       dazu. Leer = Rechnername bzw. nichts.</p>
+    <p><label>Alias <input name="alias" value="{{ ident.alias if ident.alias_set else '' }}"
+         placeholder="{{ ident.default }}" pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" style="max-width:14rem"></label>
+       <label>Ort <input name="place" value="{{ ident.place }}" placeholder="de/datacenter1/group3"
+         style="max-width:20rem"></label>
+       <label>Tags <input name="tags" value="{{ ident.tags|join(', ') }}" placeholder="kunde-x, test"
+         style="max-width:20rem"></label></p>
+    <button class="btn">Speichern</button>
+  </form>
+  </details>
+  {% endif %}
 </div>
 {# oaap.core.updates 2.6.2: the same three lines the CLI prints, with
    the recommendation on every line that is not fine. #}
@@ -6060,6 +6078,52 @@ def care_rows(facts):
     return rows
 
 
+# --- what the node calls itself (RFC-0082) -----------------------------------
+
+NODE_IDENTITY_FILE = "/apps-registry/node-identity.json"
+NODE_IDENTITY_WAIT = 20
+_ALIAS_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]")
+_SEG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+
+
+def node_identity_view():
+    """The host's declaration, read with the host's rules (appctl
+    node_identity); `default` is the host's normalized hostname, which the
+    minute job keeps current -- this container cannot see that name."""
+    rec = _read_json(NODE_IDENTITY_FILE) or {}
+    alias = str(rec.get("alias") or "")
+    alias = alias if _ALIAS_RE.fullmatch(alias) else ""
+    segs = rec.get("place") if isinstance(rec.get("place"), list) else []
+    if len(segs) > 6 or not all(isinstance(x, str) and _SEG_RE.fullmatch(x) for x in segs):
+        segs = []
+    tags = sorted({t for t in (rec.get("tags") if isinstance(rec.get("tags"), list) else [])
+                   if isinstance(t, str) and _SEG_RE.fullmatch(t)})[:10]
+    default = str(rec.get("default") or "")
+    default = default if _ALIAS_RE.fullmatch(default) else ""
+    return {"alias": alias or default, "alias_set": bool(alias), "default": default,
+            "place": "/".join(segs), "tags": tags}
+
+
+@app.post("/node/identity")
+def node_identity_post():
+    """Alias, place, tags (RFC-0082 D6) -- server_admin; the host judges
+    the role again from the actor's record."""
+    if "server_admin" not in caller_roles():
+        return "Zugriff verweigert: den Namen des Knotens setzt der server_admin.", 403
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    payload = {"action": "node-identity",
+               "alias": (request.form.get("alias") or "").strip()[:40],
+               "place": (request.form.get("place") or "").strip()[:200],
+               "tags": (request.form.get("tags") or "").strip()[:400]}
+    res = _queue_and_wait("", payload, NODE_IDENTITY_WAIT)
+    if res is None:
+        return redirect("/health?err=" + quote("Die Änderung läuft noch — bitte gleich neu laden."),
+                        code=303)
+    key = "msg" if res.get("ok") else "err"
+    return redirect(f"/health?{key}=" + quote(res.get("message", "")), code=303)
+
+
 def node_values():
     """Host-level readings, visible from inside the container.
 
@@ -6068,6 +6132,13 @@ def node_values():
     these readings, so they are host values.
     """
     rows = []
+    ident = node_identity_view()
+    rows.append({"name": "Name im Verbund", "state": "ok",
+                 "label": ident["alias"] or "(noch nicht gemessen)",
+                 "detail": "; ".join(x for x in (
+                     "" if ident["alias_set"] else "der Rechnername — kein eigener Alias gesetzt",
+                     f"Ort {ident['place']}" if ident["place"] else "",
+                     "Tags " + ", ".join(ident["tags"]) if ident["tags"] else "") if x)})
     rows.append({"name": "Plattformversion", "state": "ok", "label": VERSION,
                  "detail": ""})
     # oaap.core.updates 2.6: what the NODE measured on the machine (a
@@ -6608,6 +6679,8 @@ def health():
         })
     care, care_when = care_state()
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
+                ident=node_identity_view(),
+                is_server_admin="server_admin" in caller_roles(),
                 care=care, care_when=care_when,
                 care_warn=host_care.worst(care) in ("warn", "err"),
                 mx=Markup(metrics_view.block(METRICS_DIR,
@@ -6768,6 +6841,7 @@ def fleet_status():
     facts = care_facts()
     return fleet_view.build_document(
         host=host_care.fleet_host(facts),
+        identity=node_identity_view(),
         node=ext or request.host.split(":")[0],
         version=VERSION,
         profiles=node_profiles(),

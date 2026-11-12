@@ -8,6 +8,13 @@ set -euo pipefail
 
 NODE=""; HOST=""; USER_="oaap-admin"; KEY=""; TO="/mnt/backup"; AT="04:30"
 DAILY=7; WEEKLY=4; MONTHLY=6; REMOVE=0; LOCAL=0; VAULT=0
+# RFC-0082: this node's alias, once set, names its directory; else the hostname.
+node_alias() {
+  python3 -c 'import json,re,sys
+try: a=json.load(open(sys.argv[1])).get("alias") or ""
+except Exception: a=""
+print(a if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}[a-z0-9]",a) else "")'     "${OAAP_DATA_DIR:-/var/lib/oaap}/apps/node-identity.json" 2>/dev/null || true
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --node) NODE="$2"; shift 2 ;;
@@ -52,7 +59,7 @@ if [ "$REMOVE" -eq 1 ]; then
 fi
 
 if [ "$LOCAL" -eq 1 ]; then
-  NODE="${NODE:-$(hostname)}"; HOST="$(hostname)"; KEY="-"
+  NODE="${NODE:-$(node_alias)}"; NODE="${NODE:-$(hostname)}"; HOST="$(hostname)"; KEY="-"
 else
   [ -n "$NODE" ] && [ -n "$HOST" ] && [ -n "$KEY" ] || {
     echo "ERROR: --node, --host and --key are required (or --local)." >&2; exit 2; }
