@@ -253,7 +253,8 @@ ok("das Protokoll zeigt die Sendung ohne Adressen",
    "verschickt" in t and "1 / 1 / 1" in t)
 t = "".join(cl.get("/nachrichten?tab=" + k, headers=H).get_data(as_text=True)
             for k in ("ausgang", "verteiler", "meldungen", "protokoll"))
-ok("nichts vom fremden Mandanten", "geheim@andere.example" not in t and "Geheim" not in t)
+ok("nichts vom fremden Mandanten", "geheim@andere.example" not in t
+   and not __import__("re").search(r"\bGeheim\b", t))
 r = post("/nachrichten/verteiler/set", {"name": "Kasse", "to": "kasse@verein.example, Mandanten-Admins",
                                         "cc": "", "bcc": "", "prefix": ""})
 req = SENT[-1][0]

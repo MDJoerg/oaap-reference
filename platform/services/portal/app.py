@@ -1451,6 +1451,31 @@ HEALTH_BODY = """
      gespeichert, nur gezählt. Einstellbar je Instanz auf deren Objektseite.</p>
 </div>
 {% endif %}
+{% if guarded %}
+<div class="card{% if guarded.found %} warn{% endif %}">
+  <h2>Geheimnisdateien</h2>
+  {% if guarded.found %}
+  <p class="err">{{ guarded.found|length }} Instanz{{ "en geben" if guarded.found|length > 1 else " gibt" }}
+     auf direkte Anfrage eine Datei heraus, die nie öffentlich sein darf:</p>
+  <ul>{% for f in guarded.found %}<li><strong>{{ f.instance }}</strong> {{ f.path }} — {{ f.why }}</li>{% endfor %}</ul>
+  <p class="muted">Das Gateway weist diese Pfade ab, aber die Datei liegt im Auslieferungsverzeichnis
+     der App: aus Abbild bzw. Speicher entfernen, neu ausrollen, Zugangsdaten darin austauschen.</p>
+  {% else %}
+  <p><span class="dot ok"></span>Keine Instanz gibt eine Geheimnisdatei heraus{% if guarded.when %}
+     <span class="muted">— geprüft {{ guarded.when }}, {{ guarded.n }} Instanzen</span>{% endif %}.</p>
+  {% endif %}
+  {% if guarded.rows %}
+  <table>
+    <tr><th>Instanz</th><th>Abgewiesen (24 h)</th><th>Wer, wann</th></tr>
+    {% for b in guarded.rows %}<tr><td>{{ b.instance }}</td><td>{{ b.count }}</td><td class="muted">{{ b.who }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+  <p class="muted">Anfragen nach <code>.env</code>, <code>.git/</code>, Schlüsseln, Zugangsdateien,
+     Datenbank-Abzügen u. a. beantwortet das Gateway selbst mit 404 — für jede Instanz, ob die Datei
+     existiert oder nicht. Einmal täglich fragt der Knoten jede Instanz direkt nach diesen Dateien
+     (<code>sudo oaap guard status</code>). Ausnahmen je Instanz: <code>sudo oaap guard allow</code>.</p>
+</div>
+{% endif %}
 {% if deploys %}
 <div class="card">
   <h2>KI-Deployments (Deploy-Hook)</h2>
@@ -6571,6 +6596,28 @@ def _braked_words(c):
     return " · ".join(parts)
 
 
+GUARD_SCAN_FILE = "/apps-registry/guard-scan.json"
+
+
+def guard_state():
+    """RFC-0084: the self-check's findings and the refused requests."""
+    scan = _read_json(GUARD_SCAN_FILE) or {}
+    insts = scan.get("instances") or {}
+    found = [{"instance": n, "path": f.get("path", ""), "why": f.get("why", "")}
+             for n, r in sorted(insts.items()) for f in r.get("findings") or []
+             if not f.get("allowed")]
+    rows = []
+    try:
+        data = INTERNAL.get(f"{IDENTITY}/internal/guard-denied", timeout=3).json()
+        for name, c in sorted((data.get("instances") or {}).items(),
+                              key=lambda x: -x[1].get("count", 0)):
+            rows.append({"instance": name, "count": c.get("count", 0), "who": _braked_words(c)})
+    except (requests.RequestException, ValueError):
+        pass
+    return {"found": found, "rows": rows, "n": len(insts),
+            "when": _when(scan.get("scanned")) if scan.get("scanned") else ""}
+
+
 def braked_requests():
     """Per-instance count of throttled requests (RFC-0010 decision 2)."""
     instances = load_instances()
@@ -6717,6 +6764,7 @@ def health():
                 mx_style=Markup(metrics_view.STYLE),
                 core=core, apps=apps, ext=external_access(),
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
+                guarded=guard_state(),
                 deploys=recent_deploys(), bk=backup_state(), cx=connect_view(),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 

@@ -66,6 +66,13 @@ CATALOGUE = {
     "login.locked": {"category": "security", "scope": "tenant", "matter": False,
                      "title": "Eine Anmeldung wurde nach Fehlversuchen gesperrt",
                      "subject": "[{mandant}] Anmeldung gesperrt: {kurz}"},
+    # RFC-0084: an instance hands out a secret file when asked directly.
+    # Critical: the gateway refuses the path, but the file is where any other
+    # way in (a second proxy, a copy of the app) would serve it. Each scope
+    # its own -- the tenant whose instance it is and the node's owners.
+    "exposure.found": {"category": "critical", "scope": "both", "matter": True,
+                       "title": "Eine Instanz gibt eine Geheimnisdatei heraus",
+                       "subject": "[{knoten}] Geheimnisdatei abrufbar: {instanz}"},
     # RFC-0083: the weekly report itself. "both": the node's report goes to
     # the node's lists, a tenant's report to the tenant's -- each queued for
     # its own scope.
@@ -83,7 +90,7 @@ DELIVERY_WORDS = {"now": "sofort", "report": "nur im Wochenbericht"}
 # failure this platform exists to prevent. Enforced when a line is set AND
 # when it is read (a category line set to "report" does not carry these).
 NEVER_REPORT_ONLY = frozenset({"backup.failed", "backup.missing", "disk.full",
-                               "instance.down", "report.weekly"})
+                               "instance.down", "report.weekly", "exposure.found"})
 
 
 def delivery_for(scope, ntype):

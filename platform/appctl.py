@@ -115,6 +115,8 @@ import images  # noqa: E402
 import notify  # noqa: E402
 # ... and what it says once a week (RFC-0083): ledger, report, Markdown.
 import report  # noqa: E402
+# ... and the secret files it refuses and looks for (RFC-0084).
+import guard  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -2738,6 +2740,7 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "reboot.started": "/health", "reboot.cancelled": "/health",
                 "bulk.halted": "/store", "rebuild.failed": "/store",
                 "confirm.pending": "/store", "instance.down": "/instances/{instanz}",
+                "exposure.found": "/instances/{instanz}",
                 "login.locked": "/users"}
 
 
@@ -3339,6 +3342,9 @@ def notify_conditions(facts=None, now=None):
     # while the first is still down must be heard, not folded in.
     for tid, conds in _notify_instance_down(now).items():
         cur.setdefault(tid, {}).update(conds)
+    # RFC-0084: an instance that hands out a secret file
+    for tid, conds in guard_conditions().items():
+        cur.setdefault(tid, {}).update(conds)
     return cur
 
 
@@ -3462,6 +3468,10 @@ def notify_minute(facts=None):
     except Exception as e:                          # noqa: BLE001
         print(f"report: {type(e).__name__}: {e}", file=sys.stderr)
     try:
+        guard_minute()
+    except Exception as e:                          # noqa: BLE001
+        print(f"guard: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
         return notify_deliver()
     except Exception as e:                          # noqa: BLE001
         print(f"notify: delivery: {type(e).__name__}: {e}", file=sys.stderr)
@@ -3576,6 +3586,9 @@ def ledger_lines_for_day(day, measured_now):
     inst_tenant = {n: resolve_tenant(i.get("tenant")) for n, i in reg["instances"].items()}
     brake_all = (report.day_brake(_report_json(IDENTITY_BRAKED_FILE) or {}, start, end)
                  if measured_now else None)
+    guard_all = (report.day_brake(_report_json(GUARD_DENIED_FILE) or {}, start, end)
+                 if measured_now else None)
+    scan = (_report_json(GUARD_SCAN_FILE) or {}).get("instances") or {} if measured_now else {}
     bytes_t = _tenant_bytes(list(tenants)) if measured_now else None
     node_run = last_backup_run() or {}
     run_t = report._epoch(node_run.get("finished"))
@@ -3590,6 +3603,14 @@ def ledger_lines_for_day(day, measured_now):
         if brake_all is not None:
             parts["brake"] = {i: b for i, b in brake_all.items()
                               if is_node or inst_tenant.get(i) == tid}
+        if guard_all is not None:
+            parts["guard"] = {i: b for i, b in guard_all.items()
+                              if is_node or inst_tenant.get(i) == tid}
+            parts["exposed"] = {i: [f["path"] for f in r.get("findings") or []
+                                    if not f.get("allowed")]
+                                for i, r in scan.items()
+                                if (is_node or inst_tenant.get(i) == tid)
+                                and any(not f.get("allowed") for f in r.get("findings") or [])}
         if is_node:
             parts["metrics"] = report.day_metrics(metric_rows, start, end, metrics._aggregate)
             parts["backup"] = node_backup
@@ -5091,6 +5112,10 @@ def write_exposures_caddy():
     else:
         lines += _edge_guard(edge)
     lines += _LOG_BLOCK
+    # RFC-0084: an exposure forwards to somebody's device -- scanners found
+    # one on oaap-demo within a day (2026-11-11, l9scan) and asked it for
+    # .env and id_rsa. Refused here like on every instance site.
+    lines += guard_site_lines(GUARD_EXPOSURE_SCOPE, edge)
     lines += ["\thandle /auth/* {"] + strip_identity() + \
              ["\t\treverse_proxy identity:8000", "\t}",
               "\thandle {", "\t\troute {"]
@@ -7561,6 +7586,34 @@ def cmd_migrate_platform_routes(_args):
     print(f"  {', '.join(parts)} rewritten. /platform/feedback.js now comes "
           "from the gateway on an app's own name too, instead of reaching "
           "the app.")
+
+
+def cmd_migrate_guard(_args):
+    """0.1.263 (RFC-0084): the secret-file guard into instance sites written
+    before it. Idempotent; silent when every site already has it."""
+    reg = load_registry()
+    behind = []
+    for name, inst in sorted(reg["instances"].items()):
+        if not guard.path_regex(guard_allowed(name)):
+            continue
+        f = _read_file(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"))
+        if f is not None and "@oaap_guard" not in f:
+            behind.append(name)
+    generated = [f for f in ("external.caddy", "instance-addresses.caddy")
+                 if "	handle " in (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")
+                 and "@oaap_guard" not in (_read_file(os.path.join(CADDY_APPS_DIR, f)) or "")]
+    if write_exposures_caddy():
+        generated.append(EXPOSE_SITE)
+    if not behind and not generated:
+        return
+    print("")
+    print("Refusing secret files at the gateway (RFC-0084) ...")
+    for name in behind:
+        write_app_caddy(name, reg["instances"][name])
+    refresh_generated_sites()
+    reload_gateway()
+    print(f"  {len(behind)} instance site(s)" + (", " + ", ".join(generated) if generated else "")
+          + " rewritten: .env, .git/, keys, dumps ... now get 404 from the gateway.")
 
 
 def cmd_migrate_care_url(_args):
@@ -15647,6 +15700,266 @@ def image_uid(image):
         return None
 
 
+# --- secret files (RFC-0084) ----------------------------------------------
+#
+# The gateway refuses a well-known secret path for EVERY instance, before
+# the app: rewritten to a reserved path whose one handler asks identity
+# (which counts it) and answers 404. `rewrite` runs before every `handle`
+# in Caddy's directive order, so no app route -- however it is sorted --
+# sees the request. An instance may be allowed a category, with a reason,
+# by the server_admin (`oaap guard allow`).
+
+GUARD_RESERVED = "/.oaap-guard"
+GUARD_EXPOSURE_SCOPE = "exposures"     # the counting name of the exposure zone
+GUARD_SCAN_FILE = os.path.join(APPS_DIR, "guard-scan.json")
+GUARD_SCAN_EVERY = 24 * 3600
+GUARD_PROBE_TIMEOUT = 3
+GUARD_DENIED_FILE = os.path.join(DATA_DIR, "data", "identity", "guard-denied.json")
+
+
+def guard_allowed(scope):
+    """{category: reason} this instance is allowed to serve."""
+    if not scope:
+        return {}
+    inst = (load_registry().get("instances") or {}).get(scope) or {}
+    return {c: r for c, r in (inst.get("guard_allow") or {}).items() if c in guard.CATEGORIES}
+
+
+def guard_site_lines(scope, edge=""):
+    rx = guard.path_regex(guard_allowed(scope))
+    if not rx or not scope:
+        return []
+    import urllib.parse
+    client = ("{http.request.header.X-Forwarded-For}" if edge
+              else "{http.request.remote.host}")
+    return [
+        f'\t@oaap_guard path_regexp oaap_guard "{rx}"',
+        f"\trewrite @oaap_guard {GUARD_RESERVED}",
+        f"\thandle {GUARD_RESERVED} {{",
+        f"\t\trewrite * /guard?scope={urllib.parse.quote(scope, safe='')}",
+        *strip_identity(),
+        "\t\treverse_proxy identity:8000 {",
+        f"\t\t\theader_up X-OAAP-Client {client}",
+        "\t\t}",
+        "\t}",
+    ]
+
+
+def _guard_apply(name, inst):
+    write_app_caddy(name, inst)
+    refresh_generated_sites()
+    reload_gateway()
+
+
+def guard_allow_set(name, category, allow, reason="", who="root"):
+    reg = load_registry()
+    inst = reg["instances"].get(name)
+    if inst is None:
+        raise ValueError(f"no instance named '{name}'")
+    if category not in guard.CATEGORIES:
+        raise ValueError("category is one of: " + ", ".join(guard.CATEGORY_ORDER))
+    cur = dict(inst.get("guard_allow") or {})
+    if allow:
+        reason = (reason or "").strip()[:300]
+        if not reason:
+            raise ValueError("say why this app must serve such files: --reason \"...\"")
+        if cur.get(category) == reason:
+            return "Unchanged."
+        cur[category] = reason
+    else:
+        if category not in cur:
+            return "Unchanged."
+        cur.pop(category)
+    if cur:
+        inst["guard_allow"] = cur
+    else:
+        inst.pop("guard_allow", None)
+    save_registry(reg)
+    _guard_apply(name, inst)
+    audit_tenant("guard.allow" if allow else "guard.deny", resolve_tenant(inst.get("tenant")),
+                 subject=instance_name(name, inst), who=who,
+                 detail=(f"{category} served by the app: {reason}" if allow
+                         else f"{category} refused again at the gateway"))
+    return (f"'{name}' may serve {guard.CATEGORIES[category][1]} -- the gateway no longer "
+            "refuses them for this instance." if allow
+            else f"'{name}': {guard.CATEGORIES[category][1]} refused again at the gateway.")
+
+
+def _guard_fetch(ip, port, path):
+    import http.client
+    try:
+        c = http.client.HTTPConnection(ip, port, timeout=GUARD_PROBE_TIMEOUT)
+        c.request("GET", path, headers={"User-Agent": "oaap-guard/1 (RFC-0084 self-check)",
+                                        "Accept": "*/*"})
+        r = c.getresponse()
+        body = r.read(guard.MAX_BODY)
+        c.close()
+        return r.status, body
+    except (OSError, http.client.HTTPException, ValueError):
+        return None, b""
+
+
+def _guard_fetch_via_gateway(container, port, path):
+    """For an instance the host cannot reach (a closed network, RFC-0068):
+    ask from inside the gateway, which sits on every app network."""
+    try:
+        r = subprocess.run(["docker", "exec", GATEWAY_CONTAINER, "wget", "-q", "-S", "-O", "-",
+                            "-T", str(GUARD_PROBE_TIMEOUT), f"http://{container}:{port}{path}"],
+                           capture_output=True, timeout=GUARD_PROBE_TIMEOUT + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, b""
+    m = re.search(rb"HTTP/\d\.\d (\d{3})", r.stderr or b"")
+    if not m:
+        return None, b""
+    return int(m.group(1)), (r.stdout or b"")[:guard.MAX_BODY]
+
+
+def guard_scan_instance(name, inst):
+    """Ask the instance itself (its container on its network, past the
+    gateway) for the probe paths -> {scanned, findings, error?}."""
+    rec = {"scanned": _iso_now(), "findings": []}
+    container, port = inst.get("container"), inst.get("svc_port")
+    if not container or not port:
+        rec["error"] = "no container/port recorded"
+        return rec
+    if inst.get("standby"):
+        rec["error"] = "standby"
+        return rec
+    ip = container_ip(container, app_network(name))
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:            # '' or docker's "invalid IP" for a stopped container
+        rec["error"] = "not running"
+        return rec
+    nothing = "/oaap-guard-nothing-" + uuid.uuid4().hex[:12]
+    fetch = lambda path: _guard_fetch(ip, port, path)     # noqa: E731
+    st, body = fetch(nothing)
+    if st is None:
+        fetch = lambda path: _guard_fetch_via_gateway(container, port, path)  # noqa: E731
+        st, body = fetch(nothing)
+        rec["via"] = "gateway"
+    if st is None:
+        rec["error"] = "no answer"
+        return rec
+    fallback = guard.signature(st, body)
+    allowed = guard_allowed(name)
+    paths = guard.probes_for([r.get("path") for r in inst.get("routes") or []])
+    for path, cat, check in paths:
+        st, body = fetch(path)
+        why = guard.judge(path, check, st, body, fallback)
+        if why:
+            rec["findings"].append({"path": path, "category": cat, "why": why,
+                                    "allowed": cat in allowed})
+    return rec
+
+
+def guard_scan(names=None):
+    """Scan the running instances (or `names`) in parallel; the result
+    file is 0644 -- paths and categories, never content."""
+    from concurrent.futures import ThreadPoolExecutor
+    reg = load_registry()
+    insts = {n: i for n, i in reg["instances"].items()
+             if (names is None or n in names) and not is_rehearsal(i)}
+    prev = _report_json(GUARD_SCAN_FILE) or {}
+    results = dict(prev.get("instances") or {}) if names else {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for n, rec in zip(insts, ex.map(lambda kv: guard_scan_instance(*kv), insts.items())):
+            results[n] = rec
+    results = {n: r for n, r in results.items() if n in reg["instances"]}
+    out = {"scanned": _iso_now() if names is None else prev.get("scanned", ""),
+           "instances": results}
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = GUARD_SCAN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, GUARD_SCAN_FILE)
+    os.chmod(GUARD_SCAN_FILE, 0o644)
+    return out
+
+
+def guard_minute(now=None):
+    """Once a day (and never while a backup copies apps/)."""
+    now = now or time.time()
+    prev = _report_json(GUARD_SCAN_FILE) or {}
+    last = report._epoch(prev.get("scanned")) or 0
+    if now - last < GUARD_SCAN_EVERY or backup_running_now():
+        return None
+    return guard_scan()
+
+
+def guard_conditions():
+    """{tid: {key: condition}} -- one matter per instance with a finding
+    that is not allowed, in its tenant's scope and in the node's."""
+    data = _report_json(GUARD_SCAN_FILE) or {}
+    reg = load_registry().get("instances") or {}
+    dflt = default_tenant_id()
+    cur = {}
+    for name, rec in sorted((data.get("instances") or {}).items()):
+        bad = [f for f in rec.get("findings") or [] if not f.get("allowed")]
+        if not bad or name not in reg:
+            continue
+        inst = reg[name]
+        tid = resolve_tenant(inst.get("tenant")) or dflt
+        shown = instance_name(name, inst)
+        cond = {"type": "exposure.found", "instanz": shown, "kurz": str(len(bad)),
+                "text": "Diese Instanz gibt auf direkte Anfrage Dateien heraus, die nie öffentlich "
+                        "sein dürfen:\n"
+                        + "\n".join(f"  - {f['path']}: {f['why']}" for f in bad)
+                        + "\nDas Gateway weist diese Pfade ab -- aber die Datei liegt im "
+                          "Auslieferungsverzeichnis der App. Bitte aus dem Abbild bzw. dem "
+                          "Speicher entfernen und neu ausrollen; Zugangsdaten darin gelten als "
+                          "bekannt und gehören ausgetauscht."}
+        cur.setdefault(tid, {})["exposure.found/" + name] = cond
+        if tid != dflt:
+            cur.setdefault(dflt, {})["exposure.found/" + name] = dict(cond)
+    return cur
+
+
+def cmd_guard(args):
+    """oaap guard status|scan|allow|deny (RFC-0084)."""
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.action in ("allow", "deny"):
+        if os.geteuid() != 0:
+            die("changing what the gateway refuses needs root")
+        if not args.name or not args.category:
+            die(f"oaap guard {args.action} <instance> <category> "
+                + ("--reason \"...\"" if args.action == "allow" else ""))
+        try:
+            print(guard_allow_set(args.name, args.category, args.action == "allow",
+                                  args.reason or "", who=who))
+        except ValueError as e:
+            die(str(e))
+        return
+    if args.action == "scan":
+        if os.geteuid() != 0:
+            die("the scan reaches the instances' networks: sudo oaap guard scan")
+        out = guard_scan([args.name] if args.name else None)
+    else:
+        out = _report_json(GUARD_SCAN_FILE) or {}
+    reg = load_registry()["instances"]
+    print("The gateway refuses these paths for every instance (RFC-0084):")
+    for c in guard.CATEGORY_ORDER:
+        allowed = sorted(n for n, i in reg.items() if c in (i.get("guard_allow") or {}))
+        print(f"  {c:<7} {guard.CATEGORIES[c][1]}"
+              + (f"  -- allowed for: {', '.join(allowed)}" if allowed else ""))
+    insts = out.get("instances") or {}
+    print("")
+    print(f"Self-check: {out.get('scanned') or 'never'}; {len(insts)} instance(s).")
+    found = 0
+    for n, rec in sorted(insts.items()):
+        for f in rec.get("findings") or []:
+            found += 1
+            print(f"  !! {n}{f['path']}: {f['why']}"
+                  + ("  (allowed: " + (reg.get(n, {}).get("guard_allow") or {}).get(f["category"], "")
+                     + ")" if f.get("allowed") else ""))
+    errs = sorted(n for n, r in insts.items()
+                  if r.get("error") and r["error"] not in ("not running", "standby"))
+    if errs:
+        print("  not checked: " + ", ".join(f"{n} ({insts[n]['error']})" for n in errs))
+    print("  No instance hands out a secret file." if not found else
+          f"  {found} finding(s) -- each one is a mail to its tenant and to the node's owners.")
+
+
 DEFAULT_THROTTLE = {"limit": 300, "window": 60}
 # identity runs several gunicorn workers and each counts on its own
 # (RFC-0010) — kept here so the CLI can state the real ceiling
@@ -16289,6 +16602,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     # is looking for one. Nothing at all while no window is open: this
     # RFC does not turn on permanent per-instance logging.
     lines = list(diagnose_site_lines(scope))
+    lines += guard_site_lines(scope, edge)
     lines.append("\thandle /auth/* {")
     lines += strip_identity()
     lines.append("\t\treverse_proxy identity:8000")
@@ -34008,6 +34322,14 @@ def build_parser():
                             "command line)")
     pmail.add_argument("--yes", action="store_true", help="for 'clear'")
     pmail.set_defaults(fn=cmd_mail)
+    pgd = sub.add_parser("guard", help="secret files: refused at the gateway, looked for "
+                                       "in every instance (RFC-0084)")
+    pgd.add_argument("action", choices=["status", "scan", "allow", "deny"])
+    pgd.add_argument("name", nargs="?", help="instance (scan, allow, deny)")
+    pgd.add_argument("category", nargs="?",
+                     help="allow/deny: " + ", ".join(guard.CATEGORY_ORDER))
+    pgd.add_argument("--reason", default=None, help="allow: why the app serves such files")
+    pgd.set_defaults(fn=cmd_guard)
     prep = sub.add_parser("report", help="the weekly report (RFC-0083)")
     prep.add_argument("action", choices=["show", "run", "ledger", "settings"])
     prep.add_argument("--tenant", default=None, help="a tenant's label (default: the node)")
@@ -34453,6 +34775,9 @@ def build_parser():
     pf.add_argument("label", nargs="?",
                     help="who watches, e.g. fleetview@oaap-demo")
     pf.set_defaults(fn=cmd_fleet)
+    pmg = sub.add_parser("migrate-guard", help="internal: the secret-file guard into old "
+                                                "instance sites (RFC-0084, called by update)")
+    pmg.set_defaults(fn=cmd_migrate_guard)
     pd = sub.add_parser("process-deploys",
                         help="internal: work the deploy spool (called by the path unit and the portal)")
     pd.set_defaults(fn=cmd_process_deploys)
@@ -34627,7 +34952,7 @@ def cmd_help(args, parser):
 WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
                   "files", "user", "cohort", "disk", "machine", "authz", "key",
                   "fleet", "tenant", "metrics", "broker", "idp", "mail",
-                  "notify", "report", "destination", "connect", "connector", "help")
+                  "notify", "report", "guard", "destination", "connect", "connector", "help")
 
 # What `bin/oaap` does by itself, without appctl.py -- argparse cannot know
 # these, so the reference names them from here (same test as above).

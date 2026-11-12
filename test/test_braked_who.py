@@ -78,6 +78,18 @@ hit("93.123.109.7", scope="alt")
 ok("… und wird beim nächsten Bremsen ins neue Format gehoben",
    isinstance(json.loads(open(ident.BRAKED_FILE).read())["alt"][str(hour - 1)], (int, dict)))
 
+print("=== RFC-0084: abgewiesene Geheimnis-Anfragen ===")
+rr = c.get("/guard", query_string={"scope": "kasse"}, headers={"X-OAAP-Client": "93.123.109.7"})
+ok("/guard antwortet 404, nicht zwischenspeicherbar", rr.status_code == 404
+   and rr.headers.get("Cache-Control") == "no-store")
+for _ in range(4):
+    c.post("/guard", query_string={"scope": "kasse"}, headers={"X-OAAP-Client": "93.123.109.7"})
+gd = c.get("/internal/guard-denied", headers={"X-OAAP-Internal-Key": "k"}).get_json()
+ok("gezählt: 5, eine Adresse, in einer eigenen Datei (nicht bei der Bremse)",
+   gd["instances"]["kasse"]["count"] == 5 and gd["instances"]["kasse"]["clients"] == 1
+   and "kasse" not in json.loads(open(ident.BRAKED_FILE).read())
+   and "93.123" not in open(ident.GUARD_FILE).read(), gd)
+
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))
 sys.modules.pop("app", None)

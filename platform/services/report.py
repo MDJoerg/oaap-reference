@@ -191,6 +191,7 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     week = {e["day"]: e for e in lines}
     have = [d for d in week_days if d in week]
     events, mails, brake, backups = [], [], {}, []
+    guarded, exposed = {}, {}
     for d in have:
         e = week[d]
         events += e.get("events") or []
@@ -206,6 +207,14 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
                 agg["peak_count"], agg["peak_at"] = b["peak_count"], b.get("peak_at", 0)
         if e.get("backup"):
             backups.append((d, e["backup"]))
+        for inst, b in (e.get("guard") or {}).items():
+            g = guarded.setdefault(inst, {"count": 0, "clients": 0, "more": False, "days": 0})
+            g["count"] += b.get("count", 0)
+            g["clients"] = max(g["clients"], b.get("clients", 0))
+            g["more"] = g["more"] or b.get("clients_more", False)
+            g["days"] += 1
+        for inst, paths in (e.get("exposed") or {}).items():
+            exposed[inst] = paths
     sent = [m for m in mails if m.get("r") == "sent"]
     reboots = [e for e in events if e["a"] == "reboot.started"]
     out = [f"# {title}", ""]
@@ -241,7 +250,13 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
         who = max(brake.values(), key=lambda b: b["count"])
         summary.append(f"{total} gebremste Anfragen"
                        + (f", größter Teil von {_clients(who)}" if who["clients"] else ""))
-    if not events and not sent and not brake:
+    if exposed:
+        summary.append(f"**{len(exposed)} Instanz" + ("en geben" if len(exposed) > 1 else " gibt")
+                       + " auf direkte Anfrage eine Geheimnisdatei heraus** (siehe unten)")
+    if guarded:
+        total = sum(g["count"] for g in guarded.values())
+        summary.append(f"{total} Anfragen nach Geheimnisdateien abgewiesen")
+    if not events and not sent and not brake and not guarded and not exposed:
         summary.append("Keine besonderen Ereignisse")
     out += [f"- {s}" for s in summary] + [""]
 
@@ -293,6 +308,19 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
                        f"| {inst} | {b['count']} | {_clients(b) if b['clients'] else '–'} | {b['days']} | – |")
         out += ["", "Wenige Adressen in wenigen Minuten sind meist ein Scanner. Adressen werden nur "
                     "gezählt, nie gespeichert.", ""]
+
+    # --- secret files (RFC-0084)
+    if guarded or exposed:
+        out += ["## Geheimnisdateien", ""]
+        if exposed:
+            out += ["Die tägliche Selbstprüfung fand Dateien, die nie öffentlich sein dürfen:", ""]
+            out += [f"- {inst}: {', '.join(p)}" for inst, p in sorted(exposed.items())] + [""]
+        if guarded:
+            out += ["| Instanz | abgewiesen | Adressen | an Tagen |", "|---|---|---|---|"]
+            for inst, g in sorted(guarded.items(), key=lambda x: -x[1]["count"]):
+                out.append(f"| {inst} | {g['count']} | {_clients(g) if g['clients'] else '–'} | {g['days']} |")
+            out += ["", "Das Gateway beantwortet Anfragen nach .env, .git/, Schlüsseln, Abzügen u. a. "
+                        "selbst mit 404 — die App sieht sie nie.", ""]
 
     # --- measurements
     if scope_is_node:

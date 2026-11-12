@@ -2784,7 +2784,7 @@ def _braked_bucket(v):
     return {"n": int(v or 0), "c": [], "m": {}, "full": False}
 
 
-def _braked_note(scope, client=None):
+def _braked_note(scope, client=None, path=None):
     """Record one braked request, straight through to the shared file.
 
     Batching in process memory was tried first and produces a wrong
@@ -2808,7 +2808,7 @@ def _braked_note(scope, client=None):
     tag = _braked_client_tag(client) if client is not None else None
     oldest = hour - BRAKED_HOURS + 1
     try:
-        fd = os.open(BRAKED_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(path or BRAKED_FILE, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
         return
     try:
@@ -2838,6 +2838,23 @@ def _braked_note(scope, client=None):
             f.truncate()
     except OSError:
         return
+
+
+# RFC-0084: a request for a well-known secret path (.env, .git/, a key, a
+# dump ...) is refused by the gateway before the app is reached, and lands
+# HERE -- counted like a braked request (who, when; never an address), so
+# the health page and the weekly report can say "a scanner looked for
+# secrets". The answer is a plain 404: nothing tells the scanner whether
+# the file exists.
+GUARD_FILE = os.path.join(DATA_DIR, "guard-denied.json")
+
+
+@app.route("/guard", methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+def guard_denied():
+    scope = request.args.get("scope", "")[:120]
+    if scope:
+        _braked_note(scope, _throttle_client(), path=GUARD_FILE)
+    return ("Not found", 404, {"Cache-Control": "no-store", "Content-Type": "text/plain"})
 
 
 @app.get("/throttle")
@@ -3069,6 +3086,18 @@ def internal_throttle_braked():
     """
     try:
         with open(BRAKED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    oldest = int(time.time() // 3600) - BRAKED_HOURS + 1
+    return {"hours": BRAKED_HOURS, "instances": braked_summary(data, oldest)}
+
+
+@app.get("/internal/guard-denied")
+def internal_guard_denied():
+    """RFC-0084: refused secret-path requests per instance, last 24 hours."""
+    try:
+        with open(GUARD_FILE, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         data = {}
