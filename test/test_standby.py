@@ -214,6 +214,19 @@ ok("Text und Mandant stehen in der Statusdatei, die identity liest",
    modes["instances"]["crm"]["maintenance"]["message"].startswith("Wir sind um 14")
    and modes["instances"]["crm"]["tenant"] == tid, modes)
 
+# drift (oaapx01, 2026-11-12): the record lost the flag, the modes file kept it
+reg = m.load_registry()
+reg["instances"]["crm"].pop("maintenance", None)
+m.save_registry(reg)
+with contextlib.redirect_stdout(io.StringIO()):
+    said = m.maintenance_set("crm", reg["instances"]["crm"], False, who="joerg")
+modes = json.load(open(m.MODES_FILE, encoding="utf-8"))
+ok("'aus' bei schon geloeschtem Vermerk heilt die Statusdatei",
+   "not in maintenance" in said and not (modes["instances"].get("crm") or {}).get("maintenance"), modes)
+with contextlib.redirect_stdout(io.StringIO()):
+    m.maintenance_set("crm", cur, True, "Wir sind um 14 Uhr wieder da.", who="joerg")
+cur = m.load_registry()["instances"]["crm"]
+
 print("")
 print("identity: 503 fuer alle ausser Administratoren")
 try:

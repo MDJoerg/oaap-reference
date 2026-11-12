@@ -19511,6 +19511,9 @@ def maintenance_set(name, inst, on, message="", who="root", role="root"):
                               "message": (message or "").strip()[:500]}
     else:
         if not maintenance_of(cur):
+            # the record says off -- still rewrite what the gateway reads,
+            # so a modes file that drifted from the record heals here
+            write_instance_modes(reg)
             return "is not in maintenance"
         cur.pop("maintenance", None)
     save_registry(reg)
@@ -22116,6 +22119,13 @@ def _install_from_dir(pkg, args, source):
         reg["instances"][name]["standby_after"] = inst["standby_after"]
     elif preset.get("standby_after"):
         reg["instances"][name]["standby_after"] = int(preset["standby_after"])
+    # RFC-0059: maintenance is the operator's decision about this instance.
+    # Found 2026-11-12 rolling marketplace 0.3.0 out on oaapx01: the
+    # redeploy dropped the flag from the record while instance-modes.json
+    # (what the gateway reads) still held it -- the CLI said "not in
+    # maintenance", every protected route answered 503.
+    if inst and maintenance_of(inst):
+        reg["instances"][name]["maintenance"] = dict(inst["maintenance"])
     # RFC-0068: an exception is the operator's decision, never the app's.
     if inst and egress_exception(inst):
         reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
