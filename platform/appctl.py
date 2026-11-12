@@ -8947,6 +8947,8 @@ METRICS_SENDER_DIR = os.path.join(DATA_DIR, "data", "metrics-sender")
 # node CA's private key (mounted nowhere), and the gateway's own storage
 # (RFC-0054 stage 3).
 BROKER_CERT_DIR = os.path.join(DATA_DIR, "data", "broker-certs")
+# Node-local Mosquitto additions (RFC-0085 stage 1): bridge, queue bound.
+BROKER_CONF_DIR = os.path.join(DATA_DIR, "data", "broker-conf.d")
 BROKER_CA_DIR = os.path.join(DATA_DIR, "data", "broker-ca")
 BROKER_DATA_DIR = os.path.join(DATA_DIR, "data", "broker")   # /mosquitto/data
 CADDY_DATA_DIR = os.path.join(DATA_DIR, "data", "gateway", "caddy-data")
@@ -11451,6 +11453,14 @@ def cmd_broker(args):
               "cross the LAN in the clear")
     else:
         print("  plain port 1883: not published (profile 'broker-plain')")
+    try:
+        extra = sorted(f for f in os.listdir(BROKER_CONF_DIR)
+                       if f.endswith(".conf"))
+    except OSError:
+        extra = []
+    print("  node-local configuration: "
+          + (", ".join(extra) + f" (in {BROKER_CONF_DIR})" if extra
+             else "none"))
 
 
 def _care_known_instances():

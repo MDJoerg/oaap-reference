@@ -326,6 +326,11 @@ services:
       # `oaap broker sync` -- Caddy's own files are root-only and the
       # broker runs as uid 1000. Read-only; the broker never writes it.
       - "${OAAP_DATA_DIR}/data/broker-certs:/mosquitto/certs:ro"
+      # Node-local additions (RFC-0085 stage 1): a hub's bridge to an
+      # entry, an entry's queue bound. Files placed by the operator (uid
+      # 1000, 0600 -- a bridge file holds a key), read-only here, and
+      # untouched by `oaap update`, unlike the template above.
+      - "${OAAP_DATA_DIR}/data/broker-conf.d:/mosquitto/conf.d:ro"
     command:
       - /bin/sh
       - -c
@@ -333,11 +338,16 @@ services:
       # place -- Mosquitto refuses to start on a listener whose files are
       # missing, and a node with no certificate yet must still have its
       # broker. Last in the file on purpose: certfile/keyfile/tls_version
-      # belong to the listener named just above them.
+      # belong to the listener named just above them. The node-local
+      # files come after it and are included only when there is one:
+      # global options and bridge sections only, never listener options.
       - |
         sed "s/__INTERNAL_API_KEY__/$$INTERNAL_API_KEY/g" /mosquitto-template/mosquitto.conf.template > /tmp/mosquitto.conf
         if [ -r /mosquitto/certs/server.crt ] && [ -r /mosquitto/certs/server.key ]; then
           printf '\nlistener 8883\ncertfile /mosquitto/certs/server.crt\nkeyfile /mosquitto/certs/server.key\ntls_version tlsv1.2\n' >> /tmp/mosquitto.conf
+        fi
+        if ls /mosquitto/conf.d/*.conf >/dev/null 2>&1; then
+          printf '\ninclude_dir /mosquitto/conf.d\n' >> /tmp/mosquitto.conf
         fi
         exec /usr/sbin/mosquitto -c /tmp/mosquitto.conf
 

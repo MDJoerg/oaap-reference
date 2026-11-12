@@ -375,6 +375,7 @@ a.has_profile = lambda p: p == "broker"
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     a.cmd_broker(argparse.Namespace(action="show"))
+ok("show nennt knotenlokale Zusaetze (keine)", "node-local configuration: none" in buf.getvalue(), buf.getvalue())
 ok("show ohne Zertifikat sagt es und nennt, wie man eines macht",
    "no certificate yet" in buf.getvalue() and "plain port 1883: not published" in buf.getvalue()
    and "not published (needs the profile 'exposed')" in buf.getvalue(), buf.getvalue())
@@ -392,6 +393,14 @@ ok("... steht am ENDE der Konfiguration (certfile/keyfile gehoeren zum Listener 
 ok("... mit TLS 1.2 oder neuer", "tls_version tlsv1.2" in broker)
 ok("der Broker selbst veroeffentlicht weiterhin keinen Port", "ports:" not in broker)
 ok("der Ordner der CA wird nirgends eingehaengt", "broker-ca" not in dc)
+ok("knotenlokale Zusaetze (RFC-0085): Ordner NUR lesend eingehaengt",
+   '"${OAAP_DATA_DIR}/data/broker-conf.d:/mosquitto/conf.d:ro"' in broker)
+ok("... eingebunden nur, wenn eine .conf darin liegt, und NACH dem TLS-Listener",
+   "if ls /mosquitto/conf.d/*.conf >/dev/null 2>&1; then" in broker
+   and broker.index("listener 8883") < broker.index("include_dir /mosquitto/conf.d")
+   < broker.index("exec /usr/sbin/mosquitto"))
+ok("... die Vorlage selbst bindet nichts ein (sie gehoert dem Update)",
+   "include" not in read(PLATFORM, "services", "broker", "mosquitto.conf.template"))
 plain = read(PLATFORM, "docker-compose.broker-plain.yml")
 ok("das Klartext-Overlay scheitert LAUT ohne Adresse (`:?`), statt auf allen Schnittstellen zu veroeffentlichen",
    "${BROKER_PLAIN_BIND:?" in plain and '"1883:1883"' not in plain)
