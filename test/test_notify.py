@@ -471,6 +471,25 @@ ok("… mit frischen Fehlversuchen nach einer Stunde: wieder eine", a.notify_log
 for fn in os.listdir(a.NOTIFY_OUTBOX_DIR):
     os.remove(os.path.join(a.NOTIFY_OUTBOX_DIR, fn))
 
+print("=== RFC-0081: das eigene Archiv eines Mandanten ===")
+with open(a._identity_users_path(), "w", encoding="utf-8") as f:
+    json.dump([{"username": "joerg", "roles": ["server_admin"], "active": True,
+                "tenant": dflt, "email": "joerg@node.example"}], f)
+a.notify_list_set(tid, "Mandantenverwaltung", a.notify_parse_entries("Mandanten-Admins"))
+a.notify_route_set(tid, "backup.failed", [], "")
+for fn in os.listdir(a.NOTIFY_OUTBOX_DIR):
+    os.remove(os.path.join(a.NOTIFY_OUTBOX_DIR, fn))
+SENT.clear()
+a.notify_event("backup.failed", tid, text="eigenes Archiv: tar exit 2", own=True)
+a.notify_event("backup.failed", tid, text="Knotenarchiv: tar exit 2")
+a.notify_deliver()
+ok("niemand erreichbar: das EIGENE Archiv geht an die Serverbesitzer (der Knoten hört es sonst nie), "
+   "das Knotenarchiv nicht (das hört der Knoten selbst)",
+   len(SENT) == 1 and SENT[0]["rcpts"]["to"] == ["joerg@node.example"]
+   and "eigenes Archiv" in SENT[0]["body"], [(m["subject"], m["body"][:80]) for m in SENT])
+ok("… mit dem Link auf die Seite „Sicherung“ dieses Mandanten",
+   SENT and "/tenant/backup?tenant=verein" in SENT[0]["body"], SENT and SENT[0]["body"])
+
 print("=== die Tür ===")
 with open(a._identity_users_path(), "w", encoding="utf-8") as f:
     json.dump([

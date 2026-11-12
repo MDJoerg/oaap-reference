@@ -2101,7 +2101,8 @@ TENANT_BODY = """
      selbst unter <code>{{ me.label }}.{{ host }}</code>.</p>
   {% endif %}
   <p><a class="btn" href="/tenant/face">Das Gesicht aendern</a>
-     <a class="btn" href="/tenant/egress">Abfluss: jeder Weg hinaus</a></p>
+     <a class="btn" href="/tenant/egress">Abfluss: jeder Weg hinaus</a>
+     <a class="btn" href="/tenant/backup">Sicherung</a></p>
 </div>
 {% if me.rights_url %}
 <div class="card">
@@ -2172,7 +2173,9 @@ TENANT_BODY = """
       <td class="muted">{{ t.created }}</td>
       <td>{% if not t.is_default %}<a class="rowaction"
           href="/tenant/face?tenant={{ t.label }}">Gesicht</a>{% endif %}
-          <a class="rowaction" href="/tenant/egress?tenant={{ t.label }}">Abfluss</a></td></tr>
+          <a class="rowaction" href="/tenant/egress?tenant={{ t.label }}">Abfluss</a>
+          {% if not t.is_default %}<a class="rowaction"
+          href="/tenant/backup?tenant={{ t.label }}">Sicherung</a>{% endif %}</td></tr>
   {% endfor %}
 </table>
 </div>
@@ -5602,6 +5605,160 @@ def _idp_view(t):
 
 
 TENANT_WAIT_SECONDS = 20   # a small JSON file plus one DNS lookup
+
+# --- Sicherung je Mandant (RFC-0081 Stufe 2, oaap.data.backup 2.7) ------------
+
+BACKUP_EXCLUSIONS_FILE = "/apps-registry/backup-exclusions.json"
+BACKUP_TENANTS_DIR = "/apps-registry/backup-tenants"
+TENANT_BACKUP_WAIT = 30
+TENANT_BACKUP_WORDS = {
+    "node": "im Knoten-Backup",
+    "own": "eigenes Archiv",
+    "none": "keine Sicherung",
+}
+
+
+def _tenant_backup_facts(tid):
+    """The same three answers the host gives (tenant_backup_class), read
+    from the files the portal mounts. The host judges every change again."""
+    t = load_tenants().get(tid) or {}
+    b = t.get("backup") or {}
+    ex = (_read_json(BACKUP_EXCLUSIONS_FILE) or {}).get(tid)
+    cls = ("none" if ex and ex.get("class", "none") == "none"
+           else "own" if b.get("class") == "own" else "node")
+    last = _read_json(os.path.join(BACKUP_TENANTS_DIR, tid + ".json")) or {}
+    node_last = _read_json(BACKUP_LAST) or {}
+    return {"label": t.get("label", ""), "class": cls, "word": TENANT_BACKUP_WORDS[cls],
+            "reason": (ex or {}).get("reason", ""), "at": b.get("at", "02:30"),
+            "keep": b.get("keep", 2), "keep_max": b.get("keep_max", 3),
+            "last": {"state": last.get("state", ""),
+                     "when": _when(last.get("finished") or last.get("started")),
+                     "size": _bytes_h(last.get("bytes")) if last.get("bytes") else "",
+                     "message": last.get("message", "")} if last else None,
+            "node_last": {"ok": node_last.get("state", "ok") == "ok",
+                          "when": _when(node_last.get("finished"))} if node_last else None,
+            "node_cls": _backup_class()}
+
+
+TENANT_BACKUP_BODY = """
+<div class="pagehead"><h1>Sicherung: {{ f.label }}</h1></div>
+{% if msg %}<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0">{{ msg }}</p></div>{% endif %}
+<div class="card">
+  <h2>Wie dieser Mandant gesichert wird</h2>
+  <p><span class="dot {{ 'err' if f.class == 'none' else 'ok' }}"></span><strong>{{ f.word }}</strong>
+  {% if f.class == 'none' and f.reason %}<span class="muted">— Grund: {{ f.reason }}</span>{% endif %}</p>
+  {% if f.class == 'node' %}
+  <p class="muted">Seine Daten liegen im nächtlichen Archiv des ganzen Knotens{% if f.node_cls.word %}
+     ({{ f.node_cls.word }}){% endif %}.{% if f.node_last %} Zuletzt {{ f.node_last.when }}{% if not f.node_last.ok %},
+     <span class="err">fehlgeschlagen</span>{% endif %}.{% endif %}</p>
+  {% elif f.class == 'own' %}
+  <p class="muted">Ein eigenes Archiv, täglich <strong>{{ f.at }}</strong>; die {{ f.keep }} neuesten bleiben
+     auf diesem Knoten. Beim Kopieren stehen nur die Apps dieses Mandanten still. Das Archiv sichert, dass
+     die Daten existieren — es lässt sich auf einen leeren Knoten übernehmen (<code>oaap tenant adopt</code>),
+     nicht in einen laufenden zurückspielen.</p>
+  {% if f.last %}<p>Letzter Lauf: {% if f.last.state == 'ok' %}<span class="dot ok"></span>{{ f.last.when }}{% if f.last.size %},
+     {{ f.last.size }}{% endif %}{% elif f.last.state == 'running' %}<span class="dot warn"></span>läuft seit {{ f.last.when }}{% else %}<span
+     class="dot err"></span><span class="err">fehlgeschlagen</span> {{ f.last.when }} <span class="muted">— {{ f.last.message }}</span>{% endif %}</p>
+  {% else %}<p class="muted">Noch kein Lauf.</p>{% endif %}
+  {% else %}
+  <p class="muted">Der Betreiber sichert die Daten dieses Mandanten nicht. Das steht auch im Protokoll des
+     Mandanten.</p>
+  {% endif %}
+</div>
+{% if f.class == 'own' %}
+<div class="card">
+  <h2>Uhrzeit und Anzahl</h2>
+  <form method="post" action="/tenant/backup{{ q }}">
+    <input type="hidden" name="op" value="schedule">
+    <p><label>Uhrzeit (24 h) <input name="at" value="{{ f.at }}" pattern="[0-2][0-9]:[0-5][0-9]" style="max-width:8rem"></label>
+       <label>Archive, die liegen bleiben <input type="number" name="keep" value="{{ f.keep }}" min="1"
+         max="{{ f.keep_max }}" style="max-width:6rem"></label></p>
+    <p class="muted">Zu dieser Uhrzeit stehen die Apps dieses Mandanten kurz still. Höchstens
+       {{ f.keep_max }} Archive (vom Betreiber festgelegt).</p>
+    <button class="btn">Speichern</button>
+  </form>
+</div>
+{% endif %}
+{% if is_server_admin %}
+<div class="card">
+  <h2>Art der Sicherung ändern</h2>
+  <form method="post" action="/tenant/backup{{ q }}">
+    <input type="hidden" name="op" value="class">
+    <p>{% for k, w in words.items() %}<label class="seatopt"><input type="radio" name="class" value="{{ k }}"{% if k == f.class %}
+       checked{% endif %}> {{ w }}</label> {% endfor %}</p>
+    <p><label>Grund (nötig für „keine Sicherung“; steht im Protokoll des Mandanten)
+       <input name="reason" maxlength="300" value="{{ f.reason }}"></label></p>
+    <p><label>Höchstzahl Archive, die der Mandant wählen darf
+       <input type="number" name="keep_max" value="{{ f.keep_max }}" min="1" max="30" style="max-width:6rem"></label></p>
+    <p class="muted">„Eigenes Archiv“ nimmt den Mandanten aus dem Knotenarchiv; sein Archiv läuft zu
+       eigener Uhrzeit und hält nur seine Apps an. Nie laufen zwei Sicherungen zugleich.</p>
+    <button class="btn">Speichern</button>
+  </form>
+</div>
+{% endif %}
+<p><a href="/tenant">Zurück zu {{ "den Mandanten" if is_server_admin else "Mandant" }}</a></p>
+"""
+
+
+def _tenant_backup_target():
+    role, mine = caller_scope()
+    want = (request.values.get("tenant") or "").strip().lower()
+    if role == "server_admin":
+        tid = tenant_id_by_label(want) if want else ""
+    else:
+        tid = mine if not want or tenant_id_by_label(want) == mine else ""
+    if not tid or tid not in load_tenants():
+        return None, role
+    return tid, role
+
+
+@app.get("/tenant/backup")
+def tenant_backup_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, role = _tenant_backup_target()
+    if not tid:
+        return redirect("/tenant?err=1&msg=" + quote("Welcher Mandant? Die Sicherung gibt es je "
+                                                     "Mandant (Mandanten → Sicherung)."), code=303)
+    f = _tenant_backup_facts(tid)
+    q = f"?tenant={quote(f['label'])}" if role == "server_admin" else ""
+    return page(TENANT_BACKUP_BODY, "Sicherung", "tenant", f=f, q=q,
+                is_server_admin=role == "server_admin", words=TENANT_BACKUP_WORDS,
+                msg=request.args.get("msg"), msg_ok=request.args.get("err") is None)
+
+
+@app.post("/tenant/backup")
+def tenant_backup_post():
+    """One request through the spool (action backup-tenant); the host
+    judges role, tenant and the ceiling again from the actor's record."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, role = _tenant_backup_target()
+    if not tid:
+        return redirect("/tenant", code=303)
+    label = (load_tenants().get(tid) or {}).get("label", "")
+    back = "/tenant/backup" + (f"?tenant={quote(label)}&" if role == "server_admin" else "?")
+    args = {}
+    if role == "server_admin":
+        args["tenant"] = tid
+    if request.form.get("op") == "class" and role == "server_admin":
+        args.update({"class": (request.form.get("class") or "")[:8],
+                     "reason": (request.form.get("reason") or "").strip()[:300],
+                     "keep_max": (request.form.get("keep_max") or "").strip()[:3]})
+    else:
+        args.update({"at": (request.form.get("at") or "").strip()[:5],
+                     "keep": (request.form.get("keep") or "").strip()[:3]})
+    res = _queue_with_id(_uuid.uuid4().hex, "", {"action": "backup-tenant", "args": args},
+                         TENANT_BACKUP_WAIT)
+    if res is None:
+        return redirect(back + "err=1&msg=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    return redirect(back + ("" if res.get("ok") else "err=1&") + "msg="
+                    + quote(str(res.get("message") or "")[:600]), code=303)
 FACE_WAIT_SECONDS = 20     # a small JSON file, one small picture, no docker
 
 

@@ -28,7 +28,8 @@ CATALOGUE = {
     "backup.failed": {"category": "critical", "scope": "both", "matter": True,
                       "title": "Backup fehlgeschlagen",
                       "subject": "[{knoten}] Backup fehlgeschlagen"},
-    "backup.missing": {"category": "critical", "scope": "node", "matter": True,
+    # "both" since RFC-0081: a tenant with its own archive can miss one too.
+    "backup.missing": {"category": "critical", "scope": "both", "matter": True,
                        "title": "Kein erfolgreiches Backup seit über 26 Stunden",
                        "subject": "[{knoten}] Kein aktuelles Backup"},
     "disk.full": {"category": "health", "scope": "node", "matter": True,

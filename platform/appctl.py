@@ -2737,7 +2737,7 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "login.locked": "/users"}
 
 
-def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key=""):
+def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False):
     """Put one notification into the outbox -> its file, or "" (never raises:
     a notification that cannot be queued must not break what it reports)."""
     if ntype not in notify.CATALOGUE:
@@ -2749,6 +2749,8 @@ def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key=""):
                 "type": ntype, "op": op, "key": key, "instanz": instanz or "",
                 "kurz": (kurz or "")[:80], "text": (text or "")[:1500],
                 "attempts": 0}
+        if own:
+            item["own"] = True      # the tenant's OWN archive: the node does not hear it
         name = f"{time.time():.6f}-{item['id']}.json"
         tmp = os.path.join(NOTIFY_OUTBOX_DIR, "." + name)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2936,7 +2938,7 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
            "to": len(rcpts["to"]), "cc": len(rcpts["cc"]), "bcc": len(rcpts["bcc"])}
     if not (rcpts["to"] or rcpts["cc"] or rcpts["bcc"]):
         if (not is_node and not from_tenant and op != "test"
-                and notify.CATALOGUE[ntype]["scope"] != "both"):
+                and (notify.CATALOGUE[ntype]["scope"] != "both" or item.get("own"))):
             # Nobody with an address in the tenant's lists: the node's
             # owners hear it rather than nobody (RFC-0080 2.1). Not for a
             # type the node hears itself anyway ("both": a failed backup,
@@ -2974,6 +2976,11 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
                 if item.get("instanz") else "/instances")
     if page == "/health" and not is_node:
         page = "/"
+    if item.get("own") and op != "test":
+        # RFC-0081: the tenant's own archive has its own page -- for its
+        # tenant_admin and, with the label, for the server_admin.
+        page = "/tenant/backup?tenant=" + urllib.parse.quote(
+            (load_tenants().get(item["tenant"]) or {}).get("label", ""), safe="")
     body = notify.body(ntype, op, values, item.get("text", ""),
                        notify_link(item["tenant"] if not is_node or from_tenant else tid, page))
     ok, said, final = notify_smtp(mail, sender, rcpts, subject, body)
@@ -3208,6 +3215,32 @@ def notify_login_locks(now_epoch=None):
     return queued
 
 
+def _notify_tenant_backup_conditions(tid, now):
+    """A tenant's own archive (RFC-0081 2.3): failed, or none for 26 h."""
+    rec = tenant_backup_last(tid)
+    if rec.get("state") == "failed":
+        return ({"type": "backup.failed", "kurz": "", "own": True,
+                 "text": "Das eigene Archiv dieses Mandanten ist fehlgeschlagen"
+                         + (f" ({rec.get('finished', '')[:16].replace('T', ' ')} UTC)"
+                            if rec.get("finished") else "") + ":\n"
+                         + str(rec.get("message") or "ohne Begründung")[:600]}, None)
+    if rec.get("state") == "running":
+        return None, None
+    last_ok = rec.get("last_ok") or ""
+    when = notify._parse(last_ok) if last_ok else None
+    since = notify._parse(((load_tenants().get(tid) or {}).get("backup") or {}).get("since") or "")
+    # A tenant switched to its own archive an hour ago has not missed one.
+    if when is None and since and (now - since).total_seconds() < notify.BACKUP_STALE_HOURS * 3600:
+        return None, None
+    if when is None or (now - when).total_seconds() > notify.BACKUP_STALE_HOURS * 3600:
+        return None, {"type": "backup.missing", "kurz": "", "own": True,
+                      "text": "Seit über 26 Stunden gibt es kein erfolgreiches eigenes "
+                              "Archiv dieses Mandanten"
+                              + (f" (zuletzt {last_ok[:16].replace('T', ' ')} UTC)."
+                                 if last_ok else ".")}
+    return None, None
+
+
 def notify_conditions(facts=None, now=None):
     """The conditions true now, per scope: {tid: {key: condition}}."""
     now = now or notify.now_utc()
@@ -3216,9 +3249,21 @@ def notify_conditions(facts=None, now=None):
     cur = {tid: {} for tid in load_tenants()}
     cur.setdefault(dflt, {})
     failed, missing = _notify_backup_conditions(now)
+    tenants_all = load_tenants()
+    ex_all = excluded_tenants()
     if failed:
         for tid in cur:
-            cur[tid]["backup.failed"] = dict(failed)
+            # RFC-0081: the node archive's failure concerns only the tenants
+            # whose data it carries -- not one with its own archive or none.
+            if tid == dflt or tenant_backup_class(tid, tenants_all, ex_all) == "node":
+                cur[tid]["backup.failed"] = dict(failed)
+    for tid in cur:
+        if tid != dflt and tenant_backup_class(tid, tenants_all, ex_all) == "own":
+            tf, tm = _notify_tenant_backup_conditions(tid, now)
+            if tf:
+                cur[tid]["backup.failed"] = tf
+            if tm:
+                cur[tid]["backup.missing"] = tm
     if missing:
         cur[dflt]["backup.missing"] = missing
     pct = metrics.read_disk_percent(DATA_DIR)
@@ -3287,7 +3332,7 @@ def notify_matters(facts=None, now=None):
                     continue      # removed while down: nothing came back, nothing to mail
                 queued.append(notify_event(rec["type"], tid, instanz=rec.get("instanz", ""),
                                            kurz=rec.get("kurz", ""), text=rec.get("text", ""),
-                                           op=op, key=key))
+                                           op=op, key=key, own=bool(rec.get("own"))))
             if new:
                 matters[tid] = new
             else:
@@ -5239,7 +5284,12 @@ _MODEL_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 _MODEL_GROUP_KEY_RE = re.compile(r"[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+")
 
 
+LAST_DIE = ""      # the last refusal, for a caller that records it (RFC-0081 tenant runs)
+
+
 def die(msg):
+    global LAST_DIE
+    LAST_DIE = str(msg)
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -28529,6 +28579,24 @@ def cmd_process_deploys(_args):
                     ok = True
                 except (ValueError, OSError) as e:
                     msg = str(e)
+        elif action == "backup-tenant":
+            # RFC-0081 stage 2: a tenant's class (server_admin) or the hour
+            # and count of its own archive (also its tenant_admin, D4).
+            # Role and tenant from the ACTOR's record, judged again here.
+            a = req.get("args") if isinstance(req.get("args"), dict) else {}
+            tid_b, role_b, err_b = acting_tenant(actor, str(a.get("tenant") or ""))
+            if not tid_b:
+                msg = err_b or "requires server_admin or tenant_admin"
+            else:
+                try:
+                    msg = backup_tenant_set(
+                        tid_b, a.get("class") or None, str(a.get("at") or "") or None,
+                        int(a["keep"]) if str(a.get("keep") or "").isdigit() else None,
+                        int(a["keep_max"]) if str(a.get("keep_max") or "").isdigit() else None,
+                        str(a.get("reason") or ""), who=actor or "portal", role=role_b)
+                    ok = True
+                except (ValueError, OSError) as e:
+                    msg = str(e)
         elif action == "artifact-export":
             # Authorising a DOWNLOAD -- the portal streams the file, but
             # only after this answer (spec oaap.apps.runtime 2.14).
@@ -30366,6 +30434,272 @@ def backup_test_left_out(reg, excluded=None):
             and resolve_tenant(i.get("tenant")) not in excluded}
 
 
+# ------------------------------------------------ a tenant's class (RFC-0081 stage 2)
+
+TENANT_BACKUP_DIR = os.path.join(APPS_DIR, "backup-tenants")
+TENANT_BACKUP_UNIT = "oaap-tenant-backup@"
+TENANT_BACKUP_KEEP_MAX = 3          # the operator's default ceiling (D4)
+BACKUP_LOCK_FILE = os.path.join(DATA_DIR, "data", "backup.lock")
+BACKUP_LOCK_WAIT = 3600
+
+
+@contextlib.contextmanager
+def backup_lock(wait=None, on_wait=None):
+    """One backup at a time on this node (RFC-0081 2.5): the node archive
+    and the tenant archives both stop containers and both tar. A run that
+    finds the lock taken waits up to an hour, then gives up with a reason."""
+    try:
+        import fcntl
+    except ImportError:                       # not a Linux node (tests on Windows)
+        yield
+        return
+    os.makedirs(os.path.dirname(BACKUP_LOCK_FILE), exist_ok=True)
+    fd = os.open(BACKUP_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.time() + (BACKUP_LOCK_WAIT if wait is None else wait)
+        said = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    if on_wait:
+                        on_wait()
+                    die("another backup is running on this node and did not finish "
+                        "within an hour -- this run gave up (RFC-0081 2.5)")
+                if not said:
+                    print("Another backup is running on this node -- waiting for it ...",
+                          flush=True)
+                    said = True
+                time.sleep(5)
+        yield
+    finally:
+        os.close(fd)
+
+
+def tenant_backup_class(tid, tenants=None, excluded=None):
+    """node | own | none -- the tenant's backup class. `none` IS the
+    exclusion of 2.1.2 (one writer: the exclusion file)."""
+    excluded = excluded_tenants() if excluded is None else excluded
+    if tid in excluded and excluded[tid].get("class", "none") == "none":
+        return "none"
+    t = (load_tenants() if tenants is None else tenants).get(tid) or {}
+    return "own" if (t.get("backup") or {}).get("class") == "own" else "node"
+
+
+def tenant_backup_view(tid):
+    """What the portal and `status` show for one tenant."""
+    tenants = load_tenants()
+    t = tenants.get(tid) or {}
+    b = t.get("backup") or {}
+    ex = excluded_tenants()
+    cls = tenant_backup_class(tid, tenants, ex)
+    return {"class": cls, "at": b.get("at", ""), "keep": b.get("keep"),
+            "keep_max": b.get("keep_max", TENANT_BACKUP_KEEP_MAX),
+            "reason": (ex.get(tid) or {}).get("reason", "") if cls == "none" else "",
+            "last": tenant_backup_last(tid)}
+
+
+def tenant_backup_last(tid):
+    try:
+        with open(os.path.join(TENANT_BACKUP_DIR, tid + ".json"), encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _tenant_backup_record(tid, state, **fields):
+    os.makedirs(TENANT_BACKUP_DIR, exist_ok=True)
+    rec = tenant_backup_last(tid) if state != "running" else {}
+    if state == "running":
+        rec = {"started": _iso_now()}
+    else:
+        rec["finished"] = _iso_now()
+    rec.update(state=state, **fields)
+    if state == "ok":
+        rec["last_ok"] = rec["finished"]
+        rec.pop("message", None)
+    else:
+        rec.setdefault("last_ok", tenant_backup_last(tid).get("last_ok", ""))
+    tmp = os.path.join(TENANT_BACKUP_DIR, "." + tid + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=2)
+    os.replace(tmp, os.path.join(TENANT_BACKUP_DIR, tid + ".json"))
+    os.chmod(os.path.join(TENANT_BACKUP_DIR, tid + ".json"), 0o644)
+
+
+def tenant_backup_target(tid):
+    """Beside the node's archives, one directory per tenant id (an id, not
+    the label: a rename must not orphan the archives). Where the node's
+    archives go is decided at the machine (2.4); this follows it."""
+    try:
+        with open(BACKUP_SCHEDULE_FILE, encoding="utf-8") as f:
+            base = (json.load(f) or {}).get("target") or BACKUP_DIR_DEFAULT
+    except (OSError, ValueError):
+        base = BACKUP_DIR_DEFAULT
+    return os.path.join(base, "tenants", tid)
+
+
+def _tenant_timer_write(tid, at, enabled):
+    """The tenant's own timer: a template unit, one drop-in per tenant."""
+    svc = os.path.join(SYSTEMD_DIR, TENANT_BACKUP_UNIT + ".service")
+    tmr = os.path.join(SYSTEMD_DIR, TENANT_BACKUP_UNIT + ".timer")
+    want_svc = "\n".join([
+        "# Written by OAAP (RFC-0081 stage 2): a tenant's own archive.",
+        "[Unit]", "Description=OAAP tenant archive (%i)", "",
+        "[Service]", "Type=oneshot", f"Environment=OAAP_DATA_DIR={DATA_DIR}",
+        f"ExecStart={sys.executable} {os.path.abspath(__file__)} backup tenant-run %i", ""])
+    want_tmr = "\n".join([
+        "# Written by OAAP (RFC-0081 stage 2).",
+        "[Unit]", "Description=OAAP tenant archive timer (%i)", "",
+        "[Timer]", "Persistent=true", "RandomizedDelaySec=120", "",
+        "[Install]", "WantedBy=timers.target", ""])
+    for path, text in ((svc, want_svc), (tmr, want_tmr)):
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() == text:
+                    continue
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    unit = f"{TENANT_BACKUP_UNIT}{tid}.timer"
+    d = os.path.join(SYSTEMD_DIR, unit + ".d")
+    if enabled:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "when.conf"), "w", encoding="utf-8") as f:
+            f.write("\n".join(["# Written by OAAP (RFC-0081).", "[Timer]", "OnCalendar=",
+                                f"OnCalendar=*-*-* {at}:00", ""]))
+        _systemctl("daemon-reload")
+        _systemctl("enable", unit)
+        _systemctl("restart", unit)
+    else:
+        _systemctl("disable", "--now", unit)
+        shutil.rmtree(d, ignore_errors=True)
+        _systemctl("daemon-reload")
+
+
+def backup_tenant_set(tid, cls=None, at=None, keep=None, keep_max=None, reason="",
+                      who="root", role="server_admin"):
+    """Change a tenant's backup class or its own archive's hour and count
+    -> the sentence. A tenant_admin may change only hour and count of an
+    `own` archive, within the operator's ceiling (D4); everything else is
+    the server_admin's."""
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        raise ValueError("no such tenant on this node")
+    label = t.get("label", tid)
+    cur = tenant_backup_class(tid, tenants)
+    b = dict(t.get("backup") or {})
+    if role != "server_admin":
+        if cls is not None or keep_max is not None:
+            raise ValueError("the backup class is the operator's -- ask your server_admin")
+        if cur != "own":
+            raise ValueError("this tenant is backed up with the node; its hour is the "
+                             "operator's")
+    if at:
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(at)):
+            raise ValueError("the time wants HH:MM in 24-hour form, e.g. 02:30")
+    if keep_max is not None:
+        keep_max = int(keep_max)
+        if not 1 <= keep_max <= 30:
+            raise ValueError("keep-max: between 1 and 30")
+    ceiling = keep_max or int(b.get("keep_max") or TENANT_BACKUP_KEEP_MAX)
+    if keep is not None:
+        keep = int(keep)
+        if not 1 <= keep <= ceiling:
+            raise ValueError(f"keep: between 1 and {ceiling} archives (the operator's ceiling)")
+    if cls is not None and cls not in ("node", "own", "none"):
+        raise ValueError("a tenant's class is one of: node, own, none")
+    if cls is not None and tid == default_tenant_id() and cls != "node":
+        raise ValueError("the node's own tenant IS the node archive -- declare the node's "
+                         "class instead (oaap backup class)")
+    new_cls = cls or cur
+    if new_cls == "none":
+        if cur != "none":
+            if not (reason or "").strip():
+                raise ValueError('say why, in words the customer can read: --reason "..."')
+            ex = load_backup_exclusions()
+            ex[tid] = {"reason": reason.strip()[:300], "who": who, "since": _iso_now(),
+                       "label": label}
+            save_backup_exclusions(ex)
+        b = {}
+    else:
+        if cur == "none":
+            ex = load_backup_exclusions()
+            ex.pop(tid, None)
+            save_backup_exclusions(ex)
+        if new_cls == "own":
+            b = {"class": "own", "at": at or b.get("at") or "02:30",
+                 "keep": keep or b.get("keep") or 2, "keep_max": ceiling,
+                 "who": who, "since": b.get("since") if cur == "own" else _iso_now()}
+            if b["keep"] > ceiling:
+                b["keep"] = ceiling
+        else:
+            b = {}
+    tenants = load_tenants()
+    if b:
+        tenants[tid]["backup"] = b
+    else:
+        tenants[tid].pop("backup", None)
+    save_tenants(tenants)
+    try:
+        _tenant_timer_write(tid, b.get("at", ""), new_cls == "own")
+    except OSError as e:
+        print(f"WARNING: the tenant timer could not be written: {e}", file=sys.stderr)
+    words = {"node": "im Knoten-Backup", "own": "eigenes Archiv", "none": "keine Sicherung"}
+    detail = words[new_cls] + (f", täglich {b['at']}, {b['keep']} Archiv(e) "
+                               f"(höchstens {b['keep_max']})" if new_cls == "own" else "")
+    if new_cls == "none":
+        detail += f" -- {reason.strip()}" if reason else ""
+    audit_tenant("backup.tenant", tid, subject=label, who=who, role=role, detail=detail)
+    return f"Sicherung von {label}: {detail}."
+
+
+def _tenant_backup_prune(d, keep):
+    files = sorted(f for f in os.listdir(d) if f.startswith("oaap-tenant-")
+                   and f.endswith(".tar.gz"))
+    for f in files[:-keep] if keep and len(files) > keep else []:
+        os.remove(os.path.join(d, f))
+
+
+def cmd_backup_tenant_run(tid):
+    """The tenant timer's job: its own archive, under the node's backup
+    lock, recorded for the portal and the notifications, then pruned."""
+    global LAST_DIE
+    LAST_DIE = ""
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t or tenant_backup_class(tid, tenants) != "own":
+        die("this tenant has no own archive (oaap backup tenant <label> --class own)")
+    b = t.get("backup") or {}
+    d = tenant_backup_target(tid)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out_file = f"oaap-tenant-{t.get('label', tid)}-{socket.gethostname()}-{stamp}.tar.gz"
+    t0 = time.monotonic()
+    try:
+        with backup_lock():
+            _tenant_backup_record(tid, "running", target=d)
+            os.makedirs(d, mode=0o700, exist_ok=True)
+            path = _tenant_archive(tid, t.get("label", tid), d, out_file)
+    except SystemExit:
+        _tenant_backup_record(tid, "failed", target=d,
+                              message=(LAST_DIE or "see the journal of the tenant "
+                                                   "timer")[:600])
+        raise
+    except Exception as e:                          # noqa: BLE001 - recorded, then raised
+        # Whatever stops it (a target that cannot be made, a full disk) is
+        # recorded -- a run that dies unrecorded is a backup nobody misses.
+        _tenant_backup_record(tid, "failed", target=d,
+                              message=f"{type(e).__name__}: {e}"[:600])
+        raise
+    _tenant_backup_record(tid, "ok", archive=path, bytes=os.path.getsize(path),
+                          total_seconds=round(time.monotonic() - t0))
+    _tenant_backup_prune(d, int(b.get("keep") or 2))
+
+
 def cmd_backup_class(args):
     """`oaap backup class [offsite|local|none] [--reason ...]` and
     `oaap backup test-instances on|off` (RFC-0081 stage 1)."""
@@ -30486,7 +30820,11 @@ def cmd_backup_status(_args):
     for tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
         label = t.get("label", "?")
         n = len(tenant_instances(reg, tid))
-        if tid in ex:
+        if tenant_backup_class(tid, tenants, ex) == "own":
+            v = tenant_backup_view(tid)
+            print(f"  {label}: OWN ARCHIVE, daily {v['at']}, keep {v['keep']} "
+                  f"({n} instance(s)) -- last run: {v['last'].get('state', 'never')}")
+        elif tid in ex:
             e = ex[tid]
             print(f"  {label}: EXCLUDED from the node backup "
                   f"({n} instance(s))")
@@ -30755,6 +31093,30 @@ def cmd_backup(args):
         return cmd_backup_status(args)
     if args.action in ("class", "test-instances"):
         return cmd_backup_class(args)
+    if args.action == "tenant-run":
+        return cmd_backup_tenant_run(resolve_tenant(args.target or "") or (args.target or ""))
+    if args.action == "tenant":
+        tid = resolve_tenant_arg(args.target or "")
+        if not (getattr(args, "cls", None) or args.at or args.keep is not None
+                or getattr(args, "keep_max", None) is not None):
+            v = tenant_backup_view(tid)
+            print(f"{args.target}: {v['class']}"
+                  + (f", daily {v['at']}, keep {v['keep']} (max {v['keep_max']})"
+                     if v["class"] == "own" else "")
+                  + (f" -- {v['reason']}" if v["reason"] else ""))
+            if v["last"]:
+                print(f"  last run: {v['last'].get('state')} "
+                      f"{str(v['last'].get('finished') or v['last'].get('started') or '')[:16]}"
+                      + (f" -- {v['last'].get('message')}" if v["last"].get("message") else ""))
+            return
+        try:
+            print(backup_tenant_set(tid, getattr(args, "cls", None), args.at or None,
+                                    args.keep, getattr(args, "keep_max", None),
+                                    args.reason or "",
+                                    who=os.environ.get("SUDO_USER") or "root"))
+        except ValueError as e:
+            die(str(e))
+        return
     import datetime
     import socket
     import time
@@ -30786,9 +31148,20 @@ def cmd_backup(args):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, out_file)
     if tid:
-        return _tenant_archive(tid, (trec or {}).get("label", want_tenant),
-                               out_dir, out_file)
+        with backup_lock():
+            return _tenant_archive(tid, (trec or {}).get("label", want_tenant),
+                                   out_dir, out_file)
+    with backup_lock(on_wait=lambda: _record_backup_run(
+            "failed", message="another backup held the lock for an hour",
+            target=out_path)):
+        return _node_archive(out_dir, out_file, out_path)
 
+
+def _node_archive(out_dir, out_file, out_path):
+    """The node archive (oaap.data.backup 2.2) -- under backup_lock()."""
+    import datetime
+    import socket
+    import time
     env = {}
     try:
         with open(os.path.join(APP_DIR, ".env"), encoding="utf-8") as f:
@@ -30817,13 +31190,22 @@ def cmd_backup(args):
     # day: the day the original is gone.
     _ex = excluded_tenants()
     _all_tenants = load_tenants()
+    # RFC-0081 stage 2: a tenant with its OWN archive is left out of this
+    # one like an excluded tenant -- not copied twice, not stopped twice --
+    # and recorded as such, so a restore says where its data is.
+    for _tid, _t in _all_tenants.items():
+        if _tid not in _ex and tenant_backup_class(_tid, _all_tenants, _ex) == "own":
+            _ex[_tid] = {"reason": "has its own archive (RFC-0081, oaap backup tenant)",
+                         "who": (_t.get("backup") or {}).get("who", ""),
+                         "since": (_t.get("backup") or {}).get("since", ""),
+                         "class": "own"}
     manifest["tenants_included"] = sorted(
         t.get("label", tid) for tid, t in _all_tenants.items()
         if tid not in _ex)
     manifest["tenants_excluded"] = [
         {"tenant": tid, "label": _all_tenants[tid].get("label", tid),
          "reason": e.get("reason", ""), "who": e.get("who", ""),
-         "since": e.get("since", ""),
+         "since": e.get("since", ""), "class": e.get("class", "none"),
          "instances": sorted(tenant_instances(reg, tid))}
         for tid, e in sorted(_ex.items())]
     # RFC-0081 2.2: test instances left out by the switch -- recorded like
@@ -33414,7 +33796,7 @@ def build_parser():
                         help="platform backup: create, schedule, status, exclude or include a tenant")
     pb.add_argument("action", choices=["create", "schedule", "exclude",
                                        "include", "status", "class",
-                                       "test-instances"])
+                                       "test-instances", "tenant", "tenant-run"])
     pb.add_argument("target", nargs="?", help="tenant label for "
                                               "exclude/include; offsite|local|none "
                                               "for class; on|off for test-instances")
@@ -33427,7 +33809,12 @@ def build_parser():
                     help="exclude: why, in words the customer can read — it "
                          "goes into THEIR audit log; class none: why this node "
                          "has no backup")
-    pb.add_argument("--at", default="", help="schedule: hour HH:MM (24h)")
+    pb.add_argument("--at", default="", help="schedule / tenant: hour HH:MM (24h)")
+    pb.add_argument("--class", dest="cls", default=None, choices=["node", "own", "none"],
+                    help="tenant: in the node archive (node), its own archive on its own "
+                         "timer (own), or none (with --reason) -- RFC-0081")
+    pb.add_argument("--keep-max", dest="keep_max", type=int, default=None,
+                    help="tenant: the ceiling a tenant_admin may choose for --keep")
     pb.add_argument("--keep", type=int, default=None,
                     help="schedule: how many archives stay on this node")
     pb.add_argument("--on", action="store_true", help="schedule: arm the timer")
