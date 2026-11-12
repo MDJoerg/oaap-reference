@@ -131,6 +131,29 @@ if [ -f "$ENVF" ] && ! grep -q '^BROKER_RELAY_KEY=' "$ENVF"; then
   say "  Done."
 fi
 
+# --- the fleet's watching principal (RFC-0085 stage 2) ---
+# 'oaap.watch' reads the broker's own counters ($SYS, which no key may read)
+# and, on a hub, every node's branch for the fleet service. It never
+# writes. Generated unconditionally like the relay's secret; identity is
+# recreated so that it knows the new secret at once (the update's 'up -d'
+# ran before this line existed), and 'fleet' where the node is a hub.
+if [ -f "$ENVF" ] && ! grep -q '^BROKER_WATCH_KEY=' "$ENVF"; then
+  say ""
+  say "Adding the fleet watch's broker secret (RFC-0085 stage 2) ..."
+  umask 077
+  printf 'BROKER_WATCH_KEY=%s\n' \
+    "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$ENVF"
+  docker compose --project-directory "$APP_DIR" --project-name oaap \
+    up -d --no-deps identity >/dev/null 2>&1 \
+    || say "  WARNING: identity could not be recreated — run 'docker compose --project-directory $APP_DIR --project-name oaap up -d identity'."
+  if grep -q '"fleet-hub"' "$OAAP_DATA_DIR/apps/node.json" 2>/dev/null; then
+    docker compose --project-directory "$APP_DIR" --project-name oaap \
+      --profile broker --profile store --profile fleet-hub up -d --no-deps fleet >/dev/null 2>&1 \
+      || say "  WARNING: the fleet service could not be recreated — see 'docker compose ps'."
+  fi
+  say "  Done."
+fi
+
 # --- the node rule of closed egress (RFC-0068 §3.2) ---
 # Before the networks are looked at, because a closed instance without the
 # rule counts as a fault there.

@@ -4649,7 +4649,12 @@ PROFILE_LABELS = {
                     "ist für jeden im Netz lesbar) nur auf der privaten "
                     "LAN-Adresse dieses Knotens, für Geräte, die kein TLS "
                     "sprechen (RFC-0054 §3). Braucht 'broker'. Ab Werk aus.",
-    "gateway-only": "Nur-Gateway-Knoten — die Instanz-Ports 8100-8199 sind "
+    "fleet-hub": "Zentrale der Flotte — startet den Dienst 'fleet', der "
+                 "Lebenszeichen, Status und Meldungen aller Knoten liest "
+                 "und über die Verteiler dieses Knotens meldet, wenn ein "
+                 "Knoten schweigt oder eine Brücke fehlt (RFC-0085 §8). "
+                 "Braucht 'broker' und 'store'.",
+    "gateway-only":"Nur-Gateway-Knoten — die Instanz-Ports 8100-8199 sind "
                     "von außen nicht erreichbar; Apps nur über Namen am "
                     "Gateway (80/443).",
     "remote-access": "Fernzugang-Knoten — trägt den WireGuard-Zugang von "

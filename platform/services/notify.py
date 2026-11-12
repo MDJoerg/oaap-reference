@@ -79,6 +79,25 @@ CATALOGUE = {
     "report.weekly": {"category": "operations", "scope": "both", "matter": False,
                       "title": "Wochenbericht",
                       "subject": "[{knoten}] Wochenbericht {kurz}"},
+    # RFC-0085 stage 2: the fleet, raised by the hub (and hub.unreachable by
+    # an entry). The node's name is the short word: "Instanz:" would be
+    # wrong in the body. Closing a matter is the "back" message (node.back,
+    # bridge.back in the RFC), with how long it lasted.
+    "node.silent": {"category": "health", "scope": "node", "matter": True,
+                    "title": "Ein Knoten der Flotte meldet sich nicht mehr",
+                    "subject": "[{knoten}] Knoten schweigt: {kurz}"},
+    "bridge.down": {"category": "health", "scope": "node", "matter": True,
+                    "title": "Die Brücke zu einem Eingang ist getrennt",
+                    "subject": "[{knoten}] Brücke getrennt: {kurz}"},
+    "broker.queue": {"category": "health", "scope": "node", "matter": True,
+                     "title": "Die Warteschlange eines Brokers füllt sich",
+                     "subject": "[{knoten}] Warteschlange voll: {kurz}"},
+    "node.loss": {"category": "health", "scope": "node", "matter": False,
+                  "title": "Ein Knoten hat Messwerte verloren",
+                  "subject": "[{knoten}] Messwerte verloren: {kurz}"},
+    "hub.unreachable": {"category": "critical", "scope": "node", "matter": True,
+                        "title": "Die Zentrale der Flotte ist nicht erreichbar",
+                        "subject": "[{knoten}] Zentrale nicht erreichbar: {kurz}"},
 }
 
 # RFC-0083 2.3: how a routing line delivers. "now" -- a mail at once (and,
@@ -358,6 +377,19 @@ def matter_ops(current, stored, now):
     return ops, new
 
 
+def span_words(seconds):
+    """How long a matter lasted, in German words: "7 Minuten",
+    "2 Stunden 5 Minuten", "3 Tage 4 Stunden"."""
+    m = max(0, int(seconds) // 60)
+    d, h, mm = m // 1440, m % 1440 // 60, m % 60
+    word = lambda n, one, many: f"{n} {one if n == 1 else many}"
+    if d:
+        return word(d, "Tag", "Tage") + (f" {word(h, 'Stunde', 'Stunden')}" if h else "")
+    if h:
+        return word(h, "Stunde", "Stunden") + (f" {word(mm, 'Minute', 'Minuten')}" if mm else "")
+    return word(mm, "Minute", "Minuten") if mm else "weniger als eine Minute"
+
+
 def within_limit(stamps, now, per_hour):
     """-> (allowed, kept stamps) for one more sending."""
     cut = now - timedelta(hours=1)
@@ -479,6 +511,8 @@ def body(ntype, op, values, text, link=""):
         lines.append(f"Ort: {values['ort']}")
     if values.get("instanz"):
         lines.append(f"Instanz: {values['instanz']}")
+    if op == "close" and values.get("dauer"):
+        lines.append(f"Dauer: {values['dauer']}")
     if text:
         lines += ["", "Zuvor gemeldet:" if op == "close" else "", text]
         if not lines[-2]:

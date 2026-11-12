@@ -96,6 +96,9 @@ services:
       # principal 'oaap.relay'). Held by identity and 'relay' only --
       # never by the broker, which only asks identity, nor by 'twin'.
       BROKER_RELAY_KEY: "${BROKER_RELAY_KEY:-}"
+      # Checks the fleet's watching principal 'oaap.watch' (RFC-0085 stage
+      # 2): reads only. Held by identity and 'fleet', and read by the host.
+      BROKER_WATCH_KEY: "${BROKER_WATCH_KEY:-}"
       # The root of the metrics branch (RFC-0052 2, RFC-0054 6): nobody
       # but the matching node key writes under it. Unset means the
       # default, 'oaap-node'.
@@ -385,3 +388,29 @@ services:
       # twin-secrets.json (every tenant schema's role/password), read-only,
       # the same mount 'twin' already has.
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+
+  # The fleet service (RFC-0085 §8, stage 2) -- gated by the node profile
+  # 'fleet-hub' (which needs 'broker' and 'store'). The twin's image again,
+  # run with fleet.py: it reads every node's alive/status/broker/events and
+  # the bridges' state as the platform principal 'oaap.watch' (reads only,
+  # checked by identity) and writes what it saw into data/fleet/. Judging
+  # and mail are the host's minute job (RFC-0080: only the host sends).
+  # No port, no gateway route -- it only ever calls out, to 'broker'.
+  fleet:
+    build: ./services/twin
+    profiles: ["fleet-hub"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["python", "-u", "fleet.py"]
+    depends_on:
+      - broker
+    environment:
+      BROKER_WATCH_KEY: "${BROKER_WATCH_KEY:-}"
+      OAAP_METRICS_ROOT: "${OAAP_METRICS_ROOT:-}"
+    volumes:
+      # state.json and the nodes' status documents, 0600; the host reads it
+      - "${OAAP_DATA_DIR}/data/fleet:/fleet"

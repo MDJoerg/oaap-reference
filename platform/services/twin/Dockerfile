@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # STATE 132, is the reason this comment exists). relay.py is the same image
 # run with a different command by the 'relay' service (oaap.data.twin 0.3).
 # timeseries.py is the time-series driver (RFC-0086), ts_admin.py the
-# host's door into it (enable, the minutely job, show).
-COPY app.py relay.py timeseries.py ts_admin.py ./
+# host's door into it (enable, the minutely job, show). fleet.py is the
+# hub's fleet service (RFC-0085 stage 2), run by the 'fleet' service.
+COPY app.py relay.py timeseries.py ts_admin.py fleet.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]

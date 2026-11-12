@@ -113,6 +113,7 @@ import advisories  # noqa: E402
 import images  # noqa: E402
 # ... and who hears about it (RFC-0080): lists, catalogue, routing.
 import notify  # noqa: E402
+import fleet_watch  # noqa: E402
 # ... and what it says once a week (RFC-0083): ledger, report, Markdown.
 import report  # noqa: E402
 # ... and the secret files it refuses and looks for (RFC-0084).
@@ -2741,12 +2742,20 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "bulk.halted": "/store", "rebuild.failed": "/store",
                 "confirm.pending": "/store", "instance.down": "/instances/{instanz}",
                 "exposure.found": "/instances/{instanz}",
-                "login.locked": "/users"}
+                "login.locked": "/users", "node.silent": "/health",
+                "bridge.down": "/health", "broker.queue": "/health",
+                "node.loss": "/health", "hub.unreachable": "/health"}
 
 
-def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False):
+def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False,
+                 dauer=""):
     """Put one notification into the outbox -> its file, or "" (never raises:
-    a notification that cannot be queued must not break what it reports)."""
+    a notification that cannot be queued must not break what it reports).
+
+    RFC-0085 stage 2: on a node with a metrics sender the same notification
+    is also handed to the sender, which publishes it as class `events` --
+    the hub sees the fleet's alerts in one place; it does not mail them
+    again (§6.4)."""
     if ntype not in notify.CATALOGUE:
         return ""
     try:
@@ -2758,6 +2767,9 @@ def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", o
                 "attempts": 0}
         if own:
             item["own"] = True      # the tenant's OWN archive: the node does not hear it
+        if dauer:
+            item["dauer"] = dauer
+        _events_to_sender(item)
         name = f"{time.time():.6f}-{item['id']}.json"
         tmp = os.path.join(NOTIFY_OUTBOX_DIR, "." + name)
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2768,6 +2780,22 @@ def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", o
     except OSError as e:
         print(f"notify: not queued ({ntype}): {e}", file=sys.stderr)
         return ""
+
+
+def _events_to_sender(item):
+    """Hand a notification to the metrics sender (class `events`). Only
+    where a sender is configured; never raises."""
+    try:
+        if not os.path.exists(os.path.join(METRICS_SENDER_DIR, metrics_sender.CONFIG_FILE)):
+            return
+        t = load_tenants().get(item.get("tenant")) or {}
+        ev = {k: item[k] for k in ("id", "created", "type", "op", "key", "instanz", "kurz",
+                                   "text", "dauer") if item.get(k)}
+        if item.get("tenant") and item["tenant"] != default_tenant_id():
+            ev["tenant"] = t.get("label") or item["tenant"]
+        metrics_sender.spool_event(METRICS_DIR, ev)
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: not handed to the sender: {type(e).__name__}", file=sys.stderr)
 
 
 def _notify_from_audit(action, tenant, subject, result, detail):
@@ -2928,7 +2956,7 @@ def _notify_values(item, tid):
             "mandant": ("" if item["tenant"] == default_tenant_id()
                         else t.get("name") or t.get("label", "")),
             "instanz": item.get("instanz", ""), "typ": item["type"],
-            "kurz": item.get("kurz", "")}
+            "kurz": item.get("kurz", ""), "dauer": item.get("dauer", "")}
 
 
 def _notify_one(item, tid, from_tenant, state, now, lists=None):
@@ -3345,6 +3373,11 @@ def notify_conditions(facts=None, now=None):
     # RFC-0084: an instance that hands out a secret file
     for tid, conds in guard_conditions().items():
         cur.setdefault(tid, {}).update(conds)
+    # RFC-0085 stage 2: the fleet (on a hub) and the hub (on an entry)
+    try:
+        cur.setdefault(dflt, {}).update(fleet_conditions(now))
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: fleet: {type(e).__name__}: {e}", file=sys.stderr)
     return cur
 
 
@@ -3364,9 +3397,15 @@ def notify_matters(facts=None, now=None):
                 if (op == "close" and rec.get("type") == "instance.down"
                         and rec.get("instanz") not in reg):
                     continue      # removed while down: nothing came back, nothing to mail
+                dauer = ""
+                if op == "close":
+                    opened = notify._parse(rec.get("opened"))
+                    if opened is not None:
+                        dauer = notify.span_words((now - opened).total_seconds())
                 queued.append(notify_event(rec["type"], tid, instanz=rec.get("instanz", ""),
                                            kurz=rec.get("kurz", ""), text=rec.get("text", ""),
-                                           op=op, key=key, own=bool(rec.get("own"))))
+                                           op=op, key=key, own=bool(rec.get("own")),
+                                           dauer=dauer))
             if new:
                 matters[tid] = new
             else:
@@ -9074,7 +9113,15 @@ def cmd_metrics(args):
         # The sender is a step of the same job and is held to the same
         # rule: whatever it meets, the unit does not fail (RFC-0052 5).
         try:
-            metrics_sender.run(METRICS_DIR, METRICS_SENDER_DIR)
+            status_for_sender()       # RFC-0085 stage 2, class `status`
+        except Exception as exc:  # noqa: BLE001
+            print(f"metrics: status skipped ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+        try:
+            import cli_reference
+            metrics_sender.run(METRICS_DIR, METRICS_SENDER_DIR,
+                               version=cli_reference.read_version(
+                                   os.path.dirname(os.path.abspath(__file__))))
         except Exception as exc:  # noqa: BLE001
             print(f"metrics: sender skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
@@ -11023,6 +11070,12 @@ PROFILES = {
                     "address only, for devices that cannot speak TLS "
                     "(RFC-0054 §3). Needs 'broker'; refused on a node "
                     "with no private address. Off by default.",
+    "fleet-hub": "fleet hub — the node whose broker collects the fleet's "
+                 "reports (RFC-0085 §8): starts the platform service 'fleet', "
+                 "which reads every node's alive/status/events/broker and "
+                 "the bridges' state, and raises node.silent, bridge.down, "
+                 "broker.queue and node.loss through this node's lists "
+                 "(RFC-0080). Needs 'broker' and 'store'.",
     "gateway-only": "gateway-only node — the per-instance LAN ports "
                     "8100-8199 are no longer reachable from the network; "
                     "apps are reached only through the gateway on 80/443 "
@@ -11411,6 +11464,12 @@ def broker_sync(announce=False):
         # one. Stopping it on purpose is `oaap node remove-profile broker`.
         state = run(["docker", "ps", "-a", "--filter", "name=^oaap-broker-1$",
                      "--format", "{{.State}}"]).stdout.strip()
+        if state == "running":
+            try:
+                broker_watch()        # RFC-0085 stage 2: counters, the hub's bridge
+            except Exception as exc:  # noqa: BLE001
+                print(f"broker: watch skipped ({type(exc).__name__}: {exc})",
+                      file=sys.stderr)
         if state not in ("running", "restarting"):
             ok = _apply_broker_ports()
             print(f"broker: was {state or 'missing'} although this node has the "
@@ -12568,6 +12627,11 @@ def cmd_node(args):
                 die("this node has no private (LAN) address, so plain MQTT "
                     "would be published on a public one -- refused. Use the "
                     "TLS port (8883) here.")
+        if profile == "fleet-hub":
+            missing = [x for x in ("broker", "store") if not has_profile(x)]
+            if missing:
+                die(f"'fleet-hub' needs {' and '.join(repr(x) for x in missing)} "
+                    "first (RFC-0085 §8): oaap node add-profile <profile>")
         save_profiles(profiles + [profile])
         print(f"Node profile '{profile}' added: {PROFILES[profile]}")
         if profile == "dev":
@@ -12627,6 +12691,14 @@ def cmd_node(args):
                 print("Check with: docker compose --project-directory "
                       f"{APP_DIR} --project-name oaap --profile store "
                       "up -d store twin")
+        if profile == "fleet-hub":
+            try:
+                _fleet_compose("up", "-d", "--no-deps", "fleet")
+                print("The fleet service is starting. 'oaap fleet hub show' "
+                      "says what it sees.")
+            except (subprocess.CalledProcessError, OSError) as e:
+                print(f"WARNING: the fleet service could not be started ({e}) "
+                      "-- 'sudo oaap update' starts it.")
         if profile == "broker":
             # Same reasoning as 'store' above: nothing to check at
             # request time, so the effect happens now.
@@ -12692,6 +12764,9 @@ def cmd_node(args):
         if profile == "broker" and has_profile("broker-plain"):
             die("cannot remove profile 'broker' while 'broker-plain' is "
                 "held -- remove 'broker-plain' first.")
+        if profile in ("broker", "store") and has_profile("fleet-hub"):
+            die(f"cannot remove profile '{profile}' while 'fleet-hub' is held "
+                "-- remove 'fleet-hub' first.")
         if profile == "store":
             existing = store_schemas()
             if existing:
@@ -12715,6 +12790,14 @@ def cmd_node(args):
             else:
                 print("WARNING: could not recreate the gateway — run "
                       "'docker compose ... up -d --no-deps gateway'.")
+        if profile == "fleet-hub":
+            try:
+                _fleet_compose("stop", "fleet")
+                print("The fleet service was stopped (its state in "
+                      "data/fleet/ is kept). Nobody watches the fleet now.")
+            except (subprocess.CalledProcessError, OSError):
+                print("WARNING: could not stop the 'fleet' container -- "
+                      "check 'docker ps'.")
         if profile == "store":
             try:
                 _compose("stop", "store", "twin")
@@ -25938,7 +26021,296 @@ def audit_fleet(entry):
         f.write(json.dumps(entry) + "\n")
 
 
+# ------------------------------------------- the fleet (RFC-0085 stage 2)
+#
+# Three host-side parts; the hub's receiving is the container 'fleet'
+# (services/twin/fleet.py), the judging is services/fleet_watch.py.
+#
+#   status_for_sender()   every node with a sender: its /fleet/status
+#                         document, fetched every 5 minutes with a fleet key
+#                         of its own, handed to the sender when it changed
+#                         (at the latest hourly) -- class `status`
+#   broker_watch()        every broker node: its own counters ($SYS, read
+#                         as 'oaap.watch') and, on an entry, whether the
+#                         hub's bridge is there -- class `broker`, and
+#                         hub.unreachable
+#   fleet_conditions()    the minute job's matters: on a hub from the fleet
+#                         service's state, on an entry from the broker watch
+FLEET_DIR = os.path.join(DATA_DIR, "data", "fleet")
+FLEET_STATE = os.path.join(FLEET_DIR, "state.json")
+FLEET_WATCH_FILE = os.path.join(METRICS_DIR, "broker-watch.json")
+STATUS_KEY_FILE = os.path.join(METRICS_SENDER_DIR, "status-fleet.key")
+STATUS_FETCH_EVERY = 300
+STATUS_RESEND_EVERY = 3600
+# fields of the document that change on every fetch without anything having
+# changed on the node -- left out of the digest, never out of the document
+STATUS_VOLATILE = ("time",)
+WATCH_CLIENT = "oaap-broker-watch"
+PORTAL_CONTAINER = "oaap-portal-1"
+
+
+def _read_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json_private(path, data, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _status_fleet_key():
+    """The sender's own fleet key (RFC-0021): reading this node's status
+    document is exactly what a fleet key grants. Issued once, kept 0600
+    beside the sender's secret; re-issued when the file was lost."""
+    label = f"status-sender@{socket.gethostname()}"[:64]
+    keys = load_fleet_keys()
+    try:
+        with open(STATUS_KEY_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+        if key and label in keys and keys[label].get("digest") == \
+                hashlib.sha256(key.encode()).hexdigest():
+            return key
+    except OSError:
+        pass
+    import datetime
+    key = secrets.token_urlsafe(32)
+    keys[label] = {"digest": hashlib.sha256(key.encode()).hexdigest(),
+                   "created": datetime.datetime.now(datetime.timezone.utc)
+                   .strftime("%Y-%m-%dT%H:%M:%SZ")}
+    save_fleet_keys(keys)
+    audit_fleet({"event": "issue", "label": label, "by": "metrics sender (RFC-0085)"})
+    fd = os.open(STATUS_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key)
+    return key
+
+
+def status_for_sender(now=None):
+    """Write metrics/status-out.json for the sender when the document
+    changed (or an hour passed). Only where a sender is configured. Never
+    raises: a status that cannot be read this time is said on stderr."""
+    if not os.path.exists(os.path.join(METRICS_SENDER_DIR, metrics_sender.CONFIG_FILE)):
+        return None
+    now = int(now or time.time())
+    out_path = os.path.join(METRICS_DIR, metrics_sender.STATUS_OUT)
+    old = _read_json_file(out_path) or {}
+    if now - int(old.get("fetched", 0)) < STATUS_FETCH_EVERY:
+        return None
+    try:
+        key = _status_fleet_key()
+        ip = container_ip(PORTAL_CONTAINER, PLATFORM_NETWORK)
+        ipaddress.ip_address(ip)
+        req = urllib.request.Request(
+            f"http://{ip}:8000/fleet/status",
+            headers={"Authorization": "Bearer " + key,
+                     "Host": load_external() or socket.gethostname()})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            doc = json.loads(r.read().decode("utf-8"))
+    except Exception as e:                          # noqa: BLE001
+        print(f"metrics: status not read ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
+    stable = {k: v for k, v in doc.items() if k not in STATUS_VOLATILE}
+    content = hashlib.sha256(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:16]
+    since = int(old.get("since", 0))
+    if content != old.get("content") or now - since >= STATUS_RESEND_EVERY:
+        since = now
+    _write_json_private(out_path, {"content": content, "since": since, "fetched": now,
+                                   "digest": f"{content}@{since}", "document": doc})
+    return content
+
+
+def _broker_max_queued():
+    """The bound the broker runs with: a node-local `max_queued_messages`
+    in data/broker-conf.d (RFC-0085 §5.1), else Mosquitto's 1000."""
+    bound = 1000
+    try:
+        for name in sorted(os.listdir(BROKER_CONF_DIR)):
+            if not name.endswith(".conf"):
+                continue
+            with open(os.path.join(BROKER_CONF_DIR, name), encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] == "max_queued_messages":
+                        bound = int(parts[1])
+    except (OSError, ValueError):
+        pass
+    return bound
+
+
+def broker_watch(now=None):
+    """Read this broker's own counters and the hubs' bridge state, as
+    'oaap.watch' -> metrics/broker-watch.json. Raises on failure (the
+    caller, broker_sync, says it and carries on)."""
+    key = _read_platform_env("BROKER_WATCH_KEY")
+    if not key:
+        raise OSError("no BROKER_WATCH_KEY in the platform .env (oaap update makes one)")
+    ip = container_ip(CARE_BROKER_CONTAINER, PLATFORM_NETWORK)
+    ipaddress.ip_address(ip)
+    now = int(now or time.time())
+    cfg = {"url": f"mqtt://{ip}:1883", "user": mqtt_acl_watch_user(), "node": socket.gethostname()}
+    client = metrics_sender.Client(cfg, time.monotonic() + 20, client_id=WATCH_CLIENT)
+    client.connect(key)
+    try:
+        got = client.collect(["$SYS/broker/#", "oaap-fleet/bridge/#"], WATCH_SECONDS)
+    finally:
+        client.close()
+
+    def num(topic):
+        v = got.get(topic)
+        if v is None:
+            return None
+        try:
+            return int(float(v[0].decode("utf-8", "replace").split()[0]))
+        except (ValueError, IndexError):
+            return None
+    stored, retained = num("$SYS/broker/store/messages/count"), \
+        num("$SYS/broker/retained messages/count")
+    old = _read_json_file(FLEET_WATCH_FILE) or {}
+    hubs = {}
+    me = fleet_node_name()
+    for topic, (payload, _r) in got.items():
+        p = topic.split("/")
+        # only a hub's bridge INTO this node: oaap-fleet/bridge/<me>/<hub>.
+        # This node's own outgoing bridges notify oaap-fleet/bridge/<entry>/<me>
+        # locally and are the hub side's business (measured on oaap-test).
+        if len(p) == 4 and p[0] == "oaap-fleet" and p[1] == "bridge" and p[2] == me:
+            up = payload.decode("utf-8", "replace").strip() == "1"
+            before = (old.get("hubs") or {}).get(p[3]) or {}
+            since = before.get("since") if bool(before.get("up")) == up and \
+                isinstance(before.get("since"), int) else now
+            hubs[p[3]] = {"entry": p[2], "up": up, "since": since}
+    data = {"v": 1, "at": now, "clients": num("$SYS/broker/clients/connected"),
+            "stored": stored, "retained": retained,
+            # what waits for sessions that are away: the store holds the
+            # retained messages too (an approximation, said in the spec)
+            "queued": max(0, stored - retained) if stored is not None and retained is not None else None,
+            "dropped": num("$SYS/broker/publish/messages/dropped"),
+            "uptime": num("$SYS/broker/uptime"), "max_queued": _broker_max_queued(),
+            "sys_topics": sum(1 for t in got if t.startswith("$SYS/")), "hubs": hubs}
+    _write_json_private(FLEET_WATCH_FILE, data, 0o644)
+    return data
+
+
+WATCH_SECONDS = 3
+
+
+def fleet_node_name():
+    """This node's name on the wire: the sender's, else the host name."""
+    cfg = metrics_sender.load_config(METRICS_SENDER_DIR) or {}
+    return cfg.get("node") or socket.gethostname()
+
+
+def mqtt_acl_watch_user():
+    return "oaap.watch"     # = services/mqtt_acl.py WATCH_USER (identity's copy)
+
+
+def fleet_conditions(now):
+    """RFC-0085 §6: the fleet's matters in the node's default scope. On a
+    hub from the fleet service's state, on a broker node from its broker
+    watch. A source that cannot be trusted this minute keeps its open
+    matters open -- "unknown" is never mailed as "Behoben"."""
+    out = {}
+    now_e = now.timestamp()
+    dflt = default_tenant_id()
+
+    def keep(types):
+        for key, rec in ((_notify_state_rw().get("matters") or {}).get(dflt) or {}).items():
+            if rec.get("type") in types:
+                out[key] = {k: rec[k] for k in ("type", "instanz", "kurz", "text") if k in rec}
+    if has_profile("fleet-hub"):
+        state = _read_json_file(FLEET_STATE)
+        if fleet_watch.trusted(state, now_e):
+            out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name()))
+            found = []
+
+            def run(st):
+                evs, new = fleet_watch.loss_events(state, st.get("fleet_lost") or {})
+                found.extend(evs)
+                st["fleet_lost"] = new
+                return st
+            _notify_state_rw(run)
+            for node, before, after in found:
+                notify_event("node.loss", dflt, kurz=node,
+                             text=f"Der Knoten {node} meldet {after - before} verlorene "
+                                  f"Messzeilen seit der letzten Minute ({after} insgesamt): "
+                                  "seine Warteschlange war voll oder zu alt, bevor sie "
+                                  "gesendet werden konnte.")
+        else:
+            keep(fleet_watch.FLEET_MATTERS)
+    if has_profile("broker"):
+        conds = fleet_watch.entry_conditions(_read_json_file(FLEET_WATCH_FILE), now_e)
+        if conds is None:
+            keep(("hub.unreachable",))
+        else:
+            out.update(conds)
+    return out
+
+
+def _fleet_compose(*args):
+    """compose for 'fleet': it depends on 'broker', and a service in an
+    inactive profile is "undefined" to compose -- measured on oaap-test
+    2026-11-12 ("depends on undefined service broker"). So the profiles it
+    needs and the broker's overlay files go with every call; '--no-deps' at
+    the caller keeps the broker itself untouched."""
+    return _compose(*_broker_compose_files(), "--profile", "broker", "--profile", "store",
+                    "--profile", "fleet-hub", *args)
+
+
+def _fleet_hub_show():
+    if not has_profile("fleet-hub"):
+        die("this node is not a fleet hub (profile 'fleet-hub', RFC-0085 §8)")
+    state = _read_json_file(FLEET_STATE)
+    now = time.time()
+    if not isinstance(state, dict):
+        die(f"the fleet service has written nothing yet ({FLEET_STATE})")
+    age = int(now - state.get("written", 0))
+    print(f"Fleet service: {'connected' if state.get('connected') else 'NOT connected'}, "
+          f"state {age} s old{' -- NOT trusted' if not fleet_watch.trusted(state, now) else ''}, "
+          f"{state.get('messages', 0)} messages since its start, {state.get('bad', 0)} not placed")
+    words = {"up": "da", "silent": "SCHWEIGT", "unknown": "unbekannt"}
+    print("\nNodes:")
+    me = fleet_node_name()
+    for r in fleet_watch.view(state, now, me):
+        age_s = "—" if r["age"] is None else f"{int(r['age'])} s"
+        print(f"  {r['name']:<16} {words[r['state']]:<10} last alive {age_s:>8}  "
+              f"{r['version'] or '?':<10} {'via ' + r['via'] if r['via'] else 'direct':<14}"
+              f" seq {r['seq']} gaps {r['gaps']} lost {r['lost']}"
+              + (f"  ({r['reason']})" if r["reason"] else ""))
+    print("\nBridges:")
+    for _k, b in sorted((state.get("bridges") or {}).items()):
+        own = b.get("hub") == me
+        print(f"  {b.get('entry', '?'):<16} {'up' if b.get('up') else 'DOWN'} since "
+              f"{fleet_watch.iso(b['since']) if b.get('since') else '?'}"
+              + ("" if own else f"  (bridge of {b.get('hub')} into this node, not judged here)"))
+    if not state.get("bridges"):
+        print("  (none seen)")
+    print("\nBrokers:")
+    for node, b in sorted((state.get("brokers") or {}).items()):
+        print(f"  {node:<16} clients {b.get('clients')}, queued {b.get('queued')} of "
+              f"{b.get('max_queued')}, dropped {b.get('dropped')}, "
+              f"{int(now - b.get('rx', 0))} s ago")
+    if not state.get("brokers"):
+        print("  (none seen)")
+    evs = state.get("events") or []
+    print(f"\nEvents (last {min(10, len(evs))} of {len(evs)}):")
+    for e in evs[-10:]:
+        print(f"  {fleet_watch.iso(e['rx'])}  {e['node']:<14} {e['type']:<16} "
+              f"{e.get('op', '')} {e.get('kurz', '')}")
+
+
 def cmd_fleet(args):
+    if args.object == "hub":
+        if args.action != "show":
+            die("fleet hub: show")
+        return _fleet_hub_show()
     keys = load_fleet_keys()
     if args.action == "list":
         if not keys:
@@ -34947,8 +35319,8 @@ def build_parser():
     pt.set_defaults(fn=cmd_token)
     pf = sub.add_parser("fleet",
                         help="fleet keys: read-only /fleet/status access (RFC-0021)")
-    pf.add_argument("object", choices=["key"])
-    pf.add_argument("action", choices=["issue", "list", "revoke"])
+    pf.add_argument("object", choices=["key", "hub"])
+    pf.add_argument("action", choices=["issue", "list", "revoke", "show"])
     pf.add_argument("label", nargs="?",
                     help="who watches, e.g. fleetview@oaap-demo")
     pf.set_defaults(fn=cmd_fleet)

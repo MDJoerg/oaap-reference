@@ -47,6 +47,11 @@ DEFAULT_ROOT = "oaap-node"
 # configurable: the hub's bridge configuration and the fleet service read
 # the same constant.
 VIA_ROOT = "oaap-via"
+# The fleet's own infrastructure tree (RFC-0085 §3): bridge state on an
+# entry, later the hub's commands. Fixed like VIA_ROOT.
+FLEET_ROOT = "oaap-fleet"
+# The platform's watching principal (RFC-0085 stage 2): reads, never writes.
+WATCH_USER = "oaap.watch"
 ACCESS = ("read", "write", "readwrite")
 MAX_GRANTS = 50
 MAX_FILTER = 200
@@ -181,6 +186,25 @@ def parse_grants(raw, root=None):
                 "another tree")
         out.append({"filter": f, "access": a})
     return out
+
+
+def watch_allows(topic, acc, root):
+    """(allowed, reason) for the platform principal `oaap.watch`.
+
+    It is the broker side of the fleet: the hub's fleet service reads every
+    node's branch, the bridged branch and the fleet tree; a broker node's
+    minutely job reads the broker's own counters under `$SYS/broker/`
+    (which no key may read -- measured 2026-11-12: go-auth asks about
+    `$SYS` too). It READS, and that is all: nothing it could write would
+    be true by having been written by it."""
+    if need(acc) != "read":
+        return False, "the watch principal only reads"
+    if not isinstance(topic, str) or not topic:
+        return False, "not a topic"
+    for f in ("$SYS/broker/#", f"{root}/#", f"{VIA_ROOT}/#", f"{FLEET_ROOT}/#"):
+        if covers(f, topic):
+            return True, ""
+    return False, "outside what the watch principal reads"
 
 
 def decide(rec, topic, acc, root, tenant_allowed):

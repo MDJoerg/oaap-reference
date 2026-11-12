@@ -159,6 +159,12 @@ class Broker:
         self.srv.close()
 
 
+def metric_msgs(srv):
+    """What arrived on the metrics branch -- since RFC-0085 stage 2 every run
+    also sends `alive` (and the class files), checked in their own section."""
+    return [x for x in srv.received if "/metrics/" in x[1]]
+
+
 def fresh():
     return (tempfile.mkdtemp(prefix="oaap-snd-m-"), tempfile.mkdtemp(prefix="oaap-snd-c-"))
 
@@ -278,8 +284,11 @@ ok("ohne Einrichtung geschieht nichts", s.run(mdir, cdir, now=BASE)["status"] ==
 srv = Broker({"node-x02": SECRET})
 cfg_for(cdir, srv.port)
 mdir2 = fresh()[0]
-ok("ohne wartende Zeilen wird nicht einmal verbunden",
-   s.run(mdir2, cdir, now=BASE)["status"] == "idle" and srv.connects == 0)
+r = s.run(mdir2, cdir, now=BASE)
+ok("ohne wartende Zeilen: verbunden, nur `alive` (RFC-0085 Stufe 2 -- ein Knoten "
+   "ohne Neues ist genau der, dessen Schweigen auffallen muss)",
+   r == {"status": "ok", "sent": 0} and srv.connects == 1
+   and [t for _u, t, _p, _r in srv.received] == ["oaap-node/oaapx02/alive"], (r, srv.received))
 
 print("\n=== der Weg: senden, bestaetigen, loeschen ===")
 mdir, cdir = fresh()
@@ -288,13 +297,13 @@ cfg_for(cdir, srv.port)
 fill(mdir, 5)
 r = s.run(mdir, cdir, now=BASE + 1000)
 ok("fuenf Zeilen gesendet", r == {"status": "ok", "sent": 5}, r)
-ok("fuenfzehn Nachrichten (drei je Zeile) kamen an", len(srv.received) == 15, len(srv.received))
+ok("fuenfzehn Messnachrichten (drei je Zeile) kamen an", len(metric_msgs(srv)) == 15, len(srv.received))
 ok("das Protokoll stimmt (MQTT, Version 5, Flags)", not srv.protocol_errors, srv.protocol_errors)
-ok("die Themen sind <Wurzel>/<Knoten>/metrics/<Reihe>",
+ok("die Themen sind <Wurzel>/<Knoten>/metrics/<Reihe>, dazu `alive`",
    {t for _u, t, _p, _r in srv.received} ==
-   {"oaap-node/oaapx02/metrics/" + x for x in ("cpu", "mem", "disk")})
+   {"oaap-node/oaapx02/metrics/" + x for x in ("cpu", "mem", "disk")} | {"oaap-node/oaapx02/alive"})
 ok("alle mit dem Retain-Zeichen", all(r for *_x, r in srv.received))
-msg = json.loads(srv.received[0][2])
+msg = json.loads(metric_msgs(srv)[0][2])
 ok("die Nachricht ist die der Spezifikation (v, node, t, m, x)",
    set(msg) == {"v", "node", "t", "m", "x"} and msg["v"] == 1 and msg["node"] == "oaapx02"
    and msg["t"].endswith("Z") and msg["m"] == "cpu", msg)
@@ -305,8 +314,10 @@ ok("danach ist die Warteschlange leer (bestaetigt = geloescht)", not m.queue_pen
 st = s.load_state(mdir)
 ok("der Zustand merkt sich den Erfolg", st.get("ok_at") == BASE + 1000 and st.get("fails") == 0
    and st.get("sent_total") == 5, st)
-ok("ein Lauf ohne Neues verbindet nicht erneut",
-   s.run(mdir, cdir, now=BASE + 1100)["status"] == "idle" and srv.connects == 1)
+n_before = len(metric_msgs(srv))
+ok("ein Lauf ohne Neues verbindet fuer `alive`, sendet keine Messzeile erneut",
+   s.run(mdir, cdir, now=BASE + 1100)["sent"] == 0 and srv.connects == 2
+   and len(metric_msgs(srv)) == n_before)
 
 print("\n=== eine eigene Wurzel ===")
 mdir, cdir = fresh()
@@ -316,7 +327,7 @@ fill(mdir, 1)
 s.run(mdir, cdir, now=BASE)
 ok("die Themen tragen die gewaehlte Wurzel",
    {t for _u, t, _p, _r in srv.received} ==
-   {"home/nodes/oaapx02/metrics/" + x for x in ("cpu", "mem", "disk")},
+   {"home/nodes/oaapx02/metrics/" + x for x in ("cpu", "mem", "disk")} | {"home/nodes/oaapx02/alive"},
    [t for _u, t, _p, _r in srv.received])
 
 print("\n=== ein Absturz zwischen Ankunft und Bestaetigung (mindestens einmal) ===")
@@ -391,7 +402,7 @@ ok("als Verweigerung erkannt (nicht als Netzfehler)", r["status"] == "error" and
 ok("die Zeilen sind noch da (sonst waeren Daten geloescht, die niemand bekam)",
    len(m.queue_pending(mdir)) == 3 and m.queue_status(mdir)["acked"] == 0)
 ok("die Meldung nennt das Thema, auf das nicht geschrieben werden darf",
-   "oaap-node/oaapx02/metrics/" in r["error"], r["error"])
+   "oaap-node/oaapx02/" in r["error"], r["error"])
 
 print("\n=== TLS: ein Fehler sendet nichts ===")
 mdir, cdir = fresh()
@@ -414,11 +425,12 @@ fill(mdir, 6)
 class Tired(s.Client):
     n = 0
 
-    def publish(self, topic_name, payload):
-        Tired.n += 1
+    def publish(self, topic_name, payload, retain=True):
+        if "/metrics/" in topic_name:
+            Tired.n += 1
         if Tired.n > 6:                      # nach zwei Zeilen (je drei Nachrichten)
             raise s.SenderError("the time budget of this run is used up")
-        super().publish(topic_name, payload)
+        super().publish(topic_name, payload, retain)
 
 
 r = s.run(mdir, cdir, now=BASE, client_factory=Tired)
@@ -438,6 +450,50 @@ r = s.run(mdir, cdir, now=BASE)
 m.queue_ack = orig
 ok("700 Zeilen alle gesendet", r["sent"] == 700 and not m.queue_pending(mdir), r)
 ok("die Bestaetigung (= Umschreiben) geschah gebuendelt, nicht je Zeile", len(calls) <= 5, calls)
+
+print("\n=== RFC-0085 Stufe 2: alive, events, status, broker ===")
+mdir, cdir = fresh()
+srv = Broker({"node-x02": SECRET})
+cfg_for(cdir, srv.port)
+r1 = s.run(mdir, cdir, now=BASE, version="0.1.271")
+r2 = s.run(mdir, cdir, now=BASE + 60, version="0.1.271")
+alives = [json.loads(p) for _u, t, p, _r in srv.received if t == "oaap-node/oaapx02/alive"]
+ok("jeder Lauf sendet `alive`, Folgenummer waechst", [a["seq"] for a in alives] == [1, 2], alives)
+ok("`alive` traegt Zeit, Version, Takt, verlorene Zeilen",
+   alives[0]["version"] == "0.1.271" and alives[0]["interval"] == 60 and alives[0]["lost"] == 0
+   and alives[0]["t"].endswith("Z") and alives[0]["v"] == 1, alives[0])
+ok("`alive` ist retained", all(rr for _u, t, _p, rr in srv.received if t.endswith("/alive")))
+for i, typ in enumerate(("instance.down", "login.locked")):
+    ok(f"Meldung {typ} liegt bereit", s.spool_event(mdir, {"id": f"e{i}", "type": typ, "op": "open",
+                                                          "text": "x"}))
+s.spool_event(mdir, {"id": "bad", "type": "../../etc", "op": "open"})
+doc = {"node": "oaapx02", "instances": []}
+with open(os.path.join(mdir, s.STATUS_OUT), "w", encoding="utf-8") as f:
+    json.dump({"digest": "d1", "document": doc}, f)
+with open(os.path.join(mdir, s.BROKER_OUT), "w", encoding="utf-8") as f:
+    json.dump({"at": BASE + 120, "clients": 3}, f)
+srv.received.clear()
+s.run(mdir, cdir, now=BASE + 120)
+got = {t: (json.loads(p), rr) for _u, t, p, rr in srv.received}
+ok("Meldungen unter events/<typ>, NICHT retained",
+   got.get("oaap-node/oaapx02/events/instance.down", ({}, True))[1] is False
+   and "oaap-node/oaapx02/events/login.locked" in got, list(got))
+ok("eine Meldung mit unmoeglichem Typ wird nicht gesendet, aber entfernt",
+   not any("etc" in t for t in got) and not s.events_pending(mdir))
+ok("das Statusdokument unter status, retained", got.get("oaap-node/oaapx02/status") == (doc, True), got.get("oaap-node/oaapx02/status"))
+ok("die Broker-Zaehler unter broker", got.get("oaap-node/oaapx02/broker", ({}, 0))[0].get("clients") == 3)
+srv.received.clear()
+s.run(mdir, cdir, now=BASE + 180)
+ok("dasselbe Statusdokument geht nicht zweimal", "oaap-node/oaapx02/status" not in
+   {t for _u, t, _p, _r in srv.received})
+srv.received.clear()
+s.run(mdir, cdir, now=BASE + 400)
+ok("veraltete Broker-Zaehler gehen nicht", "oaap-node/oaapx02/broker" not in
+   {t for _u, t, _p, _r in srv.received})
+for i in range(s.EVENTS_KEEP + 3):
+    s.spool_event(mdir, {"id": f"m{i}", "type": "instance.down"})
+ok("der Meldungsspeicher ist begrenzt, das Verworfene gezaehlt",
+   len(s.events_pending(mdir)) == s.EVENTS_KEEP and s.load_state(mdir)["events_dropped"] == 3)
 
 print("\n=== `oaap metrics sender` (derselbe Weg wie an der Maschine) ===")
 import argparse                                                 # noqa: E402

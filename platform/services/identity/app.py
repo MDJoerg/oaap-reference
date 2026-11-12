@@ -2957,6 +2957,12 @@ MQTT_AUTH_PARAM = "k"
 # mistaken for each other. Must match services/twin/relay.py exactly.
 RELAY_USER = "oaap.relay"
 RELAY_KEY = os.environ.get("BROKER_RELAY_KEY", "")
+# The fleet's watching principal (RFC-0085 stage 2): the other half of the
+# relay -- it only reads (mqtt_acl.watch_allows). Its own secret, so that
+# neither can act as the other; held by identity, the fleet service and the
+# host's broker watch.
+WATCH_USER = mqtt_acl.WATCH_USER
+WATCH_KEY = os.environ.get("BROKER_WATCH_KEY", "")
 # mosquitto-go-auth's 'acc': 1 read, 2 write (publish), 3 read+write,
 # 4 subscribe. The relay only ever publishes.
 MQTT_ACC_WRITE = 2
@@ -3028,6 +3034,13 @@ def mqtt_auth_getuser():
         if _relay_login_ok(body.get("password", "")):
             return {"Ok": True, "Error": ""}, 200
         return {"Ok": False, "Error": "invalid credentials"}, 200
+    if body.get("username", "") == WATCH_USER:
+        # fail closed exactly like the relay: no secret, no principal
+        if WATCH_KEY and secrets.compare_digest(
+                (body.get("password", "") or "").encode("utf-8"),
+                WATCH_KEY.encode("utf-8")):
+            return {"Ok": True, "Error": ""}, 200
+        return {"Ok": False, "Error": "invalid credentials"}, 200
     token = body.get("password", "")
     m = KEY_TOKEN_RE.fullmatch(token)
     if not m or body.get("username", "") != m.group(1):
@@ -3058,6 +3071,11 @@ def mqtt_auth_aclcheck():
             return {"Ok": True, "Error": ""}, 200
         return {"Ok": False,
                 "Error": "the relay may only publish into a known tenant's tree"}, 200
+    if kid == WATCH_USER:
+        ok_, why = mqtt_acl.watch_allows(body.get("topic", ""), body.get("acc"),
+                                         METRICS_ROOT)
+        return {"Ok": bool(WATCH_KEY) and ok_,
+                "Error": "" if (WATCH_KEY and ok_) else (why or "no watch secret")}, 200
     rec = next((k for k in load_keys()
                 if k["id"] == kid and not k["revoked"]), None)
     if not rec:

@@ -14,8 +14,22 @@ The whole contract in four lines:
     (`sender-state.json`), with a backoff, never a failed unit;
   * the secret is never in any text this module returns.
 
+**RFC-0085 stage 2** adds the node's other classes, each from a file the
+host prepared (appctl's minute job), so this module still reads nothing
+but its own directories:
+
+  * `alive` on every run, also when the queue is empty: time, a sequence
+    number that grows with every delivered `alive`, the version, the
+    interval the node promises and how many samples its outbox lost;
+  * `status` -- the node's /fleet/status document -- when the host wrote a
+    new one (`status-out.json`), retained;
+  * `events/<type>` -- the node's RFC-0080 notifications, one file each in
+    `events-out/`, NOT retained, deleted after the broker acknowledged it;
+  * `broker` -- a broker node's own counters (`broker-watch.json`).
+
 The client speaks MQTT 5 and nothing but what it needs: CONNECT, PUBLISH
-at QoS 1, PUBACK, DISCONNECT. MQTT 5 and not 3.1.1 for one reason: in
+at QoS 1, PUBACK, DISCONNECT -- and, for the host's broker watch only,
+SUBSCRIBE at QoS 0 (nothing to acknowledge). MQTT 5 and not 3.1.1 for one reason: in
 3.1.1 a publish the broker's ACL denies is acknowledged and dropped, so
 the node would delete data nobody received. MQTT 5 puts the verdict into
 the PUBACK's reason code. No library: the host has none and should not
@@ -43,6 +57,12 @@ STATE_FILE = metrics.SENDER_STATE_FILE
 CA_FILE = "ca.crt"
 INFO_FILE = metrics.SENDER_INFO_FILE
 CONFIG_FILE = "sender.json"
+ALIVE_INTERVAL = 60          # what the node promises: the minutely unit
+STATUS_OUT = "status-out.json"       # written by the host, published once
+BROKER_OUT = "broker-watch.json"     # written by the host's broker watch
+EVENTS_OUT = "events-out"            # one file per notification
+EVENTS_KEEP = 500
+BROKER_FRESH = 180           # an older broker-watch.json is not sent
 SECRET_FILE = "sender.secret"
 
 _NODE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
@@ -119,6 +139,11 @@ def is_private_host(host):
 
 def topic(cfg, series):
     return f"{cfg['root']}/{cfg['node']}/metrics/{series}"
+
+
+def class_topic(cfg, cls, sub=""):
+    """`<root>/<node>/<class>[/<sub>]` (RFC-0085 §3)."""
+    return f"{cfg['root']}/{cfg['node']}/{cls}" + (f"/{sub}" if sub else "")
 
 
 # --- the stored configuration -----------------------------------------
@@ -300,6 +325,31 @@ def publish_packet(topic_name, payload, packet_id, retain=True):
     return bytes([0x32 | (1 if retain else 0)]) + _varlen(len(body)) + body
 
 
+def subscribe_packet(filters, packet_id):
+    """SUBSCRIBE at QoS 0 for every filter (MQTT 5, no properties)."""
+    body = struct.pack(">H", packet_id) + b"\x00" + b"".join(
+        _utf8(f) + b"\x00" for f in filters)
+    return b"\x82" + _varlen(len(body)) + body
+
+
+def parse_publish(flags, body):
+    """(topic, payload bytes, retained) of an incoming QoS-0 PUBLISH."""
+    n = struct.unpack(">H", body[:2])[0]
+    name = body[2:2 + n].decode("utf-8", "replace")
+    i = 2 + n
+    if (flags >> 1) & 3:
+        i += 2                      # a packet id (we subscribe at 0, but)
+    plen, mult = 0, 1               # the properties' varint length
+    while True:
+        b = body[i]
+        i += 1
+        plen += (b & 127) * mult
+        if not b & 128:
+            break
+        mult *= 128
+    return name, body[i + plen:], bool(flags & 1)
+
+
 DISCONNECT = b"\xe0\x00"
 
 
@@ -387,11 +437,43 @@ class Client:
             raise SenderError("the broker does not speak MQTT 5")
         raise SenderError(f"the broker refused CONNECT (reason 0x{rc:02x})")
 
-    def publish(self, topic_name, payload):
+    def collect(self, filters, seconds):
+        """Subscribe at QoS 0 and gather what arrives for `seconds`:
+        {topic: (payload bytes, retained)}, the last one per topic. A
+        refused filter is said (the broker's SUBACK reason)."""
+        self.pid = self.pid % 65535 + 1
+        out = {}
+        try:
+            self.sock.settimeout(self._timeout(CONNECT_TIMEOUT))
+            self.sock.sendall(subscribe_packet(filters, self.pid))
+            end = time.monotonic() + seconds
+            while True:
+                left = min(end - time.monotonic(), self.deadline - time.monotonic())
+                if left <= 0:
+                    break
+                self.sock.settimeout(max(0.05, left))
+                try:
+                    ptype, flags, body = read_packet(self.sock)
+                except socket.timeout:
+                    break
+                if ptype == 9:          # SUBACK: one reason code per filter
+                    codes = body[3:] if len(body) > 3 else b""
+                    bad = [f for f, c in zip(filters, codes) if c >= 0x80]
+                    if bad:
+                        raise AuthRefused("the broker refused the subscription "
+                                          f"to {', '.join(bad)}")
+                elif ptype == 3:
+                    name, payload, retained = parse_publish(flags, body)
+                    out[name] = (payload, retained)
+        except (OSError, struct.error, IndexError) as exc:
+            raise SenderError(f"subscription failed ({type(exc).__name__})") from None
+        return out
+
+    def publish(self, topic_name, payload, retain=True):
         self.pid = self.pid % 65535 + 1
         try:
             self.sock.settimeout(self._timeout(CONNECT_TIMEOUT))
-            self.sock.sendall(publish_packet(topic_name, payload, self.pid))
+            self.sock.sendall(publish_packet(topic_name, payload, self.pid, retain))
             while True:
                 ptype, _flags, body = read_packet(self.sock)
                 if ptype == 4 and len(body) >= 2 and \
@@ -438,9 +520,88 @@ def _fail(metrics_dir, st, now, exc, secret):
     return {"status": "error", "kind": kind, "error": st["err"], "sent": 0}
 
 
-def run(metrics_dir, cfg_dir, now=None, client_factory=Client):
-    """Send what is waiting. Never raises; returns what happened:
-    {"status": "unconfigured"|"backoff"|"idle"|"ok"|"error", "sent": n}."""
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def events_pending(metrics_dir):
+    d = _path(metrics_dir, EVENTS_OUT)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return []
+    return [os.path.join(d, n) for n in names]
+
+
+def spool_event(metrics_dir, item):
+    """The host's half: one notification as a file for the next run. Never
+    raises; the oldest beyond EVENTS_KEEP go (counted in the next alive as
+    `events_dropped`)."""
+    try:
+        d = _path(metrics_dir, EVENTS_OUT)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        name = f"{time.time():.6f}-{item.get('id', 'x')}.json"
+        tmp = os.path.join(d, "." + name)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(item, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(d, name))
+        old = events_pending(metrics_dir)[:-EVENTS_KEEP]
+        for path in old:
+            os.remove(path)
+        if old:
+            st = load_state(metrics_dir)
+            st["events_dropped"] = int(st.get("events_dropped", 0)) + len(old)
+            _save_state(metrics_dir, st)
+        return True
+    except OSError:
+        return False
+
+
+def _publish_classes(client, cfg, metrics_dir, st, now, version):
+    """alive, then events, status and broker. Updates `st` in place;
+    returns how many messages went out."""
+    n = 0
+    seq = int(st.get("alive_seq", 0)) + 1
+    alive = {"v": 1, "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+             "seq": seq, "version": version or "", "interval": ALIVE_INTERVAL,
+             "lost": metrics.queue_status(metrics_dir)["lost"],
+             "events_dropped": int(st.get("events_dropped", 0))}
+    client.publish(class_topic(cfg, "alive"),
+                   json.dumps(alive, separators=(",", ":")).encode("utf-8"))
+    st["alive_seq"] = seq
+    n += 1
+    for path in events_pending(metrics_dir):
+        item = _read_json(path)
+        if isinstance(item, dict) and re.match(r"^[a-z][a-z0-9.]{0,40}$", str(item.get("type", ""))):
+            client.publish(class_topic(cfg, "events", item["type"]),
+                           json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                           .encode("utf-8"), retain=False)
+            n += 1
+        os.remove(path)             # sent, or unreadable: either way done
+    doc = _read_json(_path(metrics_dir, STATUS_OUT))
+    if isinstance(doc, dict) and doc.get("digest") and \
+            doc["digest"] != st.get("status_sent"):
+        client.publish(class_topic(cfg, "status"),
+                       json.dumps(doc.get("document"), ensure_ascii=False,
+                                  separators=(",", ":")).encode("utf-8"))
+        st["status_sent"] = doc["digest"]
+        n += 1
+    bw = _read_json(_path(metrics_dir, BROKER_OUT))
+    if isinstance(bw, dict) and now - int(bw.get("at", 0)) <= BROKER_FRESH:
+        client.publish(class_topic(cfg, "broker"),
+                       json.dumps(bw, separators=(",", ":")).encode("utf-8"))
+        n += 1
+    return n
+
+
+def run(metrics_dir, cfg_dir, now=None, client_factory=Client, version=""):
+    """Send `alive`, the class files and what is waiting. Never raises;
+    returns what happened:
+    {"status": "unconfigured"|"backoff"|"ok"|"error", "sent": n}."""
     now = int(time.time() if now is None else now)
     cfg = load_config(cfg_dir)
     if not cfg:
@@ -464,10 +625,12 @@ def run(metrics_dir, cfg_dir, now=None, client_factory=Client):
         if scheme == "mqtt" and not (cfg.get("allow_plain")
                                      and is_private_host(host)):
             raise ConfigError("a plain mqtt:// target is not allowed here")
-        if not metrics.queue_pending(metrics_dir, 1):
-            return {"status": "idle", "sent": 0}
         client = client_factory(cfg, time.monotonic() + RUN_BUDGET)
         client.connect(secret)
+        # RFC-0085 stage 2: alive on every run -- a node with nothing
+        # queued is exactly the node whose silence must be noticed.
+        st["class_sent_total"] = int(st.get("class_sent_total", 0)) + \
+            _publish_classes(client, cfg, metrics_dir, st, now, version)
         for e in metrics.queue_pending(metrics_dir):
             for line in metrics.sample_lines(cfg["node"], e):
                 client.publish(topic(cfg, line["m"]),
