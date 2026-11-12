@@ -322,9 +322,29 @@ res = a.notify_minute({})
 ok("während ein Backup läuft: nichts verschickt, keine Lage geschlossen",
    res == {} and SENT == [] and "backup.failed" in a._notify_state_rw()["matters"][dflt]
    and len(os.listdir(a.NOTIFY_OUTBOX_DIR)) == 1, (res, SENT))
+os.makedirs(a.APPS_DIR, exist_ok=True)
+a.state_view_write = lambda *x: open(os.path.join(a.APPS_DIR, "instance-state.json"), "w").close() or True
+before = sorted(os.listdir(a.APPS_DIR))
+called = []
+a._care_fresh = lambda **k: called.append("fresh") or {}
+a._care_reboot_if_due = lambda f: called.append("reboot")
+
+
+class _Args:
+    profile = "sample"
+    rest = []
+
+
+a.state_index_minute()
+a.cmd_node_care(_Args())
+ok("während ein Backup läuft: state-index und node care sample schreiben nichts nach apps/ "
+   "(tar bricht sonst ab, auf oaap-test nachgestellt 12.11.)",
+   sorted(os.listdir(a.APPS_DIR)) == before and "fresh" not in called,
+   (sorted(set(os.listdir(a.APPS_DIR)) - set(before)), called))
 with open(a.BACKUP_RUN_FILE, "w", encoding="utf-8") as f:
     json.dump({"state": "running", "started": "2026-01-01T00:00:00+00:00"}, f)
-ok("ein seit Stunden „laufendes“ Backup hält nichts mehr auf", not a.notify_paused_by_backup())
+ok("ein seit Stunden „laufendes“ Backup hält nichts mehr auf", not a.notify_paused_by_backup()
+   and a.state_index_minute() is True)
 with open(a.BACKUP_RUN_FILE, "w", encoding="utf-8") as f:
     json.dump({"state": "ok", "finished": n.now_utc().isoformat()}, f)
 a.notify_minute({})

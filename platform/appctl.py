@@ -3326,12 +3326,14 @@ def notify_view_write():
 NOTIFY_BACKUP_PAUSE_HOURS = 6
 
 
-def notify_paused_by_backup(now=None):
-    """While a backup runs, the minute part waits: it would write into apps/
-    under tar's feet, and a running backup is neither failed nor fixed (a
-    "Behoben" was mailed mid-run on oaap-test 2026-11-11). A run that
-    claims to have started more than six hours ago is a crashed one; then
-    nothing waits for it."""
+def backup_running_now(now=None):
+    """True while the node backup copies (oaap.data.backup 2.2.2): then no
+    minute job writes into apps/. tar stops with exit 1 ("apps: file
+    changed as we read it") when the directory changes during its read --
+    reproduced on oaap-test 2026-11-12 by running `state-index` beside a tar
+    of apps/ (one run in three), the pattern of its nights 07.-11.11. A run
+    that claims to have started more than six hours ago is a crashed one;
+    then nothing waits for it."""
     run = last_backup_run() or {}
     if run.get("state") != "running":
         return False
@@ -3339,6 +3341,21 @@ def notify_paused_by_backup(now=None):
     now = now or notify.now_utc()
     return bool(started and (now - started).total_seconds()
                 < NOTIFY_BACKUP_PAUSE_HOURS * 3600)
+
+
+def notify_paused_by_backup(now=None):
+    """The notifications wait for the same reason, and a running backup is
+    neither failed nor fixed (a "Behoben" was mailed mid-run on oaap-test
+    2026-11-11)."""
+    return backup_running_now(now)
+
+
+def state_index_minute():
+    """The minute job's `state-index`: the views for the portal -- not while
+    a backup copies apps/ (they are rewritten the minute after)."""
+    if backup_running_now():
+        return False
+    return state_view_write()
 
 
 def notify_minute(facts=None):
@@ -11574,6 +11591,14 @@ def cmd_node_care(args):
     reason = getattr(args, "care_reason", None) or ""
 
     if verb == "sample":
+        if backup_running_now():
+            # Nothing measured, nothing written into apps/ while the backup
+            # copies it; the reboot plan is still asked as before.
+            facts = host_care.read(APPS_DIR) or {}
+            notify_minute(facts)
+            if facts:
+                _care_reboot_if_due(facts)
+            return
         facts = host_care.read(APPS_DIR)
         # A measurement younger than ten minutes is still the OLD machine
         # when the node has booted since (measured 2026-11-05: the plan
@@ -32618,7 +32643,7 @@ def build_parser():
     pms = sub.add_parser("state-index",
                          help="internal: write container state facts where "
                               "the portal can read them (RFC-0038 D1)")
-    pms.set_defaults(fn=lambda _a: state_view_write())
+    pms.set_defaults(fn=lambda _a: state_index_minute())
     pmc = sub.add_parser("config-index",
                          help="internal: write non-secret config values where "
                               "the portal can read them (portal 2.4)")
