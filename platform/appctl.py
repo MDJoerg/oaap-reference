@@ -3080,6 +3080,8 @@ def _notify_backup_conditions(now):
             sched = json.load(f) or {}
     except (OSError, ValueError):
         sched = {}
+    if backup_class()["class"] == "none":
+        sched = {}      # RFC-0081 D2: declared "no backup" -- nothing is missing
     if sched and not failed:
         # Only a node that HAS a schedule can miss a backup; a node nobody
         # set up for backups is the portal's to say, not a daily alarm.
@@ -30290,6 +30292,105 @@ def save_backup_exclusions(ex):
     os.replace(tmp, BACKUP_EXCLUSIONS)
 
 
+BACKUP_CLASS_FILE = os.path.join(APPS_DIR, "backup-class.json")
+# RFC-0081 D1: what the operator declares this node's backup to be. A
+# declaration the platform reads -- it sets up no pull and no vault; where
+# archives go is decided at the machine (oaap.data.backup 2.4).
+BACKUP_CLASSES = {
+    "offsite": "local archives and a copy that leaves the machine",
+    "local": "archives on this machine only -- protects against mistakes, "
+             "not against the disk or the machine dying",
+    "none": "no backup, declared with a reason",
+}
+
+
+def backup_class():
+    """{"class": offsite|local|none|"", "reason", "who", "since",
+    "skip_test": bool}. "" = nobody declared anything (the state before
+    RFC-0081, and still the default)."""
+    try:
+        with open(BACKUP_CLASS_FILE, encoding="utf-8") as f:
+            rec = json.load(f) or {}
+    except (OSError, ValueError):
+        rec = {}
+    cls = rec.get("class") if rec.get("class") in BACKUP_CLASSES else ""
+    return {"class": cls, "reason": str(rec.get("reason") or ""),
+            "who": rec.get("who", ""), "since": rec.get("since", ""),
+            "skip_test": bool(rec.get("skip_test"))}
+
+
+def backup_class_set(cls=None, reason=None, skip_test=None, who="root"):
+    """Change the declaration -> the sentence to print. `none` without a
+    reason is refused (the same rule as excluding a tenant, 2.1.2): a node
+    nobody backs up and nobody remembers deciding not to is the failure
+    this declaration exists to prevent. Written only on a change."""
+    rec = backup_class()
+    new = dict(rec)
+    if cls is not None:
+        if cls not in BACKUP_CLASSES:
+            raise ValueError("class is one of: " + ", ".join(BACKUP_CLASSES))
+        new["class"] = cls
+        new["reason"] = (reason or "").strip()[:300]
+        if cls == "none" and not new["reason"]:
+            raise ValueError('say why, in words a successor can read: oaap backup class '
+                             'none --reason "..." -- "no backup" without a reason is a '
+                             "node nobody remembers deciding not to back up")
+    if skip_test is not None:
+        new["skip_test"] = bool(skip_test)
+    if new == rec:
+        return "Unchanged."
+    new.update(who=who, since=_iso_now())
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = BACKUP_CLASS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(new, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, BACKUP_CLASS_FILE)
+    os.chmod(BACKUP_CLASS_FILE, 0o644)       # the portal reads it; nothing secret
+    detail = (f"backup class {new['class'] or '(undeclared)'}"
+              + (f" -- {new['reason']}" if new["reason"] else "")
+              + f"; test instances {'left out' if new['skip_test'] else 'included'}")
+    audit_tenant("backup.class", default_tenant_id(), subject="node", who=who,
+                 role="root", detail=detail)
+    return "Backup declaration: " + detail + "."
+
+
+def backup_test_left_out(reg, excluded=None):
+    """{name: inst} of the test instances the node archive leaves out
+    (RFC-0081 2.2): channel `test` or a rehearsal, when the switch is on.
+    An excluded tenant's instances are out anyway and not listed twice."""
+    if not backup_class()["skip_test"]:
+        return {}
+    excluded = excluded or {}
+    return {n: i for n, i in (reg.get("instances") or {}).items()
+            if (i.get("channel") == "test" or is_rehearsal(i))
+            and resolve_tenant(i.get("tenant")) not in excluded}
+
+
+def cmd_backup_class(args):
+    """`oaap backup class [offsite|local|none] [--reason ...]` and
+    `oaap backup test-instances on|off` (RFC-0081 stage 1)."""
+    who = os.environ.get("SUDO_USER") or "root"
+    val = (args.target or "").strip().lower()
+    try:
+        if args.action == "test-instances":
+            if val not in ("on", "off"):
+                die("oaap backup test-instances on|off -- on: test instances are "
+                    "backed up (the default), off: they are left out")
+            print(backup_class_set(skip_test=(val == "off"), who=who))
+            return
+        if val:
+            print(backup_class_set(val, getattr(args, "reason", "") or "", who=who))
+            return
+    except ValueError as e:
+        die(str(e))
+    rec = backup_class()
+    print(f"backup class: {rec['class'] or '(not declared)'}"
+          + (f" -- {BACKUP_CLASSES[rec['class']]}" if rec["class"] else ""))
+    if rec["reason"]:
+        print(f"  reason: {rec['reason']}")
+    print(f"  test instances: {'LEFT OUT' if rec['skip_test'] else 'backed up'}")
+
+
 def excluded_tenants():
     """The live exclusions: only ids that still name a tenant of this node.
 
@@ -30372,6 +30473,12 @@ def cmd_backup_exclude(args):
 
 def cmd_backup_status(_args):
     """What the node archive currently holds, and what it does not."""
+    rec = backup_class()
+    print(f"Backup class: {rec['class'] or '(not declared)'}"
+          + (f" -- {rec['reason']}" if rec["reason"] else ""))
+    if rec["skip_test"]:
+        out = sorted(backup_test_left_out(load_registry(), excluded_tenants()))
+        print(f"Test instances: LEFT OUT ({len(out)}: {', '.join(out) or '-'})")
     ex = excluded_tenants()
     tenants = load_tenants()
     reg = load_registry()
@@ -30646,6 +30753,8 @@ def cmd_backup(args):
         return cmd_backup_exclude(args)
     if args.action == "status":
         return cmd_backup_status(args)
+    if args.action in ("class", "test-instances"):
+        return cmd_backup_class(args)
     import datetime
     import socket
     import time
@@ -30717,6 +30826,11 @@ def cmd_backup(args):
          "since": e.get("since", ""),
          "instances": sorted(tenant_instances(reg, tid))}
         for tid, e in sorted(_ex.items())]
+    # RFC-0081 2.2: test instances left out by the switch -- recorded like
+    # an excluded tenant, so the restore can say it instead of discovering it.
+    _test_out = backup_test_left_out(reg, _ex)
+    manifest["test_instances_left_out"] = sorted(_test_out)
+    manifest["backup_class"] = backup_class()["class"]
 
     # RFC-0029 D3: the apps stop for the COPY, not for the compression.
     #
@@ -30765,13 +30879,20 @@ def cmd_backup(args):
     keep_running = {c for tid in _ex
                     for i in tenant_instances(reg, tid).values()
                     for c in _containers_of(i)}
+    # The same for the test instances left out (RFC-0081 2.2) -- said in
+    # their own sentence: they are not an excluded tenant's.
+    keep_test = {c for i in _test_out.values() for c in _containers_of(i)} - keep_running
     running = [c for c in run(["docker", "ps", "--format", "{{.Names}}",
                                "--filter", "name=^oaap-app-"]).stdout.split()
-               if c not in keep_running]
+               if c not in keep_running and c not in keep_test]
     if keep_running:
         print(f"NOTE: {len(keep_running)} container(s) of excluded tenant(s) "
               f"keep running ({', '.join(sorted(keep_running))}) — "
               "their data is not in this archive, so they need not stand still.")
+    if keep_test:
+        print(f"NOTE: {len(keep_test)} container(s) of test instances keep running "
+              f"({', '.join(sorted(keep_test))}) — test instances are left out "
+              "(`oaap backup test-instances`).")
     stage = tempfile.mkdtemp(prefix="oaap-backup-")
     # The managed Postgres (oaap.data.store 0.1, spec 2.4): a DUMP, not
     # a copy of its data directory -- a dump survives a Postgres
@@ -30845,6 +30966,15 @@ def cmd_backup(args):
         else:
             paths.append("files")
 
+    # Each left-out test instance by its own directory, never a pattern:
+    # an exact path matches that instance and nothing else.
+    test_excludes = []
+    for _n, _i in sorted(_test_out.items()):
+        _d = instance_dir(_n, _i)
+        if os.path.isdir(_d):
+            test_excludes.append("--exclude="
+                                 + os.path.relpath(_d, DATA_DIR).replace(os.sep, "/"))
+
     def copy_phase():
         """The only part the apps have to stand still for."""
         try:
@@ -30867,6 +30997,7 @@ def cmd_backup(args):
                  # The manifest still records them so the operator can
                  # set them again deliberately.
                  "--exclude=apps/node.json",
+                 *test_excludes,
                  "-C", stage, *stage_files,
                  "-C", DATA_DIR, *paths])
             os.chmod(tmp_tar, 0o600)
@@ -30911,7 +31042,7 @@ def cmd_backup(args):
         missing = _backup_missing_instances(
             tmp_out, {"instances": {k: i for k, i in reg["instances"].items()
                                     if resolve_tenant(i.get("tenant"))
-                                    not in _ex}})
+                                    not in _ex and k not in _test_out}})
         # Same question asked of the managed Postgres (oaap.data.store
         # 0.1, spec 2.4): a node profiled for it that fails to dump must
         # not produce an archive that calls itself complete.
@@ -30963,7 +31094,11 @@ def cmd_backup(args):
     for ent in manifest["tenants_excluded"]:
         print(f"NOTE: tenant '{ent['label']}' is NOT in this archive "
               f"({len(ent['instances'])} instance(s)) — {ent['reason']}")
-    if manifest["tenants_excluded"]:
+    if manifest["test_instances_left_out"]:
+        print(f"NOTE: {len(manifest['test_instances_left_out'])} test instance(s) are NOT "
+              "in this archive (RFC-0081, `oaap backup test-instances`): "
+              + ", ".join(manifest["test_instances_left_out"]))
+    if manifest["tenants_excluded"] or manifest["test_instances_left_out"]:
         print("      This archive is not a complete copy of this machine. "
               "A restore brings those instances back dormant and says so.")
     # What the downtime actually was, written down where a page can read
@@ -31134,6 +31269,16 @@ def restored_exclusions():
     return out
 
 
+def restored_test_left_out():
+    """Test instances the restored archive left out (RFC-0081 2.2)."""
+    try:
+        with open(os.path.join(DATA_DIR, "last-restore-manifest.json"),
+                  encoding="utf-8") as f:
+            return set((json.load(f) or {}).get("test_instances_left_out") or [])
+    except (OSError, ValueError):
+        return set()
+
+
 def cmd_restore_instances(_args):
     """Used by 'install.sh restore': re-create every registered instance."""
     _report_dropped_profiles()
@@ -31159,8 +31304,19 @@ def cmd_restore_instances(_args):
         print("   Bring their data back from wherever it is kept, then "
               "start them deliberately.")
         print("")
+    test_out = restored_test_left_out()
+    if test_out:
+        print("!! This archive left test instances out (RFC-0081): "
+              + ", ".join(sorted(test_out)))
+        print("   Their records came back, their data did not; they are NOT started.")
+        print("")
     ok = skipped = 0
     for name, inst in sorted(reg["instances"].items()):
+        if name in test_out:
+            print(f"DORMANT {name}: a test instance left out of this archive — "
+                  "the record is here, the data is not.")
+            skipped += 1
+            continue
         if resolve_tenant(inst.get("tenant")) in left_out:
             # Dormant plus a loud sentence, rather than dropping the
             # registry entry: a customer's instance silently vanishing
@@ -33257,9 +33413,11 @@ def build_parser():
     pb = sub.add_parser("backup",
                         help="platform backup: create, schedule, status, exclude or include a tenant")
     pb.add_argument("action", choices=["create", "schedule", "exclude",
-                                       "include", "status"])
+                                       "include", "status", "class",
+                                       "test-instances"])
     pb.add_argument("target", nargs="?", help="tenant label for "
-                                              "exclude/include")
+                                              "exclude/include; offsite|local|none "
+                                              "for class; on|off for test-instances")
     pb.add_argument("--to", default="", help="target directory or .tar.gz file (outside the data dir)")
     pb.add_argument("--tenant", default="",
                     help="create: archive ONE tenant instead of the node "
@@ -33267,7 +33425,8 @@ def build_parser():
                          "by the installer — see the note it prints")
     pb.add_argument("--reason", default="",
                     help="exclude: why, in words the customer can read — it "
-                         "goes into THEIR audit log")
+                         "goes into THEIR audit log; class none: why this node "
+                         "has no backup")
     pb.add_argument("--at", default="", help="schedule: hour HH:MM (24h)")
     pb.add_argument("--keep", type=int, default=None,
                     help="schedule: how many archives stay on this node")

@@ -1455,6 +1455,11 @@ HEALTH_BODY = """
 {% endif %}
 <div class="card">
   <h2>Sicherung</h2>
+  {% if bk.cls.class %}<p><span class="dot {{ 'warn' if bk.cls.class != 'offsite' else 'ok' }}"></span>Art:
+     <strong>{{ bk.cls.word }}</strong>{% if bk.cls.reason %} <span class="muted">— Grund:
+     {{ bk.cls.reason }}</span>{% endif %}</p>{% endif %}
+  {% if bk.cls.skip_test %}<p class="muted">Test-Instanzen werden nicht gesichert und stehen
+     während des Kopierens nicht still.</p>{% endif %}
   {% if bk.running %}
   <p><span class="dot warn"></span><strong>Läuft seit {{ bk.running.since }}</strong>
      <span class="muted">— währenddessen stehen die Apps dieses Knotens für
@@ -2991,7 +2996,9 @@ INSTANCE_EDIT_BODY = """
   <ul class="muted">
     {% for s in i.storage %}<li><code>{{ s.name }}</code> im Container unter <code>{{ s.mount }}</code></li>{% endfor %}
   </ul>
-  <p class="muted">Nur hier darf die App schreiben, und nur das ist im Backup.</p>
+  {% if i.backup_out %}<p class="muted">Nur hier darf die App schreiben. <strong>Nicht im
+     Backup (Test-Instanz)</strong> — der Betreiber lässt Test-Instanzen aus.</p>
+  {% else %}<p class="muted">Nur hier darf die App schreiben, und nur das ist im Backup.</p>{% endif %}
   {% else %}
   <p class="muted">Diese App erklärt keine Ablage — sie hält nichts fest, was
      einen Neustart überlebt.</p>
@@ -6844,6 +6851,20 @@ def _entry_url(name, inst):
 BACKUP_LAST = "/apps-registry/backup-last.json"
 BACKUP_SCHEDULE = "/apps-registry/backup-schedule.json"
 BACKUP_PULLS = "/apps-registry/backup-pulls"
+BACKUP_CLASS = "/apps-registry/backup-class.json"
+BACKUP_CLASS_WORDS = {
+    "offsite": "außer Haus — Archive hier und eine Kopie auf einem anderen Gerät",
+    "local": "nur lokal — die Archive liegen auf demselben Rechner; das schützt vor "
+             "Bedienfehlern, nicht vor einem Plattenausfall",
+    "none": "bewusst keine Sicherung",
+}
+
+
+def _backup_class():
+    rec = _read_json(BACKUP_CLASS) or {}
+    cls = rec.get("class") if rec.get("class") in BACKUP_CLASS_WORDS else ""
+    return {"class": cls, "word": BACKUP_CLASS_WORDS.get(cls, ""),
+            "reason": rec.get("reason", ""), "skip_test": bool(rec.get("skip_test"))}
 
 
 def _read_json(path):
@@ -6905,7 +6926,8 @@ def backup_state():
            # Jörg's condition when he chose the fuller variant).
            "downtime": _secs_h(last.get("downtime_seconds"))
                        if last.get("downtime_seconds") is not None else "",
-           "instances": last.get("instances")}
+           "instances": last.get("instances"),
+           "cls": _backup_class()}
 
     if last.get("state") == "running":
         started = last.get("started", "")
@@ -8751,6 +8773,9 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "mcp": iv.mcp_view(name, inst, load_instances(), load_tenants(),
                             server_admin="server_admin" in caller_roles(),
                             default_tid=default_tenant_id()),
+         # RFC-0081 2.2: a test instance the node archive leaves out says so.
+         "backup_out": (_backup_class()["skip_test"]
+                        and (inst.get("channel") == "test" or bool(inst.get("rehearsal")))),
          **_throttle_view(inst)}
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
