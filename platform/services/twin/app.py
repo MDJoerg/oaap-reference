@@ -74,17 +74,29 @@ Concretely NOT built yet, named here rather than silently missing:
 
 Every write still appends one row to `events`; this service itself
 never publishes anything.
+
+**oaap.data.timeseries 0.1 (RFC-0086) is served here too**, under
+'/twin/series' and '/twin/points' -- the same caller, the same bindings:
+writing a series needs `contributes` on its object's type, reading needs
+any binding, a remote reader only reads. The points live in the tenant's
+own schema `ts_<tenant-id>` with its own role (credential in the same
+secrets file, written by `oaap data timeseries enable`); the driver is
+timeseries.py, the minutely job ts_admin.py. See the section at the end.
 """
 import datetime
+import functools
 import json
 import os
 import re
 import secrets
+import time
 import uuid
 
 import psycopg2
 import psycopg2.extras
 from flask import Flask, jsonify, request
+
+import timeseries as ts
 
 app = Flask(__name__)
 
@@ -1271,3 +1283,258 @@ def twin_outbox():
             conn.close()
         out.append(entry)
     return jsonify({"tenants": out})
+
+
+# ======================================================= time series (0.1)
+# oaap.data.timeseries 0.1 §3 (RFC-0086). The caller is require_caller()'s,
+# exactly as for objects: the tenant comes from the credential, the right
+# from the caller's bindings to the OBJECT's type -- a series has no
+# rights of its own, it is a property of its object (RFC-0086 D2).
+
+TS_OFF = ("time series are not enabled for this tenant -- the operator runs "
+          "'oaap data timeseries enable <tenant>' (oaap.data.timeseries 0.1)")
+# points per minute and tenant (oaap.data.timeseries 0.1 §3); a tenant that
+# needs more says so -- there is no switch for it in 0.1
+TS_POINTS_PER_MINUTE = ts.DEFAULT_POINTS_PER_MINUTE
+TS_READ_ONLY = ("a remote reader reads only (oaap.data.twin 0.4 §2.14) -- "
+                "writing belongs to an app on the node that holds the data")
+
+
+def get_ts(tenant_id):
+    """The driver on the tenant's OWN time-series schema and role, or None
+    when the operator has not enabled time series for it. A plain cursor:
+    the driver asks for a dict cursor where it wants one."""
+    schema = f"ts_{tenant_id}"
+    creds = load_secrets().get(schema)
+    if creds is None:
+        return None
+    conn = psycopg2.connect(host=STORE_HOST, port=STORE_PORT, dbname="postgres",
+                            user=creds["role"], password=creds["password"],
+                            connect_timeout=5)
+    return ts.PostgresDriver(conn, schema)
+
+
+def _urn(obj_id):
+    return f"urn:oaap:obj:{obj_id}"
+
+
+def _ts_public(s):
+    return {**s, "object": _urn(s["object"])}
+
+
+class _Refused(Exception):
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+def _ts_object(tenant_id, name, raw_id, write):
+    """(canonical object id, type key) of an object of the caller's twin
+    the caller may read -- or, with `write`, contribute to. Raises
+    _Refused otherwise. An id merged away resolves to its canonical one,
+    so a series never forks along a merge (RFC-0031 D3)."""
+    m = OBJ_ID_RE.match(raw_id or "") if isinstance(raw_id, str) else None
+    if not m:
+        raise _Refused("malformed object id", 400)
+    conn = get_conn(tenant_id)
+    if conn is None:
+        raise _Refused("this tenant has no twin schema yet -- a series belongs "
+                       "to a twin object (RFC-0086 D2)", 409)
+    try:
+        with conn:
+            try:
+                oid = _canonical_of(conn, m.group(1))
+                with conn.cursor() as cur:
+                    cur.execute("SELECT type_key FROM objects WHERE id = %s", (oid,))
+                    obj = cur.fetchone()
+            except psycopg2.DataError:
+                raise _Refused("malformed object id", 400)
+            if obj is None:
+                raise _Refused("no such object in this tenant's twin", 404)
+            bindings = _bindings(conn, name)
+    finally:
+        conn.close()
+    if write:
+        ok = any(b["type_key"] == obj["type_key"] and b["direction"] == "contributes"
+                 for b in bindings)
+        verb = "does not contribute to"
+    else:
+        ok = any(b["type_key"] == obj["type_key"] for b in bindings)
+        verb = "neither contributes nor consumes"
+    if not ok:
+        raise _Refused(f"'{name}' {verb} '{obj['type_key']}' -- see 'oaap data "
+                       "model bindings'", 403)
+    return oid, obj["type_key"]
+
+
+def ts_route(write):
+    """Caller, driver, refusals -> HTTP, and the connection closed on every
+    path. A refusal of the driver is the caller's error (400); a missing
+    series 404; the minute's allowance 429."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **kw):
+            caller, err, code = require_caller()
+            if err:
+                return err, code
+            if write and is_remote(caller[0]):
+                return TS_READ_ONLY, 403
+            try:
+                drv = get_ts(caller[1])
+            except psycopg2.Error:
+                return "the store does not answer", 503
+            if drv is None:
+                return TS_OFF, 409
+            try:
+                return fn(caller, drv, *a, **kw)
+            except _Refused as e:
+                return str(e), e.code
+            except ts.NotFound as e:
+                return str(e), 404
+            except ts.RateLimited as e:
+                return str(e), 429
+            except ts.TimeseriesError as e:
+                return str(e), 400
+            except psycopg2.Error as e:
+                # the store's fault, not the caller's: said, never a bare 500
+                app.logger.warning("timeseries: %s: %s", type(e).__name__, e)
+                return (f"the time-series store failed ({type(e).__name__}) -- "
+                        "the operator sees it in 'oaap data timeseries show'"), 503
+            finally:
+                drv.conn.close()
+        return wrapper
+    return deco
+
+
+@app.put("/twin/series")
+@ts_route(write=True)
+def ts_ensure(caller, drv):
+    name, tenant_id, _origin = caller
+    body = request.get_json(silent=True) or {}
+    raw_id = body.get("object")
+    oid, _type = _ts_object(tenant_id, name, raw_id, write=True)
+    s, created = drv.ensure_series(
+        oid, body.get("measure"), body.get("kind", "number"), body.get("labels"),
+        body.get("unit", ""), body.get("policy", "standard"), body.get("expected_s"))
+    return jsonify({"series": _ts_public(s), "created": created}), (201 if created else 200)
+
+
+@app.get("/twin/series")
+@ts_route(write=False)
+def ts_list(caller, drv):
+    name, tenant_id, _origin = caller
+    raw_id = request.args.get("object")
+    oid, _type = _ts_object(tenant_id, name, raw_id, write=False)
+    conn = get_conn(tenant_id)
+    try:
+        with conn:
+            ids = [oid] + _aliases_of(conn, oid)
+    finally:
+        conn.close()
+    out = [s for i in ids for s in drv.list(i)]
+    return jsonify({"object": _urn(oid), "series": [_ts_public(s) for s in out]})
+
+
+def _ts_series(caller, drv, series_id, write):
+    s = drv.get_series(series_id)
+    _ts_object(caller[1], caller[0], s["object"], write)
+    return s
+
+
+@app.post("/twin/series/<int:series_id>/points")
+@ts_route(write=True)
+def ts_write(caller, drv, series_id):
+    _ts_series(caller, drv, series_id, write=True)
+    points = (request.get_json(silent=True) or {}).get("points")
+    if not isinstance(points, list):
+        return "body needs 'points': [[time, value], ...]", 400
+    if len(points) > ts.MAX_BATCH:
+        return f"at most {ts.MAX_BATCH} points per call", 400
+    now = time.time()
+    drv.admit(len(points), now, TS_POINTS_PER_MINUTE)
+    return jsonify(drv.write(series_id, points, now))
+
+
+@app.post("/twin/points")
+@ts_route(write=True)
+def ts_write_many(caller, drv):
+    """Several series in one call (the fleet service's form). Every series
+    is checked first; one the caller may not write is answered with its
+    reason and the others are written -- never all-or-nothing on rights,
+    because a sender cannot fix a revoked binding by resending."""
+    body = (request.get_json(silent=True) or {}).get("series")
+    if not isinstance(body, dict):
+        return "body needs 'series': {\"<id>\": [[time, value], ...]}", 400
+    if sum(len(v) for v in body.values() if isinstance(v, list)) > ts.MAX_BATCH:
+        return f"at most {ts.MAX_BATCH} points per call", 400
+    out, todo, allowed = {}, [], {}
+    for key, points in body.items():
+        try:
+            sid = int(key)
+            if not isinstance(points, list):
+                raise _Refused("points: a list of [time, value]", 400)
+            s = drv.get_series(sid)
+            if s["object"] not in allowed:
+                try:
+                    _ts_object(caller[1], caller[0], s["object"], write=True)
+                    allowed[s["object"]] = None
+                except _Refused as e:
+                    allowed[s["object"]] = str(e)
+            if allowed[s["object"]]:
+                raise _Refused(allowed[s["object"]], 403)
+            todo.append((sid, points))
+        except (ValueError, _Refused) as e:   # NotFound is a ValueError too
+            out[key] = {"error": str(e)}
+    now = time.time()
+    if todo:
+        drv.admit(sum(len(p) for _sid, p in todo), now, TS_POINTS_PER_MINUTE)
+    for sid, points in todo:
+        try:
+            out[str(sid)] = drv.write(sid, points, now)
+        except ts.TimeseriesError as e:
+            out[str(sid)] = {"error": str(e)}
+    return jsonify({"series": out})
+
+
+def _qtime(v):
+    """A time from the query string: seconds arrive as text there, and the
+    driver takes seconds as a number or ISO-8601 as text (§2)."""
+    if v and re.fullmatch(r"\d{1,12}(\.\d+)?", v):
+        return float(v)
+    return v
+
+
+@app.get("/twin/series/<int:series_id>/range")
+@ts_route(write=False)
+def ts_range(caller, drv, series_id):
+    _ts_series(caller, drv, series_id, write=False)
+    frm, to = _qtime(request.args.get("from")), _qtime(request.args.get("to"))
+    if not frm or not to:
+        return "'from' and 'to' are needed (seconds or ISO-8601 with zone)", 400
+    step = request.args.get("step")
+    try:
+        step = int(step) if step else None
+    except ValueError:
+        return "step: whole seconds", 400
+    return jsonify(drv.range(series_id, frm, to, step, time.time()))
+
+
+@app.get("/twin/series/<int:series_id>/latest")
+@ts_route(write=False)
+def ts_latest(caller, drv, series_id):
+    _ts_series(caller, drv, series_id, write=False)
+    return jsonify({"series": series_id, "latest": drv.latest(series_id)})
+
+
+@app.delete("/twin/series/<int:series_id>")
+@ts_route(write=True)
+def ts_delete(caller, drv, series_id):
+    """Confirmed by naming the series a second time (`?confirm=<id>`), so
+    a DELETE that reached the wrong path removes nothing; audited in the
+    tenant's own schema (who, which series, how many points)."""
+    _ts_series(caller, drv, series_id, write=True)
+    if request.args.get("confirm") != str(series_id):
+        return (f"deleting removes the series and all its points -- confirm "
+                f"with '?confirm={series_id}'"), 409
+    s = drv.drop_series(series_id, by=caller[0])
+    return jsonify({"deleted": _ts_public(s)})

@@ -57,7 +57,10 @@ DEFAULT_MAX_SERIES = 10000
 FUTURE_SLACK = 3600          # a point more than an hour ahead is refused
 MEASURE_RE = re.compile(r"^[a-z][a-z0-9_.]{0,62}$")
 LABEL_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-SCHEMA_RE = re.compile(r"^ts_[a-z0-9_]{1,59}$")
+# ts_<tenant-id>; tenant ids carry hyphens (oaap-ops), every identifier
+# here is quoted
+SCHEMA_RE = re.compile(r"^ts_[a-z0-9][a-z0-9_-]{0,58}$")
+DEFAULT_POINTS_PER_MINUTE = 20000
 
 
 class TimeseriesError(ValueError):
@@ -66,6 +69,10 @@ class TimeseriesError(ValueError):
 
 class NotFound(TimeseriesError):
     pass
+
+
+class RateLimited(TimeseriesError):
+    """More points in this minute than the tenant's limit (RFC-0086 §3)."""
 
 
 # --- helpers -------------------------------------------------------------
@@ -179,7 +186,13 @@ class PostgresDriver:
         """Create the tables if they are missing. Idempotent."""
         s = self._q
         with self.conn.cursor() as cur:
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+            # Not 'CREATE SCHEMA IF NOT EXISTS': PostgreSQL checks the right
+            # to create schemas BEFORE it looks whether this one exists, and a
+            # tenant's role owns its schema without that right (the store is
+            # closed, oaap.data.store). Found on oaap-test, 2026-11-12.
+            cur.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.schema,))
+            if cur.fetchone() is None:
+                cur.execute(f'CREATE SCHEMA "{self.schema}"')
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {s('series')} (
                 id bigserial PRIMARY KEY,
                 object_id text NOT NULL,
@@ -219,6 +232,14 @@ class PostgresDriver:
             cur.execute(f"""CREATE TABLE IF NOT EXISTS {s('counters')} (
                 day date NOT NULL, name text NOT NULL, n bigint NOT NULL,
                 PRIMARY KEY (day, name))""")
+            # points offered per minute, across every worker of the service
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {s('quota')} (
+                minute timestamptz PRIMARY KEY, n integer NOT NULL)""")
+            # a deleted series is a person's act and is kept (RFC-0086 §8)
+            cur.execute(f"""CREATE TABLE IF NOT EXISTS {s('audit')} (
+                at timestamptz NOT NULL DEFAULT now(), who text NOT NULL,
+                action text NOT NULL, series_id bigint NOT NULL,
+                detail jsonb NOT NULL DEFAULT '{{}}')""")
         self.conn.commit()
 
     def _part_name(self, table, start, size):
@@ -361,11 +382,17 @@ class PostgresDriver:
         self.conn.commit()
         return [self._public(r) for r in rows]
 
-    def drop_series(self, series_id):
+    def drop_series(self, series_id, by="?"):
+        """Remove the series and all its points, and say so in `audit`:
+        who, which series, how many raw points went with it."""
         s = self.get_series(series_id)
         pol = s["policy"]
         with self.conn.cursor() as cur:
             cur.execute(f"DELETE FROM {self._q('raw_' + pol)} WHERE series_id = %s", (series_id,))
+            raw = cur.rowcount
+            cur.execute(f"""INSERT INTO {self._q('audit')} (who, action, series_id, detail)
+                VALUES (%s, 'series.deleted', %s, %s::jsonb)""",
+                        (by, series_id, json.dumps({**s, "raw_points": raw})))
             for tier in tiers_of(pol):
                 cur.execute(f"DELETE FROM {self._q(f'a{tier}_{pol}')} WHERE series_id = %s",
                             (series_id,))
@@ -376,6 +403,28 @@ class PostgresDriver:
         return s
 
     # -- writing --
+
+    def admit(self, n, now, limit=DEFAULT_POINTS_PER_MINUTE):
+        """Take `n` points from this minute's allowance, or raise
+        RateLimited and take nothing. One row per minute, so every worker
+        of the service counts against the same number."""
+        if n > limit:
+            raise RateLimited(f"{n} points in one call, the limit is {limit} a minute")
+        with self.conn.cursor() as cur:
+            cur.execute(f"""INSERT INTO {self._q('quota')} AS q (minute, n) VALUES (%s, %s)
+                ON CONFLICT (minute) DO UPDATE SET n = q.n + EXCLUDED.n
+                WHERE q.n + EXCLUDED.n <= %s RETURNING n""",
+                        (_ts(_floor(now, 60)), n, limit))
+            if cur.fetchone() is None:
+                self.conn.rollback()
+                with self.conn.cursor() as c2:
+                    self._count(c2, now, "rate_limited", n)
+                self.conn.commit()
+                raise RateLimited(f"this tenant has written {limit} points this "
+                                  "minute, the limit -- try again in the next "
+                                  "minute or ask the operator for more")
+        self.conn.commit()
+        return True
 
     def _marks(self, cur, policy):
         cur.execute(f"SELECT tier, upto FROM {self._q('marks')} WHERE policy = %s", (policy,))
@@ -615,6 +664,8 @@ class PostgresDriver:
                     WHERE s.id = ts.series_id AND s.policy = %s AND ts.last_seen < %s""",
                             (pol, _ts(now - text_retention(pol))))
                 texts += cur.rowcount
+            cur.execute(f"DELETE FROM {self._q('quota')} WHERE minute < %s",
+                        (_ts(now - 3600),))
             self._count(cur, now, "partitions_dropped", len(dropped))
             self._count(cur, now, "text_states_expired", texts)
         self.conn.commit()
@@ -688,22 +739,41 @@ class PostgresDriver:
         step = max(step, res)
         while (to - frm) / step > MAX_BUCKETS:
             step *= 2
-        table = "raw_" + s["policy"] if tier == "raw" else f"a{tier}_{s['policy']}"
+        raw = "raw_" + s["policy"]
         bucket = f"floor(extract(epoch FROM t) / {step}) * {step}"
-        if tier == "raw":
-            agg = "avg(x), min(x), max(x), count(*)"
-        else:
-            agg = "sum(mean * count) / sum(count), min(min), max(max), sum(count)"
+        lo = _floor(frm, step)
+        acc = {}
+
+        def add(rows):
+            for b, total, mn, mx, c in rows:
+                a = acc.setdefault(float(b), [0.0, mn, mx, 0])
+                a[0] += total
+                a[1], a[2], a[3] = min(a[1], mn), max(a[2], mx), a[3] + int(c)
+
         with self.conn.cursor() as cur:
-            cur.execute(f"""SELECT {bucket} AS b, {agg} FROM {self._q(table)}
-                WHERE series_id = %s AND t >= %s AND t < %s GROUP BY b ORDER BY b""",
-                        (series_id, _ts(_floor(frm, step)), _ts(to)))
-            rows = cur.fetchall()
+            split = lo
+            if tier != "raw":
+                # A tier holds a bucket only from two intervals after it
+                # closed (§4.2); everything from its mark on is still raw.
+                # Without this the last minutes of every chart are missing,
+                # and all of a new series is.
+                mark = self._marks(cur, s["policy"]).get(tier)
+                split = min(max(mark if mark is not None else lo, lo), to)
+                cur.execute(f"""SELECT {bucket} AS b, sum(mean * count), min(min), max(max),
+                    sum(count) FROM {self._q(f"a{tier}_{s['policy']}")}
+                    WHERE series_id = %s AND t >= %s AND t < %s GROUP BY b""",
+                            (series_id, _ts(lo), _ts(split)))
+                add(cur.fetchall())
+            if split < to:
+                cur.execute(f"""SELECT {bucket} AS b, sum(x), min(x), max(x), count(*)
+                    FROM {self._q(raw)} WHERE series_id = %s AND t >= %s AND t < %s
+                    GROUP BY b""", (series_id, _ts(split), _ts(to)))
+                add(cur.fetchall())
         self.conn.commit()
         return {"series": s["id"], "kind": "number", "tier": tier, "step": step,
                 "note": note,
-                "buckets": [{"t": iso(float(b)), "mean": mean, "min": mn, "max": mx,
-                             "count": int(c)} for b, mean, mn, mx, c in rows]}
+                "buckets": [{"t": iso(b), "mean": a[0] / a[3], "min": a[1], "max": a[2],
+                             "count": a[3]} for b, a in sorted(acc.items())]}
 
     def intervals(self, series_id, frm, to, now):
         """The state intervals of a text series overlapping [frm, to):
@@ -882,6 +952,6 @@ def _rolls_back(fn):
 
 
 for _name in ("ensure_schema", "ensure_partitions", "ensure_series", "get_series",
-              "list", "drop_series", "write", "roll_up", "expire", "job", "latest",
+              "list", "drop_series", "admit", "write", "roll_up", "expire", "job", "latest",
               "range", "intervals", "counters", "size", "export", "import_"):
     setattr(PostgresDriver, _name, _rolls_back(getattr(PostgresDriver, _name)))

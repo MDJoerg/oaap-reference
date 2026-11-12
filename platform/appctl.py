@@ -3800,7 +3800,7 @@ def cmd_report(args):
         die("the report reads the node's records: sudo oaap report ...")
     tid = default_tenant_id()
     if args.tenant:
-        tid = tenant_id_by_label(args.tenant) or die(f"no tenant '{args.tenant}'")
+        tid = resolve_tenant_arg(args.tenant)   # dies on a label this node lacks
     if args.action == "ledger":
         if args.day:
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.day):
@@ -13031,8 +13031,11 @@ def cmd_data(args):
         return cmd_data_model(args)
     if args.object == "twin":
         return cmd_data_twin(args)
+    if args.object == "timeseries":
+        return cmd_data_timeseries(args)
     if args.object != "store":
-        die(f"unknown object '{args.object}' — available: store, model, twin")
+        die(f"unknown object '{args.object}' — available: store, model, "
+            "twin, timeseries")
 
     if args.action == "status":
         if not has_profile("store"):
@@ -13202,6 +13205,12 @@ def cmd_data(args):
                 "pass --yes to confirm. Nothing was changed.")
         _store_psql(f'DROP SCHEMA "{schema}" CASCADE;')
         _store_psql(f'DROP ROLE IF EXISTS "{schema}";')
+        # The credential of a role that no longer exists: left behind, the
+        # time-series job tried it every minute and the twin answered 503
+        # instead of "not enabled" (found building RFC-0086, 2026-11-12).
+        secrets_map = _twin_secrets_load()
+        if secrets_map.pop(schema, None) is not None:
+            _twin_secrets_save(secrets_map)
         print(f"Schema '{schema}' and its role dropped.")
         return
 
@@ -15677,6 +15686,112 @@ def twin_reader_remove(label, who="root"):
     audit_tenant("twin.reader.remove", r.get("tenant", ""), subject=principal,
                  who=who, detail=f"{n} key(s) revoked, principal deactivated")
     return n
+
+
+# oaap.data.timeseries 0.1 (RFC-0086): the tenant's ts_<tenant-id> schema
+# beside its twin_<tenant-id>, with its own role -- so that its size, its
+# backup and its copy can be treated apart (RFC-0086 §5). The driver and
+# psycopg2 live in the twin image; the host reaches them through
+# ts_admin.py in that container, the same container that already holds
+# the secrets file read-only.
+TWIN_CONTAINER = "oaap-twin-1"   # compose v2 default, like STORE_CONTAINER
+TS_SCHEMA_RE = re.compile(r"^ts_[a-z0-9][a-z0-9_-]{0,58}$")   # = timeseries.SCHEMA_RE
+
+
+def _ts_admin(*argv, timeout=50):
+    return subprocess.run(["docker", "exec", TWIN_CONTAINER, "python",
+                           "ts_admin.py", *argv],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def timeseries_enable(tid):
+    """Idempotent: role, schema, credential, tables, partitions. A schema
+    that survived without its credential (a restore) gets a new password
+    -- the posture of _twin_ensure_schema, for the same reason."""
+    schema = f"ts_{tid}"
+    if not TS_SCHEMA_RE.match(schema):
+        die(f"'{tid}' does not make a time-series schema name")
+    existing = {r["schema"] for r in store_schemas()}
+    secrets_map = _twin_secrets_load()
+    made = False
+    if schema not in existing:
+        password = secrets.token_urlsafe(24)
+        store_close()
+        _store_platform_login(schema, password)
+        _store_psql(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{schema}";')
+        secrets_map[schema] = {"role": schema, "password": password}
+        _twin_secrets_save(secrets_map)
+        made = True
+    elif schema not in secrets_map:
+        password = secrets.token_urlsafe(24)
+        _store_psql(f'ALTER ROLE "{schema}" PASSWORD \'{password}\';')
+        secrets_map[schema] = {"role": schema, "password": password}
+        _twin_secrets_save(secrets_map)
+    r = _ts_admin("ensure", schema)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()
+        stale = "ts_admin.py" in err and "No such file" in err
+        hint = (" -- this twin image has no ts_admin.py yet; 'sudo oaap "
+                "update' builds the new one") if stale else ""
+        die(f"the schema '{schema}' exists, its tables could not be made: "
+            f"{err.splitlines()[-1] if err else '?'}{hint}")
+    return schema, made
+
+
+def cmd_data_timeseries(args):
+    """`oaap data timeseries enable <tenant>|show [<tenant>]|job`."""
+    if args.action == "job":
+        # The minutely unit's step: never fails it (RFC-0051/0052), and
+        # costs nothing on a node where no tenant has time series.
+        try:
+            if not any(k.startswith("ts_") for k in _twin_secrets_load()):
+                return
+            r = _ts_admin("job")
+            sys.stdout.write(r.stdout)
+            sys.stderr.write(r.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"timeseries: job skipped ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+        return
+    if args.action not in ("enable", "show"):
+        die("data timeseries: enable <tenant> | show [<tenant>] | job")
+    if not has_profile("store") or not _store_running():
+        die("this node's store is not running (profile 'store') -- time "
+            "series live in it")
+    label = args.arg1 or args.tenant
+    if args.action == "enable":
+        tid = resolve_tenant_arg(label) or die(
+            "data timeseries enable needs the tenant (label or id)")
+        schema, made = timeseries_enable(tid)
+        audit_tenant("timeseries.enable", tid, subject=schema,
+                     who=os.environ.get("SUDO_USER") or "root",
+                     detail="created" if made else "checked")
+        print(f"Time series for tenant {tenant_label(tid) or tid}: schema "
+              f"'{schema}' {'created' if made else 'already there, checked'}.")
+        print("Apps with a twin key write and read them under /twin/series; "
+              "the minutely job rolls them up.")
+        return
+    argv = ["show"] + ([f"ts_{resolve_tenant_arg(label)}"] if label else [])
+    r = _ts_admin(*argv)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip()[-400:] or "ts_admin failed")
+    lines = [json.loads(x) for x in r.stdout.splitlines() if x.startswith("{")]
+    if not lines:
+        print("No tenant has time series on this node "
+              "('oaap data timeseries enable <tenant>').")
+        return
+    for d in lines:
+        tid = d["schema"][3:]
+        head = f"{tenant_label(tid) or tid} ({d['schema']})"
+        if d.get("error"):
+            print(f"  {head}: {d['error']}")
+            continue
+        c = d.get("counters_7d") or {}
+        print(f"  {head}: {d['series']} series ({d['numbers']} numbers, "
+              f"{d['texts']} texts) on {d['objects']} objects, "
+              f"{d['bytes'] // 1024} kB")
+        print(f"      rolled up to {d.get('rolled_up_to') or '—'}; last 7 days: "
+              + (", ".join(f"{k} {v}" for k, v in sorted(c.items())) or "nothing counted"))
 
 
 def cmd_data_twin(args):
@@ -31981,6 +32096,25 @@ def _tenant_archive(tid, label, out_dir, out_file):
             print(f"This tenant has no twin schema on this node "
                   f"('{schema}' does not exist), so the archive carries "
                   "none — said here rather than left to be noticed.")
+        # Its time series (RFC-0086 D8: "series are in the tenant backup"),
+        # under the same rule: a schema that exists and cannot be dumped
+        # refuses the archive. Most tenants have none, and that is not
+        # worth a line.
+        ts_schema = f"ts_{tid}"
+        if _twin_schema_exists(ts_schema):
+            try:
+                dump = run(["docker", "exec", "-u", "postgres",
+                            STORE_CONTAINER, "pg_dump", "-n", ts_schema,
+                            "postgres"]).stdout
+                if dump.strip():
+                    with open(os.path.join(stage, "tenant-timeseries-dump.sql"),
+                              "w", encoding="utf-8") as f:
+                        f.write(dump)
+                    parts.append("tenant-timeseries-dump.sql")
+            except subprocess.CalledProcessError:
+                shutil.rmtree(stage, ignore_errors=True)
+                die(f"the time-series schema '{ts_schema}' could not be "
+                    "dumped — nothing was written.")
 
     containers = [s["container"] for i in mine.values()
                   for s in instance_services(i) if s.get("container")]
@@ -34909,14 +35043,14 @@ def build_parser():
                          help="managed Postgres, type registry and other "
                               "data-platform services (oaap.data.store 0.1, "
                               "oaap.data.model 0.1, RFC-0031)")
-    pdt.add_argument("object", choices=["store", "model", "twin"])
+    pdt.add_argument("object", choices=["store", "model", "twin", "timeseries"])
     pdt.add_argument("action", choices=["status", "schemas", "create",
                                         "copy", "drop", "restore",
                                         "migrate-twin", "close",
                                         "types", "show", "register",
                                         "alias", "bindings",
                                         "readers", "add-reader",
-                                        "remove-reader"])
+                                        "remove-reader", "enable", "job"])
     pdt.add_argument("arg1", nargs="?",
                      help="create: purpose; copy/drop: schema; restore: "
                           "dump file; model show/register/alias: type key "

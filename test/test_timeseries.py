@@ -17,7 +17,9 @@ Geprueft wird, was am ehesten still schiefginge:
     Text: gleicher Wert verlaengert, neuer oeffnet, Luecke nach drei Takten,
     65 Zeichen abgelehnt, ein seit Jahren gueltiger Zustand bleibt;
     ein Mandant sieht die Reihen eines anderen nicht;
-    Export und Import geben dieselben Antworten.
+    Export und Import geben dieselben Antworten;
+    das Minutenkontingent gilt ueber Verbindungen hinweg, eine geloeschte
+    Reihe steht im Protokoll.
 
 Aufruf: TS_DSN=... python3 test/test_timeseries.py
 """
@@ -146,6 +148,25 @@ d.roll_up(T0 + 3 * DAY + 3 * 3600 + 180)
 day = d.range(s["id"], T0, T0 + DAY, DAY, T0 + 2 * DAY)
 ok("... und die Stufen darueber auch (1h, 1d)", day["buckets"][0]["max"] == 500.0, day["buckets"])
 
+print("\n=== Frische Punkte: die Stufe ist noch nicht verdichtet ===")
+d = fresh("ts_conf_a")
+sf, _ = d.ensure_series("node-a", "fresh")
+now = T0 + 5 * DAY + 3600
+d.write(sf["id"], [(now - 3600 + 60 * i, float(i % 7)) for i in range(60)], now)
+before = d.range(sf["id"], now - 3600, now, 300, now)
+ok("ohne Job: alle zwoelf 5-min-Abschnitte, aus den Rohpunkten",
+   before["tier"] == "5m" and len(before["buckets"]) == 12
+   and all(b["count"] == 5 for b in before["buckets"]), before)
+d.job(now)
+after = d.range(sf["id"], now - 3600, now, 300, now)
+ok("nach dem Job dieselbe Antwort (der Schnitt an der Marke ist nahtlos)",
+   [(b["t"], round(b["mean"], 9), b["min"], b["max"], b["count"]) for b in before["buckets"]]
+   == [(b["t"], round(b["mean"], 9), b["min"], b["max"], b["count"]) for b in after["buckets"]],
+   (before["buckets"][-3:], after["buckets"][-3:]))
+odd = d.range(sf["id"], now - 3600, now, 420, now)
+ok("ein Schritt, der nicht auf der Marke liegt: kein Punkt doppelt, keiner verloren",
+   sum(b["count"] for b in odd["buckets"]) == 60, odd)
+
 print("\n=== Stufenwahl ===")
 now = T0 + 800 * DAY
 ch = d.choose_tier
@@ -250,7 +271,7 @@ ok("'short' haelt Text 7 Tage: der alte Zustand ist weg, der seit 29 Tagen guelt
 
 print("\n=== Mandantengrenze ===")
 da = fresh("ts_conf_a")
-db = fresh("ts_conf_b")
+db = fresh("ts_conf-b")
 sa, _ = da.ensure_series("node-a", "cpu")
 ok("Mandant B sieht keine Reihe von A", db.list() == [] and raises(lambda: db.get_series(sa["id"]), "no series"))
 ok("ein ungueltiger Schemaname wird abgelehnt", raises(lambda: ts.PostgresDriver(da.conn, "twin_x"), "schema"))
@@ -264,7 +285,7 @@ da.write(t1["id"], [(T0, "a"), (T0 + 600, "b")], T0 + DAY)
 da.job(T0 + DAY)
 buf = io.StringIO()
 lines = da.export(buf)
-db = fresh("ts_conf_b")
+db = fresh("ts_conf-b")
 db.import_(io.StringIO(buf.getvalue()))
 sb = {(x["object"], x["measure"]): x for x in db.list()}
 ra = da.range(n1["id"], T0, T0 + DAY, 300, T0 + DAY)["buckets"]
@@ -276,7 +297,42 @@ ok("ein zweiter Import verdoppelt nichts",
    db.import_(io.StringIO(buf.getvalue())) and
    db.range(sb[("node-a", "cpu")]["id"], T0, T0 + DAY, 300, T0 + DAY)["buckets"] == rb)
 
-for sch in ("ts_conf_a", "ts_conf_b"):
+print("\n=== Minutenkontingent (ueber Verbindungen) ===")
+da = fresh("ts_conf_a")
+d2 = ts.PostgresDriver(psycopg2.connect(DSN), "ts_conf_a")   # the second worker
+ok("innerhalb des Kontingents", da.admit(15000, T0, limit=20000) is True)
+ok("die zweite Verbindung zaehlt gegen dieselbe Minute",
+   raises(lambda: d2.admit(6000, T0 + 30, limit=20000), "limit"))
+ok("nach der Ablehnung ist keine Transaktion offen",
+   d2.conn.get_transaction_status() == psycopg2.extensions.TRANSACTION_STATUS_IDLE)
+ok("die abgelehnte Menge zaehlt nicht mit", d2.admit(5000, T0 + 59, limit=20000) is True)
+ok("eine neue Minute beginnt bei null", da.admit(20000, T0 + 60, limit=20000) is True)
+ok("ein einzelner Aufruf ueber der Grenze", raises(lambda: da.admit(20001, T0 + 120, limit=20000), "limit"))
+ok("abgelehnte Punkte gezaehlt", da.counters().get("rate_limited") == 6000, da.counters())
+da.expire(T0 + 7200)
+with da.conn.cursor() as cur:
+    cur.execute('SELECT count(*) FROM "ts_conf_a".quota')
+    left = cur.fetchone()[0]
+da.conn.commit()
+ok("alte Minuten raeumt der Job weg", left == 0, left)
+d2.conn.close()
+
+print("\n=== Loeschen mit Protokoll ===")
+da = fresh("ts_conf_a")
+sa, _ = da.ensure_series("node-a", "cpu")
+da.write(sa["id"], [(T0 + 60 * i, 1.0) for i in range(30)], T0 + 3600)
+da.drop_series(sa["id"], by="instance:probe")
+with da.conn.cursor() as cur:
+    cur.execute('SELECT who, action, series_id, detail FROM "ts_conf_a".audit')
+    rows = cur.fetchall()
+da.conn.commit()
+ok("die Reihe ist weg", raises(lambda: da.get_series(sa["id"]), "no series"))
+ok("das Protokoll nennt wer, was und wie viele Punkte",
+   len(rows) == 1 and rows[0][0] == "instance:probe" and rows[0][1] == "series.deleted"
+   and rows[0][2] == sa["id"] and rows[0][3]["raw_points"] == 30
+   and rows[0][3]["measure"] == "cpu", rows)
+
+for sch in ("ts_conf_a", "ts_conf-b"):
     with da.conn.cursor() as cur:
         cur.execute(f'DROP SCHEMA IF EXISTS "{sch}" CASCADE')
     da.conn.commit()
