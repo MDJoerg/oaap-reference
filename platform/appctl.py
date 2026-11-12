@@ -10517,6 +10517,9 @@ def _tenant_build_cli(args):
         "continue <id> | confirm <id> --step <id> | rollback <id> [--yes]")
 
 
+TENANT_DRY_RUN_ACTIONS = frozenset({"adopt", "build"})
+
+
 def cmd_tenant(args):
     """This node's tenants (spec 2.1/2.2).
 
@@ -10524,6 +10527,15 @@ def cmd_tenant(args):
     with users, instances or data is an export-then-destroy operation and
     stays out of reach of this verb.
     """
+    # `--dry-run` is defined once for the whole verb but honoured only by
+    # these actions. Anywhere else it was ignored in silence and the action
+    # ran for real -- `tenant create oaap-ops --dry-run` created the tenant
+    # on oaap-demo (2026-11-12). A promise the verb does not keep is refused.
+    if getattr(args, "dry_run", False) and args.action not in TENANT_DRY_RUN_ACTIONS:
+        die(f"--dry-run is not supported by 'tenant {args.action}' "
+            f"(only: {', '.join(sorted(TENANT_DRY_RUN_ACTIONS))}) -- "
+            f"nothing was changed")
+
     tenants = load_tenants()
     if not tenants:
         die("this node has no tenant store yet -- run `oaap update`")

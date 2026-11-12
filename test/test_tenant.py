@@ -288,6 +288,20 @@ check("migrate.sh ruft die Mandanten-Migration auf",
       "von oaap-demo, siehe test_migrate.py")
 
 
+print("\n=== --dry-run wird gehalten oder abgelehnt, nie übergangen ===")
+# oaap-demo, 2026-11-12: `tenant create oaap-ops --dry-run` legte den
+# Mandanten wirklich an. Der Schalter galt nur für adopt/build.
+before = set(m.load_tenants())
+out, code = capture(m.cmd_tenant, Args(
+    action="create", name="probe-dry", title=None, account=None,
+    account_name=None, dry_run=True))
+check("create mit --dry-run bricht ab", code not in (0, None), f"code={code}")
+check("create mit --dry-run legt nichts an",
+      set(m.load_tenants()) == before)
+check("adopt und build behalten --dry-run",
+      m.TENANT_DRY_RUN_ACTIONS == {"adopt", "build"})
+
+
 print(f"\n{ok} bestanden, {fail} fehlgeschlagen")
 if fail:
     print("PRUEFUNGEN FEHLGESCHLAGEN")
