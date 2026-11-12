@@ -55,6 +55,7 @@ import tempfile
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -2732,7 +2733,8 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "advisory.image": "/store", "reboot.planned": "/health",
                 "reboot.started": "/health", "reboot.cancelled": "/health",
                 "bulk.halted": "/store", "rebuild.failed": "/store",
-                "confirm.pending": "/store"}
+                "confirm.pending": "/store", "instance.down": "/instances/{instanz}",
+                "login.locked": "/users"}
 
 
 def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key=""):
@@ -2967,6 +2969,9 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
     subject = notify.subject_with_prefix(lists, scope, notify.subject_for(
         op, notify.expand(tpl, values)))
     page = "/nachrichten" if op == "test" else NOTIFY_PAGES.get(ntype, "/")
+    if "{instanz}" in page:
+        page = (page.replace("{instanz}", urllib.parse.quote(item.get("instanz") or "", safe=""))
+                if item.get("instanz") else "/instances")
     if page == "/health" and not is_node:
         page = "/"
     body = notify.body(ntype, op, values, item.get("text", ""),
@@ -3093,6 +3098,114 @@ def _notify_backup_conditions(now):
     return failed, missing
 
 
+IDENTITY_THROTTLE_FILE = os.path.join(DATA_DIR, "data", "identity", "login-throttle.json")
+NOTIFY_VIEW_STALE_SECONDS = 180
+
+
+def _notify_production():
+    """{name: tenant id} of the production instances (not test, not a
+    rehearsal): the ones whose outage someone has to hear about."""
+    dflt = default_tenant_id()
+    out = {}
+    for name, inst in (load_registry().get("instances") or {}).items():
+        if (inst.get("channel") or "production") == "test" or inst.get("rehearsal"):
+            continue
+        out[name] = resolve_tenant(inst.get("tenant")) or dflt
+    return out
+
+
+def _notify_instance_down(now):
+    """-> {tid: {key: condition}} for production instances down longer than
+    five minutes. When the state view cannot be trusted (runtime not
+    reachable, view older than three minutes), the matters that are open
+    stay open: "unknown" must not be mailed as "Behoben"."""
+    try:
+        with open(STATE_VIEW, encoding="utf-8") as f:
+            view = json.load(f) or {}
+    except (OSError, ValueError):
+        view = {}
+    written = notify._parse(view.get("written")) if view.get("written") else None
+    trusted = bool(view.get("runtime_ok")) and written is not None and (
+        (now - written).total_seconds() <= NOTIFY_VIEW_STALE_SECONDS)
+    cur = {}
+    if not trusted:
+        for tid, ms in ((_notify_state_rw().get("matters") or {}).items()):
+            for key, rec in (ms or {}).items():
+                if rec.get("type") == "instance.down":
+                    cur.setdefault(tid, {})[key] = {k: rec[k] for k in ("type", "instanz", "kurz", "text")
+                                                    if k in rec}
+        return cur
+    found = {}
+
+    def run(state):
+        down, new = notify.down_conditions(view.get("instances") or {}, _notify_production(),
+                                           state.get("down_since") or {}, now)
+        found.update(down)
+        if new:
+            state["down_since"] = new
+        else:
+            state.pop("down_since", None)
+        return state
+    _notify_state_rw(run)
+    for name, (tid, cond) in found.items():
+        cur.setdefault(tid, {})["instance.down/" + name] = cond
+    return cur
+
+
+def notify_login_locks(now_epoch=None):
+    """Read identity's failure table and queue one login.locked per tenant
+    for the names locked since the last minute (RFC-0080 §4.2). The host
+    only reads the file; identity stays its one writer. -> number queued."""
+    try:
+        with open(IDENTITY_THROTTLE_FILE, encoding="utf-8") as f:
+            table = json.load(f) or {}
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(table, dict):
+        return 0
+    now_epoch = now_epoch if now_epoch is not None else time.time()
+    found = []
+
+    def run(state):
+        new, keep = notify.lock_episodes(table, now_epoch, state.get("locks_reported") or {})
+        found.extend(new)
+        if keep:
+            state["locks_reported"] = keep
+        else:
+            state.pop("locks_reported", None)
+        return state
+    _notify_state_rw(run)
+    if not found:
+        return 0
+    dflt = default_tenant_id()
+    users = {u.get("username"): u for u in (_read_identity_users() or [])}
+    per = {}
+    for key, n in found:
+        kind, client, name = notify.lock_subject(key)
+        if kind == "login":
+            u = users.get(name)
+            tid = (resolve_tenant(u.get("tenant")) or dflt) if u else dflt
+            line = (f"Anmeldung als „{name}“: {n} Fehlversuche in "
+                    f"{notify.LOCK_WINDOW // 60} Minuten von {client or 'unbekannt'}"
+                    + ("" if u else " (diesen Benutzer gibt es nicht)"))
+            per.setdefault(tid, []).append((name, line))
+        elif kind == "key":
+            per.setdefault(dflt, []).append(
+                (f"API-Schlüssel {name}", f"API-Schlüssel {name}: {n} Fehlversuche"))
+        else:
+            per.setdefault(dflt, []).append(
+                (client, f"API-Schlüssel von {client}: {n} Fehlversuche mit unbekannten Schlüsseln"))
+    queued = 0
+    for tid, rows in per.items():
+        kurz = rows[0][0] if len(rows) == 1 else f"{len(rows)} Anmeldungen"
+        text = ("Identity hat diese Anmeldungen nach Fehlversuchen gesperrt (je eine Minute, "
+                "dann wieder ein Versuch pro Minute):\n"
+                + "\n".join(f"  - {line}" for _n, line in rows)
+                + "\nWer das nicht selbst war: Passwort ändern lassen und die Adresse im Auge behalten.")
+        queued += bool(notify_event("login.locked", tid, kurz=kurz, text=text))
+    return queued
+
+
 def notify_conditions(facts=None, now=None):
     """The conditions true now, per scope: {tid: {key: condition}}."""
     now = now or notify.now_utc()
@@ -3147,6 +3260,10 @@ def notify_conditions(facts=None, now=None):
             "text": "In den Abbildern dieser Instanzen sind Sicherheitskorrekturen offen:\n"
                     + "\n".join(f"  - {nm}: {n_ or 'einige'}" for nm, n_ in rows)
                     + "\n„Neu bauen“ im Store hilft, wenn die Karte „Abbild“ das sagt."}
+    # Stage 2: one matter per instance -- an outage of a second instance
+    # while the first is still down must be heard, not folded in.
+    for tid, conds in _notify_instance_down(now).items():
+        cur.setdefault(tid, {}).update(conds)
     return cur
 
 
@@ -3155,6 +3272,7 @@ def notify_matters(facts=None, now=None):
     and close (D6). -> number queued."""
     now = now or notify.now_utc()
     cur = notify_conditions(facts, now)
+    reg = load_registry().get("instances") or {}
     queued = []
 
     def run(state):
@@ -3162,6 +3280,9 @@ def notify_matters(facts=None, now=None):
         for tid in sorted(set(cur) | set(matters)):
             ops, new = notify.matter_ops(cur.get(tid) or {}, matters.get(tid) or {}, now)
             for op, key, rec in ops:
+                if (op == "close" and rec.get("type") == "instance.down"
+                        and rec.get("instanz") not in reg):
+                    continue      # removed while down: nothing came back, nothing to mail
                 queued.append(notify_event(rec["type"], tid, instanz=rec.get("instanz", ""),
                                            kurz=rec.get("kurz", ""), text=rec.get("text", ""),
                                            op=op, key=key))
@@ -3235,6 +3356,10 @@ def notify_minute(facts=None):
         notify_matters(facts)
     except Exception as e:                          # noqa: BLE001
         print(f"notify: conditions: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
+        notify_login_locks()
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: login locks: {type(e).__name__}: {e}", file=sys.stderr)
     try:
         return notify_deliver()
     except Exception as e:                          # noqa: BLE001

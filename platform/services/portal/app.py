@@ -12600,7 +12600,10 @@ def _messages_facts(tid):
             if xid == dflt:
                 continue
             mine = _mailbox_view(dests, xid)
+            xs = notify.scope_of(_notify_stored().get(xid), False)
             rows.append({"label": x.get("label", ""),
+                         "lists": ", ".join(f"{nm} ({len(l.get('entries') or [])})"
+                                            for nm, l in sorted(xs["lists"].items())),
                          "realm": bool((x.get("idp") or {}).get("connector")),
                          "uses": ("eigenes Postfach (" + mine["from"] + ")" if mine
                                   else "Postfach des Knotens" if node else "keines")})
@@ -12689,34 +12692,58 @@ def _notify_facts(tid, is_node, tenants):
             "result": NOTIFY_RESULT_WORDS.get(e.get("result"), e.get("result", "")),
             "bad": e.get("result") in ("failed", "limited", "nobody", "retry"),
             "said": e.get("said", "")} for e in reversed(log[-30:])]
-    others = []
-    if is_node:
-        for xid, x in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
-            if xid == tid:
-                continue
-            xs = notify.scope_of(stored.get(xid), False)
-            others.append({"label": x.get("label", ""),
-                           "lists": ", ".join(f"{nm} ({len(l.get('entries') or [])})"
-                                              for nm, l in sorted(xs["lists"].items()))})
     return {"lists": lists, "names": [l["name"] for l in lists], "rows": rows, "log": log,
-            "others": others, "later": notify.LATER, "max": notify.MAX_RECIPIENTS,
+            "later": notify.LATER, "max": notify.MAX_RECIPIENTS,
             "per_hour": notify.NODE_PER_HOUR if is_node else notify.TENANT_PER_HOUR,
             "placeholders": " ".join("{" + p + "}" for p in notify.PLACEHOLDERS),
             "role_word": "Server-Admins" if is_node else "Mandanten-Admins",
             "silent": bool(reach is not None and lists and not reach.get(lists[0]["name"]))}
 
 
+MESSAGES_TABS_NODE = (("ausgang", "Postausgang"), ("verteiler", "Verteiler"),
+                      ("meldungen", "Benachrichtigungen"), ("protokoll", "Protokoll"),
+                      ("mandanten", "Mandanten"))
+MESSAGES_TABS = MESSAGES_TABS_NODE[:4]
+
+
+def _messages_tab(is_node):
+    """Which tab the page shows -- from the link (?tab=). Unknown words fall
+    back to the first tab rather than to an empty page."""
+    want = (request.values.get("tab") or "").strip()
+    keys = [k for k, _w in (MESSAGES_TABS_NODE if is_node else MESSAGES_TABS)]
+    return want if want in keys else keys[0]
+
+
+def _messages_back(tid, label, role, tab):
+    """The page URL a form returns to: same tenant, same tab."""
+    named = role == "server_admin" and tid != default_tenant_id()
+    return ("/nachrichten?" + (f"tenant={quote(label)}&" if named else "") + "tab=" + tab)
+
+
 MESSAGES_BODY = """
 <div class="pagehead"><h1>Nachrichten{% if not f.is_node %}: {{ label }}{% endif %}</h1></div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% set n = f.n %}
+{# Über den Reitern, nicht in einem: dass Meldungen ins Leere gehen, darf
+   kein Reiter verstecken (design guidelines 6.2.2). #}
+{% if n.silent %}<div class="card warn">
+  <p>Der Verteiler „{{ n.lists[0].name }}“ erreicht im Moment <strong>niemanden</strong>: Keiner der
+  {{ n.role_word }} hat eine E-Mail-Adresse{% if f.is_node %}, also gehen Meldungen des Servers ins
+  Leere{% else %}; Meldungen gehen ersatzweise an die Serverbesitzer{% endif %}.
+  <a href="{{ tq }}tab=verteiler">Adresse eintragen</a></p>
+</div>{% endif %}
+<nav class="tabs">
+  {% for key, word in tabs %}<a href="{{ tq }}tab={{ key }}" class="{{ 'active' if key == tab }}">{{ word }}</a>{% endfor %}
+</nav>
 
+{% if tab == "ausgang" %}
 <div class="card">
   <h2>Postausgang</h2>
   {% if f.is_node %}
-  <p>Das <strong>Postfach des Knotens</strong> verschickt die Mails jedes Realms, dessen Mandant
-  kein eigenes hat: „Passwort vergessen“, Bestätigungen, Einladungen — auf Deutsch, mit dem
-  Namen des Mandanten als Absendername. Apps bekommen es nie.</p>
+  <p>Das <strong>Postfach des Knotens</strong> verschickt die Benachrichtigungen dieser Seite und die
+  Mails jedes Realms, dessen Mandant kein eigenes hat („Passwort vergessen“, Bestätigungen,
+  Einladungen). Apps bekommen es nie.</p>
   {% set box = f.node %}
   {% else %}
   <p>{{ "Euer Realm verschickt" if f.realm else "Ein Realm dieses Mandanten verschickte" }} Mails
@@ -12727,19 +12754,23 @@ MESSAGES_BODY = """
   eigenen Realm an; das Postfach wird wirksam, sobald es einen gibt.</span>{% endif %}</p>
   {% set box = f.own %}
   {% endif %}
-
-  <h3>{% if f.is_node %}Postfach des Knotens{% else %}Eigenes Postfach{% endif %}</h3>
   {% if box %}<p class="muted">Eingetragen: {{ box.target }}, Absender {{ box.from }}{% if box.user %},
     Login {{ box.user }}, Passwort {{ "gesetzt" if box.secret else "FEHLT" }}{% endif %}
-    <small>(seit {{ box.since[:16] }})</small></p>{% endif %}
+    <small>(seit {{ box.since[:16] }})</small></p>
+  <form method="post" action="/nachrichten/postausgang/test{{ q }}">
+    <label>Testmail an <input name="to" type="email" required></label>
+    <button class="btn">Testmail senden</button>
+  </form>{% endif %}
+</div>
+<div class="card">
+  <h2>{% if box %}Postfach ändern{% elif f.is_node %}Postfach des Knotens eintragen{% else %}Eigenes Postfach eintragen{% endif %}</h2>
   <form method="post" action="/nachrichten/postausgang/set{{ q }}">
     <p><label>Adresse des Mailservers
       <input name="target" required value="{{ box.target if box else '' }}"
         placeholder="smtps://mail.verein.de:465" pattern="smtps?://[^/@?#]+"></label>
       <span class="muted"><code>smtps://…:465</code> heißt TLS von Anfang an,
       <code>smtp://…:587</code> STARTTLS. Unverschlüsselt gibt es nicht.{% if not f.is_node %}
-      Der Server muss im Internet stehen (der Knoten prüft das bei jedem Speichern, Testen
-      und Eintragen).{% endif %}</span></p>
+      Der Server muss im Internet stehen.{% endif %}</span></p>
     <p><label>Absender <input name="sender" type="email" required value="{{ box.from if box else '' }}"
         placeholder="info@verein.de"></label>
       <label>Absendername <input name="from_name" maxlength="80" value="{{ box.from_name if box else '' }}"
@@ -12755,49 +12786,35 @@ MESSAGES_BODY = """
     <button class="btn">Speichern</button>
   </form>
   {% if box %}
-  <form method="post" action="/nachrichten/postausgang/test{{ q }}" style="margin-top:1rem">
-    <label>Testmail an <input name="to" type="email" required></label>
-    <button class="btn">Testmail senden</button>
-  </form>
   <form method="post" action="/nachrichten/postausgang/remove{{ q }}" style="margin-top:1rem">
     <label class="seatopt"><input type="checkbox" name="confirm" value="1" required>
       {% if f.is_node %}Postfach des Knotens entfernen (die Realms behalten, was eingetragen ist){% else %}Eigenes
       Postfach entfernen — der Realm verschickt dann {% if f.node %}mit dem Postfach des Knotens{% else %}keine Mail mehr{% endif %}{% endif %}</label>
-    <button class="btn">Entfernen</button>
+    <button class="btn secondary">Entfernen</button>
   </form>
   {% endif %}
-
-  {% if f.is_node and f.rows %}
-  <h3>Womit die Mandanten verschicken</h3>
-  <table class="list"><tr><th>Mandant</th><th>Realm</th><th>Postfach</th><th></th></tr>
-  {% for r in f.rows %}<tr><td>{{ r.label }}</td><td>{{ "ja" if r.realm else "—" }}</td>
-    <td>{{ r.uses }}</td><td><a class="rowaction" href="/nachrichten?tenant={{ r.label }}">Ansehen</a></td></tr>{% endfor %}
-  </table>
-  {% endif %}
 </div>
+{% endif %}
 
-{% set n = f.n %}
-<div class="card" id="verteiler">
+{% if tab == "verteiler" %}
+<div class="card">
   <h2>Verteiler</h2>
-  <p>Ein Verteiler sagt, wer eine Benachrichtigung bekommt: E-Mail-Adressen oder eine Rolle
-  ({{ n.role_word }} — wer die Rolle beim Versand hat), jeweils unter An, Cc oder Bcc. Mindestens
-  ein Eintrag steht unter An; höchstens {{ n.max }} Adressen. Der Verteiler
-  <strong>{{ n.lists[0].name }}</strong> ist Pflicht: Was nirgends zugeordnet ist, kommt dort an.</p>
-  {% if n.silent %}<p class="err">Der Verteiler „{{ n.lists[0].name }}“ erreicht im Moment
-  <strong>niemanden</strong>: Keiner der {{ n.role_word }} hat eine E-Mail-Adresse{% if f.is_node %},
-  also gehen Meldungen des Servers ins Leere{% else %}; Meldungen gehen ersatzweise an die
-  Serverbesitzer{% endif %}. Tragt eine Adresse in den Verteiler ein oder hinterlegt sie beim Benutzer.</p>{% endif %}
-  <table class="list"><tr><th>Name</th><th>Empfänger</th><th>erreicht</th><th>Betreff-Präfix</th><th></th></tr>
+  <p class="muted">Wer eine Benachrichtigung bekommt: E-Mail-Adressen oder die Rolle
+  {{ n.role_word }}, jeweils unter An, Cc oder Bcc. <strong>{{ n.lists[0].name }}</strong> ist
+  Pflicht — was nirgends zugeordnet ist, kommt dort an.</p>
+  <table class="list"><tr><th>Name</th><th>Empfänger</th><th>erreicht</th><th>Präfix</th><th></th></tr>
   {% for l in n.lists %}<tr><td><strong>{{ l.name }}</strong>{% if l.mandatory %} <small class="muted">(Pflicht)</small>{% endif %}</td>
     <td>{{ l.words }}</td><td>{% if l.reach is none %}—{% elif l.reach %}{{ l.reach }}{% else %}<span class="err">niemanden</span>{% endif %}</td><td>{{ l.prefix or "—" }}</td>
     <td><form method="post" action="/nachrichten/verteiler/test{{ q }}" style="display:inline">
-      <input type="hidden" name="name" value="{{ l.name }}"><button class="btn">Probe senden</button></form>
+      <input type="hidden" name="name" value="{{ l.name }}"><button class="btn secondary">Probe senden</button></form>
     {% if not l.mandatory %}<form method="post" action="/nachrichten/verteiler/remove{{ q }}" style="display:inline">
       <input type="hidden" name="name" value="{{ l.name }}">
       <label class="seatopt"><input type="checkbox" name="confirm" value="1" required>entfernen</label>
-      <button class="btn">Entfernen</button></form>{% endif %}</td></tr>{% endfor %}
+      <button class="btn secondary">Entfernen</button></form>{% endif %}</td></tr>{% endfor %}
   </table>
-  <h3>Verteiler anlegen oder ändern</h3>
+</div>
+<div class="card">
+  <h2>Verteiler anlegen oder ändern</h2>
   <form method="post" action="/nachrichten/verteiler/set{{ q }}">
     <p><label>Name <input name="name" required maxlength="40" list="vt-names"
       placeholder="z. B. Servicepartner"></label>
@@ -12807,46 +12824,43 @@ MESSAGES_BODY = """
     <p><label>Cc <textarea name="cc" rows="1"></textarea></label>
       <label>Bcc <textarea name="bcc" rows="1"></textarea></label></p>
     <p><label>Betreff-Präfix (optional) <input name="prefix" maxlength="40" placeholder="[Backup]"></label></p>
-    <p class="muted">Adressen getrennt durch Komma oder Zeilenumbruch. Das Wort
-      <code>{{ n.role_word }}</code> steht für die Rolle.</p>
+    <p class="muted">Adressen getrennt durch Komma oder Zeilenumbruch; das Wort
+      <code>{{ n.role_word }}</code> steht für die Rolle. Höchstens {{ n.max }} Adressen.</p>
     <button class="btn">Speichern</button>
   </form>
-  {% if n.others %}
-  <h3>Verteiler der Mandanten</h3>
-  <p class="muted">Hier nur Namen und Anzahl der Einträge; die Adressen pflegt der Mandant.</p>
-  <table class="list"><tr><th>Mandant</th><th>Verteiler (Einträge)</th><th></th></tr>
-  {% for o in n.others %}<tr><td>{{ o.label }}</td><td>{{ o.lists }}</td>
-    <td><a class="rowaction" href="/nachrichten?tenant={{ o.label }}#verteiler">Ansehen</a></td></tr>{% endfor %}
-  </table>
-  {% endif %}
 </div>
+{% endif %}
 
-<div class="card" id="benachrichtigungen">
+{% if tab == "meldungen" %}
+<div class="card">
   <h2>Benachrichtigungen</h2>
-  <p>Welcher Verteiler welche Meldung bekommt. Eine Kategorie gilt für alle ihre Arten; eine
-  einzelne Art kann abweichen. Ohne Haken geht die Meldung an den Pflicht-Verteiler. Eine Lage
-  wird gemeldet, wenn sie beginnt und wenn sie behoben ist — Kritisches zusätzlich einmal täglich,
-  solange sie besteht. Höchstens {{ n.per_hour }} Mails je Stunde.</p>
+  <p class="muted">Welcher Verteiler welche Meldung bekommt. Ohne Haken geht sie an den
+  Pflicht-Verteiler. Eine Lage wird gemeldet, wenn sie beginnt und wenn sie behoben ist,
+  Kritisches zusätzlich einmal täglich. Höchstens {{ n.per_hour }} Mails je Stunde.</p>
   <form method="post" action="/nachrichten/benachrichtigungen{{ q }}">
-  <table class="list"><tr><th>Meldung</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
+  <table class="list"><tr><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
   {% for r in n.rows if r.is_cat %}<tr><td><strong>{{ r.word }}</strong></td>
     {% for nm in n.names %}<td><input type="checkbox" name="r__{{ r.key }}" value="{{ nm }}"{% if nm in r.lists %} checked{% endif %}></td>{% endfor %}
-    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="je Art (siehe unten)"></td></tr>{% endfor %}
+    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="je Art"></td></tr>{% endfor %}
   </table>
-  <details{% if n.rows|selectattr("lists")|rejectattr("is_cat")|list %} open{% endif %}><summary>Einzelne Arten</summary>
+  <details{% if n.rows|selectattr("lists")|rejectattr("is_cat")|list %} open{% endif %}><summary>Einzelne Arten abweichend zuordnen</summary>
   <table class="list"><tr><th>Art</th><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
   {% for r in n.rows if not r.is_cat %}<tr><td>{{ r.word }}{% if r.from_tenant %}<br><small class="muted">von den Mandanten — nur mit eigenem Haken</small>{% endif %}</td>
     <td>{{ r.cat }}</td>
     {% for nm in n.names %}<td><input type="checkbox" name="r__{{ r.key }}" value="{{ nm }}"{% if nm in r.lists %} checked{% endif %}></td>{% endfor %}
     <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="{{ r.default }}"></td></tr>{% endfor %}
   </table>
-  <p class="muted">Noch nicht gebaut: {% for k, w in n.later.items() %}{{ w }}{{ "; " if not loop.last }}{% endfor %}.</p>
+  {% if n.later %}<p class="muted">Noch nicht gebaut: {% for k, w in n.later.items() %}{{ w }}{{ "; " if not loop.last }}{% endfor %}.</p>{% endif %}
   </details>
   <p class="muted">Platzhalter im Betreff: <code>{{ n.placeholders }}</code>.</p>
   <button class="btn">Zuordnung speichern</button>
   </form>
+</div>
+{% endif %}
 
-  <h3>Zuletzt verschickt</h3>
+{% if tab == "protokoll" %}
+<div class="card">
+  <h2>Zuletzt verschickt</h2>
   {% if n.log %}
   <table class="list"><tr><th>Zeit (UTC)</th><th>Meldung</th><th>Verteiler</th><th>An / Cc / Bcc</th><th>Ergebnis</th></tr>
   {% for e in n.log %}<tr><td>{{ e.when }}</td><td>{{ e.what }}{% if e.op %} <small>({{ e.op }})</small>{% endif %}{% if e.about %} <small class="muted">— {{ e.about }}</small>{% endif %}</td>
@@ -12855,6 +12869,22 @@ MESSAGES_BODY = """
   </table>
   {% else %}<p class="muted">Noch nichts verschickt.</p>{% endif %}
 </div>
+{% endif %}
+
+{% if tab == "mandanten" %}
+<div class="card">
+  <h2>Mandanten</h2>
+  {% if f.rows %}
+  <p class="muted">Womit jeder Mandant verschickt und welche Verteiler er hat — hier nur Namen und
+  Anzahl der Einträge; die Adressen pflegt der Mandant.</p>
+  <table class="list"><tr><th>Mandant</th><th>Realm</th><th>Postfach</th><th>Verteiler (Einträge)</th><th></th></tr>
+  {% for r in f.rows %}<tr><td>{{ r.label }}</td><td>{{ "ja" if r.realm else "—" }}</td>
+    <td>{{ r.uses }}</td><td>{{ r.lists }}</td>
+    <td><a class="rowaction" href="/nachrichten?tenant={{ r.label }}">Ansehen</a></td></tr>{% endfor %}
+  </table>
+  {% else %}<p class="muted">Auf diesem Knoten gibt es außer dem Knoten selbst keinen Mandanten.</p>{% endif %}
+</div>
+{% endif %}
 """
 
 
@@ -12866,9 +12896,13 @@ def messages_page():
     tid, label, role = _messages_target()
     if tid is None:
         return role
-    named = role == "server_admin" and tid != default_tenant_id()
+    is_node = tid == default_tenant_id()
+    named = role == "server_admin" and not is_node
+    q = f"?tenant={quote(label)}" if named else ""
     return page(MESSAGES_BODY, "Nachrichten", "messages", label=label,
-                f=_messages_facts(tid), q=(f"?tenant={quote(label)}" if named else ""),
+                f=_messages_facts(tid), q=q, tq=(q + "&" if q else "?"),
+                tabs=MESSAGES_TABS_NODE if is_node else MESSAGES_TABS,
+                tab=_messages_tab(is_node),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 
 
@@ -12885,9 +12919,8 @@ def messages_outgoing(op):
     tid, label, role = _messages_target()
     if tid is None:
         return role
-    named = role == "server_admin" and tid != default_tenant_id()
-    back = "/nachrichten" + (f"?tenant={quote(label)}" if named else "")
-    joiner = "&" if "?" in back else "?"
+    back = _messages_back(tid, label, role, "ausgang")
+    joiner = "&"
     if op not in MAIL_OPS:
         return redirect(back, code=303)
     args = {}
@@ -12918,20 +12951,17 @@ NOTIFY_WAIT_SECONDS = 45
 NOTIFY_LIST_OPS = ("set", "remove", "test")
 
 
-def _notify_queue(tid, label, role, op, args, anchor):
-    named = role == "server_admin" and tid != default_tenant_id()
-    back = "/nachrichten" + (f"?tenant={quote(label)}" if named else "")
-    joiner = "&" if "?" in back else "?"
+def _notify_queue(tid, label, role, op, args, tab):
+    back = _messages_back(tid, label, role, tab) + "&"
     if role == "server_admin":
         args["tenant"] = tid          # only a server_admin names a tenant
     res = _queue_with_id(_uuid.uuid4().hex, "", {"action": "notify", "op": op, "args": args},
                          NOTIFY_WAIT_SECONDS)
     if res is None:
-        return redirect(f"{back}{joiner}err=" + quote(
-            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden.") + anchor, code=303)
+        return redirect(f"{back}err=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
     key = "msg" if res.get("ok") else "err"
-    return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]) + anchor,
-                    code=303)
+    return redirect(f"{back}{key}=" + quote(str(res.get("message") or "")[:600]), code=303)
 
 
 @app.post("/nachrichten/verteiler/<op>")
@@ -12947,7 +12977,7 @@ def messages_lists(op):
     if tid is None:
         return role
     if op not in NOTIFY_LIST_OPS:
-        return redirect("/nachrichten", code=303)
+        return redirect(_messages_back(tid, label, role, "verteiler"), code=303)
     args = {"name": (request.form.get("name") or "").strip()[:40]}
     if op == "set":
         for k, mx in (("to", 4000), ("cc", 4000), ("bcc", 4000), ("prefix", 40)):
@@ -12959,9 +12989,10 @@ def messages_lists(op):
         op = "list-set"
     elif op == "remove":
         if not request.form.get("confirm"):
-            return redirect("/nachrichten?err=" + quote("Bitte bestätigen.") + "#verteiler", code=303)
+            return redirect(_messages_back(tid, label, role, "verteiler") + "&err="
+                            + quote("Bitte bestätigen."), code=303)
         op = "list-remove"
-    return _notify_queue(tid, label, role, op, args, "#verteiler")
+    return _notify_queue(tid, label, role, op, args, "verteiler")
 
 
 @app.post("/nachrichten/benachrichtigungen")
@@ -12986,11 +13017,9 @@ def messages_routes():
         if lists != (old.get("lists") or []) or subject != (old.get("subject") or ""):
             routes[key] = {"lists": lists, "subject": subject}
     if not routes:
-        named = role == "server_admin" and not is_node
-        back = "/nachrichten" + (f"?tenant={quote(label)}" if named else "")
-        return redirect(back + ("&" if "?" in back else "?") + "msg="
-                        + quote("Nichts geändert.") + "#benachrichtigungen", code=303)
-    return _notify_queue(tid, label, role, "route-set", {"routes": routes}, "#benachrichtigungen")
+        return redirect(_messages_back(tid, label, role, "meldungen") + "&msg="
+                        + quote("Nichts geändert."), code=303)
+    return _notify_queue(tid, label, role, "route-set", {"routes": routes}, "meldungen")
 
 
 # --- Destinationen (oaap.net.destinations 0.10 §2.7, oaap.core.portal 2.17) ----------

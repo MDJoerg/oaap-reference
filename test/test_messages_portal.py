@@ -204,13 +204,16 @@ req, mode = SENT[-1]
 ok("Speichern: eine Anfrage `mail`, 0600, mit Passwort, ohne Mandant (tenant_admin)",
    req.get("action") == "mail" and req["op"] == "set" and mode == 0o600
    and req["args"]["password"] == "richtig" and "tenant" not in req["args"], (req, oct(mode)))
-ok("... und die Antwort steht auf der Seite", r.status_code == 303 and "msg=saved" in r.headers.get("Location", ""),
-   r.headers.get("Location"))
+ok("... und die Antwort steht auf der Seite, im Reiter Postausgang",
+   r.status_code == 303 and "msg=saved" in r.headers.get("Location", "")
+   and "tab=ausgang" in r.headers.get("Location", ""), r.headers.get("Location"))
 WHO.update(role="server_admin", tenant=dflt)
 H = {"X-OAAP-User": "betreiber", "X-OAAP-Roles": "server_admin"}
 t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
-ok("server_admin am Knoten: Postfach des Knotens und die Liste der Mandanten",
-   "Postfach des Knotens" in t and "Womit die Mandanten verschicken" in t and "verein" in t)
+ok("server_admin am Knoten: erster Reiter Postausgang mit dem Postfach des Knotens",
+   "Postfach des Knotens" in t and 'class="active">Postausgang' in t)
+t = cl.get("/nachrichten?tab=mandanten", headers=H).get_data(as_text=True)
+ok("... Reiter Mandanten: die Liste der Mandanten", "Verteiler (Einträge)" in t and "verein" in t)
 r = post("/nachrichten/postausgang/set?tenant=andere", dict(SET))
 ok("server_admin nennt den Mandanten in der Anfrage", SENT[-1][0]["args"].get("tenant") == other,
    SENT[-1][0])
@@ -230,16 +233,26 @@ a.notify_list_set(other, "Geheim", a.notify_parse_entries("geheim@andere.example
 a._notify_log({"tenant": tv, "type": "backup.failed", "op": "open", "lists": ["Backup-Verantwortliche"],
                "to": 1, "cc": 1, "bcc": 1, "result": "sent", "said": "accepted for 3"})
 t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
+ok("Reiter: nur der aktive wird gezeigt (Postausgang, kein Verteiler)",
+   "Postausgang" in t and "Probe senden" not in t and "Zuletzt verschickt" not in t)
+ok("tenant_admin hat keinen Reiter Mandanten; ein unbekannter Reiter fällt auf den ersten zurück",
+   "tab=mandanten" not in t
+   and 'class="active">Postausgang' in cl.get("/nachrichten?tab=mandanten", headers=H).get_data(as_text=True))
+t = cl.get("/nachrichten?tab=verteiler", headers=H).get_data(as_text=True)
 ok("tenant_admin: Pflicht-Verteiler, eigener Verteiler mit An/Cc/Bcc, Probe-Knopf",
    "Mandantenverwaltung" in t and "Backup-Verantwortliche" in t
    and "Bcc archiv@verein.example" in t and "Probe senden" in t, t[-3000:])
+t = cl.get("/nachrichten?tab=meldungen", headers=H).get_data(as_text=True)
 ok("die Zuordnung zeigt den Haken und den eigenen Betreff",
    'name="r__backup.failed" value="Backup-Verantwortliche" checked' in t
    and "[{mandant}] Backup" in t)
 ok("keine Knotenart (Platte) beim Mandanten, aber die Mandantenarten",
    "Platte fast voll" not in t and "Neubau einer Instanz fehlgeschlagen" in t)
+t = cl.get("/nachrichten?tab=protokoll", headers=H).get_data(as_text=True)
 ok("das Protokoll zeigt die Sendung ohne Adressen",
    "verschickt" in t and "1 / 1 / 1" in t)
+t = "".join(cl.get("/nachrichten?tab=" + k, headers=H).get_data(as_text=True)
+            for k in ("ausgang", "verteiler", "meldungen", "protokoll"))
 ok("nichts vom fremden Mandanten", "geheim@andere.example" not in t and "Geheim" not in t)
 r = post("/nachrichten/verteiler/set", {"name": "Kasse", "to": "kasse@verein.example, Mandanten-Admins",
                                         "cc": "", "bcc": "", "prefix": ""})
@@ -247,15 +260,19 @@ req = SENT[-1][0]
 ok("Verteiler speichern: eine Anfrage `notify` list-set, ohne Mandant, Rollenwort umgesetzt",
    req.get("action") == "notify" and req["op"] == "list-set" and "tenant" not in req["args"]
    and "mandanten-admins" in req["args"]["to"], req)
+ok("... zurück in den Reiter Verteiler", "tab=verteiler" in r.headers.get("Location", ""),
+   r.headers.get("Location"))
 r = post("/nachrichten/benachrichtigungen", {"r__critical": "Backup-Verantwortliche",
                                              "r__backup.failed": "Backup-Verantwortliche",
                                              "s__backup.failed": "[{mandant}] Backup"})
 req = SENT[-1][0]
-ok("Zuordnung: nur die geänderte Zeile reist (Kritisch)",
-   req["op"] == "route-set" and list(req["args"]["routes"]) == ["critical"], req)
+ok("Zuordnung: nur die geänderte Zeile reist (Kritisch), zurück in den Reiter",
+   req["op"] == "route-set" and list(req["args"]["routes"]) == ["critical"]
+   and "tab=meldungen" in r.headers.get("Location", ""), (req, r.headers.get("Location")))
 WHO.update(role="server_admin", tenant=dflt)
 H = {"X-OAAP-User": "betreiber", "X-OAAP-Roles": "server_admin"}
-t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
+t = "".join(cl.get("/nachrichten?tab=" + k, headers=H).get_data(as_text=True)
+            for k in ("verteiler", "meldungen", "mandanten"))
 ok("server_admin am Knoten: Serverbesitzer, Knotenarten, Mandanten nur mit Namen und Anzahl",
    "Serverbesitzer" in t and "Platte fast voll" in t and "Geheim (1)" in t
    and "geheim@andere.example" not in t and "vorstand@verein.example" not in t, t[-2500:])
@@ -263,9 +280,10 @@ ok("Mandantenarten am Knoten tragen den Hinweis „nur mit eigenem Haken“",
    "nur mit eigenem Haken" in t)
 portal.NOTIFY_VIEW_FILE = a.NOTIFY_VIEW_FILE
 a.notify_view_write()        # no person in this test has an address
-t = cl.get("/nachrichten", headers=H).get_data(as_text=True)
-ok("Serverbesitzer ohne Adresse: die Seite sagt es rot („erreicht niemanden“)",
-   "erreicht im Moment" in t and "niemanden" in t, t[-2500:])
+t = cl.get("/nachrichten?tab=protokoll", headers=H).get_data(as_text=True)
+ok("Serverbesitzer ohne Adresse: die Warnung steht über den Reitern, in jedem Reiter",
+   "erreicht im Moment" in t and "niemanden" in t
+   and t.index("erreicht im Moment") < t.index('class="tabs"'), t[-2500:])
 r = post("/nachrichten/verteiler/test?tenant=verein", {"name": "Backup-Verantwortliche"})
 req = SENT[-1][0]
 ok("Probe für einen Mandanten: der server_admin nennt ihn",

@@ -58,12 +58,17 @@ CATALOGUE = {
     "confirm.pending": {"category": "operations", "scope": "tenant", "matter": False,
                         "title": "Eine Auslieferung wartet auf Bestätigung",
                         "subject": "[{mandant}] Bestätigung nötig: {instanz}"},
+    # Stage 2 (RFC-0080 §4.2)
+    "instance.down": {"category": "health", "scope": "tenant", "matter": True,
+                      "title": "Eine Produktiv-Instanz ist ausgefallen",
+                      "subject": "[{mandant}] Instanz ausgefallen: {instanz}"},
+    "login.locked": {"category": "security", "scope": "tenant", "matter": False,
+                     "title": "Eine Anmeldung wurde nach Fehlversuchen gesperrt",
+                     "subject": "[{mandant}] Anmeldung gesperrt: {kurz}"},
 }
 
-# Stage 2 / own RFC: named so the page can say they exist and wait.
+# Own RFC: named so the page can say it exists and waits.
 LATER = {
-    "instance.down": "Stufe 2: eine Produktiv-Instanz länger als 5 Minuten nicht gesund",
-    "login.locked": "Stufe 2: Identity hat eine Anmeldung gesperrt",
     "intrusion.suspected": "eigenes RFC: heute erkennt nichts einen Einbruch",
 }
 
@@ -87,6 +92,12 @@ RETRY_SECONDS = 3600           # an unsent notification is tried for an hour
 LOG_KEEP = 200
 DISK_WARN, DISK_CRIT = 90.0, 95.0     # D7
 BACKUP_STALE_HOURS = 26
+INSTANCE_DOWN_MINUTES = 5      # RFC-0080 §4.2: unhealthy longer than this
+DOWN_SEEN_GAP = 180            # an observation older than this restarts the clock
+# identity's own numbers (services/identity: _LOCK_THRESHOLD, _LOCK_WINDOW);
+# test_notify reads them there, so the two cannot drift apart unnoticed.
+LOCK_THRESHOLD, LOCK_WINDOW = 5, 300
+LOCK_REPORT_HOURS = 1          # one mail per name and hour, however long it is hammered
 
 LIST_NAME_RE = r"[A-Za-zÄÖÜäöüß0-9][A-Za-zÄÖÜäöüß0-9 ._-]{0,39}"
 ADDR_RE = r"[^@\s<>\"',;]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
@@ -309,6 +320,100 @@ def within_limit(stamps, now, per_hour):
     cut = now - timedelta(hours=1)
     kept = [s for s in stamps or [] if (_parse(s) or cut) > cut]
     return len(kept) < per_hour, kept
+
+
+# ---------------------------------------------------------- stage 2 facts
+
+def clean(text, n=64):
+    """A word that came from outside (a login name someone typed) as it
+    may stand in a subject: no control characters, bounded."""
+    return "".join(ch for ch in str(text or "") if ch.isprintable()).strip()[:n]
+
+
+def service_trouble(row):
+    """One service row of apps/instance-state.json -> what is wrong, or ""."""
+    st = row.get("state") or "absent"
+    if st == "absent":
+        return "Container fehlt"
+    if st != "running":
+        why = f"Container {st}"
+        if row.get("oom"):
+            why += " (Speicher erschöpft)"
+        elif row.get("exit_code"):
+            why += f", Exit-Code {row['exit_code']}"
+        return why
+    if row.get("health") == "unhealthy":
+        return "Gesundheitsprüfung schlägt fehl"
+    return ""
+
+
+def instance_trouble(entry):
+    """An instance's entry of the state view -> what is wrong, or "".
+    Standby, waking and maintenance are someone's decision, not a fault."""
+    if (entry or {}).get("mode", "running") != "running" or (entry or {}).get("maintenance"):
+        return ""
+    rows = (entry or {}).get("services") or []
+    bad = [(r.get("service") or "", service_trouble(r)) for r in rows]
+    bad = [(s, w) for s, w in bad if w]
+    if not bad:
+        return ""
+    if len(rows) == 1:
+        return bad[0][1]
+    return "; ".join(f"{s or 'Hauptdienst'}: {w}" for s, w in bad)
+
+
+def down_conditions(view, production, since, now):
+    """view: {name: state entry}; production: {name: tenant id} -- the
+    production instances; since: {name: {"since", "seen"}} from the last
+    minute. -> ({name: (tid, condition)} for those down longer than
+    INSTANCE_DOWN_MINUTES, new since). An instance whose last observation
+    is older than DOWN_SEEN_GAP starts its clock again: the minute job
+    paused (a backup), so the earlier "down" says nothing about now."""
+    out, new = {}, {}
+    for name, tid in sorted(production.items()):
+        why = instance_trouble(view.get(name))
+        if name not in view or not why:
+            continue
+        old = since.get(name) or {}
+        seen = _parse(old.get("seen"))
+        start = _parse(old.get("since"))
+        if not start or not seen or (now - seen).total_seconds() > DOWN_SEEN_GAP:
+            start = now
+        new[name] = {"since": start.isoformat(), "seen": now.isoformat()}
+        if now - start >= timedelta(minutes=INSTANCE_DOWN_MINUTES):
+            out[name] = (tid, {"type": "instance.down", "instanz": name, "kurz": "",
+                               "text": f"Die Instanz „{name}“ ist seit "
+                                       f"{start.strftime('%H:%M')} UTC nicht gesund: {why}."})
+    return out, new
+
+
+def lock_subject(key):
+    """A key of identity's login-throttle.json -> (kind, client, name).
+    kind: login (client|name), key (key|<id>), keyclient (keyclient|client)."""
+    head, _sep, rest = str(key).partition("|")
+    if head == "key":
+        return "key", "", clean(rest)
+    if head == "keyclient":
+        return "keyclient", clean(rest), ""
+    return "login", clean(head), clean(rest)
+
+
+def lock_episodes(table, now_epoch, reported):
+    """table: identity's {key: [epoch, ...]}; reported: {key: epoch}.
+    -> ([(key, failures)], new reported). A key counts as locked when it
+    has LOCK_THRESHOLD failures within LOCK_WINDOW -- identity's own rule --
+    and is reported once per LOCK_REPORT_HOURS."""
+    keep = {k: t for k, t in (reported or {}).items()
+            if isinstance(t, (int, float)) and now_epoch - t < LOCK_REPORT_HOURS * 3600}
+    out = []
+    for key, hits in sorted((table or {}).items()):
+        if not isinstance(hits, list):
+            continue
+        recent = [t for t in hits if isinstance(t, (int, float)) and 0 <= now_epoch - t < LOCK_WINDOW]
+        if len(recent) >= LOCK_THRESHOLD and key not in keep:
+            out.append((key, len(recent)))
+            keep[key] = now_epoch
+    return out, keep
 
 
 # --------------------------------------------------------------- words

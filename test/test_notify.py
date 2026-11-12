@@ -12,6 +12,9 @@
                   fällt auf die Serverbesitzer zurück; die Stundengrenze;
                   ein Mailserver, der nicht annimmt -> erneut, nie eine
                   Mail über die gescheiterte Mail.
+    Stufe 2       Produktiv-Instanz > 5 min aus -> Lage; „unbekannt“ ist
+                  kein „Behoben“; Identity sperrt einen Namen -> eine Mail
+                  je Mandant, einmal je Stunde.
     Die Tür       Mandanten-Admin nur im eigenen Mandanten, nie am Knoten.
 
 Braucht kein Docker, keinen Knoten, keinen Mailserver.
@@ -329,6 +332,124 @@ ok("danach: der wartende Neubau geht raus, das Backup meldet „Behoben“",
    any("Neubau" in m["subject"] for m in SENT)
    and any(m["subject"].startswith("Behoben") and "Backup" in m["subject"] for m in SENT),
    [m["subject"] for m in SENT])
+
+print("=== Stufe 2: Instanz ausgefallen ===")
+R = lambda st="running", **k: dict({"service": "", "container": "c", "state": st}, **k)
+ok("gesund: nichts", n.instance_trouble({"services": [R(health="healthy")]}) == "")
+ok("Bereitschaft und Wartung sind Entscheidungen, keine Ausfälle",
+   n.instance_trouble({"mode": "standby", "services": [R("exited")]}) == ""
+   and n.instance_trouble({"maintenance": True, "services": [R("exited")]}) == "")
+ok("beendet mit Speichermangel, Gesundheitsprüfung, Container fehlt",
+   "Speicher" in n.instance_trouble({"services": [R("exited", oom=True, exit_code=137)]})
+   and "Gesundheitsprüfung" in n.instance_trouble({"services": [R(health="unhealthy")]})
+   and n.instance_trouble({"services": [R("absent")]}) == "Container fehlt")
+ok("mehrere Dienste: der kaputte wird genannt",
+   n.instance_trouble({"services": [R(service="web"), R("restarting", service="db")]})
+   == "db: Container restarting")
+V = {"kasse": {"services": [R("exited", exit_code=1)]}}
+t0 = n.now_utc()
+seen_by, st_ = [], {}
+for mnt in range(6):          # the minute job, minute by minute
+    cm, st_ = n.down_conditions(V, {"kasse": tid}, st_, t0 + datetime.timedelta(minutes=mnt))
+    seen_by.append(list(cm))
+    if mnt == 4:
+        s4 = st_
+ok("erst nach fünf Minuten eine Lage", seen_by == [[]] * 5 + [["kasse"]]
+   and "Exit-Code 1" in cm["kasse"][1]["text"], seen_by)
+cg, _ = n.down_conditions(V, {"kasse": tid}, s4, t0 + datetime.timedelta(minutes=9))
+ok("eine Lücke in der Beobachtung (Backup-Pause) startet die Uhr neu", cg == {}, cg)
+
+a._notify_state_rw(lambda st: {})
+for fn in os.listdir(a.NOTIFY_OUTBOX_DIR):
+    os.remove(os.path.join(a.NOTIFY_OUTBOX_DIR, fn))
+REG = {"instances": {"kasse": {"tenant": tid}, "kasse-test": {"tenant": tid, "channel": "test"},
+                     "uk": {"tenant": dflt}}}
+a.load_registry = lambda: REG
+
+
+def state_view(runtime_ok=True, **down):
+    inst = {nm: {"services": [R()]} for nm in REG["instances"]}
+    inst.update({nm: {"services": [R(st)]} for nm, st in down.items()})
+    with open(a.STATE_VIEW, "w", encoding="utf-8") as f:
+        json.dump({"written": n.now_utc().isoformat(), "runtime_ok": runtime_ok,
+                   "instances": inst}, f)
+
+
+state_view(**{"kasse": "exited", "kasse-test": "exited"})
+past = (n.now_utc() - datetime.timedelta(minutes=6)).isoformat()
+seen = (n.now_utc() - datetime.timedelta(minutes=1)).isoformat()
+a._notify_state_rw(lambda st: {"down_since": {nm: {"since": past, "seen": seen}
+                                              for nm in ("kasse", "kasse-test")}})
+SENT.clear()
+a.notify_minute({})
+down = [m for m in SENT if "ausgefallen" in m["subject"]]
+ok("Produktiv-Instanz seit sechs Minuten aus: eine Mail an den Mandanten, die Test-Instanz nicht",
+   [m["subject"] for m in down] == ["[Handballverein X] Instanz ausgefallen: kasse"]
+   and down[0]["rcpts"]["to"] == ["kasse@verein.example"], [m["subject"] for m in SENT])
+ok("der Link führt auf die Instanzseite",
+   down and "https://verein.oaap.example/instances/kasse" in down[0]["body"], down and down[0]["body"])
+state_view(runtime_ok=False)
+SENT.clear()
+a.notify_minute({})
+ok("Laufzeit nicht erreichbar: „unbekannt“ ist kein „Behoben“", SENT == [],
+   [m["subject"] for m in SENT])
+state_view()
+SENT.clear()
+a.notify_minute({})
+ok("wieder gesund -> „Behoben“",
+   [m["subject"] for m in SENT] == ["Behoben: [Handballverein X] Instanz ausgefallen: kasse"],
+   [m["subject"] for m in SENT])
+state_view(kasse="exited")
+a._notify_state_rw(lambda st: dict(st, down_since={"kasse": {"since": past, "seen": seen}}))
+a.notify_minute({})
+del REG["instances"]["kasse"]
+state_view()
+SENT.clear()
+a.notify_minute({})
+ok("im Ausfall entfernt: keine „Behoben“-Mail, die Lage ist zu",
+   SENT == [] and not any(k.startswith("instance.down")
+                          for k in (a._notify_state_rw().get("matters") or {}).get(tid, {})),
+   [m["subject"] for m in SENT])
+
+print("=== Stufe 2: Anmeldung gesperrt ===")
+ident = open(os.path.join(HERE, "..", "platform", "services", "identity", "app.py"),
+             encoding="utf-8").read()
+ok("dieselben Zahlen wie Identity (5 Fehlversuche in 300 s)",
+   f"_LOCK_THRESHOLD, _LOCK_WINDOW, _LOCK_SECONDS = {n.LOCK_THRESHOLD}, {n.LOCK_WINDOW}, 60" in ident)
+import time as _time  # noqa: E402
+now = _time.time()
+hits = lambda k, ago=10: [now - ago - i for i in range(k)]
+with open(a.IDENTITY_THROTTLE_FILE, "w", encoding="utf-8") as f:
+    json.dump({"203.0.113.7|kassierer": hits(5), "198.51.100.9|admin\nBcc: x@evil": hits(6),
+               "192.0.2.1|joerg": hits(4), "192.0.2.2|kassierer": hits(5, ago=400),
+               "keyclient|192.0.2.3": hits(5)}, f)
+SENT.clear()
+q = a.notify_login_locks(now)
+a.notify_deliver()
+by = {m["subject"]: m for m in SENT}
+kas = by.get("[Handballverein X] Anmeldung gesperrt: kassierer")
+ok("gesperrter Name des Mandanten -> an den Mandanten, mit Adresse und Zahl",
+   kas and kas["rcpts"]["to"] == ["kasse@verein.example"] and "203.0.113.7" in kas["body"]
+   and "5 Fehlversuche" in kas["body"], list(by))
+node = [m for k, m in by.items() if k.startswith("[oaap.example] Anmeldung gesperrt")]
+ok("unbekannter Name und Schlüssel-Brute-Force -> an den Knoten, in einer Mail",
+   q == 2 and len(node) == 1 and "diesen Benutzer gibt es nicht" in node[0]["body"]
+   and "192.0.2.3" in node[0]["body"] and node[0]["rcpts"]["to"] == ["joerg@node.example"],
+   (q, list(by)))
+ok("vier Versuche und alte Versuche sperren nicht", "192.0.2.1" not in str(SENT)
+   and "192.0.2.2" not in str(SENT))
+ok("ein Name mit Zeilenumbruch kommt nicht als Kopfzeile an",
+   all("\n" not in m["subject"] for m in SENT) and "adminBcc" in str(node and node[0]["body"]))
+SENT.clear()
+ok("dieselbe Sperre in der nächsten Minute: keine zweite Mail",
+   a.notify_login_locks(now + 60) == 0)
+ok("nach einer Stunde ohne frische Fehlversuche: nichts",
+   a.notify_login_locks(now + 3700) == 0)   # the hits are older than five minutes by then
+with open(a.IDENTITY_THROTTLE_FILE, "w", encoding="utf-8") as f:
+    json.dump({"203.0.113.7|kassierer": [now + 3690 - i for i in range(5)]}, f)
+ok("… mit frischen Fehlversuchen nach einer Stunde: wieder eine", a.notify_login_locks(now + 3700) == 1)
+for fn in os.listdir(a.NOTIFY_OUTBOX_DIR):
+    os.remove(os.path.join(a.NOTIFY_OUTBOX_DIR, fn))
 
 print("=== die Tür ===")
 with open(a._identity_users_path(), "w", encoding="utf-8") as f:
