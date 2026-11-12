@@ -25,6 +25,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))
@@ -209,6 +210,53 @@ for url, plain, label in (("mqtt://broker.example.org", False, "Klartext ohne Er
         ok(f"{label} wird abgelehnt", True)
 ok("Klartext zu einer privaten Adresse mit Erlaubnis geht",
    s.configure(cdir, "mqtt://192.168.1.5:1883", "u", "p", node="n1", allow_plain=True)["allow_plain"])
+print("\n=== --address: verbinden mit der Adresse, pruefen auf den Namen ===")
+c = s.configure(cdir, "mqtts://oaap-demo.duckdns.org", "u", "p", node="n1", address="10.10.10.75")
+ok("die Adresse wird gespeichert, die URL behaelt den Namen",
+   c["address"] == "10.10.10.75" and c["url"] == "mqtts://oaap-demo.duckdns.org:8883", c)
+ok("ohne --address steht keine Adresse in der Konfiguration",
+   "address" not in s.configure(cdir, "mqtts://b.example.org", "u", "p", node="n1"))
+for bad in ("oaap-demo", "10.10.10", "10.10.10.75:8883"):
+    try:
+        s.configure(cdir, "mqtts://b.example.org", "u", "p", node="n1", address=bad)
+        ok(f"--address {bad!r} wird abgelehnt", False)
+    except s.ConfigError:
+        ok(f"--address {bad!r} wird abgelehnt", True)
+try:
+    s.configure(cdir, "mqtt://b.example.org", "u", "p", node="n1", allow_plain=True, address="8.8.8.8")
+    ok("Klartext zu einer oeffentlichen --address wird abgelehnt", False)
+except s.ConfigError:
+    ok("Klartext zu einer oeffentlichen --address wird abgelehnt", True)
+dialed, sni = [], []
+
+
+class _FakeSock:
+    def close(self):
+        pass
+
+
+class _FakeCtx:
+    def wrap_socket(self, sock, server_hostname=None):
+        sni.append(server_hostname)
+        raise s.ssl.SSLError("stop here")
+
+
+_cc, _ctx = s.socket.create_connection, s.ssl.create_default_context
+s.socket.create_connection = lambda addr, timeout=None: (dialed.append(addr), _FakeSock())[1]
+s.ssl.create_default_context = lambda cafile=None: _FakeCtx()
+try:
+    for cf in (c, s.configure(cdir, "mqtts://oaap-demo.duckdns.org", "u", "p", node="n1")):
+        try:
+            s.Client(cf, time.monotonic() + 5).connect("p")
+        except s.SenderError:
+            pass
+finally:
+    s.socket.create_connection, s.ssl.create_default_context = _cc, _ctx
+ok("mit --address wird die Adresse gewaehlt, TLS prueft den NAMEN",
+   dialed[0] == ("10.10.10.75", 8883) and sni[0] == "oaap-demo.duckdns.org", (dialed, sni))
+ok("Gegenprobe: ohne --address wird der Name gewaehlt",
+   dialed[1] == ("oaap-demo.duckdns.org", 8883) and sni[1] == "oaap-demo.duckdns.org", (dialed, sni))
+
 c = cfg_for(cdir, 1883)
 ok("das Passwort steht in einer eigenen Datei, nicht in der Konfiguration",
    SECRET not in open(os.path.join(cdir, s.CONFIG_FILE)).read()

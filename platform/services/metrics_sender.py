@@ -155,15 +155,28 @@ def _write_private(path, text):
 
 
 def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
-              allow_plain=False, default_node=None):
-    """Validate and store. The secret goes into its own file."""
+              allow_plain=False, default_node=None, address=None):
+    """Validate and store. The secret goes into its own file.
+
+    `address` (an IP literal) is where to CONNECT when the URL's name does
+    not lead there from this node -- a broker in the same LAN behind a
+    router that does no hairpin NAT (measured 2026-11-12: oaap-demo's
+    public name refuses 8883 from inside the house). TLS still verifies
+    the certificate against the URL's NAME, as `curl --resolve` does.
+    """
     scheme, host, port = parse_url(url)
+    if address:
+        try:
+            address = str(ipaddress.ip_address(address))
+        except ValueError:
+            raise ConfigError("--address: an IP address, e.g. 10.10.10.75 "
+                              "(the name stays in the URL)") from None
     if scheme == "mqtt":
         if not allow_plain:
             raise ConfigError("mqtt:// sends the password in the clear; "
                               "use mqtts://, or --allow-plain for a "
                               "private address")
-        if not is_private_host(host):
+        if not is_private_host(address or host):
             raise ConfigError("--allow-plain is only accepted for a private "
                               "address; this one is not (or does not resolve)")
     if not user or not re.match(r"^[\x21-\x7e]{1,64}$", user):
@@ -175,6 +188,8 @@ def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
            "node": normalise_node(node or default_node or "node"),
            "root": validate_root(root or DEFAULT_ROOT),
            "allow_plain": bool(allow_plain)}
+    if address:
+        cfg["address"] = address
     if ca and not os.path.isfile(ca):
         raise ConfigError(f"--ca: no such file: {ca}")
     os.makedirs(cfg_dir, exist_ok=True)
@@ -335,11 +350,12 @@ class Client:
 
     def connect(self, secret):
         scheme, host, port = parse_url(self.cfg["url"])
+        dial = self.cfg.get("address") or host
         try:
             sock = socket.create_connection(
-                (host, port), timeout=self._timeout(CONNECT_TIMEOUT))
+                (dial, port), timeout=self._timeout(CONNECT_TIMEOUT))
         except OSError as exc:
-            raise SenderError(f"cannot connect to {host}:{port} "
+            raise SenderError(f"cannot connect to {dial}:{port} "
                               f"({type(exc).__name__})") from None
         if scheme == "mqtts":
             try:

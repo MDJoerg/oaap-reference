@@ -8985,7 +8985,8 @@ def _metrics_sender(args):
             cfg = metrics_sender.configure(
                 d, args.url, args.user, secret, node=args.node, root=args.root,
                 ca=args.ca, allow_plain=args.allow_plain,
-                default_node=socket.gethostname())
+                default_node=socket.gethostname(),
+                address=getattr(args, "address", None))
         except metrics_sender.ConfigError as exc:
             die(str(exc))
         metrics_sender.write_info(METRICS_DIR, cfg)
@@ -8993,6 +8994,9 @@ def _metrics_sender(args):
         print(f"Sender set: {cfg['url']} as {cfg['user']} (secret stored, "
               "not shown).")
         print(f"  Topic: {cfg['root']}/{cfg['node']}/metrics/<series>")
+        if cfg.get("address"):
+            print(f"  Connects to {cfg['address']}, verifies the certificate "
+                  "for the name in the URL.")
         if cfg["url"].startswith("mqtt://"):
             print("  Plain mqtt:// -- the password crosses the network in "
                   "the clear; allowed for a private address only.")
@@ -9027,6 +9031,9 @@ def _metrics_sender(args):
         print("  plain mqtt allowed (private address)")
     if cfg.get("ca"):
         print(f"  CA file: {cfg['ca']}")
+    if cfg.get("address"):
+        print(f"  connects to: {cfg['address']} (certificate checked for "
+              "the URL's name)")
     st = metrics_sender.load_state(METRICS_DIR)
     if st.get("ok_at"):
         print(f"  last success: {_fmt_at(st['ok_at'])}; sent so far: "
@@ -34540,6 +34547,10 @@ def build_parser():
                       help="for 'sender set': topic root (default oaap-node)")
     pmet.add_argument("--ca", default=None,
                       help="for 'sender set': a private CA file")
+    pmet.add_argument("--address", default=None,
+                      help="for 'sender set': connect to this IP instead of "
+                           "the URL's name (same LAN, no hairpin NAT); TLS "
+                           "still checks the name")
     pmet.add_argument("--allow-plain", action="store_true",
                       help="for 'sender set': allow mqtt:// to a private "
                            "address")
