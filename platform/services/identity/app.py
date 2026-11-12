@@ -2760,9 +2760,31 @@ def _throttle_client():
 
 BRAKED_FILE = os.path.join(DATA_DIR, "throttle-braked.json")
 BRAKED_HOURS = 24
+# RFC-0083 stage 1: per bucket also WHO and WHEN, so "2312" can read
+# "1 Adresse, in einer Minute" (a scanner, not an overload). Who = a keyed
+# hash of the client address, 8 hex digits, at most BRAKED_CLIENTS per
+# bucket -- a count, never an address on disk. When = braked per minute of
+# the hour (at most 60 keys). The file stays bounded as before.
+BRAKED_CLIENTS = 50
 
 
-def _braked_note(scope):
+def _braked_client_tag(client):
+    import hashlib
+    import hmac as _hmac
+    key = (os.environ.get("INTERNAL_API_KEY") or "oaap-braked").encode()
+    return _hmac.new(key, (client or "?").encode(), hashlib.sha256).hexdigest()[:8]
+
+
+def _braked_bucket(v):
+    """A bucket as a dict -- before RFC-0083 it was a bare count."""
+    if isinstance(v, dict):
+        return {"n": int(v.get("n") or 0), "c": list(v.get("c") or [])[:BRAKED_CLIENTS],
+                "m": {str(k): int(x) for k, x in (v.get("m") or {}).items()},
+                "full": bool(v.get("full"))}
+    return {"n": int(v or 0), "c": [], "m": {}, "full": False}
+
+
+def _braked_note(scope, client=None):
     """Record one braked request, straight through to the shared file.
 
     Batching in process memory was tried first and produces a wrong
@@ -2780,7 +2802,10 @@ def _braked_note(scope):
     only make the number it produces larger.
     """
     import fcntl
-    hour = int(time.time() // 3600)
+    now = time.time()
+    hour = int(now // 3600)
+    minute = str(int(now // 60) % 60)
+    tag = _braked_client_tag(client) if client is not None else None
     oldest = hour - BRAKED_HOURS + 1
     try:
         fd = os.open(BRAKED_FILE, os.O_RDWR | os.O_CREAT, 0o600)
@@ -2795,7 +2820,15 @@ def _braked_note(scope):
                 data = {}
             buckets = {k: v for k, v in (data.get(scope) or {}).items()
                        if str(k).isdigit() and int(k) >= oldest}
-            buckets[str(hour)] = buckets.get(str(hour), 0) + 1
+            b = _braked_bucket(buckets.get(str(hour)))
+            b["n"] += 1
+            b["m"][minute] = b["m"].get(minute, 0) + 1
+            if tag and tag not in b["c"]:
+                if len(b["c"]) < BRAKED_CLIENTS:
+                    b["c"].append(tag)
+                else:
+                    b["full"] = True
+            buckets[str(hour)] = b
             data[scope] = buckets
             # drop instances whose last brake fell out of the window
             data = {s: b for s, b in data.items()
@@ -2828,7 +2861,7 @@ def throttle():
     hits = [t for t in _RATE.get(key, ()) if now - t < window]
     if len(hits) >= limit:
         _RATE[key] = hits
-        _braked_note(scope)
+        _braked_note(scope, _throttle_client())
         retry = max(1, int(window - (now - hits[0])))
         return ("Too many requests", 429,
                 {"Retry-After": str(retry), "Cache-Control": "no-store"})
@@ -3040,14 +3073,34 @@ def internal_throttle_braked():
     except (OSError, ValueError):
         data = {}
     oldest = int(time.time() // 3600) - BRAKED_HOURS + 1
+    return {"hours": BRAKED_HOURS, "instances": braked_summary(data, oldest)}
+
+
+def braked_summary(data, oldest, newest=None):
+    """{scope: {count, last_hour, clients, clients_more, minutes, peak_count,
+    peak_at}} over the hour buckets oldest..newest. `clients` counts
+    distinct tags (a bucket of an old format has none: 0 = unknown);
+    `clients_more` says the cap was hit somewhere."""
     out = {}
-    for scope, buckets in data.items():
-        fresh = {int(h): c for h, c in buckets.items()
-                 if str(h).isdigit() and int(h) >= oldest}
-        if fresh:
-            out[scope] = {"count": sum(fresh.values()),
-                          "last_hour": max(fresh)}
-    return {"hours": BRAKED_HOURS, "instances": out}
+    for scope, buckets in (data or {}).items():
+        fresh = {int(h): _braked_bucket(v) for h, v in buckets.items()
+                 if str(h).isdigit() and int(h) >= oldest
+                 and (newest is None or int(h) <= newest)}
+        if not fresh:
+            continue
+        tags, more, minutes, peak = set(), False, 0, (0, 0)
+        for h, b in fresh.items():
+            tags.update(b["c"])
+            more = more or b["full"]
+            minutes += len(b["m"])
+            for m, n in b["m"].items():
+                if n > peak[0]:
+                    peak = (n, h * 3600 + int(m) * 60)
+        out[scope] = {"count": sum(b["n"] for b in fresh.values()),
+                      "last_hour": max(fresh), "clients": len(tags),
+                      "clients_more": more, "minutes": minutes,
+                      "peak_count": peak[0], "peak_at": peak[1]}
+    return out
 
 
 @app.post("/internal/setup")

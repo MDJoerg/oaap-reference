@@ -50,6 +50,7 @@ import nav_view
 import host_care  # noqa: E402
 # RFC-0080: the catalogue of message types, the same module the host routes with.
 import notify  # noqa: E402
+import report  # noqa: E402  (RFC-0083: the weekly report's renderer)
 
 IDENTITY = "http://identity:8000"
 TWIN = "http://twin:8000"
@@ -1432,10 +1433,11 @@ HEALTH_BODY = """
   <p class="muted">Der Zähler war nicht abrufbar.</p>
   {% else %}
   <table>
-    <tr><th>Instanz</th><th>Abgewiesen</th><th>Zuletzt</th></tr>
+    <tr><th>Instanz</th><th>Abgewiesen</th><th>Wer, wann</th><th>Zuletzt</th></tr>
     {% for b in braked.rows %}
     <tr><td>{{ b.instance }}</td>
         <td>{% if b.count %}<span class="dot warn"></span>{{ b.count }}{% else %}<span class="dot ok"></span>0{% endif %}</td>
+        <td class="muted">{{ b.who }}</td>
         <td class="muted">{{ b.last }}</td></tr>
     {% endfor %}
   </table>
@@ -1444,7 +1446,9 @@ HEALTH_BODY = """
      eine öffentliche Route abgewiesen hat (HTTP 429). Das ist eine
      Mengenbremse und <strong>keine Zugangskontrolle</strong> — dauerhaft
      hohe Zahlen heißen: nachsehen, wer da klopft, und die App selbst
-     absichern. Einstellbar je Instanz auf deren Objektseite.</p>
+     absichern. Wenige Adressen in wenigen Minuten sind meist ein Scanner,
+     viele Adressen über Stunden echte Last. Adressen werden nicht
+     gespeichert, nur gezählt. Einstellbar je Instanz auf deren Objektseite.</p>
 </div>
 {% endif %}
 {% if deploys %}
@@ -6550,6 +6554,23 @@ def reach_check():
     return result
 
 
+def _braked_words(c):
+    """"1 Adresse · in 1 Minute (Spitze 2312 um 10:07 UTC)" -- RFC-0083 stage 1.
+    Few addresses in few minutes reads as a scanner, many as real load."""
+    parts = []
+    n = c.get("clients") or 0
+    if n:
+        parts.append(("50+" if c.get("clients_more") else str(n))
+                     + (" Adresse" if n == 1 and not c.get("clients_more") else " Adressen"))
+    m = c.get("minutes") or 0
+    if m:
+        parts.append(f"in {m} Minute" + ("" if m == 1 else "n"))
+    if c.get("peak_count") and m > 1:
+        parts.append(f"Spitze {c['peak_count']} um "
+                     + datetime.fromtimestamp(c["peak_at"], timezone.utc).strftime("%H:%M UTC"))
+    return " · ".join(parts)
+
+
 def braked_requests():
     """Per-instance count of throttled requests (RFC-0010 decision 2)."""
     instances = load_instances()
@@ -6567,7 +6588,8 @@ def braked_requests():
         c = counts.get(name, {})
         rows.append({"instance": name, "count": c.get("count", 0),
                      "last": datetime.fromtimestamp(c["last_hour"] * 3600, timezone.utc)
-                                     .strftime("%d.%m.%Y %H:00 UTC") if c else "–"})
+                                     .strftime("%d.%m.%Y %H:00 UTC") if c else "–",
+                     "who": _braked_words(c) if c else ""})
     return {"hours": data.get("hours", 24), "rows": rows, "error": False}
 
 
@@ -12871,7 +12893,8 @@ def _messages_facts(tid):
                          "uses": ("eigenes Postfach (" + mine["from"] + ")" if mine
                                   else "Postfach des Knotens" if node else "keines")})
     return {"node": node, "own": own, "realm": realm, "rows": rows,
-            "is_node": tid == dflt, "n": _notify_facts(tid, tid == dflt, tenants)}
+            "is_node": tid == dflt, "n": _notify_facts(tid, tid == dflt, tenants),
+            "reports": _reports_facts(tid, tid == dflt)}
 
 
 NOTIFY_FILE = "/apps-registry/notifications.json"
@@ -12924,7 +12947,9 @@ def _notify_facts(tid, is_node, tenants):
         r = scope["routes"].get(key) or {}
         rows.append({"key": key, "word": notify.CATEGORY_WORDS[key], "is_cat": True,
                      "lists": r.get("lists") or [], "subject": r.get("subject", ""),
-                     "default": "", "from_tenant": False})
+                     "default": "", "from_tenant": False,
+                     "report": r.get("delivery") == "report",
+                     "can_report": key != "critical"})
     for key in notify.types_for(is_node):
         d = notify.CATALOGUE[key]
         r = scope["routes"].get(key) or {}
@@ -12932,7 +12957,9 @@ def _notify_facts(tid, is_node, tenants):
                      "cat": notify.CATEGORY_WORDS[d["category"]],
                      "lists": r.get("lists") or [], "subject": r.get("subject", ""),
                      "default": d["subject"],
-                     "from_tenant": is_node and d["scope"] == "tenant"})
+                     "from_tenant": is_node and d["scope"] == "tenant",
+                     "report": r.get("delivery") == "report",
+                     "can_report": key not in notify.NEVER_REPORT_ONLY})
     log = []
     try:
         with open(NOTIFY_LOG_FILE, encoding="utf-8") as f:
@@ -12965,8 +12992,35 @@ def _notify_facts(tid, is_node, tenants):
 
 MESSAGES_TABS_NODE = (("ausgang", "Postausgang"), ("verteiler", "Verteiler"),
                       ("meldungen", "Benachrichtigungen"), ("protokoll", "Protokoll"),
-                      ("mandanten", "Mandanten"))
-MESSAGES_TABS = MESSAGES_TABS_NODE[:4]
+                      ("berichte", "Berichte"), ("mandanten", "Mandanten"))
+MESSAGES_TABS = MESSAGES_TABS_NODE[:5]
+REPORTS_DIR = "/apps-registry/reports"
+REPORT_SETTINGS_FILE = "/apps-registry/report.json"
+REPORT_DAY_WORDS = (("mon", "Montag"), ("tue", "Dienstag"), ("wed", "Mittwoch"),
+                    ("thu", "Donnerstag"), ("fri", "Freitag"), ("sat", "Samstag"),
+                    ("sun", "Sonntag"))
+
+
+def _reports_facts(tid, is_node):
+    """The scope's reports, the chosen one rendered (report.to_html escapes
+    every text first), and for the node the day and hour."""
+    weeks = report.list_reports(REPORTS_DIR, tid)
+    want = (request.args.get("woche") or "").strip()
+    week = want if want in weeks else (weeks[0] if weeks else "")
+    shown = ""
+    if week:
+        try:
+            with open(report.report_path(REPORTS_DIR, tid, week), encoding="utf-8") as f:
+                shown = Markup(report.to_html(f.read()))
+        except OSError:
+            shown = ""
+    st = _read_json(REPORT_SETTINGS_FILE) or {}
+    routed = is_node or bool(((_notify_stored().get(tid) or {}).get("routes") or {})
+                             .get("report.weekly", {}).get("lists"))
+    return {"weeks": weeks, "week": week, "html": shown, "routed": routed,
+            "day": st.get("day") if st.get("day") in dict(REPORT_DAY_WORDS) else "mon",
+            "at": st.get("at") or "07:00", "enabled": st.get("enabled", True) is not False,
+            "days": REPORT_DAY_WORDS}
 
 
 def _messages_tab(is_node):
@@ -13101,24 +13155,63 @@ MESSAGES_BODY = """
   Pflicht-Verteiler. Eine Lage wird gemeldet, wenn sie beginnt und wenn sie behoben ist,
   Kritisches zusätzlich einmal täglich. Höchstens {{ n.per_hour }} Mails je Stunde.</p>
   <form method="post" action="/nachrichten/benachrichtigungen{{ q }}">
-  <table class="list"><tr><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
+  <table class="list"><tr><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th><th>nur im Bericht</th></tr>
   {% for r in n.rows if r.is_cat %}<tr><td><strong>{{ r.word }}</strong></td>
     {% for nm in n.names %}<td><input type="checkbox" name="r__{{ r.key }}" value="{{ nm }}"{% if nm in r.lists %} checked{% endif %}></td>{% endfor %}
-    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="je Art"></td></tr>{% endfor %}
+    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="je Art"></td>
+    <td>{% if r.can_report %}<input type="checkbox" name="d__{{ r.key }}" value="report"{% if r.report %} checked{% endif %}>{% else %}<span class="muted">immer sofort</span>{% endif %}</td></tr>{% endfor %}
   </table>
   <details{% if n.rows|selectattr("lists")|rejectattr("is_cat")|list %} open{% endif %}><summary>Einzelne Arten abweichend zuordnen</summary>
-  <table class="list"><tr><th>Art</th><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th></tr>
+  <table class="list"><tr><th>Art</th><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th><th>nur im Bericht</th></tr>
   {% for r in n.rows if not r.is_cat %}<tr><td>{{ r.word }}{% if r.from_tenant %}<br><small class="muted">von den Mandanten — nur mit eigenem Haken</small>{% endif %}</td>
     <td>{{ r.cat }}</td>
     {% for nm in n.names %}<td><input type="checkbox" name="r__{{ r.key }}" value="{{ nm }}"{% if nm in r.lists %} checked{% endif %}></td>{% endfor %}
-    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="{{ r.default }}"></td></tr>{% endfor %}
+    <td><input name="s__{{ r.key }}" value="{{ r.subject }}" maxlength="160" placeholder="{{ r.default }}"></td>
+    <td>{% if r.can_report %}<input type="checkbox" name="d__{{ r.key }}" value="report"{% if r.report %} checked{% endif %}>{% else %}<span class="muted">immer sofort</span>{% endif %}</td></tr>{% endfor %}
   </table>
   {% if n.later %}<p class="muted">Noch nicht gebaut: {% for k, w in n.later.items() %}{{ w }}{{ "; " if not loop.last }}{% endfor %}.</p>{% endif %}
   </details>
-  <p class="muted">Platzhalter im Betreff: <code>{{ n.placeholders }}</code>.</p>
+  <p class="muted">Platzhalter im Betreff: <code>{{ n.placeholders }}</code>.
+     „Nur im Bericht“: keine Mail, die Meldung steht im Wochenbericht (Reiter Berichte).
+     Jede verschickte Mail steht dort ohnehin. Kritisches, eine volle Platte und eine
+     ausgefallene Instanz gehen immer sofort raus.</p>
   <button class="btn">Zuordnung speichern</button>
   </form>
 </div>
+{% endif %}
+
+{% if tab == "berichte" %}
+{% set r = f.reports %}
+<div class="card">
+  <h2>Wochenberichte</h2>
+  {% if not r.routed %}
+  <p class="muted">Dieser Mandant bekommt noch keinen Wochenbericht. Unter
+     <a href="/nachrichten{{ tq }}tab=meldungen">Benachrichtigungen</a> der Art
+     „Wochenbericht“ einen Verteiler zuordnen — dann kommt er jede Woche.</p>
+  {% endif %}
+  {% if r.weeks %}
+  <p>{% for w in r.weeks[:12] %}<a class="rowaction{% if w == r.week %} active{% endif %}"
+     href="/nachrichten{{ tq }}tab=berichte&woche={{ w }}">{{ w.replace('-W', ' · KW ') }}</a> {% endfor %}</p>
+  {% else %}
+  <p class="muted">Noch kein Bericht. Der erste kommt {% for k, w in r.days if k == r.day %}am {{ w }}{% endfor %}
+     um {{ r.at }} Uhr über die Vorwoche.</p>
+  {% endif %}
+</div>
+{% if r.html %}<div class="card report">{{ r.html }}</div>{% endif %}
+{% if f.is_node %}
+<div class="card">
+  <h2>Wann</h2>
+  <form method="post" action="/nachrichten/berichte{{ q }}">
+    <p><label>Tag <select name="day">{% for k, w in r.days %}<option value="{{ k }}"{% if k == r.day %} selected{% endif %}>{{ w }}</option>{% endfor %}</select></label>
+       <label>Uhrzeit <input name="at" value="{{ r.at }}" pattern="[0-2][0-9]:[0-5][0-9]" style="max-width:7rem"></label>
+       <label><input type="checkbox" name="enabled" value="on"{% if r.enabled %} checked{% endif %}> Wochenbericht verschicken</label></p>
+    <p class="muted">Der Bericht fasst die Vorwoche zusammen: Ereignisse, alle verschickten Meldungen,
+       Backups, gebremste Anfragen, Messwerte und Wachstum. Er geht an die Verteiler der Art
+       „Wochenbericht“ (ohne Zuordnung an die Serverbesitzer).</p>
+    <button class="btn">Speichern</button>
+  </form>
+</div>
+{% endif %}
 {% endif %}
 
 {% if tab == "protokoll" %}
@@ -13227,6 +13320,25 @@ def _notify_queue(tid, label, role, op, args, tab):
     return redirect(f"{back}{key}=" + quote(str(res.get("message") or "")[:600]), code=303)
 
 
+@app.post("/nachrichten/berichte")
+def messages_reports():
+    """The weekly report's day and hour (RFC-0083) -- the node's, so the
+    server_admin's; the host checks it again."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    return _notify_queue(tid, label, role, "report-settings",
+                         {"day": (request.form.get("day") or "")[:3],
+                          "at": (request.form.get("at") or "").strip()[:5],
+                          "enabled": "on" if request.form.get("enabled") == "on" else "off"},
+                         "berichte")
+
+
 @app.post("/nachrichten/verteiler/<op>")
 def messages_lists(op):
     """RFC-0080: a recipient list -- save, remove, test. One request each;
@@ -13276,9 +13388,11 @@ def messages_routes():
     for key in list(notify.CATEGORIES) + notify.types_for(is_node):
         lists = [x for x in request.form.getlist("r__" + key) if x in scope["lists"]]
         subject = (request.form.get("s__" + key) or "").strip()[:160]
+        delivery = "report" if request.form.get("d__" + key) == "report" else "now"
         old = scope["routes"].get(key) or {}
-        if lists != (old.get("lists") or []) or subject != (old.get("subject") or ""):
-            routes[key] = {"lists": lists, "subject": subject}
+        if (lists != (old.get("lists") or []) or subject != (old.get("subject") or "")
+                or delivery != (old.get("delivery") or "now")):
+            routes[key] = {"lists": lists, "subject": subject, "delivery": delivery}
     if not routes:
         return redirect(_messages_back(tid, label, role, "meldungen") + "&msg="
                         + quote("Nichts geändert."), code=303)

@@ -113,6 +113,8 @@ import advisories  # noqa: E402
 import images  # noqa: E402
 # ... and who hears about it (RFC-0080): lists, catalogue, routing.
 import notify  # noqa: E402
+# ... and what it says once a week (RFC-0083): ledger, report, Markdown.
+import report  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
@@ -2846,14 +2848,15 @@ NOTIFY_SEND = None      # tests replace it: (mail, sender_name, rcpts, subject, 
 #                         -> (ok, said) or (ok, said, final)
 
 
-def notify_smtp(mail, sender_name, rcpts, subject, body):
+def notify_smtp(mail, sender_name, rcpts, subject, body, html=None):
     """Send one plain mail from the host -> (ok, sentence, final). `final`
     says a failure will not get better by trying again: the server refused
     with a 5xx (measured on oaap-test 2026-11-11: "521 5.1.2 Domain does not
     exist" was retried every minute). A connection that broke, a 4xx: not
     final. The password never reaches the sentence; Bcc never a header."""
     if NOTIFY_SEND:
-        got = NOTIFY_SEND(mail, sender_name, rcpts, subject, body)
+        got = (NOTIFY_SEND(mail, sender_name, rcpts, subject, body, html=html) if html
+               else NOTIFY_SEND(mail, sender_name, rcpts, subject, body))
         return got if len(got) == 3 else (got[0], got[1], False)
     import smtplib
     import ssl
@@ -2871,6 +2874,8 @@ def notify_smtp(mail, sender_name, rcpts, subject, body):
     msg["Message-ID"] = make_msgid(domain=mail["from"].split("@", 1)[1])
     msg["Auto-Submitted"] = "auto-generated"
     msg.set_content(body)
+    if html:
+        msg.add_alternative(html, subtype="html")
     every = rcpts["to"] + rcpts["cc"] + rcpts["bcc"]
     ctx = ssl.create_default_context()
     try:
@@ -2936,6 +2941,14 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
         tpl = notify.CATALOGUE[ntype]["subject"]
     if not lists:
         return "skipped"            # a tenant's event the node did not ask for
+    if op != "test" and notify.delivery_for(scope, ntype) == "report":
+        # RFC-0083: this scope reads it in the weekly report, not now. The
+        # log line is what the ledger picks up.
+        _notify_log({"tenant": tid, "type": ntype, "op": op, "lists": lists,
+                     "about": item["tenant"] if from_tenant else "",
+                     "to": 0, "cc": 0, "bcc": 0, "result": "report",
+                     "said": "only in the weekly report"})
+        return "report"
     values = _notify_values(item, tid)
     rcpts = notify.resolve(lists, scope, notify_people_of_role(tid))
     log = {"tenant": tid, "type": ntype, "op": op, "lists": lists,
@@ -2988,7 +3001,17 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
             (load_tenants().get(item["tenant"]) or {}).get("label", ""), safe="")
     body = notify.body(ntype, op, values, item.get("text", ""),
                        notify_link(item["tenant"] if not is_node or from_tenant else tid, page))
-    ok, said, final = notify_smtp(mail, sender, rcpts, subject, body)
+    html_body = None
+    if ntype == "report.weekly":
+        # RFC-0083: the report is the body -- Markdown as text, rendered as HTML
+        md = report_read(tid, item.get("kurz", ""))
+        if md is None:
+            _notify_log(dict(log, result="failed", said="the report file is gone"))
+            return "failed"
+        body = md + "\nIm Portal: " + notify_link(tid, "/nachrichten?tab=berichte&woche="
+                                                 + item.get("kurz", "")) + "\n"
+        html_body = report.to_html(body, title=subject)
+    ok, said, final = notify_smtp(mail, sender, rcpts, subject, body, html=html_body)
     if ok:
         state["stamps"][bucket] = kept + [now.isoformat()]
         _notify_log(dict(log, result="sent", said=said))
@@ -3434,10 +3457,360 @@ def notify_minute(facts=None):
     except Exception as e:                          # noqa: BLE001
         print(f"notify: login locks: {type(e).__name__}: {e}", file=sys.stderr)
     try:
+        ledger_minute()
+        report_minute()
+    except Exception as e:                          # noqa: BLE001
+        print(f"report: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
         return notify_deliver()
     except Exception as e:                          # noqa: BLE001
         print(f"notify: delivery: {type(e).__name__}: {e}", file=sys.stderr)
         return {}
+
+
+# ------------------------------------------------- the weekly report (RFC-0083)
+#
+#   apps/report-ledger/<scope>.jsonl   one reduced line per day, 3 years, 0600
+#   apps/report-ledger/state.json      the last day written
+#   apps/reports/<scope>/<YYYY-Www>.md the reports, a year, 0644 (portal)
+#   apps/report.json                   day and hour of the week's report
+
+REPORT_LEDGER_DIR = os.path.join(APPS_DIR, "report-ledger")
+REPORTS_DIR = os.path.join(APPS_DIR, "reports")
+REPORT_SETTINGS_FILE = os.path.join(APPS_DIR, "report.json")
+IDENTITY_BRAKED_FILE = os.path.join(DATA_DIR, "data", "identity", "throttle-braked.json")
+REPORT_BACKFILL_DAYS = 7
+REPORT_DU_SECONDS = 120
+REPORT_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+REPORT_DAY_WORDS = {"mon": "montags", "tue": "dienstags", "wed": "mittwochs",
+                    "thu": "donnerstags", "fri": "freitags", "sat": "samstags",
+                    "sun": "sonntags"}
+
+
+def report_settings():
+    rec = {}
+    try:
+        with open(REPORT_SETTINGS_FILE, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        pass
+    day = rec.get("day") if rec.get("day") in REPORT_DAYS else "mon"
+    at = rec.get("at") if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(rec.get("at") or "")) \
+        else "07:00"
+    return {"day": day, "at": at, "enabled": rec.get("enabled", True) is not False}
+
+
+def report_settings_set(day=None, at=None, enabled=None, who="root", role="root"):
+    cur = report_settings()
+    new = dict(cur)
+    if day is not None:
+        d = day.strip().lower()[:3]
+        if d not in REPORT_DAYS:
+            raise ValueError("day is one of: " + ", ".join(REPORT_DAYS))
+        new["day"] = d
+    if at is not None:
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", at.strip()):
+            raise ValueError("at is HH:MM (24 h)")
+        new["at"] = at.strip()
+    if enabled is not None:
+        new["enabled"] = bool(enabled)
+    if new == cur:
+        return "Unchanged."
+    os.makedirs(APPS_DIR, exist_ok=True)
+    with open(REPORT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(new, f, indent=2)
+    os.chmod(REPORT_SETTINGS_FILE, 0o644)
+    said = (f"weekly report {REPORT_DAY_WORDS[new['day']]} {new['at']}" if new["enabled"]
+            else "weekly report off")
+    audit_tenant("report.settings", default_tenant_id(), subject="node", who=who, role=role,
+                 detail=said)
+    return "Weekly report: " + said + "."
+
+
+def _report_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _tenant_bytes(tids):
+    """{tid: bytes} of each tenant's directory -- du, bounded in time. A
+    node whose disk is too slow for that gets None ('not measured')."""
+    dirs = {t: tenant_dir(t) for t in tids if os.path.isdir(tenant_dir(t))}
+    if not dirs:
+        return {}
+    try:
+        r = subprocess.run(["du", "-sb", "--one-file-system"] + list(dirs.values()),
+                           capture_output=True, text=True, timeout=REPORT_DU_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    by_dir = {}
+    for line in r.stdout.splitlines():
+        size, _, path = line.partition("\t")
+        if size.isdigit():
+            by_dir[path] = int(size)
+    return {t: by_dir[d] for t, d in dirs.items() if d in by_dir}
+
+
+def ledger_lines_for_day(day, measured_now):
+    """{scope: line} for one local day. `measured_now`: this is yesterday,
+    so the facts that exist only as 'the current state' (bytes, care,
+    backup's last run, the brake's 24 h) belong to it; an older day gets
+    them as not measured -- nothing is invented for it."""
+    start, end = report.day_bounds(day)
+    tenants = load_tenants()
+    dflt = default_tenant_id()
+    log = read_tenant_log(limit=0)
+    by_tenant = {}
+    for e in log:
+        by_tenant.setdefault(e.get("tenant"), []).append(e)
+    try:
+        with open(NOTIFY_LOG_FILE, encoding="utf-8") as f:
+            nlog = [json.loads(x) for x in f if x.strip()]
+    except (OSError, ValueError):
+        nlog = []
+    metric_rows = metrics._read(METRICS_DIR, "30m")
+    reg = load_registry()
+    inst_tenant = {n: resolve_tenant(i.get("tenant")) for n, i in reg["instances"].items()}
+    brake_all = (report.day_brake(_report_json(IDENTITY_BRAKED_FILE) or {}, start, end)
+                 if measured_now else None)
+    bytes_t = _tenant_bytes(list(tenants)) if measured_now else None
+    node_run = last_backup_run() or {}
+    run_t = report._epoch(node_run.get("finished"))
+    node_backup = ({k: node_run.get(k) for k in ("state", "finished", "bytes", "total_seconds",
+                                                  "downtime_seconds", "message") if node_run.get(k)}
+                   if run_t and start <= run_t < end else {})
+    out = {}
+    for tid in tenants:
+        is_node = tid == dflt
+        parts = {"events": report.day_events(by_tenant.get(tid, []), start, end),
+                 "mails": report.day_mails(nlog, tid, start, end)}
+        if brake_all is not None:
+            parts["brake"] = {i: b for i, b in brake_all.items()
+                              if is_node or inst_tenant.get(i) == tid}
+        if is_node:
+            parts["metrics"] = report.day_metrics(metric_rows, start, end, metrics._aggregate)
+            parts["backup"] = node_backup
+            if measured_now:
+                try:
+                    du = shutil.disk_usage(DATA_DIR)
+                    parts["bytes"] = {"disk_used": du.used, "disk_free": du.free,
+                                      "tenants": bytes_t or {}}
+                except OSError:
+                    parts["bytes"] = None
+                care = _report_json(os.path.join(APPS_DIR, host_care.FILE_NAME))
+                k = (care or {}).get("kernel") or {}
+                adv = (care or {}).get("advisories") or {}
+                parts["care"] = {"kernel": k.get("running", ""),
+                                 "reboot_required": bool(k.get("reboot_required")),
+                                 "advisories": adv.get("open")} if care else None
+            else:
+                parts["bytes"] = None
+        else:
+            own = tenant_backup_last(tid) if tenant_backup_class(tid, tenants) == "own" else {}
+            ot = report._epoch((own or {}).get("finished"))
+            parts["backup"] = ({k: own.get(k) for k in ("state", "finished", "bytes", "message")
+                                if own.get(k)} if ot and start <= ot < end else {})
+            if measured_now:
+                parts["bytes"] = ({"tenant": (bytes_t or {}).get(tid)}
+                                  if bytes_t is not None and tid in (bytes_t or {}) else None)
+        out[tid] = report.ledger_line(day, tid, **parts)
+    return out
+
+
+def _ledger_path(scope):
+    return os.path.join(REPORT_LEDGER_DIR, scope + ".jsonl")
+
+
+def ledger_write_day(day, measured_now):
+    os.makedirs(REPORT_LEDGER_DIR, mode=0o700, exist_ok=True)
+    lines = ledger_lines_for_day(day, measured_now)
+    for scope, line in lines.items():
+        path = _ledger_path(scope)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n")
+        os.chmod(path, 0o600)
+        kept = report.read_ledger(path)
+        if len(kept) > report.LEDGER_KEEP_DAYS * 1.1:
+            kept = report.trim_lines(kept, day)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for e in kept:
+                    f.write(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n")
+            os.replace(tmp, path)
+    return lines
+
+
+def ledger_minute(now=None):
+    """Once a day, the first minute job after local midnight writes
+    yesterday. The first run on a node also writes the six days before
+    from what still exists (events, mails, metrics), so the first report is
+    not empty. Returns the days written."""
+    now = now or time.time()
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    yesterday = time.strftime("%Y-%m-%d", time.localtime(report.day_bounds(today)[0] - 3600))
+    state = _report_json(os.path.join(REPORT_LEDGER_DIR, "state.json")) or {}
+    last = state.get("last_day", "")
+    if last >= yesterday:
+        return []
+    days, d = [], yesterday
+    for _ in range(REPORT_BACKFILL_DAYS):
+        if d <= last:
+            break
+        days.append(d)
+        d = time.strftime("%Y-%m-%d", time.localtime(report.day_bounds(d)[0] - 3600))
+    for d in sorted(days):
+        ledger_write_day(d, measured_now=(d == yesterday))
+    os.makedirs(REPORT_LEDGER_DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(REPORT_LEDGER_DIR, "state.json"), "w", encoding="utf-8") as f:
+        json.dump({"last_day": yesterday, "written": _iso_now()}, f)
+    return sorted(days)
+
+
+def report_read(scope, week):
+    if not re.fullmatch(r"\d{4}-W\d{2}", week or ""):
+        return None
+    try:
+        with open(report.report_path(REPORTS_DIR, scope, week), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _report_routed(tid, data=None):
+    """A tenant gets a report only when its admin routed `report.weekly`
+    (D4): a tenant who never asked must not start receiving mail."""
+    scope, is_node = notify_scope(tid, data)
+    if is_node:
+        return True
+    line = (scope.get("routes") or {}).get("report.weekly") or {}
+    return bool(line.get("lists"))
+
+
+def report_write(scope, week_day):
+    """The report of the week holding `week_day` for one scope -> (week, path)."""
+    week, mon, sun = report.week_of(week_day)
+    days = []
+    t = report.day_bounds(mon)[0]
+    for _ in range(7):
+        d = time.strftime("%Y-%m-%d", time.localtime(t))
+        days.append(d)
+        t = report.day_bounds(d)[1]
+    hist = report.read_ledger(_ledger_path(scope))
+    tenants = load_tenants()
+    is_node = scope == default_tenant_id()
+    alias = node_alias()
+    y, w = week.split("-W")
+    span = f"{report.fmt_day(mon)[3:]}–{report.fmt_day(sun)[3:]}{y}"
+    if is_node:
+        title = f"Wochenbericht {alias} — KW {int(w)} ({span})"
+    else:
+        t = tenants.get(scope) or {}
+        title = f"Wochenbericht {t.get('name') or t.get('label', '')} — KW {int(w)} ({span})"
+    names = {tid: (t.get("label") or tid[:8]) for tid, t in tenants.items()}
+    md = report.build([e for e in hist if e["day"] in days], days, title,
+                      scope_is_node=is_node, history=hist if is_node else None,
+                      tenant_names=names)
+    path = report.report_path(REPORTS_DIR, scope, week)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.chmod(REPORTS_DIR, 0o755)
+    os.chmod(os.path.dirname(path), 0o755)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(md)
+    os.chmod(path, 0o644)
+    _report_prune(scope)
+    return week, path
+
+
+def _report_prune(scope):
+    names = report.list_reports(REPORTS_DIR, scope)
+    for week in names[53:]:
+        try:
+            os.remove(report.report_path(REPORTS_DIR, scope, week))
+        except OSError:
+            pass
+
+
+def report_minute(now=None, force=False):
+    """On the set weekday at the set hour: last week's report for the node
+    and for every tenant that routed it, each written and queued once."""
+    now = now or time.time()
+    st = report_settings()
+    lt = time.localtime(now)
+    if not force:
+        if not st["enabled"] or REPORT_DAYS[lt.tm_wday] != st["day"] \
+                or time.strftime("%H:%M", lt) < st["at"]:
+            return []
+    last_week_day = time.strftime("%Y-%m-%d", time.localtime(now - 7 * 86400))
+    week = report.week_of(last_week_day)[0]
+    data = notify_load()
+    done = []
+    for tid in load_tenants():
+        if not _report_routed(tid, data):
+            continue
+        if not force and report_read(tid, week) is not None:
+            continue
+        week, _path = report_write(tid, last_week_day)
+        notify_event("report.weekly", tid, kurz=week)
+        done.append((tid, week))
+    return done
+
+
+def cmd_report(args):
+    """oaap report show|run|ledger|settings (RFC-0083)."""
+    if args.action == "settings":
+        if args.day is None and args.at is None and not args.on and not args.off:
+            st = report_settings()
+            print("Weekly report: " + (f"{REPORT_DAY_WORDS[st['day']]} at {st['at']} (local time)"
+                                       if st["enabled"] else "off"))
+            return
+        if os.geteuid() != 0:
+            die("changing the weekly report needs root")
+        try:
+            print(report_settings_set(args.day, args.at,
+                                      True if args.on else False if args.off else None,
+                                      who=os.environ.get("SUDO_USER") or "root"))
+        except ValueError as e:
+            die(str(e))
+        return
+    if os.geteuid() != 0:
+        die("the report reads the node's records: sudo oaap report ...")
+    tid = default_tenant_id()
+    if args.tenant:
+        tid = tenant_id_by_label(args.tenant) or die(f"no tenant '{args.tenant}'")
+    if args.action == "ledger":
+        if args.day:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.day):
+                die("--day is YYYY-MM-DD")
+            today = time.strftime("%Y-%m-%d")
+            yesterday = time.strftime("%Y-%m-%d", time.localtime(report.day_bounds(today)[0] - 3600))
+            ledger_write_day(args.day, measured_now=(args.day in (yesterday, today)))
+            print(f"Ledger: {args.day} written for every scope.")
+        else:
+            days = ledger_minute()
+            print("Ledger: " + (", ".join(days) + " written." if days else "up to date."))
+        lines = report.read_ledger(_ledger_path(tid))
+        print(f"{len(lines)} day(s) recorded for this scope"
+              + (f", {lines[0]['day']} .. {lines[-1]['day']}" if lines else "") + ".")
+        return
+    if args.action == "run":
+        ledger_minute()
+        day = args.week_of or time.strftime("%Y-%m-%d", time.localtime(time.time() - 7 * 86400))
+        week, path = report_write(tid, day)
+        print(f"Report {week} written: {path}")
+        if args.send:
+            notify_event("report.weekly", tid, kurz=week)
+            print(notify_deliver())
+        return
+    weeks = report.list_reports(REPORTS_DIR, tid)
+    want = args.week or (weeks[0] if weeks else "")
+    md = report_read(tid, want)
+    if md is None:
+        print("No report yet." + (" Weeks: " + ", ".join(weeks) if weeks else ""))
+        return
+    print(md)
 
 
 # ------------------------------------------------- writing lists and routes
@@ -3499,22 +3872,27 @@ def notify_list_remove(tid, name, who="root", role="root"):
     audit_tenant("notify.list.remove", tid, subject=name, who=who, role=role)
 
 
-def notify_route_set(tid, key, lists, subject="", who="root", role="root"):
+def notify_route_set(tid, key, lists, subject="", who="root", role="root", delivery=None):
     data = notify_load()
     scope, is_node = notify_scope(tid, data)
     route = {"lists": [n for n in (lists or []) if n], "subject": (subject or "").strip()}
+    if delivery is None:      # unchanged unless named (the portal form names it)
+        delivery = ((scope.get("routes") or {}).get(key) or {}).get("delivery", "now")
+    if delivery and delivery != "now":
+        route["delivery"] = delivery
     bad = notify.route_refusal(key, route, scope, is_node)
     if bad:
         raise NotifyRefused(bad)
     stored = data["scopes"].setdefault(tid, {}).setdefault("routes", {})
-    if route["lists"] or route["subject"]:
+    if route["lists"] or route["subject"] or route.get("delivery"):
         stored[key] = route
     else:
         stored.pop(key, None)
     notify_save(data)
     audit_tenant("notify.route", tid, subject=key, who=who, role=role,
                  detail=(", ".join(route["lists"]) or "the mandatory list")
-                 + (f"; subject {route['subject']}" if route["subject"] else ""))
+                 + (f"; subject {route['subject']}" if route["subject"] else "")
+                 + ("; only in the weekly report" if route.get("delivery") == "report" else ""))
     return route
 
 
@@ -3578,12 +3956,20 @@ def notify_job(req, actor):
         if op == "list-remove":
             notify_list_remove(tid, str(a.get("name") or ""), who=actor, role=role)
             return True, f"Verteiler „{a.get('name')}“ entfernt."
+        if op == "report-settings":
+            if tid != default_tenant_id() or role != "server_admin":
+                return False, "the weekly report's day and hour are the server_admin's"
+            return True, report_settings_set(
+                str(a.get("day") or "") or None, str(a.get("at") or "") or None,
+                {"on": True, "off": False}.get(str(a.get("enabled") or "")),
+                who=actor, role=role)
         if op == "route-set":
             routes = a.get("routes") if isinstance(a.get("routes"), dict) else {}
             for key, r in sorted(routes.items()):
                 r = r if isinstance(r, dict) else {}
                 notify_route_set(tid, str(key), [str(x) for x in r.get("lists") or []],
-                                 str(r.get("subject") or ""), who=actor, role=role)
+                                 str(r.get("subject") or ""), who=actor, role=role,
+                                 delivery=(str(r["delivery"]) if "delivery" in r else None))
             return True, "Zuordnung gespeichert."
         if op == "test":
             return notify_test(tid, str(a.get("name") or ""), who=actor, role=role)
@@ -3618,7 +4004,9 @@ def cmd_notify(args):
                 if r or key in notify.CATEGORIES:
                     print(f"  {key:<18} -> " + (", ".join((r or {}).get("lists") or [])
                                                  or "(mandatory list)")
-                          + (f"   subject: {r['subject']}" if (r or {}).get("subject") else ""))
+                          + (f"   subject: {r['subject']}" if (r or {}).get("subject") else "")
+                          + ("   [only in the weekly report]" if (r or {}).get("delivery") == "report"
+                             else ""))
             if is_node:
                 s = notify_settings()
                 print(f"Disk: warn {s['disk_warn']:g} %, critical {s['disk_crit']:g} %")
@@ -3636,8 +4024,12 @@ def cmd_notify(args):
         if act == "route":
             key = args.name or die("which category or type?")
             lists = [x.strip() for x in (args.lists or "").split(",") if x.strip()]
-            notify_route_set(tid, key, lists, args.subject or "", who=who)
-            print(f"{key} -> " + (", ".join(lists) or "the mandatory list"))
+            notify_route_set(tid, key, lists, args.subject or "", who=who,
+                             delivery=args.delivery)
+            got = (notify_scope(tid)[0].get("routes") or {}).get(key) or {}
+            print(f"{key} -> " + (", ".join(lists) or "the mandatory list")
+                  + (" -- only in the weekly report, no mail" if got.get("delivery") == "report"
+                     else ""))
             return
         if act == "test":
             ok, said = notify_test(tid, args.name or die("which list?"), who=who)
@@ -33616,6 +34008,19 @@ def build_parser():
                             "command line)")
     pmail.add_argument("--yes", action="store_true", help="for 'clear'")
     pmail.set_defaults(fn=cmd_mail)
+    prep = sub.add_parser("report", help="the weekly report (RFC-0083)")
+    prep.add_argument("action", choices=["show", "run", "ledger", "settings"])
+    prep.add_argument("--tenant", default=None, help="a tenant's label (default: the node)")
+    prep.add_argument("--week", default=None, help="show: which week, e.g. 2026-W46")
+    prep.add_argument("--week-of", dest="week_of", default=None,
+                      help="run: a day (YYYY-MM-DD) in the week to report (default: last week)")
+    prep.add_argument("--send", action="store_true", help="run: also mail it now")
+    prep.add_argument("--day", default=None,
+                      help="ledger: write this day (YYYY-MM-DD); settings: mon..sun")
+    prep.add_argument("--at", default=None, help="settings: HH:MM (local time)")
+    prep.add_argument("--on", action="store_true")
+    prep.add_argument("--off", action="store_true")
+    prep.set_defaults(fn=cmd_report)
     pnot = sub.add_parser("notify", help="recipient lists and notifications "
                                          "(RFC-0080)")
     pnot.add_argument("action", choices=["show", "list-set", "list-remove", "route",
@@ -33635,7 +34040,10 @@ def build_parser():
                            "mandatory list")
     pnot.add_argument("--subject", default=None,
                       help="for route: subject template ({knoten} {mandant} "
-                           "{instanz} {typ} {kurz})")
+                           "{instanz} {typ} {kurz} {ort})")
+    pnot.add_argument("--delivery", default=None, choices=["now", "report"],
+                      help="for route: mail at once (now) or only in the weekly "
+                           "report (RFC-0083); critical types are always now")
     pnot.add_argument("--disk-warn", dest="disk_warn", type=float, default=None)
     pnot.add_argument("--disk-crit", dest="disk_crit", type=float, default=None)
     pnot.add_argument("--all", action="store_true", help="for log: every tenant")
@@ -34219,7 +34627,7 @@ def cmd_help(args, parser):
 WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
                   "files", "user", "cohort", "disk", "machine", "authz", "key",
                   "fleet", "tenant", "metrics", "broker", "idp", "mail",
-                  "notify", "destination", "connect", "connector", "help")
+                  "notify", "report", "destination", "connect", "connector", "help")
 
 # What `bin/oaap` does by itself, without appctl.py -- argparse cannot know
 # these, so the reference names them from here (same test as above).

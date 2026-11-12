@@ -319,7 +319,7 @@ if flask:
     ident = importlib.reload(importlib.import_module("app"))
     # Die Zaehlung gebremster Anfragen braucht fcntl (POSIX) und ist
     # nicht, was hier geprueft wird.
-    ident._braked_note = lambda scope: None
+    ident._braked_note = lambda *a: None
     ident._RATE.clear()
     c = ident.app.test_client()
 

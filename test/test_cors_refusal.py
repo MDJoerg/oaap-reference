@@ -194,7 +194,7 @@ m._RATE.clear()
 # fcntl wuerde sie den 429 in einen 500 verwandeln und die Regel
 # verdecken. Also stillgelegt, nicht uebersprungen: die Regel gilt auf
 # jedem Rechner, auf dem diese Datei laeuft.
-m._braked_note = lambda scope: None
+m._braked_note = lambda *a: None
 last = None
 for _ in range(4):
     last = c.get("/throttle", query_string={"scope": "x", "limit": "2",

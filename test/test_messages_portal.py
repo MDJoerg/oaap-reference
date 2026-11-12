@@ -289,5 +289,36 @@ req = SENT[-1][0]
 ok("Probe für einen Mandanten: der server_admin nennt ihn",
    req["op"] == "test" and req["args"].get("tenant") == tv, req)
 
+print("\n=== Wochenbericht (RFC-0083) ===")
+portal.REPORTS_DIR = a.REPORTS_DIR
+portal.REPORT_SETTINGS_FILE = a.REPORT_SETTINGS_FILE
+os.makedirs(os.path.join(a.REPORTS_DIR, dflt), exist_ok=True)
+open(os.path.join(a.REPORTS_DIR, dflt, "2026-W46.md"), "w").write(
+    "# Wochenbericht oaapx01 — KW 46\n\n## Auf einen Blick\n\n- 1 Neustart <b>x</b>\n\n"
+    "| Wann | Was |\n|---|---|\n| Do | Neustart |\n")
+t = cl.get("/nachrichten?tab=berichte", headers=H).get_data(as_text=True)
+ok("server_admin: Reiter Berichte zeigt den Bericht gerendert, Text maskiert, und „Wann“",
+   "<h2>Auf einen Blick</h2>" in t and "&lt;b&gt;x&lt;/b&gt;" in t and "<td>Neustart</td>" in t
+   and 'action="/nachrichten/berichte"' in t, t[-2500:])
+r = post("/nachrichten/berichte", {"day": "fri", "at": "18:30", "enabled": "on"})
+req = SENT[-1][0]
+ok("„Wann“ speichern: notify report-settings, zurück in den Reiter",
+   req["op"] == "report-settings" and req["args"]["day"] == "fri" and req["args"]["at"] == "18:30"
+   and "tab=berichte" in r.headers.get("Location", ""), req)
+t = cl.get("/nachrichten?tab=meldungen", headers=H).get_data(as_text=True)
+ok("Zuordnung: Spalte „nur im Bericht“, Kritisch und Backup „immer sofort“",
+   "nur im Bericht" in t and 'name="d__operations"' in t and 'name="d__critical"' not in t
+   and 'name="d__backup.failed"' not in t and "immer sofort" in t)
+r = post("/nachrichten/benachrichtigungen", {"d__operations": "report"})
+req = SENT[-1][0]
+ok("„nur im Bericht“ für Betrieb: reist als delivery report",
+   req["args"]["routes"] == {"operations": {"lists": [], "subject": "", "delivery": "report"}}, req)
+WHO.update(role="tenant_admin", tenant=tv)
+H = {"X-OAAP-User": "vorstand", "X-OAAP-Roles": "tenant_admin"}
+t = cl.get("/nachrichten?tab=berichte", headers=H).get_data(as_text=True)
+ok("tenant_admin: Reiter Berichte, ohne Zuordnung der Hinweis, nie der Bericht des Knotens, kein „Wann“",
+   "bekommt noch keinen Wochenbericht" in t and "oaapx01 — KW 46" not in t
+   and 'action="/nachrichten/berichte"' not in t, t[-2000:])
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)

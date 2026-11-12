@@ -66,7 +66,35 @@ CATALOGUE = {
     "login.locked": {"category": "security", "scope": "tenant", "matter": False,
                      "title": "Eine Anmeldung wurde nach Fehlversuchen gesperrt",
                      "subject": "[{mandant}] Anmeldung gesperrt: {kurz}"},
+    # RFC-0083: the weekly report itself. "both": the node's report goes to
+    # the node's lists, a tenant's report to the tenant's -- each queued for
+    # its own scope.
+    "report.weekly": {"category": "operations", "scope": "both", "matter": False,
+                      "title": "Wochenbericht",
+                      "subject": "[{knoten}] Wochenbericht {kurz}"},
 }
+
+# RFC-0083 2.3: how a routing line delivers. "now" -- a mail at once (and,
+# like every mail, a line in the weekly report); "report" -- no mail, only
+# the report. (The RFC's "both" is "now": the report lists every mail.)
+DELIVERIES = ("now", "report")
+DELIVERY_WORDS = {"now": "sofort", "report": "nur im Wochenbericht"}
+# Never only in the report: a failed backup that waits until Monday is the
+# failure this platform exists to prevent. Enforced when a line is set AND
+# when it is read (a category line set to "report" does not carry these).
+NEVER_REPORT_ONLY = frozenset({"backup.failed", "backup.missing", "disk.full",
+                               "instance.down", "report.weekly"})
+
+
+def delivery_for(scope, ntype):
+    """"now" | "report" for one type in one scope (type line over category)."""
+    if ntype in NEVER_REPORT_ONLY:
+        return "now"
+    routes = scope.get("routes") or {}
+    t_line = routes.get(ntype) or {}
+    c_line = routes.get(CATALOGUE.get(ntype, {}).get("category", "")) or {}
+    d = t_line.get("delivery") or c_line.get("delivery") or "now"
+    return d if d in DELIVERIES else "now"
 
 # Own RFC: named so the page can say it exists and waits.
 LATER = {
@@ -213,6 +241,12 @@ def route_refusal(key, route, scope, is_node):
     for n in names:
         if n not in scope["lists"]:
             return f"there is no list '{n}'"
+    d = (route or {}).get("delivery") or "now"
+    if d not in DELIVERIES:
+        return "delivery is one of: " + ", ".join(DELIVERIES)
+    if d == "report" and (key == "critical" or key in NEVER_REPORT_ONLY):
+        return (f"'{key}' is always mailed at once -- a critical matter never waits for "
+                "the weekly report")
     return template_refusal((route or {}).get("subject") or "")
 
 
