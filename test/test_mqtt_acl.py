@@ -152,6 +152,36 @@ ok("ohne Rechte darf er nichts", not d({"kind": "operator", "grants": []}, "home
 ok("unbekannte Art: wie ein Mandantenschluessel ohne Mandanten (nichts)",
    not d({"kind": "gast"}, "home/x", 2))
 
+print("\n=== Gebrueckter Zweig oaap-via/ (RFC-0085 A1) ===")
+via_rw = {"kind": "operator", "grants": [{"filter": "oaap-via/#", "access": "readwrite"}]}
+ok("kein Schluessel schreibt unter oaap-via/ -- auch nicht mit Recht darauf",
+   not d(via_rw, "oaap-via/oaapx01/pi/alive", 2)
+   and not d({"kind": "operator", "grants": [{"filter": "#", "access": "readwrite"}]}, "oaap-via/x/y", 2)
+   and not d({"kind": "operator", "grants": [{"filter": "+/oaapx01/#", "access": "write"}]},
+             "oaap-via/oaapx01/pi/alive", 2))
+ok("... auch kein Knotenschluessel, nicht einmal mit Wurzel oaap-via",
+   not acl.decide(node, "oaap-via/oaapx02/metrics/cpu", 2, "oaap-via", tenant_rule)[0]
+   and not d(node, "oaap-via/oaapx02/metrics/cpu", 2))
+ok("... und kein Mandantenschluessel", not d(dict(ten, tenant="x"), "oaap-via/x", 2))
+ok("Lesen ist ein gewoehnliches Recht", d(via_rw, "oaap-via/oaapx01/pi/alive", 1)
+   and d(via_rw, "oaap-via/#", 4))
+ok("Gegenprobe: derselbe Schluessel schreibt in einem Nachbarbaum",
+   d({"kind": "operator", "grants": [{"filter": "oaap-viaduct/#", "access": "readwrite"}]},
+     "oaap-viaduct/x", 2))
+for g in ("oaap-via/#:write", "oaap-via/oaapx01/#:readwrite", "+/x/#:write"):
+    f, _, a = g.rpartition(":")
+    try:
+        acl.parse_grants([{"filter": f, "access": a}], "oaap-node")
+        ok(f"Recht {g} wird beim Ausstellen abgelehnt", False)
+    except ValueError as e:
+        ok(f"Recht {g} wird beim Ausstellen abgelehnt",
+           "bridged branch" in str(e) or "tenant trees" in str(e), e)
+ok("Leserecht auf oaap-via/# wird ausgestellt",
+   acl.parse_grants([{"filter": "oaap-via/#", "access": "read"}], "oaap-node")
+   == [{"filter": "oaap-via/#", "access": "read"}])
+ok("oaap-via ist keine gueltige Metrik-Wurzel",
+   not acl.valid_root("oaap-via") and not acl.valid_root("oaap-via/x") and acl.valid_root("oaap-node"))
+
 print("\n=== durch die echten Wege (Identity) ===")
 try:
     import flask  # noqa: F401

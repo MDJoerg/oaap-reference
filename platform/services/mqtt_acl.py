@@ -23,6 +23,14 @@ The metrics branch `<root>/#` is protected HERE, where the decision is
 made, not where a key is issued: nobody but the matching node key writes
 under the root, whatever grants another key carries. A value on that
 branch is therefore always a value the node sent.
+
+The bridged branch `oaap-via/#` (RFC-0085 amendment A1) is protected the
+same way, only harder: NO key writes there, not even a node key. On a hub,
+a bridge to an entry remaps the entry's `oaap-node/<n>/...` to
+`oaap-via/<entry>/<n>/...`, and Mosquitto delivers what a bridge brings in
+without asking this module (measured 2026-11-12, RFC-0085 section 14). The
+bridge is therefore the only writer there, and the topic itself says
+through which entry a value came. Reading it is an ordinary grant.
 """
 import re
 
@@ -35,6 +43,10 @@ _READS = (ACC_READ, ACC_SUBSCRIBE, ACC_UNSUBSCRIBE)
 
 BROKER_KINDS = ("node", "operator")
 DEFAULT_ROOT = "oaap-node"
+# What a hub's bridge writes for an entry (RFC-0085 A1). Fixed, not
+# configurable: the hub's bridge configuration and the fleet service read
+# the same constant.
+VIA_ROOT = "oaap-via"
 ACCESS = ("read", "write", "readwrite")
 MAX_GRANTS = 50
 MAX_FILTER = 200
@@ -62,6 +74,8 @@ def valid_root(root):
         return False
     if root.startswith("/") or root.endswith("/"):
         return False
+    if root.split("/")[0] == VIA_ROOT:
+        return False          # the bridged branch is nobody's root (A1)
     return all(_LEVEL_RE.match(level) for level in root.split("/"))
 
 
@@ -155,6 +169,11 @@ def parse_grants(raw, root=None):
                 f"{f!r} reaches the tenant trees ('oaap/...'). Operator "
                 "grants live outside them: start with a name of your own, "
                 "e.g. 'home/#'")
+        if a in ("write", "readwrite") and overlaps(f"{VIA_ROOT}/#", f):
+            raise ValueError(
+                f"{f!r} reaches the bridged branch '{VIA_ROOT}/...', which "
+                "only a hub's bridge writes. Grant 'read' there, or choose "
+                "another tree")
         if root and a in ("write", "readwrite") and overlaps(f"{root}/#", f):
             raise ValueError(
                 f"{f!r} reaches the metrics branch '{root}/...', which only "
@@ -177,6 +196,11 @@ def decide(rec, topic, acc, root, tenant_allowed):
     if not isinstance(topic, str) or not topic or topic.startswith("$"):
         return False, "not a topic this key may use"
     kind = rec.get("kind") or "tenant"
+    if what == "write" and overlaps(f"{VIA_ROOT}/#", topic):
+        # The bridged branch: only a hub's bridge writes there, and a
+        # bridge is never asked (RFC-0085 A1).
+        return False, ("the bridged branch is written by a hub's bridge "
+                       "only, never by a key")
     if what == "write" and overlaps(f"{root}/#", topic):
         # The metrics branch: only the node itself writes there.
         if kind != "node":
