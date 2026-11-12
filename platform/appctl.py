@@ -27781,8 +27781,21 @@ def cmd_bulk(args):
             print(f"  ({n})")
         print(f"{len(steps)} step(s)")
     elif verb == "start" and rest:
-        ok, msg, _d = bulk_job({"op": "start", "kind": rest[0]}, "server_admin", None,
-                               "root")
+        # Measured on oaap-test 2026-11-12: a run started here in the name of
+        # "root" failed at its first step -- every step is a spool request,
+        # and the worker takes promote/install/rebuild only from a signed-in,
+        # active person (spec 2.3). So the CLI names that person up front and
+        # is refused HERE, not one step into the run.
+        who = (getattr(args, "bulk_as", None) or "").strip()
+        if not who:
+            die("say in whose name the run works: `oaap app bulk start "
+                f"{rest[0]} --as <portal user>` (an active server_admin) -- the node "
+                "takes each step only from a signed-in person, not from root")
+        u = next((x for x in (_read_identity_users() or [])
+                  if x.get("username") == who), None)
+        if not u or u.get("active") is False or "server_admin" not in (u.get("roles") or []):
+            die(f"'{who}' is not an active server_admin of this node's portal")
+        ok, msg, _d = bulk_job({"op": "start", "kind": rest[0]}, "server_admin", None, who)
         print(msg) if ok else die(msg)
     elif verb == "run" and rest:
         bulk_run(rest[0])
@@ -32410,6 +32423,10 @@ def build_parser():
                               "after another, stopping at the first failure")
     pbk.add_argument("verb", choices=["plan", "start", "run", "stop", "list"])
     pbk.add_argument("rest", nargs="*")
+    pbk.add_argument("--as", dest="bulk_as", default=None, metavar="USER",
+                     help="for start: the portal user (an active server_admin) in "
+                          "whose name every step runs -- the node takes a step only "
+                          "from a signed-in person, never from 'root'")
     pbk.set_defaults(fn=cmd_bulk)
     psb = sub.add_parser("standby",
                          help="put an instance to sleep: containers stopped, "

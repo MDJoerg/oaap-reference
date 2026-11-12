@@ -214,6 +214,26 @@ ok("6 no route hands 'title=' to page() (it is page's own argument -- 500 on oaa
 ok("6 the templates use 'heading'", "{{ heading }}" in T["BULK_PLAN_BODY"]
    and "{{ heading }}" in T["BULK_RUN_BODY"] and "{{ title }}" not in T["BULK_RUN_BODY"])
 
+# 7. the command line names the person (measured on oaap-test 2026-11-12: a run
+#    started as "root" failed at its first step -- the worker takes steps only
+#    from a signed-in, active person)
+os.makedirs(os.path.dirname(m._identity_users_path()), exist_ok=True)
+with open(m._identity_users_path(), "w", encoding="utf-8") as f:
+    json.dump([{"username": "anna", "roles": ["server_admin"], "active": True},
+               {"username": "bert", "roles": ["tenant_admin"], "active": True}], f)
+m.bulk_running = lambda: None
+m.os.geteuid = lambda: 0          # the root check of main() passes, as under sudo
+spawned.clear()
+code, out = m._run_verb(["bulk", "start", "update"])[:2]
+ok("7 CLI start without --as: refused up front, says how",
+   code != 0 and "--as" in str(out) and spawned == [], (code, out))
+code, out = m._run_verb(["bulk", "start", "update", "--as", "bert"])[:2]
+ok("7 --as somebody who is no server_admin: refused", code != 0 and spawned == [], (code, out))
+code, out = m._run_verb(["bulk", "start", "update", "--as", "anna"])[:2]
+newest = m.bulk_load(spawned[0]) if spawned else {}
+ok("7 --as an active server_admin: started in her name",
+   code == 0 and spawned and newest.get("by") == "anna", (code, out, newest))
+
 print()
 print("ALL PASS (0 failing)" if not fails else f"FAIL ({fails} failing)")
 sys.exit(1 if fails else 0)
