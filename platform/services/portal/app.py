@@ -238,6 +238,13 @@ STYLE = """
   nav.jumps a:hover{color:var(--oaap-text);background:rgba(37,99,235,.06)}
   nav.jumps a.active{color:var(--oaap-blue-700);font-weight:600;
        border-bottom-color:var(--oaap-blue-600)}
+  /* Wide screens: the marks wrap onto a second row instead of a scroll
+     bar nobody sees the end of (health page, 12 sections). A phone keeps
+     the one swipeable row -- two sticky rows would eat its screen. */
+  @media (min-width:900px){
+    nav.jumps{flex-wrap:wrap;overflow-x:visible;row-gap:0}
+    nav.jumps a{padding:0 .7rem;min-height:40px}
+  }
   h2[id^="abschnitt-"]{scroll-margin-top:calc(var(--hdr-h) + 4rem)}
   h1{font-size:1.35rem;margin:.2rem 0 1rem}
   h2{font-size:1.02rem;margin:0 0 .8rem}

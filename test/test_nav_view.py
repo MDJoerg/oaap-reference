@@ -87,8 +87,9 @@ long_page = head + "".join(card(t) for t in
                            ("Knoten", "Pflegestand", "Kernservices", "Apps",
                             "Tunnel (Connector)"))
 html, marks = nv.jump_sections(long_page)
-ok("lange Seite: fuenf Marken", [l for _, l in marks] ==
-   ["Knoten", "Pflegestand", "Kernservices", "Apps", "Tunnel (Connector)"], marks)
+ok("lange Seite: fuenf Marken, die Marke ohne Klammerzusatz", [l for _, l in marks] ==
+   ["Knoten", "Pflegestand", "Kernservices", "Apps", "Tunnel"], marks)
+ok("… die Ueberschrift selbst behaelt ihn", ">Tunnel (Connector)</h2>" in html)
 ok("jede Marke hat ihr Ziel im Dokument",
    all(f'<h2 id="{i}">' in html for i, _ in marks), html)
 ok("Ziel-IDs lesbar", marks[4][0] == "abschnitt-tunnel-connector", marks)

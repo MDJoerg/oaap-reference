@@ -107,22 +107,26 @@ def jump_sections(html):
         if not before or "warn" in before[-1][1]:
             continue
         label = " ".join(_TAG.sub("", m.group("inner")).split())
+        # The mark is a short name, the heading may explain: "Gebremste
+        # Anfragen (24 Stunden)" -> "Gebremste Anfragen". The id keeps the
+        # full heading, so existing links still land.
+        short = re.sub(r"\s*\([^)]*\)\s*$", "", label).strip() or label
         if label:
-            found.append((m, before[-1][0], label))
+            found.append((m, before[-1][0], label, short))
     if len(found) < MIN_SECTIONS:
         return html, []
 
     used, marks = set(), []
-    for m, _, label in found:
+    for m, _, label, short in found:
         base = sid = _slug(label)
         n = 2
         while sid in used:
             sid, n = f"{base}-{n}", n + 1
         used.add(sid)
-        marks.append((sid, label))
+        marks.append((sid, short))
 
     # Back to front, so earlier offsets stay valid.
-    for (m, _, _), (sid, _) in reversed(list(zip(found, marks))):
+    for (m, _, _, _), (sid, _) in reversed(list(zip(found, marks))):
         html = html[:m.start()] + f'<h2 id="{sid}"' + html[m.start() + 3:]
     at = found[0][1]
     bar = ('<nav class="jumps" aria-label="Abschnitte">'
