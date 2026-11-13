@@ -175,6 +175,11 @@ STYLE = """
      veil, not white: a theme with a pale primary makes the header light,
      and a white veil on a white header is invisible. */
   .usermenu{margin-left:auto;position:relative;font-size:.9rem}
+  /* The node's name in the federation (RFC-0082), for the operator: which
+     node am I on? Right-aligned, left of the user menu. */
+  .nodename{margin-left:auto;font-size:.85rem;opacity:.85;letter-spacing:.03em;
+       white-space:nowrap}
+  .nodename + .usermenu{margin-left:.6rem}
   .usermenu summary{list-style:none;cursor:pointer;display:flex;align-items:center;
        gap:.5rem;min-height:44px;padding:0 .9rem;border-radius:.4rem;
        background:rgba(127,127,127,.22);border:1px solid rgba(127,127,127,.45)}
@@ -386,7 +391,7 @@ LAYOUT = STYLE + """
 <!doctype html><html lang="de"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href=\"""" + FAVICON + """\">
-<title>{{ title }} — {{ place.title if at_place else "OAAP" }}</title>
+<title>{{ title }} | {% if node_name %}{{ node_name }} | {% endif %}{{ place.title if at_place else "OAAP" }}</title>
 {{ theme_style }}
 {% if show_side %}<input type="checkbox" id="navtoggle" class="navtoggle" aria-label="Menü ein- und ausblenden">{% endif %}
 <header class="oaap">
@@ -407,6 +412,7 @@ LAYOUT = STYLE + """
     <span><b>OAAP</b><small>Open Application &amp; Automation Platform</small></span>
     {% endif %}
   </a>
+  {% if node_name %}<span class="nodename" title="Name im Verbund">{{ node_name }}</span>{% endif %}
   <details class="usermenu">
     <summary><span class="who">{{ user }}</span> <span aria-hidden="true">&#9662;</span></summary>
     <div class="menu">
@@ -4169,7 +4175,7 @@ SETUP_PAGE = STYLE + """
 <!doctype html><html lang="de"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href=\"""" + FAVICON + """\">
-<title>Einrichtung — OAAP</title>
+<title>Einrichtung | OAAP</title>
 <body style="display:grid;place-items:center;min-height:100vh">
 <main style="width:min(26rem,92vw);margin:0">
   <div class="card">
@@ -4418,11 +4424,15 @@ def page(body_template, title, active, status=200, **ctx):
     groups = nav_view.nav_groups(flags, active)
     # Long pages without tabs: jump marks from what THIS caller sees (6.2.3).
     body, jumps = nav_view.jump_sections(body)
+    # The node's name in the federation (RFC-0082) in the header and the
+    # page title -- for the node's operators only: it is how WE call the
+    # node, not known outside, so a tenant's people do not see it.
+    node_name = node_identity_view()["alias"] if caller & {"server_admin", "support"} else ""
     return render_template_string(
         LAYOUT,
         nav_groups=groups, show_side=nav_view.show_side(groups), jumps=jumps,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
-        place=face, at_place=bool(at), show_face=show_face,
+        node_name=node_name, place=face, at_place=bool(at), show_face=show_face,
         theme_style=Markup(place.theme_style(face) if show_face else ""),
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
         is_server_admin="server_admin" in caller,
@@ -12249,7 +12259,7 @@ PUBLIC_REQUEST_PAGE = STYLE + """
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex,nofollow">
 <link rel="icon" href=\"""" + FAVICON + """\">
-<title>Mandant beantragen — OAAP</title>
+<title>Mandant beantragen | OAAP</title>
 <body style="display:grid;place-items:center;min-height:100vh">
 <main style="width:min(30rem,94vw);margin:0">
   <div class="card">

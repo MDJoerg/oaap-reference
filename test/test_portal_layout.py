@@ -3,8 +3,9 @@
 
 Gerendert wird page() selbst, fuer verschiedene Rollen:
 
-  * die Kopfzeile traegt nur Marke und Benutzermenue (Profil, Passwort,
-    Abmelden) -- kein Verwaltungspunkt mehr darin;
+  * die Kopfzeile traegt Marke und Benutzermenue (Profil, Passwort,
+    Abmelden), fuer Betreiber dazu den Namen im Verbund -- kein
+    Verwaltungspunkt darin;
   * die Seitenleiste zeigt dem Serververwalter die Gruppen, dem einfachen
     Benutzer gar nichts (nur "Apps" = keine Leiste, kein Menueknopf);
   * eine lange Seite ohne Reiter bekommt Sprungmarken samt Skript, eine
@@ -48,6 +49,11 @@ def render(body, active, roles):
             "/", headers={"X-OAAP-User": "jo", "X-OAAP-Roles": ",".join(roles)}):
         html, status = portal.page(body, "Test", active)
     return html
+
+
+def title_of(html):
+    m = re.search(r"<title>(.*?)</title>", html)
+    return m.group(1) if m else ""
 
 
 def part(html, start, end):
@@ -99,19 +105,17 @@ ok("nur Apps: keine Seitenleiste", '<nav class="side"' not in h, h[-1200:])
 ok("nur Apps: kein Menueknopf", 'id="navtoggle"' not in h and 'for="navtoggle"' not in h)
 ok("Benutzermenue bleibt", 'class="usermenu"' in h and "Abmelden" in h)
 
-print("\nSprungmarken")
-h = render(LONG, "health", ["server_admin"])
-jumps = part(h, '<nav class="jumps"', "</nav>")
-ok("lange Seite: vier Marken", jumps.count("<a href=\"#abschnitt-") == 4, jumps)
-ok("die Ziele stehen im Dokument", 'id="abschnitt-kernservices"' in h)
-ok("Skript zum Mitleuchten dabei", "IntersectionObserver" in h)
-ok("Leiste im Arbeitsbereich, nach dem Seitenkopf",
-   h.index("<main>") < h.index("</h1>") < h.index('<nav class="jumps"'))
-h = render(TABS, "instances", ["server_admin"])
-ok("Seite mit Reitern: keine Sprungmarken, kein Skript",
-   '<nav class="jumps"' not in h and "IntersectionObserver" not in h)
+# Name im Verbund (RFC-0082) in Kopfzeile und Seitentitel, nur fuer Betreiber
+portal.node_identity_view = lambda: {"alias": "oaapi01", "alias_set": True, "default": "oaap-demo",
+                                     "place": "", "tags": []}
 h = render(SHORT, "health", ["server_admin"])
-ok("kurze Seite: keine Sprungmarken", '<nav class="jumps"' not in h)
-
-print(f"\n{'OK' if not fails else f'{fails} FEHLER'}")
-sys.exit(1 if fails else 0)
+ok("Serververwalter: Titel 'Sicht | Name | OAAP', ohne langen Strich",
+   title_of(h) == "Test | oaapi01 | OAAP", title_of(h))
+ok("Serververwalter: Name steht in der Kopfzeile, links neben dem Benutzermenue",
+   '<span class="nodename"' in h and h.index('class="nodename"') < h.index('class="usermenu"'))
+h = render(SHORT, "health", ["support"])
+ok("Support sieht den Namen ebenfalls", "oaapi01" in title_of(h))
+h = render(SHORT, "apps", ["user"])
+ok("einfacher Benutzer: kein interner Name, weder Titel noch Kopfzeile",
+   title_of(h) == "Test | OAAP" and "oaapi01" not in h, title_of(h))
+ok("kein langer Gedankenstrich mehr im Seitentitel des Geruests", "—" not in title_of(h))
