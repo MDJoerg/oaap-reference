@@ -344,8 +344,26 @@ services:
       # belong to the listener named just above them. The node-local
       # files come after it and are included only when there is one:
       # global options and bridge sections only, never listener options.
+      #
+      # It waits (at most 90 s) until identity answers at all: every
+      # delivery is an ACL call to identity, and when docker starts all
+      # containers at once (reboot, daemon restart) a bridge hands over
+      # its backlog in the broker's first second -- refused calls dropped
+      # those messages for every local subscriber (RFC-0085 §15, measured
+      # on oaap-demo). wget exits 8 on any HTTP answer, 4 when nothing
+      # listens yet.
       - |
+        i=0
+        while [ $$i -lt 90 ]; do
+          wget -q -T 2 -O /dev/null http://identity:8000/ 2>/dev/null; rc=$$?
+          [ $$rc -eq 0 ] || [ $$rc -eq 8 ] && break
+          i=$$((i+1)); sleep 1
+        done
+        echo "broker: identity answered after $${i} s"
         sed "s/__INTERNAL_API_KEY__/$$INTERNAL_API_KEY/g" /mosquitto-template/mosquitto.conf.template > /tmp/mosquitto.conf
+        # Never a broker without its auth plugin: a broken line above once
+        # left only the TLS listener in the file (found on oaap-test).
+        grep -q '^auth_plugin ' /tmp/mosquitto.conf || { echo "broker: configuration incomplete, not starting"; exit 1; }
         if [ -r /mosquitto/certs/server.crt ] && [ -r /mosquitto/certs/server.key ]; then
           printf '\nlistener 8883\ncertfile /mosquitto/certs/server.crt\nkeyfile /mosquitto/certs/server.key\ntls_version tlsv1.2\n' >> /tmp/mosquitto.conf
         fi

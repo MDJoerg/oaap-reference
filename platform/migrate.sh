@@ -739,7 +739,10 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
   # whose configuration lacks a line the template now has (0.1.272:
   # persistent_client_expiration) is restarted once -- persistence keeps
   # its sessions and retained values, bridges reconnect by themselves.
+  # Only a configuration already written counts: a broker just recreated
+  # may still wait for identity and write it from the new template.
   if [ -n "$(docker ps -q -f name=^oaap-broker-1$ -f status=running)" ] \
+     && docker exec oaap-broker-1 grep -q '^auth_plugin' /tmp/mosquitto.conf 2>/dev/null \
      && ! docker exec oaap-broker-1 grep -q '^persistent_client_expiration' /tmp/mosquitto.conf 2>/dev/null; then
     say ""
     say "Restarting the MQTT broker for its new configuration (sessions expire after 7 days) ..."
