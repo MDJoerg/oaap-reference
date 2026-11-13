@@ -4507,6 +4507,16 @@ def cmd_destination(args):
                       "platform until one is added and bound "
                       "(oaap destination add ...).")
             return
+        if args.action in ("bindings", "bind", "unbind") and args.name:
+            # I-12 for this verb too (0.1.277): the portal shows NAMES, and
+            # `bind mg gamingpc --tenant ais` failed with "no instance named
+            # 'mg'" on oaapi01 -- the key `ais-mg` was the only spelling.
+            # The same resolver as every other instance verb.
+            label = tenant_label(resolve_tenant_arg(args.tenant)) if args.tenant else ""
+            key, err = resolve_instance_ref(reg, args.name, label)
+            if not key:
+                die(err)
+            args.name = key
         if args.action == "bindings":
             key = args.name or die("'destination bindings' needs an instance")
             inst = reg["instances"].get(key) or die(f"no instance named '{key}'")
@@ -4519,6 +4529,18 @@ def cmd_destination(args):
             for need in sorted(set(binds) | set(needs)):
                 d = own.get(binds.get(need, ""))
                 decl = needs.get(need)
+                if decl and decl.get("any") and need not in binds:
+                    print(f"  {need:<20} ANY NUMBER of http destinations, each "
+                          f"under its own name: oaap destination bind {key} "
+                          "<destination>"
+                          + (f" -- {decl['purpose']}" if decl.get("purpose") else ""))
+                    continue
+                if not decl and d and d.get("kind") == "http":
+                    # one of an `any: true` family: declared by it
+                    decl = next(({**x, "purpose": f"one of '{x['name']}'"
+                                  + (f": {x['purpose']}" if x.get("purpose") else "")}
+                                 for x in needs.values()
+                                 if x.get("any") and x.get("kind") == "http"), None)
                 what = (f"{decl['kind']} need" + (f" -- {decl['purpose']}"
                                                   if decl.get("purpose") else "")
                         if decl else "not declared by the manifest")
@@ -13792,6 +13814,14 @@ def validate_destination_needs(m):
         elif env:
             errs.append(f"destinations {name}: only a tcp need hands values over "
                         "(env); an http need is reached through the gateway")
+        # 0.1.277 (oaap.net.destinations 0.3): `any: true` -- the app can use
+        # ANY NUMBER of this tenant's http destinations, each under its own
+        # name (an AI gateway's suppliers). Only http: a tcp need names the
+        # fields it is handed into, and those cannot be many.
+        if "any" in d and not isinstance(d.get("any"), bool):
+            errs.append(f"destinations {name}: any is true or false")
+        elif d.get("any") and kind != "http":
+            errs.append(f"destinations {name}: only an http need may say any: true")
     return errs
 
 
@@ -13806,6 +13836,8 @@ def normalized_dest_needs(m):
             if d["kind"] == "tcp":
                 rec["env"] = {k: v for k, v in (d.get("env") or {}).items()
                               if k in ("host", "port", "user", "password")}
+            elif d.get("any") is True:
+                rec["any"] = True
             out.append(rec)
     return out
 

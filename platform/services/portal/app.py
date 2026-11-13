@@ -3383,8 +3383,22 @@ INSTANCE_EDIT_BODY = """
           {% if not d.declared %}<br><span class="muted">nicht im Manifest erklärt</span>{% endif %}</td>
       <td>{% if d.missing %}<code>{{ d.destination }}</code> — <strong>fehlt auf diesem Knoten</strong>
           {% elif d.destination %}<code>{{ d.destination }}</code><br><span class="muted">{{ d.target }}</span>
+          {% elif d.family %}<span class="muted">beliebig viele — jede unter ihrem eigenen Namen</span>
           {% else %}<span class="muted">nicht zugeordnet</span>{% endif %}
-          {% if d.bound %}
+          {% if d.family %}
+          {% if d.options and not i.rehearsal %}
+          <form method="post" action="/instances/{{ i.key }}/destination">
+            <input type="hidden" name="tab" value="netz">
+            <input type="hidden" name="op" value="bind">
+            <input type="hidden" name="need" value="{{ d.need }}">
+            <input type="hidden" name="family" value="1">
+            <select name="destination" aria-label="Weitere Destination für {{ d.need }}">
+              {% for o in d.options %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+            </select>
+            <button>Zuordnen</button>
+          </form>
+          {% elif not i.rehearsal %}<br><span class="muted">Keine weitere http-Destination in diesem Mandanten.</span>{% endif %}
+          {% elif d.bound %}
           <form method="post" action="/instances/{{ i.key }}/destination">
             <input type="hidden" name="tab" value="netz">
             <input type="hidden" name="op" value="unbind">
@@ -3788,10 +3802,15 @@ INSTANCE_EDIT_BODY = """
   {% if i.tunnel.targets %}
   <p>Ziele hinter dem Tunnel — als Destination mit dem Ziel:</p>
   <ul>{% for t in i.tunnel.targets %}<li><code>through:{{ i.tunnel.through_name }}/{{ t }}</code></li>{% endfor %}</ul>
-  <p class="muted">Anlegen unter <a href="/destinationen">Destinationen</a> (Server-Admin). Den Schlüssel
+  {% if i.tunnel.named_hosts %}<p class="err">{% for t in i.tunnel.named_hosts %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}:
+     das Ziel ist ein Rechnername, keine IP-Adresse. Der Tunnel leitet nur IP-Adressen weiter und
+     übernimmt keine Namensauflösung der Gegenseite — so kommt keine Antwort. Trage die Adresse des
+     Rechners im VPN ein und den Port des Dienstes, nicht den des VPN-Servers (1194).</p>{% endif %}
+  <p class="muted">Anlegen unter <a href="/destinationen{% if i.tunnel.tenant_label %}?tenant={{ i.tunnel.tenant_label|urlencode }}{% endif %}">Destinationen</a> (Server-Admin). Den Schlüssel
      des Ziels trägt die Destination, nicht diese App (RFC-0060 D5).</p>
   {% else %}<p class="muted">Noch keine Ziele — unten bei <em>Konfiguration</em> eintragen,
-     eines je Zeile: <code>name = http://adresse:port</code>.</p>{% endif %}
+     eines je Zeile, z. B. <code>gamingpc = http://10.8.0.1:11434</code>: ein Name für das Ziel,
+     dann die IP-Adresse des Rechners im VPN und der Port des Dienstes (hier Ollama).</p>{% endif %}
 </div>
 {% endif %}
 <form method="post" action="/instances/{{ i.key }}/config"{% if i.config|selectattr('file')|list %} enctype="multipart/form-data"{% endif %}>
@@ -4565,10 +4584,19 @@ def _destination_view(inst):
     own = dests.get(resolve_tenant(inst.get("tenant")) or "") or {}
     binds = inst.get("destinations") or {}
     needs = {d.get("name"): d for d in inst.get("declared_destinations") or []}
+    # `any: true` (oaap.net.destinations 0.3, 0.1.277): the app takes any
+    # number of http destinations, each bound under its own name. The
+    # family is one row with a choice; what is bound under it counts as
+    # declared, under the family's purpose.
+    families = {n: d for n, d in needs.items() if d.get("any") and d.get("kind") == "http"}
     tunnels = ((_read_json(CONNECT_STATE) or {}).get("tunnels") or {})
     rows = []
-    for need in sorted(set(binds) | set(needs)):
+    fam_purpose = next((d.get("purpose", "") for d in families.values()), "")
+    for need in sorted(set(binds) | (set(needs) - set(families))):
         decl = needs.get(need) or {}
+        if not decl and families and binds.get(need) and (
+                (own.get(binds[need]) or {}).get("kind") == "http"):
+            decl = {"name": need, "kind": "http", "purpose": fam_purpose}
         dname = binds.get(need, "")
         d = own.get(dname) if dname else None
         rows.append({
@@ -4588,6 +4616,18 @@ def _destination_view(inst):
                         sorted(n for n, o in own.items()
                                if o.get("kind") == decl.get("kind"))),
             "bound": bool(dname),
+        })
+    taken = set(binds.values())
+    for fname, decl in sorted(families.items()):
+        rows.append({
+            "need": fname, "purpose": decl.get("purpose", ""), "declared": True,
+            "kind": "http", "destination": "", "missing": False, "target": "",
+            "mode": "", "env": "", "bound": False, "family": True,
+            # every http destination of the tenant not bound yet, and whose
+            # name is not a need of its own (it would take that need's place)
+            "options": sorted(n for n, o in own.items()
+                              if o.get("kind") == "http" and n not in taken
+                              and n not in needs and n not in binds),
         })
     return rows
 
@@ -9330,6 +9370,15 @@ def instance_destination(name):
         return _inst_back(name, err="Kein Bedarf angegeben.")
     if op == "bind" and not dest:
         return _inst_back(name, err="Bitte eine Destination wählen.")
+    if op == "bind" and request.form.get("family"):
+        # `any: true` (0.1.277): bound under its OWN name, so the app reads
+        # OAAP_DESTINATION_<DESTINATION>_URL -- only for a family the
+        # manifest declares; the worker's checks run as for any binding.
+        fam = next((d for d in (load_instances()[name].get("declared_destinations") or [])
+                    if d.get("name") == need), {})
+        if not (fam.get("any") and fam.get("kind") == "http"):
+            return _inst_back(name, err="Diese App nimmt hier nicht beliebig viele Destinationen.")
+        need = dest
     return _queue_and_redirect(
         name, {"action": "destination", "op": op, "need": need,
                "destination": dest if op == "bind" else ""},
@@ -9972,16 +10021,41 @@ def _config_file_values(rows, files):
     return values, ""
 
 
-def _tunnel_targets(name):
-    """Target names from a tunnel app's VPN_TARGETS (not secret), as the
-    host's config view reports it: `name = http://…`, one per entry."""
+def _tunnel_entries(name):
+    """(target name, url) from a tunnel app's VPN_TARGETS (not secret), as
+    the host's config view reports it: `name = http://…`, one per entry."""
     view = _config_view(name) or {}
     raw = str((view.get("values") or {}).get("VPN_TARGETS", ""))
     out = []
     for line in iv.value_to_lines(raw).splitlines():
-        left = line.split("=", 1)[0].strip() if "=" in line else ""
+        left, _, right = line.partition("=") if "=" in line else ("", "", "")
+        left = left.strip()
         if _re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}", left or ""):
-            out.append(left)
+            out.append((left, right.strip()))
+    return out
+
+
+def _tunnel_targets(name):
+    return [t for t, _u in _tunnel_entries(name)]
+
+
+def _tunnel_named_hosts(name):
+    """Targets whose host is a NAME, not an IP address (0.1.277). The
+    client routes only IP targets into the tunnel and takes no DNS from the
+    far side (RFC-0060 2.3) -- a name resolves on the node, or nowhere, and
+    the call times out. Seen on oaapi01: `gamingpc = http://<name>:1194`."""
+    import ipaddress
+    out = []
+    for t, url in _tunnel_entries(name):
+        from urllib.parse import urlparse as _urlparse
+        try:
+            host = _urlparse(url).hostname or ""
+        except ValueError:
+            host = ""
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            out.append(t)
     return out
 
 
@@ -10017,6 +10091,9 @@ def _tunnel_view(name, inst):
             "detail": "" if st[0] == "ok" else " — ".join(x for x in (st[1], st[2]) if x),
             "config_set": "VPN_CONFIG" in set(view.get("set") or []),
             "targets": _tunnel_targets(name),
+            "named_hosts": _tunnel_named_hosts(name),
+            "tenant_label": (load_tenants().get(resolve_tenant(inst.get("tenant")) or "")
+                             or {}).get("label", ""),
             "through_name": local_name(name, inst)}
 
 
@@ -13110,11 +13187,13 @@ def _messages_target():
     """(tenant_id, label, role) or (None, None, refusal) -- as the page
     "Abfluss": a tenant_admin reads their own tenant, a label naming another
     one is answered as a tenant that does not exist; a server_admin without
-    a label is at the node."""
+    a label is at the PLACE the request came in on -- the node's own tenant
+    at the node's address, `ais` at `ais.<node>` (0.1.277: a destination
+    added on ais.oaap-demo... landed in the node's tenant)."""
     role, mine = caller_scope()
     want = (request.values.get("tenant") or "").strip().lower()
     if role == "server_admin" and not want:
-        tid = default_tenant_id()
+        tid = request_place()[0] or default_tenant_id()
     else:
         tid = tenant_id_by_label(want) if want else mine
     tenants = load_tenants()

@@ -564,5 +564,102 @@ ok("through-Vorschlaege: nur die Tunnel-Apps DIESES Mandanten",
    portal._through_suggestions(KB) == ["through:vpn/gaming", "through:vpn/nas"],
    portal._through_suggestions(KB))
 
+
+print("\n=== 0.1.277: Rechnername im Ziel, Beispiel, Link mit Mandant ===")
+ok("ein IP-Ziel ist kein Rechnername", portal._tunnel_named_hosts("kunde-b-vpn") == [])
+portal._config_view = lambda name: {"values": {"VPN_TARGETS": "gamingpc = http://pc.example:1194;ok = http://10.8.0.1:11434"},
+                                    "set": ["VPN_CONFIG"]}
+tv = portal._tunnel_view("kunde-b-vpn", TUNI)
+ok("ein Rechnername wird erkannt (die Lage auf oaapi01), die IP nicht",
+   tv["named_hosts"] == ["gamingpc"] and tv["targets"] == ["gamingpc", "ok"], tv)
+ok("die Karte kennt den Mandanten fuer den Link", tv["tenant_label"] == "kunde-b", tv)
+SRCP = open(os.path.join(HERE, "..", "platform", "services", "portal", "app.py"), encoding="utf-8").read()
+ok("der Hinweis nennt ein echtes Beispiel statt 'name = http://adresse:port'",
+   "gamingpc = http://10.8.0.1:11434" in SRCP and "<code>name = http://adresse:port</code>" not in SRCP)
+
+
+print("\n=== 0.1.277: Destinationen nach dem Ort, beliebig viele (any: true) ===")
+portal.caller_scope = lambda: ("server_admin", default_id)
+portal.request_place = lambda: (KB, None)
+with portal.app.test_request_context("/destinationen"):
+    got = portal._messages_target()
+ok("Server-Admin ohne ?tenant= an der Adresse von kunde-b: kunde-b, nicht der Knoten",
+   got[0] == KB and got[1] == "kunde-b", got)
+portal.request_place = lambda: (None, None)
+with portal.app.test_request_context("/destinationen"):
+    got = portal._messages_target()
+ok("... an der Knotenadresse: der Knoten", got[0] == default_id, got)
+portal.request_place = lambda: (KB, None)
+with portal.app.test_request_context("/destinationen?tenant=kunde-a"):
+    got = portal._messages_target()
+ok("... ein genannter Mandant gilt vor dem Ort", got[0] == KA, got)
+
+DESTS = {KB: {"gamingpc": {"kind": "http", "target": {"through": "ovc/gamingpc"}},
+              "intern": {"kind": "http", "target": {"via": "x01/mg"}},
+              "db": {"kind": "tcp", "target": {"direct": "tcp://10.0.0.1:5432"}}},
+         KA: {"fremd": {"kind": "http", "target": {"direct": "https://x"}}}}
+_dd = os.path.join(DATA, "destinations-portal.json")
+with open(_dd, "w", encoding="utf-8") as f:
+    json.dump({"destinations": DESTS}, f)
+portal.DESTINATIONS_FILE = _dd
+GW = {"app_id": "ai-gateway", "name": "mg", "tenant": KB,
+      "declared_destinations": [{"name": "supplier", "kind": "http", "any": True,
+                                 "purpose": "Bezugsquellen"}],
+      "destinations": {"gamingpc": "gamingpc"}}
+rows_ = portal._destination_view(GW)
+fam = [r for r in rows_ if r.get("family")]
+mem = [r for r in rows_ if r["need"] == "gamingpc"]
+ok("eine Zeile fuer die Familie, angeboten: nur ungebundene http-Destinationen DIESES Mandanten",
+   len(fam) == 1 and fam[0]["options"] == ["intern"], rows_)
+ok("die gebundene gilt als erklaert, mit dem Zweck der Familie",
+   len(mem) == 1 and mem[0]["declared"] and mem[0]["purpose"] == "Bezugsquellen" and mem[0]["bound"], mem)
+caught = []
+portal._queue_and_redirect = lambda name, req, wait: caught.append(req) or "queued"
+portal.require_instance_admin = lambda name: None
+portal.load_instances = lambda: {"kunde-b-mg": GW, "kunde-b-vpn": TUNI}
+with portal.app.test_request_context("/instances/kunde-b-mg/destination", method="POST",
+                                     data={"op": "bind", "need": "supplier", "family": "1",
+                                           "destination": "intern"}):
+    portal.instance_destination("kunde-b-mg")
+ok("Zuordnen aus der Familie: gebunden unter dem EIGENEN Namen der Destination",
+   caught and caught[-1]["need"] == "intern" and caught[-1]["destination"] == "intern", caught)
+caught.clear()
+with portal.app.test_request_context("/instances/kunde-b-vpn/destination", method="POST",
+                                     data={"op": "bind", "need": "x", "family": "1",
+                                           "destination": "intern"}):
+    portal.instance_destination("kunde-b-vpn")
+ok("eine App ohne any-Familie: abgewiesen, nichts in den Spool", caught == [], caught)
+
+errs = a.validate_destination_needs({"destinations": [{"name": "supplier", "kind": "http", "any": True}]})
+ok("Manifest: any: true an einem http-Bedarf ist gueltig", errs == [], errs)
+errs = a.validate_destination_needs({"destinations": [{"name": "db", "kind": "tcp", "any": True,
+                                                       "env": {"host": "H", "port": "P"}}]})
+ok("... an einem tcp-Bedarf nicht", any("only an http need" in e for e in errs), errs)
+errs = a.validate_destination_needs({"destinations": [{"name": "s", "kind": "http", "any": "ja"}]})
+ok("... und nur true oder false", any("true or false" in e for e in errs), errs)
+ok("die Registry merkt sich any",
+   a.normalized_dest_needs({"destinations": [{"name": "supplier", "kind": "http", "any": True}]})
+   == [{"name": "supplier", "kind": "http", "purpose": "", "any": True}])
+
+print("\n=== 0.1.277: destination bind versteht den Namen im Mandanten ===")
+seen = []
+_orig_bind = a.destination_bind
+a.destination_bind = lambda reg, key, other, **kw: seen.append(key) or False
+_orig_load = a.load_registry
+a.load_registry = lambda: {"instances": {"kunde-b-mg": {"name": "mg", "tenant": KB}}}
+_orig_tba = a.resolve_tenant_arg
+a.resolve_tenant_arg = lambda label: KB if label == "kunde-b" else ""
+_orig_tl, _orig_tbl = a.tenant_label, a.tenant_by_label
+a.tenant_label = lambda tid: "kunde-b" if tid == KB else ""
+a.tenant_by_label = lambda label, include_former=True: (KB, {}) if label == "kunde-b" else (None, None)
+import argparse                                                # noqa: E402
+ns = argparse.Namespace(action="bind", name="mg", second="gamingpc", tenant="kunde-b",
+                        as_="", rehearsal_exception=False, propagate=False)
+with contextlib.redirect_stdout(io.StringIO()):
+    a.cmd_destination(ns)
+ok("'bind mg gamingpc --tenant kunde-b' findet kunde-b-mg", seen == ["kunde-b-mg"], seen)
+a.destination_bind, a.load_registry, a.resolve_tenant_arg = _orig_bind, _orig_load, _orig_tba
+a.tenant_label, a.tenant_by_label = _orig_tl, _orig_tbl
+
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)
