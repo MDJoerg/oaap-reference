@@ -1253,9 +1253,17 @@ HEALTH_BODY = """
      hinkt hinterher.</p>
 </div>
 {% endif %}
+{% if is_server_admin and not (cx and (cx.tunnels or cx.connectors or cx.exposures)) %}
+<div class="card" id="tunnel-einrichten">
+  <h2>Tunnel (Connector)</h2>
+  <p class="muted">Kein Tunnel eingerichtet. Ein innerer Knoten (ohne öffentliche Adresse) kann über
+     einen Tunnel Ziele für einen äußeren anbieten. <a href="/connector">Einrichten →</a></p>
+</div>
+{% endif %}
 {% if cx and (cx.tunnels or cx.connectors or cx.exposures) %}
 <div class="card" id="freigaben">
   <h2>Tunnel (Connector)</h2>
+  {% if is_server_admin %}<p><a href="/connector">Schlüssel, Connectoren und Angebote einrichten →</a></p>{% endif %}
   <p class="muted">Ein <strong>innerer</strong> Knoten baut von sich aus einen
      Tunnel zu einem <strong>äußeren</strong> auf und bietet dort benannte
      Ziele an. Der äußere Knoten sieht nur die Namen der Angebote, nie ihre
@@ -6995,6 +7003,244 @@ def exposures_post():
                 "close": "Freigabe geschlossen; der Name kommt nicht wieder."}.get(
                     op, "Erledigt.")
     return redirect("/health?msg=" + quote(text) + "#freigaben", code=303)
+
+
+# --- The connector set up in the portal (0.1.277, oaap.net.connector 0.4) ----
+#
+# Both sides on one page: the OUTER node issues a key for a tunnel label and a
+# tenant; the INNER node adds a connector with that key and names what it
+# offers. Every button queues one act (`connect-admin`); the worker asks for
+# server_admin again from the actor's own record and runs the functions the
+# CLI runs. The key is shown ONCE, from the response, never in a URL.
+CONNECT_ADMIN_WAIT = 40
+CONNECT_OPS = ("key-issue", "key-revoke", "add", "set-key", "remove", "pause",
+               "resume", "offer-add", "offer-remove")
+
+CONNECTOR_BODY = """
+<div class="pagehead"><h1>Connector</h1></div>
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<div class="card">
+  <p>Ein <strong>innerer</strong> Knoten (ohne öffentliche Adresse, etwa im Büro) baut von
+     sich aus einen Tunnel zu einem <strong>äußeren</strong> auf und bietet dort benannte
+     Ziele an. Der äußere Knoten sieht nur die Namen, nie die Adressen. So geht es:</p>
+  <ol>
+    <li><strong>Äußerer Knoten</strong>, hier unten bei <em>Zugangsschlüssel</em>: einen Schlüssel
+        für den Tunnel ausstellen, mit dem Mandanten, dessen Destinationen ihn nutzen.</li>
+    <li><strong>Innerer Knoten</strong>, bei <em>Connector anlegen</em>: die Adresse des äußeren
+        Knotens und den Schlüssel eintragen, dann ein <em>Angebot</em> anlegen (Name und Adresse,
+        die der innere Knoten erreicht).</li>
+    <li><strong>Äußerer Knoten</strong>, auf der Seite <a href="/destinationen">Destinationen</a> des
+        Mandanten: eine Destination mit dem Ziel <code>via:&lt;tunnel&gt;/&lt;angebot&gt;</code> — sie
+        wird dort vorgeschlagen, sobald der Tunnel steht.</li>
+  </ol>
+  {% if not cx.reported %}<p class="err">Der Verbindungsdienst meldet keinen Zustand — läuft
+     <code>oaap-connect-1</code>?</p>{% endif %}
+</div>
+
+<div class="card" id="aussen">
+  <h2>Zugangsschlüssel — hier wählen innere Knoten ein</h2>
+  {% if cx.tunnels %}
+  <table class="mini">
+    <tr><th>Tunnel</th><th>Zustand</th><th>Angebote</th><th>Genutzt von</th>{% if can_edit %}<th></th>{% endif %}</tr>
+    {% for t in cx.tunnels %}
+    <tr>
+      <td><code>{{ t.label }}</code><br><span class="muted">Mandant {{ t.tenant }}</span></td>
+      <td>{% if t.connected %}<span class="dot ok"></span>verbunden seit {{ t.since }}
+            <br><span class="muted">von {{ t.remote }}</span>
+          {% else %}<span class="dot err"></span>nicht verbunden{% endif %}</td>
+      <td>{% for o in t.offers %}<code>via:{{ t.label }}/{{ o }}</code><br>{% else %}<span class="muted">–</span>{% endfor %}</td>
+      <td>{% for d in t.used_by %}<code>{{ d }}</code> {% else %}<span class="muted">keine Destination</span>{% endfor %}</td>
+      {% if can_edit %}<td>
+        <form method="post" action="/connector/key-revoke">
+          <input type="hidden" name="label" value="{{ t.label }}">
+          <label><input type="checkbox" name="confirm" value="1"> wirklich</label>
+          <button class="secondary">Widerrufen</button></form></td>{% endif %}
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Widerrufen wirkt sofort: Ein verbundener Tunnel schließt sich in 5 Sekunden, und
+     jede Destination, die ihn nutzt, antwortet mit 502.</p>
+  {% else %}<p class="muted">Noch kein Schlüssel — kein innerer Knoten kann hier einwählen.</p>{% endif %}
+  {% if can_edit %}
+  <h3>Zugangsschlüssel ausstellen</h3>
+  <form method="post" action="/connector/key-issue">
+    <p><label>Name des Tunnels (etwa der Name des inneren Knotens)
+      <input name="label" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" placeholder="oaapi01"></label></p>
+    <p><label>Mandant, dessen Destinationen den Tunnel nutzen
+      <select name="tenant">{% for t in tenants %}<option value="{{ t.label }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}</select></label></p>
+    <button>Ausstellen</button>
+  </form>
+  <p class="muted">Der Schlüssel wird <strong>einmal</strong> angezeigt; der Knoten speichert nur
+     seine Prüfsumme.</p>
+  {% endif %}
+</div>
+
+<div class="card" id="innen">
+  <h2>Connectoren — dieser Knoten wählt hinaus</h2>
+  {% for c in cx.connectors %}
+  <div style="border-top:1px solid var(--line, #ddd);padding-top:.6rem;margin-top:.6rem">
+    <p><code>{{ c.label }}</code> → {{ c.endpoint }}
+      {% if c.paused %}<span class="dot warn"></span>pausiert
+      {% elif not c.key %}<span class="dot err"></span>Schlüssel fehlt
+      {% elif c.connected %}<span class="dot ok"></span>verbunden seit {{ c.since }}
+      {% else %}<span class="dot err"></span>nicht verbunden{% if c.last_error %} — <span class="muted">{{ c.last_error }}</span>{% endif %}{% endif %}</p>
+    {% if c.offers %}
+    <table class="mini">
+      <tr><th>Angebot</th><th>Adresse (sieht nur dieser Knoten)</th>{% if can_edit %}<th></th>{% endif %}</tr>
+      {% for o in c.offers %}
+      <tr><td><code>{{ o.name }}</code></td>
+          <td>{{ o.to }}{% if o.path %}<br><span class="muted">nur unter {{ o.path }}</span>{% endif %}
+              {% if o.methods %}<br><span class="muted">{{ o.methods|join(", ") }}</span>{% endif %}</td>
+          {% if can_edit %}<td><form method="post" action="/connector/offer-remove">
+            <input type="hidden" name="label" value="{{ c.label }}"><input type="hidden" name="offer" value="{{ o.name }}">
+            <button class="secondary">Entfernen</button></form></td>{% endif %}</tr>
+      {% endfor %}
+    </table>
+    {% else %}<p class="muted">Bietet nichts an — der Tunnel trägt keinen Aufruf.</p>{% endif %}
+    {% if can_edit %}
+    <details><summary class="rowaction">Angebot anlegen</summary>
+      <form method="post" action="/connector/offer-add">
+        <input type="hidden" name="label" value="{{ c.label }}">
+        <p><label>Name des Angebots (sieht der äußere Knoten)
+          <input name="offer" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" placeholder="mg"></label></p>
+        <p><label>Adresse, die <em>dieser</em> Knoten erreicht
+          <input name="to" required placeholder="https://mg.ais.{{ ext or 'knoten.example' }}/v1" style="max-width:28rem"></label></p>
+        <p><label>Nur unter diesem Pfad (leer = alles)<input name="path" placeholder="/api/"></label></p>
+        <p><label>Nur diese Methoden (leer = alle)<input name="methods" placeholder="GET,POST"></label></p>
+        <button>Anlegen</button>
+      </form>
+      <p class="muted">Eine App dieses Knotens bietet man über ihre öffentliche Adresse an
+         (<code>https://&lt;instanz&gt;.&lt;mandant&gt;.{{ ext or 'knoten' }}/…</code>); ihre
+         eigene Anmeldung bleibt, etwa der API-Schlüssel eines KI-Gateways. Nicht angeboten
+         werden können die Dienste der Plattform und <code>localhost</code>.</p>
+    </details>
+    <form method="post" action="/connector/{{ 'resume' if c.paused else 'pause' }}" style="display:inline">
+      <input type="hidden" name="label" value="{{ c.label }}">
+      <button class="secondary">{{ "Fortsetzen" if c.paused else "Pausieren" }}</button></form>
+    <details style="display:inline-block"><summary class="rowaction">Schlüssel ersetzen</summary>
+      <form method="post" action="/connector/set-key">
+        <input type="hidden" name="label" value="{{ c.label }}">
+        <input type="password" name="key" autocomplete="new-password" required aria-label="Neuer Schlüssel">
+        <button>Ersetzen</button></form></details>
+    <form method="post" action="/connector/remove" style="display:inline">
+      <input type="hidden" name="label" value="{{ c.label }}">
+      <label><input type="checkbox" name="confirm" value="1"> wirklich</label>
+      <button class="secondary">Entfernen</button></form>
+    {% endif %}
+  </div>
+  {% else %}<p class="muted">Kein Connector — dieser Knoten wählt nirgendwohin.</p>{% endfor %}
+  {% if can_edit %}
+  <h3>Connector anlegen</h3>
+  <form method="post" action="/connector/add">
+    <p><label>Name (derselbe wie beim Schlüssel auf dem äußeren Knoten)
+      <input name="label" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" placeholder="oaapi01"></label></p>
+    <p><label>Adresse des äußeren Knotens<input name="endpoint" required pattern="https://.+" placeholder="https://oaap.example.org"></label></p>
+    <p><label>Zugangsschlüssel (vom äußeren Knoten, beginnt mit <code>oaapc_</code>)
+      <input type="password" name="key" autocomplete="new-password" required></label></p>
+    <button>Anlegen</button>
+  </form>
+  <p class="muted">Pausieren schließt den Tunnel sofort, und der äußere Knoten kann ihn nicht wieder
+     öffnen. Entfernen löscht den Connector samt Schlüssel.</p>
+  {% endif %}
+</div>
+"""
+
+CONNECT_KEY_SHOWN_BODY = """
+<div class="pagehead"><h1>Zugangsschlüssel für {{ d.label }}</h1></div>
+<div class="card warn">
+  <h2>Der Schlüssel — jetzt oder nie</h2>
+  <p>Er wird nur dieses eine Mal angezeigt. Dieser Knoten speichert nur seine Prüfsumme.</p>
+  <p><code style="display:block;word-break:break-all;padding:.7rem;font-size:1.05rem">{{ d.secret }}</code></p>
+  <h2>Auf dem inneren Knoten</h2>
+  <p>Portal → <strong>Connector</strong> → <em>Connector anlegen</em>:</p>
+  <ul>
+    <li>Name: <code>{{ d.label }}</code></li>
+    <li>Adresse des äußeren Knotens: <code>{{ d.endpoint }}</code></li>
+    <li>Zugangsschlüssel: der Wert oben</li>
+  </ul>
+  <p class="muted">Oder an der Kommandozeile des inneren Knotens:
+     <code>sudo oaap connector add {{ d.label }} --endpoint {{ d.endpoint }} --key-stdin</code></p>
+  <p class="muted">Destinationen über diesen Tunnel legt der Mandant <code>{{ d.tenant }}</code> an, sobald
+     der innere Knoten verbunden ist und etwas anbietet.</p>
+  <p><a href="/connector">Fertig — zurück zum Connector</a></p>
+</div>
+"""
+
+
+def _connect_view_full():
+    """connect_view(), or the empty shape when this node has no role yet --
+    the page is where the first one is made."""
+    return connect_view() or {"tunnels": [], "connectors": [], "exposures": [],
+                              "reported": _connect_data()[1] is not None,
+                              "can_edit": "server_admin" in caller_roles()}
+
+
+@app.get("/connector")
+def connector_page():
+    roles = caller_roles()
+    if not roles & {"server_admin", "support"}:
+        return ("Zugriff verweigert: den Connector richtet der Server-Admin ein.", 403)
+    here = request_place()[0] or default_tenant_id()
+    tenants = [{"label": t.get("label", ""), "selected": tid == here}
+               for tid, t in sorted(load_tenants().items(), key=lambda kv: kv[1].get("label", ""))]
+    return page(CONNECTOR_BODY, "Connector", "health", cx=_connect_view_full(),
+                can_edit="server_admin" in roles, tenants=tenants, ext=external_host(),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.post("/connector/<op>")
+def connector_post(op):
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: einen Tunnel einzurichten erfordert die Rolle "
+                "server_admin (oaap.net.connector 2.2).", 403)
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if op not in CONNECT_OPS:
+        return redirect("/connector?err=" + quote("Unbekannte Aktion."), code=303)
+    f = request.form
+    if op in ("key-revoke", "remove") and not f.get("confirm"):
+        return redirect("/connector?err=" + quote("Bitte „wirklich“ ankreuzen."), code=303)
+    payload = {"action": "connect-admin", "op": op,
+               "label": (f.get("label") or "").strip()[:40]}
+    if op == "key-issue":
+        payload["tenant"] = (f.get("tenant") or "").strip()[:40]
+    elif op in ("add", "set-key"):
+        payload["key"] = (f.get("key") or "").strip()[:200]
+        if op == "add":
+            payload["endpoint"] = (f.get("endpoint") or "").strip()[:300]
+    elif op in ("offer-add", "offer-remove"):
+        payload["offer"] = (f.get("offer") or "").strip()[:40]
+        if op == "offer-add":
+            for k, mx in (("to", 500), ("path", 200), ("methods", 80)):
+                payload[k] = (f.get(k) or "").strip()[:mx]
+    res = _queue_and_wait("", payload, CONNECT_ADMIN_WAIT)
+    if res is None:
+        return redirect("/connector?err=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    if not res.get("ok"):
+        return redirect("/connector?err=" + quote(str(res.get("message") or "Fehlgeschlagen.")[:600]),
+                        code=303)
+    d = res.get("detail") or {}
+    if op == "key-issue" and d.get("secret"):
+        # once, from this response -- never in a URL
+        return page(CONNECT_KEY_SHOWN_BODY, "Zugangsschlüssel", "health", d=d)
+    return redirect("/connector?msg=" + quote(str(res.get("message") or "Erledigt.")[:600]), code=303)
+
+
+def _via_suggestions(tid):
+    """`via:<tunnel>/<offer>` for every connected tunnel of one tenant whose
+    inner node offers something -- what the destination form suggests."""
+    conf, st = _connect_data()
+    st_t = (st or {}).get("tunnels") or {}
+    out = []
+    for label, rec in sorted((conf.get("keys") or {}).items()):
+        if rec.get("tenant") != tid:
+            continue
+        for o in (st_t.get(label) or {}).get("offers") or []:
+            if o.get("name"):
+                out.append(f"via:{label}/{o['name']}")
+    return out
 
 
 # --------------------------------------------- fleet status (RFC-0021)
@@ -13876,10 +14122,14 @@ DESTINATIONS_BODY = """
       <option value="tcp">tcp (Übergabe: Adresse und Zugangsdaten in der App)</option></select></label></p>
     <p><label>Ziel<input name="target" required list="through-list"
        placeholder="https://host[:port][/basis], tcp://host:port, via:&lt;tunnel&gt;/&lt;angebot&gt;, through:&lt;instanz&gt;/&lt;ziel&gt;"></label></p>
-    {% if through %}<datalist id="through-list">{% for t in through %}<option value="{{ t }}">{% endfor %}</datalist>
-    <p class="muted" style="margin-top:-.4rem">Tunnel-Ziele dieses Mandanten (RFC-0060):
+    {% if through or via %}<datalist id="through-list">{% for t in through + via %}<option value="{{ t }}">{% endfor %}</datalist>{% endif %}
+    {% if through %}<p class="muted" style="margin-top:-.4rem">Tunnel-Ziele dieses Mandanten (RFC-0060):
       {% for t in through %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
       — Art <code>http</code>.</p>{% endif %}
+    {% if via %}<p class="muted" style="margin-top:-.4rem">Angebote innerer Knoten über den
+      <a href="/connector">Connector</a>:
+      {% for t in via %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+      — Art <code>http</code>; die Anmeldung beim Ziel (etwa der API-Schlüssel) trägt die Destination.</p>{% endif %}
     <p><label>Anmeldung<select name="auth">
       <option value="none">keine</option><option value="bearer">Bearer-Token</option>
       <option value="basic">Benutzer + Passwort</option><option value="header">eigene Kopfzeile</option></select></label></p>
@@ -13918,6 +14168,7 @@ def destinations_page():
                 f=f, admin=role == "server_admin",
                 self_admin=role == "tenant_admin" and f["may"], switch=named,
                 through=(_through_suggestions(tid) if role == "server_admin" else []),
+                via=(_via_suggestions(tid) if role == "server_admin" else []),
                 q=(f"?tenant={quote(label)}" if named else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 

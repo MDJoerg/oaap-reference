@@ -30860,6 +30860,90 @@ def cmd_process_deploys(_args):
                         ok, msg = True, f"closed: '{key}'"
                 except DestinationRefused as e:
                     msg = str(e)
+        elif action == "connect-admin":
+            # The connector set up from the portal (0.1.277,
+            # oaap.net.connector 0.4 §2.9): keys on the outer node,
+            # connectors and offers on the inner one. The functions are the
+            # ones `oaap connect` / `oaap connector` call -- the same rules,
+            # the same audit lines (so NOT in TENANT_AUDITED).
+            #
+            # server_admin's alone, required, not only checked when a name
+            # is given: an offer names any address this node can reach, a
+            # key lets another node into a tenant -- decisions about the
+            # node's network (spec 2.2/2.3). A refusal is written here,
+            # because no function ran.
+            op = str(req.get("op") or "")
+            label = str(req.get("label") or "").strip()
+            who = actor or "portal"
+            logged = {"key-issue": "connect.key.issue", "key-revoke": "connect.key.revoke",
+                      "add": "connector.add", "set-key": "connector.set-key",
+                      "remove": "connector.remove", "pause": "connector.pause",
+                      "resume": "connector.resume", "offer-add": "connector.offer.add",
+                      "offer-remove": "connector.offer.remove"}
+            if op not in logged:
+                msg = f"unknown connector op '{op}'"
+            elif act_role != "server_admin":
+                msg = ("setting up a tunnel requires server_admin -- it decides "
+                       "what reaches this node's network (oaap.net.connector 2.2)")
+                audit_tenant(logged[op], "", subject=label or "-", result="denied",
+                             who=who, role=act_role or "-", detail=msg)
+            else:
+                try:
+                    if op == "key-issue":
+                        # not resolve_tenant_arg: it ends the process on
+                        # an unknown label, and this is the worker
+                        want_t = str(req.get("tenant") or "").strip()
+                        tid = (want_t if want_t in load_tenants()
+                               else tenant_by_label(want_t)[0] if want_t
+                               else ensure_default_tenant())
+                        if not tid:
+                            raise DestinationRefused(f"no tenant '{want_t}' on this node")
+                        secret_key = connect_key_issue(label, tid, who=who, role=act_role)
+                        ok, msg = True, f"key issued for tunnel '{label}'"
+                        detail = {"secret": secret_key, "label": label,
+                                  "tenant": tenant_label(tid),
+                                  "endpoint": "https://" + (load_external() or "<this node>")}
+                    elif op == "key-revoke":
+                        cut = connect_key_revoke(label, who=who, role=act_role)
+                        ok, msg = True, (f"key of '{label}' revoked; a connected tunnel "
+                                         "closes within 5 seconds"
+                                         + (". These destinations now answer 502: "
+                                            + ", ".join(n for _t, n in cut) if cut else ""))
+                    elif op in ("add", "set-key"):
+                        key_ = str(req.get("key") or "").strip()
+                        if op == "add":
+                            tunnel_connector_add(label, str(req.get("endpoint") or ""),
+                                                 key_, plain=False, who=who, role=act_role)
+                            ok, msg = True, (f"connector '{label}' added; it dials within "
+                                             "seconds and offers nothing yet")
+                        else:
+                            tunnel_connector_set_key(label, key_, who=who, role=act_role)
+                            ok, msg = True, f"key of '{label}' replaced; it redials within seconds"
+                    elif op == "remove":
+                        tunnel_connector_remove(label, who=who, role=act_role)
+                        ok, msg = True, f"connector '{label}' removed, with its key"
+                    elif op in ("pause", "resume"):
+                        changed = tunnel_connector_set_paused(label, op == "pause",
+                                                              who=who, role=act_role)
+                        ok, msg = True, (f"'{label}' " + ("paused" if op == "pause" else "resumed")
+                                         if changed else f"'{label}' was already "
+                                         + ("paused" if op == "pause" else "running"))
+                    elif op == "offer-add":
+                        offer = str(req.get("offer") or "").strip()
+                        replaced = tunnel_offer_add(
+                            label, offer, str(req.get("to") or ""),
+                            str(req.get("path") or ""), str(req.get("methods") or ""),
+                            who=who, role=act_role)
+                        ok, msg = True, (f"offer '{offer}' {'replaced' if replaced else 'added'} "
+                                         f"on '{label}'; the outer node learns its name, "
+                                         "never the address")
+                    else:
+                        offer = str(req.get("offer") or "").strip()
+                        tunnel_offer_remove(label, offer, who=who, role=act_role)
+                        ok, msg = True, (f"offer '{offer}' removed; every destination "
+                                         "that used it is cut now")
+                except DestinationRefused as e:
+                    msg = str(e)
         elif action == "access":
             # RFC-0044: open/close a time-boxed access record from the
             # instance page. Same functions the CLI calls
@@ -31472,7 +31556,7 @@ def cmd_process_deploys(_args):
                "remove": "portal", "create": "portal",
                "endpoint": "portal", "link": "portal",
                "destination": "portal", "exposure": "portal",
-               "access": "portal",
+               "connect-admin": "portal", "access": "portal",
                "source": "portal", "node": "setup wizard",
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
@@ -31532,7 +31616,10 @@ def cmd_process_deploys(_args):
                          detail="" if ok else msg)
         if rid:
             res_tmp = os.path.join(results, f"{rid}.tmp")
-            with open(res_tmp, "w", encoding="utf-8") as f:
+            # 0600: a result may carry a secret shown once (a connect key,
+            # 0.1.277) -- the portal reads it as root and removes it.
+            with os.fdopen(os.open(res_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                           "w", encoding="utf-8") as f:
                 # The KEY the request ended up on (RFC-0025 8.1). For a
                 # create the caller only knew the tenant-local name, and
                 # without this the portal could not link to what it just
