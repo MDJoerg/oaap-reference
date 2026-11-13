@@ -138,8 +138,14 @@ with contextlib.redirect_stdout(io.StringIO()):
 BUILT = []
 
 
+TUN_APP = {"on": False}
+
+
 def fake_install_from_dir(pkg, args, source):
+    if TUN_APP["on"] and not getattr(args, "confirm_tun", False):
+        a.die("asks for a network tunnel ... " + a.TUN_MARK)
     BUILT.append({"name": getattr(args, "name", ""), "key": args.key,
+                  "confirm_tun": bool(getattr(args, "confirm_tun", False)),
                   "channel": args.channel, "tenant": getattr(args, "tenant", ""),
                   "source": dict(source)})
     reg = a.load_registry()
@@ -303,6 +309,31 @@ built_before = len(BUILT)
 r = ask({"instance": "vereinsportal", "app_id": "vereinsportal"}, by="betreiber")
 ok("ohne Mandant: wie bisher der Mandant des Betreibers (default)",
    r.get("ok") and BUILT[-1]["key"] == a.instance_key(default_id, "vereinsportal"), (r, BUILT[-1:]))
+
+
+print("\n=== Tunnel aus dem Store bestaetigen (RFC-0060 Stufe 4) ===")
+TUN_APP["on"] = True
+built_before = len(BUILT)
+r = ask({"instance": "vpn", "app_id": "vereinsportal", "new": True}, by="betreiber")
+ok("ohne Haekchen: nichts gebaut, das Portal soll fragen (needs: confirm_tun), ohne Marke im Text",
+   not r.get("ok") and r.get("needs") == "confirm_tun" and len(BUILT) == built_before
+   and a.TUN_MARK not in r.get("message", ""), r)
+r = ask({"instance": "vpn", "app_id": "vereinsportal", "new": True,
+         "confirm_tun": "vereinsportal"}, by="betreiber")
+ok("mit dem Haekchen des Server-Admins, das genau diese App nennt: gebaut, mit Recht",
+   r.get("ok") and BUILT[-1]["confirm_tun"] is True, (r, BUILT[-1:]))
+built_before = len(BUILT)
+r = ask({"instance": "vpn2", "app_id": "vereinsportal", "new": True,
+         "confirm_tun": "vereinsportal"}, by="chef-a")
+ok("ein Mandanten-Admin kann das Haekchen nicht setzen (D2): nichts gebaut",
+   not r.get("ok") and len(BUILT) == built_before, r)
+r = ask({"instance": "vpn3", "app_id": "vereinsportal", "new": True,
+         "confirm_tun": "andere-app"}, by="betreiber")
+ok("ein Haekchen fuer eine ANDERE App zaehlt nicht", not r.get("ok") and len(BUILT) == built_before, r)
+TUN_APP["on"] = False
+ok("die Ablehnung des echten Pruefers traegt die Marke und nennt das Portal",
+   a.TUN_MARK in a.tun_refusal({"app": {"id": "x"}, "services": {"vpn": {"tun": True}}}, None, False, False)
+   and "portal" in a.tun_refusal({"app": {"id": "x"}, "services": {"vpn": {"tun": True}}}, None, False, False))
 
 print("\n=== das Portal ===")
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))
@@ -473,6 +504,65 @@ r = c.post("/store/install", headers=HB, data={
     "app_id": "vereinsportal", "source_id": "catalog-katalog", "tenant": KB, "name": "mg"})
 q = queued()
 ok("derselbe Name in einem ANDEREN Mandanten ist kein Konflikt", len(q) == 1, (q, r.headers.get("Location")))
+
+
+print("\n=== Portal: Tunnel-Frage, Datei-Feld, Tunnel-Karte, through-Vorschlaege ===")
+t = c.get("/store/catalog-katalog/vereinsportal?need=tun&nn=vpn&tn=" + KB, headers=HB).get_data(as_text=True)
+ok("need=tun: die Tunnel-Karte mit Haekchen fuer den Server-Admin, Name und Mandant reisen mit",
+   'id="tunnel"' in t and 'name="confirm_tun"' in t and 'value="vpn"' in t
+   and f'name="tenant" value="{KB}"' in t and 'id="rechte"' not in t, t[t.find("tunnel")-100:t.find("tunnel")+1500])
+r = c.post("/store/install", headers=HB, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "name": "vpn",
+    "confirm_tun": "vereinsportal"})
+q = queued()
+ok("Server-Admin: die Anfrage traegt confirm_tun mit der App", len(q) == 1 and q[0].get("confirm_tun") == "vereinsportal", q)
+portal.caller_roles = lambda: {"tenant_admin"}
+r = c.post("/store/install", headers=H, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "name": "vpn",
+    "confirm_tun": "vereinsportal"})
+q = queued()
+ok("Mandanten-Admin: confirm_tun wird nicht weitergereicht", len(q) == 1 and "confirm_tun" not in q[0], q)
+portal.caller_roles = lambda: {"server_admin"}
+
+
+class FakeFile:
+    def __init__(self, name, data):
+        self.filename, self._d = name, data
+
+    def read(self, n=-1):
+        return self._d if n < 0 else self._d[:n]
+
+
+import base64                                                  # noqa: E402
+rows = [{"key": "VPN_CONFIG", "label": "OpenVPN-Datei", "file": True, "secret": True},
+        {"key": "VPN_TARGETS", "label": "Ziele", "file": False}]
+OVPN = b"client\n; Kommentar mit ; Semikolon\nremote 1.2.3.4 1194\n<ca>\nABC\n</ca>\n"
+v, e = portal._config_file_values(rows, {"cfgfile-VPN_CONFIG": FakeFile("c.ovpn", OVPN)})
+ok("Datei-Feld: die Datei wird EINE base64-Zeile, Byte fuer Byte",
+   e == "" and base64.b64decode(v["VPN_CONFIG"]) == OVPN and "\n" not in v["VPN_CONFIG"], (v, e))
+v, e = portal._config_file_values(rows, {})
+ok("keine Datei gewaehlt: nichts geaendert", v == {} and e == "")
+v, e = portal._config_file_values(rows, {"cfgfile-VPN_CONFIG": FakeFile("x", b"x" * (portal.CONFIG_FILE_MAX + 1))})
+ok("zu gross: abgewiesen", v == {} and "kB" in e, e)
+v, e = portal._config_file_values(rows, {"cfgfile-VPN_CONFIG": FakeFile("x", b"  \n")})
+ok("leer: abgewiesen", v == {} and "leer" in e, e)
+
+portal._config_view = lambda name: {"values": {"VPN_TARGETS": "gaming = http://10.8.0.5:11434;nas = http://10.8.0.9;kaputt"},
+                                    "set": ["VPN_CONFIG"]}
+portal._instance_probe = lambda name, inst: ("ok", "Läuft", "")
+portal._sleep_status = lambda inst: None
+TUNI = {"app_id": "vpn-client", "name": "vpn", "tenant": KB, "services": [{"service": "", "tun": True}]}
+tv = portal._tunnel_view("kunde-b-vpn", TUNI)
+ok("Tunnel-Karte: Zustand, Datei hinterlegt, Ziele aus VPN_TARGETS (kaputte Zeile ausgelassen)",
+   tv and tv["state"] == "ok" and tv["config_set"] and tv["targets"] == ["gaming", "nas"]
+   and tv["through_name"] == "vpn", tv)
+ok("keine Tunnel-App: keine Karte", portal._tunnel_view("x", {"services": [{"service": ""}]}) is None)
+portal.load_instances = lambda: {"kunde-b-vpn": TUNI, "kunde-a-vpn": dict(TUNI, tenant=KA),
+                                 "kunde-b-web": {"name": "web", "tenant": KB, "services": [{}]}}
+portal.resolve_tenant = lambda ref: ref or ""
+ok("through-Vorschlaege: nur die Tunnel-Apps DIESES Mandanten",
+   portal._through_suggestions(KB) == ["through:vpn/gaming", "through:vpn/nas"],
+   portal._through_suggestions(KB))
 
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)

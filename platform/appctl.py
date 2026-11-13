@@ -18131,7 +18131,13 @@ def tun_refusal(m, inst, rehearsal, confirmed):
             "goes through the tunnel is the app's promise, not the "
             "platform's. Nothing was built. Only the node's operator can "
             "accept this: install again from the command line with "
-            "--confirm-tun (oaap.apps.runtime 2.23, RFC-0060).")
+            "--confirm-tun -- or, as server_admin, confirm it in the "
+            f"portal's store (oaap.apps.runtime 2.23, RFC-0060). {TUN_MARK}")
+
+
+# The tail of the refusal above; the worker turns it into `needs:
+# confirm_tun` so the portal can ask the operator (RFC-0060 stage 4).
+TUN_MARK = "[needs: confirm-tun]"
 
 
 def disk_grants_of(stored, inst=None):
@@ -18366,6 +18372,7 @@ def config_entries(name, inst):
             "label": c.get("label") or key,
             "secret": bool(c.get("secret")),
             "multiline": bool(c.get("multiline")),
+            "file": bool(c.get("file")),
             "generate": c.get("generate", ""),
             "default": c.get("default", ""),
             "value": env.get(key, ""),
@@ -21669,7 +21676,9 @@ def cmd_install(args):
                 sideloaded_by=("cli" if channel == "production"
                                and not getattr(args, "store_source", "")
                                else ""),
-                store_source=getattr(args, "store_source", "") or "")
+                store_source=getattr(args, "store_source", "") or "",
+                confirms={"confirm_tun": getattr(args, "confirm_tun", False),
+                          "confirm_administer": getattr(args, "confirm_administer", False)})
         except ArtifactRejected as e:
             die(str(e))
         if channel == "production" and not getattr(args, "store_source", ""):
@@ -22281,6 +22290,9 @@ def _install_from_dir(pkg, args, source):
         "config": [{"key": c["key"], "label": c.get("label", ""),
                     "secret": bool(c.get("secret")),
                     "multiline": bool(c.get("multiline")),
+                    # runtime 2.8 (0.2.43): the value is a FILE, kept as
+                    # one base64 line; the portal offers an upload
+                    "file": bool(c.get("file")),
                     # spec 2.8: only a key whose value THIS app defines
                     # may ask the portal to produce it. Anything else is
                     # recorded as "no" -- a value we generate into a
@@ -27135,7 +27147,7 @@ def announce_artifact(name, manifest_text, artifact_sha, artifact_bytes,
 
 def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                      permit=None, ident=None, rehearsal=None,
-                     sideloaded_by="", store_source=""):
+                     sideloaded_by="", store_source="", confirms=None):
     """Phase 3: verify the upload against its grant, then install.
 
     `grant` is positional and mandatory on purpose. It was optional
@@ -27250,7 +27262,17 @@ def install_artifact(name, zip_path, grant, channel="test", path="", origin="",
                                 # time here, without that confirmation, and
                                 # refused every confirmed widening of a
                                 # production instance on these paths.
-                                envelope_checked=True)
+                                envelope_checked=True,
+                                # The operator's yes to a tunnel / to an app
+                                # that administers its tenant's grants, from
+                                # the ONE caller that has it (cmd_install:
+                                # the command line, or the store with a
+                                # server_admin's tick). Every other door
+                                # passes nothing and is asked. Missing
+                                # before 0.1.276: a ZIP package from a store
+                                # catalogue could never be confirmed.
+                                confirm_tun=bool((confirms or {}).get("confirm_tun")),
+                                confirm_administer=bool((confirms or {}).get("confirm_administer")))
         try:
             _install_from_dir(pkg, ns, source)
         except BaseException:
@@ -29711,6 +29733,11 @@ def cmd_process_deploys(_args):
                 confirm_administer=(act_role == "server_admin"
                                     and bool(lookup_id)
                                     and req.get("confirm_administer") == lookup_id),
+                # RFC-0060 D2 / stage 4: the same shape for a tunnel -- a
+                # server_admin by their own record, naming exactly this app.
+                confirm_tun=(act_role == "server_admin"
+                             and bool(lookup_id)
+                             and req.get("confirm_tun") == lookup_id),
                 # Only consulted when the instance is NEW: a redeploy
                 # keeps whatever the instance already says, so this can
                 # never move one between tenants. An update names the
@@ -31483,6 +31510,9 @@ def cmd_process_deploys(_args):
                 if not ok and ADMINISTER_MARK in str(msg or ""):
                     res_body["needs"] = "confirm_administer"
                     res_body["message"] = str(msg).replace(ADMINISTER_MARK, "").strip()
+                elif not ok and TUN_MARK in str(msg or ""):
+                    res_body["needs"] = "confirm_tun"
+                    res_body["message"] = str(msg).replace(TUN_MARK, "").strip()
                 elif not ok and envelope_need.get("fingerprint"):
                     # I-43: not a failure to report, a question to ask.
                     res_body["needs"] = "confirm_envelope"

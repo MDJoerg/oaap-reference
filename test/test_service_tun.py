@@ -193,10 +193,25 @@ ok("ein hochgeladenes Paket (keine Kommandozeile) wird beim ersten Mal "
    and not record("vpn-upload") and not built(), buf.getvalue())
 
 SRC = open(os.path.join(PLATFORM, "appctl.py"), encoding="utf-8").read()
-ok("nur die Kommandozeile setzt confirm_tun (argparse + die eine Abfrage)",
-   SRC.count("confirm_tun") == 2
-   and 'getattr(args, "confirm_tun", False)' in SRC
-   and 'dest="confirm_tun"' in SRC, SRC.count("confirm_tun"))
+# Stufe 4 (RFC-0060, 0.1.276): ausser der Kommandozeile setzt GENAU EINE
+# weitere Tuer das Recht -- der Store, und nur fuer einen server_admin nach
+# dessen eigenem Eintrag, mit dem Namen genau dieser App. Jede Zeile, die
+# confirm_tun nennt, muss eine der erlaubten sein.
+ALLOWED = (
+    'dest="confirm_tun"',                                   # argparse
+    'getattr(args, "confirm_tun", False)',                  # die eine Abfrage / Durchreichen
+    'confirm_tun=(act_role == "server_admin"',              # der Store
+    'and req.get("confirm_tun") == lookup_id',              # ... genau diese App
+    'confirm_tun=bool((confirms or {}).get("confirm_tun"))',  # install_artifact reicht durch
+    '{"confirm_tun": getattr(args, "confirm_tun", False)',  # ... von cmd_install
+    'res_body["needs"] = "confirm_tun"',                    # die Frage ans Portal
+    "# confirm_tun` so the portal can ask",                 # Kommentar
+)
+lines = [ln.strip() for ln in SRC.splitlines() if "confirm_tun" in ln]
+stray = [ln for ln in lines if not any(a in ln for a in ALLOWED)]
+ok("confirm_tun setzen nur Kommandozeile und Store (server_admin, genau diese App)",
+   not stray and 'dest="confirm_tun"' in SRC
+   and 'confirm_tun=(act_role == "server_admin"' in SRC, stray)
 
 # ------------------------------------------------------------ mit Bestaetigung
 print("")

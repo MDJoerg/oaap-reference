@@ -1901,7 +1901,7 @@ STORE_APP_BODY = """
   .icon-lg{width:3rem;height:3rem;object-fit:contain;flex:none}
 </style>
 <a class="back" href="/store?back=1">← Zurück zum Store</a>
-{% if need %}
+{% if need and need.kind != 'tun' %}
 <div class="card warn" id="bestaetigen">
   <h2 style="margin-top:0">Diese App verwaltet Rechte — bitte bestätigen</h2>
   <p>„{{ a.name }}“ bittet darum, die <strong>fachlichen Berechtigungen ihres
@@ -1929,10 +1929,46 @@ STORE_APP_BODY = """
     <input type="hidden" name="name" value="{{ need.new_name }}">{% endif %}
     {% if need.channel %}<input type="hidden" name="channel" value="test">{% endif %}
     {% if need.tenant %}<input type="hidden" name="tenant" value="{{ need.tenant }}">{% endif %}
+    {% if need.tun_too %}<input type="hidden" name="confirm_tun" value="{{ a.id }}">{% endif %}
     {% if need.confirm_source %}<input type="hidden" name="confirm_source" value="{{ need.confirm_source }}">{% endif %}
     <label class="checkline"><input type="checkbox" name="confirm_administer"
            value="{{ a.id }}" required> Ich bestätige als Server-Admin: diese App
            darf die Rechte ihres Mandanten verwalten.</label>
+    <button>Mit Bestätigung installieren</button>
+    <a class="rowaction" href="/store/{{ a.source.id }}/{{ a.id }}" style="margin-left:.8rem">Abbrechen</a>
+  </form>
+  {% else %}
+  <p style="margin:0">Das bestätigt der <strong>Server-Admin</strong> des Knotens —
+    bitte ihn, die App hier im Store zu installieren.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% if need and need.kind == 'tun' %}
+<div class="card warn" id="tunnel">
+  <h2 style="margin-top:0">Diese App baut einen Netzwerk-Tunnel — bitte bestätigen</h2>
+  <p>Ihr Container bekommt das Gerät <code>/dev/net/tun</code> und das Recht
+    <code>NET_ADMIN</code>: Er darf einen Tunnel aufbauen und Routen, Adressen und
+    Paketfilter <strong>in seinem eigenen Container</strong> ändern — nicht auf diesem
+    Rechner, nicht in einem anderen Container. Was durch den Tunnel geht, verspricht
+    die App, nicht die Plattform (RFC-0060).</p>
+  <p class="muted">Ein Tunnel ist eine Tür, die der Betreiber des Knotens kennen muss —
+    deshalb fragt der Knoten einmal, beim ersten Installieren, und nur der Server-Admin
+    darf ja sagen. Ein späteres Update fragt nicht noch einmal.</p>
+  {% if need.can_confirm %}
+  <form method="post" action="/store/install"
+        onsubmit="this.querySelector('button').disabled=true;
+                  this.querySelector('button').textContent='Wird installiert …'">
+    <input type="hidden" name="app_id" value="{{ a.id }}">
+    <input type="hidden" name="source_id" value="{{ a.source.id }}">
+    {% if need.new_name %}<input type="hidden" name="new" value="1">
+    <input type="hidden" name="name" value="{{ need.new_name }}">{% endif %}
+    {% if need.channel %}<input type="hidden" name="channel" value="test">{% endif %}
+    {% if need.tenant %}<input type="hidden" name="tenant" value="{{ need.tenant }}">{% endif %}
+    {% if need.confirm_source %}<input type="hidden" name="confirm_source" value="{{ need.confirm_source }}">{% endif %}
+    {% if need.administer_too %}<input type="hidden" name="confirm_administer" value="{{ a.id }}">{% endif %}
+    <label class="checkline"><input type="checkbox" name="confirm_tun"
+           value="{{ a.id }}" required> Ich bestätige als Server-Admin: diese App
+           darf in ihrem Container einen Tunnel aufbauen.</label>
     <button>Mit Bestätigung installieren</button>
     <a class="rowaction" href="/store/{{ a.source.id }}/{{ a.id }}" style="margin-left:.8rem">Abbrechen</a>
   </form>
@@ -3742,7 +3778,23 @@ INSTANCE_EDIT_BODY = """
      <code>sudo oaap app config set {{ i.key }} SCHLÜSSEL WERT</code>.</p>
 </div>
 {% elif i.config %}
-<form method="post" action="/instances/{{ i.key }}/config">
+{% if i.tunnel %}
+<div class="card">
+  <h2>Tunnel</h2>
+  <p><span class="dot {{ i.tunnel.state }}"></span>{{ i.tunnel.label }}{% if i.tunnel.detail %}
+     <span class="muted">— {{ i.tunnel.detail }}</span>{% endif %}</p>
+  {% if not i.tunnel.config_set %}<p class="err">Noch keine Tunnel-Datei hinterlegt — unten
+     bei <em>Konfiguration</em> hochladen.</p>{% endif %}
+  {% if i.tunnel.targets %}
+  <p>Ziele hinter dem Tunnel — als Destination mit dem Ziel:</p>
+  <ul>{% for t in i.tunnel.targets %}<li><code>through:{{ i.tunnel.through_name }}/{{ t }}</code></li>{% endfor %}</ul>
+  <p class="muted">Anlegen unter <a href="/destinationen">Destinationen</a> (Server-Admin). Den Schlüssel
+     des Ziels trägt die Destination, nicht diese App (RFC-0060 D5).</p>
+  {% else %}<p class="muted">Noch keine Ziele — unten bei <em>Konfiguration</em> eintragen,
+     eines je Zeile: <code>name = http://adresse:port</code>.</p>{% endif %}
+</div>
+{% endif %}
+<form method="post" action="/instances/{{ i.key }}/config"{% if i.config|selectattr('file')|list %} enctype="multipart/form-data"{% endif %}>
   <input type="hidden" name="tab" value="konfiguration">
   {# Enter in einem Feld loest den ERSTEN Absendeknopf des Formulars aus.
      Stuende dort „Wert erzeugen", erzeugte Enter einen Wert, statt zu
@@ -3765,7 +3817,11 @@ INSTANCE_EDIT_BODY = """
          je Zeile{% endif %}{% if c.secret %} — vertraulich,
          wird nie angezeigt{% endif %}{% if c.generate %} — diesen Wert
          bestimmt die App selbst, der Knoten kann ihn erzeugen{% endif %}</p>
-      {% if c.multiline %}
+      {% if c.file %}
+      <input type="file" name="cfgfile-{{ c.key }}" id="cfg-{{ c.key }}">
+      <p class="muted" style="margin:.2rem 0 0">{{ 'Eine Datei ist hinterlegt — nur wählen, um sie zu ersetzen.' if c.is_set else 'Noch keine Datei hinterlegt.' }}
+         Der Knoten speichert sie unverändert (als eine base64-Zeile){% if c.secret %} und zeigt sie nie wieder an{% endif %}.</p>
+      {% elif c.multiline %}
       <textarea name="cfg-{{ c.key }}" id="cfg-{{ c.key }}" rows="4" spellcheck="false"
                 style="width:100%;font-family:ui-monospace,monospace;font-size:.9rem"
                 placeholder="{{ ('gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt') if c.secret else 'eine Angabe je Zeile' }}">{{ c.value }}</textarea>
@@ -8006,7 +8062,7 @@ def store_app(source_id, app_id, envelope=None):
                         + quote("Diese App steht in keiner eingetragenen "
                                 "Quelle (mehr)."), code=303)
     need = None
-    if request.args.get("need") == "administer":
+    if request.args.get("need") in ("administer", "tun"):
         upd = request.args.get("upd", "")
         nn = request.args.get("nn", "")
         own = visible_instances()
@@ -8016,7 +8072,11 @@ def store_app(source_id, app_id, envelope=None):
                 "tenant": request.args.get("tn", "") if request.args.get("tn", "") in load_tenants() else "",
                 "confirm_source": request.args.get("cs", "")
                 if request.args.get("cs", "") == a["source"]["id"] else "",
-                "can_confirm": "server_admin" in caller_roles()}
+                "can_confirm": "server_admin" in caller_roles(),
+                "kind": request.args.get("need"),
+                # the other question, already answered on the way here
+                "administer_too": request.args.get("ca") == "1",
+                "tun_too": request.args.get("ct") == "1"}
     return page(STORE_APP_BODY, a["name"], "store", a=a, need=need, envelope=envelope,
                 instances=_app_instances(a["id"]), target=_install_target(),
                 profiles=node_profiles(),
@@ -8276,6 +8336,11 @@ def store_install():
                    **({"confirm_administer": app_id}
                       if (request.form.get("confirm_administer") == app_id
                           and "server_admin" in caller_roles()) else {}),
+                   # RFC-0060 stage 4: the operator's yes to a tunnel, naming
+                   # the app; the host checks the actor's record again.
+                   **({"confirm_tun": app_id}
+                      if (request.form.get("confirm_tun") == app_id
+                          and "server_admin" in caller_roles()) else {}),
                    # I-43: the tick under the widenings, as their fingerprint.
                    **({"confirm_envelope": request.form.get("confirm_envelope")}
                       if update and _re.fullmatch(r"[0-9a-f]{16}",
@@ -8303,13 +8368,16 @@ def store_install():
                 return back(f"'{app_id}' wurde installiert"
                             + (f" (Version {v})" if v else "")
                             + " — die Kachel erscheint im Launchpad.")
-            if res.get("needs") == "confirm_administer":
+            if res.get("needs") in ("confirm_administer", "confirm_tun"):
                 # Not a failure to report, a question to ask: the object
                 # page shows what the app's key can and cannot do, and --
                 # to a server_admin -- the same install once more with the
                 # tick box. The form state travels in the link.
                 where = f"/store/{source_id}/{app_id}" if source_id else "/store"
-                return redirect(where + "?need=administer"
+                return redirect(where + "?need="
+                                + ("tun" if res.get("needs") == "confirm_tun" else "administer")
+                                + ("&ca=1" if request.form.get("confirm_administer") == app_id else "")
+                                + ("&ct=1" if request.form.get("confirm_tun") == app_id else "")
                                 + (f"&upd={quote(update)}" if update else "")
                                 + (f"&nn={quote(new_name)}" if wants_new else "")
                                 + (f"&tn={quote(want_tenant)}" if want_tenant else "")
@@ -8428,6 +8496,7 @@ def _instance_config(name, inst, fresh=None, typed=None):
             continue
         secret = bool(c.get("secret"))
         multiline = bool(c.get("multiline"))
+        is_file = bool(c.get("file"))
         # The view carries no secret value at all, so there is nothing to
         # show for one and nothing to compare a submission against.
         stored = "" if secret else str(values.get(key, ""))
@@ -8437,7 +8506,7 @@ def _instance_config(name, inst, fresh=None, typed=None):
             shown = typed[key]
         rows.append({
             "key": key, "label": c.get("label") or key, "secret": secret,
-            "multiline": multiline,
+            "multiline": multiline, "file": is_file,
             # Only where the app said its value is its own to define
             # (spec 2.8) -- never on a field holding somebody else's
             # credential, where a generated value is a wrong answer.
@@ -9082,6 +9151,7 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "services": inst.get("services") or [],
          "groups": groups, "roles": inst.get("roles") or [],
          "config": _instance_config(name, inst, fresh, typed),
+         "tunnel": _tunnel_view(name, inst),
          # Unknown is not empty (0.1.100): without the host's view the
          # card offers no form, instead of empty fields a save writes back.
          "config_known": _config_view(name) is not None,
@@ -9879,6 +9949,77 @@ def instance_token(name):
                 name=name, token=token, hook_url=_hook_url(name))
 
 
+CONFIG_FILE_MAX = 256 * 1024    # an .ovpn with certificates is a few kB
+
+
+def _config_file_values(rows, files):
+    """Uploaded files for `file` keys (runtime 2.8): one base64 line each.
+    Returns (values, err). No file chosen = keep what is stored."""
+    import base64
+    values = {}
+    for c in rows:
+        if not c.get("file"):
+            continue
+        f = files.get(f"cfgfile-{c['key']}") if files else None
+        if f is None or not getattr(f, "filename", ""):
+            continue
+        data = f.read(CONFIG_FILE_MAX + 1)
+        if len(data) > CONFIG_FILE_MAX:
+            return {}, f"{c['label']}: die Datei ist größer als {CONFIG_FILE_MAX // 1024} kB."
+        if not data.strip():
+            return {}, f"{c['label']}: die Datei ist leer."
+        values[c["key"]] = base64.b64encode(data).decode("ascii")
+    return values, ""
+
+
+def _tunnel_targets(name):
+    """Target names from a tunnel app's VPN_TARGETS (not secret), as the
+    host's config view reports it: `name = http://…`, one per entry."""
+    view = _config_view(name) or {}
+    raw = str((view.get("values") or {}).get("VPN_TARGETS", ""))
+    out = []
+    for line in iv.value_to_lines(raw).splitlines():
+        left = line.split("=", 1)[0].strip() if "=" in line else ""
+        if _re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}", left or ""):
+            out.append(left)
+    return out
+
+
+def _through_suggestions(tid):
+    """`through:<instance>/<target>` for every tunnel app of one tenant --
+    the names the destination form offers (RFC-0060 stage 4). Only the
+    tenant's own instances: a destination may not point into another."""
+    out = []
+    for key, inst in sorted(load_instances().items()):
+        if resolve_tenant(inst.get("tenant")) != tid:
+            continue
+        if not any(isinstance(s, dict) and s.get("tun") is True
+                   for s in (inst.get("services") or [])):
+            continue
+        out += [f"through:{local_name(key, inst)}/{t}" for t in _tunnel_targets(key)]
+    return out
+
+
+def _tunnel_view(name, inst):
+    """The card for an instance that holds a tunnel (RFC-0060 stage 4),
+    or None: its state (the app's health is 'up' only while the tunnel
+    stands), its targets and the names a destination uses for them."""
+    if not any(isinstance(s, dict) and s.get("tun") is True
+               for s in (inst.get("services") or [])):
+        return None
+    st = _sleep_status(inst) or _instance_probe(name, inst)
+    view = _config_view(name) or {}
+    return {"state": st[0],
+            # The app's health is 200 only while the tunnel stands (its
+            # contract, RFC-0060 2.2) -- anything else IS "not standing";
+            # the probe's own words go into the detail.
+            "label": "Tunnel steht" if st[0] == "ok" else "Tunnel steht nicht",
+            "detail": "" if st[0] == "ok" else " — ".join(x for x in (st[1], st[2]) if x),
+            "config_set": "VPN_CONFIG" in set(view.get("set") or []),
+            "targets": _tunnel_targets(name),
+            "through_name": local_name(name, inst)}
+
+
 def _config_changes(rows, form):
     """The values the operator actually changed, as the host stores them.
 
@@ -9968,9 +10109,13 @@ def instance_config(name):
                                     "liegen dem Portal gerade nicht vor. "
                                     "Gespeichert wurde nichts, damit kein "
                                     "Wert versehentlich überschrieben wird.")
-    values, err = _config_changes(rows, request.form)
+    values, err = _config_changes([c for c in rows if not c.get("file")], request.form)
     if err:
         return _inst_back(name, err=err)
+    fvalues, err = _config_file_values(rows, request.files)
+    if err:
+        return _inst_back(name, err=err)
+    values.update(fvalues)
     if not values:
         msg, err = _config_outcome({"ok": True, "message": "config no change"})
         return _inst_back(name, msg=msg, err=err)
@@ -13650,7 +13795,12 @@ DESTINATIONS_BODY = """
     <p><label>Name (klein, Ziffern, Bindestrich)<input name="name" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"></label></p>
     <p><label>Art<select name="kind"><option value="http">http (über das Gateway, Proxy)</option>
       <option value="tcp">tcp (Übergabe: Adresse und Zugangsdaten in der App)</option></select></label></p>
-    <p><label>Ziel<input name="target" required placeholder="https://host[:port][/basis], tcp://host:port, via:&lt;tunnel&gt;/&lt;angebot&gt;"></label></p>
+    <p><label>Ziel<input name="target" required list="through-list"
+       placeholder="https://host[:port][/basis], tcp://host:port, via:&lt;tunnel&gt;/&lt;angebot&gt;, through:&lt;instanz&gt;/&lt;ziel&gt;"></label></p>
+    {% if through %}<datalist id="through-list">{% for t in through %}<option value="{{ t }}">{% endfor %}</datalist>
+    <p class="muted" style="margin-top:-.4rem">Tunnel-Ziele dieses Mandanten (RFC-0060):
+      {% for t in through %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+      — Art <code>http</code>.</p>{% endif %}
     <p><label>Anmeldung<select name="auth">
       <option value="none">keine</option><option value="bearer">Bearer-Token</option>
       <option value="basic">Benutzer + Passwort</option><option value="header">eigene Kopfzeile</option></select></label></p>
@@ -13688,6 +13838,7 @@ def destinations_page():
                 label=(label if tid != default_tenant_id() else ""),
                 f=f, admin=role == "server_admin",
                 self_admin=role == "tenant_admin" and f["may"], switch=named,
+                through=(_through_suggestions(tid) if role == "server_admin" else []),
                 q=(f"?tenant={quote(label)}" if named else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
 

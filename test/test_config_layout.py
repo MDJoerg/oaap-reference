@@ -53,7 +53,7 @@ def ok(label, cond, detail=""):
 SRC = open(os.path.join(PORTAL, "app.py"), encoding="utf-8").read()
 
 # Die ECHTE Vorlage der Konfigurationskarte, nicht eine Abschrift.
-start = SRC.index('<form method="post" action="/instances/{{ i.key }}/config">')
+start = SRC.index('<form method="post" action="/instances/{{ i.key }}/config"')
 CARD = Template(SRC[start:SRC.index("</form>", start) + len("</form>")])
 
 
