@@ -29562,6 +29562,17 @@ def cmd_process_deploys(_args):
             if u is None or not u.get("active", True):
                 actor_refusal = (f"'{action}' must be requested by a signed-in, "
                                  "active user -- this request names none")
+        # A NEW instance from the store may name its tenant -- a
+        # server_admin's choice, judged here again like a creation
+        # permit's (acting_tenant: anyone else gets their own tenant and
+        # nothing else). Without it the instance landed in the tenant of
+        # whoever was signed in, unannounced (oaap-demo 2026-11-13: three
+        # instances meant for `ais` in `oaap-ops`).
+        if (action == "install" and not req.get("update") and req.get("tenant")
+                and actor and act_role == "server_admin" and not actor_refusal):
+            act_tenant, act_role, _act_err = acting_tenant(actor, str(req.get("tenant")))
+            if not act_tenant:
+                actor_refusal = _act_err or "that tenant does not exist on this node"
 
         # The two actions that bring an instance into being name it the
         # way the CALLER thinks of it -- inside their tenant -- because

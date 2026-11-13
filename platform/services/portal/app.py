@@ -1928,6 +1928,7 @@ STORE_APP_BODY = """
     {% if need.new_name %}<input type="hidden" name="new" value="1">
     <input type="hidden" name="name" value="{{ need.new_name }}">{% endif %}
     {% if need.channel %}<input type="hidden" name="channel" value="test">{% endif %}
+    {% if need.tenant %}<input type="hidden" name="tenant" value="{{ need.tenant }}">{% endif %}
     {% if need.confirm_source %}<input type="hidden" name="confirm_source" value="{{ need.confirm_source }}">{% endif %}
     <label class="checkline"><input type="checkbox" name="confirm_administer"
            value="{{ a.id }}" required> Ich bestätige als Server-Admin: diese App
@@ -2060,11 +2061,26 @@ STORE_APP_BODY = """
     <p class="muted">Diese App ist als <strong>nur für Experten</strong>
     gekennzeichnet — sie verlangt Wissen, das über die Bedienung hinausgeht.</p>
     {% endif %}
+    {% if target.choose %}
+    <label for="tenant">Mandant</label>
+    <select id="tenant" name="tenant">
+      {% for t in target.options %}<option value="{{ t.id }}"{% if t.id == target.preset %} selected{% endif %}>{{ t.label }}{% if t.name %} ({{ t.name }}){% endif %}</option>{% endfor %}
+    </select>
+    {% elif target.label %}
+    <p class="muted" style="margin:.2rem 0 .6rem">Wird im Mandanten
+       <strong>{{ target.label }}</strong> installiert.</p>
+    {% endif %}
     {% if instances %}
     <label for="new_name">Name der neuen Instanz</label>
     <input id="new_name" name="name" required pattern="[a-z0-9][a-z0-9-]*"
            placeholder="{{ a.id }}-2">
     <input type="hidden" name="new" value="1">
+    {% else %}
+    <label for="new_name">Name der Instanz <span class="muted">(leer = {{ a.id }})</span></label>
+    <input id="new_name" name="name" pattern="[a-z0-9][a-z0-9-]*" placeholder="{{ a.id }}">
+    <p class="muted" style="margin:.1rem 0 .6rem">Der Name steht in der Adresse:
+       <code>&lt;Name&gt;.&lt;Mandant&gt;.…</code>. Ein unauffälliger Name lockt weniger
+       Scanner an als der Name der App.</p>
     {% endif %}
     <p style="margin:.2rem 0 .4rem"><strong>Wohin?</strong></p>
     <label class="checkline"><input type="radio" name="channel" value="production" checked>
@@ -2528,6 +2544,15 @@ INSTANCES_LIST_BODY = """
 {% endif %}
 {% if scope_note %}<p class="muted">Mandant <strong>{{ scope_note }}</strong> —
    Du siehst und verwaltest die Instanzen dieses Mandanten.</p>{% endif %}
+{% if installing %}
+<div class="card"><meta http-equiv="refresh" content="15">
+  <p style="margin:0"><strong>⏳ Installation läuft:</strong>
+  {% for p in installing %}<code>{{ p.name }}</code>
+    <span class="muted">({{ 'wartet' if p.state == 'queued' else ('hängt' if p.state == 'stale' else 'läuft') }}
+    seit {{ (p.since // 60) }} Min.)</span>{% if not loop.last %}, {% endif %}{% endfor %}
+  <br><span class="muted">Ein großes Abbild braucht mehrere Minuten. Die Seite lädt sich
+  alle 15 Sekunden neu; das Ergebnis steht danach im Deploy-Protokoll.</span></p></div>
+{% endif %}
 {% if care_counts.newer or care_counts.security %}
 <div class="card warn"><p style="margin:0">
   {% if care_counts.newer %}<a href="/instances?care=update">{{ care_counts.newer }}
@@ -7917,6 +7942,25 @@ def store_sources_change():
                     + ("" if res.get("ok") else "&err=1"), code=303)
 
 
+def _install_target():
+    """Where a NEW instance from the store lands, said before the click.
+
+    A server_admin on a multi-tenant node chooses, preset to the tenant
+    whose address they are on (else `default`); a tenant_admin is told
+    their own tenant. The host decides again (acting_tenant)."""
+    if not multi_tenant():
+        return {"choose": False, "label": ""}
+    role, mine = caller_scope()
+    tenants = load_tenants()
+    if role == "server_admin":
+        at, _face = request_place()
+        opts = sorted(({"id": tid, "label": t.get("label", ""), "name": t.get("name", "")}
+                       for tid, t in tenants.items()), key=lambda o: o["label"])
+        return {"choose": True, "options": opts,
+                "preset": at if at in tenants else default_tenant_id()}
+    return {"choose": False, "label": tenant_label(mine) if mine else ""}
+
+
 def _app_instances(app_id):
     """The caller's own instances of one app, for the store's object page.
 
@@ -7969,11 +8013,12 @@ def store_app(source_id, app_id, envelope=None):
         need = {"update": upd if (upd and (own.get(upd) or {}).get("app_id") == a["id"]) else "",
                 "new_name": nn if _re.fullmatch(r"[a-z0-9][a-z0-9-]*", nn or "") else "",
                 "channel": "test" if request.args.get("ch") == "test" else "",
+                "tenant": request.args.get("tn", "") if request.args.get("tn", "") in load_tenants() else "",
                 "confirm_source": request.args.get("cs", "")
                 if request.args.get("cs", "") == a["source"]["id"] else "",
                 "can_confirm": "server_admin" in caller_roles()}
     return page(STORE_APP_BODY, a["name"], "store", a=a, need=need, envelope=envelope,
-                instances=_app_instances(a["id"]),
+                instances=_app_instances(a["id"]), target=_install_target(),
                 profiles=node_profiles(),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)
@@ -8187,8 +8232,20 @@ def store_install():
     # updating the first). The host judges both again.
     update = request.form.get("update", "").strip()
     new_name = request.form.get("name", "").strip().lower()
-    wants_new = bool(request.form.get("new")) and not update
+    # A name on the FIRST install too: "mg" instead of the app id
+    # (Jörg 2026-11-13) -- a name of its own is a new instance by name.
+    wants_new = (bool(request.form.get("new"))
+                 or bool(new_name and new_name != app_id)) and not update
+    if not wants_new:
+        new_name = ""
+    # The tenant of a new instance: a server_admin's choice only; the
+    # host judges it again. Anyone else installs into their own tenant.
+    want_tenant = request.form.get("tenant", "").strip()
+    if update or "server_admin" not in caller_roles() or want_tenant not in load_tenants():
+        want_tenant = ""
     own = visible_instances()
+    if want_tenant:
+        own = {k: i for k, i in own.items() if resolve_tenant(i.get("tenant")) == want_tenant}
     if update:
         if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", update) \
                 or (own.get(update) or {}).get("app_id") != app_id:
@@ -8209,6 +8266,7 @@ def store_install():
                    "app_id": app_id,
                    **({"update": update} if update else {}),
                    **({"new": True} if wants_new else {}),
+                   **({"tenant": want_tenant} if want_tenant else {}),
                    "action": "install",
                    "source_id": source_id, "confirm_source": confirm,
                    # oaap.core.authorization 2.10: the operator's yes to an
@@ -8254,6 +8312,7 @@ def store_install():
                 return redirect(where + "?need=administer"
                                 + (f"&upd={quote(update)}" if update else "")
                                 + (f"&nn={quote(new_name)}" if wants_new else "")
+                                + (f"&tn={quote(want_tenant)}" if want_tenant else "")
                                 + ("&ch=test" if request.form.get("channel") == "test" else "")
                                 + (f"&cs={quote(confirm)}" if confirm else ""), code=303)
             if (res.get("needs") == "confirm_envelope" and update
@@ -8444,8 +8503,11 @@ def instances_list():
                    "security": sum(1 for r in rows if r["care"]["open"])}
     total = len(rows)
     rows = [r for r in rows if instance_matches(r, f)]
+    pending = pending_installs()
+    installing = [{"name": e["instance"], "state": e["state"], "since": e["since"]}
+                  for e in _in_flight() if e["action"] == "install" and e["instance"] in pending]
     return page(INSTANCES_LIST_BODY, "Instanzen", "instances", instances=rows,
-                total=total, f=f, filtered=any(f.values()),
+                total=total, installing=installing, f=f, filtered=any(f.values()),
                 opt_state=opt_state, opt_channel=opt_channel, opt_tenant=opt_tenant,
                 care_counts=care_counts, care_labels=CARE_FILTER_LABEL,
                 can_create="dev" in node_profiles(),

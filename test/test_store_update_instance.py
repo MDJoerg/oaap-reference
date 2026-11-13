@@ -26,6 +26,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import zipfile
@@ -280,6 +281,29 @@ ok("... mit Test-Instanz: <Name>-test auf dem Test-Kanal",
    r.get("ok") and BUILT[-1]["key"] == a.instance_key(KA, "verein-drei-test")
    and BUILT[-1]["channel"] == "test", (r, BUILT[-1:]))
 
+
+print("\n=== Name und Mandant beim ERSTEN Installieren (13.11.) ===")
+built_before = len(BUILT)
+r = ask({"instance": "mg", "app_id": "vereinsportal", "new": True,
+         "tenant": KB, "channel": "production"}, by="betreiber")
+ok("der Betreiber waehlt Mandant und Namen: Instanz 'mg' in kunde-b",
+   r.get("ok") and BUILT[-1]["key"] == a.instance_key(KB, "mg")
+   and a.load_registry()["instances"][BUILT[-1]["key"]]["tenant"] == KB, (r, BUILT[-1:]))
+built_before = len(BUILT)
+r = ask({"instance": "verein-fuenf", "app_id": "vereinsportal", "new": True,
+         "tenant": KB}, by="chef-a")
+ok("ein Mandanten-Admin kann keinen fremden Mandanten waehlen: er bleibt in seinem",
+   r.get("ok") and BUILT[-1]["key"] == a.instance_key(KA, "verein-fuenf"), (r, BUILT[-1:]))
+built_before = len(BUILT)
+r = ask({"instance": "verein-sechs", "app_id": "vereinsportal", "new": True,
+         "tenant": "gibt-es-nicht"}, by="betreiber")
+ok("ein unbekannter Mandant: abgelehnt, nichts gebaut (kein Ausweichen nach default)",
+   not r.get("ok") and len(BUILT) == built_before, r)
+built_before = len(BUILT)
+r = ask({"instance": "vereinsportal", "app_id": "vereinsportal"}, by="betreiber")
+ok("ohne Mandant: wie bisher der Mandant des Betreibers (default)",
+   r.get("ok") and BUILT[-1]["key"] == a.instance_key(default_id, "vereinsportal"), (r, BUILT[-1:]))
+
 print("\n=== das Portal ===")
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))
 import app as portal                                           # noqa: E402
@@ -394,6 +418,61 @@ ok("neue Instanz: Name als Instanz, App-Id getrennt, kein 'update'",
    len(q) == 1 and q[0]["instance"] == "verein-vier"
    and q[0]["app_id"] == "vereinsportal" and q[0].get("new") is True
    and "update" not in q[0] and q[0]["channel"] == "test", q)
+
+
+print("\n=== Portal: Name beim ersten Installieren, Mandant fuer den Betreiber ===")
+INST.clear()
+t = page()
+ok("ohne Instanz: ein Namensfeld (leer = App-Id), nicht Pflicht",
+   'name="name"' in t and 'placeholder="vereinsportal"' in t
+   and 'name="name" required' not in t, t[-1500:])
+r = c.post("/store/install", headers=H, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "name": "mg"})
+q = queued()
+ok("ein eigener Name beim ersten Installieren wird eine neue Instanz unter diesem Namen",
+   len(q) == 1 and q[0]["instance"] == "mg" and q[0].get("new") is True, q)
+r = c.post("/store/install", headers=H, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "name": ""})
+q = queued()
+ok("leer: wie bisher, die App-Id", len(q) == 1 and q[0]["instance"] == "vereinsportal"
+   and "new" not in q[0], q)
+r = c.post("/store/install", headers=H, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "tenant": KB})
+q = queued()
+ok("ein Mandanten-Admin kann keinen Mandanten mitschicken", len(q) == 1 and "tenant" not in q[0], q)
+
+portal.multi_tenant = lambda: True
+portal.load_tenants = lambda: {default_id: {"label": "default"}, KA: {"label": "kunde-a"},
+                               KB: {"label": "kunde-b", "name": "Kunde B"}}
+portal.default_tenant_id = lambda: default_id
+t = page()
+ok("Mandanten-Admin auf Mehrmandanten-Knoten: der Zielmandant steht da",
+   "Wird im Mandanten" in t and "<strong>kunde-a</strong>" in t and 'name="tenant"' not in t, t[-1500:])
+portal.caller_roles = lambda: {"server_admin"}
+portal.caller_scope = lambda: ("server_admin", default_id)
+HB = {"X-OAAP-User": "betreiber", "X-OAAP-Roles": "server_admin"}
+portal.host_tenant_scope = lambda host: (KB, True)
+t = c.get("/store/catalog-katalog/vereinsportal", headers=HB).get_data(as_text=True)
+ok("Betreiber: Auswahl aller Mandanten, vorbelegt mit dem der Adresse",
+   'name="tenant"' in t and f'value="{KB}" selected' in t and "kunde-a" in t,
+   t[t.find("<main>"):t.find("<main>")+700])
+portal.host_tenant_scope = lambda host: (None, True)
+t = c.get("/store/catalog-katalog/vereinsportal", headers=HB).get_data(as_text=True)
+ok("... an der Knotenadresse vorbelegt mit default", f'value="{default_id}" selected' in t)
+r = c.post("/store/install", headers=HB, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "tenant": KB, "name": "mg"})
+q = queued()
+ok("Betreiber: die Anfrage nennt den gewaehlten Mandanten und den Namen",
+   len(q) == 1 and q[0].get("tenant") == KB and q[0]["instance"] == "mg", q)
+r = c.post("/store/install", headers=HB, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "tenant": "erfunden"})
+q = queued()
+ok("ein Mandant, den es nicht gibt, wird nicht weitergereicht", len(q) == 1 and "tenant" not in q[0], q)
+INST["kunde-a-mg"] = rec("mg")
+r = c.post("/store/install", headers=HB, data={
+    "app_id": "vereinsportal", "source_id": "catalog-katalog", "tenant": KB, "name": "mg"})
+q = queued()
+ok("derselbe Name in einem ANDEREN Mandanten ist kein Konflikt", len(q) == 1, (q, r.headers.get("Location")))
 
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)
