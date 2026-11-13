@@ -18,7 +18,7 @@ What it reads:
 
 state.json:
 
-    {"v": 1, "started", "written", "connected", "messages",
+    {"v": 1, "started", "written", "connected", "connected_since", "messages",
      "nodes":   {"<via>/<n>" | "<n>": {"name", "via", "alive", "rx", "gaps",
                                        "resets", "status": {"digest", "rx", "bytes"}}},
      "bridges": {"<entry>@<hub>": {"entry", "hub", "up", "since", "rx"}},
@@ -182,6 +182,9 @@ def handle(topic, raw, now):
 def on_connect(client, _userdata, _flags, reason_code, _properties):
     with lock:
         state["connected"] = not reason_code.is_failure
+        if not reason_code.is_failure:
+            # the fleet watch's catch-up rule counts from here (fleet_watch.CATCHUP)
+            state["connected_since"] = int(time.time())
     if reason_code.is_failure:
         print(f"fleet: the broker refused the login ({reason_code})", flush=True)
         return

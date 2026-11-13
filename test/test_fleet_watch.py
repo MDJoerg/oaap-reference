@@ -89,6 +89,32 @@ ok("Bruecke seit 30 s zurueck, letztes alive von davor: unbekannt, keine Meldung
    fw.hub_conditions(back, NOW, "hub") == {} and fw.view(back, NOW, "hub")[0]["reason"].endswith("gerade zurück"))
 back2 = st({"e/x": {"name": "x", "via": "e", "alive": alive(780)}}, bridges=br("e", True, NOW - 121))
 ok("nach zwei Minuten ohne neues alive: schweigt doch", set(fw.hub_conditions(back2, NOW, "hub")) == {"node.silent/x"})
+# Aufholen nach der Rueckkehr der Zentrale (gemessen 13.11.: oaap-demo 13 Min
+# aus, drei direkte Knoten 4-5 Min spaeter zurueck -- je zwei Mails)
+cu = st({"d": {"name": "d", "via": "", "alive": alive(1000)}}, started=NOW - 240)
+ok("Zentrale seit 4 Min zurueck, letztes alive von davor: unbekannt ('holt auf'), keine Meldung",
+   fw.hub_conditions(cu, NOW) == {} and "holt auf" in fw.view(cu, NOW)[0]["reason"], fw.view(cu, NOW))
+cu2 = dict(cu, started=NOW - 9999, connected_since=NOW - 240)
+ok("dasselbe nach einer Wiederverbindung des Dienstes (connected_since)", fw.hub_conditions(cu2, NOW) == {})
+cu3 = st({"d": {"name": "d", "via": "", "alive": alive(1100)}}, started=NOW - fw.CATCHUP - 1)
+ok("nach CATCHUP ohne neues alive: schweigt doch", set(fw.hub_conditions(cu3, NOW)) == {"node.silent/d"})
+cu4 = st({"d": {"name": "d", "via": "", "alive": alive(400)}}, started=NOW - 600)
+ok("ein alive von NACH der Rueckkehr zaehlt normal: schweigt", set(fw.hub_conditions(cu4, NOW)) == {"node.silent/d"})
+ok("CATCHUP deckt die laengste Wartezeit des Senders (Zwei Wege, eine Regel)",
+   fw.CATCHUP >= ms.BACKOFF_MAX + fw.WARMUP, (fw.CATCHUP, ms.BACKOFF_MAX))
+# 'unbekannt' schliesst keine offene Sache
+held = {"node.silent/x": {"type": "node.silent", "kurz": "x", "text": "alt"}}
+ok("offene Sache, Knoten jetzt hinter getrennter Bruecke: bleibt offen, kein 'Behoben'",
+   fw.hub_conditions(behind, NOW, "hub", held).get("node.silent/x") == held["node.silent/x"])
+ok("offene Sache, Dienst startet gerade: bleibt offen", fw.hub_conditions(warm, NOW, None,
+   {"node.silent/c": {"type": "node.silent"}}) == {"node.silent/c": {"type": "node.silent"}})
+ok("offene Sache, Knoten wieder da: schliesst", fw.hub_conditions(s, NOW, None,
+   {"node.silent/a": {"type": "node.silent"}}).get("node.silent/a") is None)
+hb = {"bridge.down/e": {"type": "bridge.down", "kurz": "e"}}
+ok("offene Bruecke, Dienst startet gerade, Bruecke noch weg: bleibt offen",
+   "bridge.down/e" in fw.hub_conditions(st(bridges=br("e", False, NOW - 999), started=NOW - 30), NOW, "hub", hb))
+ok("offene Bruecke, Bruecke wieder da: schliesst",
+   "bridge.down/e" not in fw.hub_conditions(st(bridges=br("e", True, NOW - 10), started=NOW - 30), NOW, "hub", hb))
 other = st(bridges=br("hub", False, NOW - 9999, hub="anderer"))
 ok("die Bruecke einer ANDEREN Zentrale in diesen Knoten wird hier nicht beurteilt "
    "(gemessen auf oaap-test, das beide Rollen trug)", fw.hub_conditions(other, NOW, "hub") == {})

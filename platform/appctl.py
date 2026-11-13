@@ -26221,14 +26221,18 @@ def fleet_conditions(now):
     now_e = now.timestamp()
     dflt = default_tenant_id()
 
+    def held(types):
+        return {key: {k: rec[k] for k in ("type", "instanz", "kurz", "text") if k in rec}
+                for key, rec in ((_notify_state_rw().get("matters") or {}).get(dflt) or {}).items()
+                if rec.get("type") in types}
+
     def keep(types):
-        for key, rec in ((_notify_state_rw().get("matters") or {}).get(dflt) or {}).items():
-            if rec.get("type") in types:
-                out[key] = {k: rec[k] for k in ("type", "instanz", "kurz", "text") if k in rec}
+        out.update(held(types))
     if has_profile("fleet-hub"):
         state = _read_json_file(FLEET_STATE)
         if fleet_watch.trusted(state, now_e):
-            out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name()))
+            out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name(),
+                                                  held(fleet_watch.FLEET_MATTERS)))
             found = []
 
             def run(st):

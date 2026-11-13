@@ -17,6 +17,14 @@ The rules, in one place:
   * the first two minutes after the fleet service started are a warm-up:
     nothing new is opened (a hub restart before the first full interval
     is "unknown", §6.1);
+  * **catching up**: after the fleet service started or reconnected to its
+    broker, a node whose last `alive` is from before gets CATCHUP seconds
+    before it can be silent -- a node that could not reach the hub waits
+    up to 15 minutes between tries (the metrics sender's backoff); measured
+    2026-11-13: oaap-demo stopped 13 minutes, three direct nodes back 4-5
+    minutes after the hub, each an open and a close mail;
+  * what can no longer be judged ("unknown") keeps an open matter open --
+    it is never mailed as "Behoben";
   * a **bridge** is down when its notification says `0` for five minutes;
   * a **broker queue** warns above half of its bound (§6.2);
   * **node.loss**: the node's own outbox reported more lost samples than
@@ -33,6 +41,7 @@ HUB_UNREACHABLE_AFTER = 600
 QUEUE_WARN = 0.5
 STATE_STALE = 180          # an older state.json is not trusted at all
 WARMUP = 120
+CATCHUP = 17 * 60          # the sender's longest backoff (15 min) + 2 min
 FLEET_MATTERS = ("node.silent", "bridge.down", "broker.queue")
 
 
@@ -91,6 +100,7 @@ def view(state, now, me=None):
     what `oaap fleet hub show` prints and what the conditions use."""
     rows = []
     warm = now - (state.get("started") or now) < WARMUP
+    back = max(state.get("started") or 0, state.get("connected_since") or 0)
     for key, n in sorted((state.get("nodes") or {}).items()):
         a = n.get("alive") or {}
         t = parse_t(a.get("t"))
@@ -108,8 +118,12 @@ def view(state, now, me=None):
             # minute -- an open and a close mail each (measured on oaap-test,
             # 2026-11-12).
             st, why = "unknown", f"Eingang {via} gerade zurück"
+        elif age > SILENT_AFTER and warm:
+            st, why = "unknown", "Dienst startet gerade"
+        elif age > SILENT_AFTER and t < back and now - back < CATCHUP:
+            st, why = "unknown", "Zentrale gerade zurück, Sender holt auf"
         elif age > SILENT_AFTER:
-            st, why = ("unknown", "Dienst startet gerade") if warm else ("silent", "")
+            st, why = "silent", ""
         rows.append({"name": n.get("name") or key, "via": via, "state": st, "age": age,
                      "version": a.get("version", ""), "seq": a.get("seq"),
                      "gaps": int(n.get("gaps", 0)), "lost": a.get("lost"),
@@ -117,12 +131,18 @@ def view(state, now, me=None):
     return rows
 
 
-def hub_conditions(state, now, me=None):
+def hub_conditions(state, now, me=None, open_matters=None):
     """{key: condition} for the hub's default scope; `me` is the hub's name
-    on the wire (only its own bridges count)."""
+    on the wire (only its own bridges count). `open_matters` ({key:
+    condition}, the matters open now): one whose subject is "unknown" this
+    minute stays open as it is."""
     out = {}
+    held = open_matters or {}
     rows = view(state, now, me)
     for r in rows:
+        key = f"node.silent/{r['name']}"
+        if r["state"] == "unknown" and key in held:
+            out[key] = held[key]
         if r["state"] != "silent":
             continue
         last = iso(now - r["age"])
@@ -137,6 +157,8 @@ def hub_conditions(state, now, me=None):
     warm = now - (state.get("started") or now) < WARMUP
     for entry, b in sorted(own_bridges(state, me).items()):
         since = b.get("since")
+        if warm and not b.get("up") and f"bridge.down/{entry}" in held:
+            out[f"bridge.down/{entry}"] = held[f"bridge.down/{entry}"]
         if b.get("up") or not isinstance(since, (int, float)) or warm:
             continue
         if now - since < BRIDGE_DOWN_AFTER:
