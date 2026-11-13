@@ -734,6 +734,18 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
       "${BROKER_FILES[@]}" --profile broker up -d --no-deps broker >/dev/null 2>&1 \
       || say "  WARNING: could not re-apply the broker's raw device port — check 'docker ps'."
   fi
+  # The broker writes its configuration from the template at container
+  # start; a changed template alone recreates nothing. A running broker
+  # whose configuration lacks a line the template now has (0.1.272:
+  # persistent_client_expiration) is restarted once -- persistence keeps
+  # its sessions and retained values, bridges reconnect by themselves.
+  if [ -n "$(docker ps -q -f name=^oaap-broker-1$ -f status=running)" ] \
+     && ! docker exec oaap-broker-1 grep -q '^persistent_client_expiration' /tmp/mosquitto.conf 2>/dev/null; then
+    say ""
+    say "Restarting the MQTT broker for its new configuration (sessions expire after 7 days) ..."
+    docker restart oaap-broker-1 >/dev/null 2>&1 && say "  Done." \
+      || say "  WARNING: could not restart the broker — check 'docker ps'."
+  fi
   # The outbox relay rides on the same profile (oaap.data.twin 0.3). Same
   # safety net as the broker's, '--no-deps' so it never touches 'broker'.
   if [ -z "$(docker ps -q -f name=^oaap-relay-1$ -f status=running)" ]; then

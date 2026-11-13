@@ -36,6 +36,12 @@ allow_anonymous false
 
 persistence true
 persistence_location /mosquitto/data/
+# A persistent session (clean session off) whose client has not come back
+# for 7 days is discarded with its queue and subscriptions (RFC-0085 §15,
+# oaap.events.broker 0.4). Without it the session of a revoked key lived
+# for ever, and the broker asked identity about it for every matching
+# message. 7 days outlast an entry's 24-hour queue (D6) many times over.
+persistent_client_expiration 7d
 log_dest stdout
 
 auth_plugin /mosquitto/go-auth.so
