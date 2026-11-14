@@ -87,6 +87,12 @@ ok("eine Aenderung der semantischen ID ist zerstoerend, ihr Hinzufuegen additiv"
                       {"key": "K", "semantic_id": "oaap-aas:A/0/2"}) == "destructive"
    and a.type_change_kind({"key": "K"}, {"key": "K", "semantic_id": "oaap-aas:A/0/1"}) == "additive")
 
+import inspect                    # noqa: E402
+src = inspect.getsource(a.fleet_hub_twin)
+ok("hub twin legt das Typregister an, BEVOR es den Zwilling anlegt (oaap-demo 14.11.: "
+   "Store ohne oaap_model)",
+   0 < src.find("_model_ensure_schema()") < src.find("_twin_ensure_schema(tid)"))
+
 print("=== Teil 1: Statusdokument -> Gruppen ===")
 DOC = {
     "schema": "oaap.fleet.status/0.9", "node": "oaap.joomp.de", "alias": "oaapx01",

@@ -26447,6 +26447,10 @@ def fleet_hub_twin(label):
     if errs:
         die("the fleet's own data model is invalid (a bug, not a setting):\n  "
             + "\n  ".join(errs))
+    # The registry first: the twin schema's grants name oaap_model, and a
+    # store where no app ever registered a type has none (oaap-demo,
+    # 2026-11-14: "schema oaap_model does not exist" -- oaap-test had one).
+    _model_ensure_schema()
     _twin_ensure_schema(tid)
     plan = model_register_data_model(fm.ORIGIN, fm.PACKAGE, fm.VERSION, dm, tenant_id=tid)
     timeseries_enable(tid)
