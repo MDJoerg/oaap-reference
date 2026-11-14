@@ -70,6 +70,18 @@ from yarl import URL
 
 import propagate
 
+
+def tunnel_id(key_hash_hex):
+    """The tunnel's shared, non-secret id (RFC-0087 §3) from the connect
+    key's SHA-256 hex digest. The same rule as portal/fleet_links.py --
+    test_fleet_links.py holds the two together. The outer side has the
+    digest, the inner side the key: both get the same id, nothing crosses
+    the tunnel."""
+    if not key_hash_hex:
+        return ""
+    return "t-" + hashlib.sha256(("oaap-tunnel-id/1\n" + key_hash_hex).encode()).hexdigest()[:24]
+
+
 APPS = os.environ.get("CONNECT_APPS", "/platform-apps")
 SECRETS = os.environ.get("CONNECT_SECRETS", "/secrets")
 STATE = os.environ.get("CONNECT_STATE", "/state")
@@ -463,6 +475,7 @@ class Node:
             t = self.tunnels.get(label)
             tunnels[label] = {
                 "tenant": r.get("tenant", ""),
+                "tunnel_id": tunnel_id(r.get("hash", "")),
                 "connected": bool(t and not t.closed),
                 "since": t.since if t else "",
                 "remote": t.remote if t else "",
@@ -478,6 +491,8 @@ class Node:
                 "endpoint": c.get("endpoint", ""),
                 "paused": bool(c.get("paused")),
                 "key": bool(self.keys.get(label)),
+                "tunnel_id": tunnel_id(hashlib.sha256(self.keys[label].encode()).hexdigest())
+                if self.keys.get(label) else "",
                 "connected": bool(conn and conn.connected),
                 "since": conn.since if conn else "",
                 "last_error": conn.last_error if conn else "",

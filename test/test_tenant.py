@@ -267,8 +267,20 @@ check("aber das Portal erfaehrt ihn — sonst koennte es nicht filtern",
       "es muss einem tenant_admin dessen eigenen Mandanten zeigen koennen")
 
 fleet = read("services/portal/fleet_view.py")
-check("die Flotten-Auskunft nennt keinen Mandanten", "tenant" not in fleet,
-      "sie beantwortet die Frage nach dem KNOTEN und gehört dem Betreiber")
+links_src = read("services/portal/fleet_links.py")
+# Bis 0.9 nannte die Flotten-Auskunft nie einen Mandanten. RFC-0087 D2
+# (Joerg, 14.11.): Mandanten sind Assets ihres Knotens und duerfen hinaus --
+# aber NUR ueber die Preisgabe (Obergrenze des Knotens, Stufe je Mandant).
+# fleet_view selbst kennt weiterhin keine Mandanten, es reicht durch.
+check("die Flotten-Auskunft holt keinen Mandanten selbst",
+      "load_tenants" not in fleet and "TENANTS" not in fleet and "tenants.get(" not in fleet,
+      "fleet_view reicht nur durch, was fleet_links nach der Preisgabe baut")
+check("ein Mandantenname entsteht nur in Disclosure.tenant / .thing (RFC-0087 §4)",
+      links_src.count('.get("label")') == 1
+      and 'return (self.tenants.get(tid) or {}).get("label") or tid' in links_src
+      and links_src.count('row["tenant"] = tname') == 2
+      and links_src.count("tname = d.tenant(") >= 2,
+      "jede Stelle, die einen Mandanten in eine Zeile schreibt, fragt vorher die Preisgabe")
 
 check("identity schreibt den Mandantenspeicher nicht",
       "TENANTS_FILE" in ident and "_save(TENANTS_FILE" not in ident,

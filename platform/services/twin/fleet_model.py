@@ -21,9 +21,12 @@ groups; `owner.*` are registered for people and never written by it.
 
 ORIGIN = "platform:fleet"
 PACKAGE = "oaap-fleet"
-VERSION = "0.1.0"
+VERSION = "0.2.0"     # 0.2.0: half-edges (RFC-0087)
 
 NODE, BROKER, INSTANCE = "FleetNode", "FleetBroker", "FleetInstance"
+# RFC-0087: the links between and behind nodes
+TENANT, TUNNEL, DESTINATION, EXTERNAL = ("FleetTenant", "FleetTunnel", "FleetDestination",
+                                         "FleetExternal")
 
 IDTA_SOFTWARE = "https://admin-shell.io/idta/SoftwareNameplate/1/0"
 IDTA_SW_INSTANCE = IDTA_SOFTWARE + "/SoftwareNameplate/SoftwareNameplateInstance/"
@@ -94,6 +97,32 @@ _ATTRS = [
     ("autoState", "text", _own("InstanceRuntime/0/1/AutoState"), "Zustand automatische Adresse"),
     # oaap.broker
     ("role", "text", _own("Broker/0/1/Role"), "Rolle"),
+    # oaap.tenant (RFC-0087 §4)
+    ("tenantName", "text", _own("FleetTenant/0/1/Name"), "Mandant"),
+    ("level", "text", _own("FleetTenant/0/1/Level"), "Preisgabe"),
+    ("instanceCount", "int", _own("FleetTenant/0/1/Instances"), "Instanzen"),
+    # oaap.tunnel.outer / .inner -- each half written from its own node (§5)
+    ("outerLabel", "text", _own("FleetTunnel/0/1/Outer/Label"), "Name außen"),
+    ("outerState", "text", _own("FleetTunnel/0/1/Outer/State"), "Zustand außen"),
+    ("outerSince", "datetime", _own("FleetTunnel/0/1/Outer/Since"), "Verbunden seit"),
+    ("outerOffers", "text", _own("FleetTunnel/0/1/Outer/Offers"), "Angekündigte Angebote"),
+    ("innerLabel", "text", _own("FleetTunnel/0/1/Inner/Label"), "Name innen"),
+    ("innerState", "text", _own("FleetTunnel/0/1/Inner/State"), "Zustand innen"),
+    ("innerPaused", "bool", _own("FleetTunnel/0/1/Inner/Paused"), "Angehalten"),
+    ("innerOffers", "text", _own("FleetTunnel/0/1/Inner/Offers"), "Angebote"),
+    # oaap.destination
+    ("destName", "text", _own("FleetDestination/0/1/Name"), "Destination"),
+    ("destKind", "text", _own("FleetDestination/0/1/Kind"), "Weg"),
+    ("destOffer", "text", _own("FleetDestination/0/1/Offer"), "Angebot"),
+    ("destState", "text", _own("FleetDestination/0/1/State"), "Zustand"),
+    ("boundCount", "int", _own("FleetDestination/0/1/Bound"), "Gebunden"),
+    # oaap.external -- the edge of what the fleet knows (§5.1)
+    ("extName", "text", _own("FleetExternal/0/1/Name"), "Ziel"),
+    ("extKind", "text", _own("FleetExternal/0/1/Kind"), "Art"),
+    ("extState", "text", _own("FleetExternal/0/1/State"), "Zustand"),
+    # owner.link -- people only: the far end in someone else's world (§5.1)
+    ("externalId", "text", _own("FleetExternal/0/1/Link/ExternalId"), "Externe Kennung"),
+    ("externalSource", "text", _own("FleetExternal/0/1/Link/Source"), "Wessen Welt"),
     # owner.* -- written by people only
     ("contactName", "text", "0173-1#02-AAO205#002", "Ansprechpartner"),
     ("contactRole", "text", "0173-1#02-AAO204#003", "Rolle"),
@@ -137,8 +166,23 @@ GROUPS = [
      "Software"),
     ("oaap.runtime", INSTANCE, _own("InstanceRuntime/0/1"),
      ["channel", "runState", "origin", "address", "autoAddress", "autoState"],
-     ["isPartOf"], "Laufzeit"),
+     ["isPartOf", "heldBy", "bindsTo"], "Laufzeit"),
     ("oaap.broker", BROKER, _own("Broker/0/1"), ["role"], ["bridgedTo"], "Broker"),
+    # RFC-0087
+    ("oaap.tenant", TENANT, _own("FleetTenant/0/1"), ["tenantName", "level", "instanceCount"],
+     ["tenantOn"], "Mandant"),
+    ("oaap.tunnel.outer", TUNNEL, _own("FleetTunnel/0/1/Outer"),
+     ["outerLabel", "outerState", "outerSince", "outerOffers"], ["servedBy"], "Äußere Seite"),
+    ("oaap.tunnel.inner", TUNNEL, _own("FleetTunnel/0/1/Inner"),
+     ["innerLabel", "innerState", "innerPaused", "innerOffers"],
+     ["dialedBy", "reaches"], "Innere Seite"),
+    ("oaap.destination", DESTINATION, _own("FleetDestination/0/1"),
+     ["destName", "destKind", "destOffer", "destState", "boundCount"],
+     ["definedOn", "destOf", "usesTunnel", "usesExternal"], "Destination"),
+    ("oaap.external", EXTERNAL, _own("FleetExternal/0/1"), ["extName", "extKind", "extState"],
+     ["behind"], "Externes Ende"),
+    ("owner.link", EXTERNAL, _own("FleetExternal/0/1/Link"),
+     ["externalId", "externalSource", "notes"], [], "Verknüpfung"),
 ]
 
 def ak(name):
@@ -160,12 +204,37 @@ RELATIONS = [
      "meldet über", "nimmt Meldungen an von"),
     ("bridgedTo", BROKER, BROKER, _own("PeerRelations/0/1/BridgedTo"),
      "ist gebrückt zu", "nimmt Brücke an von"),
+    # RFC-0087 §5
+    ("tenantOn", TENANT, NODE, IDTA_IS_PART_OF, "gehört zu Knoten", "hält Mandant"),
+    ("heldBy", INSTANCE, TENANT, _own("PeerRelations/0/2/HeldBy"), "gehört Mandant", "hat Instanz"),
+    ("bindsTo", INSTANCE, DESTINATION, _own("PeerRelations/0/2/BindsTo"),
+     "ruft über", "wird gerufen von"),
+    ("servedBy", TUNNEL, NODE, _own("PeerRelations/0/2/ServedBy"),
+     "endet außen auf", "nimmt Tunnel an"),
+    ("dialedBy", TUNNEL, NODE, _own("PeerRelations/0/2/DialedBy"),
+     "wird aufgebaut von", "baut Tunnel auf"),
+    ("reaches", TUNNEL, INSTANCE, _own("PeerRelations/0/2/Reaches"),
+     "erreicht", "erreichbar über"),
+    ("definedOn", DESTINATION, NODE, _own("PeerRelations/0/2/DefinedOn"),
+     "liegt auf", "hat Destination"),
+    ("destOf", DESTINATION, TENANT, _own("PeerRelations/0/2/DestinationOf"),
+     "gehört Mandant", "hat Destination"),
+    ("usesTunnel", DESTINATION, TUNNEL, _own("PeerRelations/0/2/UsesTunnel"),
+     "geht durch", "trägt"),
+    ("usesExternal", DESTINATION, EXTERNAL, _own("PeerRelations/0/2/UsesExternal"),
+     "führt zu", "erreicht über"),
+    ("behind", EXTERNAL, INSTANCE, _own("PeerRelations/0/2/Behind"),
+     "liegt hinter", "führt zu"),
 ]
 
 OBJECTS = [
     (NODE, "Knoten", "Knoten", _own("FleetNode/0/1")),
     (BROKER, "Broker", "Broker", _own("FleetBroker/0/1")),
     (INSTANCE, "Instanz", "Instanzen", _own("FleetInstance/0/1")),
+    (TENANT, "Mandant", "Mandanten", _own("FleetTenant/0/1")),
+    (TUNNEL, "Tunnel", "Tunnel", _own("FleetTunnel/0/1")),
+    (DESTINATION, "Destination", "Destinationen", _own("FleetDestination/0/1")),
+    (EXTERNAL, "Externes Ende", "Externe Enden", _own("FleetExternal/0/1")),
 ]
 
 # The node's series (RFC-0086), one per metric of the sender (metrics.SERIES).

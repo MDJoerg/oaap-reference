@@ -20,6 +20,14 @@ Rules, all from twin_write (the API's own):
     people's and never touched here;
   * an unchanged value writes nothing, so a status document that arrives
     again (a resubscribe, a restart) costs reads, not rows.
+
+Half-edges (RFC-0087): a node's `links` and `tenants` (oaap.fleet.status
+0.10) become tenants, tunnels, destinations and external ends. A tunnel is
+ONE object for two nodes (`tunnel:<id>`), each writing its own half's group;
+whatever disappears from a node's document is marked `removed` and its
+relations are closed with `valid_to` -- history stays, nothing is deleted.
+A node that still speaks 0.9 sends no `links`, and nothing of its links is
+touched.
 """
 import json
 import os
@@ -55,6 +63,10 @@ class Sink:
         self.dir = fleet_dir
         self.ids = {}           # source key -> object id
         self.series = {}        # (object id, measure) -> series id
+        # tunnel object id -> {"outer": state, "inner": (state, paused)}: the
+        # halves last seen, for the joined state series (RFC-0087 §5). Not a
+        # cache of the database -- it survives a failed flush.
+        self.halves = {}
         self.last_error = ""
 
     # -- where
@@ -146,6 +158,12 @@ class Sink:
                         st = (verdict.get(name) or {}).get("state") or "unknown"
                         self._points(drv, self._series(drv, oid, fm.TEXT_STATE, "text"),
                                      [(int(now) // 60 * 60, st)], now)
+                if drv is not None:
+                    t = int(now) // 60 * 60
+                    for toid, h in list(self.halves.items()):
+                        st = ft.joined_state(h.get("outer"), h.get("inner"))
+                        self._points(drv, self._series(drv, toid, fm.TEXT_STATE, "text"),
+                                     [(t, st)], now)
             left["status"] = {}         # committed
             if drv is not None and left["points"]:
                 by = {}
@@ -192,6 +210,7 @@ class Sink:
             rows += tw.write_group(conn, iid, "oaap.runtime", fm.ORIGIN, BY,
                                    {"relations": [{"key": fm.ak("isPartOf"), "target": oid}]})
         rows += self._mark_gone(conn, name, seen)
+        rows += self._write_links(conn, name, oid, doc, now)
         if drv is not None:
             t = int(now) // 60 * 60
             for measure, state in ft.core_states(doc).items():
@@ -243,3 +262,130 @@ class Sink:
                 self._points(drv, self._series(drv, eid, "bridge", "text"),
                              [(t, "up" if b.get("up") else "down")], now)
         return rows
+
+    # -- half-edges (RFC-0087)
+
+    def _sync_rel(self, conn, oid, group, rel_key, targets, now_iso):
+        """The open relations `rel_key` of this group are exactly `targets`:
+        new ones opened, missing ones closed with valid_to (never deleted)."""
+        rk = fm.ak(rel_key)
+        targets = sorted({str(t) for t in targets if t})
+        with conn.cursor() as cur:
+            cur.execute("SELECT target_id, valid_from FROM current_relations WHERE object_id = %s "
+                        "AND group_key = %s AND rel_key = %s AND valid_to IS NULL",
+                        (oid, group, rk))
+            current = cur.fetchall()
+        rels = [{"key": rk, "target": t} for t in targets]
+        rels += [{"key": rk, "target": str(r["target_id"]), "valid_from": r["valid_from"],
+                  "valid_to": now_iso}
+                 for r in current if str(r["target_id"]) not in targets]
+        return tw.write_group(conn, oid, group, fm.ORIGIN, BY, {"relations": rels})
+
+    def _prefixed(self, conn, prefix):
+        """{source key: object id} of the fleet's objects under a prefix."""
+        like = prefix.replace("\\", "").replace("%", "").replace("_", "\\_") + "%"
+        with conn.cursor() as cur:
+            cur.execute("SELECT object_id, source_key FROM source_keys WHERE origin = %s "
+                        "AND source_key LIKE %s", (fm.ORIGIN, like))
+            return {r["source_key"]: str(r["object_id"]) for r in cur.fetchall()}
+
+    def _open_from(self, conn, rel_key, target):
+        """Objects with an open relation `rel_key` to `target`."""
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT object_id FROM current_relations WHERE rel_key = %s "
+                        "AND target_id = %s AND valid_to IS NULL", (fm.ak(rel_key), target))
+            return {str(r["object_id"]) for r in cur.fetchall()}
+
+    def _write_links(self, conn, name, oid, doc, now):
+        if not isinstance(doc, dict) or ("links" not in doc and "tenants" not in doc):
+            return 0            # a 0.9 node: its links are not ours to judge
+        iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+        rows = 0
+
+        tenants, seen = {}, set()
+        for key, title, groups in ft.tenant_rows(doc, name):
+            xid = self._object(conn, fm.TENANT, key, title, "oaap.tenant")
+            tenants[title] = xid
+            seen.add(key)
+            rows += self._groups(conn, xid, groups)
+            rows += self._sync_rel(conn, xid, "oaap.tenant", "tenantOn", [oid], iso)
+        for key, xid in self._prefixed(conn, f"tenant:{name}/").items():
+            if key not in seen:
+                rows += self._groups(conn, xid, {"oaap.tenant": {"level": ft.REMOVED}})
+                rows += self._sync_rel(conn, xid, "oaap.tenant", "tenantOn", [], iso)
+
+        inst_oid = {}
+        for inst, _g in ft.instance_rows(doc):
+            inst_oid[inst] = self._object(conn, fm.INSTANCE, f"{name}/{inst}", inst, "oaap.runtime")
+
+        outer, inner = set(), set()
+        for tid_, side, groups, reached in ft.tunnel_halves(doc):
+            toid = self._object(conn, fm.TUNNEL, "tunnel:" + tid_, tid_, "oaap.tunnel." + side)
+            rows += self._groups(conn, toid, groups)
+            h = self.halves.setdefault(toid, {})
+            g = groups["oaap.tunnel." + side]
+            if side == "outer":
+                outer.add(toid)
+                h["outer"] = g["outerState"]
+                rows += self._sync_rel(conn, toid, "oaap.tunnel.outer", "servedBy", [oid], iso)
+            else:
+                inner.add(toid)
+                h["inner"] = (g["innerState"], g["innerPaused"])
+                rows += self._sync_rel(conn, toid, "oaap.tunnel.inner", "dialedBy", [oid], iso)
+                rows += self._sync_rel(conn, toid, "oaap.tunnel.inner", "reaches",
+                                       [inst_oid[i] for i in reached if i in inst_oid], iso)
+        if "links" in doc:
+            for toid in self._open_from(conn, "servedBy", oid) - outer:
+                rows += self._groups(conn, toid, {"oaap.tunnel.outer": {"outerState": ft.REMOVED}})
+                rows += self._sync_rel(conn, toid, "oaap.tunnel.outer", "servedBy", [], iso)
+                self.halves.get(toid, {}).pop("outer", None)
+            for toid in self._open_from(conn, "dialedBy", oid) - inner:
+                rows += self._groups(conn, toid, {"oaap.tunnel.inner": {"innerState": ft.REMOVED}})
+                rows += self._sync_rel(conn, toid, "oaap.tunnel.inner", "dialedBy", [], iso)
+                rows += self._sync_rel(conn, toid, "oaap.tunnel.inner", "reaches", [], iso)
+                self.halves.get(toid, {}).pop("inner", None)
+            for toid in [k for k, v in self.halves.items() if not v]:
+                del self.halves[toid]
+
+        binds, seen_d, seen_e = {}, set(), set()
+        for d in ft.destinations(doc, name):
+            doid = self._object(conn, fm.DESTINATION, d["key"], d["title"], "oaap.destination")
+            seen_d.add(d["key"])
+            rows += self._groups(conn, doid, d["groups"])
+            rows += self._sync_rel(conn, doid, "oaap.destination", "definedOn", [oid], iso)
+            rows += self._sync_rel(conn, doid, "oaap.destination", "destOf",
+                                   [tenants[d["tenant"]]] if d["tenant"] in tenants else [], iso)
+            tun = []
+            if d["tunnel"]:
+                tun = [self._object(conn, fm.TUNNEL, "tunnel:" + d["tunnel"], d["tunnel"],
+                                    "oaap.tunnel.outer")]
+            rows += self._sync_rel(conn, doid, "oaap.destination", "usesTunnel", tun, iso)
+            ext = []
+            if d["external"]:
+                ekey, etitle, egroups, einst = d["external"]
+                eoid = self._object(conn, fm.EXTERNAL, ekey, etitle, "oaap.external")
+                seen_e.add(ekey)
+                ext = [eoid]
+                rows += self._groups(conn, eoid, egroups)
+                rows += self._sync_rel(conn, eoid, "oaap.external", "behind",
+                                       [inst_oid[einst]] if einst in inst_oid else [], iso)
+            rows += self._sync_rel(conn, doid, "oaap.destination", "usesExternal", ext, iso)
+            for b in d["bound"]:
+                binds.setdefault(b, []).append(doid)
+        for key, xid in self._prefixed(conn, f"dest:{name}/").items():
+            if key not in seen_d:
+                rows += self._groups(conn, xid, {"oaap.destination": {"destState": ft.REMOVED}})
+                for rk in ("definedOn", "destOf", "usesTunnel", "usesExternal"):
+                    rows += self._sync_rel(conn, xid, "oaap.destination", rk, [], iso)
+        for key, xid in self._prefixed(conn, f"ext:{name}/").items():
+            if key not in seen_e:
+                rows += self._groups(conn, xid, {"oaap.external": {"extState": ft.REMOVED}})
+                rows += self._sync_rel(conn, xid, "oaap.external", "behind", [], iso)
+
+        it = ft.instance_tenants(doc)
+        for inst, iid in inst_oid.items():
+            held = [tenants[it[inst]]] if it.get(inst) in tenants else []
+            rows += self._sync_rel(conn, iid, "oaap.runtime", "heldBy", held, iso)
+            rows += self._sync_rel(conn, iid, "oaap.runtime", "bindsTo", binds.get(inst, []), iso)
+        return rows
+

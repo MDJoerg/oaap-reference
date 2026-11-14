@@ -31,6 +31,7 @@ import build_view
 import cohort_view
 import disk_view
 import fleet_view
+import fleet_links
 # place.py sits BESIDE this file in the image (the build context is
 # services/, see docker-compose.yml) and one level up in the
 # repository, where a test runs app.py straight from the tree. Both
@@ -7262,6 +7263,36 @@ def _fleet_keys():
         return {}
 
 
+FLEET_DISCLOSE_FILE = "/apps-registry/fleet-disclose.json"
+
+
+def _fleet_links(insts, rows):
+    """0.10 (RFC-0087): the half-edges and the tenants block, and each
+    instance row's outward tenant -- built by fleet_links from what this
+    portal already reads. (None, None) when anything fails: the document
+    then says nothing about links rather than something half-built."""
+    try:
+        conf, st = _connect_data()
+        tenants = load_tenants()
+        hosts = {}
+        for name, inst in insts:
+            for h in (name, instance_auto_host(name, inst), inst.get("address"),
+                      *(inst.get("aliases") or [])):
+                if isinstance(h, str) and h:
+                    hosts.setdefault(h.lower().strip("."), name)
+        links, block, by_inst = fleet_links.build(
+            conf, st, _load_destinations_all(), dict(insts), tenants,
+            _read_json(FLEET_DISCLOSE_FILE) or {}, hosts, resolve_tenant)
+        for row in rows:
+            t = by_inst.get(row.get("instance"))
+            if t:
+                row["tenant"] = t
+        return links, block
+    except Exception as exc:                            # noqa: BLE001
+        app.logger.warning("fleet links not built: %s", exc)
+        return None, None
+
+
 @app.get("/fleet/status")
 def fleet_status():
     # Same brake as the deploy hook (5 failures in 5 min → 1/min), with
@@ -7298,7 +7329,9 @@ def fleet_status():
     # 2.6) -- the view that was missing on 2026-11-05; 0.6: the reboot
     # plan and the protections (2.7).
     facts = care_facts()
+    links, tenants_block = _fleet_links(insts, instances)
     return fleet_view.build_document(
+        links=links, tenants=tenants_block,
         host=host_care.fleet_host(facts),
         identity=node_identity_view(),
         node=ext or request.host.split(":")[0],

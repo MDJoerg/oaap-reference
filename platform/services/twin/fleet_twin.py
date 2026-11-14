@@ -125,3 +125,129 @@ def metric_point(payload):
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         return None
     return m, t, x
+
+
+# --- half-edges (RFC-0087) --------------------------------------------------
+#
+# Source keys get a prefix per kind, so that the instance sweep (`<node>/%`,
+# fleet_sink._mark_gone) never takes a tenant or a destination for an
+# instance: `tenant:<node>/<name>`, `dest:<node>/<tenant>/<name>`,
+# `ext:<node>/<instance>/<target>`, `tunnel:<id>` -- the tunnel alone has no
+# node in its key, because two nodes write it.
+
+import re as _re
+
+TUNNEL_ID = _re.compile(r"^t-[0-9a-f]{24}$")
+_NAME = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+REMOVED = "removed"
+
+
+def _name(v):
+    return str(v) if isinstance(v, str) and _NAME.match(v) else ""
+
+
+def _links(doc):
+    return [lk for lk in (doc or {}).get("links") or [] if isinstance(lk, dict)]
+
+
+def tenant_rows(doc, node):
+    """[(source key, title, {group: values})] -- the tenants the node names
+    (at `pseudonym` or `names`); a tenant at `count` is only a number."""
+    out = []
+    block = (doc or {}).get("tenants") or {}
+    for t in block.get("items") or [] if isinstance(block, dict) else []:
+        name = _name((t or {}).get("tenant"))
+        if not name:
+            continue
+        out.append((f"tenant:{node}/{name}", name, {"oaap.tenant": {
+            "tenantName": name, "level": str(t.get("level") or ""),
+            "instanceCount": t.get("instances") if isinstance(t.get("instances"), int) else None}}))
+    return out
+
+
+def tenant_count(doc):
+    block = (doc or {}).get("tenants") or {}
+    c = block.get("count") if isinstance(block, dict) else None
+    return c if isinstance(c, int) else None
+
+
+def instance_tenants(doc):
+    """{instance: outward tenant name} from the instance rows (0.10)."""
+    return {str(r["instance"]): _name(r.get("tenant"))
+            for r in (doc or {}).get("instances") or []
+            if isinstance(r, dict) and r.get("instance") and _name(r.get("tenant"))}
+
+
+def tunnel_halves(doc):
+    """[(tunnel id, side, {group: values}, [instances an offer reaches])]."""
+    out = []
+    for lk in _links(doc):
+        if lk.get("kind") != "tunnel" or not TUNNEL_ID.match(str(lk.get("id") or "")):
+            continue
+        side = lk.get("side")
+        if side == "outer":
+            offers = [_name(o) for o in lk.get("offers") or []]
+            out.append((lk["id"], "outer", {"oaap.tunnel.outer": {
+                "outerLabel": _name(lk.get("label")), "outerState": str(lk.get("state") or "unknown"),
+                "outerSince": lk.get("since") or None,
+                "outerOffers": _join(sorted(o for o in offers if o))}}, []))
+        elif side == "inner":
+            offers = [o for o in lk.get("offers") or [] if isinstance(o, dict) and _name(o.get("name"))]
+            reached = sorted({_name(o.get("reaches")) for o in offers} - {"", "external"})
+            out.append((lk["id"], "inner", {"oaap.tunnel.inner": {
+                "innerLabel": _name(lk.get("label")), "innerState": str(lk.get("state") or "unknown"),
+                "innerPaused": bool(lk.get("paused")),
+                "innerOffers": _join(f"{o['name']} → {_name(o.get('reaches')) or 'external'}"
+                                     for o in offers)}}, reached))
+    return out
+
+
+def destinations(doc, node):
+    """[{key, title, tenant, groups, tunnel, external: (key, title, groups,
+    instance) | None, bound: [instances]}] -- `via` and `through` rows."""
+    out = []
+    for lk in _links(doc):
+        if lk.get("kind") != "destination":
+            continue
+        name = _name(lk.get("name"))
+        if not name:
+            continue
+        tenant = _name(lk.get("tenant"))
+        via, through = lk.get("via"), lk.get("through")
+        bound = lk.get("bound")
+        row = {"key": f"dest:{node}/{tenant or '-'}/{name}", "title": name, "tenant": tenant,
+               "tunnel": "", "external": None,
+               "bound": [b for b in (bound if isinstance(bound, list) else []) if _name(b)]}
+        values = {"destName": name, "destState": "present",
+                  "boundCount": len(bound) if isinstance(bound, list)
+                  else (bound if isinstance(bound, int) else None)}
+        if isinstance(via, dict):
+            values.update(destKind="via", destOffer=_name(via.get("offer")))
+            if TUNNEL_ID.match(str(via.get("tunnel") or "")):
+                row["tunnel"] = via["tunnel"]
+        elif isinstance(through, dict):
+            inst, target = _name(through.get("instance")), _name(through.get("target"))
+            values.update(destKind="through", destOffer="")
+            if inst and target:
+                row["external"] = (f"ext:{node}/{inst}/{target}", target,
+                                   {"oaap.external": {"extName": target, "extKind": "vpn",
+                                                      "extState": "present"}}, inst)
+        else:
+            continue
+        row["groups"] = {"oaap.destination": values}
+        out.append(row)
+    return out
+
+
+def joined_state(outer, inner):
+    """The tunnel's state over time (RFC-0087 §5): from the two halves the
+    hub last saw -- outer: its state or None, inner: (state, paused) or None."""
+    if outer is None or inner is None:
+        return "half"
+    if inner[1]:
+        return "paused"
+    if inner[0] != "ok":
+        return "down-inner"
+    if outer != "ok":
+        return "down-outer"
+    return "ok"

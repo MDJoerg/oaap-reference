@@ -20,7 +20,12 @@ nicht aus einer Abschrift. Festgehalten wird:
   aus dem Urteil des Hosts;
 - eine Gruppe der Menschen (`owner.*`) schreibt die Flotte nie;
 - faellt die Datenbank aus, bleibt alles ausstehend und kommt beim
-  naechsten Mal an.
+  naechsten Mal an;
+- Halbkanten (RFC-0087): zwei Knoten melden je eine Haelfte desselben
+  Tunnels -> EIN Tunnelobjekt mit zwei Gruppen; Destination, externes Ende,
+  Mandant und ihre Beziehungen; der gemeinsame Zustand als Textreihe;
+  ein zurueckgezogener Schluessel schliesst Beziehungen mit valid_to;
+  ein Knoten mit 0.9 (ohne links) bleibt unberuehrt.
 
 Aufruf: py -3 test/test_fleet_twin.py            (Teil 1)
         TS_DSN=... python3 test/test_fleet_twin.py   (Teil 1 + 2, oaap-test)
@@ -141,6 +146,48 @@ ok("unbekannte Reihe, Text oder bool: kein Punkt",
 ok("Lebenszeichen: nur langsame Werte (kein seq, keine Zeit)",
    set(ft.liveness({"seq": 9, "t": "x", "interval": 60, "lost": 0}, {"state": "up"}))
    == {"state", "since", "interval", "lostTotal", "eventsDropped"})
+
+print("=== Teil 1: Halbkanten -> Zwilling (RFC-0087) ===")
+TUN = "t-" + "a" * 24
+OUT = {**DOC, "schema": "oaap.fleet.status/0.10", "alias": "nx",
+       "instances": [{"instance": "ais-chat", "app": "chat", "version": "1", "state": "ok",
+                      "tenant": "ais"}],
+       "tenants": {"count": 2, "ceiling": "names",
+                   "items": [{"tenant": "ais", "level": "names", "instances": 1}]},
+       "links": [{"kind": "tunnel", "side": "outer", "id": TUN, "label": "oaapi01", "tenant": "ais",
+                  "state": "ok", "since": "2026-11-14T18:00:00Z", "offers": ["mg"]},
+                 {"kind": "destination", "tenant": "ais", "name": "ais-oaapi01",
+                  "via": {"tunnel": TUN, "offer": "mg"}, "bound": ["ais-chat"]},
+                 {"kind": "tunnel", "side": "outer", "id": "kaputt"}]}
+INN = {**DOC, "schema": "oaap.fleet.status/0.10", "alias": "ni",
+       "instances": [{"instance": "ais-mg", "app": "ai-gateway", "version": "0.6", "state": "ok",
+                      "tenant": "ais"},
+                     {"instance": "ais-ovc", "app": "vpn-client", "version": "0.1", "state": "ok",
+                      "tenant": "ais"}],
+       "tenants": {"count": 1, "ceiling": "names",
+                   "items": [{"tenant": "ais", "level": "names", "instances": 2}]},
+       "links": [{"kind": "tunnel", "side": "inner", "id": TUN, "label": "oaapx01", "state": "ok",
+                  "paused": False, "offers": [{"name": "mg", "reaches": "ais-mg"},
+                                              {"name": "nas", "reaches": "external"}]},
+                 {"kind": "destination", "tenant": "ais", "name": "gamingpc",
+                  "through": {"instance": "ais-ovc", "target": "gamingpc"}, "bound": ["ais-mg"]}]}
+th = ft.tunnel_halves(OUT)
+ok("aussen: eine Haelfte, die kaputte ID verworfen", len(th) == 1 and th[0][0] == TUN
+   and th[0][1] == "outer" and th[0][2]["oaap.tunnel.outer"]["outerOffers"] == "mg", th)
+ti = ft.tunnel_halves(INN)
+ok("innen: Angebote mit Ziel, erreichte eigene Instanz ais-mg (external zaehlt nicht)",
+   ti[0][3] == ["ais-mg"] and "nas → external" in ti[0][2]["oaap.tunnel.inner"]["innerOffers"], ti)
+dd = ft.destinations(INN, "ni")
+ok("through: Destination mit externem Ende hinter ais-ovc",
+   dd[0]["key"] == "dest:ni/ais/gamingpc" and dd[0]["external"][0] == "ext:ni/ais-ovc/gamingpc"
+   and dd[0]["external"][3] == "ais-ovc" and dd[0]["groups"]["oaap.destination"]["destKind"] == "through",
+   dd)
+ok("Mandanten: genannte als Zeilen, Instanz -> Mandant",
+   ft.tenant_rows(OUT, "nx")[0][0] == "tenant:nx/ais" and ft.instance_tenants(OUT) == {"ais-chat": "ais"})
+ok("gemeinsamer Zustand: ok, paused, down-inner, down-outer, half",
+   [ft.joined_state("ok", ("ok", False)), ft.joined_state("ok", ("error", True)),
+    ft.joined_state("ok", ("error", False)), ft.joined_state("error", ("ok", False)),
+    ft.joined_state(None, ("ok", False))] == ["ok", "paused", "down-inner", "down-outer", "half"])
 
 print("=== Teil 1: das Urteil je Knoten ===")
 now = 1_800_000_000
@@ -327,6 +374,96 @@ ok("die Bruecke einer fremden Zentrale wird hier nicht als eigene Bruecke verbun
    ("hubnode", "fleetBridgedTo", "far") not in rels, rels)
 ok("Warteschlange und Bruecke als Reihen des Brokers",
    {"queued", "bridge"} <= {r["measure"] for r in q("SELECT measure FROM S.series")})
+
+print("=== Teil 2: Halbkanten gegen eine echte PostgreSQL (RFC-0087) ===")
+hsink = fleet_sink.Sink(FDIR)
+hsink._conns = conns
+hsnap = {"status": {"nx": ("nx", "", OUT), "ni": ("ni", "", INN)}, "nodes": {}, "points": [],
+         "brokers": {}, "bridges": {}, "verdict": {}}
+hsink.flush(dict(hsnap), NOW + 200)
+ok("Halbkanten ohne Fehler", hsink.last_error == "", hsink.last_error)
+tun = q("SELECT id FROM T.objects WHERE type_key = %s", fm.TUNNEL)
+ok("zwei Knoten, EIN Tunnelobjekt", len(tun) == 1, tun)
+tgroups = {r["group_key"] for r in q("SELECT group_key FROM T.groups WHERE object_id = %s", tun[0]["id"])}
+ok("… mit beiden Haelften als eigene Gruppen", {"oaap.tunnel.outer", "oaap.tunnel.inner"} <= tgroups,
+   tgroups)
+
+
+def rels_now():
+    return {(r["src"], r["rel_key"], r["dst"], r["closed"]) for r in q(
+        "SELECT o.title src, r.rel_key, t.title dst, r.valid_to IS NOT NULL closed "
+        "FROM T.current_relations r JOIN T.objects o ON o.id = r.object_id "
+        "JOIN T.objects t ON t.id = r.target_id")}
+
+
+R = rels_now()
+want = {(TUN, "fleetServedBy", "nx", False), (TUN, "fleetDialedBy", "ni", False),
+        (TUN, "fleetReaches", "ais-mg", False),
+        ("ais-oaapi01", "fleetUsesTunnel", TUN, False), ("ais-oaapi01", "fleetDestOf", "ais", False),
+        ("ais-oaapi01", "fleetDefinedOn", "nx", False),
+        ("ais-chat", "fleetBindsTo", "ais-oaapi01", False), ("ais-chat", "fleetHeldBy", "ais", False),
+        ("gamingpc", "fleetUsesExternal", "gamingpc", False), ("gamingpc", "fleetBehind", "ais-ovc", False),
+        ("ais-mg", "fleetBindsTo", "gamingpc", False), ("ais", "fleetTenantOn", "nx", False),
+        ("ais", "fleetTenantOn", "ni", False)}
+ok("die Kette als Beziehungen: App -> Destination -> Tunnel -> Gateway -> Destination -> VPN -> Ziel",
+   want <= R, sorted(want - R))
+types = {r["type_key"] for r in q("SELECT type_key FROM T.objects")}
+ok("Mandant, Destination und externes Ende angelegt",
+   {fm.TENANT, fm.DESTINATION, fm.EXTERNAL} <= types, types)
+hsink.flush({**hsnap, "status": {}}, NOW + 240)
+jser = q("SELECT ts.value FROM S.series s JOIN S.text_states ts ON ts.series_id = s.id "
+         "WHERE s.object_id = %s AND s.measure = 'state' ORDER BY ts.t_from", str(tun[0]["id"]))
+ok("gemeinsamer Zustand als Textreihe am Tunnel: ok", [j["value"] for j in jser][-1:] == ["ok"], jser)
+before = q("SELECT (SELECT count(*) FROM T.attributes) a, (SELECT count(*) FROM T.relations) r")[0]
+hsink.flush(dict(hsnap), NOW + 270)
+after = q("SELECT (SELECT count(*) FROM T.attributes) a, (SELECT count(*) FROM T.relations) r")[0]
+ok("dieselben zwei Dokumente noch einmal: keine Zeile, keine Beziehung", before == after,
+   (before, after))
+
+inn2 = json.loads(json.dumps(INN))
+inn2["links"][0]["paused"] = True
+inn2["links"][0]["state"] = "error"
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", inn2)}}, NOW + 300)
+jser = q("SELECT ts.value FROM S.series s JOIN S.text_states ts ON ts.series_id = s.id "
+         "WHERE s.object_id = %s AND s.measure = 'state' ORDER BY ts.t_from", str(tun[0]["id"]))
+ok("Connector angehalten: Zustand `paused` (keine Stoerung)", jser[-1]["value"] == "paused",
+   [j["value"] for j in jser])
+
+out2 = json.loads(json.dumps(OUT))
+out2["links"] = [lk for lk in out2["links"] if lk.get("kind") != "tunnel"]
+out2["links"][0]["via"]["tunnel"] = ""
+hsink.flush({**hsnap, "status": {"nx": ("nx", "", out2)}}, NOW + 330)
+R = rels_now()
+ok("Schluessel zurueckgezogen: servedBy und usesTunnel geschlossen (valid_to), nicht geloescht",
+   (TUN, "fleetServedBy", "nx", True) in R and ("ais-oaapi01", "fleetUsesTunnel", TUN, True) in R
+   and (TUN, "fleetServedBy", "nx", False) not in R, sorted(r for r in R if r[0] in (TUN, "ais-oaapi01")))
+st_outer = q("SELECT a.value FROM T.current_attributes a WHERE a.object_id = %s "
+             "AND a.attr_key = 'fleetOuterState'", tun[0]["id"])
+ok("… die aeussere Haelfte sagt `removed`, die innere bleibt",
+   st_outer and st_outer[0]["value"] == "removed")
+hsink.flush({**hsnap, "status": {}}, NOW + 360)
+jser = q("SELECT ts.value FROM S.series s JOIN S.text_states ts ON ts.series_id = s.id "
+         "WHERE s.object_id = %s AND s.measure = 'state' ORDER BY ts.t_from", str(tun[0]["id"]))
+ok("… und der gemeinsame Zustand `half`", jser[-1]["value"] == "half", [j["value"] for j in jser])
+
+out3 = json.loads(json.dumps(OUT))
+out3["tenants"]["items"] = []
+for r in out3["instances"]:
+    r.pop("tenant", None)
+hsink.flush({**hsnap, "status": {"nx": ("nx", "", out3)}}, NOW + 390)
+R = rels_now()
+ok("Mandant auf count gestellt: tenantOn und heldBy geschlossen, der Mandant bleibt als Geschichte",
+   ("ais", "fleetTenantOn", "nx", True) in R and ("ais-chat", "fleetHeldBy", "ais", True) in R,
+   sorted(r for r in R if r[1] in ("fleetTenantOn", "fleetHeldBy")))
+n_before = len(q("SELECT id FROM T.relations"))
+old9 = {k: v for k, v in out3.items() if k not in ("links", "tenants")}
+old9["schema"] = "oaap.fleet.status/0.9"
+hsink.flush({**hsnap, "status": {"nx": ("nx", "", old9)}}, NOW + 420)
+ok("derselbe Knoten wieder mit 0.9 (ohne links): seine Halbkanten unberuehrt",
+   len(q("SELECT id FROM T.relations")) == n_before and hsink.last_error == "", hsink.last_error)
+ok("Instanzsuche (<node>/%) nimmt keinen Mandanten und keine Destination fuer eine Instanz",
+   not q("SELECT a.object_id FROM T.current_attributes a JOIN T.objects o ON o.id = a.object_id "
+         "WHERE a.attr_key = 'fleetRunState' AND o.type_key <> %s", fm.INSTANCE))
 
 with admin.cursor() as cur:
     for sch in (f"twin_{TID}", f"ts_{TID}"):

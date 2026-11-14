@@ -26170,6 +26170,10 @@ def status_for_sender(now=None):
     raises: a status that cannot be read this time is said on stderr."""
     if not os.path.exists(os.path.join(METRICS_SENDER_DIR, metrics_sender.CONFIG_FILE)):
         return None
+    try:
+        fleet_disclose_load()       # RFC-0087 §4: the default and its salt exist
+    except OSError as e:
+        print(f"metrics: disclosure file not written ({e})", file=sys.stderr)
     now = int(now or time.time())
     out_path = os.path.join(METRICS_DIR, metrics_sender.STATUS_OUT)
     old = _read_json_file(out_path) or {}
@@ -26464,7 +26468,90 @@ def fleet_hub_twin(label):
     return tid, plan
 
 
+FLEET_DISCLOSE_FILE = os.path.join(APPS_DIR, "fleet-disclose.json")
+FLEET_DISCLOSE_LEVELS = ("count", "pseudonym", "names")
+
+
+def fleet_disclose_load():
+    """How much this node gives away about its tenants in the status
+    document (RFC-0087 §4): {ceiling, salt, tenants: {id: level}}. Made on
+    first use with the default ceiling `pseudonym` and a fresh salt for the
+    pseudonyms. The portal reads it (read-only mount); it holds no secret
+    worth more than the registry beside it -- whoever reads it can read the
+    tenant names anyway."""
+    try:
+        with open(FLEET_DISCLOSE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except (OSError, ValueError):
+        d = {}
+    if d.get("ceiling") in FLEET_DISCLOSE_LEVELS and d.get("salt"):
+        return d
+    d.setdefault("ceiling", "pseudonym")
+    if d["ceiling"] not in FLEET_DISCLOSE_LEVELS:
+        d["ceiling"] = "pseudonym"
+    d.setdefault("salt", secrets.token_hex(16))
+    d.setdefault("tenants", {})
+    fleet_disclose_save(d)
+    return d
+
+
+def fleet_disclose_save(d):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = FLEET_DISCLOSE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, FLEET_DISCLOSE_FILE)
+    os.chmod(FLEET_DISCLOSE_FILE, 0o644)
+
+
+def fleet_disclose(level, tenant_label="", who="root"):
+    """Set the node's ceiling, or one tenant's level (at most the ceiling).
+    Audited: the node level in the fleet log, a tenant's in its own log.
+    -> the file's content after the change."""
+    if level not in FLEET_DISCLOSE_LEVELS + ("default",):
+        die("level: count | pseudonym | names (a tenant also: default)")
+    d = fleet_disclose_load()
+    if tenant_label:
+        tid = resolve_tenant_arg(tenant_label)
+        rank = FLEET_DISCLOSE_LEVELS.index
+        if level == "default":
+            d["tenants"].pop(tid, None)
+        else:
+            if rank(level) > rank(d["ceiling"]):
+                die(f"the node's ceiling is '{d['ceiling']}' -- a tenant cannot give away "
+                    f"more ('sudo oaap fleet disclose {level}' raises the ceiling)")
+            d["tenants"][tid] = level
+        fleet_disclose_save(d)
+        audit_tenant("fleet.disclose", tid, subject=level, who=who)
+        return d
+    if level == "default":
+        level = "pseudonym"
+    d["ceiling"] = level
+    fleet_disclose_save(d)
+    audit_fleet({"event": "disclose", "ceiling": level, "by": who})
+    return d
+
+
+def _fleet_disclose_show(d):
+    tenants = load_tenants()
+    rank = FLEET_DISCLOSE_LEVELS.index
+    print(f"Ceiling of this node: {d['ceiling']} (RFC-0087 §4; count < pseudonym < names)")
+    for tid, t in sorted(tenants.items(), key=lambda kv: kv[1].get("label", "")):
+        own = d["tenants"].get(tid)
+        eff = own if own in FLEET_DISCLOSE_LEVELS and rank(own) <= rank(d["ceiling"])             else d["ceiling"]
+        note = f"own choice {own}" if own else "follows the ceiling"
+        print(f"  {t.get('label', tid)}: {eff} ({note})")
+    print("Instance names leave the node at every level (oaap.fleet.status 0.10).")
+
+
 def cmd_fleet(args):
+    if args.object == "disclose":
+        if args.action == "show":
+            return _fleet_disclose_show(fleet_disclose_load())
+        d = fleet_disclose(args.action, getattr(args, "tenant", "") or "")
+        return _fleet_disclose_show(d)
     if args.object == "hub":
         if args.action == "twin":
             tid, plan = fleet_hub_twin(args.label or "oaap-ops")
@@ -35602,8 +35689,12 @@ def build_parser():
     pt.set_defaults(fn=cmd_token)
     pf = sub.add_parser("fleet",
                         help="fleet keys: read-only /fleet/status access (RFC-0021)")
-    pf.add_argument("object", choices=["key", "hub"])
-    pf.add_argument("action", choices=["issue", "list", "revoke", "show", "twin"])
+    pf.add_argument("object", choices=["key", "hub", "disclose"])
+    pf.add_argument("action", choices=["issue", "list", "revoke", "show", "twin",
+                                       "count", "pseudonym", "names", "default"])
+    pf.add_argument("--tenant", default="",
+                    help="for 'disclose': set this tenant's level instead of the node's "
+                         "ceiling (RFC-0087 §4)")
     pf.add_argument("label", nargs="?",
                     help="who watches, e.g. fleetview@oaap-demo; for 'hub twin' the "
                          "tenant whose twin the fleet writes (default oaap-ops)")
