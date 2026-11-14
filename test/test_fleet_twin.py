@@ -301,7 +301,8 @@ ok("Datenbank weg: Fehler gemerkt, Dokument und Punkte bleiben ausstehend",
 
 snapv = {"status": {"entry1/n2": ("n2", "entry1", {**DOC, "alias": "n2", "instances": []})},
          "nodes": {}, "points": [], "brokers": {"entry1": {"queued": 4}},
-         "bridges": {"entry1@hubnode": {"entry": "entry1", "hub": "hubnode", "up": True}},
+         "bridges": {"entry1@hubnode": {"entry": "entry1", "hub": "hubnode", "up": True},
+                     "hubnode@far": {"entry": "hubnode", "hub": "far", "up": True}},
          "verdict": {}}
 sink.flush(snapv, NOW + 150)
 rels = {(r["src"], r["rel_key"], r["dst"]) for r in q(
@@ -310,6 +311,14 @@ rels = {(r["src"], r["rel_key"], r["dst"]) for r in q(
 ok("hinter einem Eingang: n2 meldet ueber entry1, entry1 ist zur Zentrale gebrueckt",
    ("n2", "fleetReportsThrough", "entry1") in rels and ("entry1", "fleetBridgedTo", "hubnode") in rels,
    rels)
+roles = {r["title"]: r["value"] for r in q(
+    "SELECT o.title, a.value FROM T.current_attributes a JOIN T.objects o ON o.id = a.object_id "
+    "WHERE a.attr_key = 'fleetRole'")}
+ok("Rollen: diese Zentrale, ihr Eingang, eine fremde Zentrale, die hereinbrueckt",
+   roles.get("hubnode") == "hub" and roles.get("entry1") == "entry"
+   and roles.get("far") == "remote-hub", roles)
+ok("die Bruecke einer fremden Zentrale wird hier nicht als eigene Bruecke verbunden",
+   ("hubnode", "fleetBridgedTo", "far") not in rels, rels)
 ok("Warteschlange und Bruecke als Reihen des Brokers",
    {"queued", "bridge"} <= {r["measure"] for r in q("SELECT measure FROM S.series")})
 

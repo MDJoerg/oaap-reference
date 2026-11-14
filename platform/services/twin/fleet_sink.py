@@ -220,9 +220,15 @@ class Sink:
             names |= {b.get("entry"), b.get("hub")}
         names.discard(None)
         names.discard("")
+        bridges = list((snap.get("bridges") or {}).values())
+        entries = {b.get("entry") for b in bridges}
+        # a hub ELSE whose bridge comes into this node (a test bench is hub
+        # and entry at once) is neither this hub nor one of its entries
+        foreign = {b.get("hub") for b in bridges if b.get("hub") != hub} - entries
         for name in sorted(names):
             bid = self._object(conn, fm.BROKER, "broker:" + name, name, "oaap.broker")
-            rows += self._groups(conn, bid, {"oaap.broker": {"role": "hub" if name == hub else "entry"}})
+            role = "hub" if name == hub else ("remote-hub" if name in foreign else "entry")
+            rows += self._groups(conn, bid, {"oaap.broker": {"role": role}})
             c = (snap.get("brokers") or {}).get(name) or {}
             if drv is not None and isinstance(c.get("queued"), (int, float)):
                 self._points(drv, self._series(drv, bid, "queued"), [(t, c["queued"])], now)
