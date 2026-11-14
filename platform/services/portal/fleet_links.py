@@ -115,6 +115,18 @@ def reaches(url, hosts):
     return hosts.get(_host(url), "external")
 
 
+def _registry_key(instances, tid, local, resolve):
+    """A `through` target names the tunnel app by its name INSIDE the tenant
+    (`ovc`, oaap.net.destinations 2.8); every other row of the document --
+    and the hub's instance objects -- use the registry key (`ais-ovc`).
+    Found live on oaap-demo, 2026-11-14: without this the external end had
+    no `behind`."""
+    for key, inst in sorted(instances.items()):
+        if (resolve(inst.get("tenant")) or "") == tid and (inst.get("name") or key) == local:
+            return key
+    return local
+
+
 def _bound(instances, tid, name, resolve):
     return sorted(n for n, inst in instances.items()
                   if (resolve(inst.get("tenant")) or "") == tid
@@ -188,11 +200,13 @@ def build(conf, state, dests, instances, tenants, settings, hosts, resolve):
                 row = {"kind": "destination",
                        "via": {"tunnel": ids_by_label.get(lab, ""), "offer": offer}}
             elif target.get("through"):
-                inst, _, tname = target["through"].partition("/")
+                local, _, tname = target["through"].partition("/")
                 ext = d.thing(tid, "x-", tname)
                 if not ext:
                     continue
-                row = {"kind": "destination", "through": {"instance": inst, "target": ext}}
+                row = {"kind": "destination",
+                       "through": {"instance": _registry_key(instances or {}, tid, local, resolve),
+                                   "target": ext}}
             if row is None:
                 continue        # direct: its far end is configuration (RFC-0087 §2 rule 2)
             dname = d.thing(tid, "d-", name)

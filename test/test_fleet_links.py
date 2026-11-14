@@ -92,12 +92,12 @@ STATE = {"tunnels": {"oaapi01": {"connected": True, "since": "2026-11-14T18:00:0
          "connectors": {"oaapx01": {"connected": False, "tunnel_id": tid,
                                     "last_error": "Cannot connect to host geheim.example:443"}}}
 DESTS = {"T-ais": {"ais-oaapi01": {"target": {"via": "oaapi01/mg"}},
-                   "gamingpc": {"target": {"through": "ais-ovc/gamingpc"}},
+                   "gamingpc": {"target": {"through": "ovc/gamingpc"}},
                    "draussen": {"target": {"direct": "https://api.example.com/"}}},
          "T-x": {"geheim-ziel": {"target": {"via": "frei/x"}}}}
 INST = {"ais-chat": {"tenant": "T-ais", "destinations": {"llm": "ais-oaapi01"}},
         "ais-mg": {"tenant": "T-ais", "destinations": {"gpu": "gamingpc"}},
-        "ais-ovc": {"tenant": "T-ais"},
+        "ais-ovc": {"tenant": "T-ais", "name": "ovc"},
         "kunde-app": {"tenant": "T-x", "destinations": {"x": "geheim-ziel"}}}
 HOSTS = {"mg.ais.oaap-demo.example": "ais-mg", "ais-mg": "ais-mg"}
 SET = {"ceiling": "names", "salt": "s", "tenants": {"T-x": "count"}}
@@ -126,7 +126,7 @@ ok("via: Tunnel per ID statt Name, Angebot, gebunden ais-chat",
    dest["ais-oaapi01"]["via"] == {"tunnel": tid, "offer": "mg"}
    and dest["ais-oaapi01"]["bound"] == ["ais-chat"] and dest["ais-oaapi01"]["tenant"] == "ais",
    dest.get("ais-oaapi01"))
-ok("through: Tunnel-App und Ziel (auf names mit Namen)",
+ok("through: Tunnel-App per Registerschluessel (Ziel sagt `ovc`, oaap-demo 14.11.), Ziel mit Namen",
    dest["gamingpc"]["through"] == {"instance": "ais-ovc", "target": "gamingpc"}, dest.get("gamingpc"))
 ok("direct bleibt draussen", "draussen" not in dest)
 cnt = [l for l in links if l["kind"] == "destination" and l["name"].startswith("d-")]
