@@ -123,6 +123,27 @@ with open(a.BACKUP_RUN_FILE) as f:
 rec["finished"] = iso(at("2026-11-15", 2, 31))
 json.dump(rec, open(a.BACKUP_RUN_FILE, "w"))
 
+print("=== fremde Anmeldeversuche ===")
+os.makedirs(os.path.dirname(a.IDENTITY_THROTTLE_FILE), exist_ok=True)
+sat = at("2026-11-14", 3, 10)
+with open(a.IDENTITY_THROTTLE_FILE, "w", encoding="utf-8") as f:
+    json.dump({"184.35.254.91|": [sat - i for i in range(5)],
+               "184.35.254.91|admin": [sat - i for i in range(6)],
+               "198.51.100.4|admin": [sat - i for i in range(5)]}, f)
+ok("drei Sperren auf Namen, die es nicht gibt (einer leer): keine Mail eingereiht",
+   a.notify_login_locks(sat) == 0)
+fstate = a._notify_state_rw().get("foreign_logins") or {}
+fb = fstate.get("2026-11-14") or {}
+ok("… sondern gezählt: 3 Sperren, 16 Fehlversuche, 2 Adressen als Prüfsumme, Namen",
+   fb.get("locks") == 3 and fb.get("n") == 16 and len(fb.get("c") or []) == 2
+   and fb.get("names") == {"": 1, "admin": 2}
+   and "184.35.254.91" not in json.dumps(fstate), fb)
+ok("foreign_note: höchstens zehn Tage, höchstens 20 Namen",
+   len(n.foreign_note({f"2026-10-{d:02d}": {"locks": 1} for d in range(1, 12)},
+                      "2026-11-14", "t", "x", 5)) == 10
+   and len(__import__("functools").reduce(
+       lambda acc, i: n.foreign_note(acc, "d", "t", f"n{i}", 5), range(30), {})["d"]["names"]) == 20)
+
 print("=== das Tagebuch ===")
 days = a.ledger_minute(now=NOW)
 ok("der erste Lauf schreibt sieben Tage (gestern + sechs davor)",
@@ -161,6 +182,13 @@ ok("Zusammenfassung: Neustart mit Kernel, Backup, Platte, Bremse mit Adresse",
    "1 Neustart (Kernel 6.12.116+deb13-amd64)" in summary and "Backup: 1 von 1 gelungen" in summary
    and "Platte: 61 % belegt" in summary and "2312 gebremste Anfragen, größter Teil von 1 Adresse" in summary,
    summary)
+ok("Zusammenfassung: fremde Anmeldeversuche mit Adressen und häufigstem Namen",
+   "3 Sperren nach Anmeldeversuchen auf unbekannte Namen von 2 Adressen (häufigster Name: „admin“)"
+   in summary, summary)
+fremd = md.split("## Fremde Anmeldeversuche")[-1].split("##")[0]
+ok("Abschnitt: Namen mit Sperren, der leere Name als „(leer)“, keine Adresse",
+   "| „admin“ | 2 |" in fremd and "| (leer) | 1 |" in fremd and "16 Fehlversuche" in fremd
+   and "184.35.254.91" not in md, fremd)
 ok("Ereignisse: Neustart geplant/Neustart/Zurück", "Neustart geplant" in md and "| Zurück nach Neustart" in md)
 ok("jede verschickte Mail des Knotens steht drin", "reboot.started | Ereignis | verschickt" in md, md)
 ok("Messwerte min/Ø/max, deutsch geschrieben", "| CPU | 2 % | 9 % | 71 % |" in md

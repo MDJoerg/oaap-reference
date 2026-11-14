@@ -452,14 +452,18 @@ ok("gesperrter Name des Mandanten -> an den Mandanten, mit Adresse und Zahl",
    kas and kas["rcpts"]["to"] == ["kasse@verein.example"] and "203.0.113.7" in kas["body"]
    and "5 Fehlversuche" in kas["body"], list(by))
 node = [m for k, m in by.items() if k.startswith("[oaap.example] Anmeldung gesperrt")]
-ok("unbekannter Name und Schlüssel-Brute-Force -> an den Knoten, in einer Mail",
-   q == 2 and len(node) == 1 and "diesen Benutzer gibt es nicht" in node[0]["body"]
+ok("Schlüssel-Brute-Force -> an den Knoten; ein unbekannter Name kommt nicht in die Mail",
+   q == 2 and len(node) == 1 and "admin" not in node[0]["body"]
    and "192.0.2.3" in node[0]["body"] and node[0]["rcpts"]["to"] == ["joerg@node.example"],
    (q, list(by)))
+ok("… sondern in die Zählung für den Wochenbericht",
+   any((b.get("names") or {}).get("adminBcc: x@evil") == 1
+       for b in (a._notify_state_rw().get("foreign_logins") or {}).values()),
+   a._notify_state_rw().get("foreign_logins"))
 ok("vier Versuche und alte Versuche sperren nicht", "192.0.2.1" not in str(SENT)
    and "192.0.2.2" not in str(SENT))
 ok("ein Name mit Zeilenumbruch kommt nicht als Kopfzeile an",
-   all("\n" not in m["subject"] for m in SENT) and "adminBcc" in str(node and node[0]["body"]))
+   all("\n" not in m["subject"] for m in SENT))
 SENT.clear()
 ok("dieselbe Sperre in der nächsten Minute: keine zweite Mail",
    a.notify_login_locks(now + 60) == 0)

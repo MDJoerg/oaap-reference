@@ -491,6 +491,39 @@ def lock_episodes(table, now_epoch, reported):
     return out, keep
 
 
+# A lock on a name nobody has is a stranger guessing, not an account under
+# attack: it is counted for the weekly report (RFC-0083) instead of mailed
+# one by one (RFC-0080 §4.2, since 0.1.278). Addresses are kept as hashes
+# only -- a count, never an address on disk -- and everything is bounded.
+FOREIGN_KEEP_DAYS = 10
+FOREIGN_CLIENTS = 50
+FOREIGN_NAMES = 20
+
+
+def foreign_note(days, day, tag, name, failures):
+    """days: {day: {locks, n, c, full, names}} -> the same with one lock
+    episode on a name that does not exist added, the oldest days dropped."""
+    days = {d: v for d, v in (days or {}).items() if isinstance(v, dict)}
+    b = days.setdefault(day, {"locks": 0, "n": 0, "c": [], "full": False, "names": {}})
+    b["locks"] = int(b.get("locks") or 0) + 1
+    b["n"] = int(b.get("n") or 0) + int(failures or 0)
+    c = list(b.get("c") or [])
+    if tag and tag not in c:
+        if len(c) < FOREIGN_CLIENTS:
+            c.append(tag)
+        else:
+            b["full"] = True
+    b["c"] = c
+    names = dict(b.get("names") or {})
+    name = clean(name, 40)
+    if name in names or len(names) < FOREIGN_NAMES:
+        names[name] = int(names.get(name) or 0) + 1
+    b["names"] = names
+    for d in sorted(days)[:-FOREIGN_KEEP_DAYS]:
+        days.pop(d, None)
+    return days
+
+
 # --------------------------------------------------------------- words
 
 def body(ntype, op, values, text, link=""):

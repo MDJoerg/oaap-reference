@@ -131,6 +131,18 @@ def day_brake(data, start, end):
     return out
 
 
+def day_foreign(bucket):
+    """One day of locks on names nobody has (notify.foreign_note) -> the
+    ledger's part: {locks, n, c, full, names}. The client hashes stay so a
+    week can count its distinct addresses; they are never addresses."""
+    if not isinstance(bucket, dict) or not bucket.get("locks"):
+        return {}
+    return {"locks": int(bucket.get("locks") or 0), "n": int(bucket.get("n") or 0),
+            "c": [str(x)[:8] for x in (bucket.get("c") or [])][:50],
+            "full": bool(bucket.get("full")),
+            "names": {str(k)[:40]: int(v) for k, v in (bucket.get("names") or {}).items()}}
+
+
 def ledger_line(day, scope, **parts):
     """One day of one scope. Empty parts are left out, None means 'not
     measured' and is kept -- the report says so instead of showing 0."""
@@ -192,6 +204,7 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     have = [d for d in week_days if d in week]
     events, mails, brake, backups = [], [], {}, []
     guarded, exposed = {}, {}
+    foreign = {"locks": 0, "n": 0, "c": set(), "full": False, "names": {}, "days": 0}
     for d in have:
         e = week[d]
         events += e.get("events") or []
@@ -215,6 +228,15 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
             g["days"] += 1
         for inst, paths in (e.get("exposed") or {}).items():
             exposed[inst] = paths
+        fl = e.get("foreign") or {}
+        if fl.get("locks"):
+            foreign["locks"] += fl["locks"]
+            foreign["n"] += fl.get("n", 0)
+            foreign["c"].update(fl.get("c") or [])
+            foreign["full"] = foreign["full"] or fl.get("full", False)
+            foreign["days"] += 1
+            for nm, k in (fl.get("names") or {}).items():
+                foreign["names"][nm] = foreign["names"].get(nm, 0) + k
     sent = [m for m in mails if m.get("r") == "sent"]
     reboots = [e for e in events if e["a"] == "reboot.started"]
     out = [f"# {title}", ""]
@@ -256,7 +278,11 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     if guarded:
         total = sum(g["count"] for g in guarded.values())
         summary.append(f"{total} Anfragen nach Geheimnisdateien abgewiesen")
-    if not events and not sent and not brake and not guarded and not exposed:
+    if foreign["locks"]:
+        summary.append(f"{foreign['locks']} Sperre" + ("" if foreign["locks"] == 1 else "n")
+                       + " nach Anmeldeversuchen auf unbekannte Namen von " + _foreign_clients(foreign)
+                       + f" (häufigster Name: {_foreign_name(_top_names(foreign, 1)[0][0])})")
+    if not events and not sent and not brake and not guarded and not exposed and not foreign["locks"]:
         summary.append("Keine besonderen Ereignisse")
     out += [f"- {s}" for s in summary] + [""]
 
@@ -308,6 +334,17 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
                        f"| {inst} | {b['count']} | {_clients(b) if b['clients'] else '–'} | {b['days']} | – |")
         out += ["", "Wenige Adressen in wenigen Minuten sind meist ein Scanner. Adressen werden nur "
                     "gezählt, nie gespeichert.", ""]
+
+    # --- strangers guessing names (RFC-0080 §4.2 since 0.1.278)
+    if foreign["locks"]:
+        out += ["## Fremde Anmeldeversuche", "",
+                f"{foreign['locks']} Sperren an {foreign['days']} Tag"
+                + ("" if foreign["days"] == 1 else "en") + f", {foreign['n']} Fehlversuche, von "
+                + _foreign_clients(foreign) + ".", "",
+                "| Versuchter Name | Sperren |", "|---|---|"]
+        out += [f"| {_cell(_foreign_name(nm))} | {k} |" for nm, k in _top_names(foreign, 10)]
+        out += ["", "Diese Namen gibt es auf dem Knoten nicht — niemandes Konto war in Gefahr, "
+                    "deshalb kam keine Einzelmail. Adressen werden nur gezählt, nie gespeichert.", ""]
 
     # --- secret files (RFC-0084)
     if guarded or exposed:
@@ -384,6 +421,21 @@ def _clients(b):
     if b.get("more") or b.get("clients_more"):
         return "50+ Adressen"
     return f"{n} Adresse" + ("" if n == 1 else "n")
+
+
+def _foreign_clients(f):
+    if f.get("full"):
+        return "50+ Adressen"
+    n = len(f["c"])
+    return f"{n} Adresse" + ("" if n == 1 else "n")
+
+
+def _top_names(f, k):
+    return sorted(f["names"].items(), key=lambda x: (-x[1], x[0]))[:k] or [("", 0)]
+
+
+def _foreign_name(nm):
+    return f"„{nm}“" if nm else "(leer)"
 
 
 def _last_value(week, have, part, key):

@@ -3247,15 +3247,19 @@ def notify_login_locks(now_epoch=None):
         return 0
     dflt = default_tenant_id()
     users = {u.get("username"): u for u in (_read_identity_users() or [])}
-    per = {}
+    per, foreign = {}, []
     for key, n in found:
         kind, client, name = notify.lock_subject(key)
         if kind == "login":
             u = users.get(name)
-            tid = (resolve_tenant(u.get("tenant")) or dflt) if u else dflt
+            if not u:
+                # Nobody has this name (an empty one included): a stranger
+                # guessing. Counted for the weekly report, not mailed.
+                foreign.append((client, name, n))
+                continue
+            tid = resolve_tenant(u.get("tenant")) or dflt
             line = (f"Anmeldung als „{name}“: {n} Fehlversuche in "
-                    f"{notify.LOCK_WINDOW // 60} Minuten von {client or 'unbekannt'}"
-                    + ("" if u else " (diesen Benutzer gibt es nicht)"))
+                    f"{notify.LOCK_WINDOW // 60} Minuten von {client or 'unbekannt'}")
             per.setdefault(tid, []).append((name, line))
         elif kind == "key":
             per.setdefault(dflt, []).append(
@@ -3263,6 +3267,22 @@ def notify_login_locks(now_epoch=None):
         else:
             per.setdefault(dflt, []).append(
                 (client, f"API-Schlüssel von {client}: {n} Fehlversuche mit unbekannten Schlüsseln"))
+    if foreign:
+        import hashlib
+        import hmac
+        day = time.strftime("%Y-%m-%d", time.localtime(now_epoch))
+
+        def note(state):
+            salt = state.get("foreign_salt") or secrets.token_hex(16)
+            state["foreign_salt"] = salt
+            days = state.get("foreign_logins") or {}
+            for client, name, n in foreign:
+                tag = hmac.new(salt.encode(), (client or "?").encode(),
+                               hashlib.sha256).hexdigest()[:8]
+                days = notify.foreign_note(days, day, tag, name, n)
+            state["foreign_logins"] = days
+            return state
+        _notify_state_rw(note)
     queued = 0
     for tid, rows in per.items():
         kurz = rows[0][0] if len(rows) == 1 else f"{len(rows)} Anmeldungen"
@@ -3653,6 +3673,9 @@ def ledger_lines_for_day(day, measured_now):
         if is_node:
             parts["metrics"] = report.day_metrics(metric_rows, start, end, metrics._aggregate)
             parts["backup"] = node_backup
+            # Kept ten days in the notify state, so a backfilled day has it too.
+            parts["foreign"] = report.day_foreign(
+                (_notify_state_rw().get("foreign_logins") or {}).get(day))
             if measured_now:
                 try:
                     du = shutil.disk_usage(DATA_DIR)
