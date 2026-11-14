@@ -26,7 +26,18 @@ state.json:
      "events":  [the last 200: {"rx", "node", "via", "type", "op", "kurz", "text"}]}
 
 The status documents themselves go to /fleet/status/<key>.json.
+
+Since amendment A2 (RFC-0085 stage 4, data part; RFC-0086 stage 2) it also
+writes into the hub's twin and time series -- fleet_sink.py, every
+SINK_EVERY seconds, when the host has named a tenant (/fleet/hub.json,
+`oaap fleet hub twin`). For that it also reads the nodes' metrics:
+
+    <root>/<n>/metrics/<series>, oaap-via/<entry>/<n>/metrics/<series>
+
+state.json then carries "sink": {"at", "rows", "error", "pending",
+"points_dropped"} -- what the last write did.
 """
+import calendar
 import hashlib
 import json
 import os
@@ -34,6 +45,8 @@ import signal
 import threading
 import time
 
+import fleet_sink
+import fleet_twin
 import paho.mqtt.client as mqtt
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
@@ -55,12 +68,16 @@ SESSION_EXPIRY = 7 * 86400
 SUBSCRIPTIONS = [f"{ROOT}/+/alive", f"{ROOT}/+/status", f"{ROOT}/+/broker",
                  f"{ROOT}/+/events/#", f"{ROOT}/+/bridge/+",
                  f"{VIA}/+/+/alive", f"{VIA}/+/+/status", f"{VIA}/+/+/broker",
-                 f"{VIA}/+/+/events/#", f"{FLEET}/bridge/#"]
+                 f"{VIA}/+/+/events/#", f"{FLEET}/bridge/#",
+                 f"{ROOT}/+/metrics/+", f"{VIA}/+/+/metrics/+"]
 
 lock = threading.Lock()
 state = {"v": 1, "started": int(time.time()), "written": 0, "connected": False,
-         "messages": 0, "bad": 0, "nodes": {}, "bridges": {}, "brokers": {}, "events": []}
+         "messages": 0, "bad": 0, "nodes": {}, "bridges": {}, "brokers": {}, "events": [],
+         "sink": {}}
 dirty = True
+# What waits for the twin (fleet_sink): new status documents, metric points.
+pending = {"status": {}, "points": []}
 
 
 def load_previous():
@@ -71,7 +88,7 @@ def load_previous():
             old = json.load(f)
     except (OSError, ValueError):
         return
-    for k in ("nodes", "bridges", "brokers", "events"):
+    for k in ("nodes", "bridges", "brokers", "events", "sink"):
         if isinstance(old.get(k), type(state[k])):
             state[k] = old[k]
     # a bridge record without its entry and hub is of an older build
@@ -165,7 +182,20 @@ def handle(topic, raw, now):
     if cls == "broker" and isinstance(payload, dict):
         state["brokers"][name] = dict(payload, rx=now, via=via)
         return True
+    if cls == "metrics" and isinstance(payload, dict):
+        pt = fleet_twin.metric_point(payload)
+        if pt is None:
+            return False
+        pending["points"].append((name, *pt))
+        over = len(pending["points"]) - fleet_sink.POINTS_MAX
+        if over > 0:
+            del pending["points"][:over]
+            sink = state.setdefault("sink", {})
+            sink["points_dropped"] = int(sink.get("points_dropped", 0)) + over
+        return True
     if cls == "status":
+        if isinstance(payload, dict):
+            pending["status"][key] = (name, via, payload)
         digest = hashlib.sha256(raw).hexdigest()[:16]
         n = state["nodes"].setdefault(key, {"name": name, "via": via, "gaps": 0, "resets": 0})
         n["status"] = {"digest": digest, "rx": now, "bytes": len(raw)}
@@ -215,6 +245,48 @@ def on_message(_client, _userdata, msg):
         dirty = True
 
 
+VERDICT_STALE = 180        # = fleet_watch.VERDICT_STALE: older is no verdict
+
+
+def read_verdict(now):
+    """{name: {state, since}} the host judged last minute -- or {} when the
+    file is missing or stale: then every node's liveness says `unknown`,
+    never a state nobody vouches for any more."""
+    try:
+        with open(os.path.join(DIR, "verdict.json"), encoding="utf-8") as f:
+            doc = json.load(f) or {}
+        t = calendar.timegm(time.strptime(doc.get("written", ""), "%Y-%m-%dT%H:%M:%SZ"))
+    except (OSError, ValueError, TypeError, OverflowError):
+        return {}
+    return (doc.get("nodes") or {}) if now - t <= VERDICT_STALE else {}
+
+
+def flush(sink, now):
+    """One write into the twin, outside the lock (fleet_sink.Sink.flush)."""
+    global dirty
+    if sink.target() is None:
+        return
+    with lock:
+        snap = {"status": pending["status"], "points": pending["points"],
+                "nodes": {k: (n.get("name"), n.get("via", ""), n.get("alive"))
+                          for k, n in state["nodes"].items() if n.get("name")},
+                "brokers": dict(state["brokers"]), "bridges": dict(state["bridges"])}
+        pending["status"], pending["points"] = {}, []
+    snap["verdict"] = read_verdict(now)
+    rows, left = sink.flush(snap, now)
+    with lock:
+        for k, v in left["status"].items():
+            pending["status"].setdefault(k, v)      # a newer document wins
+        pending["points"][:0] = left["points"]
+        sk = state.setdefault("sink", {})
+        sk.update({"at": int(now), "rows": rows, "error": sink.last_error,
+                   "pending": len(pending["points"]) + len(pending["status"])})
+        dirty = True
+    if sink.last_error:
+        print(f"fleet: twin not written ({sink.last_error}) -- tried again in "
+              f"{fleet_sink.SINK_EVERY} s", flush=True)
+
+
 def main():
     if not WATCH_KEY:
         # fail visibly, never silently: the host's minute job sees a stale
@@ -242,8 +314,12 @@ def main():
             stop.wait(5)
     client.loop_start()
     last = 0
+    sink, last_sink = fleet_sink.Sink(DIR), 0
     while not stop.wait(1):
         now = time.time()
+        if now - last_sink >= fleet_sink.SINK_EVERY:
+            last_sink = now
+            flush(sink, now)
         if (dirty and now - last >= WRITE_EVERY) or now - last >= HEARTBEAT:
             try:
                 write_state()

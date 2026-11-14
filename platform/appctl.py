@@ -13901,6 +13901,10 @@ def validate_data_model_sections(m):
                 errs.append(f"data_model.{kind}: key '{key}' invalid "
                             + ("(dotted lowercase, e.g. 'crm.core')" if kind == "group_types"
                                else "([A-Za-z][A-Za-z0-9]*)"))
+            if entry.get("semantic_id") is not None and                     not _fleet_model_modules()[0].valid(entry.get("semantic_id")):
+                errs.append(f"data_model.{kind}.{key}: semantic_id must be an IRI, an IRDI "
+                            "or OAAP's own 'oaap-aas:<Submodel>/<major>/<minor>[/...]' "
+                            "(oaap.data.model 0.2 §2.9)")
             if kind == "attribute_types" and entry.get("value_type") not in MODEL_VALUE_TYPES:
                 errs.append(f"data_model.attribute_types.{key}: value_type must be one "
                             f"of {' | '.join(MODEL_VALUE_TYPES)}")
@@ -26279,6 +26283,28 @@ def mqtt_acl_watch_user():
     return "oaap.watch"     # = services/mqtt_acl.py WATCH_USER (identity's copy)
 
 
+FLEET_VERDICT = os.path.join(FLEET_DIR, "verdict.json")
+FLEET_HUB_FILE = os.path.join(FLEET_DIR, "hub.json")
+
+
+def _fleet_write_verdict(state, now_e):
+    """The judgement per node for the fleet service's twin writer (RFC-0085
+    amendment A2) -- the same rule the mails use (fleet_watch.view). Only
+    where the twin is wanted; never fails the minute job."""
+    if not os.path.exists(FLEET_HUB_FILE):
+        return
+    try:
+        doc = fleet_watch.verdict(state, now_e, fleet_node_name(),
+                                  _read_json_file(FLEET_VERDICT) or {})
+        tmp = FLEET_VERDICT + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        os.replace(tmp, FLEET_VERDICT)
+    except (OSError, ValueError) as exc:
+        print(f"fleet: verdict not written ({exc})", file=sys.stderr)
+
+
 def fleet_conditions(now):
     """RFC-0085 §6: the fleet's matters in the node's default scope. On a
     hub from the fleet service's state, on a broker node from its broker
@@ -26300,6 +26326,7 @@ def fleet_conditions(now):
         if fleet_watch.trusted(state, now_e):
             out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name(),
                                                   held(fleet_watch.FLEET_MATTERS)))
+            _fleet_write_verdict(state, now_e)
             found = []
 
             def run(st):
@@ -26377,10 +26404,75 @@ def _fleet_hub_show():
               f"{e.get('op', '')} {e.get('kurz', '')}")
 
 
+def _fleet_model_modules():
+    """fleet_model and semantic from the twin's own directory -- the one
+    source the fleet service in the image reads too (no second copy).
+    Loaded once per process."""
+    global _FLEET_MODEL_MODS
+    if _FLEET_MODEL_MODS:
+        return _FLEET_MODEL_MODS
+    import importlib.util
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "services", "twin")
+    mods = []
+    for name in ("semantic", "fleet_model"):
+        spec = importlib.util.spec_from_file_location(name, os.path.join(here, name + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault(name, mod)
+        spec.loader.exec_module(mod)
+        mods.append(mod)
+    _FLEET_MODEL_MODS = mods
+    return mods
+
+
+_FLEET_MODEL_MODS = []
+
+
+def fleet_hub_twin(label):
+    """RFC-0085 amendment A2: the hub's fleet writes into the twin of one
+    tenant (`oaap-ops` unless named). Idempotent: the tenant's twin schema,
+    the fleet's types (origin platform:fleet) registered and activated, its
+    time series enabled, and /fleet/hub.json naming the tenant and the hub.
+    -> (tenant id, registration plan)."""
+    if not has_profile("fleet-hub"):
+        die("this node is not a fleet hub (profile 'fleet-hub', RFC-0085 §8)")
+    if not has_profile("store") or not _store_running():
+        die("this node's store is not running (profile 'store') -- the twin lives in it")
+    tid = resolve_tenant_arg(label)
+    sem, fm = _fleet_model_modules()
+    dm = fm.data_model()
+    errs = validate_data_model_sections({"data_model": dm})
+    errs += [f"{kind}.{e['key']}: semantic_id {e['semantic_id']!r} is no IRI, IRDI or oaap-aas: form"
+             for kind in MODEL_KINDS for e in dm.get(kind) or []
+             if e.get("semantic_id") and not sem.valid(e["semantic_id"])]
+    if errs:
+        die("the fleet's own data model is invalid (a bug, not a setting):\n  "
+            + "\n  ".join(errs))
+    _twin_ensure_schema(tid)
+    plan = model_register_data_model(fm.ORIGIN, fm.PACKAGE, fm.VERSION, dm, tenant_id=tid)
+    timeseries_enable(tid)
+    os.makedirs(FLEET_DIR, exist_ok=True)
+    tmp = FLEET_HUB_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"tenant": tid, "hub": fleet_node_name(), "set": _iso_now()}, f)
+    os.replace(tmp, FLEET_HUB_FILE)
+    audit_fleet({"event": "twin", "tenant": tid})
+    return tid, plan
+
+
 def cmd_fleet(args):
     if args.object == "hub":
+        if args.action == "twin":
+            tid, plan = fleet_hub_twin(args.label or "oaap-ops")
+            made = [k for _kind, k, a, _e in plan if a == "create"]
+            changed = [k for _kind, k, a, _e in plan if a == "additive"]
+            print(f"Fleet twin: tenant {tid} -- {len(plan)} types "
+                  f"({len(made)} new, {len(changed)} extended), time series on, "
+                  f"{FLEET_HUB_FILE} written. The fleet service writes within a minute "
+                  "(needs the twin image of this version: 'sudo oaap update').")
+            return
         if args.action != "show":
-            die("fleet hub: show")
+            die("fleet hub: show | twin [<tenant>]")
         return _fleet_hub_show()
     keys = load_fleet_keys()
     if args.action == "list":
@@ -35507,9 +35599,10 @@ def build_parser():
     pf = sub.add_parser("fleet",
                         help="fleet keys: read-only /fleet/status access (RFC-0021)")
     pf.add_argument("object", choices=["key", "hub"])
-    pf.add_argument("action", choices=["issue", "list", "revoke", "show"])
+    pf.add_argument("action", choices=["issue", "list", "revoke", "show", "twin"])
     pf.add_argument("label", nargs="?",
-                    help="who watches, e.g. fleetview@oaap-demo")
+                    help="who watches, e.g. fleetview@oaap-demo; for 'hub twin' the "
+                         "tenant whose twin the fleet writes (default oaap-ops)")
     pf.set_defaults(fn=cmd_fleet)
     pmg = sub.add_parser("migrate-guard", help="internal: the secret-file guard into old "
                                                 "instance sites (RFC-0084, called by update)")

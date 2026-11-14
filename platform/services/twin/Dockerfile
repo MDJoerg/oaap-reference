@@ -9,6 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # timeseries.py is the time-series driver (RFC-0086), ts_admin.py the
 # host's door into it (enable, the minutely job, show). fleet.py is the
 # hub's fleet service (RFC-0085 stage 2), run by the 'fleet' service.
-COPY app.py relay.py timeseries.py ts_admin.py fleet.py ./
+# twin_write.py holds the write rules the API and the fleet share,
+# semantic.py the one setting for OAAP's own semantic IDs; fleet_model,
+# fleet_twin and fleet_sink are the fleet's writer into the twin (RFC-0085
+# amendment A2).
+COPY app.py relay.py timeseries.py ts_admin.py fleet.py \
+     twin_write.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]

@@ -96,7 +96,9 @@ import psycopg2
 import psycopg2.extras
 from flask import Flask, jsonify, request
 
+import semantic
 import timeseries as ts
+import twin_write as tw
 
 app = Flask(__name__)
 
@@ -284,11 +286,7 @@ def _type_active(conn, tenant_id, type_key):
         return cur.fetchone()
 
 
-def _record_event(conn, kind, object_id, group_key, origin):
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO events (kind, object_id, group_key, origin) "
-            "VALUES (%s, %s, %s, %s)", (kind, object_id, group_key, origin))
+_record_event = tw.record_event
 
 
 # ---------------------------------------------------------------- validity
@@ -323,16 +321,8 @@ def _row_open(row, at):
 
 
 # -------------------------------------------------------------- merge (D3)
-def _canonical_of(conn, obj_id):
-    """The id everyone should use instead, if 'obj_id' was merged away
-    -- or 'obj_id' itself, unchanged, for the overwhelming majority of
-    objects that were never part of a merge. D3: "a merge keeps both
-    platform IDs resolvable forever; one becomes canonical.\""""
-    with conn.cursor() as cur:
-        cur.execute("SELECT canonical_id FROM aliases WHERE alias_id = %s "
-                   "AND unmerged_at IS NULL", (obj_id,))
-        row = cur.fetchone()
-    return str(row["canonical_id"]) if row else obj_id
+# The rules live in twin_write.py (one rule for the API and the fleet).
+_canonical_of = tw.canonical_of
 
 
 def _aliases_of(conn, canonical_id):
@@ -524,70 +514,7 @@ def create_object():
     return jsonify({"id": f"urn:oaap:obj:{obj_id}"}), 201
 
 
-def _write_group_content(conn, obj_id, group_key, origin, recorded_by, payload):
-    """Append the attribute/relation/activity rows a group PUT (or the
-    creating POST) carries. Superseding only compares to the CURRENT
-    row of the same slot -- a value repeated unchanged writes nothing,
-    keeping the history honest (RFC-0031 §3.4)."""
-    with conn.cursor() as cur:
-        for key, value in (payload.get("attributes") or {}).items():
-            if not KEY_RE.match(key):
-                continue
-            cur.execute(
-                "SELECT id, value FROM current_attributes "
-                "WHERE object_id = %s AND group_key = %s AND attr_key = %s",
-                (obj_id, group_key, key))
-            current = cur.fetchone()
-            if current and json.dumps(current["value"], sort_keys=True) == json.dumps(value, sort_keys=True):
-                continue
-            cur.execute(
-                "INSERT INTO attributes (object_id, group_key, attr_key, "
-                "value, valid_from, valid_to, recorded_by) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                (obj_id, group_key, key, json.dumps(value),
-                 payload.get("valid_from"), payload.get("valid_to"), recorded_by))
-            new_id = cur.fetchone()["id"]
-            if current:
-                cur.execute("UPDATE attributes SET superseded_by = %s WHERE id = %s",
-                           (new_id, current["id"]))
-        for rel in (payload.get("relations") or []):
-            rel_key = (rel.get("key") or "").strip()
-            target = (rel.get("target") or "").strip()
-            m = OBJ_ID_RE.match(target)
-            if not rel_key or not m or not KEY_RE.match(rel_key):
-                continue
-            target_id = _canonical_of(conn, m.group(1))
-            cur.execute(
-                "SELECT id FROM current_relations WHERE object_id = %s AND "
-                "group_key = %s AND rel_key = %s AND target_id = %s",
-                (obj_id, group_key, rel_key, target_id))
-            current = cur.fetchone()
-            cur.execute(
-                "INSERT INTO relations (object_id, group_key, rel_key, "
-                "target_id, valid_from, valid_to, recorded_by) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                (obj_id, group_key, rel_key, target_id,
-                 rel.get("valid_from"), rel.get("valid_to"), recorded_by))
-            new_id = cur.fetchone()["id"]
-            if current:
-                cur.execute("UPDATE relations SET superseded_by = %s WHERE id = %s",
-                           (new_id, current["id"]))
-        for act in (payload.get("activities") or []):
-            activity_key = (act.get("key") or "").strip()
-            if not activity_key or not KEY_RE.match(activity_key):
-                continue
-            target = act.get("target") or ""
-            m = OBJ_ID_RE.match(target) if target else None
-            cur.execute(
-                "INSERT INTO activities (object_id, group_key, activity_key, "
-                "target_id, status, planned_start, planned_end, started_at, "
-                "finished_at, recorded_by) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (obj_id, group_key, activity_key,
-                 _canonical_of(conn, m.group(1)) if m else None,
-                 act.get("status", "open"), act.get("planned_start"),
-                 act.get("planned_end"), act.get("started_at"),
-                 act.get("finished_at"), recorded_by))
+_write_group_content = tw.write_group_content
 
 
 @app.get("/twin/objects/<obj_id>")
@@ -658,23 +585,12 @@ def write_group(obj_id, group_key):
             if not writes:
                 return (f"'{name}' does not contribute to '{obj['type_key']}' "
                         "-- see 'oaap data model bindings' (RFC-0031 D4)"), 403
-            with conn.cursor() as cur:
-                cur.execute("SELECT origin FROM groups WHERE object_id = %s "
-                           "AND group_key = %s", (obj_id, group_key))
-                existing = cur.fetchone()
-            if existing is None:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO groups (object_id, group_key, origin, "
-                        "created_by) VALUES (%s, %s, %s, %s)",
-                        (obj_id, group_key, origin, name))
-            elif existing["origin"] != origin:
+            try:
                 # "Nobody else writes there" (RFC-0031 §3.3) -- enforced
-                # here, not by trusting the caller to behave.
-                return (f"group '{group_key}' belongs to '{existing['origin']}' "
-                        f"-- '{origin}' may not write it"), 403
-            _write_group_content(conn, obj_id, group_key, origin, name, body)
-            _record_event(conn, "group.written", obj_id, group_key, origin)
+                # in twin_write, not by trusting the caller to behave.
+                tw.write_group(conn, obj_id, group_key, origin, name, body)
+            except tw.Refused as exc:
+                return str(exc), exc.code
     finally:
         conn.close()
     return "", 204
@@ -720,9 +636,13 @@ def twin_types_for_person():
         definition = r["definition"]
         if isinstance(definition, str):
             definition = json.loads(definition)
-        out.append({"key": r["key"], "kind": r["kind"], "origin": r["origin"],
-                   "title": definition.get("title") or r["key"],
-                   "definition": definition})
+        row = {"key": r["key"], "kind": r["kind"], "origin": r["origin"],
+               "title": definition.get("title") or r["key"],
+               "definition": definition}
+        if definition.get("semantic_id"):
+            # stored short, answered in full (oaap.data.model 0.2 §2.9)
+            row["semantic_iri"] = semantic.expand(definition["semantic_id"])
+        out.append(row)
     return jsonify({"types": out})
 
 

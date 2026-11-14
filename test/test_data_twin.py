@@ -67,7 +67,10 @@ appctl_src = read("appctl.py")
 compose_src = read("docker-compose.yml")
 caddy_src = read("Caddyfile")
 migrate_src = read("migrate.sh")
-twin_src = read("services", "twin", "app.py")
+# Since 0.1.279 the write rules live in twin_write.py, shared by the API and
+# the fleet's writer (RFC-0085 amendment A2) -- the twin's code is both files.
+write_src = read("services", "twin", "twin_write.py")
+twin_src = read("services", "twin", "app.py") + "\n" + write_src
 
 print("=== _scrub_rehearsal_env: no production twin credential survives (D8 stand-in) ===")
 tid = m.ensure_default_tenant()
@@ -220,7 +223,8 @@ ok("a merged-away id still resolves ('an app that stored the alias never "
    "breaks', D3) -- _load_object/_canonical_of is on the read AND write path",
    twin_src.count("_canonical_of(conn,") >= 3)
 ok("_write_group_content resolves a relation's TARGET through a merge too, "
-   "not just the object being written", "_canonical_of(conn, m.group(1))" in twin_src)
+   "not just the object being written",
+   "target_id = canonical_of(conn, m.group(1))" in write_src)
 
 print("\n=== 0.2: a second authentication path for the portal ONLY, never "
       "through the gateway, never with an RFC-0027 key ===")

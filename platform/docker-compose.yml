@@ -277,6 +277,10 @@ services:
       # '/twin/*' (the gateway route, RFC-0027 keys) needs no part of
       # this and is unaffected.
       INTERNAL_API_KEY: "${INTERNAL_API_KEY:-}"
+      # The domain of OAAP's own semantic IDs (oaap.data.model 0.2 §2.9):
+      # stored as 'oaap-aas:...', expanded with this on the way out; empty =
+      # https://objid.info/oaap/aas (semantic.py). Changing it moves no row.
+      OAAP_SEMANTIC_BASE: "${OAAP_SEMANTIC_BASE:-}"
     volumes:
       # registry.json (whose tenant/app owns which instance) and
       # twin-secrets.json (the per-tenant schema role/password, written
@@ -430,5 +434,10 @@ services:
       BROKER_WATCH_KEY: "${BROKER_WATCH_KEY:-}"
       OAAP_METRICS_ROOT: "${OAAP_METRICS_ROOT:-}"
     volumes:
-      # state.json and the nodes' status documents, 0600; the host reads it
+      # state.json and the nodes' status documents, 0600; the host reads it.
+      # The host writes hub.json (which tenant's twin, `oaap fleet hub twin`)
+      # and verdict.json (its judgement per node, each minute) into it.
       - "${OAAP_DATA_DIR}/data/fleet:/fleet"
+      # twin-secrets.json: the tenant's twin and time-series roles, read-only,
+      # the same mount the twin service has (RFC-0085 amendment A2)
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"

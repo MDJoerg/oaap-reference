@@ -225,3 +225,20 @@ def entry_conditions(watch, now):
                          "schweigende Knoten. Was hier ankommt, wartet in der "
                          "Warteschlange.")}
     return out
+
+
+VERDICT_STALE = 180        # an older verdict.json is no verdict at all (fleet_sink)
+
+
+def verdict(state, now, me, previous):
+    """The judgement per node for the twin (RFC-0085 amendment A2):
+    {"written", "nodes": {name: {state, since, reason}}}. The same rows as
+    `view` -- one rule for the mail and the twin -- with `since` kept while
+    a node's state does not change. `previous` is the last verdict."""
+    prev = (previous or {}).get("nodes") or {}
+    out = {}
+    for r in view(state, now, me):
+        p = prev.get(r["name"]) or {}
+        since = p.get("since") if p.get("state") == r["state"] and p.get("since") else iso(now)
+        out[r["name"]] = {"state": r["state"], "since": since, "reason": r.get("reason") or ""}
+    return {"written": iso(now), "nodes": out}
