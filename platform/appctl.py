@@ -26488,8 +26488,11 @@ def fleet_conditions(now):
         else:
             out.update(conds)
     try:
-        if os.path.exists(FLEET_PAIR_FILE) or has_profile("fleet-hub"):
-            _pair_view_write()        # RFC-0085 stage 3: the page "Flotte" reads it
+        # RFC-0085 stage 3: the page "Flotte" reads it -- on EVERY node: a
+        # fresh node with no pairing yet is exactly the one that needs the
+        # card "Kopplungsdatei einspielen" (oaapx02, 2026-11-15: the page
+        # showed only the ceiling, because this ran only after a pairing).
+        _pair_view_write()
     except Exception as exc:  # noqa: BLE001 -- never fails the minute job
         print(f"fleet pair: view skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
     return out
