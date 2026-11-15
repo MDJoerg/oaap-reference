@@ -6861,6 +6861,12 @@ def _instance_probe(name, inst):
         # any response below 400 counts as alive.
         if state == "warn" and detail.startswith("HTTP 3"):
             state, label = "ok", "Gesund"
+        # 0.1.294: a declared path the app never built -- ask its home page
+        elif fleet_view.health_path_missing(state, detail) and health_path != "/":
+            alt = fleet_view.root_fallback(health_path, detail,
+                                           _probe(f"{GATEWAY_HEALTH}/r/{name}"))
+            if alt:
+                state, label, detail = alt
     elif container and svc_port:
         state, label, detail = _probe(f"{GATEWAY_HEALTH}/h/{name}")
         if state == "warn":  # any HTTP answer counts as reachable here

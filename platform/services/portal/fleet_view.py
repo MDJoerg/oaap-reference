@@ -252,6 +252,31 @@ def build_document(node, version, profiles, now_iso, core, instances,
 # app was fixed). Asked together, the answer takes as long as the slowest
 # single probe, and never longer than the budget.
 PROBE_WORKERS = 8
+# 0.1.294: an app may declare a health path it never built (an AI-built web
+# site on oaapx02, 2026-11-15: /healthz 404, its home page 200). The node
+# cannot make others meet its rules, so a declared path that is MISSING
+# (404/405 -- not a 5xx, not silence) is not taken as the app's verdict:
+# the probe asks the app's home page (/r/<name>), and an answer below 400
+# there counts as reachable, with the missing path named in the detail.
+MISSING_PATH = ("HTTP 404", "HTTP 405")
+
+
+def health_path_missing(state, detail):
+    """Did the declared health path answer 'no such path'?"""
+    return state == "warn" and detail in MISSING_PATH
+
+
+def root_fallback(health_path, detail, root):
+    """(state, label, detail) when the home page answers, else None.
+    `root` is the probe's own (state, label, detail) for /r/<name>."""
+    rs, _rl, rd = root
+    if rs == "ok" or (rs == "warn" and rd[:6] in ("HTTP 2", "HTTP 3")):
+        return ("ok", "Erreichbar",
+                f"Healthcheck-Pfad {health_path} fehlt ({detail}), Startseite "
+                f"antwortet ({rd}) — Manifest prüfen")
+    return None
+
+
 PROBE_BUDGET = 4.0          # seconds for the whole round, however many apps
 
 

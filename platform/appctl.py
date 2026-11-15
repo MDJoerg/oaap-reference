@@ -17709,6 +17709,13 @@ def write_internal_health_caddy():
         lines.append(f"\t\t\trewrite * {hp}")
         lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
         lines.append("\t\t}")
+        # 0.1.294: the app's home page, asked only when its declared health
+        # path answers 404/405 (portal _instance_probe, fleet_view.root_fallback)
+        if hp != "/":
+            lines.append(f"\t\thandle /r/{name} {{")
+            lines.append("\t\t\trewrite * /")
+            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t}")
         # RFC-0087 §8.1: a tunnel app's links door, for the status document
         lp = link_state_door(inst)
         if lp:
@@ -19815,6 +19822,52 @@ def _republish_sites(name, inst):
     # A sleeping tunnel app answers its `through` destinations with a
     # sentence, a woken one forwards again (RFC-0060 §2.3).
     refresh_destinations()
+
+
+def _http_status(url):
+    """The first HTTP status the gateway gets for url, or None (no answer).
+    The gateway's wget is busybox: no --max-redirect (measured on oaap-test,
+    0.1.294) -- it follows a redirect, and the FIRST status line is kept."""
+    r = subprocess.run(["docker", "exec", GATEWAY_CONTAINER, "wget", "-S", "-q",
+                        "-O", "/dev/null", "-T", "3", url],
+                       capture_output=True, text=True)
+    m = re.search(r"HTTP/\S+ (\d{3})", (r.stderr or "") + (r.stdout or ""))
+    return int(m.group(1)) if m else None
+
+
+def health_path_note(path, code, root_code):
+    """0.1.294: what install says about a declared health path the app does
+    not answer -- pure, so the wording is tested without Docker. None when
+    there is nothing to say."""
+    if not path or path == "/" or code not in (404, 405):
+        return None
+    if root_code is not None and root_code < 400:
+        return (f"NOTE: health.path {path} answers HTTP {code}, the home page HTTP "
+                f"{root_code}. The node counts the instance as reachable and names the "
+                "missing path on the health page. Better: build the path, or declare "
+                "'health: path: /' in the manifest.")
+    return (f"WARNING: health.path {path} answers HTTP {code}, and the home page "
+            + (f"HTTP {root_code}" if root_code else "not at all")
+            + ". The instance will show as unhealthy.")
+
+
+def check_health_path(inst, seconds=20):
+    """After an install: ask the declared health path once the app answers at
+    all (up to `seconds`), and say so if the app never built it."""
+    path = inst.get("health_path") or ""
+    svcs = instance_services(inst)
+    if not path or path == "/" or not svcs:
+        return None
+    base = f"http://{svcs[0]['container']}:{svcs[0].get('port') or inst.get('svc_port')}"
+    end = time.monotonic() + seconds
+    code = None
+    while code is None and time.monotonic() < end:
+        code = _http_status(base + path)
+        if code is None:
+            time.sleep(2)
+    if code not in (404, 405):
+        return None
+    return health_path_note(path, code, _http_status(base + "/"))
 
 
 def _answers(inst, seconds):
@@ -22596,6 +22649,12 @@ def _install_from_dir(pkg, args, source):
     sync_instance_names(reg, only=name)
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
     print(f"Entry point: port {port} (through the gateway, login required)")
+    try:
+        _note = check_health_path(reg["instances"][name])
+        if _note:
+            print(_note)
+    except Exception:  # noqa: BLE001 -- a hint, never a reason to fail an install
+        pass
     if not inst:
         # Nothing was held back: a new instance has nothing to be compared
         # with. Said here and written to the tenant's log, so a person can
