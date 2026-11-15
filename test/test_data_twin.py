@@ -272,6 +272,16 @@ ok("viewing/merging duplicates needs role tenant_admin (§3.6) -- checked "
        or '"tenant_admin" in roles' in (_twin_fn_body(n) or "")
        for n in ("twin_candidates", "twin_merges", "twin_merge", "twin_unmerge")) == 4)
 
+list_fn = _twin_fn_body("list_objects")
+ok("0.7 §2.6a: GET /twin/objects?type= is app-facing (require_caller), "
+   "refused without a binding on the type, merged aliases excluded, bounded",
+   list_fn is not None and "require_caller()" in list_fn
+   and "require_person()" not in list_fn
+   and 'b["type_key"] == type_key for b in bindings' in list_fn
+   and "aliases WHERE unmerged_at IS NULL" in list_fn
+   and "LIMIT %s" in list_fn and '"truncated"' in list_fn
+   and '@app.get("/twin/objects")' in twin_src)
+
 candidates_fn = _twin_fn_body("twin_candidates")
 ok("candidate buckets are keyed by TITLE ALONE, not (type, title) -- a "
    "same-type restriction would hide the very duplicate this step exists "

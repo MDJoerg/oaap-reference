@@ -519,6 +519,55 @@ def create_object():
 
 _write_group_content = tw.write_group_content
 
+# oaap.data.twin 0.7 §2.6a: the most objects one list answers. A fleet of a
+# few nodes has a few hundred instances at most; a list longer than this
+# says so (`truncated`) rather than cutting silently.
+LIST_MAX = 500
+
+
+@app.get("/twin/objects")
+def list_objects():
+    """oaap.data.twin 0.7 §2.6a (RFC-0085 §10): every object of one type,
+    each answered as §2.6 answers it -- for an instance whose bindings name
+    the type in either direction, exactly the rule of the single read. The
+    fleet app reads its tenant's fleet with this; without it an app could
+    only read objects whose ids it already held. A merged-away alias is no
+    row of its own (it answers as its canonical object)."""
+    caller, err, code = require_caller()
+    if err:
+        return err, code
+    name, tenant_id, _origin = caller
+    type_key = (request.args.get("type") or "").strip()
+    if not type_key:
+        return "query needs '?type='", 400
+    at = _parse_at(request.args.get("at"))
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return "this tenant has no twin schema yet", 409
+    try:
+        with conn:
+            bindings = _bindings(conn, name)
+            if not any(b["type_key"] == type_key for b in bindings):
+                return (f"'{name}' neither contributes nor consumes "
+                        f"'{type_key}' -- see 'oaap data model "
+                        "bindings' (RFC-0031 D7)"), 403
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM objects WHERE type_key = %s AND id NOT IN "
+                    "(SELECT alias_id FROM aliases WHERE unmerged_at IS NULL) "
+                    "ORDER BY title, id LIMIT %s", (type_key, LIST_MAX + 1))
+                ids = [str(r["id"]) for r in cur.fetchall()]
+            out = []
+            for oid in ids[:LIST_MAX]:
+                loaded = _load_object(conn, oid, at)
+                if loaded is not None:
+                    out.append({"id": f"urn:oaap:obj:{loaded['canonical_id']}",
+                                "type": loaded["type_key"], "title": loaded["title"],
+                                "owner": loaded["owner"], "groups": loaded["groups"]})
+    finally:
+        conn.close()
+    return jsonify({"objects": out, "truncated": len(ids) > LIST_MAX})
+
 
 @app.get("/twin/objects/<obj_id>")
 def read_object(obj_id):
