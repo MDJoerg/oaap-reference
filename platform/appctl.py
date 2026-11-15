@@ -10045,7 +10045,7 @@ def job_result_fill(req, rid, ok, msg):
     """
     if str(req.get("action") or "") not in (
             "cohort", "tenant-build", "tenant-request", "tenant-request-submit",
-            "tenant-profile", "disk"):
+            "tenant-profile", "disk", "fleet-disclose"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
         return
@@ -26506,7 +26506,7 @@ def fleet_disclose_save(d):
     os.chmod(FLEET_DISCLOSE_FILE, 0o644)
 
 
-def fleet_disclose(level, tenant_label="", who="root"):
+def fleet_disclose(level, tenant_label="", who="root", role="root"):
     """Set the node's ceiling, or one tenant's level (at most the ceiling).
     Audited: the node level in the fleet log, a tenant's in its own log.
     -> the file's content after the change."""
@@ -26524,14 +26524,60 @@ def fleet_disclose(level, tenant_label="", who="root"):
                     f"more ('sudo oaap fleet disclose {level}' raises the ceiling)")
             d["tenants"][tid] = level
         fleet_disclose_save(d)
-        audit_tenant("fleet.disclose", tid, subject=level, who=who)
+        audit_tenant("fleet.disclose", tid, subject=level, who=who, role=role)
         return d
     if level == "default":
         level = "pseudonym"
     d["ceiling"] = level
     fleet_disclose_save(d)
-    audit_fleet({"event": "disclose", "ceiling": level, "by": who})
+    audit_fleet({"event": "disclose", "ceiling": level, "by": who, "role": role})
     return d
+
+
+def fleet_disclose_job(req, act_tenant, role, actor):
+    """The page "Flotte" (RFC-0087 §4) -> (ok, sentence, tenant id).
+
+    The server_admin sets the node's ceiling and any tenant's level; a
+    tenant_admin sets their own tenant's level and nothing else. Role and
+    tenant come from the ACTOR's record (the worker derives them), never
+    from the request; the function the command line calls does the act,
+    so its rule -- a tenant never above the ceiling -- is judged here too.
+    """
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    level = str(a.get("level") or "")
+    if role not in ("server_admin", "tenant_admin"):
+        return (False, "the disclosure levels are the server admin's and a "
+                "tenant admin's", act_tenant)
+    if op == "ceiling":
+        if role != "server_admin":
+            return False, "only the server admin sets the node's ceiling", act_tenant
+        if level not in FLEET_DISCLOSE_LEVELS:
+            return False, "level: count | pseudonym | names", None
+        tid = ""
+    elif op == "tenant":
+        label = str(a.get("tenant") or "").strip().lower()
+        tid = act_tenant
+        if label:
+            tid, _t = tenant_by_label(label, include_former=False)
+            if not tid or (role != "server_admin" and tid != act_tenant):
+                # one sentence for "not there" and "not yours"
+                return False, f"no tenant '{label}' to set", act_tenant
+        if not tid or tid not in load_tenants():
+            return False, "no tenant to set", act_tenant
+        if level not in FLEET_DISCLOSE_LEVELS + ("default",):
+            return False, "level: count | pseudonym | names | default", tid
+    else:
+        return False, f"unknown disclosure operation '{op}'", act_tenant
+    try:
+        d = fleet_disclose(level, tid, who=actor or "portal", role=role)
+    except SystemExit:
+        return False, LAST_DIE or "refused", tid or None
+    if op == "ceiling":
+        return True, f"The node's ceiling is now '{d['ceiling']}'.", None
+    own = d["tenants"].get(tid)
+    return True, (f"This tenant now gives away '{own}'." if own else
+                  f"This tenant now follows the ceiling ('{d['ceiling']}')."), tid
 
 
 def _fleet_disclose_show(d):
@@ -31635,6 +31681,23 @@ def cmd_process_deploys(_args):
                 audit_tenant("disk." + str(req.get("op") or "?"),
                              ensure_default_tenant(), result="denied",
                              who=actor or "portal", role=act_role or "-")
+        elif action == "fleet-disclose":
+            # RFC-0087 §4: the page "Flotte". A done change audits itself
+            # (node level in the fleet log, a tenant's in its own log); a
+            # refused one is recorded here, in the tenant it was meant for.
+            ok, msg, _ftid = fleet_disclose_job(req, act_tenant, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("fleet.disclose", _ftid or ensure_default_tenant(),
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
         elif action == "egress":
             # RFC-0068 stage 4: the page "Abfluss". The functions the command
             # line calls judge the role; role and tenant come from the
@@ -31767,7 +31830,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal", "care": "portal", "rebuild": "portal", "bulk": "portal",
+               "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "care": "portal", "rebuild": "portal", "bulk": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(

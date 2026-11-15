@@ -77,6 +77,28 @@ ok("Pseudonym stabil, m- plus 10 Hex, nicht der Name", p1 == d.tenant("T1") and 
 ok("anderes Salz, anderes Pseudonym (nicht zwischen Knoten verknuepfbar)",
    fl.Disclosure({**S, "salt": "xyz"}, {}).tenant("T1") != p1)
 
+print("=== die Seite Flotte: disclosure_view ===")
+TN = {"T1": {"label": "ais", "name": "AIS GmbH"}, "T2": {"label": "kunde"},
+      "T3": {"label": "cls"}}
+v = fl.disclosure_view(S, TN)
+by = {r["label"]: r for r in v["rows"]}
+ok("Obergrenze und alle Mandanten fuer den Server-Admin, nach Kurzname sortiert",
+   v["ceiling"] == "pseudonym" and v["ceiling_set"] and [r["label"] for r in v["rows"]]
+   == ["ais", "cls", "kunde"], v)
+ok("ohne eigene Wahl: folgt der Obergrenze, Pseudonym draussen",
+   by["ais"]["own"] == "" and by["ais"]["level"] == "pseudonym"
+   and by["ais"]["outward"] == fl.Disclosure(S, TN).tenant("T1") and by["ais"]["title"] == "AIS GmbH")
+ok("eigene Wahl ueber der Obergrenze bleibt sichtbar, gilt aber nicht",
+   by["kunde"]["own"] == "names" and by["kunde"]["capped"] and by["kunde"]["level"] == "pseudonym")
+ok("Stufe count: draussen kein Name", by["cls"]["level"] == "count" and by["cls"]["outward"] == "")
+ok("waehlbar sind nur Stufen bis zur Obergrenze", v["choosable"] == ["count", "pseudonym"])
+mine = fl.disclosure_view(S, TN, only="T2")
+ok("ein tenant_admin sieht nur seinen Mandanten -- keine Zeile, keine Zahl der anderen",
+   [r["tid"] for r in mine["rows"]] == ["T2"] and "ais" not in json.dumps(mine), mine)
+ok("ohne Datei: Vorgabe pseudonym, als nicht festgelegt erkennbar",
+   fl.disclosure_view({}, TN)["ceiling"] == "pseudonym"
+   and not fl.disclosure_view({}, TN)["ceiling_set"])
+
 print("=== die Zeilen ===")
 TENANTS = {"T-ais": {"label": "ais"}, "T-ops": {"label": "oaap-ops"}, "T-x": {"label": "kunde"}}
 CONF = {
@@ -194,6 +216,37 @@ if a is not None:
     log = open(logf, encoding="utf-8").read() if logf and os.path.exists(logf) else ""
     ok("die Wahl eines Mandanten steht in SEINEM Protokoll", '"fleet.disclose"' in log
        and '"T1"' in log, (logf, log[-300:]))
+
+    print("=== die Seite Flotte: fleet_disclose_job (Host) ===")
+    J = a.fleet_disclose_job
+    r = J({"op": "tenant", "args": {"level": "count"}}, "T2", "tenant_admin", "kunde-admin")
+    ok("tenant_admin setzt seinen eigenen Mandanten",
+       r[0] and a.fleet_disclose_load()["tenants"].get("T2") == "count" and r[2] == "T2", r)
+    r1 = J({"op": "tenant", "args": {"level": "count", "tenant": "ais"}}, "T2", "tenant_admin", "x")
+    r2 = J({"op": "tenant", "args": {"level": "count", "tenant": "gibtsnicht"}}, "T2",
+           "tenant_admin", "x")
+    ok("tenant_admin nennt einen fremden Mandanten: abgelehnt, derselbe Satz wie fuer keinen",
+       not r1[0] and not r2[0] and r1[1].replace("ais", "?") == r2[1].replace("gibtsnicht", "?")
+       and a.fleet_disclose_load()["tenants"].get("T1") == "names", (r1, r2))
+    r = J({"op": "ceiling", "args": {"level": "count"}}, "T2", "tenant_admin", "x")
+    ok("tenant_admin setzt keine Obergrenze", not r[0] and a.fleet_disclose_load()["ceiling"] == "names", r)
+    r = J({"op": "tenant", "args": {"level": "count"}}, "T2", "admin", "x")
+    ok("eine App-Rolle setzt gar nichts", not r[0], r)
+    r = J({"op": "ceiling", "args": {"level": "pseudonym"}}, "T1", "server_admin", "root-admin")
+    ok("server_admin setzt die Obergrenze", r[0] and a.fleet_disclose_load()["ceiling"] == "pseudonym", r)
+    ok("... und die hoehere Wahl eines Mandanten bleibt gespeichert",
+       a.fleet_disclose_load()["tenants"].get("T1") == "names")
+    r = J({"op": "tenant", "args": {"level": "names", "tenant": "kunde"}}, "T1", "server_admin", "x")
+    ok("ueber die Obergrenze auch fuer den server_admin: abgelehnt, mit dem Satz der Kommandozeile",
+       not r[0] and "ceiling" in r[1] and a.fleet_disclose_load()["tenants"].get("T2") == "count", r)
+    r = J({"op": "tenant", "args": {"level": "default", "tenant": "kunde"}}, "T1", "server_admin", "x")
+    ok("server_admin nimmt die Wahl eines Mandanten zurueck",
+       r[0] and "T2" not in a.fleet_disclose_load()["tenants"], r)
+    r = J({"op": "alles", "args": {"level": "names"}}, "T1", "server_admin", "x")
+    ok("unbekannte Operation: abgelehnt", not r[0], r)
+    flog = open(a.FLEET_LOG, encoding="utf-8").read() if os.path.exists(a.FLEET_LOG) else ""
+    ok("die Obergrenze aus dem Portal steht im Flottenprotokoll mit Person und Rolle",
+       '"root-admin"' in flog and '"server_admin"' in flog, flog[-300:])
 
 print(f"\n{'ALLE GRUEN' if not fails else str(fails) + ' FEHLER'}")
 sys.exit(1 if fails else 0)

@@ -99,6 +99,42 @@ class Disclosure:
         return _pseudo(self.settings, prefix, f"{prefix}/{tid}/{name}")
 
 
+def disclosure_view(settings, tenants, only=None):
+    """The page "Flotte" (RFC-0087 §4): the ceiling and, per tenant, its own
+    choice, the level that holds and the name it carries outside the node.
+
+    `only` is a tenant id: a tenant_admin's page shows that tenant and no
+    other -- not a row, not a count. `ceiling_set` says whether the node has
+    written its settings yet (they are made on first use, with the salt);
+    until then the page says "Vorgabe" instead of pretending a choice.
+    """
+    settings = settings or {}
+    tenants = tenants or {}
+    d = Disclosure(settings, tenants)
+    rows = []
+    for tid, t in sorted(tenants.items(), key=lambda kv: (kv[1] or {}).get("label", kv[0])):
+        if only is not None and tid != only:
+            continue
+        own = (settings.get("tenants") or {}).get(tid)
+        rows.append({
+            "tid": tid,
+            "label": (t or {}).get("label") or tid,
+            "title": (t or {}).get("title") or (t or {}).get("name") or "",
+            "own": own if own in LEVELS else "",
+            # an own choice above a ceiling lowered later: it is kept, and
+            # does not hold -- the page says so instead of hiding it
+            "capped": own in LEVELS and _rank(own) > _rank(ceiling(settings)),
+            "level": d.level(tid),
+            "outward": d.tenant(tid),
+        })
+    top = ceiling(settings)
+    return {"ceiling": top,
+            "ceiling_set": settings.get("ceiling") in LEVELS and bool(settings.get("salt")),
+            # the levels a tenant may choose: at or below the ceiling
+            "choosable": [lv for lv in LEVELS if _rank(lv) <= _rank(top)],
+            "rows": rows}
+
+
 # --- the rows ---------------------------------------------------------------
 
 def _host(url):

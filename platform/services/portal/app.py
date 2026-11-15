@@ -4529,6 +4529,9 @@ def page(body_template, title, active, status=200, **ctx):
         "can_build": _can_build(),
         "has_cohorts": _has_cohorts(),
         "show_tenant_admin": multi and bool(caller & {"server_admin", "tenant_admin"}),
+        # The page "Flotte" (RFC-0087 §4): the ceiling is the server_admin's,
+        # a tenant's level its tenant_admin's.
+        "can_fleet": bool(caller & {"server_admin", "tenant_admin"}),
     }
     groups = nav_view.nav_groups(flags, active)
     # Long pages without tabs: jump marks from what THIS caller sees (6.2.3).
@@ -14460,6 +14463,140 @@ dasselbe sofort.</p></div>
 </div>
 {% endif %}
 """
+
+
+# ---------------------------------------------- Flotte: Preisgabe (RFC-0087 §4)
+# How much the status document says about this node's tenants. The page
+# reads the settings file (read-only mount) and writes through the spool;
+# the host judges role and tenant again from the actor's record.
+
+FLEET_LEVEL_TEXT = {
+    "count": ("Nur Anzahl",
+              "Der Mandant zählt nur in der Zahl der Mandanten. Seine Instanzen und "
+              "Verbindungen tragen keinen Mandanten, eine Destination erscheint als "
+              "Pseudonym, gebundene Instanzen nur als Zahl."),
+    "pseudonym": ("Pseudonym",
+                  "Der Mandant erscheint unter einer festen Kennung (m-…), seine "
+                  "Destinationen und externen Ziele ebenso. Die Kennungen entstehen "
+                  "mit einem Geheimnis dieses Knotens und lassen sich zwischen "
+                  "Knoten nicht verknüpfen."),
+    "names": ("Namen",
+              "Der Mandant erscheint mit seinem Kurznamen, seine Destinationen und "
+              "externen Ziele mit ihren Namen."),
+}
+
+FLEET_BODY = """
+<div class="pagehead"><h1>Flotte</h1></div>
+""" + BUILD_BANNER + """
+<div class="card">
+  <h2>Was der Knoten über seine Mandanten preisgibt</h2>
+  <p>Das gilt für das Statusdokument dieses Knotens: das, was eine Zentrale mit einem
+  Flottenschlüssel liest oder was der Knoten selbst an seine Zentrale schickt. Adressen,
+  Pfade, Schlüssel und Fehlertexte stehen auf keiner Stufe darin.</p>
+  <table class="mini"><tbody>
+  {% for lv in levels %}<tr><th>{{ texts[lv][0] }}</th><td>{{ texts[lv][1] }}</td></tr>{% endfor %}
+  </tbody></table>
+  <p class="muted">Instanznamen verlassen den Knoten auf jeder Stufe, wie bisher, und
+  enthalten oft das Mandantenkürzel (zum Beispiel <code>cls-viewer</code>). Diese Seite
+  versteckt sie nicht; das wäre eine eigene Entscheidung.</p>
+</div>
+
+<div class="card">
+  <h2>Obergrenze des Knotens</h2>
+  <p>Kein Mandant gibt mehr preis als die Obergrenze:
+  <strong>{{ texts[v.ceiling][0] }}</strong>{% if not v.ceiling_set %} (Vorgabe, noch
+  nicht festgelegt){% endif %}.</p>
+  {% if is_server_admin %}
+  <form method="post" action="/flotte">
+    <input type="hidden" name="op" value="ceiling">
+    <label>Neue Obergrenze
+      <select name="level">
+      {% for lv in levels %}<option value="{{ lv }}" {% if lv == v.ceiling %}selected{% endif %}>{{ texts[lv][0] }}</option>{% endfor %}
+      </select></label>
+    <button>Obergrenze setzen</button>
+  </form>
+  <p class="muted">Senken wirkt sofort für alle Mandanten darüber; ihre eigene Wahl bleibt
+  gespeichert und gilt wieder, wenn die Obergrenze steigt. Jede Änderung steht im
+  Flottenprotokoll des Knotens.</p>
+  {% else %}
+  <p class="muted">Die Obergrenze setzt der Server-Admin.</p>
+  {% endif %}
+</div>
+
+<div class="card" style="overflow-x:auto">
+  <h2>{{ "Mandanten" if is_server_admin else "Ihr Mandant" }}</h2>
+  {% if not v.rows %}<p class="muted">Keine Mandanten.</p>{% else %}
+  <table class="mini">
+    <thead><tr><th>Mandant</th><th>Eigene Wahl</th><th>Gilt</th><th>Erscheint draußen als</th><th>Ändern</th></tr></thead>
+    <tbody>
+    {% for r in v.rows %}
+    <tr>
+      <td>{{ r.label }}{% if r.title %}<br><span class="muted">{{ r.title }}</span>{% endif %}</td>
+      <td>{% if r.own %}{{ texts[r.own][0] }}{% if r.capped %} <span class="muted">(über der Obergrenze, gilt nicht)</span>{% endif %}{% else %}<span class="muted">folgt der Obergrenze</span>{% endif %}</td>
+      <td>{{ texts[r.level][0] }}</td>
+      <td>{% if r.outward %}<code>{{ r.outward }}</code>{% else %}<span class="muted">nur in der Anzahl</span>{% endif %}</td>
+      <td>
+        <form method="post" action="/flotte">
+          <input type="hidden" name="op" value="tenant">
+          {% if is_server_admin %}<input type="hidden" name="tenant" value="{{ r.label }}">{% endif %}
+          <select name="level" style="margin:.1rem 0 .4rem" aria-label="Stufe für {{ r.label }}">
+            <option value="default" {% if not r.own %}selected{% endif %}>Obergrenze folgen</option>
+            {% for lv in v.choosable %}<option value="{{ lv }}" {% if lv == r.own %}selected{% endif %}>{{ texts[lv][0] }}</option>{% endfor %}
+          </select>
+          <button>Setzen</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted">Jede Änderung steht im Protokoll des Mandanten.</p>
+  {% endif %}
+</div>
+"""
+
+
+@app.get("/flotte")
+def fleet_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    role, mine = caller_scope()
+    tenants = load_tenants()
+    if role != "server_admin" and mine not in tenants:
+        return "Diesen Mandanten gibt es auf diesem Knoten nicht.", 404
+    view = fleet_links.disclosure_view(
+        _read_json(FLEET_DISCLOSE_FILE) or {}, tenants,
+        only=None if role == "server_admin" else mine)
+    return page(FLEET_BODY, "Flotte", "fleet", v=view,
+                levels=fleet_links.LEVELS, texts=FLEET_LEVEL_TEXT,
+                is_server_admin=role == "server_admin",
+                job=_build_job_note(mine, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/flotte")
+def fleet_set():
+    """One change through the spool; the host judges it again."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    role, mine = caller_scope()
+    op = request.form.get("op", "")
+    level = request.form.get("level", "")
+    if op not in ("ceiling", "tenant") or level not in fleet_links.LEVELS + ("default",):
+        return redirect("/flotte?err=" + quote("Diese Stufe gibt es nicht."), code=303)
+    if op == "ceiling" and role != "server_admin":
+        return "Zugriff verweigert: die Obergrenze setzt der Server-Admin.", 403
+    args = {"level": level}
+    if op == "tenant" and role == "server_admin":
+        # Only a server_admin names a tenant; for anyone else the host takes
+        # the actor's own (as on the page "Abfluss").
+        args["tenant"] = (request.form.get("tenant") or "").strip().lower()[:64]
+    rid = management_api.enqueue(mine, role, op, args, action="fleet-disclose")
+    return redirect(f"/flotte?job={rid}", code=303)
 
 
 @app.get("/tenant/egress")

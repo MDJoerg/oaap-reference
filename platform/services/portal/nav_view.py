@@ -25,6 +25,7 @@ GROUPS = (
         ("apps", "/", "Apps", None),
         ("instances", "/instances", "Instanzen", "is_user_admin"),
         ("health", "/health", "Gesundheit", "can_health"),
+        ("fleet", "/flotte", "Flotte", "can_fleet"),
         ("build", "/aufbau", "Aufbau", "can_build"),
         ("disks", "/datentraeger", "Datenträger", "can_build"),
     )),
