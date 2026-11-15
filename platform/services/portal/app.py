@@ -4535,6 +4535,8 @@ def page(body_template, title, active, status=200, **ctx):
         # The page "Flotte" (RFC-0087 §4): the ceiling is the server_admin's,
         # a tenant's level its tenant_admin's.
         "can_fleet": bool(caller & {"server_admin", "tenant_admin"}),
+        # The page "Assets" (RFC-0088 §5): the tenant's own universe.
+        "can_assets": bool(caller & {"server_admin", "tenant_admin"}),
     }
     groups = nav_view.nav_groups(flags, active)
     # Long pages without tabs: jump marks from what THIS caller sees (6.2.3).
@@ -14662,6 +14664,176 @@ def fleet_set():
     return redirect(f"/flotte?job={rid}", code=303)
 
 
+# ------------------------------------------- the tenant's assets (RFC-0088)
+# Stage 1: what the tenant's apps name of themselves, as the node wrote it
+# into the tenant's own twin (origin platform:assets) -- a list per kind
+# with state and what depends on each row. The tenant_admin's page (D3:
+# the whole universe is theirs); a server_admin looks at any tenant.
+
+ASSETS_VIEW = "/apps-registry/assets-view.json"
+ASSETS_SETTINGS = "/apps-registry/assets-settings.json"
+ASSET_KIND_TEXT = {
+    "source": ("Bezugsquellen", "Bezugsquelle"), "model": ("Modellnamen", "Modellname"),
+    "key": ("Schlüssel", "Schlüssel"), "cohort": ("Kohorten", "Kohorte"),
+    "signin": ("Anmeldungen", "Anmeldung"), "tool": ("Werkzeuge", "Werkzeug"),
+    "agent": ("Agenten", "Agent")}
+ASSET_STATE_TEXT = {"ok": "erreichbar", "down": "nicht erreichbar", "idle": "ruhig",
+                    "unknown": "unbekannt", "present": "vorhanden", "removed": "entfernt",
+                    "paused": "angehalten"}
+ASSET_REL_TEXT = {"uses": "nutzt", "mayUse": "darf nutzen", "toolOf": "Werkzeug von",
+                  "opens": "öffnet", "agentUses": "arbeitet mit"}
+
+ASSETS_BODY = """
+<div class="pagehead"><h1>Assets</h1></div>
+{% if job %}<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}">{{ job.text }}</p></div>
+{% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}{% endif %}
+{% if error %}<div class="card err"><p>{{ error }}</p></div>{% endif %}
+
+<div class="card">
+  <h2>Was Ihre Apps von sich nennen</h2>
+  <p>Apps wie das KI-Gateway nennen dem Knoten, was sie verwalten: Bezugsquellen, Modellnamen
+  und künftig Schlüssel, Kohorten und Agenten. Der Knoten schreibt das alle fünf Minuten in den
+  Zwilling {{ "des Mandanten <strong>" ~ tlabel ~ "</strong>" if is_server_admin else "Ihres Mandanten" }}
+  und zeigt hier, was wovon abhängt. Schlüsselwerte, Zugangsdaten und Inhalte gehen nie mit.</p>
+  {% if is_server_admin and tenants|length > 1 %}
+  <form method="get" action="/assets" style="margin-bottom:.6rem">
+    <label>Mandant <select name="tenant">
+      {% for t in tenants %}<option value="{{ t.label }}" {% if t.id == tid %}selected{% endif %}>{{ t.label }}</option>{% endfor %}
+    </select></label> <button>Anzeigen</button>
+  </form>
+  {% endif %}
+  <p>Zuletzt gelesen: <strong>{{ run.at or "noch nie" }}</strong>{% if run.error %} —
+    <span class="err">{{ run.error }}</span>{% endif %}.
+  Schreiben ist <strong>{{ "an" if on else "aus" }}</strong>.</p>
+  <form method="post" action="/assets">
+    <input type="hidden" name="op" value="{{ 'off' if on else 'on' }}">
+    {% if is_server_admin %}<input type="hidden" name="tenant" value="{{ tlabel }}">{% endif %}
+    <button {% if on %}class="danger"{% endif %}>{{ "Ausschalten" if on else "Einschalten" }}</button>
+    <span class="muted">{{ "Aus: Es wird nichts Neues geschrieben; was der Zwilling hält, bleibt als Geschichte." if on else "An: beim nächsten Lauf, höchstens fünf Minuten." }}</span>
+  </form>
+</div>
+
+{% if apps %}
+<div class="card" style="overflow-x:auto">
+  <h2>Apps</h2>
+  <table class="mini"><thead><tr><th>Instanz</th><th>App</th><th>Antwort</th></tr></thead><tbody>
+  {% for a in apps %}<tr><td>{{ a.instance }}</td><td>{{ a.app }}</td>
+    <td>{{ app_state.get(a.state, a.state) }}</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+{% endif %}
+
+{% for kind, rows in groups %}
+<div class="card" style="overflow-x:auto">
+  <h2>{{ kind_text[kind][0] if kind in kind_text else kind }} ({{ rows|length }})</h2>
+  <table class="mini"><thead><tr><th>Name</th><th>Instanz</th><th>Zustand</th><th>Angaben</th><th>Hängt davon ab</th></tr></thead><tbody>
+  {% for r in rows %}{% set v = r['values'] %}
+  <tr>
+    <td><a href="/zwilling/object/urn:oaap:obj:{{ r.id }}">{{ r.name }}</a></td>
+    <td>{{ r.instance }}</td>
+    <td>{{ state_text.get(v.state, v.state) }}{% if v.light %} <span class="muted">({{ v.light }})</span>{% endif %}</td>
+    <td>
+      {% for rk, k, n in r.rel %}<span class="muted">{{ rel_text.get(rk, rk) }}</span> {{ n }}{% if not loop.last %}, {% endif %}{% endfor %}
+      {% if v.destination %}<br><span class="muted">über</span> {{ v.destination }}{% endif %}
+      {% if v.upstream %}<br><span class="muted">bei der Quelle:</span> {{ v.upstream }}{% endif %}
+      {% if v.expires %}<br><span class="muted">endet</span> {{ v.expires[:16]|replace("T", " ") }}{% endif %}
+      {% if v.budget is defined %}<br><span class="muted">Budget</span> {{ v.used if v.used is defined else "?" }} / {{ v.budget }}{% endif %}
+      {% if v.seats is defined %}<br><span class="muted">Plätze</span> {{ v.seats }}{% endif %}
+      {% if v.checked %}<br><span class="muted">geprüft</span> {{ v.checked[:16]|replace("T", " ") }}{% if v.checkedOk is defined %} — {{ "ok" if v.checkedOk else "fehlgeschlagen" }}{% endif %}{% endif %}
+      {% if v.modelCount is defined %}<br><span class="muted">{{ v.modelCount }} Modelle bei der Quelle</span>{% endif %}
+    </td>
+    <td>{% if r.affected %}{% for x in r.affected[:8] %}{{ kind_text[x.kind][1] if x.kind in kind_text else x.kind }} {{ x.name }}{% if not loop.last %}, {% endif %}{% endfor %}{% if r.affected|length > 8 %} und {{ r.affected|length - 8 }} weitere{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody></table>
+</div>
+{% endfor %}
+
+{% if not groups %}
+<div class="card"><p class="muted">{% if not twin %}Dieser Mandant hat noch keinen Zwilling. {% endif %}Noch keine Assets.
+Sobald eine App mit einer <code>assets</code>-Tür läuft (zum Beispiel das KI-Gateway ab 0.7.0),
+erscheinen sie hier nach dem nächsten Lauf.</p></div>
+{% endif %}
+"""
+
+
+def _assets_target():
+    """(role, tenant id, error) -- whose universe this request looks at. A
+    tenant_admin always their own; a server_admin any (?tenant=label)."""
+    role, mine = caller_scope()
+    tid = mine
+    want = (request.values.get("tenant") or "").strip().lower()
+    if want and role == "server_admin":
+        tid = next((t for t, rec in load_tenants().items() if rec.get("label") == want), "")
+        if not tid:
+            return role, "", "Diesen Mandanten gibt es auf diesem Knoten nicht."
+    if not tid or tid not in load_tenants():
+        return role, "", "Kein Mandant."
+    return role, tid, ""
+
+
+@app.get("/assets")
+def assets_page():
+    if not (caller_roles() & {"server_admin", "tenant_admin"}):
+        return "Zugriff verweigert: erfordert die Rolle tenant_admin.", 403
+    role, tid, err = _assets_target()
+    if err:
+        return err, 404
+    data, error = {"apps": [], "items": [], "twin": False}, ""
+    try:
+        r = TWIN_INTERNAL.get(f"{TWIN}/internal/twin/assets", timeout=8, headers={
+            "X-OAAP-Person-User": caller_name(), "X-OAAP-Person-Tenant": tid,
+            "X-OAAP-Person-Roles": ",".join(caller_roles())})
+        if r.status_code == 200:
+            data = r.json()
+        else:
+            error = f"Der Zwilling antwortet nicht wie erwartet (HTTP {r.status_code})."
+    except (requests.RequestException, ValueError):
+        error = "Der Zwilling antwortet nicht."
+    view = _read_json(ASSETS_VIEW) or {}
+    settings = _read_json(ASSETS_SETTINGS) or {}
+    t = (view.get("tenants") or {}).get(tid) or {}
+    groups, by = [], {}
+    for row in data.get("items") or []:
+        by.setdefault(row.get("kind") or "?", []).append(row)
+    for k in list(ASSET_KIND_TEXT) + sorted(set(by) - set(ASSET_KIND_TEXT)):
+        if by.get(k):
+            groups.append((k, by[k]))
+    tenants = sorted(({"id": i, "label": rec.get("label", "")} for i, rec in load_tenants().items()),
+                     key=lambda x: x["label"])
+    return page(ASSETS_BODY, "Assets", "assets",
+                apps=data.get("apps") or [], groups=groups, twin=data.get("twin"),
+                run={"at": view.get("at") if tid in (view.get("tenants") or {}) else "",
+                     "error": t.get("error") or ""},
+                on=((settings.get("tenants") or {}).get(tid) != "off"),
+                tid=tid, tlabel=tenant_label(tid), tenants=tenants,
+                is_server_admin=role == "server_admin",
+                kind_text=ASSET_KIND_TEXT, state_text=ASSET_STATE_TEXT,
+                rel_text=ASSET_REL_TEXT, app_state=ASSET_STATE_TEXT,
+                job=_build_job_note(caller_scope()[1], role, request.args.get("job", "")),
+                error=error or request.args.get("err"))
+
+
+@app.post("/assets")
+def assets_set():
+    """D2: on/off through the spool; the host judges it again."""
+    if not (caller_roles() & {"server_admin", "tenant_admin"}):
+        return "Zugriff verweigert: erfordert die Rolle tenant_admin.", 403
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    role, mine = caller_scope()
+    op = request.form.get("op", "")
+    if op not in ("on", "off"):
+        return redirect("/assets?err=" + quote("Unbekannter Schritt."), code=303)
+    args = {}
+    back = ""
+    if role == "server_admin":
+        args["tenant"] = (request.form.get("tenant") or "").strip().lower()[:64]
+        back = "&tenant=" + quote(args["tenant"]) if args["tenant"] else ""
+    rid = management_api.enqueue(mine, role, op, args, action="assets-set")
+    return redirect(f"/assets?job={rid}{back}", code=303)
+
+
 # ------------------------------------------- pairing (RFC-0085 stage 3, A3)
 # The doors a node or a hub calls (/fleet/pair/*, no session: the gateway
 # strips identity headers on /fleet/*) and the wizard on /flotte. The portal
@@ -14812,7 +14984,7 @@ FLEET_PAIR_BODY = """
 </div>
 
 {% if pv.is_hub %}
-<div class="card" style="overflow-x:auto">
+<div class="card" id="zentrale" style="overflow-x:auto">
   <h2>Zentrale: Knoten koppeln</h2>
   <form method="post" action="/flotte/kopplung">
     <input type="hidden" name="op" value="code">

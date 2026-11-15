@@ -9185,6 +9185,10 @@ def cmd_metrics(args):
             print(f"metrics: status skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
         try:
+            assets_collect()          # RFC-0088: every five minutes, the tenants' twins
+        except BaseException as exc:  # noqa: BLE001 -- die() too: the unit does not fail
+            print(f"assets: run skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+        try:
             import cli_reference
             metrics_sender.run(METRICS_DIR, METRICS_SENDER_DIR,
                                version=cli_reference.read_version(
@@ -10068,7 +10072,7 @@ def job_result_fill(req, rid, ok, msg):
     if str(req.get("action") or "") not in (
             "cohort", "tenant-build", "tenant-request", "tenant-request-submit",
             "tenant-profile", "disk", "fleet-disclose", "fleet-pair",
-            "fleet-pair-public"):
+            "fleet-pair-public", "assets-set"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
         return
@@ -27453,6 +27457,12 @@ def cmd_fleet_pair(args):
             return
         if act == "offer":
             text, _exp = fleet_pair_offer()
+            if args.out:
+                fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text + "\n")
+                print(f"Offer written to {args.out} (valid 15 minutes, once).")
+                return
             print(text)
             print("\nAt the hub: sudo oaap fleet pair entry <file>  -- or the portal, "
                   "Flotte -> Eingang hinzufügen. Valid 15 minutes, once.", file=sys.stderr)
@@ -27477,6 +27487,206 @@ def cmd_fleet_pair(args):
     die("fleet pair: show | code <node> [--via <entry>] [--lan] [--replace] | offer | "
         "entry <file> | apply <file> [--classes ...] | classes --classes ... | unpair | "
         "remove <node>")
+
+
+# ------------------------------------------- tenant asset universe (RFC-0088)
+# The second reader of an app's `assets` door: the node writes what a
+# tenant's apps name of themselves into THAT tenant's own twin (D1), for
+# every tenant with a door-app unless its tenant_admin switched it off (D2).
+# The host knows the registry, the setting and which instance sleeps, and
+# makes the plan; assets_run.py in the twin's container asks the doors and
+# writes (it holds the credentials and the network). Every five minutes,
+# a step of the minutely job; `oaap assets collect` runs it at once.
+
+ASSETS_DIR = os.path.join(DATA_DIR, "data", "assets")
+ASSETS_READY = os.path.join(ASSETS_DIR, "ready.json")
+ASSETS_SETTINGS = os.path.join(APPS_DIR, "assets-settings.json")   # the portal reads it
+ASSETS_VIEW = os.path.join(APPS_DIR, "assets-view.json")           # the portal reads it
+ASSETS_EVERY = 300
+_ASSETS_MODEL = None
+
+
+def _assets_model():
+    """assets_model from the twin's own directory -- the one source the
+    image reads too."""
+    global _ASSETS_MODEL
+    if _ASSETS_MODEL is None:
+        import importlib.util
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "services", "twin")
+        spec = importlib.util.spec_from_file_location(
+            "assets_model", os.path.join(here, "assets_model.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _ASSETS_MODEL = mod
+    return _ASSETS_MODEL
+
+
+def assets_settings_load():
+    d = _read_json_file(ASSETS_SETTINGS)
+    d = d if isinstance(d, dict) else {}
+    if not isinstance(d.get("tenants"), dict):
+        d["tenants"] = {}
+    return d
+
+
+def assets_on(tid, settings=None):
+    """D2: on unless the tenant switched it off."""
+    s = settings if settings is not None else assets_settings_load()
+    return (s.get("tenants") or {}).get(tid) != "off"
+
+
+def assets_set(label, on, who="root", role="root"):
+    """Switch the tenant reader on or off for one tenant. Off keeps what the
+    twin already holds (history); nothing new is written."""
+    tid = resolve_tenant_arg(label)
+    d = assets_settings_load()
+    if on:
+        d["tenants"].pop(tid, None)
+    else:
+        d["tenants"][tid] = "off"
+    _write_json_private(ASSETS_SETTINGS, d, mode=0o644)
+    audit_tenant("assets.set", tid, subject="assets", who=who, role=role,
+                 detail=f"tenant asset universe (RFC-0088) {'on' if on else 'off'}")
+    return tid
+
+
+def assets_plan(reg=None, settings=None):
+    """{tid: {instance: {"app", "ask"}}} -- every instance with an `assets`
+    door, by its tenant, for the tenants that have it on. A sleeping or
+    maintained instance is not asked (`ask` false): its assets stay as
+    they were -- someone's decision, not an outage."""
+    reg = reg if reg is not None else load_registry()
+    settings = settings if settings is not None else assets_settings_load()
+    dflt = default_tenant_id()
+    out = {}
+    for name, inst in sorted((reg.get("instances") or {}).items()):
+        if not assets_door(inst):
+            continue
+        tid = resolve_tenant(inst.get("tenant")) or dflt
+        if not assets_on(tid, settings):
+            continue
+        ask = inst.get("state") not in ("standby", "waking") and not inst.get("maintenance")
+        out.setdefault(tid, {})[name] = {"app": str(inst.get("app_id") or inst.get("app") or ""),
+                                         "ask": bool(ask)}
+    return out
+
+
+def _assets_ready(tid):
+    """'' once the tenant's twin carries the reader's types and its time
+    series exist (idempotent, done once per model version), else why not."""
+    am = _assets_model()
+    ready = _read_json_file(ASSETS_READY) or {}
+    if ready.get(tid) == am.VERSION:
+        return ""
+    try:
+        _model_ensure_schema()
+        _twin_ensure_schema(tid)
+        model_register_data_model(am.ORIGIN, am.PACKAGE, am.VERSION, am.data_model(),
+                                  tenant_id=tid)
+        timeseries_enable(tid)
+    except SystemExit:
+        return LAST_DIE or "the twin could not be prepared"
+    ready[tid] = am.VERSION
+    _write_json_private(ASSETS_READY, ready)
+    return ""
+
+
+def assets_collect(now=None, force=False):
+    """One run: plan, prepare each tenant's twin, ask and write (in the
+    twin's container), and the view for the portal. Every ASSETS_EVERY
+    seconds unless forced. -> the view, or None when nothing ran."""
+    if not has_profile("store"):
+        return None
+    now = int(now or time.time())
+    old = _read_json_file(ASSETS_VIEW) or {}
+    if not force and now - int(old.get("run", 0)) < ASSETS_EVERY:
+        return None
+    settings = assets_settings_load()
+    plan = assets_plan(settings=settings)
+    view = {"run": now, "at": _iso_now(), "tenants": {},
+            "off": sorted(t for t, v in settings["tenants"].items() if v == "off")}
+    todo = {}
+    for tid, insts in plan.items():
+        why = _assets_ready(tid)
+        if why:
+            view["tenants"][tid] = {"ok": False, "error": why, "instances": {
+                n: "unknown" for n in insts}}
+        else:
+            todo[tid] = insts
+    if todo:
+        try:
+            r = subprocess.run(["docker", "exec", "-i", TWIN_CONTAINER, "python", "assets_run.py"],
+                               input=json.dumps({"now": now, "tenants": todo}),
+                               capture_output=True, text=True, timeout=120)
+            got = json.loads((r.stdout or "").strip().splitlines()[-1]).get("tenants") or {}
+        except (subprocess.SubprocessError, OSError, ValueError, IndexError) as exc:
+            got = {tid: {"ok": False, "error": f"the twin did not run it ({type(exc).__name__})",
+                         "instances": {n: "unknown" for n in insts}}
+                   for tid, insts in todo.items()}
+        view["tenants"].update(got)
+    _write_json_private(ASSETS_VIEW, view, mode=0o644)
+    return view
+
+
+def assets_set_job(req, act_tenant, role, actor):
+    """The page "Assets" (RFC-0088 D2) -> (ok, sentence). A tenant_admin
+    switches their own tenant, a server_admin any; role and tenant come
+    from the ACTOR's record, never from the request."""
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    op = str(req.get("op") or "")
+    if op not in ("on", "off"):
+        return False, "on | off"
+    if role not in ("server_admin", "tenant_admin"):
+        return False, "the asset universe is switched by a tenant admin"
+    tid = act_tenant
+    label = str(a.get("tenant") or "").strip().lower()
+    if label and role == "server_admin":
+        tid, _t = tenant_by_label(label, include_former=False)
+    if not tid or tid not in load_tenants():
+        return False, "no tenant to switch"
+    try:
+        assets_set(tid, op == "on", who=actor or "portal", role=role)
+    except SystemExit:
+        return False, LAST_DIE or "not switched"
+    return True, ("Die Assets dieses Mandanten werden wieder in seinen Zwilling geschrieben "
+                  "(beim nächsten Lauf, höchstens fünf Minuten)." if op == "on" else
+                  "Es wird nichts Neues mehr geschrieben; was der Zwilling schon hält, bleibt.")
+
+
+def cmd_assets(args):
+    """`oaap assets show | collect | on <tenant> | off <tenant>` (RFC-0088)."""
+    act = args.action
+    if act == "show":
+        view = _read_json_file(ASSETS_VIEW) or {}
+        settings = assets_settings_load()
+        plan = assets_plan(settings=settings)
+        print(f"Last run: {view.get('at') or 'never'}")
+        if not plan and not view.get("tenants"):
+            print("No tenant has an app with an `assets` door.")
+        for tid in sorted(set(plan) | set(view.get("tenants") or {})):
+            t = (view.get("tenants") or {}).get(tid) or {}
+            state = "ok" if t.get("ok") else (t.get("error") or "not yet run")
+            print(f"  {tenant_label(tid):<16} {state}; {t.get('items', 0)} assets")
+            for name, st in sorted((t.get("instances") or {}).items()):
+                print(f"      {name:<24} {st}")
+        for tid in view.get("off") or []:
+            print(f"  {tenant_label(tid):<16} off (the tenant switched it off)")
+        return
+    if act == "collect":
+        view = assets_collect(force=True)
+        if view is None:
+            die("this node has no store (profile 'store') -- there is no twin to write into")
+        for tid, t in sorted(view["tenants"].items()):
+            print(f"{tenant_label(tid)}: " + (f"{t.get('items', 0)} assets, {t.get('rows', 0)} rows "
+                                             "written" if t.get("ok") else t.get("error", "?")))
+        if not view["tenants"]:
+            print("No tenant has an app with an `assets` door.")
+        return
+    if act in ("on", "off"):
+        tid = assets_set(args.tenant or die(f"assets {act} <tenant>"), act == "on")
+        print(f"Tenant asset universe for {tenant_label(tid)}: {act}.")
+        return
+    die("assets: show | collect | on <tenant> | off <tenant>")
 
 
 def cmd_token(args):
@@ -32519,6 +32729,21 @@ def cmd_process_deploys(_args):
                 audit_tenant("fleet.disclose", _ftid or ensure_default_tenant(),
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
+        elif action == "assets-set":
+            # RFC-0088 D2: the page "Assets" switches a tenant's reader.
+            ok, msg = assets_set_job(req, act_tenant, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("assets.set", act_tenant or ensure_default_tenant(),
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
         elif action in ("fleet-pair", "fleet-pair-public"):
             # RFC-0085 stage 3: pairing. "fleet-pair" is the page "Flotte"
             # (role from the ACTOR's record); "fleet-pair-public" a call at
@@ -32670,7 +32895,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "fleet-pair": "portal", "fleet-pair-public": "pairing", "care": "portal", "rebuild": "portal", "bulk": "portal",
+               "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "assets-set": "portal", "fleet-pair": "portal", "fleet-pair-public": "pairing", "care": "portal", "rebuild": "portal", "bulk": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -36590,6 +36815,12 @@ def build_parser():
                      help=f"extend by this many days (default {REHEARSAL_STEP})")
     prs.set_defaults(fn=cmd_rehearsal)
     pt.set_defaults(fn=cmd_token)
+    pas = sub.add_parser("assets",
+                         help="the tenant's own asset universe: what apps name of themselves, "
+                              "in the tenant's twin (RFC-0088)")
+    pas.add_argument("action", choices=["show", "collect", "on", "off"])
+    pas.add_argument("tenant", nargs="?", help="'on'/'off': the tenant")
+    pas.set_defaults(fn=cmd_assets)
     pf = sub.add_parser("fleet",
                         help="the fleet: keys for /fleet/status (RFC-0021), the hub, disclosure, pairing (RFC-0085)")
     pf.add_argument("object", choices=["key", "hub", "disclose", "pair"])
@@ -36793,7 +37024,7 @@ def cmd_help(args, parser):
 # holds this list against the wrapper's `case`.
 WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
                   "files", "user", "cohort", "disk", "machine", "authz", "key",
-                  "fleet", "tenant", "metrics", "broker", "idp", "mail",
+                  "fleet", "assets", "tenant", "metrics", "broker", "idp", "mail",
                   "notify", "report", "guard", "destination", "connect", "connector", "help")
 
 # What `bin/oaap` does by itself, without appctl.py -- argparse cannot know

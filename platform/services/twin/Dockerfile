@@ -14,8 +14,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # fleet_twin and fleet_sink are the fleet's writer into the twin (RFC-0085
 # amendment A2); fleet_affected the backward walk from a broken link
 # (RFC-0087 §6), used by the fleet service and by the read in app.py.
+# assets_model, assets_twin and assets_run are the tenant reader (RFC-0088):
+# the host runs assets_run.py here every five minutes (docker exec), and
+# app.py's /internal/twin/assets reads what it wrote.
 COPY app.py relay.py timeseries.py ts_admin.py fleet.py \
      twin_write.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py \
-     fleet_affected.py ./
+     fleet_affected.py assets_model.py assets_twin.py assets_run.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]

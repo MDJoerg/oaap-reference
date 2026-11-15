@@ -96,6 +96,8 @@ import psycopg2
 import psycopg2.extras
 from flask import Flask, jsonify, request
 
+import assets_model
+import assets_twin
 import fleet_affected
 import semantic
 import timeseries as ts
@@ -813,6 +815,57 @@ def twin_affected(obj_id):
             if r.get(k):
                 r[k] = f"urn:oaap:obj:{r[k]}"
     return jsonify(result)
+
+
+@app.get("/internal/twin/assets")
+def twin_assets():
+    """RFC-0088 stage 1: the tenant's own asset universe for the portal page
+    "Assets" -- every app and asset the node wrote under `platform:assets`,
+    each with its current values, its relations and what depends on it
+    (assets_twin.affected). The tenant_admin's read (D3: the whole universe
+    is theirs); the server_admin's for the tenant the portal names."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    _username, tenant_id, roles = person
+    if not roles & {"tenant_admin", "server_admin"}:
+        return "the asset universe is the tenant_admin's to read", 403
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return jsonify({"apps": [], "items": [], "twin": False})
+    rk = {assets_model.ak(r): r for r in assets_twin.REL_KEYS}
+    ak = {assets_model.ak(a[0]): a[0] for a in assets_model._ATTRS}
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT o.id, o.type_key, o.title, s.source_key FROM objects o "
+                            "JOIN source_keys s ON s.object_id = o.id AND s.origin = %s "
+                            "WHERE o.type_key = ANY(%s)",
+                            (assets_model.ORIGIN, [assets_model.APP, assets_model.ITEM]))
+                objects = {str(r["id"]): {"type": r["type_key"], "title": r["title"],
+                                          "source": r["source_key"], "values": {}}
+                           for r in cur.fetchall()}
+                ids = list(objects)
+                rels = []
+                if ids:
+                    cur.execute("SELECT object_id, attr_key, value FROM current_attributes "
+                                "WHERE object_id = ANY(%s::uuid[]) AND group_key = ANY(%s) "
+                                "AND valid_to IS NULL",
+                                (ids, ["oaap.assetapp", "oaap.assetitem"]))
+                    for r in cur.fetchall():
+                        short = ak.get(r["attr_key"])
+                        if short:
+                            objects[str(r["object_id"])]["values"][short] = r["value"]
+                    cur.execute("SELECT object_id, rel_key, target_id FROM current_relations "
+                                "WHERE object_id = ANY(%s::uuid[]) AND valid_to IS NULL "
+                                "AND rel_key = ANY(%s)", (ids, list(rk)))
+                    rels = [(str(r["object_id"]), rk[r["rel_key"]], str(r["target_id"]))
+                            for r in cur.fetchall()]
+    finally:
+        conn.close()
+    out = assets_twin.universe(objects, rels)
+    out["twin"] = True
+    return jsonify(out)
 
 
 @app.get("/internal/twin/candidates")

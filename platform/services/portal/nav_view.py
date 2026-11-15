@@ -38,6 +38,7 @@ GROUPS = (
     ("Katalog & Daten", (
         ("store", "/store", "Store", "can_store"),
         ("twin", "/zwilling", "Zwilling", "can_twin"),
+        ("assets", "/assets", "Assets", "can_assets"),
     )),
     ("Kommunikation", (
         ("messages", "/nachrichten", "Nachrichten", "is_user_admin"),
