@@ -7315,13 +7315,16 @@ def fleet_status():
     # all instances hang off it (schema 0.3). Empty on a LAN-only node;
     # then instance rows carry no automatic name at all.
     ext = external_host()
+    # ... and, outside the default tenant, the tenant's label (0.1.283)
+    tenants = load_tenants()
     insts = sorted(load_instances().items())
     probed = fleet_view.probe_all(
         [(n, i) for n, i in insts if not _sleep_status(i)], _instance_probe)
     for name, inst in insts:
         # asleep (or waking) on purpose: its own state, not a fault (0.4)
         state = "standby" if _sleep_status(inst) else probed[name][0]
-        instances.append(fleet_view.instance_row(name, inst, state, ext))
+        instances.append(fleet_view.instance_row(name, inst, state, ext,
+                                                    tenants))
         if _pending_envelope(name):
             pending.append(name)
     dns = dns_check() or {}

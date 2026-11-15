@@ -135,6 +135,32 @@ check("a LAN-only node has no automatic name — both fields absent",
 check("0.2 consumers keep working: the row is otherwise unchanged",
       row["instance"] == "bdt-app" and row["state"] == "ok")
 
+# 0.1.283: Instanzen in Mandanten. Der Name ist der, den das Gateway
+# schreibt (oaap.core.tenant 2.4) -- gewaehlter Name plus Mandantenlabel,
+# nicht der Registerschluessel. Vorher stand hier `cls-viewer.<knoten>`,
+# ein Name, der nirgends antwortet.
+TENANTS = {"tid-default": {"label": "default"}, "tid-cls": {"label": "cls"}}
+in_cls = dict(routed, name="viewer", tenant="tid-cls")
+row = fv.instance_row("cls-viewer", in_cls, "ok", "oaap.joomp.de", TENANTS)
+check("a tenant instance's automatic name carries its chosen name and label",
+      row["auto_address"] == "viewer.cls.oaap.joomp.de"
+      and row["auto_state"] == "ok")
+check("... and the row still names the instance by its registry key",
+      row["instance"] == "cls-viewer")
+row = fv.instance_row("bdt-hub", dict(routed, tenant="tid-default"), "ok",
+                      "oaap.joomp.de", TENANTS)
+check("the default tenant keeps the plain name",
+      row["auto_address"] == "bdt-hub.oaap.joomp.de")
+row = fv.instance_row("weg-x", dict(routed, name="x", tenant="tid-weg"), "ok",
+                      "oaap.joomp.de", TENANTS)
+check("a tenant the node does not have: no name at all (fail closed)",
+      "auto_address" not in row and "auto_state" not in row)
+row = fv.instance_row("cls-viewer", dict(in_cls, routes=[]), "ok",
+                      "oaap.joomp.de", TENANTS)
+check("a tenant instance without a route is 'error' under its right name",
+      row["auto_address"] == "viewer.cls.oaap.joomp.de"
+      and row["auto_state"] == "error")
+
 print("\n-- attention list")
 core = [{"name": "Identity", "state": "ok"},
         {"name": "Deploy-Worker", "state": "error"}]

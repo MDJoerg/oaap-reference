@@ -14,6 +14,8 @@ import hashlib
 import hmac
 from concurrent.futures import ThreadPoolExecutor, wait
 
+import instance_view
+
 SCHEMA = "oaap.fleet.status/0.10"
 
 # The document's state vocabulary. The health page grew two spellings
@@ -54,12 +56,21 @@ def valid_key(presented, keys):
     return found
 
 
-def auto_verdict(name, inst, state, node_host):
+def auto_verdict(name, inst, state, node_host, tenants=None):
     """The instance's automatic name and the node's verdict on it (0.3).
 
-    Returns (name, state) or ("", "") when the node publishes no
-    external hostname — then there is no automatic name to speak about
-    and both fields stay out of the document.
+    Returns (name, state) or ("", "") when there is no automatic name
+    to speak about: the node publishes no external hostname, or the
+    instance names a tenant this node does not have (fail closed, as at
+    the gateway).
+
+    The name itself is `instance_view.auto_host` -- the one rule the
+    gateway, the launchpad and the instance page already share
+    (oaap.core.tenant 2.4): the name the tenant chose, plus the tenant's
+    label outside the default tenant. Until 0.1.283 this function built
+    `<registry key>.<node>` on its own, which for every tenant instance
+    named a host that answers nowhere (`cls-viewer.<node>` instead of
+    `viewer.cls.<node>`).
 
     The question asked here is deliberately narrow: **is the instance
     reachable under this name on this node?** Not whether the name
@@ -77,9 +88,11 @@ def auto_verdict(name, inst, state, node_host):
     That is a real, silent failure, and this is where it becomes
     visible.
     """
-    if not node_host or not name:
+    if not name:
         return "", ""
-    auto = f"{name}.{node_host}"
+    auto = instance_view.auto_host(name, inst, tenants, node_host)
+    if not auto:
+        return "", ""
     if not (inst.get("routes") and inst.get("svc_port")):
         # No site was generated for this name — it lands on the
         # catch-all, not on the app.
@@ -93,12 +106,13 @@ def auto_verdict(name, inst, state, node_host):
     return auto, "warn"
 
 
-def instance_row(name, inst, state, node_host=""):
+def instance_row(name, inst, state, node_host="", tenants=None):
     """One instance as facts — a whitelist of safe fields.
 
     `inst` is the raw registry entry and may contain a source URL with
     embedded credentials; only the source TYPE ever leaves this
-    function.
+    function. `tenants` is the node's tenant map, needed for the
+    automatic name of an instance outside the default tenant.
     """
     row = {
         "instance": name,
@@ -117,7 +131,8 @@ def instance_row(name, inst, state, node_host=""):
     if address:
         row["address"] = address
     # 0.3: the automatic name `<instance>.<node>` and the verdict on it.
-    auto_name, auto_state = auto_verdict(name, inst, state, node_host)
+    auto_name, auto_state = auto_verdict(name, inst, state, node_host,
+                                        tenants)
     if auto_name:
         row["auto_address"] = auto_name
         row["auto_state"] = auto_state
