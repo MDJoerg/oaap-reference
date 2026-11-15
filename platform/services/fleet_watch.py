@@ -154,7 +154,7 @@ def hub_conditions(state, now, me=None, open_matters=None):
             continue
         last = iso(now - r["age"])
         out[f"node.silent/{r['name']}"] = {
-            "type": "node.silent", "kurz": r["name"],
+            "type": "node.silent", "kurz": r["name"], "began": last,
             "text": (f"Der Knoten {r['name']} hat seit {minutes(r['age'])} kein "
                      f"Lebenszeichen geschickt (zuletzt {last} UTC"
                      + (f", über den Eingang {r['via']}" if r["via"] else "")
@@ -172,7 +172,7 @@ def hub_conditions(state, now, me=None, open_matters=None):
             continue
         behind = sorted(r["name"] for r in rows if r["via"] == entry)
         out[f"bridge.down/{entry}"] = {
-            "type": "bridge.down", "kurz": entry,
+            "type": "bridge.down", "kurz": entry, "began": iso(since),
             "text": (f"Die Brücke zum Eingang {entry} ist seit {minutes(now - since)} "
                      f"getrennt (seit {iso(since)} UTC).\n"
                      + ("Dahinter, ohne Nachricht bis die Brücke zurück ist: "
@@ -225,7 +225,7 @@ def entry_conditions(watch, now):
             continue
         if now - since >= HUB_UNREACHABLE_AFTER:
             out[f"hub.unreachable/{hub}"] = {
-                "type": "hub.unreachable", "kurz": hub,
+                "type": "hub.unreachable", "kurz": hub, "began": iso(since),
                 "text": (f"Die Zentrale {hub} ist seit {minutes(now - since)} nicht mit "
                          f"diesem Eingang verbunden (seit {iso(since)} UTC).\n"
                          "Solange sie fehlt, sieht niemand die Flotte: kein Alarm über "
@@ -294,7 +294,8 @@ def link_conditions(doc, now, held=None):
                 # anew: still the same broken tunnel, the matter stays
                 out[key] = held[key]
             continue
-        out[key] = {"type": "link.down", "kurz": name, "text": link_text(name, link, now)}
+        out[key] = {"type": "link.down", "kurz": name, "began": iso(since),
+                    "text": link_text(name, link, now)}
     return out
 
 

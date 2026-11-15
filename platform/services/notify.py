@@ -370,6 +370,12 @@ def matter_ops(current, stored, now):
         # The short word stays the opening one: "Behoben: Platte zu 96 %
         # voll" names the matter that ended, not the last minute's reading.
         rec = dict(old, **{k: v for k, v in c.items() if k != "kurz"})
+        # `began` (0.1.287): when the fault itself began, as the condition
+        # knows it -- the earliest one stays (a tunnel whose broken side
+        # changes starts a new `since`, but it is the same matter)
+        b_old, b_new = _parse(old.get("began")), _parse(c.get("began"))
+        if b_old is not None and (b_new is None or b_old < b_new):
+            rec["began"] = old["began"]
         last = _parse(old.get("last_sent")) or now
         if (CATALOGUE.get(c["type"], {}).get("category") == "critical"
                 and now - last >= timedelta(hours=REMIND_HOURS)):
@@ -380,6 +386,20 @@ def matter_ops(current, stored, now):
         if key not in current:
             ops.append(("close", key, old))
     return ops, new
+
+
+def matter_duration(rec, now):
+    """Seconds a closing matter lasted: from when the fault began, if the
+    condition said so (`began`, fleet types), else from when the matter
+    opened. Before 0.1.287 always the opening: a tunnel down 11 minutes
+    read "Dauer: 7 Minuten" under a text that said 5 at the opening --
+    both true, not in step (RFC-0087 finding b). None when unknown."""
+    start = _parse(rec.get("began")) or _parse(rec.get("opened"))
+    if start is None:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return max(0, (now - start).total_seconds())
 
 
 def span_words(seconds):

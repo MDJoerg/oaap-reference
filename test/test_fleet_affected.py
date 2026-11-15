@@ -157,6 +157,37 @@ t2 = fw.link_conditions({"written": fw.iso(now), "links": {"t": many}}, now)["li
 ok("viele Betroffene: 25 genannt, der Rest gezählt", "... und 15 weitere" in t2
    and t2.count("- Destination") == 25, t2[-200:])
 
+print("=== Dauer im Behoben: ab dem Beginn der Störung (0.1.287, Befund b) ===")
+from datetime import datetime, timedelta, timezone   # noqa: E402
+ok("die Bedingung trägt ihren Beginn", m.get("began") == fw.iso(now - 400), m)
+t0 = datetime.fromtimestamp(now, timezone.utc)
+ops, st = notify.matter_ops({"link.down/t-9f2c": m}, {}, t0)
+rec = st["link.down/t-9f2c"]
+ok("die Lage merkt sich began neben opened",
+   rec.get("began") == fw.iso(now - 400) and rec.get("opened") == t0.isoformat(), rec)
+# die Seite wechselt (innen -> außen): since beginnt neu, began bleibt der früheste
+later = dict(m, began=fw.iso(now + 60))
+_ops, st2 = notify.matter_ops({"link.down/t-9f2c": later}, st, t0 + timedelta(minutes=2))
+ok("began bleibt der früheste, auch wenn since neu beginnt",
+   st2["link.down/t-9f2c"]["began"] == fw.iso(now - 400), st2)
+t_close = t0 + timedelta(minutes=6)
+ops3, _st3 = notify.matter_ops({}, st2, t_close)
+closing = [r for op, _k, r in ops3 if op == "close"][0]
+lasted = notify.matter_duration(closing, t_close)
+ok("Dauer = Störung (6 min 40 s ab began), nicht ab Öffnung (6 min)",
+   lasted == 400 + 360, lasted)
+ok("... in Worten wie im Text", notify.span_words(lasted) == notify.span_words(760),
+   notify.span_words(lasted))
+ok("ohne began (alle anderen Typen): wie bisher ab opened",
+   notify.matter_duration({"opened": t0.isoformat()}, t_close) == 360)
+ok("weder began noch opened: unbekannt", notify.matter_duration({}, t_close) is None)
+src_w = open(os.path.join(HERE, "..", "platform", "services", "fleet_watch.py"),
+             encoding="utf-8").read()
+ok("node.silent, bridge.down, hub.unreachable, link.down tragen began",
+   src_w.count('"began": ') == 4)
+src_a = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+ok("appctl rechnet die Dauer über matter_duration", "notify.matter_duration(rec, now)" in src_a)
+
 print("=== Katalog ===")
 ok("link.down: Gesundheit, Knoten, eine Meldung mit Behoben",
    notify.CATALOGUE.get("link.down", {}).get("matter") is True

@@ -3421,9 +3421,9 @@ def notify_matters(facts=None, now=None):
                     continue      # removed while down: nothing came back, nothing to mail
                 dauer = ""
                 if op == "close":
-                    opened = notify._parse(rec.get("opened"))
-                    if opened is not None:
-                        dauer = notify.span_words((now - opened).total_seconds())
+                    lasted = notify.matter_duration(rec, now)
+                    if lasted is not None:
+                        dauer = notify.span_words(lasted)
                 queued.append(notify_event(rec["type"], tid, instanz=rec.get("instanz", ""),
                                            kurz=rec.get("kurz", ""), text=rec.get("text", ""),
                                            op=op, key=key, own=bool(rec.get("own")),
