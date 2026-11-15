@@ -2744,7 +2744,8 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "exposure.found": "/instances/{instanz}",
                 "login.locked": "/users", "node.silent": "/health",
                 "bridge.down": "/health", "broker.queue": "/health",
-                "node.loss": "/health", "hub.unreachable": "/health"}
+                "node.loss": "/health", "hub.unreachable": "/health",
+                "link.down": "/health"}
 
 
 def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False,
@@ -26288,6 +26289,7 @@ def mqtt_acl_watch_user():
 
 
 FLEET_VERDICT = os.path.join(FLEET_DIR, "verdict.json")
+FLEET_AFFECTED = os.path.join(FLEET_DIR, "affected.json")   # RFC-0087 §6, fleet_sink
 FLEET_HUB_FILE = os.path.join(FLEET_DIR, "hub.json")
 
 
@@ -26330,6 +26332,13 @@ def fleet_conditions(now):
         if fleet_watch.trusted(state, now_e):
             out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name(),
                                                   held(fleet_watch.FLEET_MATTERS)))
+            # RFC-0087 §6: a broken tunnel, one matter, with what depends on it
+            links = fleet_watch.link_conditions(_read_json_file(FLEET_AFFECTED), now_e,
+                                                held(("link.down",)))
+            if links is None:
+                keep(("link.down",))
+            else:
+                out.update(links)
             _fleet_write_verdict(state, now_e)
             found = []
 

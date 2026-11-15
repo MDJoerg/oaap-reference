@@ -37,6 +37,7 @@ import psycopg2
 import psycopg2.extras
 
 import fleet_model as fm
+import fleet_affected as fa
 import fleet_twin as ft
 import timeseries as ts
 import twin_write as tw
@@ -165,6 +166,7 @@ class Sink:
                         self._points(drv, self._series(drv, toid, fm.TEXT_STATE, "text"),
                                      [(t, st)], now)
             left["status"] = {}         # committed
+            self._write_affected(conn, now)
             if drv is not None and left["points"]:
                 by = {}
                 for name, measure, t, x in left["points"]:
@@ -191,6 +193,27 @@ class Sink:
                 except Exception:  # noqa: BLE001
                     pass
         return rows, left
+
+    def _write_affected(self, conn, now):
+        """RFC-0087 §6: /fleet/affected.json for the host's minute job --
+        every tunnel that is down, with what depends on it. Written on every
+        flush, empty when nothing is down, so its age says whether the fleet
+        service still vouches for it; the graph is read only when a tunnel
+        is down. A failure here is the flush's failure: the next one tries
+        again, and a stale report keeps open matters open on the host."""
+        states = {toid: ft.joined_state(h.get("outer"), h.get("inner"))
+                  for toid, h in self.halves.items()}
+        rels, objects = ([], {})
+        if any(st in fa.DOWN for st in states.values()):
+            with conn:
+                rels, objects = fa.load_graph(conn)
+        path = os.path.join(self.dir, "affected.json")
+        doc = fa.link_report(states, rels, objects, _load(path) or {}, now)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(tmp, path)
 
     def _write_status(self, conn, drv, name, via, doc, hub, now):
         oid = self._object(conn, fm.NODE, name, name, "oaap.placement")

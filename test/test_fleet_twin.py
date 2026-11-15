@@ -420,6 +420,42 @@ after = q("SELECT (SELECT count(*) FROM T.attributes) a, (SELECT count(*) FROM T
 ok("dieselben zwei Dokumente noch einmal: keine Zeile, keine Beziehung", before == after,
    (before, after))
 
+print("=== Teil 2: Betroffenheit gegen eine echte PostgreSQL (RFC-0087 Stufe 2) ===")
+import fleet_affected as fa                                     # noqa: E402
+AFF = os.path.join(FDIR, "affected.json")
+rep = json.load(open(AFF, encoding="utf-8"))
+ok("alles verbunden: der Bericht steht da, frisch und leer", rep.get("links") == {}
+   and rep.get("written"), rep)
+inn_down = json.loads(json.dumps(INN))
+inn_down["links"][0]["state"] = "error"          # nicht angehalten: gestoert
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", inn_down)}}, NOW + 280)
+ok("innen getrennt: ohne Fehler geschrieben", hsink.last_error == "", hsink.last_error)
+rep = json.load(open(AFF, encoding="utf-8"))
+lk = (rep.get("links") or {}).get(TUN) or {}
+ok("ein Eintrag fuer den Tunnel, Zustand down-inner, mit beiden Enden",
+   list(rep["links"]) == [TUN] and lk.get("state") == "down-inner"
+   and lk.get("outer") == "nx" and lk.get("inner") == "ni", rep)
+ok("betroffen aus der Datenbank: ais-oaapi01 (nutzt den Tunnel), ais-chat (bindet sie), Mandant ais",
+   [(r["title"], r["via"]) for r in lk.get("affected", [])][:2]
+   == [("ais-oaapi01", "usesTunnel"), ("ais-chat", "bindsTo")]
+   and lk.get("tenants") == ["ais"] and lk["affected"][1]["node"] == "nx", lk)
+c = hsink._conns(TID)[0]
+try:
+    rels, objs = fa.load_graph(c)
+finally:
+    c.close()
+ovc = next(k for k, v in objs.items() if v["title"] == "ais-ovc")
+chain = [r["title"] for r in fa.affected(rels, objs, ovc)["affected"]]
+ok("die Kette aus dem RFC aus der echten Datenbank: VPN ais-ovc -> gamingpc -> gamingpc -> ais-mg "
+   "-> Tunnel -> ais-oaapi01 -> ais-chat",
+   chain == ["gamingpc", "gamingpc", "ais-mg", TUN, "ais-oaapi01", "ais-chat"], chain)
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", inn_down)}}, NOW + 290)
+rep2 = json.load(open(AFF, encoding="utf-8"))
+ok("naechster Lauf, derselbe Zustand: `since` bleibt", rep2["links"][TUN]["since"] == lk["since"])
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", INN)}}, NOW + 295)
+ok("wieder verbunden: der Eintrag ist weg (die Meldung schliesst)",
+   json.load(open(AFF, encoding="utf-8"))["links"] == {})
+
 inn2 = json.loads(json.dumps(INN))
 inn2["links"][0]["paused"] = True
 inn2["links"][0]["state"] = "error"

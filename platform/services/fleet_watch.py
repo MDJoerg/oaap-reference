@@ -30,7 +30,11 @@ The rules, in one place:
   * **node.loss**: the node's own outbox reported more lost samples than
     the last time (the first sighting only sets the baseline);
   * on an entry, **hub.unreachable** when the hub's bridge has been away
-    for ten minutes (§6.3).
+    for ten minutes (§6.3);
+  * **link.down** (RFC-0087 §6): a tunnel whose joined state has been down
+    for five minutes -- ONE matter per tunnel, however many of its halves
+    report it, naming what depends on it. The fleet service's report
+    (`affected.json`) is trusted for three minutes, like its state.
 """
 import calendar
 import time
@@ -42,7 +46,10 @@ QUEUE_WARN = 0.5
 STATE_STALE = 180          # an older state.json is not trusted at all
 WARMUP = 120
 CATCHUP = 17 * 60          # the sender's longest backoff (15 min) + 2 min
-FLEET_MATTERS = ("node.silent", "bridge.down", "broker.queue")
+FLEET_MATTERS = ("node.silent", "bridge.down", "broker.queue", "link.down")
+LINK_DOWN_AFTER = 300
+AFFECTED_STALE = 180       # an older affected.json is no report at all
+LINK_ROWS = 25             # a matter's text names this many, then counts
 
 
 def parse_t(s):
@@ -224,6 +231,70 @@ def entry_conditions(watch, now):
                          "Solange sie fehlt, sieht niemand die Flotte: kein Alarm über "
                          "schweigende Knoten. Was hier ankommt, wartet in der "
                          "Warteschlange.")}
+    return out
+
+
+_KIND = {"tunnel": "Tunnel", "destination": "Destination", "instance": "Instanz",
+         "external": "Externes Ende", "tenant": "Mandant", "node": "Knoten"}
+_VIA = {"usesTunnel": "nutzt {}", "usesExternal": "nutzt {}", "behind": "liegt hinter {}",
+        "reaches": "erreicht {} -- möglicherweise betroffen", "bindsTo": "bindet {}"}
+_SIDE = {"down-inner": "Die innere Seite ist nicht verbunden.",
+         "down-outer": "Die äußere Seite meldet ihn getrennt."}
+
+
+def link_text(name, link, now):
+    """The matter's text: the tunnel, its two ends, and what depends on it,
+    nearest first, indented by distance."""
+    since = parse_t(link.get("since")) or now
+    titles = {link.get("id"): name}
+    for r in link.get("affected") or []:
+        titles[r.get("id")] = r.get("title")
+    ends = ", ".join(x for x in (f"außen {link['outer']}" if link.get("outer") else "",
+                                  f"innen {link['inner']}" if link.get("inner") else "") if x)
+    lines = [f"Der Tunnel {name} ist seit {minutes(now - since)} getrennt "
+             f"(seit {iso(since)} UTC{', ' + ends if ends else ''}). "
+             + _SIDE.get(link.get("state"), "")]
+    rows = link.get("affected") or []
+    if rows:
+        lines.append("Betroffen, von nah nach fern:")
+        for r in rows[:LINK_ROWS]:
+            where = f" auf {r['node']}" if r.get("node") else ""
+            ten = f", Mandant {r['tenant']}" if r.get("tenant") else ""
+            how = _VIA.get(r.get("via"), "{}").format(titles.get(r.get("from"), "?"))
+            lines.append("  " * max(0, int(r.get("depth", 1)) - 1)
+                         + f"- {_KIND.get(r.get('kind'), r.get('kind'))} {r.get('title')}"
+                         + f"{where}{ten} ({how})")
+        more = len(rows) - LINK_ROWS
+        if more > 0 or link.get("truncated"):
+            lines.append(f"  ... und {max(more, 0)} weitere"
+                         + (" (die Suche wurde begrenzt)" if link.get("truncated") else ""))
+    else:
+        lines.append("Im Zwilling hängt nichts an diesem Tunnel.")
+    if link.get("tenants"):
+        lines.append("Mandanten: " + ", ".join(link["tenants"]) + ".")
+    lines.append("Außen zeigt 'oaap connect list', innen 'oaap connector list' beide Hälften.")
+    return "\n".join(lines)
+
+
+def link_conditions(doc, now, held=None):
+    """{key: condition} for the tunnels that are down (RFC-0087 §6), or None
+    when the fleet service's report is missing or stale -- then open matters
+    stay as they are, never mailed as "Behoben"."""
+    t = parse_t((doc or {}).get("written")) if isinstance(doc, dict) else None
+    if t is None or now - t > AFFECTED_STALE:
+        return None
+    held = held or {}
+    out = {}
+    for name, link in sorted((doc.get("links") or {}).items()):
+        key = f"link.down/{name}"
+        since = parse_t(link.get("since"))
+        if since is None or now - since < LINK_DOWN_AFTER:
+            if key in held:
+                # the state changed side (inner -> outer) and `since` began
+                # anew: still the same broken tunnel, the matter stays
+                out[key] = held[key]
+            continue
+        out[key] = {"type": "link.down", "kurz": name, "text": link_text(name, link, now)}
     return out
 
 

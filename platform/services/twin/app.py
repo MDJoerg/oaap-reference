@@ -96,6 +96,7 @@ import psycopg2
 import psycopg2.extras
 from flask import Flask, jsonify, request
 
+import fleet_affected
 import semantic
 import timeseries as ts
 import twin_write as tw
@@ -779,6 +780,39 @@ def twin_tree(obj_id):
     finally:
         conn.close()
     return jsonify(root_node)
+
+
+@app.get("/internal/twin/objects/<obj_id>/affected")
+def twin_affected(obj_id):
+    """RFC-0087 §6, stage 2: what depends on this object -- the relations
+    of the fleet read BACKWARDS (uses, reaches, behind, bindsTo), each row
+    with its tenant (heldBy, destOf). Today's state only; the walk is
+    fleet_affected.affected, the same the hub's matter uses. FleetView
+    draws it later."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    _username, tenant_id, _roles = person
+    m = OBJ_ID_RE.match(obj_id)
+    if not m:
+        return "malformed object id", 400
+    obj_id = m.group(1)
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return "this tenant has no twin schema yet", 409
+    try:
+        with conn:
+            rels, objects = fleet_affected.load_graph(conn)
+    finally:
+        conn.close()
+    result = fleet_affected.affected(rels, objects, obj_id)
+    if result is None:
+        return "no such fleet object", 404
+    for r in [result["start"]] + result["affected"]:
+        for k in ("id", "from"):
+            if r.get(k):
+                r[k] = f"urn:oaap:obj:{r[k]}"
+    return jsonify(result)
 
 
 @app.get("/internal/twin/candidates")

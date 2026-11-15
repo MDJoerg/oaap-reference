@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # twin_write.py holds the write rules the API and the fleet share,
 # semantic.py the one setting for OAAP's own semantic IDs; fleet_model,
 # fleet_twin and fleet_sink are the fleet's writer into the twin (RFC-0085
-# amendment A2).
+# amendment A2); fleet_affected the backward walk from a broken link
+# (RFC-0087 §6), used by the fleet service and by the read in app.py.
 COPY app.py relay.py timeseries.py ts_admin.py fleet.py \
-     twin_write.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py ./
+     twin_write.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py \
+     fleet_affected.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]

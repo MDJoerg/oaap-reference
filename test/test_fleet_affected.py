@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""RFC-0087 §6, stage 2: affected, not alarmed.
+
+Defends three things:
+
+    THE WALK GOES THE RIGHT WAY ROUND. From a broken object, backwards:
+    who uses it, who is bound to that, who reaches that -- the RFC's own
+    chain ("VPN of ais-ovc down -> gamingpc -> ais-mg -> tunnel ->
+    ais-oaapi01 -> ais-chat") is rebuilt here and must come out in exactly
+    that order, nearest first, each object once even through a cycle, and
+    nothing that does not depend on the start.
+
+    ONE BROKEN TUNNEL, ONE MATTER. The hub's report lists a tunnel once,
+    whichever half reports it down, keeps its `since` while the state holds,
+    and the minute job opens a matter only after five minutes -- a matter
+    that names what depends on it and its tenants.
+
+    A STALE REPORT DECIDES NOTHING. Without a fresh report from the fleet
+    service open matters stay as they are; an empty fresh report closes them.
+
+Run: python3 test/test_fleet_affected.py   (pure, no database)
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))
+sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "twin"))
+
+import fleet_affected as fa    # noqa: E402
+import fleet_model as fm       # noqa: E402
+import fleet_watch as fw       # noqa: E402
+import notify                  # noqa: E402
+
+fails = 0
+
+
+def ok(label, cond, detail=""):
+    global fails
+    print(("PASS  " if cond else "FAIL  ") + label + ("" if cond else f"  -- {detail}"))
+    if not cond:
+        fails += 1
+
+
+O = {
+    "nx": {"type": fm.NODE, "title": "oaapx01", "source": "oaapx01"},
+    "ni": {"type": fm.NODE, "title": "oaapi01", "source": "oaapi01"},
+    "ta": {"type": fm.TENANT, "title": "ais", "source": "tenant:oaapi01/x"},
+    "ovc": {"type": fm.INSTANCE, "title": "ais-ovc", "source": "oaapi01/ais-ovc"},
+    "egpc": {"type": fm.EXTERNAL, "title": "gamingpc", "source": "ext:oaapi01/gamingpc"},
+    "dgpc": {"type": fm.DESTINATION, "title": "gamingpc", "source": "dest:oaapi01/gamingpc"},
+    "mg": {"type": fm.INSTANCE, "title": "ais-mg", "source": "oaapi01/ais-mg"},
+    "tun": {"type": fm.TUNNEL, "title": "t-9f2c", "source": "tunnel:t-9f2c"},
+    "doi": {"type": fm.DESTINATION, "title": "ais-oaapi01", "source": "dest:oaapx01/ais-oaapi01"},
+    "chat": {"type": fm.INSTANCE, "title": "ais-chat", "source": "oaapx01/ais-chat"},
+    "studio": {"type": fm.INSTANCE, "title": "studio", "source": "oaapx01/studio"},
+    # a second tunnel back from oaapx01 to oaapi01: makes a cycle
+    "tun2": {"type": fm.TUNNEL, "title": "t-b00c", "source": "tunnel:t-b00c"},
+    "dback": {"type": fm.DESTINATION, "title": "chat-back", "source": "dest:oaapi01/chat-back"},
+}
+R = [
+    ("egpc", "fleetBehind", "ovc"),
+    ("dgpc", "fleetUsesExternal", "egpc"),
+    ("dgpc", "fleetDestOf", "ta"),
+    ("mg", "fleetBindsTo", "dgpc"),
+    ("mg", "fleetHeldBy", "ta"),
+    ("ovc", "fleetHeldBy", "ta"),
+    ("tun", "fleetReaches", "mg"),
+    ("tun", "fleetServedBy", "nx"),
+    ("tun", "fleetDialedBy", "ni"),
+    ("doi", "fleetUsesTunnel", "tun"),
+    ("doi", "fleetDestOf", "ta"),
+    ("chat", "fleetBindsTo", "doi"),
+    ("chat", "fleetHeldBy", "ta"),
+    ("ta", "fleetTenantOn", "ni"),
+    # the cycle: tun2 reaches ais-chat, chat-back uses tun2, ais-mg binds chat-back
+    ("tun2", "fleetReaches", "chat"),
+    ("dback", "fleetUsesTunnel", "tun2"),
+    ("mg", "fleetBindsTo", "dback"),
+]
+
+print("=== affected(): die Kette aus dem RFC ===")
+a = fa.affected(R, O, "ovc")
+order = [r["title"] for r in a["affected"]]
+ok("VPN von ais-ovc aus: gamingpc (extern), gamingpc (Destination), ais-mg, t-9f2c, "
+   "ais-oaapi01, ais-chat -- in dieser Reihenfolge",
+   order[:6] == ["gamingpc", "gamingpc", "ais-mg", "t-9f2c", "ais-oaapi01", "ais-chat"], order)
+by = {r["id"]: r for r in a["affected"]}
+ok("jede Zeile sagt, wodurch sie abhängt",
+   by["egpc"]["via"] == "behind" and by["dgpc"]["via"] == "usesExternal"
+   and by["mg"]["via"] == "bindsTo" and by["tun"]["via"] == "reaches"
+   and by["doi"]["via"] == "usesTunnel" and by["chat"]["via"] == "bindsTo", by)
+ok("Ort und Mandant je Zeile", by["chat"]["node"] == "oaapx01" and by["chat"]["tenant"] == "ais"
+   and by["dgpc"]["node"] == "oaapi01" and by["doi"]["tenant"] == "ais")
+ok("die Schleife endet, jedes Objekt einmal", len(order) == len(set(by)) and "ovc" not in by
+   and set(by) == {"egpc", "dgpc", "mg", "tun", "doi", "chat", "tun2", "dback"}, order)
+ok("was nicht abhängt, fehlt: studio, die Knoten, der Mandant als Zeile",
+   not ({"studio", "nx", "ni", "ta"} & set(by)))
+ok("Mandanten zusammengefasst", a["tenants"] == ["ais"], a["tenants"])
+t = fa.affected(R, O, "tun")
+ok("vom Tunnel aus: ais-oaapi01, ais-chat, dann über die Schleife weiter",
+   [r["title"] for r in t["affected"]][:2] == ["ais-oaapi01", "ais-chat"], t["affected"])
+ok("der Tunnel nennt seine Enden", t["start"]["outer"] == "oaapx01" and t["start"]["inner"] == "oaapi01")
+ok("kein Objekt: None", fa.affected(R, O, "gibtsnicht") is None)
+ok("an nichts hängt nichts", fa.affected(R, O, "studio")["affected"] == [])
+lim = fa.affected(R, O, "ovc", limit=3)
+ok("eine Grenze wird gesagt, nicht verschwiegen", lim["truncated"] and len(lim["affected"]) == 3)
+ok("kurze Schlüssel gehen auch", fa.short("fleetUsesTunnel") == "usesTunnel"
+   and fa.short("bindsTo") == "bindsTo")
+
+print("=== link_report(): ein Tunnel, ein Eintrag ===")
+r1 = fa.link_report({"tun": "down-inner", "tun2": "ok"}, R, O, {}, 1_800_000_000)
+ok("nur der gestörte Tunnel steht drin", list(r1["links"]) == ["t-9f2c"], r1["links"].keys())
+l1 = r1["links"]["t-9f2c"]
+ok("mit Zustand, Enden, Betroffenen und Mandanten",
+   l1["state"] == "down-inner" and l1["outer"] == "oaapx01" and l1["inner"] == "oaapi01"
+   and [x["title"] for x in l1["affected"]][:2] == ["ais-oaapi01", "ais-chat"]
+   and l1["tenants"] == ["ais"], l1)
+r2 = fa.link_report({"tun": "down-inner"}, R, O, r1, 1_800_000_600)
+ok("`since` bleibt, solange der Zustand bleibt", r2["links"]["t-9f2c"]["since"] == l1["since"])
+r3 = fa.link_report({"tun": "down-outer"}, R, O, r2, 1_800_000_900)
+ok("ein anderer Zustand beginnt neu", r3["links"]["t-9f2c"]["since"] != l1["since"])
+ok("paused, half und ok sind nicht gestört",
+   fa.link_report({"tun": "paused", "tun2": "half"}, R, O, {}, 1_800_000_000)["links"] == {})
+
+print("=== fleet_watch.link_conditions(): die Meldung ===")
+now = 1_800_001_000
+doc = {"written": fw.iso(now - 20),
+       "links": {"t-9f2c": dict(l1, since=fw.iso(now - 400))}}
+c = fw.link_conditions(doc, now)
+m = c.get("link.down/t-9f2c") or {}
+ok("nach fünf Minuten eine Meldung je Tunnel", list(c) == ["link.down/t-9f2c"]
+   and m.get("type") == "link.down" and m.get("kurz") == "t-9f2c", c)
+txt = m.get("text", "")
+ok("der Text nennt Dauer, Enden, Seite, Betroffene und Mandanten",
+   "seit 6 Minuten" in txt and "außen oaapx01" in txt and "innen oaapi01" in txt
+   and "innere Seite" in txt and "Destination ais-oaapi01 auf oaapx01, Mandant ais" in txt
+   and "Instanz ais-chat auf oaapx01" in txt and "bindet ais-oaapi01" in txt
+   and "Mandanten: ais." in txt, txt)
+ok("ein Tunnel, der eine betroffene Instanz erreicht, heißt möglicherweise betroffen",
+   "möglicherweise betroffen" in txt, txt)
+ok("eingerückt nach Entfernung", "\n- Destination ais-oaapi01" in txt
+   and "\n  - Instanz ais-chat" in txt, txt)
+young = {"written": fw.iso(now), "links": {"t-9f2c": dict(l1, since=fw.iso(now - 100))}}
+ok("unter fünf Minuten: keine Meldung", fw.link_conditions(young, now) == {})
+held = {"link.down/t-9f2c": {"type": "link.down", "kurz": "t-9f2c", "text": "alt"}}
+ok("... aber eine offene bleibt offen (Seite gewechselt, since neu)",
+   fw.link_conditions(young, now, held) == held)
+ok("ein frischer leerer Bericht schließt (-> Behoben)",
+   fw.link_conditions({"written": fw.iso(now), "links": {}}, now, held) == {})
+ok("ein alter Bericht entscheidet nichts (None: offene bleiben)",
+   fw.link_conditions(dict(doc, written=fw.iso(now - 400)), now, held) is None
+   and fw.link_conditions(None, now) is None and fw.link_conditions({}, now) is None)
+many = dict(l1, since=fw.iso(now - 400),
+            affected=[dict(l1["affected"][0], id=f"x{i}", title=f"d{i}") for i in range(40)])
+t2 = fw.link_conditions({"written": fw.iso(now), "links": {"t": many}}, now)["link.down/t"]["text"]
+ok("viele Betroffene: 25 genannt, der Rest gezählt", "... und 15 weitere" in t2
+   and t2.count("- Destination") == 25, t2[-200:])
+
+print("=== Katalog ===")
+ok("link.down: Gesundheit, Knoten, eine Meldung mit Behoben",
+   notify.CATALOGUE.get("link.down", {}).get("matter") is True
+   and notify.CATALOGUE["link.down"]["scope"] == "node")
+ok("link.down gehört zu den Flottenmeldungen (bleibt offen, wenn die Quelle schweigt)",
+   "link.down" in fw.FLEET_MATTERS)
+src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+ok("die Mail zeigt auf eine Seite", '"link.down": "/health"' in src)
+
+print(f"\n{'ALLE GRUEN' if not fails else str(fails) + ' FEHLER'}")
+sys.exit(1 if fails else 0)
