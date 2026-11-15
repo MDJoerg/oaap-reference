@@ -22,6 +22,7 @@ Braucht aiohttp (wie der Dienst selbst).
 Aufruf: python3 test/test_connector_tunnel.py
 """
 import asyncio
+import calendar
 import hashlib
 import json
 import os
@@ -39,6 +40,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SERVICE = os.path.join(HERE, "..", "platform", "services", "connect", "app.py")
 sys.path.insert(0, os.path.dirname(SERVICE))
 import app as connect                                          # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(SERVICE)))
+import connect_fresh                                           # noqa: E402
 
 fails = 0
 
@@ -109,7 +112,7 @@ def side(root, name):
 def start(s):
     env = dict(os.environ, CONNECT_APPS=s["apps"], CONNECT_SECRETS=s["secrets"],
                CONNECT_STATE=s["state"], CONNECT_PORT=str(s["port"]),
-               PYTHONUNBUFFERED="1")
+               CONNECT_STATE_BEAT="1", PYTHONUNBUFFERED="1")
     s["log"] = open(os.path.join(s["state"], "..", "stderr.txt"), "w")
     s["proc"] = subprocess.Popen([sys.executable, SERVICE], env=env,
                                  stdout=s["log"], stderr=subprocess.STDOUT)
@@ -221,6 +224,14 @@ async def main():
             # do not read it once (the one flaky line of this test)
             ok("inner state: connected", await until(
                 lambda: read_state(inner).get("connectors", {}).get("x01", {}).get("connected"), 5))
+            # 0.1.286: the file is rewritten on a beat even when nothing
+            # changes -- so a file that stops changing means a dead service
+            t_before = read_state(inner).get("time")
+            beat = await until(lambda: read_state(inner).get("time") != t_before, 4)
+            ok("heartbeat: state.json rewritten without a change, beat named",
+               beat and read_state(inner).get("beat") == 1, read_state(inner).get("time"))
+            ok("heartbeat: a live file is believed",
+               connect_fresh.judge(read_state(inner))[0] is not None)
 
             def gw(tenant="t1", key=GW):
                 h = {connect.GW_CALLER: "orders", connect.GW_DEST: f"{tenant}/erp",
@@ -386,6 +397,16 @@ async def main():
                 except subprocess.TimeoutExpired:
                     s["proc"].kill()
                 s["log"].close()
+
+    # the service is gone: its file stops, and judged two minutes later
+    # it is no state at all -- nothing connected (portal, CLI, hub)
+    last = read_state(inner)
+    await asyncio.sleep(2.5)
+    ok("stopped service: state.json no longer rewritten", read_state(inner).get("time") == last.get("time"))
+    at = calendar.timegm(time.strptime(last["time"], "%Y-%m-%dT%H:%M:%SZ"))
+    ok("stopped service: judged stale after two minutes",
+       connect_fresh.judge(last, now=at + 121) == (None, last["time"])
+       and connect_fresh.judge(last, now=at + 60)[0] is not None)
 
 
 if __name__ == "__main__":

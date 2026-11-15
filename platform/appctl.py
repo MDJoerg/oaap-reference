@@ -113,6 +113,7 @@ import advisories  # noqa: E402
 import images  # noqa: E402
 # ... and who hears about it (RFC-0080): lists, catalogue, routing.
 import notify  # noqa: E402
+import connect_fresh  # noqa: E402  (0.1.286: a state.json left behind is no state)
 import fleet_watch  # noqa: E402
 # ... and what it says once a week (RFC-0083): ledger, report, Markdown.
 import report  # noqa: E402
@@ -4821,12 +4822,18 @@ def connect_gateway_key():
     return key
 
 
-def connect_state():
+def _connect_state_raw():
     try:
         with open(os.path.join(CONNECT_STATE_DIR, "state.json"), encoding="utf-8") as f:
             return json.load(f) or {}
     except (OSError, ValueError):
         return {}
+
+
+def connect_state():
+    """The connect service's state, or {} when it stopped rewriting it
+    (connect_fresh.py, 0.1.286) -- the same rule the portal reads by."""
+    return connect_fresh.judge(_connect_state_raw())[0] or {}
 
 
 def connect_service_running():
@@ -5422,6 +5429,11 @@ def _service_note():
     if not connect_service_running():
         print("  NOTE: the connector service is not running on this node "
               f"({CONNECT_CONTAINER}) -- nothing dials and nothing is accepted.")
+        return
+    since = connect_fresh.stale_since(_connect_state_raw())
+    if since:
+        print(f"  NOTE: the connector service has not reported since {since} -- "
+              "what was connected then is shown as disconnected.")
 
 
 def cmd_connect(args):

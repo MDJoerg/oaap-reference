@@ -85,6 +85,9 @@ def tunnel_id(key_hash_hex):
 APPS = os.environ.get("CONNECT_APPS", "/platform-apps")
 SECRETS = os.environ.get("CONNECT_SECRETS", "/secrets")
 STATE = os.environ.get("CONNECT_STATE", "/state")
+# seconds: state.json is rewritten at least this often (0.1.286); the
+# environment only for the test, which cannot wait half a minute
+STATE_BEAT = max(1, int(os.environ.get("CONNECT_STATE_BEAT") or 30))
 PORT = int(os.environ.get("CONNECT_PORT", "8000"))
 CONF_FILE = os.path.join(APPS, "connect.json")
 KEYS_FILE = os.path.join(SECRETS, "connector-keys.json")
@@ -512,14 +515,20 @@ class Node:
                                "connected": bool(t)}
         people = [{"user": t.who, "tenant": t.tenant, "since": t.since, "remote": t.remote}
                   for t in self.tunnels.values() if t.person and not t.closed]
-        return {"schema": "0.2", "time": now_iso(), "tunnels": tunnels,
+        return {"schema": "0.2", "time": now_iso(), "beat": STATE_BEAT, "tunnels": tunnels,
                 "connectors": connectors, "zone": zone, "scheme": scheme,
                 "exposures": exposures, "people": people,
                 "certs_week": len(self.opened), "certs_limit": CERT_WEEK_LIMIT}
 
     async def write_state(self):
+        # on every change, and at least every STATE_BEAT seconds: a file
+        # that stops being rewritten tells its readers this service is
+        # gone (connect_fresh.py) instead of keeping "connected" forever
         while True:
-            await self._state_dirty.wait()
+            try:
+                await asyncio.wait_for(self._state_dirty.wait(), STATE_BEAT)
+            except asyncio.TimeoutError:
+                pass
             self._state_dirty.clear()
             try:
                 os.makedirs(STATE, exist_ok=True)

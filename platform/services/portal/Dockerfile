@@ -17,6 +17,7 @@ COPY host_care.py .
 COPY gen_values.py .
 # RFC-0080: the catalogue of message types, shared with the host
 COPY notify.py .
+COPY connect_fresh.py .
 # RFC-0083: the weekly report's renderer (the page Berichte)
 COPY report.py .
 COPY portal/app.py portal/store_view.py portal/instance_view.py portal/fleet_view.py portal/fleet_links.py portal/deploy_state.py portal/twin_view.py portal/relay_view.py portal/diagnose_view.py portal/management_api.py portal/cohort_view.py portal/metrics_view.py portal/build_view.py portal/disk_view.py portal/nav_view.py ./

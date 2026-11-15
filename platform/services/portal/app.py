@@ -51,6 +51,7 @@ import nav_view
 import host_care  # noqa: E402
 # RFC-0080: the catalogue of message types, the same module the host routes with.
 import notify  # noqa: E402
+import connect_fresh  # noqa: E402  (0.1.286: a state.json left behind is no state)
 import report  # noqa: E402  (RFC-0083: the weekly report's renderer)
 
 IDENTITY = "http://identity:8000"
@@ -1269,8 +1270,10 @@ HEALTH_BODY = """
      Tunnel zu einem <strong>äußeren</strong> auf und bietet dort benannte
      Ziele an. Der äußere Knoten sieht nur die Namen der Angebote, nie ihre
      Adressen (oaap.net.connector).</p>
-  {% if not cx.reported %}<p class="err">Der Verbindungsdienst meldet keinen
-     Zustand — läuft <code>oaap-connect-1</code>?</p>{% endif %}
+  {% if not cx.reported %}<p class="err">Der Verbindungsdienst meldet {% if cx.stale %}seit
+     {{ cx.stale|replace("T", " ")|replace("Z", " UTC") }} nichts mehr — was zuletzt
+     verbunden war, gilt als getrennt{% else %}keinen Zustand{% endif %} — läuft
+     <code>oaap-connect-1</code>?</p>{% endif %}
   {% if cx.connectors %}
   <h3>Dieser Knoten wählt hinaus</h3>
   <table class="mini">
@@ -4601,7 +4604,7 @@ def _destination_view(inst):
     # family is one row with a choice; what is bound under it counts as
     # declared, under the family's purpose.
     families = {n: d for n, d in needs.items() if d.get("any") and d.get("kind") == "http"}
-    tunnels = ((_read_json(CONNECT_STATE) or {}).get("tunnels") or {})
+    tunnels = ((_connect_data()[1] or {}).get("tunnels") or {})
     rows = []
     fam_purpose = next((d.get("purpose", "") for d in families.values()), "")
     for need in sorted(set(binds) | (set(needs) - set(families))):
@@ -4652,9 +4655,16 @@ CONNECT_STATE = "/connect-state/state.json"
 
 
 def _connect_data():
+    """(connect.json, state or None). A state the service stopped
+    rewriting is None, as if nothing had been written: every tunnel then
+    reads as not connected (connect_fresh.py, 0.1.286)."""
     conf = _read_json(CONNECT_FILE) or {}
-    st = _read_json(CONNECT_STATE)
+    st, _since = connect_fresh.judge(_read_json(CONNECT_STATE))
     return conf, st
+
+
+def _connect_stale_since():
+    return connect_fresh.stale_since(_read_json(CONNECT_STATE))
 
 
 def _load_destinations_all():
@@ -4725,6 +4735,7 @@ def connect_view():
     # `support` sees the page and changes nothing; the worker asks for
     # server_admin again, so this only decides whether the forms are shown
     return {"tunnels": tunnels, "connectors": connectors, "reported": st is not None,
+            "stale": _connect_stale_since(),
             "can_edit": "server_admin" in caller_roles(),
             "exposures": exposures, "scheme": (st or {}).get("scheme") or "https",
             "certs_week": int((st or {}).get("certs_week") or 0),
@@ -4914,7 +4925,7 @@ def edge_tls_ask():
     if ext and domain.endswith(".t." + ext):
         import time as _time
         now = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-        for e in ((_read_json(CONNECT_STATE) or {}).get("exposures") or {}).values():
+        for e in ((_connect_data()[1] or {}).get("exposures") or {}).values():
             if e.get("host") == domain and (e.get("expires") or "") > now:
                 return "ok", 200
     return "not an edge-routed name", 404
@@ -7038,7 +7049,9 @@ CONNECTOR_BODY = """
         Mandanten: eine Destination mit dem Ziel <code>via:&lt;tunnel&gt;/&lt;angebot&gt;</code> — sie
         wird dort vorgeschlagen, sobald der Tunnel steht.</li>
   </ol>
-  {% if not cx.reported %}<p class="err">Der Verbindungsdienst meldet keinen Zustand — läuft
+  {% if not cx.reported %}<p class="err">Der Verbindungsdienst meldet {% if cx.stale %}seit
+     {{ cx.stale|replace("T", " ")|replace("Z", " UTC") }} nichts mehr — was zuletzt
+     verbunden war, gilt als getrennt{% else %}keinen Zustand{% endif %} — läuft
      <code>oaap-connect-1</code>?</p>{% endif %}
 </div>
 
@@ -7177,6 +7190,7 @@ def _connect_view_full():
     the page is where the first one is made."""
     return connect_view() or {"tunnels": [], "connectors": [], "exposures": [],
                               "reported": _connect_data()[1] is not None,
+                              "stale": _connect_stale_since(),
                               "can_edit": "server_admin" in caller_roles()}
 
 
@@ -7276,6 +7290,10 @@ def _fleet_links(insts, rows):
     then says nothing about links rather than something half-built."""
     try:
         conf, st = _connect_data()
+        if st is None and _connect_stale_since():
+            # stale: nothing connected, but each half keeps its tunnel id,
+            # or the hub sees one half only and says nothing (0.1.286)
+            st = connect_fresh.disconnected(_read_json(CONNECT_STATE))
         tenants = load_tenants()
         hosts = {}
         for name, inst in insts:
