@@ -182,6 +182,20 @@ ok("through: Destination mit externem Ende hinter ais-ovc",
    dd[0]["key"] == "dest:ni/ais/gamingpc" and dd[0]["external"][0] == "ext:ni/ais-ovc/gamingpc"
    and dd[0]["external"][3] == "ais-ovc" and dd[0]["groups"]["oaap.destination"]["destKind"] == "through",
    dd)
+def with_state(doc, st):
+    d = json.loads(json.dumps(doc))
+    for lk in d["links"]:
+        if "through" in lk:
+            lk["through"]["state"] = st
+    return d
+
+
+ext_state = lambda doc: ft.destinations(doc, "ni")[0]["external"][2]["oaap.external"]["extState"]  # noqa: E731
+ok("0.11: through.state wird extState (down-target, down-tunnel, paused, unknown, ok)",
+   [ext_state(with_state(INN, x)) for x in ("down-target", "down-tunnel", "paused", "unknown", "ok")]
+   == ["down-target", "down-tunnel", "paused", "unknown", "ok"])
+ok("ohne state (0.10, App ohne Tuer) oder mit fremdem Wort: present",
+   ext_state(INN) == "present" and ext_state(with_state(INN, "kaputt")) == "present")
 ok("Mandanten: genannte als Zeilen, Instanz -> Mandant",
    ft.tenant_rows(OUT, "nx")[0][0] == "tenant:nx/ais" and ft.instance_tenants(OUT) == {"ais-chat": "ais"})
 ok("gemeinsamer Zustand: ok, paused, down-inner, down-outer, half",
@@ -500,6 +514,69 @@ ok("derselbe Knoten wieder mit 0.9 (ohne links): seine Halbkanten unberuehrt",
 ok("Instanzsuche (<node>/%) nimmt keinen Mandanten und keine Destination fuer eine Instanz",
    not q("SELECT a.object_id FROM T.current_attributes a JOIN T.objects o ON o.id = a.object_id "
          "WHERE a.attr_key = 'fleetRunState' AND o.type_key <> %s", fm.INSTANCE))
+
+print("=== Teil 2: Stufe 3a -- die Tunnel-App meldet Tunnel und Ziel (RFC-0087 §8.1) ===")
+EXT_NAME = "ni/ais-ovc/gamingpc"
+hsink.flush({**hsnap, "status": {"nx": ("nx", "", OUT), "ni": ("ni", "", with_state(INN, "ok"))}},
+            NOW + 500)
+ok("Ziel ok: ohne Fehler, nichts im Bericht", hsink.last_error == ""
+   and json.load(open(AFF, encoding="utf-8"))["links"] == {}, hsink.last_error)
+eo = q("SELECT o.id FROM T.objects o WHERE o.type_key = %s", fm.EXTERNAL)[0]["id"]
+
+
+def ext_attr():
+    r = q("SELECT a.value FROM T.current_attributes a WHERE a.object_id = %s "
+          "AND a.attr_key = 'fleetExtState'", eo)
+    return r[0]["value"] if r else None
+
+
+def ext_series():
+    return [j["value"] for j in q(
+        "SELECT ts.value FROM S.series s JOIN S.text_states ts ON ts.series_id = s.id "
+        "WHERE s.object_id = %s AND s.measure = 'state' ORDER BY ts.t_from", str(eo))]
+
+
+ok("das externe Ende sagt ok (Gruppe) und hat eine Zustandsreihe", ext_attr() == "ok"
+   and ext_series()[-1:] == ["ok"], (ext_attr(), ext_series()))
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_state(INN, "down-target"))}}, NOW + 560)
+rep3 = json.load(open(AFF, encoding="utf-8"))
+le = (rep3.get("links") or {}).get(EXT_NAME) or {}
+ok("Gaming-PC antwortet nicht: ein Eintrag unter Knoten/Instanz/Ziel, Art external, down-target",
+   list(rep3["links"]) == [EXT_NAME] and le.get("kind") == "external"
+   and le.get("state") == "down-target" and le.get("behind") == "ais-ovc" and le.get("node") == "ni",
+   rep3)
+ok("betroffen aus der Datenbank: Destination gamingpc, ais-mg, dann der Tunnel, ais-oaapi01, ais-chat",
+   [r["title"] for r in le.get("affected", [])][:5]
+   == ["gamingpc", "ais-mg", TUN, "ais-oaapi01", "ais-chat"] and le.get("tenants") == ["ais"], le)
+ok("... das externe Ende wird rot: Gruppe und Reihe down-target",
+   ext_attr() == "down-target" and ext_series()[-1] == "down-target", (ext_attr(), ext_series()))
+now_w = NOW + 560 + 320
+c3 = fleet_watch.link_conditions(dict(rep3, written=fleet_watch.iso(now_w)), now_w)
+ok("nach fünf Minuten öffnet der Host link.down für das externe Ende",
+   list(c3 or {}) == [f"link.down/{EXT_NAME}"]
+   and "nicht erreichbar" in c3[f"link.down/{EXT_NAME}"]["text"], c3)
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_state(INN, "down-tunnel"))}}, NOW + 600)
+le2 = json.load(open(AFF, encoding="utf-8"))["links"].get(EXT_NAME) or {}
+ok("VPN aus: down-tunnel, `since` beginnt neu (ein anderer Zustand)",
+   le2.get("state") == "down-tunnel" and le2.get("since") != le.get("since"), le2)
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_state(INN, "paused"))}}, NOW + 640)
+ok("Tunnel-App schläft: paused, kein Eintrag (keine Störung)",
+   json.load(open(AFF, encoding="utf-8"))["links"] == {} and ext_attr() == "paused")
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_state(INN, "unknown"))}}, NOW + 680)
+ok("App antwortet nicht an ihrer Tür: unknown, kein Eintrag",
+   json.load(open(AFF, encoding="utf-8"))["links"] == {} and ext_attr() == "unknown")
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_state(INN, "down-target"))}}, NOW + 700)
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", INN)}}, NOW + 720)
+ok("dieselbe App ohne Tür (zurück auf 0.1.x): present, nicht mehr verfolgt, Eintrag weg",
+   ext_attr() == "present" and eo not in hsink.ext
+   and json.load(open(AFF, encoding="utf-8"))["links"] == {}, (ext_attr(), hsink.ext))
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_state(INN, "down-target"))}}, NOW + 740)
+inn_nod = json.loads(json.dumps(INN))
+inn_nod["links"] = [lk for lk in inn_nod["links"] if "through" not in lk]
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", inn_nod)}}, NOW + 760)
+ok("Destination gelöscht: das externe Ende removed, nicht mehr im Bericht",
+   ext_attr() == "removed" and eo not in hsink.ext
+   and json.load(open(AFF, encoding="utf-8"))["links"] == {}, (ext_attr(), hsink.ext))
 
 with admin.cursor() as cur:
     for sch in (f"twin_{TID}", f"ts_{TID}"):

@@ -5729,7 +5729,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 13     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 14     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -5750,7 +5750,9 @@ MANIFEST_MINOR = 13     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.12 adds mcp_client.use (RFC-0074 -- a chat
                         # acts at its tenant's gateways as the person);
                         # 0.13 adds ui_sandbox.path (RFC-0075 -- a second,
-                        # cookie-less origin for the views of MCP Apps)
+                        # cookie-less origin for the views of MCP Apps);
+                        # 0.14 adds link_state.path (RFC-0087 §8.1 -- a tunnel
+                        # app says how its tunnel and its targets are)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -13692,6 +13694,12 @@ def validate_manifest(m):
             err = ui_sandbox_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.14 (RFC-0087 §8.1): the door where a tunnel app says
+        # how its tunnel and its targets are; same rule as `mcp:`.
+        if "link_state" in m:
+            err = link_state_door_error(m)
+            if err:
+                errs.append(err)
         if "openapi" in m:
             errs.append("openapi: reserved (RFC-0073 D1) -- REST/OData as MCP "
                         "tools needs its own RFC first (capability idea I-39)")
@@ -15174,6 +15182,33 @@ def mcp_door_error(m):
         if rp == "/" or p == rp or p.startswith(rp.rstrip("/") + "/"):
             return ""
     return f"mcp.path: {p} lies under none of the app's routes"
+
+
+def link_state_door_error(m):
+    """'' when `link_state:` is a valid door (manifest 0.14, RFC-0087 §8.1), else
+    the sentence. The rule of `mcp:`: a local path under one of the app's
+    routes."""
+    d = m.get("link_state")
+    if not isinstance(d, dict):
+        return "link_state: object expected"
+    if set(d) - {"path"}:
+        return "link_state: only 'path' is known"
+    p = d.get("path")
+    if not isinstance(p, str) or not MCP_PATH_RE.match(p) or p == "/" or "//" in p \
+            or "/../" in p + "/" or p.endswith("/.."):
+        return "link_state.path: a local path such as /oaap/links (not /)"
+    for r in m.get("routes") or []:
+        rp = str((r or {}).get("path") or "")
+        if rp == "/" or p == rp or p.startswith(rp.rstrip("/") + "/"):
+            return ""
+    return f"link_state.path: {p} lies under none of the app's routes"
+
+
+def link_state_door(m_or_inst):
+    """The declared link_state path of a manifest or a registry record, or ''.
+    (`links` in the registry is the RFC-0016 partner list -- another thing.)"""
+    d = (m_or_inst or {}).get("link_state")
+    return str(d.get("path") or "") if isinstance(d, dict) else ""
 
 
 UI_SANDBOX_SUFFIX = "--ui"
@@ -17638,6 +17673,13 @@ def write_internal_health_caddy():
         lines.append(f"\t\t\trewrite * {hp}")
         lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
         lines.append("\t\t}")
+        # RFC-0087 §8.1: a tunnel app's links door, for the status document
+        lp = link_state_door(inst)
+        if lp:
+            lines.append(f"\t\thandle /l/{name} {{")
+            lines.append(f"\t\t\trewrite * {lp}")
+            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t}")
     lines += ["\t\thandle {", "\t\t\trespond 404", "\t\t}", "\t}",
               "\thandle {", "\t\trespond 403", "\t}", "}"]
     with open(path, "w", encoding="utf-8") as f:
@@ -22348,6 +22390,9 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.13 (RFC-0075): the sandbox page for MCP App views; the
         # gateway gives it a second, cookie-less origin.
         "ui_sandbox": ({"path": ui_sandbox_path(m)} if ui_sandbox_path(m) else {}),
+        # Manifest 0.14 (RFC-0087 §8.1): where the node asks a tunnel app
+        # how its tunnel and its targets are (gateway:8099/l/<name>).
+        "link_state": ({"path": link_state_door(m)} if link_state_door(m) else {}),
         "build": primary["build"],
         "storage": m.get("storage") or [],
         # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the

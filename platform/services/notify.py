@@ -95,8 +95,10 @@ CATALOGUE = {
     # RFC-0087 §6: one matter per broken tunnel at the hub, naming what
     # depends on it -- the halves' attention items are not mailed one by one.
     "link.down": {"category": "health", "scope": "node", "matter": True,
-                  "title": "Ein Tunnel der Flotte ist getrennt",
-                  "subject": "[{knoten}] Tunnel getrennt: {kurz}"},
+                  # since RFC-0087 §8.1 also an external end behind a
+                  # tunnel app -- an unreachable PC is no tunnel
+                  "title": "Eine Verbindung der Flotte ist getrennt",
+                  "subject": "[{knoten}] Verbindung getrennt: {kurz}"},
     "node.loss": {"category": "health", "scope": "node", "matter": False,
                   "title": "Ein Knoten hat Messwerte verloren",
                   "subject": "[{knoten}] Messwerte verloren: {kurz}"},

@@ -171,10 +171,49 @@ links_o, _b, _i = fl.build(CONF, st_old, {}, {}, {}, SET, HOSTS, resolve)
 ok("Connect-Dienst ohne tunnel_id (vor 0.1.281): keine innere Zeile statt einer falschen",
    not [l for l in links_o if l.get("side") == "inner"])
 
+print("=== was eine Tunnel-App sagt (0.11, RFC-0087 §8.1) ===")
+ans = fl.read_link_answer({"v": 1, "tunnel": {"state": "ok", "since": "x", "remote": "1.2.3.4"},
+                           "targets": {"gamingpc": {"state": "down", "addr": "10.8.0.5"},
+                                       "nas": {"state": "kaputt"}, "pc2": "ok"},
+                           "extra": "geheim"})
+ok("Antwort gelesen: nur tunnel/targets, nur ok/down -- Rest bleibt auf dem Knoten",
+   ans == {"tunnel": "ok", "targets": {"gamingpc": "down"}}, ans)
+ok("keine Antwort: falsche Version, kein Objekt",
+   fl.read_link_answer({"v": 2}) is None and fl.read_link_answer([]) is None
+   and fl.read_link_answer(None) is None)
+ok("Tunnel in unbekanntem Wort: unknown",
+   fl.read_link_answer({"v": 1, "tunnel": {"state": "verbunden"}})["tunnel"] == "unknown")
+TS = fl.through_state
+ok("through_state: ohne Tuer nichts; paused/unknown durchgereicht",
+   TS(None, "g") == "" and TS("paused", "g") == "paused" and TS("unknown", "g") == "unknown")
+ok("through_state: Tunnel down schlaegt jedes Ziel",
+   TS({"tunnel": "down", "targets": {"g": "ok"}}, "g") == "down-tunnel")
+ok("through_state: Tunnel ok, Ziel ok/down/ungenannt",
+   TS({"tunnel": "ok", "targets": {"g": "ok"}}, "g") == "ok"
+   and TS({"tunnel": "ok", "targets": {"g": "down"}}, "g") == "down-target"
+   and TS({"tunnel": "ok", "targets": {}}, "g") == "unknown")
+ok("through_state: Tunnel unbekannt, Ziel ok -> unknown (kein falsches ok)",
+   TS({"tunnel": "unknown", "targets": {"g": "ok"}}, "g") == "unknown")
+REP = {"ais-ovc": {"tunnel": "ok", "targets": {"gamingpc": "down"}}}
+links_r, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS, SET, HOSTS, resolve, reports=REP)
+gr = [l for l in links_r if "through" in l][0]
+ok("build: through traegt state down-target (Bericht unter dem Registerschluessel)",
+   gr["through"] == {"instance": "ais-ovc", "target": "gamingpc", "state": "down-target"}, gr)
+links_rp, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS,
+                            {"ceiling": "pseudonym", "salt": "s"}, HOSTS, resolve, reports=REP)
+grp = [l for l in links_rp if "through" in l][0]
+ok("auf pseudonym: Zustand gefunden am echten Namen, hinaus geht das Pseudonym",
+   grp["through"]["state"] == "down-target" and grp["through"]["target"].startswith("x-")
+   and "gamingpc" not in json.dumps(links_rp), grp)
+links_n, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS, SET, HOSTS, resolve,
+                           reports={"andere-app": "paused"})
+ok("build: Tunnel-App ohne Tuer -> through ohne state (wie vor 0.11)",
+   "state" not in [l for l in links_n if "through" in l][0]["through"])
+
 print("=== das Dokument ===")
 doc = fleet_view.build_document("n", "0.1.281", [], "t", [], [], [], [],
                                 links=links, tenants=block)
-ok("Schema 0.10, links und tenants drin", doc["schema"] == "oaap.fleet.status/0.10"
+ok("Schema 0.11, links und tenants drin", doc["schema"] == "oaap.fleet.status/0.11"
    and doc["links"] == links and doc["tenants"] == block)
 doc9 = fleet_view.build_document("n", "0.1.281", [], "t", [], [], [], [])
 ok("ohne Halbkanten (Aufbau gescheitert): keine Felder statt halber",

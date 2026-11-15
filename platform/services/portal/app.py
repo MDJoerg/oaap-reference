@@ -7283,6 +7283,28 @@ def _fleet_keys():
 FLEET_DISCLOSE_FILE = "/apps-registry/fleet-disclose.json"
 
 
+def _link_reports(insts):
+    """RFC-0087 §8.1: ask each tunnel app that declares a `link_state` door
+    how its tunnel and its targets are -- through the gateway's internal
+    endpoint (/l/<name>, platform network only), 2 s, as the health probe.
+    An instance that sleeps or is in maintenance is not asked: its targets
+    are `paused`, someone's decision. No usable answer: `unknown`."""
+    out = {}
+    for name, inst in insts:
+        if not isinstance(inst.get("link_state"), dict) or not inst["link_state"].get("path"):
+            continue
+        if _sleep_status(inst) or inst.get("maintenance"):
+            out[name] = fleet_links.PAUSED
+            continue
+        try:
+            r = requests.get(f"{GATEWAY_HEALTH}/l/{name}", timeout=2, allow_redirects=False)
+            got = fleet_links.read_link_answer(r.json()) if r.status_code == 200 else None
+        except (requests.RequestException, ValueError):
+            got = None
+        out[name] = got if got is not None else fleet_links.UNKNOWN
+    return out
+
+
 def _fleet_links(insts, rows):
     """0.10 (RFC-0087): the half-edges and the tenants block, and each
     instance row's outward tenant -- built by fleet_links from what this
@@ -7303,7 +7325,8 @@ def _fleet_links(insts, rows):
                     hosts.setdefault(h.lower().strip("."), name)
         links, block, by_inst = fleet_links.build(
             conf, st, _load_destinations_all(), dict(insts), tenants,
-            _read_json(FLEET_DISCLOSE_FILE) or {}, hosts, resolve_tenant)
+            _read_json(FLEET_DISCLOSE_FILE) or {}, hosts, resolve_tenant,
+            reports=_link_reports(insts))
         for row in rows:
             t = by_inst.get(row.get("instance"))
             if t:

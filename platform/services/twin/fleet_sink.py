@@ -68,6 +68,9 @@ class Sink:
         # halves last seen, for the joined state series (RFC-0087 §5). Not a
         # cache of the database -- it survives a failed flush.
         self.halves = {}
+        # external end object id -> the state its tunnel app last said
+        # (RFC-0087 §8.1, oaap.fleet.status 0.11); only ends that say one
+        self.ext = {}
         self.last_error = ""
 
     # -- where
@@ -165,6 +168,9 @@ class Sink:
                         st = ft.joined_state(h.get("outer"), h.get("inner"))
                         self._points(drv, self._series(drv, toid, fm.TEXT_STATE, "text"),
                                      [(t, st)], now)
+                    for eoid, st in list(self.ext.items()):
+                        self._points(drv, self._series(drv, eoid, fm.TEXT_STATE, "text"),
+                                     [(t, st)], now)
             left["status"] = {}         # committed
             self._write_affected(conn, now)
             if drv is not None and left["points"]:
@@ -196,13 +202,15 @@ class Sink:
 
     def _write_affected(self, conn, now):
         """RFC-0087 §6: /fleet/affected.json for the host's minute job --
-        every tunnel that is down, with what depends on it. Written on every
+        every tunnel that is down, and every external end whose tunnel app
+        says it is down (§8.1), with what depends on it. Written on every
         flush, empty when nothing is down, so its age says whether the fleet
-        service still vouches for it; the graph is read only when a tunnel
+        service still vouches for it; the graph is read only when something
         is down. A failure here is the flush's failure: the next one tries
         again, and a stale report keeps open matters open on the host."""
         states = {toid: ft.joined_state(h.get("outer"), h.get("inner"))
                   for toid, h in self.halves.items()}
+        states.update(self.ext)
         rels, objects = ([], {})
         if any(st in fa.DOWN for st in states.values()):
             with conn:
@@ -390,6 +398,11 @@ class Sink:
                 seen_e.add(ekey)
                 ext = [eoid]
                 rows += self._groups(conn, eoid, egroups)
+                est = egroups["oaap.external"]["extState"]
+                if est in ft.EXT_STATES:
+                    self.ext[eoid] = est
+                else:
+                    self.ext.pop(eoid, None)    # an app without the door (again)
                 rows += self._sync_rel(conn, eoid, "oaap.external", "behind",
                                        [inst_oid[einst]] if einst in inst_oid else [], iso)
             rows += self._sync_rel(conn, doid, "oaap.destination", "usesExternal", ext, iso)
@@ -402,6 +415,7 @@ class Sink:
                     rows += self._sync_rel(conn, xid, "oaap.destination", rk, [], iso)
         for key, xid in self._prefixed(conn, f"ext:{name}/").items():
             if key not in seen_e:
+                self.ext.pop(xid, None)
                 rows += self._groups(conn, xid, {"oaap.external": {"extState": ft.REMOVED}})
                 rows += self._sync_rel(conn, xid, "oaap.external", "behind", [], iso)
 

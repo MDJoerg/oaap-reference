@@ -34,7 +34,9 @@ The rules, in one place:
   * **link.down** (RFC-0087 §6): a tunnel whose joined state has been down
     for five minutes -- ONE matter per tunnel, however many of its halves
     report it, naming what depends on it. The fleet service's report
-    (`affected.json`) is trusted for three minutes, like its state.
+    (`affected.json`) is trusted for three minutes, like its state. Since
+    RFC-0087 §8.1 also an external end whose tunnel app says its tunnel
+    or the target is down -- the same matter type, one per end.
 """
 import calendar
 import time
@@ -239,7 +241,19 @@ _KIND = {"tunnel": "Tunnel", "destination": "Destination", "instance": "Instanz"
 _VIA = {"usesTunnel": "nutzt {}", "usesExternal": "nutzt {}", "behind": "liegt hinter {}",
         "reaches": "erreicht {} -- möglicherweise betroffen", "bindsTo": "bindet {}"}
 _SIDE = {"down-inner": "Die innere Seite ist nicht verbunden.",
-         "down-outer": "Die äußere Seite meldet ihn getrennt."}
+         "down-outer": "Die äußere Seite meldet ihn getrennt.",
+         "down-tunnel": "Der Tunnel der App selbst ist getrennt.",
+         "down-target": "Der Tunnel der App steht, aber das Ziel antwortet nicht."}
+
+
+def _external_head(name, link, now, since):
+    """The first line for an external end (RFC-0087 §8.1)."""
+    node, _, rest = name.partition("/")
+    inst, _, target = rest.partition("/")
+    behind = link.get("behind") or inst
+    return (f"Das externe Ende {target or name} hinter {behind}"
+            f"{' auf ' + node if node else ''} ist seit {minutes(now - since)} nicht erreichbar "
+            f"(seit {iso(since)} UTC). " + _SIDE.get(link.get("state"), ""))
 
 
 def link_text(name, link, now):
@@ -251,9 +265,13 @@ def link_text(name, link, now):
         titles[r.get("id")] = r.get("title")
     ends = ", ".join(x for x in (f"außen {link['outer']}" if link.get("outer") else "",
                                   f"innen {link['inner']}" if link.get("inner") else "") if x)
-    lines = [f"Der Tunnel {name} ist seit {minutes(now - since)} getrennt "
-             f"(seit {iso(since)} UTC{', ' + ends if ends else ''}). "
-             + _SIDE.get(link.get("state"), "")]
+    external = link.get("kind") == "external"
+    if external:
+        lines = [_external_head(name, link, now, since)]
+    else:
+        lines = [f"Der Tunnel {name} ist seit {minutes(now - since)} getrennt "
+                 f"(seit {iso(since)} UTC{', ' + ends if ends else ''}). "
+                 + _SIDE.get(link.get("state"), "")]
     rows = link.get("affected") or []
     if rows:
         lines.append("Betroffen, von nah nach fern:")
@@ -269,10 +287,14 @@ def link_text(name, link, now):
             lines.append(f"  ... und {max(more, 0)} weitere"
                          + (" (die Suche wurde begrenzt)" if link.get("truncated") else ""))
     else:
-        lines.append("Im Zwilling hängt nichts an diesem Tunnel.")
+        lines.append("Im Zwilling hängt nichts an diesem "
+                     + ("externen Ende." if external else "Tunnel."))
     if link.get("tenants"):
         lines.append("Mandanten: " + ", ".join(link["tenants"]) + ".")
-    lines.append("Außen zeigt 'oaap connect list', innen 'oaap connector list' beide Hälften.")
+    if external:
+        lines.append("Die Seite der Tunnel-App zeigt ihren Tunnel und jedes Ziel.")
+    else:
+        lines.append("Außen zeigt 'oaap connect list', innen 'oaap connector list' beide Hälften.")
     return "\n".join(lines)
 
 

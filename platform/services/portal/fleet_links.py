@@ -135,6 +135,56 @@ def disclosure_view(settings, tenants, only=None):
             "rows": rows}
 
 
+# --- what a tunnel app says (RFC-0087 §8.1, manifest 0.14 `link_state`) -----
+
+APP_STATES = ("ok", "down")
+PAUSED = "paused"          # the tunnel app sleeps or is in maintenance
+UNKNOWN = "unknown"        # it did not answer its door
+
+
+def read_link_answer(doc):
+    """The app's answer at its `link_state` door -> {"tunnel": ok|down|unknown,
+    "targets": {name: ok|down}}, or None when it is no answer at all.
+
+    Whitelist: exactly these fields, exactly these two words; anything else
+    the app writes stays on the node (oaap.fleet.status rule 1) -- a target
+    in some other state is simply not named."""
+    if not isinstance(doc, dict) or doc.get("v") != 1:
+        return None
+    t = doc.get("tunnel")
+    tunnel = t.get("state") if isinstance(t, dict) else None
+    targets = {}
+    raw = doc.get("targets")
+    for name, rec in (raw.items() if isinstance(raw, dict) else []):
+        st = rec.get("state") if isinstance(rec, dict) else None
+        if isinstance(name, str) and st in APP_STATES:
+            targets[name] = st
+    return {"tunnel": tunnel if tunnel in APP_STATES else UNKNOWN, "targets": targets}
+
+
+def through_state(report, target):
+    """The `state` of one `through` row (oaap.fleet.status 0.11), or "" when
+    the tunnel app has no door (the row then says nothing, as before 0.11).
+
+    report -- what the portal learnt from the app: PAUSED, UNKNOWN (asked,
+              no usable answer) or read_link_answer()'s dict; None = the
+              app declares no door."""
+    if report is None:
+        return ""
+    if report in (PAUSED, UNKNOWN):
+        return report
+    if not isinstance(report, dict):
+        return UNKNOWN
+    if report.get("tunnel") == "down":
+        return "down-tunnel"
+    st = (report.get("targets") or {}).get(target)
+    if st == "ok":
+        return "ok" if report.get("tunnel") == "ok" else UNKNOWN
+    if st == "down":
+        return "down-target"
+    return UNKNOWN
+
+
 # --- the rows ---------------------------------------------------------------
 
 def _host(url):
@@ -169,7 +219,7 @@ def _bound(instances, tid, name, resolve):
                   and name in ((inst.get("destinations") or {}).values()))
 
 
-def build(conf, state, dests, instances, tenants, settings, hosts, resolve):
+def build(conf, state, dests, instances, tenants, settings, hosts, resolve, reports=None):
     """(links, tenants block, {instance: outward tenant name}).
 
     conf     -- the connect configuration ({keys, connectors})
@@ -180,6 +230,8 @@ def build(conf, state, dests, instances, tenants, settings, hosts, resolve):
     settings -- the disclosure file ({ceiling, salt, tenants})
     hosts    -- {host name: instance} of this node's instances
     resolve  -- tenant reference -> tenant id (absent = default)
+    reports  -- {instance registry key: what its link_state door said}, for
+                the tunnel apps that declare one (see through_state)
     """
     d = Disclosure(settings, tenants)
     conf, state = conf or {}, state or {}
@@ -240,9 +292,14 @@ def build(conf, state, dests, instances, tenants, settings, hosts, resolve):
                 ext = d.thing(tid, "x-", tname)
                 if not ext:
                     continue
+                inst_key = _registry_key(instances or {}, tid, local, resolve)
                 row = {"kind": "destination",
-                       "through": {"instance": _registry_key(instances or {}, tid, local, resolve),
-                                   "target": ext}}
+                       "through": {"instance": inst_key, "target": ext}}
+                # the app's own word on its tunnel and this target (0.11);
+                # the target's real name is matched, its outward one leaves
+                st = through_state((reports or {}).get(inst_key), tname)
+                if st:
+                    row["through"]["state"] = st
             if row is None:
                 continue        # direct: its far end is configuration (RFC-0087 §2 rule 2)
             dname = d.thing(tid, "d-", name)

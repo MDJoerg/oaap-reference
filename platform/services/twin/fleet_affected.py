@@ -31,7 +31,10 @@ ENDS = ("servedBy", "dialedBy")
 KINDS = {fm.TUNNEL: "tunnel", fm.DESTINATION: "destination", fm.INSTANCE: "instance",
          fm.EXTERNAL: "external", fm.TENANT: "tenant", fm.NODE: "node"}
 LIMIT = 200            # a walk stops here and says so; the fleet is far smaller
-DOWN = ("down-inner", "down-outer")
+TUNNEL_DOWN = ("down-inner", "down-outer")
+# an external end whose tunnel app says so (RFC-0087 §8.1)
+EXTERNAL_DOWN = ("down-tunnel", "down-target")
+DOWN = TUNNEL_DOWN + EXTERNAL_DOWN
 
 
 def short(rel_key):
@@ -65,9 +68,11 @@ def affected(rels, objects, start, limit=LIMIT):
     Breadth first, so the nearest come first; every object once."""
     if start not in objects:
         return None
-    deps, owner, ends = {}, {}, {}
+    deps, owner, ends, behind = {}, {}, {}, {}
     for s, rk, t in rels:
         rk = short(rk)
+        if rk == "behind":
+            behind.setdefault(s, t)
         if rk in BACK:
             deps.setdefault(t, []).append((s, rk))
         elif rk in OWNER:
@@ -109,6 +114,8 @@ def affected(rels, objects, start, limit=LIMIT):
     e = ends.get(start) or {}
     first["outer"] = title(e["servedBy"]) if e.get("servedBy") else ""
     first["inner"] = title(e["dialedBy"]) if e.get("dialedBy") else ""
+    # an external end: the tunnel app it lies behind
+    first["behind"] = title(behind[start]) if behind.get(start) else ""
     for r in [first] + out:
         if r["tenant"] and r["tenant"] not in tenants:
             tenants.append(r["tenant"])
@@ -117,12 +124,17 @@ def affected(rels, objects, start, limit=LIMIT):
 
 def link_report(states, rels, objects, previous, now):
     """The hub's report for its minute job (fleet_watch.link_conditions):
-    every tunnel whose joined state is down, with what depends on it.
+    every tunnel whose joined state is down, and every external end whose
+    tunnel app says it is down (§8.1), with what depends on it.
 
-    states: {tunnel object id: joined state} (fleet_twin.joined_state);
-    previous: the last report -- a link's `since` is kept while its state
-    does not change. -> {"written", "links": {tunnel title: {"id", "state",
-    "since", "outer", "inner", "affected", "tenants", "truncated"}}}."""
+    states: {object id: state} -- a tunnel's joined state
+    (fleet_twin.joined_state), an external end's `extState`; previous: the
+    last report -- a link's `since` is kept while its state does not
+    change. -> {"written", "links": {name: {"id", "kind", "state", "since",
+    "outer", "inner", "behind", "node", "affected", "tenants",
+    "truncated"}}}. A tunnel is named by its title (its id), an external
+    end by `<node>/<instance>/<target>` -- its title alone (a target's
+    name) may repeat on another node."""
     iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     prev = (previous or {}).get("links") or {}
     links = {}
@@ -130,11 +142,14 @@ def link_report(states, rels, objects, previous, now):
         if st not in DOWN or oid not in objects:
             continue
         a = affected(rels, objects, oid)
-        name = a["start"]["title"]
+        src = objects[oid].get("source") or ""
+        ext = objects[oid].get("type") == fm.EXTERNAL
+        name = src[len("ext:"):] if ext and src.startswith("ext:") else a["start"]["title"]
         p = prev.get(name) or {}
-        links[name] = {"id": oid, "state": st,
+        links[name] = {"id": oid, "kind": "external" if ext else "tunnel", "state": st,
                        "since": p["since"] if p.get("state") == st and p.get("since") else iso,
                        "outer": a["start"]["outer"], "inner": a["start"]["inner"],
+                       "behind": a["start"]["behind"], "node": a["start"]["node"],
                        "affected": a["affected"], "tenants": a["tenants"],
                        "truncated": a["truncated"]}
     return {"written": iso, "links": links}

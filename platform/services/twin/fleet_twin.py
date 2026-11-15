@@ -140,6 +140,10 @@ import re as _re
 TUNNEL_ID = _re.compile(r"^t-[0-9a-f]{24}$")
 _NAME = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 REMOVED = "removed"
+# what a `through` row may say of its external end (oaap.fleet.status 0.11,
+# RFC-0087 §8.1); without it the end is only `present`
+EXT_STATES = ("ok", "down-tunnel", "down-target", "paused", "unknown")
+EXT_DOWN = ("down-tunnel", "down-target")
 
 
 def _name(v):
@@ -229,9 +233,11 @@ def destinations(doc, node):
             inst, target = _name(through.get("instance")), _name(through.get("target"))
             values.update(destKind="through", destOffer="")
             if inst and target:
+                st = through.get("state")
                 row["external"] = (f"ext:{node}/{inst}/{target}", target,
                                    {"oaap.external": {"extName": target, "extKind": "vpn",
-                                                      "extState": "present"}}, inst)
+                                                      "extState": st if st in EXT_STATES
+                                                      else "present"}}, inst)
         else:
             continue
         row["groups"] = {"oaap.destination": values}

@@ -188,6 +188,48 @@ ok("node.silent, bridge.down, hub.unreachable, link.down tragen began",
 src_a = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
 ok("appctl rechnet die Dauer über matter_duration", "notify.matter_duration(rec, now)" in src_a)
 
+print("=== Stufe 3a: ein externes Ende, das seine Tunnel-App gestört meldet (§8.1) ===")
+O3 = dict(O, egpc=dict(O["egpc"], source="ext:oaapi01/ais-ovc/gamingpc"))
+r5 = fa.link_report({"egpc": "down-target", "tun": "ok"}, R, O3, {}, 1_800_000_000)
+ok("das externe Ende steht im Bericht unter Knoten/Instanz/Ziel",
+   list(r5["links"]) == ["oaapi01/ais-ovc/gamingpc"], r5["links"].keys())
+e5 = r5["links"]["oaapi01/ais-ovc/gamingpc"]
+ok("Art external, liegt hinter ais-ovc, auf oaapi01, ohne Tunnel-Enden",
+   e5["kind"] == "external" and e5["behind"] == "ais-ovc" and e5["node"] == "oaapi01"
+   and e5["outer"] == "" and e5["inner"] == "", e5)
+ok("Betroffene: die Destination gamingpc, ais-mg, dann der Tunnel und weiter",
+   [x["title"] for x in e5["affected"]][:4] == ["gamingpc", "ais-mg", "t-9f2c", "ais-oaapi01"],
+   e5["affected"])
+ok("ein Tunnel im Bericht heißt weiter tunnel",
+   fa.link_report({"tun": "down-inner"}, R, O3, {}, 1)["links"]["t-9f2c"]["kind"] == "tunnel")
+ok("down-tunnel ist gestört; paused, unknown, present, ok nicht",
+   list(fa.link_report({"egpc": "down-tunnel"}, R, O3, {}, 1)["links"]) == ["oaapi01/ais-ovc/gamingpc"]
+   and all(fa.link_report({"egpc": st}, R, O3, {}, 1)["links"] == {}
+           for st in ("paused", "unknown", "present", "ok")))
+r6 = fa.link_report({"egpc": "down-target"}, R, O3, r5, 1_800_000_600)
+ok("since bleibt, solange der Zustand bleibt",
+   r6["links"]["oaapi01/ais-ovc/gamingpc"]["since"] == e5["since"])
+now3 = 1_800_001_000
+doc3 = {"written": fw.iso(now3), "links": {"oaapi01/ais-ovc/gamingpc": dict(e5, since=fw.iso(now3 - 420))}}
+c3 = fw.link_conditions(doc3, now3)
+m3 = c3.get("link.down/oaapi01/ais-ovc/gamingpc") or {}
+ok("nach fünf Minuten: link.down für das externe Ende, kurz = Knoten/Instanz/Ziel",
+   m3.get("type") == "link.down" and m3.get("kurz") == "oaapi01/ais-ovc/gamingpc", c3)
+t3 = m3.get("text", "")
+ok("der Text: externes Ende gamingpc hinter ais-ovc auf oaapi01, nicht erreichbar, Ziel antwortet nicht",
+   "Das externe Ende gamingpc hinter ais-ovc auf oaapi01 ist seit 7 Minuten nicht erreichbar" in t3
+   and "das Ziel antwortet nicht" in t3, t3)
+ok("... nennt die Betroffenen und den Weg zur Seite der App, nicht 'oaap connect list'",
+   "Destination gamingpc auf oaapi01" in t3 and "Instanz ais-mg" in t3
+   and "Seite der Tunnel-App" in t3 and "connect list" not in t3, t3)
+e7 = dict(e5, state="down-tunnel", since=fw.iso(now3 - 400))
+t7 = fw.link_conditions({"written": fw.iso(now3), "links": {"oaapi01/ais-ovc/gamingpc": e7}},
+                        now3)["link.down/oaapi01/ais-ovc/gamingpc"]["text"]
+ok("down-tunnel: der Text sagt, dass der Tunnel der App getrennt ist",
+   "Der Tunnel der App selbst ist getrennt." in t7, t7)
+ok("der Betreff sagt Verbindung, nicht Tunnel",
+   notify.CATALOGUE["link.down"]["subject"] == "[{knoten}] Verbindung getrennt: {kurz}")
+
 print("=== Katalog ===")
 ok("link.down: Gesundheit, Knoten, eine Meldung mit Behoben",
    notify.CATALOGUE.get("link.down", {}).get("matter") is True
