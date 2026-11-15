@@ -138,6 +138,12 @@ def _alive(key, name, via, payload, now):
             n["resets"] = int(n.get("resets", 0)) + 1   # the node's state began anew
     n["alive"] = {k: payload.get(k) for k in ("t", "seq", "version", "interval", "lost",
                                               "events_dropped")}
+    cls = payload.get("classes")
+    if isinstance(cls, list):
+        # RFC-0085 §4.4 / A3: what the node offers -- a class it does not
+        # offer is "nicht angeboten", not missing data
+        n["alive"]["classes"] = [c for c in cls if c in ("alive", "metrics", "status",
+                                                         "events")]
     n["rx"] = now
 
 

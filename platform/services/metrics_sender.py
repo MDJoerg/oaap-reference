@@ -180,7 +180,7 @@ def _write_private(path, text):
 
 
 def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
-              allow_plain=False, default_node=None, address=None):
+              allow_plain=False, default_node=None, address=None, classes=None):
     """Validate and store. The secret goes into its own file.
 
     `address` (an IP literal) is where to CONNECT when the URL's name does
@@ -215,6 +215,10 @@ def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
            "allow_plain": bool(allow_plain)}
     if address:
         cfg["address"] = address
+    if classes is not None:
+        # RFC-0085 §4.4 / A3: what the node offers; alive always (without it
+        # the hub cannot tell a silent node from a removed one)
+        cfg["classes"] = offered(classes)
     if ca and not os.path.isfile(ca):
         raise ConfigError(f"--ca: no such file: {ca}")
     os.makedirs(cfg_dir, exist_ok=True)
@@ -233,6 +237,31 @@ def configure(cfg_dir, url, user, secret, node=None, root=None, ca=None,
     _write_private(_path(cfg_dir, SECRET_FILE), secret + "\n")
     _write_private(_path(cfg_dir, CONFIG_FILE), json.dumps(cfg, indent=2) + "\n")
     return cfg
+
+
+CLASSES = ("alive", "metrics", "status", "events")
+
+
+def offered(values):
+    """The classes a node sends: alive always, unknown names never."""
+    want = set(values or ())
+    return [c for c in CLASSES if c in want or c == "alive"]
+
+
+def set_classes(cfg_dir, classes):
+    """Change what a configured sender sends; returns the classes."""
+    cfg = load_config(cfg_dir)
+    if not cfg:
+        raise ConfigError("no sender configured")
+    cfg["classes"] = offered(classes)
+    _write_private(_path(cfg_dir, CONFIG_FILE), json.dumps(cfg, indent=2) + "\n")
+    return cfg["classes"]
+
+
+def sends(cfg, cls):
+    """A configuration without `classes` (made by hand, before stage 3)
+    sends everything, as before."""
+    return "classes" not in cfg or cls in (cfg.get("classes") or ())
 
 
 def write_info(metrics_dir, cfg):
@@ -570,12 +599,16 @@ def _publish_classes(client, cfg, metrics_dir, st, now, version):
              "seq": seq, "version": version or "", "interval": ALIVE_INTERVAL,
              "lost": metrics.queue_status(metrics_dir)["lost"],
              "events_dropped": int(st.get("events_dropped", 0))}
+    if "classes" in cfg:
+        alive["classes"] = list(cfg.get("classes") or ())
     client.publish(class_topic(cfg, "alive"),
                    json.dumps(alive, separators=(",", ":")).encode("utf-8"))
     st["alive_seq"] = seq
     n += 1
     for path in events_pending(metrics_dir):
         item = _read_json(path)
+        if not sends(cfg, "events"):
+            item = None                 # not offered: it does not leave the node
         if isinstance(item, dict) and re.match(r"^[a-z][a-z0-9.]{0,40}$", str(item.get("type", ""))):
             client.publish(class_topic(cfg, "events", item["type"]),
                            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
@@ -583,7 +616,7 @@ def _publish_classes(client, cfg, metrics_dir, st, now, version):
             n += 1
         os.remove(path)             # sent, or unreadable: either way done
     doc = _read_json(_path(metrics_dir, STATUS_OUT))
-    if isinstance(doc, dict) and doc.get("digest") and \
+    if isinstance(doc, dict) and doc.get("digest") and sends(cfg, "status") and \
             doc["digest"] != st.get("status_sent"):
         client.publish(class_topic(cfg, "status"),
                        json.dumps(doc.get("document"), ensure_ascii=False,
@@ -632,6 +665,9 @@ def run(metrics_dir, cfg_dir, now=None, client_factory=Client, version=""):
         st["class_sent_total"] = int(st.get("class_sent_total", 0)) + \
             _publish_classes(client, cfg, metrics_dir, st, now, version)
         for e in metrics.queue_pending(metrics_dir):
+            if not sends(cfg, "metrics"):
+                done = e["q"]           # not offered: taken off the queue unsent
+                continue
             for line in metrics.sample_lines(cfg["node"], e):
                 client.publish(topic(cfg, line["m"]),
                                json.dumps(line, separators=(",", ":"))

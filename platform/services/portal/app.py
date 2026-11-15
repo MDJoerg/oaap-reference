@@ -14634,7 +14634,8 @@ def fleet_page():
                 levels=fleet_links.LEVELS, texts=FLEET_LEVEL_TEXT,
                 is_server_admin=role == "server_admin",
                 job=_build_job_note(mine, role, request.args.get("job", "")),
-                error=request.args.get("err"))
+                error=request.args.get("err"),
+                **_pair_page_ctx(request.args.get("job", "") if role == "server_admin" else ""))
 
 
 @app.post("/flotte")
@@ -14659,6 +14660,377 @@ def fleet_set():
         args["tenant"] = (request.form.get("tenant") or "").strip().lower()[:64]
     rid = management_api.enqueue(mine, role, op, args, action="fleet-disclose")
     return redirect(f"/flotte?job={rid}", code=303)
+
+
+# ------------------------------------------- pairing (RFC-0085 stage 3, A3)
+# The doors a node or a hub calls (/fleet/pair/*, no session: the gateway
+# strips identity headers on /fleet/*) and the wizard on /flotte. The portal
+# judges nothing that matters: it takes the call, hands it to the host
+# through the spool and waits; the host judges (fleet_pair) and answers.
+
+import fleet_pair  # noqa: E402
+
+FLEET_PAIR_VIEW = "/apps-registry/fleet-pair-view.json"
+PAIR_DOOR_FIELDS = {"claim": ("code", "node", "classes"),
+                    "entry": ("token", "hub"),
+                    "revoke": ("hub", "node", "ts", "nonce", "mac"),
+                    "unpair": ("node", "key")}
+PAIR_WAIT_SECONDS = 25
+PAIR_BODY_MAX = 16 * 1024
+PAIR_FILE_MAX = fleet_pair.MAX_TEXT
+
+
+def _pair_clean(op, body):
+    out = {}
+    for k in PAIR_DOOR_FIELDS[op]:
+        v = body.get(k)
+        if k == "classes":
+            if isinstance(v, list):
+                out[k] = [str(c)[:16] for c in v[:8]]
+        elif k == "ts":
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(v, str):
+            out[k] = v[:PAIR_FILE_MAX]
+    return out
+
+
+def _pair_wait(rid, seconds):
+    """The job's result once the host wrote it -- and then gone from disk:
+    it may hold a key."""
+    path = os.path.join(management_api.SPOOL_DIR, "jobs", rid, "result.json")
+    deadline = _time.time() + seconds
+    while _time.time() < deadline:
+        if os.path.exists(path):
+            res = management_api.read_json(path) or {}
+            management_api.shred(path)
+            return res
+        _time.sleep(0.5)
+    return None
+
+
+@app.post("/fleet/pair/<op>")
+def fleet_pair_door(op):
+    if op not in PAIR_DOOR_FIELDS:
+        return {"ok": False, "error": "unknown"}, 404
+    key = f"pair:{_client_ip()}"
+    if _deploy_blocked(key):
+        return {"ok": False, "error": "Zu viele Versuche -- eine Minute warten."}, 429
+    if (request.content_length or 0) > PAIR_BODY_MAX:
+        return {"ok": False, "error": "Anfrage zu groß."}, 413
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "Kein JSON."}, 400
+    args = _pair_clean(op, body)
+    if op == "claim":
+        try:
+            fleet_pair.decode(args.get("code", ""))
+        except fleet_pair.Refusal:
+            _deploy_failed(key)
+            return {"ok": False, "error": "Der Code ist ungültig."}, 400
+    rid = management_api.enqueue("", "", op, args, action="fleet-pair-public")
+    res = _pair_wait(rid, PAIR_WAIT_SECONDS)
+    if res is None:
+        try:
+            os.remove(os.path.join(SPOOL_QUEUE, f"{rid}.json"))      # withdrawn: nothing happened
+            return {"ok": False, "error": "Der Knoten ist gerade beschäftigt (ein Bau "
+                                          "läuft). In ein paar Minuten noch einmal."}, 503
+        except OSError:
+            res = _pair_wait(rid, 15)                                 # it is running: a little longer
+        if res is None:
+            return {"ok": False, "error": "Der Knoten hat nicht rechtzeitig geantwortet."}, 504
+    if res.get("ok") and isinstance(res.get("answer"), dict):
+        _deploy_succeeded(key)
+        resp = make_response(json.dumps(res["answer"]), 200)
+        resp.headers["Content-Type"] = "application/json"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    _deploy_failed(key)
+    return {"ok": False, "error": res.get("message") or "abgelehnt"}, 403
+
+
+FLEET_PAIR_BODY = """
+{% if is_server_admin and pv is not none %}
+{% if pair_file %}
+<div class="card warn" id="kopplungsdatei">
+  <h2>{{ "Kopplungsdatei für den Knoten" if pair_op == "code" else "Angebot für die Zentrale" }}</h2>
+  <p><strong>Nur dieses eine Mal hier sichtbar</strong>, 15 Minuten gültig, einmal benutzbar.
+  {% if pair_op == "code" %}Auf dem Knoten: <em>Flotte → Kopplungsdatei einspielen</em>
+  (oder <code>sudo oaap fleet pair apply &lt;datei&gt;</code>).
+  {% else %}An der Zentrale: <em>Flotte → Eingang hinzufügen</em>
+  (oder <code>sudo oaap fleet pair entry &lt;datei&gt;</code>).{% endif %}</p>
+  <p><a class="btn" href="/flotte/kopplung/datei/{{ job_id }}">Datei herunterladen</a></p>
+  <details><summary>Als Text (zum Kopieren)</summary>
+  <textarea readonly rows="5" style="width:100%;font-family:monospace">{{ pair_file }}</textarea></details>
+  <p class="muted">Weitergabe nur an die Person, die den anderen Knoten verwaltet, in einem Kanal,
+  den nur ihr beide lest. Wer die Datei hat, kann in dieser Zeit genau diesen einen Schritt tun.</p>
+</div>
+{% endif %}
+
+<div class="card" id="kopplung">
+  <h2>Kopplung: an wen dieser Knoten sendet</h2>
+  {% if pv.node %}
+  <p>Gekoppelt mit der Zentrale <strong>{{ pv.node.hub }}</strong>
+  {% if pv.node.entry != pv.node.hub %}über den Eingang <strong>{{ pv.node.entry }}</strong>{% else %}direkt{% endif %},
+  als <code>{{ pv.node.node }}</code>, seit {{ pv.node.at }}.</p>
+  {% elif pv.sender %}
+  <p>Sendet an <code>{{ pv.sender.url }}</code> als <code>{{ pv.sender.node }}</code> —
+  <strong>von Hand eingerichtet</strong>. Eine Kopplungsdatei ersetzt das.</p>
+  {% else %}
+  <p class="muted">Dieser Knoten sendet an keine Zentrale.</p>
+  {% endif %}
+
+  {% if pv.sender %}
+  <form method="post" action="/flotte/kopplung">
+    <input type="hidden" name="op" value="classes">
+    <p>Was den Knoten verlässt:
+    {% for c in pair_classes %}
+      <label style="margin-right:1rem"><input type="checkbox" name="classes" value="{{ c }}"
+        {% if c in pv.sender.classes %}checked{% endif %} {% if c == "alive" %}disabled{% endif %}>
+        {{ pair_class_text[c] }}</label>
+    {% endfor %}
+    <button>Ändern</button></p>
+    <p class="muted">Das Lebenszeichen geht immer: ohne es kann die Zentrale einen ausgefallenen
+    Knoten nicht von einem entfernten unterscheiden. Die Zentrale kann keine Klasse verlangen, die
+    dieser Knoten nicht anbietet.</p>
+  </form>
+  <form method="post" action="/flotte/kopplung" onsubmit="return confirm('Kopplung wirklich lösen? Der Knoten sendet danach nichts mehr.');">
+    <input type="hidden" name="op" value="unpair">
+    <button class="danger">{{ "Kopplung lösen" if pv.node else "Sender entfernen" }}</button>
+  </form>
+  {% endif %}
+
+  <h3>Kopplungsdatei einspielen</h3>
+  <form method="post" action="/flotte/kopplung/pruefen" enctype="multipart/form-data">
+    <p><input type="file" name="file" accept=".oaap-pair,.txt"></p>
+    <p><textarea name="text" rows="3" style="width:100%;font-family:monospace" placeholder="… oder den Text einfügen (beginnt mit OAAP-PAIR1.)"></textarea></p>
+    <button>Prüfen</button>
+    <span class="muted">Es passiert noch nichts: zuerst zeigt die Seite, wohin und was gesendet wird.</span>
+  </form>
+</div>
+
+{% if pv.is_hub %}
+<div class="card" style="overflow-x:auto">
+  <h2>Zentrale: Knoten koppeln</h2>
+  <form method="post" action="/flotte/kopplung">
+    <input type="hidden" name="op" value="code">
+    <p><label>Name des Knotens <input name="node" required pattern="[a-z0-9][a-z0-9-]{1,39}" placeholder="z. B. oaapx02"></label></p>
+    <p><label>Weg
+      <select name="via">
+        <option value="">direkt an diese Zentrale ({{ pv.me }})</option>
+        {% for e in pv.entries if not e.direct %}<option value="{{ e.name }}">über den Eingang {{ e.name }} ({{ e.https }})</option>{% endfor %}
+      </select></label></p>
+    <p><label><input type="checkbox" name="lan" value="1"> Der Knoten steht im selben Netz wie diese Zentrale
+      (nur „direkt“: er verbindet sich über die LAN-Adresse)</label></p>
+    <p><label><input type="checkbox" name="replace" value="1"> Als Ersatz — der Knoten wurde neu installiert;
+      sein alter Schlüssel wird widerrufen</label></p>
+    <button>Kopplungsdatei erzeugen</button>
+  </form>
+  {% if pv.codes %}<p class="muted">Offene Codes: {% for c in pv.codes %}{{ c.node }} (über {{ c.entry }}, bis {{ c.expires[11:16] }} UTC){% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+
+  <h3>Knoten dieser Zentrale</h3>
+  {% if pv.nodes %}
+  <table class="mini"><thead><tr><th>Knoten</th><th>Weg</th><th>Zustand</th><th></th></tr></thead><tbody>
+  {% for n in pv.nodes %}
+    <tr><td>{{ n.name }}</td><td>{{ n.via or "direkt" }}</td>
+      <td>{{ pair_state_text.get(n.state, n.state) }}{% if n.reason %} <span class="muted">({{ n.reason }})</span>{% endif %}
+        {% if n.classes %}<br><span class="muted">bietet: {{ n.classes | join(", ") }}</span>{% endif %}</td>
+      <td>{% if n.state != "removed" %}
+      <form method="post" action="/flotte/kopplung" style="display:inline" onsubmit="return confirm('Knoten {{ n.name }} entfernen? Sein Schlüssel am Eingang wird widerrufen.');">
+        <input type="hidden" name="op" value="remove"><input type="hidden" name="node" value="{{ n.name }}">
+        <button class="danger">Entfernen</button></form>{% endif %}</td></tr>
+  {% endfor %}
+  </tbody></table>
+  {% else %}<p class="muted">Noch kein Knoten hat sich gemeldet.</p>{% endif %}
+
+  <h3>Eingänge</h3>
+  {% set real = pv.entries | rejectattr("direct") | list %}
+  {% if real %}<ul>{% for e in real %}<li>{{ e.name }} — {{ e.https }}, seit {{ e.since }}</li>{% endfor %}</ul>
+  {% else %}<p class="muted">Kein Eingang durch Kopplung bekannt.</p>{% endif %}
+  <form method="post" action="/flotte/kopplung" enctype="multipart/form-data">
+    <input type="hidden" name="op" value="entry">
+    <p>Eingang hinzufügen: das Angebot des Eingangs
+      <input type="file" name="file" accept=".oaap-pair,.txt"></p>
+    <p><textarea name="text" rows="2" style="width:100%;font-family:monospace" placeholder="… oder den Text einfügen"></textarea></p>
+    <button>Eingang koppeln</button>
+    <span class="muted">Die Zentrale ruft den Eingang an, holt ihren Brückenschlüssel und startet ihren Broker neu.</span>
+  </form>
+</div>
+{% endif %}
+
+{% if pv.is_entry %}
+<div class="card">
+  <h2>Eingang für eine Zentrale</h2>
+  <p>Dieser Knoten hat einen von außen erreichbaren Broker und kann Knoten an eine Zentrale
+  weiterreichen, die selbst nicht erreichbar ist (zum Beispiel im Heimnetz).</p>
+  {% if pv.hubs %}<p>Zentralen: {% for h in pv.hubs %}<strong>{{ h.name }}</strong>{% if h.direct %} (dieser Knoten selbst){% endif %} seit {{ h.since }}{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  {% if pv.paired %}<p>Durch Kopplung angemeldete Knoten: {% for p in pv.paired %}{{ p.node }} → {{ p.hub }}{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  <form method="post" action="/flotte/kopplung">
+    <input type="hidden" name="op" value="offer">
+    <button>Angebot für eine Zentrale erzeugen</button>
+  </form>
+</div>
+{% endif %}
+{% endif %}
+"""
+
+FLEET_PAIR_CONFIRM = """
+<a class="back" href="/flotte#kopplung">← Zurück zu Flotte</a>
+<div class="pagehead"><h1>Kopplung prüfen</h1></div>
+<div class="card">
+  <p>Dieser Knoten sendet nach der Bestätigung als <strong><code>{{ p.node }}</code></strong>
+  an die Zentrale <strong>{{ p.hub }}</strong>
+  {% if p.entry != p.hub %}über den Eingang <strong>{{ p.entry }}</strong>{% else %}direkt{% endif %}
+  (<code>{{ p.broker }}</code>).</p>
+  {% if p.replace %}<p class="warn">Der Code ist „als Ersatz“ erzeugt: ein früherer Schlüssel für diesen Namen wird widerrufen.</p>{% endif %}
+  {% if current %}<p class="muted">Bisher: {{ current }} — das wird ersetzt.</p>{% endif %}
+  <p class="muted">Gültig bis {{ p.expires[11:16] }} UTC. Der Knoten ruft dafür {{ p.https }} an und
+  prüft dessen Zertifikat gegen den Fingerabdruck in der Datei.</p>
+  <form method="post" action="/flotte/kopplung">
+    <input type="hidden" name="op" value="apply">
+    <input type="hidden" name="text" value="{{ text }}">
+    <p>Was den Knoten verlässt:</p>
+    {% for c in pair_classes %}
+    <p><label><input type="checkbox" name="classes" value="{{ c }}" checked {% if c == "alive" %}disabled{% endif %}>
+      {{ pair_class_text[c] }}</label></p>
+    {% endfor %}
+    <p class="muted">Ereignisse können Namen von Personen enthalten (zum Beispiel wer eine Instanz
+    gestartet hat).</p>
+    <button>Koppeln</button>
+  </form>
+</div>
+"""
+
+PAIR_CLASS_TEXT = {"alive": "Lebenszeichen (immer)", "metrics": "Messwerte (CPU, Speicher, Platte)",
+                   "status": "Statusdokument (Instanzen, Versionen, Zustand)",
+                   "events": "Ereignisse (die Benachrichtigungen des Knotens)"}
+PAIR_STATE_TEXT = {"up": "meldet sich", "silent": "verstummt", "unknown": "unbekannt",
+                   "removed": "entfernt"}
+
+
+def _pair_text_from_request():
+    f = request.files.get("file")
+    if f and f.filename:
+        raw = f.read(PAIR_FILE_MAX + 1)
+        if len(raw) > PAIR_FILE_MAX:
+            return None, "Die Datei ist zu groß für eine Kopplungsdatei."
+        return raw.decode("utf-8", "replace"), None
+    return (request.form.get("text") or "")[:PAIR_FILE_MAX + 1], None
+
+
+def _pair_page_ctx(job_id):
+    """The view and, for a finished code/offer job, its file (once per page)."""
+    pv = _read_json(FLEET_PAIR_VIEW)
+    ctx = {"pv": pv if isinstance(pv, dict) else None, "pair_file": "", "pair_op": "",
+           "job_id": "", "pair_classes": list(fleet_pair.CLASSES),
+           "pair_class_text": PAIR_CLASS_TEXT, "pair_state_text": PAIR_STATE_TEXT}
+    if management_api.JOB_RE.match(job_id or ""):
+        jd = os.path.join(management_api.SPOOL_DIR, "jobs", job_id)
+        res = management_api.read_json(os.path.join(jd, "result.json")) or {}
+        if res.get("ok") and res.get("file") and res.get("op") in ("code", "offer"):
+            ctx.update(pair_file=res["file"], pair_op=res["op"], job_id=job_id)
+    return ctx
+
+
+@app.post("/flotte/kopplung")
+def fleet_pair_act():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    role, mine = caller_scope()
+    if role != "server_admin":
+        return "Zugriff verweigert: koppeln darf nur der Server-Admin.", 403
+    op = request.form.get("op", "")
+    args = {}
+    if op == "code":
+        args = {"node": (request.form.get("node") or "").strip().lower()[:40],
+                "via": (request.form.get("via") or "").strip()[:40],
+                "lan": bool(request.form.get("lan")),
+                "replace": bool(request.form.get("replace"))}
+    elif op in ("entry", "apply"):
+        text, err = _pair_text_from_request()
+        if err:
+            return redirect("/flotte?err=" + quote(err), code=303)
+        args = {"text": text}
+        if op == "apply":
+            args["classes"] = request.form.getlist("classes")
+    elif op == "classes":
+        args = {"classes": request.form.getlist("classes")}
+    elif op == "remove":
+        args = {"node": (request.form.get("node") or "").strip().lower()[:40]}
+    elif op not in ("offer", "unpair"):
+        return redirect("/flotte?err=" + quote("Diesen Schritt gibt es nicht."), code=303)
+    rid = management_api.enqueue(mine, role, op, args, action="fleet-pair")
+    return redirect(f"/flotte?job={rid}#kopplung", code=303)
+
+
+@app.post("/flotte/kopplung/pruefen")
+def fleet_pair_preview():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    role, _mine = caller_scope()
+    if role != "server_admin":
+        return "Zugriff verweigert: koppeln darf nur der Server-Admin.", 403
+    text, err = _pair_text_from_request()
+    try:
+        if err:
+            raise fleet_pair.Refusal(err)
+        obj = fleet_pair.decode(text)
+        if obj.get("type") != "node-code":
+            raise fleet_pair.Refusal("Das ist das Angebot eines Eingangs; es gehört an die "
+                                     "Zentrale (Flotte → Eingang hinzufügen).")
+        if fleet_pair.expired(obj, _time.time()):
+            raise fleet_pair.Refusal("Der Code ist abgelaufen. An der Zentrale einen neuen erzeugen.")
+    except fleet_pair.Refusal as exc:
+        return redirect("/flotte?err=" + quote(str(exc)) + "#kopplung", code=303)
+    pv = _read_json(FLEET_PAIR_VIEW) or {}
+    s = pv.get("sender") or {}
+    current = ""
+    if s:
+        current = (f"gekoppelt mit {pv['node'].get('hub')}" if pv.get("node")
+                   else f"von Hand an {s.get('url')}")
+    return page(FLEET_PAIR_CONFIRM, "Kopplung prüfen", "fleet", p=fleet_pair.preview(obj),
+                text=fleet_pair.encode(obj), current=current,
+                pair_classes=list(fleet_pair.CLASSES), pair_class_text=PAIR_CLASS_TEXT)
+
+
+@app.get("/flotte/kopplung/datei/<rid>")
+def fleet_pair_file(rid):
+    denied = require_user_admin()
+    if denied:
+        return denied
+    role, _mine = caller_scope()
+    if role != "server_admin" or not management_api.JOB_RE.match(rid or ""):
+        return "Zugriff verweigert.", 403
+    jd = os.path.join(management_api.SPOOL_DIR, "jobs", rid)
+    res = management_api.read_json(os.path.join(jd, "result.json")) or {}
+    if not res.get("ok") or not res.get("file") or res.get("op") not in ("code", "offer"):
+        return "Diese Datei gibt es nicht (mehr).", 404
+    try:
+        obj = fleet_pair.decode(res["file"])
+        if fleet_pair.expired(obj, _time.time()):
+            return "Die Datei ist abgelaufen. Eine neue erzeugen.", 410
+        name = (f"oaap-kopplung-{obj.get('node')}" if obj.get("type") == "node-code"
+                else f"oaap-eingang-{obj.get('entry')}")
+    except fleet_pair.Refusal:
+        return "Diese Datei gibt es nicht (mehr).", 404
+    resp = make_response(res["file"] + "\n", 200)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{name}.oaap-pair"'
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+_FLEET_FIRST_CARD = '<div class="card">\n  <h2>Was der Knoten über'
+assert FLEET_BODY.count(_FLEET_FIRST_CARD) == 1
+FLEET_BODY = FLEET_BODY.replace(_FLEET_FIRST_CARD, FLEET_PAIR_BODY + _FLEET_FIRST_CARD)
 
 
 @app.get("/tenant/egress")

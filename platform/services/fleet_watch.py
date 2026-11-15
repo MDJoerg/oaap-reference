@@ -104,9 +104,14 @@ def _just_back(state, via, me, now, t):
             and now - since < WARMUP and t < since)
 
 
-def view(state, now, me=None):
+def view(state, now, me=None, removed=None):
     """[{name, via, state, age, version, seq, gaps, lost, reason}] sorted --
-    what `oaap fleet hub show` prints and what the conditions use."""
+    what `oaap fleet hub show` prints and what the conditions use.
+
+    `removed` ({name: epoch}, RFC-0085 §4.5 / A3): nodes the hub removed. Such
+    a node is "removed", never "silent", until an `alive` newer than the
+    removal arrives (it was paired again)."""
+    removed = removed or {}
     rows = []
     warm = now - (state.get("started") or now) < WARMUP
     back = max(state.get("started") or 0, state.get("connected_since") or 0)
@@ -116,7 +121,10 @@ def view(state, now, me=None):
         age = None if t is None else max(0, now - t)
         via = n.get("via") or ""
         st, why = "up", ""
-        if age is None:
+        gone = removed.get(n.get("name") or key)
+        if gone is not None and (t is None or t <= gone):
+            st, why = "removed", "an der Zentrale entfernt"
+        elif age is None:
             st, why = "unknown", "noch kein Lebenszeichen"
         elif via and bridge_up(state, via, me) is False:
             st, why = "unknown", f"Eingang {via} getrennt"
@@ -140,14 +148,14 @@ def view(state, now, me=None):
     return rows
 
 
-def hub_conditions(state, now, me=None, open_matters=None):
+def hub_conditions(state, now, me=None, open_matters=None, removed=None):
     """{key: condition} for the hub's default scope; `me` is the hub's name
     on the wire (only its own bridges count). `open_matters` ({key:
     condition}, the matters open now): one whose subject is "unknown" this
     minute stays open as it is."""
     out = {}
     held = open_matters or {}
-    rows = view(state, now, me)
+    rows = view(state, now, me, removed)
     for r in rows:
         key = f"node.silent/{r['name']}"
         if r["state"] == "unknown" and key in held:
@@ -329,14 +337,14 @@ def link_conditions(doc, now, held=None):
 VERDICT_STALE = 180        # an older verdict.json is no verdict at all (fleet_sink)
 
 
-def verdict(state, now, me, previous):
+def verdict(state, now, me, previous, removed=None):
     """The judgement per node for the twin (RFC-0085 amendment A2):
     {"written", "nodes": {name: {state, since, reason}}}. The same rows as
     `view` -- one rule for the mail and the twin -- with `since` kept while
     a node's state does not change. `previous` is the last verdict."""
     prev = (previous or {}).get("nodes") or {}
     out = {}
-    for r in view(state, now, me):
+    for r in view(state, now, me, removed):
         p = prev.get(r["name"]) or {}
         since = p.get("since") if p.get("state") == r["state"] and p.get("since") else iso(now)
         out[r["name"]] = {"state": r["state"], "since": since, "reason": r.get("reason") or ""}

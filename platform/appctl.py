@@ -122,6 +122,7 @@ import guard  # noqa: E402
 import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
+import fleet_pair  # noqa: E402  (RFC-0085 stage 3)
 # The broker's certificate (RFC-0054 stage 3): copied from the gateway or
 # issued by this node's own CA; the acting is cmd_broker.
 import broker_certs  # noqa: E402
@@ -178,8 +179,12 @@ SPOOL_CLAIMS = os.path.join(SPOOL_DIR, "claims")
 # (cmd_process_deploys).
 # "tenant-request-submit" is the prospect's form (RFC-0055 stage 4): its
 # proof is the invitation link, checked here against the stored hash.
+# "fleet-pair-public" is a call at /fleet/pair/* (RFC-0085 stage 3): its proof
+# is a signed code, an offer's token, a HMAC or the node's own key, judged in
+# fleet_pair.
 SPOOL_ACTIONS_WITHOUT_ACTOR = frozenset({"redeploy", "announce", "artifact",
-                                         "node", "tenant-request-submit"})
+                                         "node", "tenant-request-submit",
+                                         "fleet-pair-public"})
 # How long one deploy request may take before it is called off. A build
 # that hangs used to block every later deployment for every instance,
 # with nothing anywhere saying so (RFC-0024). A recorded failure is
@@ -10062,7 +10067,8 @@ def job_result_fill(req, rid, ok, msg):
     """
     if str(req.get("action") or "") not in (
             "cohort", "tenant-build", "tenant-request", "tenant-request-submit",
-            "tenant-profile", "disk", "fleet-disclose"):
+            "tenant-profile", "disk", "fleet-disclose", "fleet-pair",
+            "fleet-pair-public"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
         return
@@ -26415,7 +26421,7 @@ def _fleet_write_verdict(state, now_e):
         return
     try:
         doc = fleet_watch.verdict(state, now_e, fleet_node_name(),
-                                  _read_json_file(FLEET_VERDICT) or {})
+                                  _read_json_file(FLEET_VERDICT) or {}, _pair_removed())
         tmp = FLEET_VERDICT + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -26445,7 +26451,8 @@ def fleet_conditions(now):
         state = _read_json_file(FLEET_STATE)
         if fleet_watch.trusted(state, now_e):
             out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name(),
-                                                  held(fleet_watch.FLEET_MATTERS)))
+                                                  held(fleet_watch.FLEET_MATTERS),
+                                                  _pair_removed()))
             # RFC-0087 §6: a broken tunnel, one matter, with what depends on it
             links = fleet_watch.link_conditions(_read_json_file(FLEET_AFFECTED), now_e,
                                                 held(("link.down",)))
@@ -26476,6 +26483,11 @@ def fleet_conditions(now):
             keep(("hub.unreachable",))
         else:
             out.update(conds)
+    try:
+        if os.path.exists(FLEET_PAIR_FILE) or has_profile("fleet-hub"):
+            _pair_view_write()        # RFC-0085 stage 3: the page "Flotte" reads it
+    except Exception as exc:  # noqa: BLE001 -- never fails the minute job
+        print(f"fleet pair: view skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
     return out
 
 
@@ -26500,10 +26512,10 @@ def _fleet_hub_show():
     print(f"Fleet service: {'connected' if state.get('connected') else 'NOT connected'}, "
           f"state {age} s old{' -- NOT trusted' if not fleet_watch.trusted(state, now) else ''}, "
           f"{state.get('messages', 0)} messages since its start, {state.get('bad', 0)} not placed")
-    words = {"up": "da", "silent": "SCHWEIGT", "unknown": "unbekannt"}
+    words = {"up": "da", "silent": "SCHWEIGT", "unknown": "unbekannt", "removed": "entfernt"}
     print("\nNodes:")
     me = fleet_node_name()
-    for r in fleet_watch.view(state, now, me):
+    for r in fleet_watch.view(state, now, me, _pair_removed()):
         age_s = "—" if r["age"] is None else f"{int(r['age'])} s"
         print(f"  {r['name']:<16} {words[r['state']]:<10} last alive {age_s:>8}  "
               f"{r['version'] or '?':<10} {'via ' + r['via'] if r['via'] else 'direct':<14}"
@@ -26716,6 +26728,8 @@ def _fleet_disclose_show(d):
 
 
 def cmd_fleet(args):
+    if args.object == "pair":
+        return cmd_fleet_pair(args)
     if args.object == "disclose":
         if args.action == "show":
             return _fleet_disclose_show(fleet_disclose_load())
@@ -26779,6 +26793,690 @@ def cmd_fleet(args):
     print("It grants exactly one thing — reading this node's status document:")
     print(f"  curl {url} -H \"Authorization: Bearer <key>\"")
     print("Revoke it any time with: sudo oaap fleet key revoke " + label)
+
+
+# ------------------------------------------ pairing (RFC-0085 stage 3, A3)
+#
+# The rules are in services/fleet_pair.py; here is what touches the host:
+# the pairing file (secrets, mounted in no container), identity (keys), the
+# broker (the hub's bridge), the sender, and the view the portal reads.
+
+FLEET_PAIR_DIR = os.path.join(DATA_DIR, "data", "fleet-pair")
+FLEET_PAIR_FILE = os.path.join(FLEET_PAIR_DIR, "pair.json")
+FLEET_PAIR_VIEW = os.path.join(APPS_DIR, "fleet-pair-view.json")
+PAIR_ROOT = "oaap-node"         # = mqtt_acl.DEFAULT_ROOT, the bridge's topic root
+PAIR_KEY_DAYS = 365
+
+
+def _pair_load():
+    d = _read_json_file(FLEET_PAIR_FILE)
+    d = d if isinstance(d, dict) else {}
+    for k in ("entry", "hub", "node"):
+        if not isinstance(d.get(k), dict):
+            d[k] = {}
+    return d
+
+
+def _pair_save(d):
+    os.makedirs(FLEET_PAIR_DIR, exist_ok=True)
+    os.chmod(FLEET_PAIR_DIR, 0o700)
+    tmp = FLEET_PAIR_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, FLEET_PAIR_FILE)
+    try:
+        _pair_view_write(d)
+    except Exception as exc:  # noqa: BLE001 -- the view is a convenience
+        print(f"fleet pair: view not written ({type(exc).__name__}: {exc})", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _pair_tx():
+    """Load, change, save -- under a lock (the worker and a command may meet).
+    A Refusal saves too: a code is spent by its first try, refused or not."""
+    import fcntl
+    os.makedirs(FLEET_PAIR_DIR, exist_ok=True)
+    os.chmod(FLEET_PAIR_DIR, 0o700)
+    with open(os.path.join(FLEET_PAIR_DIR, ".lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        d = _pair_load()
+        try:
+            yield d
+        except fleet_pair.Refusal:
+            _pair_save(d)
+            raise
+        _pair_save(d)
+
+
+def _pair_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def _pair_removed(d=None):
+    d = d if d is not None else _pair_load()
+    return {k: v for k, v in ((d.get("hub") or {}).get("removed") or {}).items()
+            if isinstance(v, (int, float))}
+
+
+def _pair_view_write(d=None):
+    """What the portal shows on /flotte -- no secret, no token, no MAC."""
+    d = d if d is not None else _pair_load()
+    now = time.time()
+    me = fleet_node_name()
+    hub, entry, node = d["hub"], d["entry"], d["node"]
+    cfg = metrics_sender.load_config(METRICS_SENDER_DIR) or {}
+    nodes = []
+    if has_profile("fleet-hub"):
+        state = _read_json_file(FLEET_STATE)
+        if isinstance(state, dict):
+            offered = {n.get("name"): (n.get("alive") or {}).get("classes")
+                       for n in (state.get("nodes") or {}).values()}
+            nodes = [{"name": r["name"], "via": r["via"], "state": r["state"],
+                      "reason": r.get("reason") or "",
+                      "classes": offered.get(r["name"])}
+                     for r in fleet_watch.view(state, now, me, _pair_removed(d))]
+    view = {
+        "written": _pair_iso(now), "me": me,
+        "is_hub": has_profile("fleet-hub"),
+        "is_entry": has_profile("broker") and has_profile("exposed") and bool(load_external()),
+        "node": {k: node.get(k) for k in ("hub", "entry", "https", "at", "classes", "node")
+                 if node.get(k) not in (None, "")},
+        "sender": ({"url": cfg.get("url"), "node": cfg.get("node"),
+                    "classes": cfg.get("classes") or list(metrics_sender.CLASSES),
+                    "paired": bool(node)} if cfg else None),
+        "entries": [{"name": n, "https": e.get("https"), "since": e.get("since"),
+                     "direct": bool(e.get("direct"))}
+                    for n, e in sorted((hub.get("entries") or {}).items())],
+        "codes": [{"node": c.get("node"), "entry": c.get("entry"),
+                   "expires": _pair_iso(c.get("expires", 0)), "replace": bool(c.get("replace"))}
+                  for c in hub.get("codes") or [] if c.get("expires", 0) > now],
+        "removed": {n: _pair_iso(t) for n, t in _pair_removed(d).items()},
+        "nodes": nodes,
+        "hubs": [{"name": n, "since": h.get("since"), "direct": bool(h.get("direct"))}
+                 for n, h in sorted((entry.get("hubs") or {}).items())],
+        "paired": [{"node": n, "hub": p.get("hub"), "at": p.get("at"),
+                    "classes": p.get("classes") or []}
+                   for n, p in sorted((entry.get("nodes") or {}).items())],
+        "offers": len([o for o in entry.get("offers") or [] if o.get("expires", 0) > now]),
+    }
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = FLEET_PAIR_VIEW + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(view, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, FLEET_PAIR_VIEW)
+    return view
+
+
+# -- identity: the keys. Values go in as environment, a key to check on
+# standard input -- never on a command line.
+_PAIR_IDENTITY = r'''
+import json, os, sys, time, app as m
+op = os.environ["OAAP_P_OP"]
+now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+try:
+    if op == "active":
+        node, label = os.environ["OAAP_P_NODE"], os.environ.get("OAAP_P_LABEL", "")
+        out = [k["id"] for k in m.load_keys()
+               if k.get("kind") == "node" and k.get("node") == node
+               and not k.get("revoked") and (k.get("expires") or "") > now
+               and (not label or k.get("label") == label)]
+    elif op == "issue":
+        rec, secret = m.issue_broker_key(
+            os.environ["OAAP_P_KIND"], os.environ["OAAP_P_NAME"],
+            os.environ.get("OAAP_P_NODE", ""),
+            json.loads(os.environ.get("OAAP_P_GRANTS") or "null"),
+            os.environ["OAAP_P_LABEL"], int(os.environ["OAAP_P_DAYS"]), "pairing")
+        out = {"id": rec["id"], "secret": secret, "principal": rec["principal"],
+               "expires": rec["expires"]}
+    elif op == "revoke":
+        out = bool(m.revoke_key(os.environ["OAAP_P_KID"]))
+    elif op == "login":
+        token = sys.stdin.readline().strip()
+        # not m._by_key: it needs a request (its brake reads the client's
+        # address) -- measured 2026-11-15; the portal door brakes instead
+        mt = m.KEY_TOKEN_RE.fullmatch(token)
+        rec = next((k for k in m.load_keys() if mt and k["id"] == mt.group(1)), None) or {}
+        good = bool(rec) and rec.get("kind") == "node" and not rec.get("revoked") \
+            and (rec.get("expires") or "") > now \
+            and m.check_password_hash(rec.get("hash", ""), mt.group(2))
+        out = {"ok": good, "id": rec.get("id", ""),
+               "node": rec.get("node", ""), "label": rec.get("label", "")}
+    else:
+        raise ValueError("unknown op")
+except ValueError as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(0)
+print(json.dumps({"out": out}))
+'''
+
+
+def _pair_identity(op, env=None, stdin=None):
+    cmd = ["docker", "exec"] + (["-i"] if stdin is not None else [])
+    for k, v in {"OAAP_P_OP": op, **(env or {})}.items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd += [IDENTITY_CONTAINER, "python3", "-c", _PAIR_IDENTITY]
+    try:
+        out = subprocess.run(cmd, check=True, text=True, capture_output=True,
+                             input=stdin, timeout=30).stdout
+        res = json.loads(out.strip().splitlines()[-1])
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        raise fleet_pair.Refusal("Die Schlüsselverwaltung dieses Knotens antwortet "
+                                 "nicht.") from None
+    if "error" in res:
+        raise fleet_pair.Refusal(str(res["error"]))
+    return res["out"]
+
+
+def _pair_active(node, label=""):
+    return _pair_identity("active", {"OAAP_P_NODE": node, "OAAP_P_LABEL": label})
+
+
+def _pair_revoke(kid, why):
+    _pair_identity("revoke", {"OAAP_P_KID": kid})
+    audit_tenant("key.revoke", "", subject=f"key {kid}", who="pairing",
+                 detail=f"MQTT key revoked by the pairing: {why}")
+    audit_fleet({"event": "pair.revoke", "key": kid, "why": why})
+
+
+def _pair_issue(kind, name, label, node="", grants=None):
+    r = _pair_identity("issue", {"OAAP_P_KIND": kind, "OAAP_P_NAME": name,
+                                 "OAAP_P_NODE": node, "OAAP_P_LABEL": label,
+                                 "OAAP_P_GRANTS": json.dumps(grants),
+                                 "OAAP_P_DAYS": str(PAIR_KEY_DAYS)})
+    audit_tenant("key.issue", "", subject=r["principal"], who="pairing",
+                 detail=f"key {r['id']}, MQTT {kind}"
+                        + (f", node {node}" if node else "")
+                        + "".join(f", {g['access']} {g['filter']}" for g in grants or [])
+                        + f", {label}, expires {r['expires'][:10]}")
+    return r["id"], r["secret"]
+
+
+def _pair_issue_node(node, hub):
+    kid, secret = _pair_issue("node", node, fleet_pair.KEY_LABEL + hub, node=node)
+    audit_fleet({"event": "pair.node", "node": node, "hub": hub, "key": kid})
+    return kid, secret
+
+
+def _pair_issue_operator(hub):
+    me = fleet_node_name()
+    grants = [{"filter": f"{PAIR_ROOT}/#", "access": "read"},
+              {"filter": f"oaap-fleet/control/{me}/#", "access": "write"}]
+    kid, secret = _pair_issue("operator", f"hub-{hub}"[:40], f"pair-entry:{hub}",
+                              grants=grants)
+    audit_fleet({"event": "pair.entry", "hub": hub, "key": kid})
+    return kid, secret
+
+
+def _pair_broker_ca():
+    """The broker's CA when its certificate comes from this node's own CA;
+    None when it comes from the gateway (a public authority)."""
+    try:
+        if broker_certs._state(BROKER_CERT_DIR).get("source") != "local":
+            return None
+        with open(os.path.join(BROKER_CA_DIR, "ca.crt"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _pair_can_be_entry():
+    if not (has_profile("broker") and has_profile("exposed")):
+        raise fleet_pair.Refusal("Dieser Knoten hat keinen von außen erreichbaren Broker "
+                                 "(Profile 'broker' und 'exposed').")
+
+
+def _pair_edge():
+    return load_external_conf()[1]
+
+
+def _pair_self_place(lan=False):
+    """This node as a place to call -> (place, https address, broker address).
+
+    place = {https name, broker, certificate pin}. The pin is what the CALLER
+    sees. With `lan` the callers sit in this node's network: HTTPS goes to the
+    edge in front of the node when there is one (oaap-test behind oaap-demo,
+    measured 2026-11-15: the node's own gateway speaks no TLS for its public
+    name), else to the node's LAN address; the broker is always the node's own.
+    Without `lan`: the public name, and only when that does not lead back here
+    (no hairpin) the node's own certificate."""
+    _pair_can_be_entry()
+    host = load_external()
+    if not host:
+        raise fleet_pair.Refusal("Dieser Knoten hat keinen öffentlichen Namen "
+                                 "('oaap external set').")
+    https_addr = broker_addr = ""
+    if lan:
+        broker_addr = lan_address()
+        if not broker_addr:
+            raise fleet_pair.Refusal("Die LAN-Adresse dieses Knotens ist nicht zu ermitteln.")
+        https_addr = _pair_edge() or broker_addr
+    fp, last = "", None
+    for addr in ([https_addr] if lan else ["", "127.0.0.1"]):
+        try:
+            fp = fleet_pair.peer_fingerprint(host, address=addr)
+            break
+        except OSError as exc:
+            last = exc
+    if not fp:
+        raise fleet_pair.Refusal(f"Das HTTPS-Zertifikat dieses Knotens ließ sich nicht "
+                                 f"lesen ({type(last).__name__}).")
+    return ({"https": host, "broker": f"mqtts://{host}:8883", "fp": fp},
+            https_addr, broker_addr)
+
+
+# -- the entry: what a call from outside may do (portal door -> spool -> here)
+
+def fleet_pair_public(req, now=None):
+    """-> (ok, sentence, answer). The answer may hold a secret: the portal
+    hands it to the caller and shreds it."""
+    now = now or time.time()
+    op = str(req.get("op") or "")
+    args = req.get("args") if isinstance(req.get("args"), dict) else {}
+    me = fleet_node_name()
+    try:
+        if op == "claim":
+            _pair_can_be_entry()
+            with _pair_tx() as d:
+                ans = fleet_pair.claim_node(
+                    d["entry"], args, now, me, _pair_active, _pair_issue_node,
+                    lambda kid: _pair_revoke(kid, "replaced by a new pairing"))
+            ans["root"] = PAIR_ROOT
+            ca = _pair_broker_ca()
+            if ca:
+                ans["ca"] = ca
+            return True, f"Knoten {ans['node']} gekoppelt (Zentrale {ans['hub']}).", ans
+        if op == "entry":
+            _pair_can_be_entry()
+            with _pair_tx() as d:
+                ans = fleet_pair.claim_entry(d["entry"], args, now, me, _pair_issue_operator,
+                                             f"mqtts://{load_external()}:8883")
+            ca = _pair_broker_ca()
+            if ca:
+                ans["ca"] = ca
+            return True, f"Zentrale {args.get('hub')} nutzt diesen Knoten als Eingang.", ans
+        if op == "revoke":
+            with _pair_tx() as d:
+                ans = fleet_pair.revoke_node(
+                    d["entry"], args, now, _pair_active,
+                    lambda kid: _pair_revoke(kid, f"removed at the hub {args.get('hub')}"))
+            return True, f"Knoten {ans['node']}: {ans['revoked']} Schlüssel widerrufen.", ans
+        if op == "unpair":
+            node = str(args.get("node") or "")
+            info = _pair_identity("login", stdin=str(args.get("key") or "") + "\n")
+            if not info.get("ok") or info.get("node") != node or not node:
+                raise fleet_pair.Refusal("Nicht berechtigt.")
+            _pair_revoke(info["id"], "the node unpaired itself")
+            with _pair_tx() as d:
+                (d["entry"].get("nodes") or {}).pop(node, None)
+            return True, f"Knoten {node} hat die Kopplung gelöst.", {"ok": True}
+        raise fleet_pair.Refusal("Unbekannter Schritt.")
+    except fleet_pair.Refusal as exc:
+        audit_fleet({"event": "pair.refused", "op": op, "why": str(exc)[:200]})
+        return False, str(exc), {"ok": False, "error": str(exc)}
+
+
+# -- the hub
+
+def _pair_need_hub():
+    if not has_profile("fleet-hub"):
+        raise fleet_pair.Refusal("Dieser Knoten ist keine Zentrale (Profil 'fleet-hub').")
+
+
+def fleet_pair_code(node, via="", lan=False, replace=False, now=None):
+    """A node code -> (text, record). `via` names a paired entry; empty or
+    this node's own name is a direct pairing with the hub's own broker."""
+    _pair_need_hub()
+    now = now or time.time()
+    me = fleet_node_name()
+    via = (via or "").strip() or me
+    with _pair_tx() as d:
+        entries = d["hub"].setdefault("entries", {})
+        if via == me:
+            place, https_addr, broker_addr = _pair_self_place(lan)
+            e = entries.get(me)
+            if not e or not e.get("secret"):
+                secret = secrets.token_urlsafe(32)
+                entries[me] = {"https": place["https"], "broker": place["broker"],
+                               "secret": secret, "since": _pair_iso(now), "direct": True}
+                d["entry"].setdefault("hubs", {})[me] = {"secret": secret,
+                                                         "since": _pair_iso(now),
+                                                         "direct": True}
+                e = entries[me]
+            text, rec = fleet_pair.make_node_code(me, me, place, e["secret"], node, now,
+                                                  replace, address=https_addr,
+                                                  broker_address=broker_addr)
+        else:
+            e = entries.get(via)
+            if not e:
+                raise fleet_pair.Refusal(f"Den Eingang '{via}' kennt diese Zentrale nicht.")
+            try:
+                fp = fleet_pair.peer_fingerprint(e["https"])
+            except OSError as exc:
+                raise fleet_pair.Refusal(f"Der Eingang {e['https']} ist nicht erreichbar "
+                                         f"({type(exc).__name__}).") from None
+            text, rec = fleet_pair.make_node_code(
+                me, via, {"https": e["https"], "broker": e["broker"], "fp": fp},
+                e["secret"], node, now, replace)
+        d["hub"]["codes"] = [c for c in d["hub"].get("codes") or []
+                             if c.get("expires", 0) > now] + [rec]
+        (d["hub"].get("removed") or {}).pop(rec["node"], None)
+    audit_fleet({"event": "pair.code", "node": rec["node"], "entry": via,
+                 "replace": bool(replace)})
+    return text, rec
+
+
+def fleet_pair_entry_add(text, now=None):
+    """The hub takes an entry offer: calls the entry, writes its bridge,
+    restarts its broker. -> sentence."""
+    _pair_need_hub()
+    now = now or time.time()
+    obj = fleet_pair.decode(text)
+    if obj.get("type") != "entry-offer":
+        raise fleet_pair.Refusal("Das ist kein Angebot eines Eingangs, sondern ein Code "
+                                 "für einen Knoten.")
+    if fleet_pair.expired(obj, now):
+        raise fleet_pair.Refusal("Das Angebot ist abgelaufen. Am Eingang ein neues erzeugen.")
+    me = fleet_node_name()
+    status, ans = fleet_pair.post(obj["https"], "/fleet/pair/entry",
+                                  {"token": obj.get("token", ""), "hub": me},
+                                  obj.get("fp", ""), obj.get("address", ""))
+    if status != 200 or not ans.get("ok"):
+        raise fleet_pair.Refusal(ans.get("error") or f"Der Eingang lehnt ab (HTTP {status}).")
+    entry = str(ans.get("entry") or "")
+    if entry != obj.get("entry") or not fleet_pair.NODE_RE.match(entry) or entry == me:
+        raise fleet_pair.Refusal("Die Antwort des Eingangs passt nicht zum Angebot.")
+    cafile = "/etc/ssl/certs/ca-certificates.crt"
+    os.makedirs(BROKER_CONF_DIR, exist_ok=True)
+    if ans.get("ca"):
+        ca_path = os.path.join(BROKER_CONF_DIR, f"ca-{entry}.crt")
+        with open(ca_path, "w", encoding="utf-8") as f:
+            f.write(ans["ca"])
+        os.chmod(ca_path, 0o644)
+        cafile = f"/mosquitto/conf.d/ca-{entry}.crt"
+    conf = fleet_pair.bridge_conf(entry, me, ans["broker"], ans["operator_user"],
+                                  ans["operator_secret"], cafile)
+    path = os.path.join(BROKER_CONF_DIR, f"bridge-{entry}.conf")
+    if os.path.exists(path):
+        # a hand-made bridge (stage 1) is kept beside the pairing file, not
+        # in conf.d where Mosquitto would read it twice
+        os.makedirs(FLEET_PAIR_DIR, exist_ok=True)
+        shutil.copy2(path, os.path.join(FLEET_PAIR_DIR,
+                                        f"bridge-{entry}.conf.before-{int(now)}"))
+    with _pair_tx() as d:
+        d["hub"].setdefault("entries", {})[entry] = {
+            "https": obj["https"], "broker": ans["broker"], "secret": ans["pair_secret"],
+            "since": _pair_iso(now), "operator": ans["operator_user"]}
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(conf)
+    try:
+        os.chown(tmp, broker_certs.BROKER_UID, broker_certs.BROKER_UID)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    restarted = False
+    try:
+        if run(["docker", "ps", "-q", "-f", "name=^oaap-broker-1$"]).stdout.strip():
+            run(["docker", "restart", "oaap-broker-1"])   # a bridge needs a restart
+            restarted = True
+    except (subprocess.CalledProcessError, DeployTimeout):
+        pass
+    audit_fleet({"event": "pair.entry-added", "entry": entry,
+                 "operator": ans["operator_user"]})
+    return (f"Eingang {entry} gekoppelt: Brücke {path} geschrieben, Broker "
+            + ("neu gestartet." if restarted else "NICHT neu gestartet (läuft er?)."))
+
+
+def fleet_pair_remove(node, now=None):
+    """The hub removes a node: the entry revokes the key a pairing by this
+    hub issued; the node is "removed" here, never "silent". -> sentence."""
+    _pair_need_hub()
+    now = now or time.time()
+    node = (node or "").strip().lower()
+    if not fleet_pair.NODE_RE.match(node):
+        raise fleet_pair.Refusal("Ungültiger Name.")
+    me = fleet_node_name()
+    state = _read_json_file(FLEET_STATE) or {}
+    via = next((n.get("via") or "" for n in (state.get("nodes") or {}).values()
+                if n.get("name") == node), None)
+    d0 = _pair_load()
+    if via is None:
+        via = next((c.get("entry") for c in reversed(d0["hub"].get("codes") or [])
+                    if c.get("node") == node), "")
+    via = via or me
+    told = ""
+    if via == me:
+        n = 0
+        for kid in _pair_active(node, fleet_pair.KEY_LABEL + me):
+            _pair_revoke(kid, "removed at the hub")
+            n += 1
+        told = f"{n} Schlüssel auf diesem Knoten widerrufen"
+        with _pair_tx() as d:
+            (d["entry"].get("nodes") or {}).pop(node, None)
+    else:
+        e = (d0["hub"].get("entries") or {}).get(via)
+        if not e:
+            told = (f"über den Eingang {via}, der nicht durch Kopplung bekannt ist: "
+                    "dort von Hand widerrufen ('oaap key list', 'oaap key revoke')")
+        else:
+            ts, nonce = int(now), secrets.token_urlsafe(12)
+            body = {"hub": me, "node": node, "ts": ts, "nonce": nonce,
+                    "mac": fleet_pair.revoke_mac(e["secret"], me, node, ts, nonce)}
+            try:
+                fp = fleet_pair.peer_fingerprint(e["https"])
+                status, ans = fleet_pair.post(e["https"], "/fleet/pair/revoke", body, fp)
+            except (OSError, fleet_pair.Refusal) as exc:
+                status, ans = 0, {"error": str(exc)}
+            if status == 200 and ans.get("ok"):
+                told = f"Eingang {via}: {ans.get('revoked', 0)} Schlüssel widerrufen"
+                if not ans.get("revoked"):
+                    told += (" (keiner von dieser Zentrale ausgestellt -- von Hand "
+                             "gekoppelt? Dort mit 'oaap key revoke' widerrufen)")
+            else:
+                told = (f"Eingang {via} hat NICHT widerrufen: "
+                        f"{ans.get('error') or 'HTTP ' + str(status)}")
+    with _pair_tx() as d:
+        d["hub"].setdefault("removed", {})[node] = int(now)
+    audit_fleet({"event": "pair.remove", "node": node, "via": via, "told": told[:200]})
+    return f"Knoten {node} entfernt; {told}."
+
+
+# -- the node
+
+def fleet_pair_apply(text, classes=None, now=None):
+    """The node takes a code: calls the entry, configures its sender. -> sentence."""
+    now = now or time.time()
+    obj = fleet_pair.decode(text)
+    if obj.get("type") != "node-code":
+        raise fleet_pair.Refusal("Das ist das Angebot eines Eingangs; es gehört an die "
+                                 "Zentrale, nicht an einen Knoten.")
+    if fleet_pair.expired(obj, now):
+        raise fleet_pair.Refusal("Der Code ist abgelaufen. An der Zentrale einen neuen "
+                                 "erzeugen.")
+    classes = fleet_pair.classes_from(classes if classes is not None
+                                      else fleet_pair.DEFAULT_CLASSES)
+    status, ans = fleet_pair.post(obj["https"], "/fleet/pair/claim",
+                                  {"code": fleet_pair.encode(obj), "node": obj["node"],
+                                   "classes": classes},
+                                  obj.get("fp", ""), obj.get("address", ""))
+    if status != 200 or not ans.get("ok"):
+        raise fleet_pair.Refusal(ans.get("error") or f"Der Eingang lehnt ab (HTTP {status}).")
+    ca = None
+    if ans.get("ca"):
+        ca = os.path.join(FLEET_PAIR_DIR, "broker-ca.crt")
+        os.makedirs(FLEET_PAIR_DIR, exist_ok=True)
+        with open(ca, "w", encoding="utf-8") as f:
+            f.write(ans["ca"])
+    try:
+        cfg = metrics_sender.configure(
+            METRICS_SENDER_DIR, ans["broker"], ans["user"], ans["secret"],
+            node=obj["node"], root=ans.get("root") or PAIR_ROOT, ca=ca,
+            default_node=socket.gethostname(),
+            address=obj.get("broker_address") or None, classes=classes)
+    except (metrics_sender.ConfigError, KeyError) as exc:
+        raise fleet_pair.Refusal(f"Der Sender ließ sich nicht einrichten: {exc}") from None
+    metrics_sender.write_info(METRICS_DIR, cfg)
+    metrics_sender.reset_state(METRICS_DIR)
+    with _pair_tx() as d:
+        d["node"] = {"hub": obj["hub"], "entry": obj["entry"], "https": obj["https"],
+                     "fp": obj.get("fp", ""), "address": obj.get("address", ""),
+                     "node": obj["node"], "user": ans["user"], "at": _pair_iso(now),
+                     "classes": cfg.get("classes")}
+    audit_fleet({"event": "pair.apply", "hub": obj["hub"], "entry": obj["entry"],
+                 "node": obj["node"], "key": ans["user"], "classes": cfg.get("classes")})
+    way = "direkt" if obj["entry"] == obj["hub"] else f"über {obj['entry']}"
+    return (f"Gekoppelt: dieser Knoten sendet als {obj['node']} an die Zentrale "
+            f"{obj['hub']} {way} ({', '.join(cfg.get('classes') or [])}). "
+            "Die Zentrale sieht ihn innerhalb einer Minute.")
+
+
+def fleet_pair_classes(classes):
+    cfg = metrics_sender.load_config(METRICS_SENDER_DIR)
+    if not cfg:
+        raise fleet_pair.Refusal("Dieser Knoten sendet an keine Zentrale.")
+    got = metrics_sender.set_classes(METRICS_SENDER_DIR, classes)
+    with _pair_tx() as d:
+        if d["node"]:
+            d["node"]["classes"] = got
+    audit_fleet({"event": "pair.classes", "classes": got})
+    return "Dieser Knoten sendet jetzt: " + ", ".join(got) + "."
+
+
+def fleet_pair_unpair():
+    """The node unpairs: tells the entry (best effort, authenticated by its
+    own key), then removes its sender. The queue stays (RFC-0052)."""
+    d = _pair_load()
+    p = d["node"]
+    cfg = metrics_sender.load_config(METRICS_SENDER_DIR)
+    if not cfg and not p:
+        raise fleet_pair.Refusal("Dieser Knoten sendet an keine Zentrale.")
+    told = "kein Eingang benachrichtigt (der Sender war von Hand eingerichtet)"
+    if p and cfg:
+        try:
+            status, ans = fleet_pair.post(
+                p["https"], "/fleet/pair/unpair",
+                {"node": p.get("node", ""), "key": metrics_sender.load_secret(METRICS_SENDER_DIR)},
+                p.get("fp", ""), p.get("address", ""))
+            told = (f"{p.get('entry')} hat den Schlüssel widerrufen" if status == 200 and ans.get("ok")
+                    else f"{p.get('entry')} hat NICHT widerrufen ({ans.get('error') or status}) -- "
+                         "an der Zentrale 'Knoten entfernen'")
+        except fleet_pair.Refusal as exc:
+            told = f"{p.get('entry')} nicht erreicht ({exc}) -- an der Zentrale 'Knoten entfernen'"
+    metrics_sender.remove_config(METRICS_SENDER_DIR, METRICS_DIR)
+    with _pair_tx() as d2:
+        d2["node"] = {}
+    audit_fleet({"event": "pair.unpair", "told": told[:200]})
+    return f"Kopplung gelöst; {told}. Die Warteschlange bleibt."
+
+
+def fleet_pair_offer(now=None):
+    """An entry offer -> (text, expiry)."""
+    now = now or time.time()
+    place, _h, _b = _pair_self_place(False)
+    me = fleet_node_name()
+    text, rec = fleet_pair.make_entry_offer(me, place["https"], place["broker"],
+                                            place["fp"], now)
+    with _pair_tx() as d:
+        d["entry"]["offers"] = [o for o in d["entry"].get("offers") or []
+                                if o.get("expires", 0) > now] + [rec]
+    audit_fleet({"event": "pair.offer"})
+    return text, rec["expires"]
+
+
+def fleet_pair_job(req, role, actor):
+    """The page "Flotte" (server_admin only) -> (ok, sentence, file text or "")."""
+    if role != "server_admin":
+        return False, "Koppeln darf nur ein server_admin.", ""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    try:
+        if op == "code":
+            text, rec = fleet_pair_code(str(a.get("node") or ""), str(a.get("via") or ""),
+                                        bool(a.get("lan")), bool(a.get("replace")))
+            return (True, f"Code für {rec['node']} erzeugt, gültig bis "
+                          f"{time.strftime('%H:%M', time.localtime(rec['expires']))}.", text)
+        if op == "offer":
+            text, exp = fleet_pair_offer()
+            return (True, "Angebot als Eingang erzeugt, gültig bis "
+                          f"{time.strftime('%H:%M', time.localtime(exp))}.", text)
+        if op == "entry":
+            return True, fleet_pair_entry_add(str(a.get("text") or "")), ""
+        if op == "remove":
+            return True, fleet_pair_remove(str(a.get("node") or "")), ""
+        if op == "apply":
+            return True, fleet_pair_apply(str(a.get("text") or ""), a.get("classes")), ""
+        if op == "classes":
+            return True, fleet_pair_classes(a.get("classes") or []), ""
+        if op == "unpair":
+            return True, fleet_pair_unpair(), ""
+        return False, "Unbekannter Schritt.", ""
+    except fleet_pair.Refusal as exc:
+        return False, str(exc), ""
+
+
+def _pair_read_text(src):
+    if src in (None, "", "-"):
+        return sys.stdin.read()
+    try:
+        with open(src, encoding="utf-8") as f:
+            return f.read(fleet_pair.MAX_TEXT + 1)
+    except (OSError, UnicodeDecodeError) as exc:
+        die(f"cannot read {src}: {exc}")
+
+
+def cmd_fleet_pair(args):
+    """`oaap fleet pair show|code|offer|entry|apply|classes|unpair|remove`."""
+    act = args.action
+    classes = ([c.strip() for c in args.classes.split(",") if c.strip()]
+               if getattr(args, "classes", None) else None)
+    try:
+        if act == "show":
+            v = _pair_view_write()
+            print(json.dumps(v, indent=1, ensure_ascii=False))
+            return
+        if act == "code":
+            text, rec = fleet_pair_code(args.label or die("fleet pair code <node>"),
+                                        args.via or "", args.lan, args.replace)
+            out = args.out
+            if out:
+                fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text + "\n")
+                print(f"Code for {rec['node']} written to {out} (valid 15 minutes, once).")
+            else:
+                print(text)
+                print(f"\nOn the node: sudo oaap fleet pair apply <file>  -- or the portal, "
+                      "Flotte -> Kopplung. Valid 15 minutes, once.", file=sys.stderr)
+            return
+        if act == "offer":
+            text, _exp = fleet_pair_offer()
+            print(text)
+            print("\nAt the hub: sudo oaap fleet pair entry <file>  -- or the portal, "
+                  "Flotte -> Eingang hinzufügen. Valid 15 minutes, once.", file=sys.stderr)
+            return
+        if act == "entry":
+            print(fleet_pair_entry_add(_pair_read_text(args.label)))
+            return
+        if act == "apply":
+            print(fleet_pair_apply(_pair_read_text(args.label), classes))
+            return
+        if act == "classes":
+            print(fleet_pair_classes(classes or []))
+            return
+        if act == "unpair":
+            print(fleet_pair_unpair())
+            return
+        if act == "remove":
+            print(fleet_pair_remove(args.label or die("fleet pair remove <node>")))
+            return
+    except fleet_pair.Refusal as exc:
+        die(str(exc))
+    die("fleet pair: show | code <node> [--via <entry>] [--lan] [--replace] | offer | "
+        "entry <file> | apply <file> [--classes ...] | classes --classes ... | unpair | "
+        "remove <node>")
 
 
 def cmd_token(args):
@@ -31821,6 +32519,25 @@ def cmd_process_deploys(_args):
                 audit_tenant("fleet.disclose", _ftid or ensure_default_tenant(),
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
+        elif action in ("fleet-pair", "fleet-pair-public"):
+            # RFC-0085 stage 3: pairing. "fleet-pair" is the page "Flotte"
+            # (role from the ACTOR's record); "fleet-pair-public" a call at
+            # /fleet/pair/* whose answer may hold a key -- written into the
+            # job's result (0700 directory), read and shredded by the portal.
+            _file, _answer = "", None
+            if action == "fleet-pair":
+                ok, msg, _file = fleet_pair_job(req, act_role, actor)
+            else:
+                ok, msg, _answer = fleet_pair_public(req)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                _tmp = os.path.join(_jd, "result.json.tmp")
+                _fd = os.open(_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(_fd, "w", encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "file": _file, "answer": _answer,
+                               "finished": _iso_now()}, f)
+                os.replace(_tmp, os.path.join(_jd, "result.json"))
         elif action == "egress":
             # RFC-0068 stage 4: the page "Abfluss". The functions the command
             # line calls judge the role; role and tenant come from the
@@ -31953,7 +32670,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "care": "portal", "rebuild": "portal", "bulk": "portal",
+               "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "fleet-pair": "portal", "fleet-pair-public": "pairing", "care": "portal", "rebuild": "portal", "bulk": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -35874,10 +36591,25 @@ def build_parser():
     prs.set_defaults(fn=cmd_rehearsal)
     pt.set_defaults(fn=cmd_token)
     pf = sub.add_parser("fleet",
-                        help="fleet keys: read-only /fleet/status access (RFC-0021)")
-    pf.add_argument("object", choices=["key", "hub", "disclose"])
+                        help="the fleet: keys for /fleet/status (RFC-0021), the hub, disclosure, pairing (RFC-0085)")
+    pf.add_argument("object", choices=["key", "hub", "disclose", "pair"])
     pf.add_argument("action", choices=["issue", "list", "revoke", "show", "twin",
-                                       "count", "pseudonym", "names", "default"])
+                                       "count", "pseudonym", "names", "default",
+                                       "code", "offer", "entry", "apply", "classes",
+                                       "unpair", "remove"])
+    pf.add_argument("--via", default="",
+                    help="for 'pair code': the entry the node sends through (default: "
+                         "this hub directly, RFC-0085 stage 3)")
+    pf.add_argument("--lan", action="store_true",
+                    help="for 'pair code' (direct): the node sits in this hub's LAN and "
+                         "connects to its LAN address")
+    pf.add_argument("--replace", action="store_true",
+                    help="for 'pair code': the node was reinstalled; its old key goes")
+    pf.add_argument("--classes", default=None,
+                    help="for 'pair apply|classes': what this node sends, e.g. "
+                         "alive,metrics,status,events (alive always)")
+    pf.add_argument("--out", default="",
+                    help="for 'pair code': write the code to this file (0600)")
     pf.add_argument("--tenant", default="",
                     help="for 'disclose': set this tenant's level instead of the node's "
                          "ceiling (RFC-0087 §4)")
