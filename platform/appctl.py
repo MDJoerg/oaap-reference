@@ -27008,8 +27008,15 @@ def _pair_issue_node(node, hub):
 
 def _pair_issue_operator(hub):
     me = fleet_node_name()
+    # The third grant is the bridge's own notification (RFC-0085 stage 2,
+    # notifications_local_only false): the hub tells the entry "1"/"0" on
+    # oaap-fleet/bridge/<entry>/<hub>, and the entry's broker watch reads it
+    # for hub.unreachable. Missing in 0.1.290/0.1.291: the "1" was refused,
+    # the old session's "0" stayed, and oaapx01 reported its hub unreachable
+    # while the bridge ran (2026-11-15).
     grants = [{"filter": f"{PAIR_ROOT}/#", "access": "read"},
-              {"filter": f"oaap-fleet/control/{me}/#", "access": "write"}]
+              {"filter": f"oaap-fleet/control/{me}/#", "access": "write"},
+              {"filter": f"oaap-fleet/bridge/{me}/{hub}", "access": "write"}]
     kid, secret = _pair_issue("operator", f"hub-{hub}"[:40], f"pair-entry:{hub}",
                               grants=grants)
     audit_fleet({"event": "pair.entry", "hub": hub, "key": kid})

@@ -387,10 +387,14 @@ ok("D1 Eingang gekoppelt: Brücke geschrieben, Broker neu gestartet",
    "Eingang entry1 gekoppelt" in msg and H.restarts == 1
    and "connection entry-entry1" in conf and "address entry.example:8883" in conf, msg)
 op_key = E.ident.keys[0]
-ok("D1 Betreiberschlüssel am Eingang mit genau den zwei Rechten",
+ok("D1 Betreiberschlüssel am Eingang mit genau den drei Rechten (auch die Meldung der Brücke)",
    op_key["kind"] == "operator" and op_key["grants"] == [
        {"filter": "oaap-node/#", "access": "read"},
-       {"filter": "oaap-fleet/control/entry1/#", "access": "write"}], op_key)
+       {"filter": "oaap-fleet/control/entry1/#", "access": "write"},
+       {"filter": "oaap-fleet/bridge/entry1/hub1", "access": "write"}], op_key)
+import mqtt_acl  # noqa: E402
+ok("D1 die drei Rechte bestehen die Prüfung der Rechte",
+   mqtt_acl.parse_grants(op_key["grants"], root="oaap-node") == op_key["grants"])
 ok("D1 Zentrale und Eingang teilen das Kopplungsgeheimnis",
    hub_pair["hub"]["entries"]["entry1"]["secret"]
    == json.load(open(os.path.join(E.dir, "fleet-pair", "pair.json")))["entry"]["hubs"]["hub1"]["secret"])
