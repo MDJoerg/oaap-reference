@@ -51,7 +51,7 @@ def manifest(**extra):
 
 
 print("=== Manifest ===")
-ok("0.14 ist die eigene Version", m.MANIFEST_MINOR == 14)
+ok("0.14 oder neuer", m.MANIFEST_MINOR >= 14)
 ok("link_state.path unter einer Route: gültig",
    m.link_state_door_error(manifest(link_state={"path": "/oaap/links"})) == "")
 cases = [({"path": "http://x/oaap"}, "local path"), ({"path": "//x/y"}, "local path"),

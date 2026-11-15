@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 import instance_view
 
-SCHEMA = "oaap.fleet.status/0.11"     # 0.11: a `through` row says its state (RFC-0087 §8.1)
+SCHEMA = "oaap.fleet.status/0.12"     # 0.12: `app` rows name an app's assets (RFC-0087 §8.2)
 
 # The document's state vocabulary. The health page grew two spellings
 # ("err" from probes, "error" from the worker); consumers get one.

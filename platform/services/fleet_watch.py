@@ -237,9 +237,12 @@ def entry_conditions(watch, now):
 
 
 _KIND = {"tunnel": "Tunnel", "destination": "Destination", "instance": "Instanz",
-         "external": "Externes Ende", "tenant": "Mandant", "node": "Knoten"}
+         "external": "Externes Ende", "tenant": "Mandant", "node": "Knoten",
+         # RFC-0087 §8.2: what an app names of itself
+         "model": "Modellname", "source": "Bezugsquelle", "asset": "Asset"}
 _VIA = {"usesTunnel": "nutzt {}", "usesExternal": "nutzt {}", "behind": "liegt hinter {}",
-        "reaches": "erreicht {} -- möglicherweise betroffen", "bindsTo": "bindet {}"}
+        "reaches": "erreicht {} -- möglicherweise betroffen", "bindsTo": "bindet {}",
+        "assetVia": "geht über {}", "assetUses": "nutzt {}"}
 _SIDE = {"down-inner": "Die innere Seite ist nicht verbunden.",
          "down-outer": "Die äußere Seite meldet ihn getrennt.",
          "down-tunnel": "Der Tunnel der App selbst ist getrennt.",
@@ -260,12 +263,14 @@ def link_text(name, link, now):
     """The matter's text: the tunnel, its two ends, and what depends on it,
     nearest first, indented by distance."""
     since = parse_t(link.get("since")) or now
-    titles = {link.get("id"): name}
+    external = link.get("kind") == "external"
+    # an external end is reported as <node>/<instance>/<target>; a row that
+    # depends on it says the target's own name (seen live 2026-11-15)
+    titles = {link.get("id"): name.rsplit("/", 1)[-1] if external else name}
     for r in link.get("affected") or []:
         titles[r.get("id")] = r.get("title")
     ends = ", ".join(x for x in (f"außen {link['outer']}" if link.get("outer") else "",
                                   f"innen {link['inner']}" if link.get("inner") else "") if x)
-    external = link.get("kind") == "external"
     if external:
         lines = [_external_head(name, link, now, since)]
     else:
@@ -276,7 +281,7 @@ def link_text(name, link, now):
     if rows:
         lines.append("Betroffen, von nah nach fern:")
         for r in rows[:LINK_ROWS]:
-            where = f" auf {r['node']}" if r.get("node") else ""
+            where = (f" in {r['instance']}" if r.get("instance") else "")                 + (f" auf {r['node']}" if r.get("node") else "")
             ten = f", Mandant {r['tenant']}" if r.get("tenant") else ""
             how = _VIA.get(r.get("via"), "{}").format(titles.get(r.get("from"), "?"))
             lines.append("  " * max(0, int(r.get("depth", 1)) - 1)

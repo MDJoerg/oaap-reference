@@ -18,6 +18,7 @@ Two rules shape everything:
 """
 import hashlib
 import hmac
+import re
 from urllib.parse import urlsplit
 
 LEVELS = ("count", "pseudonym", "names")
@@ -185,6 +186,101 @@ def through_state(report, target):
     return UNKNOWN
 
 
+# --- what an app says of its assets (RFC-0087 §8.2, manifest 0.15 `assets`) --
+
+ASSET_KINDS = ("model", "source")      # grows by the spec, never by an app
+ASSET_STATES = ("ok", "down", "idle")
+ASSETS_MAX = 200
+_ASSET_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+
+
+def _dest_key(name):
+    """A destination name as an app receives it (OAAP_DESTINATION_<NAME>_URL)
+    and as the node knows it, made comparable: case-insensitive, `_` = `-`."""
+    return str(name).lower().replace("_", "-")
+
+
+def read_assets_answer(doc):
+    """The app's answer at its `assets` door -> [{"kind", "name", "state"?,
+    "uses"?, "destination"?}], or None when it is no answer at all.
+
+    Whitelist (oaap.fleet.status rule 1): exactly these fields; a kind
+    outside ASSET_KINDS, a name outside the name rule, a state outside
+    ASSET_STATES are dropped; `uses` keeps only sources of this answer,
+    `destination` only on a source. At most ASSETS_MAX assets."""
+    if not isinstance(doc, dict) or doc.get("v") != 1 or not isinstance(doc.get("assets"), list):
+        return None
+    raw = [a for a in doc["assets"] if isinstance(a, dict)][:ASSETS_MAX]
+    out, seen = [], set()
+    for a in raw:
+        kind, name = a.get("kind"), a.get("name")
+        if kind not in ASSET_KINDS or not isinstance(name, str) or not _ASSET_NAME.match(name):
+            continue
+        if (kind, name) in seen:
+            continue
+        seen.add((kind, name))
+        row = {"kind": kind, "name": name}
+        if a.get("state") in ASSET_STATES:
+            row["state"] = a["state"]
+        if kind == "source" and isinstance(a.get("destination"), str) and a["destination"]:
+            row["destination"] = a["destination"]
+        out.append((row, a.get("uses") if kind == "model" else None))
+    sources = {r["name"] for r, _u in out if r["kind"] == "source"}
+    result = []
+    for row, uses in out:
+        if isinstance(uses, list):
+            u = sorted({x for x in uses if isinstance(x, str) and x in sources})
+            if u:
+                row["uses"] = u
+        result.append(row)
+    return result
+
+
+def app_row(inst_key, report, tid, d, bound, named):
+    """One `app` row (oaap.fleet.status 0.12), or None.
+
+    report -- PAUSED, UNKNOWN or read_assets_answer()'s list
+    tid    -- the instance's tenant id; at `count` there is no row
+    bound  -- {need: destination name} the instance is bound to
+    named  -- {destination name: outward name} of the destinations that
+              have a row of their own in this document (via/through)"""
+    if d.level(tid) == "count":
+        return None
+    row = {"kind": "app", "instance": inst_key}
+    tname = d.tenant(tid)
+    if tname:
+        row["tenant"] = tname
+    if report in (PAUSED, UNKNOWN) or not isinstance(report, list):
+        row["state"] = report if report in (PAUSED, UNKNOWN) else UNKNOWN
+        return row
+    by_need = {_dest_key(need): dest for need, dest in (bound or {}).items()}
+
+    def outward(kind, name):
+        # the app's name at `names`; below it the HMAC over a-/<tenant>/<kind>/<name>,
+        # so a model and a source of the same name stay two assets
+        if d.level(tid) == "names":
+            return name
+        return _pseudo(d.settings, "a-", f"a-/{tid}/{kind}/{name}")
+
+    out = []
+    for a in report:
+        name = outward(a["kind"], a["name"])
+        if not name:
+            continue
+        r = {"kind": a["kind"], "name": name}
+        if a.get("state"):
+            r["state"] = a["state"]
+        if a.get("uses"):
+            r["uses"] = sorted({outward("source", u) for u in a["uses"]} - {""})
+        dest = by_need.get(_dest_key(a.get("destination") or ""))
+        if dest and named.get(dest):
+            r["destination"] = named[dest]
+        out.append(r)
+    row["state"] = "ok"
+    row["assets"] = out
+    return row
+
+
 # --- the rows ---------------------------------------------------------------
 
 def _host(url):
@@ -219,7 +315,8 @@ def _bound(instances, tid, name, resolve):
                   and name in ((inst.get("destinations") or {}).values()))
 
 
-def build(conf, state, dests, instances, tenants, settings, hosts, resolve, reports=None):
+def build(conf, state, dests, instances, tenants, settings, hosts, resolve, reports=None,
+          assets=None):
     """(links, tenants block, {instance: outward tenant name}).
 
     conf     -- the connect configuration ({keys, connectors})
@@ -232,6 +329,8 @@ def build(conf, state, dests, instances, tenants, settings, hosts, resolve, repo
     resolve  -- tenant reference -> tenant id (absent = default)
     reports  -- {instance registry key: what its link_state door said}, for
                 the tunnel apps that declare one (see through_state)
+    assets   -- {instance registry key: what its assets door said} (PAUSED,
+                UNKNOWN or read_assets_answer()'s list), RFC-0087 §8.2
     """
     d = Disclosure(settings, tenants)
     conf, state = conf or {}, state or {}
@@ -279,6 +378,7 @@ def build(conf, state, dests, instances, tenants, settings, hosts, resolve, repo
         # connect to host ...") -- configuration, rule 1
         links.append(row)
 
+    named = {}              # (tenant id, destination) -> its outward name
     for tid, own in sorted((dests or {}).items()):
         for name, dd in sorted(own.items()):
             target = dd.get("target") or {}
@@ -306,11 +406,22 @@ def build(conf, state, dests, instances, tenants, settings, hosts, resolve, repo
             if not dname:
                 continue        # count without salt: nothing nameable leaves
             row["name"] = dname
+            named[(tid, name)] = dname
             tname = d.tenant(tid)
             if tname:
                 row["tenant"] = tname
             bound = _bound(instances or {}, tid, name, resolve)
             row["bound"] = bound if d.level(tid) != "count" else len(bound)
+            links.append(row)
+
+    for key in sorted(assets or {}):
+        inst = (instances or {}).get(key)
+        if inst is None:
+            continue
+        tid = resolve(inst.get("tenant")) or ""
+        row = app_row(key, assets[key], tid, d, inst.get("destinations") or {},
+                      {n: v for (t, n), v in named.items() if t == tid})
+        if row:
             links.append(row)
 
     per = {}

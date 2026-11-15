@@ -245,6 +245,53 @@ def destinations(doc, node):
     return out
 
 
+ASSET_KINDS = ("model", "source")
+ASSET_STATES = ("ok", "down", "idle")
+APP_ROW_STATES = ("ok", "paused", "unknown")
+
+
+def app_assets(doc, node):
+    """[{instance, state, assets: [{key, title, kind, groups, uses: [keys],
+    destination: dest name}] | None}] -- the `app` rows (oaap.fleet.status
+    0.12, RFC-0087 §8.2). `assets` is None unless the row says `ok`: a
+    sleeping or silent app changes nothing at the hub. Whitelisted like
+    every other row; a `uses` that names no source of the row is dropped."""
+    out = []
+    for lk in _links(doc):
+        if lk.get("kind") != "app":
+            continue
+        inst = _name(lk.get("instance"))
+        st = lk.get("state") if lk.get("state") in APP_ROW_STATES else "unknown"
+        if not inst:
+            continue
+        row = {"instance": inst, "state": st, "assets": None}
+        if st == "ok" and isinstance(lk.get("assets"), list):
+            items, sources = [], set()
+            raw = [a for a in lk["assets"] if isinstance(a, dict)]
+            for a in raw:
+                if a.get("kind") == "source" and _name(a.get("name")):
+                    sources.add(a["name"])
+            seen = set()
+            for a in raw:
+                kind, name = a.get("kind"), _name(a.get("name"))
+                if kind not in ASSET_KINDS or not name or (kind, name) in seen:
+                    continue
+                seen.add((kind, name))
+                key = f"asset:{node}/{inst}/{kind}/{name}"
+                uses = sorted({f"asset:{node}/{inst}/source/{u}" for u in a.get("uses") or []
+                               if isinstance(u, str) and u in sources}) if kind == "model" else []
+                items.append({"key": key, "title": name, "kind": kind,
+                              "groups": {"oaap.asset": {
+                                  "assetName": name, "assetKind": kind,
+                                  "assetState": a.get("state") if a.get("state") in ASSET_STATES
+                                  else "unknown"}},
+                              "uses": uses,
+                              "destination": _name(a.get("destination")) if kind == "source" else ""})
+            row["assets"] = items
+        out.append(row)
+    return out
+
+
 def joined_state(outer, inner):
     """The tunnel's state over time (RFC-0087 §5): from the two halves the
     hub last saw -- outer: its state or None, inner: (state, paused) or None."""

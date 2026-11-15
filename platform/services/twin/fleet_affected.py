@@ -23,13 +23,17 @@ import time
 import fleet_model as fm
 
 # who depends on whom: `source --rel--> target` means source depends on target
-BACK = ("usesTunnel", "usesExternal", "behind", "reaches", "bindsTo")
+# (assetVia/assetUses, RFC-0087 §8.2: a source goes through a destination, a
+# model name uses a source)
+BACK = ("usesTunnel", "usesExternal", "behind", "reaches", "bindsTo", "assetVia", "assetUses")
 # whose it is: instance --heldBy--> tenant, destination --destOf--> tenant
 OWNER = ("heldBy", "destOf")
 # the tunnel's two ends, for the matter's text
 ENDS = ("servedBy", "dialedBy")
+# an asset's instance: its node and its tenant are the instance's
+ASSET_OF = ("assetOf",)
 KINDS = {fm.TUNNEL: "tunnel", fm.DESTINATION: "destination", fm.INSTANCE: "instance",
-         fm.EXTERNAL: "external", fm.TENANT: "tenant", fm.NODE: "node"}
+         fm.EXTERNAL: "external", fm.TENANT: "tenant", fm.NODE: "node", fm.ASSET: "asset"}
 LIMIT = 200            # a walk stops here and says so; the fleet is far smaller
 TUNNEL_DOWN = ("down-inner", "down-outer")
 # an external end whose tunnel app says so (RFC-0087 §8.1)
@@ -49,7 +53,7 @@ def _node_of(obj, ends):
     `dest:node/name`, an external end `ext:node/name`; a tunnel has two
     ends and no single place."""
     src = obj.get("source") or ""
-    for prefix in ("dest:", "ext:"):
+    for prefix in ("dest:", "ext:", "asset:"):
         if src.startswith(prefix):
             return src[len(prefix):].split("/", 1)[0]
     if obj.get("type") == fm.INSTANCE and "/" in src:
@@ -68,12 +72,14 @@ def affected(rels, objects, start, limit=LIMIT):
     Breadth first, so the nearest come first; every object once."""
     if start not in objects:
         return None
-    deps, owner, ends, behind = {}, {}, {}, {}
+    deps, owner, ends, behind, asset_of = {}, {}, {}, {}, {}
     for s, rk, t in rels:
         rk = short(rk)
         if rk == "behind":
             behind.setdefault(s, t)
-        if rk in BACK:
+        if rk in ASSET_OF:
+            asset_of.setdefault(s, t)
+        elif rk in BACK:
             deps.setdefault(t, []).append((s, rk))
         elif rk in OWNER:
             owner.setdefault(s, t)
@@ -83,12 +89,22 @@ def affected(rels, objects, start, limit=LIMIT):
     def title(oid):
         return (objects.get(oid) or {}).get("title") or oid
 
+    def kind(o):
+        if o.get("type") == fm.ASSET:
+            # asset:<node>/<instance>/<kind>/<name> -- a model name, a source
+            parts = (o.get("source") or "").split("/")
+            return parts[2] if len(parts) >= 4 and parts[2] in ("model", "source") else "asset"
+        return KINDS.get(o.get("type"), o.get("type") or "?")
+
     def row(oid, depth, via, frm):
         o = objects.get(oid) or {}
-        ten = owner.get(oid)
-        return {"id": oid, "kind": KINDS.get(o.get("type"), o.get("type") or "?"),
-                "title": title(oid), "node": _node_of(o, ends.get(oid)),
-                "tenant": title(ten) if ten else "", "depth": depth, "via": via, "from": frm}
+        ten = owner.get(oid) or owner.get(asset_of.get(oid, ""))
+        r = {"id": oid, "kind": kind(o),
+             "title": title(oid), "node": _node_of(o, ends.get(oid)),
+             "tenant": title(ten) if ten else "", "depth": depth, "via": via, "from": frm}
+        if asset_of.get(oid):
+            r["instance"] = title(asset_of[oid])
+        return r
 
     out, seen, tenants = [], {start}, []
     frontier, truncated = [start], False
@@ -159,7 +175,7 @@ def load_graph(conn):
     """(rels, objects) of the fleet from the twin schema `conn` points at:
     the open relations the walk follows, and every fleet object with its
     type, title and source key."""
-    keys = [fm.ak(k) for k in BACK + OWNER + ENDS]
+    keys = [fm.ak(k) for k in BACK + OWNER + ENDS + ASSET_OF]
     with conn.cursor() as cur:
         cur.execute("SELECT object_id, rel_key, target_id FROM current_relations "
                     "WHERE valid_to IS NULL AND rel_key = ANY(%s)", (keys,))

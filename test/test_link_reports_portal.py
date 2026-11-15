@@ -118,6 +118,41 @@ links, _block = portal._fleet_links([("ais-ovc", {"tenant": "T-ais", "name": "ov
 thr = [lk for lk in links or [] if "through" in lk]
 ok("App ohne Tür: through ohne state, wie vor 0.11", thr and "state" not in thr[0]["through"], links)
 
+print("=== Assets einer App (RFC-0087 §8.2, oaap.fleet.status 0.12) ===")
+ASKED.clear()
+ADOOR = {"path": "/oaap/assets"}
+GW = {"assets": ADOOR, "tenant": "T-ais", "destinations": {"gpu": "gamingpc"}}
+ANSWERS["ais-mg"] = Resp(200, {"v": 1, "assets": [
+    {"kind": "source", "name": "gaming", "state": "down", "destination": "GPU",
+     "url": "http://10.8.0.1:11434/v1"},
+    {"kind": "model", "name": "chat-gaming", "state": "down", "uses": ["gaming"],
+     "upstream": "llama3.3:70b"}]})
+ANSWERS["ais-ovc"] = Resp(200, GOOD)
+ainsts = [("ais-ovc", {"link_state": DOOR, "tenant": "T-ais", "name": "ovc"}),
+          ("ais-mg", GW),
+          ("gw-schlaeft", dict(GW, state="standby", standby={"since": "x"})),
+          ("gw-stumm", dict(GW))]
+ANSWERS["gw-stumm"] = requests.ConnectTimeout("t")
+arep = portal._asset_reports(ainsts)
+aurls = sorted(u for u, _t in ASKED)
+ok("gefragt: nur Instanzen mit assets-Tür und wach, über /a/<name>, 2 s",
+   aurls == sorted(f"{portal.GATEWAY_HEALTH}/a/{n}" for n in ("ais-mg", "gw-stumm"))
+   and {t for _u, t in ASKED} == {2}, ASKED)
+ok("schlafend: paused; stumm: unknown",
+   arep["gw-schlaeft"] == "paused" and arep["gw-stumm"] == "unknown", arep)
+ok("eine Instanz nur mit link_state wird hier nicht gefragt", "ais-ovc" not in arep, arep)
+links, _block = portal._fleet_links(ainsts[:2], [{"instance": "ais-mg"}])
+app_rows = [lk for lk in links or [] if lk.get("kind") == "app"]
+ok("das Statusdokument traegt eine app-Zeile fuer ais-mg",
+   len(app_rows) == 1 and app_rows[0]["instance"] == "ais-mg" and app_rows[0]["state"] == "ok",
+   links)
+ga = {(x["kind"], x["name"]): x for x in (app_rows[0]["assets"] if app_rows else [])}
+ok("die Quelle geht ueber gamingpc, der Modellname nutzt sie",
+   ga.get(("source", "gaming"), {}).get("destination") == "gamingpc"
+   and ga.get(("model", "chat-gaming"), {}).get("uses") == ["gaming"], ga)
+ok("nichts, was die App dazuschrieb (Adresse, Modellkennung), geht hinaus",
+   "10.8.0.1" not in json.dumps(links) and "llama" not in json.dumps(links), links)
+
 print("")
 print("ALLE GRUEN" if not fails else f"{fails} FEHLER")
 sys.exit(1 if fails else 0)

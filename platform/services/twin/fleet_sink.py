@@ -327,6 +327,43 @@ class Sink:
                         "AND target_id = %s AND valid_to IS NULL", (fm.ak(rel_key), target))
             return {str(r["object_id"]) for r in cur.fetchall()}
 
+    def _write_assets(self, conn, name, doc, inst_oid, inst_tenant, dest_oid, iso):
+        """RFC-0087 §8.2: an app's assets as objects with `assetOf` (the
+        instance), `assetUses` (model -> source) and `assetVia` (source ->
+        destination, joined by the destination's outward name within the
+        instance's tenant). A row that says `paused`/`unknown` keeps what is
+        there; whatever else is no longer named is `removed`."""
+        rows, seen, keep = 0, set(), []
+        for ar in ft.app_assets(doc, name):
+            iid = inst_oid.get(ar["instance"])
+            if ar["assets"] is None:
+                keep.append(f"asset:{name}/{ar['instance']}/")
+                continue
+            if iid is None:
+                continue        # no instance row: its assets go below
+            oids = {}
+            for a in ar["assets"]:
+                aoid = self._object(conn, fm.ASSET, a["key"], a["title"], "oaap.asset")
+                oids[a["key"]] = aoid
+                seen.add(a["key"])
+                rows += self._groups(conn, aoid, a["groups"])
+                rows += self._sync_rel(conn, aoid, "oaap.asset", "assetOf", [iid], iso)
+            ten = inst_tenant.get(ar["instance"]) or ""
+            for a in ar["assets"]:
+                aoid = oids[a["key"]]
+                rows += self._sync_rel(conn, aoid, "oaap.asset", "assetUses",
+                                       [oids[u] for u in a["uses"] if u in oids], iso)
+                via = dest_oid.get((ten, a["destination"])) if a["destination"] else None
+                rows += self._sync_rel(conn, aoid, "oaap.asset", "assetVia",
+                                       [via] if via else [], iso)
+        for key, xid in self._prefixed(conn, f"asset:{name}/").items():
+            if key in seen or any(key.startswith(k) for k in keep):
+                continue
+            rows += self._groups(conn, xid, {"oaap.asset": {"assetState": ft.REMOVED}})
+            for rk in ("assetOf", "assetUses", "assetVia"):
+                rows += self._sync_rel(conn, xid, "oaap.asset", rk, [], iso)
+        return rows
+
     def _write_links(self, conn, name, oid, doc, now):
         if not isinstance(doc, dict) or ("links" not in doc and "tenants" not in doc):
             return 0            # a 0.9 node: its links are not ours to judge
@@ -379,9 +416,11 @@ class Sink:
                 del self.halves[toid]
 
         binds, seen_d, seen_e = {}, set(), set()
+        dest_oid = {}           # (outward tenant, outward name) -> object id
         for d in ft.destinations(doc, name):
             doid = self._object(conn, fm.DESTINATION, d["key"], d["title"], "oaap.destination")
             seen_d.add(d["key"])
+            dest_oid[(d["tenant"], d["title"])] = doid
             rows += self._groups(conn, doid, d["groups"])
             rows += self._sync_rel(conn, doid, "oaap.destination", "definedOn", [oid], iso)
             rows += self._sync_rel(conn, doid, "oaap.destination", "destOf",
@@ -420,6 +459,7 @@ class Sink:
                 rows += self._sync_rel(conn, xid, "oaap.external", "behind", [], iso)
 
         it = ft.instance_tenants(doc)
+        rows += self._write_assets(conn, name, doc, inst_oid, it, dest_oid, iso)
         for inst, iid in inst_oid.items():
             held = [tenants[it[inst]]] if it.get(inst) in tenants else []
             rows += self._sync_rel(conn, iid, "oaap.runtime", "heldBy", held, iso)

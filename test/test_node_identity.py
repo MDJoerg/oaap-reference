@@ -120,7 +120,7 @@ doc = fleet_view.build_document("oaap.joomp.de", "0.1.260", [], "2026-11-12T00:0
                                                           "place": "de/dc1/group3",
                                                           "tags": ["test"]})
 ok("Flottenstatus 0.9: node bleibt, alias/place/tags kommen dazu",
-   doc["schema"] == "oaap.fleet.status/0.11" and doc["node"] == "oaap.joomp.de"
+   doc["schema"] == "oaap.fleet.status/0.12" and doc["node"] == "oaap.joomp.de"
    and doc["alias"] == "oaap-x1" and doc["place"] == "de/dc1/group3" and doc["tags"] == ["test"], doc)
 ok("… ohne Angabe fehlen die Felder (wie bisher)",
    "alias" not in fleet_view.build_document("x", "v", [], "t", [], [], [], []))

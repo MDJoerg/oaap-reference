@@ -230,6 +230,57 @@ ok("down-tunnel: der Text sagt, dass der Tunnel der App getrennt ist",
 ok("der Betreff sagt Verbindung, nicht Tunnel",
    notify.CATALOGUE["link.down"]["subject"] == "[{knoten}] Verbindung getrennt: {kurz}")
 
+print("=== Stufe 3b: Assets einer App -- Modellnamen hinter dem externen Ende (§8.2) ===")
+O4 = dict(O3, **{
+    "sgpc": {"type": fm.ASSET, "title": "gaming", "source": "asset:oaapi01/ais-mg/source/gaming"},
+    "mchat": {"type": fm.ASSET, "title": "chat-gaming",
+              "source": "asset:oaapi01/ais-mg/model/chat-gaming"},
+    "mcode": {"type": fm.ASSET, "title": "code", "source": "asset:oaapi01/ais-mg/model/code"},
+    "sfern": {"type": fm.ASSET, "title": "anthropic",
+              "source": "asset:oaapi01/ais-mg/source/anthropic"},
+    "mfern": {"type": fm.ASSET, "title": "chat-fern", "source": "asset:oaapi01/ais-mg/model/chat-fern"},
+})
+R4 = R + [
+    ("sgpc", "fleetAssetOf", "mg"), ("sgpc", "fleetAssetVia", "dgpc"),
+    ("mchat", "fleetAssetOf", "mg"), ("mchat", "fleetAssetUses", "sgpc"),
+    ("mcode", "fleetAssetOf", "mg"), ("mcode", "fleetAssetUses", "sgpc"),
+    ("mcode", "fleetAssetUses", "sfern"),
+    ("sfern", "fleetAssetOf", "mg"), ("mfern", "fleetAssetOf", "mg"),
+    ("mfern", "fleetAssetUses", "sfern"),
+]
+a8 = fa.affected(R4, O4, "egpc")
+by8 = {x["id"]: x for x in a8["affected"]}
+ok("die Quelle gaming haengt an der Destination (assetVia), Art source, in ais-mg auf oaapi01",
+   by8.get("sgpc", {}).get("kind") == "source" and by8["sgpc"]["via"] == "assetVia"
+   and by8["sgpc"]["from"] == "dgpc" and by8["sgpc"]["instance"] == "ais-mg"
+   and by8["sgpc"]["node"] == "oaapi01", by8.get("sgpc"))
+ok("das Asset traegt den Mandanten seiner Instanz", by8["sgpc"]["tenant"] == "ais", by8["sgpc"])
+ok("die Modellnamen chat-gaming und code nutzen sie (assetUses), Art model",
+   all(by8.get(k, {}).get("kind") == "model" and by8[k]["via"] == "assetUses"
+       and by8[k]["from"] == "sgpc" for k in ("mchat", "mcode")), a8["affected"])
+ok("genau: der Modellname nur ueber den fremden Anbieter und dessen Quelle sind NICHT betroffen",
+   "mfern" not in by8 and "sfern" not in by8, sorted(by8))
+ok("assetOf zaehlt nicht als Abhaengigkeit: die Instanz zieht nicht alle ihre Assets mit",
+   fa.affected(R4, O4, "mg")["affected"] == fa.affected(R, O3, "mg")["affected"])
+r8 = fa.link_report({"egpc": "down-target"}, R4, O4, {}, 1_800_000_000)
+e8 = r8["links"]["oaapi01/ais-ovc/gamingpc"]
+t8 = fw.link_text("oaapi01/ais-ovc/gamingpc", dict(e8, since=fw.iso(now3 - 420)), now3)
+ok("die Meldung nennt die Quelle: Bezugsquelle gaming in ais-mg auf oaapi01 (geht über gamingpc)",
+   "- Bezugsquelle gaming in ais-mg auf oaapi01, Mandant ais (geht über gamingpc)" in t8, t8)
+ok("... und die Modellnamen, die sie nutzen",
+   "- Modellname chat-gaming in ais-mg auf oaapi01, Mandant ais (nutzt gaming)" in t8
+   and "- Modellname code in ais-mg" in t8 and "chat-fern" not in t8, t8)
+ok("Schoenheitsfehler aus 3a behoben: 'nutzt gamingpc' statt des Berichtsschluessels",
+   "Destination gamingpc auf oaapi01, Mandant ais (nutzt gamingpc)" in t8
+   and "nutzt oaapi01/ais-ovc/gamingpc" not in t8, t8)
+ok("ein Tunnel heisst in der Zeile darunter weiter mit seinem Namen",
+   "(nutzt t-9f2c)" in fw.link_text("t-9f2c", fa.link_report({"tun": "down-inner"}, R, O3, {},
+                                                              1)["links"]["t-9f2c"], 1000))
+src_f = open(os.path.join(HERE, "..", "platform", "services", "twin", "fleet_affected.py"),
+             encoding="utf-8").read()
+ok("load_graph liest assetOf mit (fuer Mandant und Instanz eines Assets)",
+   "BACK + OWNER + ENDS + ASSET_OF" in src_f)
+
 print("=== Katalog ===")
 ok("link.down: Gesundheit, Knoten, eine Meldung mit Behoben",
    notify.CATALOGUE.get("link.down", {}).get("matter") is True

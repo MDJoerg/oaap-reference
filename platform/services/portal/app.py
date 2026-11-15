@@ -7305,6 +7305,27 @@ def _link_reports(insts):
     return out
 
 
+def _asset_reports(insts):
+    """RFC-0087 §8.2: ask each app that declares an `assets` door what its
+    assets are -- /a/<name> at the gateway's internal endpoint, 2 s, as
+    _link_reports. Standby or maintenance: not asked (`paused`); no usable
+    answer: `unknown`. Neither carries a list; the hub keeps what it knew."""
+    out = {}
+    for name, inst in insts:
+        if not isinstance(inst.get("assets"), dict) or not inst["assets"].get("path"):
+            continue
+        if _sleep_status(inst) or inst.get("maintenance"):
+            out[name] = fleet_links.PAUSED
+            continue
+        try:
+            r = requests.get(f"{GATEWAY_HEALTH}/a/{name}", timeout=2, allow_redirects=False)
+            got = fleet_links.read_assets_answer(r.json()) if r.status_code == 200 else None
+        except (requests.RequestException, ValueError):
+            got = None
+        out[name] = got if got is not None else fleet_links.UNKNOWN
+    return out
+
+
 def _fleet_links(insts, rows):
     """0.10 (RFC-0087): the half-edges and the tenants block, and each
     instance row's outward tenant -- built by fleet_links from what this
@@ -7326,7 +7347,7 @@ def _fleet_links(insts, rows):
         links, block, by_inst = fleet_links.build(
             conf, st, _load_destinations_all(), dict(insts), tenants,
             _read_json(FLEET_DISCLOSE_FILE) or {}, hosts, resolve_tenant,
-            reports=_link_reports(insts))
+            reports=_link_reports(insts), assets=_asset_reports(insts))
         for row in rows:
             t = by_inst.get(row.get("instance"))
             if t:

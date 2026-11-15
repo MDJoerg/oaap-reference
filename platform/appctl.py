@@ -5729,7 +5729,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 14     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 15     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -5752,7 +5752,9 @@ MANIFEST_MINOR = 14     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.13 adds ui_sandbox.path (RFC-0075 -- a second,
                         # cookie-less origin for the views of MCP Apps);
                         # 0.14 adds link_state.path (RFC-0087 §8.1 -- a tunnel
-                        # app says how its tunnel and its targets are)
+                        # app says how its tunnel and its targets are);
+                        # 0.15 adds assets.path (RFC-0087 §8.2 -- an app
+                        # names its assets and how they hang together)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -13700,6 +13702,12 @@ def validate_manifest(m):
             err = link_state_door_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.15 (RFC-0087 §8.2): the door where an app names its
+        # assets (model names, sources) and how they hang together.
+        if "assets" in m:
+            err = assets_door_error(m)
+            if err:
+                errs.append(err)
         if "openapi" in m:
             errs.append("openapi: reserved (RFC-0073 D1) -- REST/OData as MCP "
                         "tools needs its own RFC first (capability idea I-39)")
@@ -15184,24 +15192,42 @@ def mcp_door_error(m):
     return f"mcp.path: {p} lies under none of the app's routes"
 
 
-def link_state_door_error(m):
-    """'' when `link_state:` is a valid door (manifest 0.14, RFC-0087 §8.1), else
-    the sentence. The rule of `mcp:`: a local path under one of the app's
-    routes."""
-    d = m.get("link_state")
+def _door_path_error(m, key, example):
+    """'' when `<key>: {path: ...}` is a valid door, else the sentence. The
+    rule of `mcp:`: a local path under one of the app's routes. Shared by
+    the declared doors of RFC-0087 (`link_state`, `assets`)."""
+    d = m.get(key)
     if not isinstance(d, dict):
-        return "link_state: object expected"
+        return f"{key}: object expected"
     if set(d) - {"path"}:
-        return "link_state: only 'path' is known"
+        return f"{key}: only 'path' is known"
     p = d.get("path")
     if not isinstance(p, str) or not MCP_PATH_RE.match(p) or p == "/" or "//" in p \
             or "/../" in p + "/" or p.endswith("/.."):
-        return "link_state.path: a local path such as /oaap/links (not /)"
+        return f"{key}.path: a local path such as {example} (not /)"
     for r in m.get("routes") or []:
         rp = str((r or {}).get("path") or "")
         if rp == "/" or p == rp or p.startswith(rp.rstrip("/") + "/"):
             return ""
-    return f"link_state.path: {p} lies under none of the app's routes"
+    return f"{key}.path: {p} lies under none of the app's routes"
+
+
+def link_state_door_error(m):
+    """'' when `link_state:` is a valid door (manifest 0.14, RFC-0087 §8.1), else
+    the sentence."""
+    return _door_path_error(m, "link_state", "/oaap/links")
+
+
+def assets_door_error(m):
+    """'' when `assets:` is a valid door (manifest 0.15, RFC-0087 §8.2), else
+    the sentence."""
+    return _door_path_error(m, "assets", "/oaap/assets")
+
+
+def assets_door(m_or_inst):
+    """The declared assets path of a manifest or a registry record, or ''."""
+    d = (m_or_inst or {}).get("assets")
+    return str(d.get("path") or "") if isinstance(d, dict) else ""
 
 
 def link_state_door(m_or_inst):
@@ -17680,6 +17706,13 @@ def write_internal_health_caddy():
             lines.append(f"\t\t\trewrite * {lp}")
             lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
             lines.append("\t\t}")
+        # RFC-0087 §8.2: an app's assets door, for the status document
+        ap = assets_door(inst)
+        if ap:
+            lines.append(f"\t\thandle /a/{name} {{")
+            lines.append(f"\t\t\trewrite * {ap}")
+            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t}")
     lines += ["\t\thandle {", "\t\t\trespond 404", "\t\t}", "\t}",
               "\thandle {", "\t\trespond 403", "\t}", "}"]
     with open(path, "w", encoding="utf-8") as f:
@@ -17989,10 +18022,19 @@ def env_path(name, inst=None):
     return os.path.join(instance_dir(name, inst), "instance.env")
 
 
+# What `docker run --env-file` takes as a name. A line of instance.env
+# whose part before '=' is no such name is the second line of a value that
+# should never have had one (a multiline value written by `oaap app config
+# set` before 0.1.289): docker refuses the whole file and the instance has
+# no container. Such lines are neither read nor written again.
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def load_env(name, inst=None):
     try:
         with open(env_path(name, inst), encoding="utf-8") as f:
-            return dict(l.strip().split("=", 1) for l in f if "=" in l)
+            pairs = (l.rstrip("\r\n").split("=", 1) for l in f if "=" in l)
+            return {k.strip(): v.strip() for k, v in pairs if ENV_NAME_RE.match(k.strip())}
     except OSError:
         return {}
 
@@ -18003,7 +18045,8 @@ def save_env(name, env, inst=None):
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(f"{k}={v}\n" for k, v in env.items())
+        f.writelines(f"{k}={v}\n" for k, v in env.items()
+                     if ENV_NAME_RE.match(str(k)) and "\n" not in str(v))
     os.replace(tmp, path)
     # The portal cannot read this file (tenant tree); what its card shows
     # must follow every write, or the next save compares against old values.
@@ -18509,6 +18552,7 @@ def apply_config(name, inst, values):
     env = load_env(name)
     changed = []
     for key, value in values.items():
+        value = config_env_value(key, value, entries[key].get("multiline"))
         if env.get(key, "") == value:
             continue
         env[key] = value
@@ -22393,6 +22437,9 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.14 (RFC-0087 §8.1): where the node asks a tunnel app
         # how its tunnel and its targets are (gateway:8099/l/<name>).
         "link_state": ({"path": link_state_door(m)} if link_state_door(m) else {}),
+        # Manifest 0.15 (RFC-0087 §8.2): where the node asks an app for its
+        # assets (gateway:8099/a/<name>).
+        "assets": ({"path": assets_door(m)} if assets_door(m) else {}),
         "build": primary["build"],
         "storage": m.get("storage") or [],
         # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the
@@ -24572,19 +24619,29 @@ def _cohort_source(app, confirm_source=""):
     return src
 
 
-def _cohort_env_value(key, value, multiline):
+def config_env_value(key, value, multiline):
     """A config value as instance.env keeps it: one line. A multiline key
-    is stored `;`-separated, as the portal's textarea stores it."""
+    is stored `;`-separated, as the portal's textarea stores it. Raises
+    ValueError -- shared by cohorts and `oaap app config set` (found on
+    oaap-test 2026-11-15: a value with a newline went into instance.env as
+    it was, and the container never started again)."""
     text = str(value).replace("\r", "")
     if multiline:
         lines = [l.strip() for l in text.split("\n") if l.strip()]
-        if any(";" in l for l in lines):
-            die(f"config {key}: an entry may not contain ';' (it separates "
-                "the entries)")
+        if "\n" in text and any(";" in l for l in lines):
+            raise ValueError(f"config {key}: an entry may not contain ';' (it "
+                             "separates the entries)")
         return ";".join(lines)
     if "\n" in text:
-        die(f"config {key}: this key takes one line")
+        raise ValueError(f"config {key}: this key takes one line")
     return text
+
+
+def _cohort_env_value(key, value, multiline):
+    try:
+        return config_env_value(key, value, multiline)
+    except ValueError as e:
+        die(str(e))
 
 
 def _cohort_shared_base(rec):

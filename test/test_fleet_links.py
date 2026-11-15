@@ -210,10 +210,92 @@ links_n, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS, SET, HOSTS, resolv
 ok("build: Tunnel-App ohne Tuer -> through ohne state (wie vor 0.11)",
    "state" not in [l for l in links_n if "through" in l][0]["through"])
 
+print("=== was eine App von ihren Assets sagt (0.12, RFC-0087 §8.2) ===")
+RA = fl.read_assets_answer
+raw = {"v": 1, "assets": [
+    {"kind": "source", "name": "gaming", "state": "down", "destination": "GPU",
+     "url": "http://10.8.0.1:11434/v1", "light": "green"},
+    {"kind": "source", "name": "anthropic", "state": "idle"},
+    {"kind": "source", "name": "gaming", "state": "ok"},
+    {"kind": "model", "name": "chat-gaming", "state": "down", "uses": ["gaming", "fremd", 7],
+     "destination": "gpu", "upstream": "llama3.3:70b"},
+    {"kind": "key", "name": "laptop-joerg"},
+    {"kind": "source", "name": "mit leer", "state": "ok"},
+    {"kind": "source", "name": "komisch", "state": "verbunden"},
+    "kein-objekt"]}
+got = RA(raw)
+g = {(a["kind"], a["name"]): a for a in got}
+ok("gelesen: nur model/source mit gueltigem Namen, je einmal",
+   sorted(g) == [("model", "chat-gaming"), ("source", "anthropic"), ("source", "gaming"),
+                 ("source", "komisch")], sorted(g))
+ok("nur die erlaubten Felder -- keine Adresse, Ampel, Modellkennung",
+   all(set(a) <= {"kind", "name", "state", "uses", "destination"} for a in got)
+   and "10.8.0.1" not in json.dumps(got) and "llama" not in json.dumps(got), got)
+ok("uses nur auf Quellen derselben Antwort; destination nur an einer Quelle",
+   g[("model", "chat-gaming")].get("uses") == ["gaming"]
+   and "destination" not in g[("model", "chat-gaming")]
+   and g[("source", "gaming")]["destination"] == "GPU", g)
+ok("ein unbekanntes Zustandswort faellt weg", "state" not in g[("source", "komisch")])
+ok("keine Antwort: falsche Version, keine Liste, kein Objekt",
+   RA({"v": 2, "assets": []}) is None and RA({"v": 1}) is None and RA([]) is None
+   and RA(None) is None)
+ok("hoechstens 200", len(RA({"v": 1, "assets": [{"kind": "source", "name": f"q{i}"}
+                                               for i in range(300)]})) == 200)
+ASSETS = {"ais-mg": got}
+links_a, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS, SET, HOSTS, resolve,
+                           reports=REP, assets=ASSETS)
+apps = [l for l in links_a if l["kind"] == "app"]
+ok("eine app-Zeile fuer ais-mg mit Mandant und state ok",
+   len(apps) == 1 and apps[0]["instance"] == "ais-mg" and apps[0]["tenant"] == "ais"
+   and apps[0]["state"] == "ok", apps)
+ga = {(a["kind"], a["name"]): a for a in apps[0]["assets"]}
+ok("auf names: die Quelle geht ueber die Destination gamingpc (Bedarf gpu, GPU geschrieben)",
+   ga[("source", "gaming")].get("destination") == "gamingpc", ga)
+ok("der Modellname nutzt gaming, traegt seinen Zustand",
+   ga[("model", "chat-gaming")] == {"kind": "model", "name": "chat-gaming", "state": "down",
+                                    "uses": ["gaming"]}, ga)
+ok("eine Quelle ohne Destination nennt keine", "destination" not in ga[("source", "anthropic")])
+links_ap, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS,
+                            {"ceiling": "pseudonym", "salt": "s"}, HOSTS, resolve,
+                            reports=REP, assets=ASSETS)
+ap = [l for l in links_ap if l["kind"] == "app"][0]
+dp = [l for l in links_ap if "through" in l][0]
+src_p = [a for a in ap["assets"] if a["kind"] == "source" and a.get("destination")][0]
+mod_p = [a for a in ap["assets"] if a["kind"] == "model"][0]
+ok("auf pseudonym: a-Pseudonyme, die Destination heisst wie ihre eigene Zeile",
+   all(a["name"].startswith("a-") for a in ap["assets"]) and src_p["destination"] == dp["name"]
+   and mod_p["uses"] == [src_p["name"]], ap)
+ok("auf pseudonym: kein echter Name im Dokument",
+   not any(x in json.dumps(links_ap) for x in ("chat-gaming", "anthropic", '"gaming"')), ap)
+ok("dasselbe Asset, dasselbe Pseudonym (die Zentrale erkennt es wieder)",
+   fl.build(CONF, STATE, DESTS, INST, TENANTS, {"ceiling": "pseudonym", "salt": "s"}, HOSTS,
+            resolve, assets=ASSETS)[0][-1]["assets"] == ap["assets"])
+links_k, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS, SET, HOSTS, resolve,
+                           assets={"kunde-app": [{"kind": "source", "name": "q"}]})
+ok("Mandant auf count: keine app-Zeile", not [l for l in links_k if l["kind"] == "app"])
+links_s, _b, _i = fl.build(CONF, STATE, DESTS, INST, TENANTS, SET, HOSTS, resolve,
+                           assets={"ais-mg": "paused", "ais-chat": "unknown", "weg": []})
+st = {l["instance"]: l for l in links_s if l["kind"] == "app"}
+ok("schlafend/stumm: paused bzw. unknown ohne Liste; unbekannte Instanz keine Zeile",
+   st["ais-mg"] == {"kind": "app", "instance": "ais-mg", "tenant": "ais", "state": "paused"}
+   and st["ais-chat"]["state"] == "unknown" and "assets" not in st["ais-chat"]
+   and "weg" not in st, st)
+INST2 = dict(INST, **{"ais-mg": {"tenant": "T-ais",
+                                 "destinations": {"gpu": "gamingpc", "raus": "draussen"}}})
+links_d, _b, _i = fl.build(CONF, STATE, DESTS, INST2, TENANTS, SET, HOSTS, resolve,
+                           assets={"ais-mg": [{"kind": "source", "name": "a", "destination": "raus"},
+                                              {"kind": "source", "name": "b",
+                                               "destination": "nicht-gebunden"}]})
+dd = [l for l in links_d if l["kind"] == "app"][0]["assets"]
+ok("eine direkte (ohne eigene Zeile) oder ungebundene Destination wird nicht genannt",
+   all("destination" not in a for a in dd), dd)
+ok("ohne assets: keine app-Zeile (wie 0.11)",
+   not [l for l in links if l["kind"] == "app"])
+
 print("=== das Dokument ===")
 doc = fleet_view.build_document("n", "0.1.281", [], "t", [], [], [], [],
                                 links=links, tenants=block)
-ok("Schema 0.11, links und tenants drin", doc["schema"] == "oaap.fleet.status/0.11"
+ok("Schema 0.12, links und tenants drin", doc["schema"] == "oaap.fleet.status/0.12"
    and doc["links"] == links and doc["tenants"] == block)
 doc9 = fleet_view.build_document("n", "0.1.281", [], "t", [], [], [], [])
 ok("ohne Halbkanten (Aufbau gescheitert): keine Felder statt halber",

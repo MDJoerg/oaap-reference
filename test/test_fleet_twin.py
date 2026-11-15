@@ -203,6 +203,41 @@ ok("gemeinsamer Zustand: ok, paused, down-inner, down-outer, half",
     ft.joined_state("ok", ("error", False)), ft.joined_state("error", ("ok", False)),
     ft.joined_state(None, ("ok", False))] == ["ok", "paused", "down-inner", "down-outer", "half"])
 
+APP_ROW = {"kind": "app", "instance": "ais-mg", "tenant": "ais", "state": "ok", "assets": [
+    {"kind": "source", "name": "gaming", "state": "down", "destination": "gamingpc"},
+    {"kind": "source", "name": "anthropic", "state": "idle"},
+    {"kind": "model", "name": "chat-gaming", "state": "down", "uses": ["gaming", "fremd"]},
+    {"kind": "model", "name": "chat-fern", "uses": ["anthropic"]},
+    {"kind": "key", "name": "laptop"},
+    {"kind": "model", "name": "chat-gaming", "state": "ok"}]}
+
+
+def with_app(doc, row):
+    d = json.loads(json.dumps(doc))
+    d["links"] = [lk for lk in d["links"] if lk.get("kind") != "app"] + ([row] if row else [])
+    return d
+
+
+aa = ft.app_assets(with_app(INN, APP_ROW), "ni")
+ok("0.12: eine app-Zeile, vier Assets (key verworfen, doppelt einmal)",
+   len(aa) == 1 and aa[0]["instance"] == "ais-mg" and len(aa[0]["assets"]) == 4, aa)
+ab = {x["key"]: x for x in aa[0]["assets"]}
+ok("Quellschluessel asset:<Knoten>/<Instanz>/<Art>/<Name>, Gruppe mit Zustand",
+   ab["asset:ni/ais-mg/source/gaming"]["groups"]["oaap.asset"]
+   == {"assetName": "gaming", "assetKind": "source", "assetState": "down"}, ab)
+ok("uses nur auf Quellen der Zeile, als Quellschluessel; destination nur an Quellen",
+   ab["asset:ni/ais-mg/model/chat-gaming"]["uses"] == ["asset:ni/ais-mg/source/gaming"]
+   and ab["asset:ni/ais-mg/source/gaming"]["destination"] == "gamingpc"
+   and ab["asset:ni/ais-mg/model/chat-gaming"]["destination"] == "", ab)
+ok("ein Asset ohne Zustand: unknown", ab["asset:ni/ais-mg/model/chat-fern"]["groups"]["oaap.asset"]
+   ["assetState"] == "unknown")
+ok("paused/unknown: keine Liste (die Zentrale behaelt, was sie wusste)",
+   ft.app_assets(with_app(INN, {"kind": "app", "instance": "ais-mg", "state": "paused",
+                                "assets": APP_ROW["assets"]}), "ni")[0]["assets"] is None
+   and ft.app_assets(with_app(INN, {"kind": "app", "instance": "ais-mg", "state": "egal"}),
+                     "ni")[0]["state"] == "unknown")
+ok("ohne app-Zeile (0.11): nichts", ft.app_assets(INN, "ni") == [])
+
 print("=== Teil 1: das Urteil je Knoten ===")
 now = 1_800_000_000
 st = {"started": now - 3600, "nodes": {"n1": {"name": "n1", "alive": {"t": fleet_watch.iso(now - 30)}},
@@ -577,6 +612,62 @@ hsink.flush({**hsnap, "status": {"ni": ("ni", "", inn_nod)}}, NOW + 760)
 ok("Destination gelöscht: das externe Ende removed, nicht mehr im Bericht",
    ext_attr() == "removed" and eo not in hsink.ext
    and json.load(open(AFF, encoding="utf-8"))["links"] == {}, (ext_attr(), hsink.ext))
+
+print("=== Teil 2: Stufe 3b -- die Assets einer App (RFC-0087 §8.2) ===")
+INN3 = with_app(with_state(INN, "down-target"), APP_ROW)
+hsink.flush({**hsnap, "status": {"nx": ("nx", "", OUT), "ni": ("ni", "", INN3)}}, NOW + 800)
+ok("Assets ohne Fehler", hsink.last_error == "", hsink.last_error)
+ass = {r["title"]: str(r["id"]) for r in q("SELECT id, title FROM T.objects WHERE type_key = %s",
+                                            fm.ASSET)}
+ok("vier Asset-Objekte (kein Schluessel als Asset)",
+   sorted(ass) == ["anthropic", "chat-fern", "chat-gaming", "gaming"], ass)
+R3 = rels_now()
+want3 = {("gaming", "fleetAssetOf", "ais-mg", False), ("gaming", "fleetAssetVia", "gamingpc", False),
+         ("chat-gaming", "fleetAssetUses", "gaming", False),
+         ("chat-fern", "fleetAssetUses", "anthropic", False),
+         ("chat-fern", "fleetAssetOf", "ais-mg", False)}
+ok("Beziehungen: gehoert zu ais-mg, geht ueber gamingpc, nutzt", want3 <= R3, sorted(want3 - R3))
+ok("anthropic geht ueber keine Destination",
+   not any(s == "anthropic" and k == "fleetAssetVia" and not c for s, k, _d, c in R3))
+
+
+def asset_state(title):
+    r = q("SELECT a.value FROM T.current_attributes a WHERE a.object_id = %s "
+          "AND a.attr_key = 'fleetAssetState'", ass[title])
+    return r[0]["value"] if r else None
+
+
+ok("Zustand je Asset: gaming down, anthropic idle",
+   asset_state("gaming") == "down" and asset_state("anthropic") == "idle")
+le3 = json.load(open(AFF, encoding="utf-8"))["links"].get(EXT_NAME) or {}
+rows3 = {r["title"]: r for r in le3.get("affected", [])}
+ok("der Bericht nennt hinter dem externen Ende die Quelle gaming und den Modellnamen chat-gaming",
+   rows3.get("gaming", {}).get("kind") == "source" and rows3["gaming"].get("instance") == "ais-mg"
+   and rows3.get("chat-gaming", {}).get("kind") == "model"
+   and rows3["chat-gaming"].get("via") == "assetUses", le3.get("affected"))
+ok("... nicht den Modellnamen, der nur den fremden Anbieter nutzt",
+   "chat-fern" not in rows3 and "anthropic" not in rows3, sorted(rows3))
+tx = fleet_watch.link_text(EXT_NAME, dict(le3, since=fleet_watch.iso(NOW)), NOW + 420)
+ok("die Mail: Modellname chat-gaming in ais-mg auf ni",
+   "Modellname chat-gaming in ais-mg auf ni" in tx and "Bezugsquelle gaming in ais-mg" in tx, tx)
+before3 = q("SELECT (SELECT count(*) FROM T.attributes) a, (SELECT count(*) FROM T.relations) r")[0]
+hsink.flush({**hsnap, "status": {"nx": ("nx", "", OUT), "ni": ("ni", "", INN3)}}, NOW + 830)
+after3 = q("SELECT (SELECT count(*) FROM T.attributes) a, (SELECT count(*) FROM T.relations) r")[0]
+ok("dasselbe Dokument noch einmal: keine Zeile", before3 == after3, (before3, after3))
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_app(INN3, {
+    "kind": "app", "instance": "ais-mg", "tenant": "ais", "state": "paused"}))}}, NOW + 860)
+ok("Gateway schlaeft (paused): die Assets bleiben, wie sie waren",
+   asset_state("gaming") == "down" and asset_state("chat-fern") == "unknown")
+less = dict(APP_ROW, assets=[x for x in APP_ROW["assets"] if x.get("name") != "chat-fern"])
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_app(INN3, less))}}, NOW + 890)
+R4 = rels_now()
+ok("chat-fern geloescht: removed, seine Beziehungen geschlossen (Geschichte bleibt)",
+   asset_state("chat-fern") == "removed"
+   and ("chat-fern", "fleetAssetOf", "ais-mg", True) in R4
+   and ("chat-fern", "fleetAssetOf", "ais-mg", False) not in R4, sorted(x for x in R4 if x[0] == "chat-fern"))
+hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_app(INN3, None))}}, NOW + 920)
+ok("App ohne Tuer (keine app-Zeile mehr): alle Assets removed",
+   all(asset_state(t) == "removed" for t in ass), {t: asset_state(t) for t in ass})
 
 with admin.cursor() as cur:
     for sch in (f"twin_{TID}", f"ts_{TID}"):

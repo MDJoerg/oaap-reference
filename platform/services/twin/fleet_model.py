@@ -21,12 +21,14 @@ groups; `owner.*` are registered for people and never written by it.
 
 ORIGIN = "platform:fleet"
 PACKAGE = "oaap-fleet"
-VERSION = "0.2.0"     # 0.2.0: half-edges (RFC-0087)
+VERSION = "0.3.0"     # 0.2.0: half-edges (RFC-0087); 0.3.0: an app's assets (§8.2)
 
 NODE, BROKER, INSTANCE = "FleetNode", "FleetBroker", "FleetInstance"
 # RFC-0087: the links between and behind nodes
 TENANT, TUNNEL, DESTINATION, EXTERNAL = ("FleetTenant", "FleetTunnel", "FleetDestination",
                                          "FleetExternal")
+# RFC-0087 §8.2: what an app names of itself (model names, sources)
+ASSET = "FleetAsset"
 
 IDTA_SOFTWARE = "https://admin-shell.io/idta/SoftwareNameplate/1/0"
 IDTA_SW_INSTANCE = IDTA_SOFTWARE + "/SoftwareNameplate/SoftwareNameplateInstance/"
@@ -120,6 +122,10 @@ _ATTRS = [
     ("extName", "text", _own("FleetExternal/0/1/Name"), "Ziel"),
     ("extKind", "text", _own("FleetExternal/0/1/Kind"), "Art"),
     ("extState", "text", _own("FleetExternal/0/1/State"), "Zustand"),
+    # oaap.asset -- what an app names of itself (§8.2)
+    ("assetName", "text", _own("FleetAsset/0/1/Name"), "Asset"),
+    ("assetKind", "text", _own("FleetAsset/0/1/Kind"), "Art"),
+    ("assetState", "text", _own("FleetAsset/0/1/State"), "Zustand"),
     # owner.link -- people only: the far end in someone else's world (§5.1)
     ("externalId", "text", _own("FleetExternal/0/1/Link/ExternalId"), "Externe Kennung"),
     ("externalSource", "text", _own("FleetExternal/0/1/Link/Source"), "Wessen Welt"),
@@ -183,6 +189,8 @@ GROUPS = [
      ["behind"], "Externes Ende"),
     ("owner.link", EXTERNAL, _own("FleetExternal/0/1/Link"),
      ["externalId", "externalSource", "notes"], [], "Verknüpfung"),
+    ("oaap.asset", ASSET, _own("FleetAsset/0/1"), ["assetName", "assetKind", "assetState"],
+     ["assetOf", "assetUses", "assetVia"], "Asset"),
 ]
 
 def ak(name):
@@ -225,6 +233,11 @@ RELATIONS = [
      "führt zu", "erreicht über"),
     ("behind", EXTERNAL, INSTANCE, _own("PeerRelations/0/2/Behind"),
      "liegt hinter", "führt zu"),
+    # RFC-0087 §8.2
+    ("assetOf", ASSET, INSTANCE, _own("PeerRelations/0/3/AssetOf"), "gehört zu", "hat Asset"),
+    ("assetUses", ASSET, ASSET, _own("PeerRelations/0/3/AssetUses"), "nutzt", "wird genutzt von"),
+    ("assetVia", ASSET, DESTINATION, _own("PeerRelations/0/3/AssetVia"),
+     "geht über", "trägt Asset"),
 ]
 
 OBJECTS = [
@@ -235,6 +248,7 @@ OBJECTS = [
     (TUNNEL, "Tunnel", "Tunnel", _own("FleetTunnel/0/1")),
     (DESTINATION, "Destination", "Destinationen", _own("FleetDestination/0/1")),
     (EXTERNAL, "Externes Ende", "Externe Enden", _own("FleetExternal/0/1")),
+    (ASSET, "Asset", "Assets", _own("FleetAsset/0/1")),
 ]
 
 # The node's series (RFC-0086), one per metric of the sender (metrics.SERIES).
