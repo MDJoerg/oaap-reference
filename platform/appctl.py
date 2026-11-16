@@ -6186,7 +6186,7 @@ def resolve_instance_ref(reg, ref, tenant_label=""):
 INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
                   "standby", "wake", "maintenance",
                   "diagnose", "endpoint", "tile", "resources", "config",
-                  "address", "throttle", "artifact", "promote", "rehearse",
+                  "address", "throttle", "artifact", "promote", "catalog-put", "rehearse",
                   "rehearsal")
 
 
@@ -9786,7 +9786,8 @@ class _BuildDrivers:
         from by a profile: nobody is there to confirm."""
         import contextlib
         import io
-        src, _version, store = _store_lookup(a["app"], a.get("source_id") or "")
+        src, _version, store = _store_lookup(a["app"], a.get("source_id") or "",
+                                             label=self.label)
         if not src:
             return False, (f"'{a['app']}' steht in keiner eingerichteten "
                            "Store-Quelle"), []
@@ -24659,7 +24660,7 @@ def _cohort_existing_users():
     return set(json.loads(out.strip().splitlines()[-1]))
 
 
-def _cohort_source(app, confirm_source=""):
+def _cohort_source(app, confirm_source="", tenant=None):
     """Where an app of the template comes from.
 
     A store id is resolved against the CONFIGURED sources, like the
@@ -24677,7 +24678,8 @@ def _cohort_source(app, confirm_source=""):
     if app["kind"] == "git":
         return {"kind": "git", "url": app["id"], "path": app["path"],
                 "ref": app["ref"]}
-    src, _version, store_src = _store_lookup(app["id"], app["source"])
+    src, _version, store_src = _store_lookup(app["id"], app["source"],
+                                             tenant=tenant)
     if not src:
         die(f"'{app['id']}' is not listed in any configured store source")
     if store_src["trust"] == "unverified" and confirm_source != store_src["id"]:
@@ -25034,7 +25036,7 @@ def _cohort_create(args):
     if missing:
         die("the tenant has no stored secret: " + ", ".join(missing)
             + " (oaap cohort secret set <name>)")
-    srcs = {a["name"]: _cohort_source(a, args.confirm_source) for a in tpl["apps"]}
+    srcs = {a["name"]: _cohort_source(a, args.confirm_source, tid) for a in tpl["apps"]}
     out = args.handout_file or os.path.join(
         os.getcwd(), os.path.basename(tpl["handout"] or "handout.csv"))
     why = cohort.handout_path_refusal(out, src_dir)
@@ -25118,7 +25120,7 @@ def _cohort_add(args):
         tpl["seat_labels"].append(label)
     tid = rec["tenant"]
     secrets_map = load_cohort_secrets().get(tid, {})
-    srcs = {a["name"]: _cohort_source(a, args.confirm_source) for a in tpl["apps"]}
+    srcs = {a["name"]: _cohort_source(a, args.confirm_source, tid) for a in tpl["apps"]}
     stem, ext = os.path.splitext(os.path.basename(tpl["handout"] or "handout.csv"))
     out = args.handout_file or os.path.join(os.getcwd(), f"{stem}-{sid}{ext}")
     why = cohort.handout_path_refusal(out, tdir)
@@ -25170,7 +25172,7 @@ def _cohort_reset(args):
     _confirm_word(f"{rec['name']}-{sid}", args, what)
     tid = rec["tenant"]
     secrets_map = load_cohort_secrets().get(tid, {})
-    srcs = {a["name"]: _cohort_source(a, args.confirm_source)
+    srcs = {a["name"]: _cohort_source(a, args.confirm_source, tid)
             for a in tpl["apps"] if not a["shared"]}
     if not args.keep_home:
         for key in keys:
@@ -30269,6 +30271,217 @@ def _staged_expect(zip_path):
         return None
 
 
+# --- the tested package into the catalog (RFC-0050 §9) -------------------
+#
+# Promotion's third leg. RFC-0020 promises that production runs the bytes
+# that were tested; before this, the way from a tested instance to OTHER
+# tenants was "download the ZIP, upload it into the catalog" -- a person,
+# a file manager and a download folder between test and release, exactly
+# what promotion was built to remove. Now the node hands the retained
+# package to the catalog itself.
+#
+# The catalog stays the only writer of its own state: the node drops the
+# file and a note into `inbox/` of the catalog's storage, the catalog takes
+# it in under the rules of an upload (as NOT released) and answers with
+# `<stem>.result.json`. Releasing stays a human's act in the catalog.
+#
+# That storage is written by the app, so every step here goes through a
+# directory handle opened without following links: an app that swapped
+# `inbox` for a symbolic link between a check and a write would otherwise
+# have the node write as root wherever it points.
+
+CATALOG_PUT_WAIT = 30
+
+
+class CatalogPutRefused(Exception):
+    """A refusal a person can act on."""
+
+
+def catalog_put_sources(reg=None):
+    """[(source, catalog instance key)] -- the package catalogs of this node
+    that are configured store sources. Only those: a catalog nobody reads
+    from would take the package in and supply nobody."""
+    reg = reg or load_registry()
+    try:
+        sources = load_sources()[0]
+    except SourcesUnreadable:
+        return []
+    out = []
+    for s in sources:
+        if catalog_source.is_catalog_url(s.get("url")):
+            key = catalog_source.instance_of(s.get("url"))
+            if key and key in reg["instances"]:
+                out.append((s, key))
+    return out
+
+
+def _catalog_put_target(reg, catalog):
+    cats = catalog_put_sources(reg)
+    if catalog:
+        cats = [(s, k) for s, k in cats
+                if catalog in (s["id"], k, instance_name(k, reg["instances"][k]))]
+        if not cats:
+            raise CatalogPutRefused(
+                f"'{catalog}' is not a package catalog this node reads from "
+                "('oaap store list'; a catalog becomes a source with "
+                "'oaap store add-catalog <instance>')")
+    if not cats:
+        raise CatalogPutRefused(
+            "no package catalog is a store source on this node -- install "
+            "one and add it: 'oaap app install https://github.com/MDJoerg/"
+            "oaap-apps --path apps/package-catalog --name katalog', then "
+            "'oaap store add-catalog katalog'")
+    if len(cats) > 1:
+        raise CatalogPutRefused(
+            "this node reads from several catalogs -- name one: "
+            + ", ".join(s["id"] for s, _k in cats))
+    return cats[0]
+
+
+def catalog_put_review(reg, name):
+    """(package path, manifest app section) of what `name` would hand over,
+    or CatalogPutRefused. The same 'same bytes' rule as promotion: only a
+    retained package proves which bytes were tested."""
+    inst = reg["instances"].get(name)
+    if not inst:
+        raise CatalogPutRefused(f"no instance '{name}'")
+    src = inst.get("source") or {}
+    if src.get("kind") != "artifact":
+        raise CatalogPutRefused(
+            f"'{instance_name(name, inst)}' does not run from an uploaded "
+            "package -- the catalog takes the tested ZIP, and only a retained "
+            "package proves which bytes were tested. An app from Git or a "
+            "store list is distributed from there")
+    path = source_package_arg(name, src)
+    if not path or not os.path.isfile(path):
+        raise CatalogPutRefused(
+            f"the retained package of '{instance_name(name, inst)}' is gone "
+            "-- deploy it once more, then hand it over")
+    app_id, version = inst.get("app_id", ""), inst.get("version", "")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", app_id or "") \
+            or not re.fullmatch(r"[0-9A-Za-z.+-]{1,64}", version or ""):
+        raise CatalogPutRefused("the instance's app id or version cannot "
+                                "name a package")
+    return path, inst
+
+
+def catalog_put(name, catalog="", by="", wait=CATALOG_PUT_WAIT):
+    """Hand the retained package of instance `name` to the catalog.
+
+    Returns (ok, message, catalog source id). `ok` is None when the
+    catalog has not answered within `wait` seconds -- the package then
+    waits in its inbox, and "not answered" is said, not "refused"
+    (RFC-0019's second lesson: no answer is not a refusal).
+    """
+    reg = load_registry()
+    path, inst = catalog_put_review(reg, name)
+    src_rec, cat_key = _catalog_put_target(reg, catalog)
+    if cat_key == name:
+        raise CatalogPutRefused("a catalog cannot take itself in")
+    base = _catalog_base(src_rec)
+    if base is None:
+        raise CatalogPutRefused(f"the catalog '{src_rec['id']}' has no storage")
+    sha = catalog_source.sha256_file(path)
+    stem = f"{inst['app_id']}-{inst['version']}-{sha[:12]}"
+    tenant = resolve_tenant(inst.get("tenant"))
+    meta = {"sha256": sha, "app_id": inst["app_id"], "version": inst["version"],
+            # the default tenant has no short name worth showing
+            "tenant": (tenant_label(tenant)
+                       if tenant and tenant != default_tenant_id() else ""),
+            "instance": instance_name(name, inst),
+            "channel": inst.get("channel", ""), "by": by or _operator_name(),
+            "at": datetime.datetime.now(datetime.timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")}
+    nofollow = os.O_NOFOLLOW
+    try:
+        bfd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    except OSError as e:
+        raise CatalogPutRefused(f"the catalog's storage cannot be opened: {e}")
+    try:
+        owner = os.fstat(bfd)
+        try:
+            os.mkdir("inbox", 0o750, dir_fd=bfd)
+            os.chown("inbox", owner.st_uid, owner.st_gid, dir_fd=bfd,
+                     follow_symlinks=False)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open("inbox", os.O_RDONLY | os.O_DIRECTORY | nofollow,
+                         dir_fd=bfd)
+        except OSError:
+            raise CatalogPutRefused("the catalog's inbox is not a directory "
+                                    "(a symbolic link is not followed)")
+    finally:
+        os.close(bfd)
+    try:
+        for leftover in (stem + ".result.json", stem + ".zip.part",
+                         stem + ".json.part"):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(leftover, dir_fd=fd)
+
+        def put(final, write):
+            part = final + ".part"
+            wfd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                          0o640, dir_fd=fd)
+            with os.fdopen(wfd, "wb") as out:
+                write(out)
+                out.flush()
+                os.fsync(out.fileno())
+                os.fchown(out.fileno(), owner.st_uid, owner.st_gid)
+            os.rename(part, final, src_dir_fd=fd, dst_dir_fd=fd)
+
+        def copy_zip(out):
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, out, 1024 * 1024)
+
+        # The ZIP first, the note last: the catalog acts on the note, so
+        # it never sees a note whose package is still being written.
+        put(stem + ".zip", copy_zip)
+        put(stem + ".json", lambda out: out.write(json.dumps(meta).encode()))
+        deadline = time.time() + max(0, wait)
+        while True:
+            try:
+                rfd = os.open(stem + ".result.json", os.O_RDONLY | nofollow,
+                              dir_fd=fd)
+            except FileNotFoundError:
+                if time.time() >= deadline:
+                    return (None, "the catalog has not answered yet -- is it "
+                            "running? The package waits in its inbox and is "
+                            "taken in when it does", src_rec["id"])
+                time.sleep(1)
+                continue
+            with os.fdopen(rfd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    return False, "the catalog's answer is not a file", src_rec["id"]
+                raw = f.read(65536)
+            with contextlib.suppress(OSError):
+                os.unlink(stem + ".result.json", dir_fd=fd)
+            try:
+                ans = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return False, "the catalog's answer is unreadable", src_rec["id"]
+            return (bool(ans.get("ok")), str(ans.get("message") or "")[:400],
+                    src_rec["id"])
+    finally:
+        os.close(fd)
+
+
+def cmd_catalog_put(args):
+    """`oaap app catalog-put <instance> [--catalog <name>]`."""
+    try:
+        ok, msg, sid = catalog_put(args.name, args.catalog or "",
+                                   wait=args.wait)
+    except CatalogPutRefused as e:
+        die(str(e))
+    if ok is None:
+        print(f"Handed to '{sid}': {msg}")
+        return
+    if not ok:
+        die(f"the catalog '{sid}' refused: {msg}")
+    print(f"Catalog '{sid}': {msg}")
+    print("Release it in the catalog -- that stays a person's decision.")
+
+
 def catalog_view_write():
     """The portal's copy of every catalog source's list (no file paths).
 
@@ -30313,7 +30526,12 @@ def catalog_view_write():
         pass
 
 
-def _store_lookup(app_id, source_id="", prefer=""):
+def _store_label(tenant):
+    """The label a catalog's `visible_to` names a tenant by (RFC-0050 §9)."""
+    return tenant_label(tenant) or DEFAULT_TENANT_LABEL
+
+
+def _store_lookup(app_id, source_id="", prefer="", tenant=None, label=None):
     """Resolve an app id against the CONFIGURED store sources (spec 2.6).
 
     The spool request names an app id and at most a source id — what
@@ -30331,6 +30549,14 @@ def _store_lookup(app_id, source_id="", prefer=""):
     wins over the trust rule as long as that source still lists the app,
     so a redeploy cannot be silently re-pointed at a different list.
 
+    `tenant` (RFC-0050 §9) is the tenant the instance belongs to: a
+    catalog entry with `visible_to` that does not name it does not
+    resolve -- for that tenant the entry is not listed, exactly as the
+    store page shows it. Judged here again, because the page is only a
+    page: the spool is data, not trust. `label` names the tenant by its
+    label instead (a profile run knows only that). Neither given: no
+    tenant in play, nothing is filtered.
+
     Returns (package_dict, version, source) — source is the full source
     object, or (None, "", None) when nothing matches.
     """
@@ -30339,6 +30565,9 @@ def _store_lookup(app_id, source_id="", prefer=""):
         sources = [s for s in sources if s["id"] == source_id]
     hits = []
     _store_lookup.note = ""
+    if label is None and tenant is not None:
+        label = _store_label(tenant)
+    hidden = []
     for pos, src in enumerate(sources):
         is_cat = catalog_source.is_catalog_url(src.get("url"))
         data = _catalog_read(src) if is_cat else fetch_store_list(src["url"])
@@ -30351,9 +30580,18 @@ def _store_lookup(app_id, source_id="", prefer=""):
             # a "zip" in a remote list is not something this node fetches.
             if a.get("id") == app_id and (pkg.get("git")
                                           or (is_cat and pkg.get("zip"))):
+                if label is not None and not catalog_source.visible_for(a, label):
+                    hidden.append(src["id"])
+                    break
                 hits.append((src, a, pos))
                 break
     if not hits:
+        if hidden and not _store_lookup.note:
+            # Said, not swallowed: "not listed" would send the operator
+            # looking for a missing release when the filter is the cause.
+            _store_lookup.note = (f" ('{hidden[0]}' lists '{app_id}' only for "
+                                  f"other tenants, not for '{label}' -- "
+                                  "'Sichtbar für' in the catalog)")
         return None, "", None
     hits.sort(key=lambda h: (h[0]["id"] != prefer,
                              -TRUST_RANK.get(h[0].get("trust"), 0),
@@ -30388,6 +30626,7 @@ TENANT_AUDITED = {
     # reason this log cannot be complete, not a reason to leave out the
     # line that can be written.
     "artifact-export": "instance.export",
+    "catalog-put": "instance.catalog",
     "promote": "instance.promote",
     "remove": "instance.remove",
     "rename": "instance.rename",
@@ -31190,7 +31429,12 @@ def cmd_process_deploys(_args):
             # exactly what `local_name` still holds (RFC-0025 §8.1).
             src, _listed_version, store_src = _store_lookup(
                 lookup_id, req.get("source_id", ""),
-                prefer=((inst or {}).get("source") or {}).get("store_source", ""))
+                prefer=((inst or {}).get("source") or {}).get("store_source", ""),
+                # The tenant the instance IS in (an update) or lands in
+                # (a new one) -- never the actor's: an operator installing
+                # into a customer's tenant gets what that tenant may see.
+                tenant=(resolve_tenant(inst.get("tenant")) if inst
+                        else (act_tenant or ensure_default_tenant())))
             if not src:
                 note = getattr(_store_lookup, "note", "")
                 # A refusal by a catalog is not "not listed": the person
@@ -31232,9 +31476,11 @@ def cmd_process_deploys(_args):
                 # Same resolution as the one-click install: the request
                 # names an app id, the host decides where it comes from.
                 src, _listed, store_src = _store_lookup(
-                    req.get("app_id", ""), req.get("source_id", ""))
+                    req.get("app_id", ""), req.get("source_id", ""),
+                    tenant=act_tenant or ensure_default_tenant())
                 if not src:
-                    msg = "app is not listed in any configured store source"
+                    msg = ("app is not listed in any configured store source"
+                           + getattr(_store_lookup, "note", ""))
                 elif (store_src["trust"] == "unverified"
                       and req.get("confirm_source") != store_src["id"]):
                     src = None
@@ -31517,6 +31763,34 @@ def cmd_process_deploys(_args):
                     ok = True
                 except (ValueError, OSError) as e:
                     msg = str(e)
+        elif action == "catalog-put":
+            # RFC-0050 §9: the tested package into the catalog. server_admin
+            # only -- the catalog is the operator's (RFC-0050 §2 decision
+            # 1), and what it holds may reach every tenant of the node.
+            # Re-checked here: the spool is data, not trust.
+            if not inst:
+                msg = "unknown instance"
+            elif actor and act_role != "server_admin":
+                msg = ("handing a package to the catalog requires server_admin "
+                       "-- the catalog supplies other tenants, so it is the "
+                       "operator's (RFC-0050 §2)")
+            else:
+                try:
+                    got, msg, sid = catalog_put(
+                        name, str(req.get("catalog") or ""),
+                        by=actor or "portal")
+                    ok = bool(got)
+                    if got is None:
+                        # handed over, answer pending: not a failure
+                        ok, msg = True, f"handed to '{sid}': {msg}"
+                    elif not got:
+                        msg = f"the catalog '{sid}' refused: {msg}"
+                    else:
+                        msg = f"catalog '{sid}': {msg}"
+                except CatalogPutRefused as e:
+                    msg = str(e)
+                except OSError as e:
+                    msg = f"handing over failed: {e}"
         elif action == "promote":
             # Ship the tested artifact to production (RFC-0020). The
             # request names the SOURCE instance; `name` is by now the
@@ -32966,7 +33240,7 @@ def cmd_process_deploys(_args):
                "tenant-request": "portal", "tenant-profile": "portal",
                "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "assets-set": "portal", "fleet-pair": "portal", "fleet-pair-public": "pairing", "care": "portal", "rebuild": "portal", "bulk": "portal",
                "tenant-request-submit": "invitation",
-               "grant": "portal", "promote": "portal",
+               "grant": "portal", "promote": "portal", "catalog-put": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
                    action, "deploy-hook")
         # The request id travels into the log, not only into the result
@@ -36858,6 +37132,16 @@ def build_parser():
     pp.add_argument("--confirm", action="store_true",
                     help="accept an envelope widening reported as NOTE")
     pp.set_defaults(fn=cmd_promote)
+    pcp = sub.add_parser("catalog-put",
+                         help="hand the tested package of an instance to the "
+                              "package catalog, not released (RFC-0050 §9)")
+    pcp.add_argument("name", help="the instance whose retained package goes")
+    pcp.add_argument("--catalog", default="",
+                     help="the catalog (source id or instance), when the node "
+                          "reads from more than one")
+    pcp.add_argument("--wait", type=int, default=CATALOG_PUT_WAIT,
+                     help="seconds to wait for the catalog's answer")
+    pcp.set_defaults(fn=cmd_catalog_put)
     prh = sub.add_parser("rehearse",
                          help="build a rehearsal: the test instance's code on "
                               "a copy of production data (RFC-0030)")

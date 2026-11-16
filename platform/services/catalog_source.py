@@ -44,6 +44,7 @@ SCHEME = "catalog:"
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_LABEL = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")    # TENANT_LABEL_RE of appctl
 
 
 class CatalogError(Exception):
@@ -160,7 +161,23 @@ def _entry(a):
            if k in a}
     out.update({"id": app_id, "version": version,
                 "package": {"zip": rel, "sha256": sha, "size": size}})
+    # RFC-0050 §9: which tenants see the entry. Absent = everybody (§6
+    # answer 1). A list that is not a list of labels is NOT read as
+    # "everybody" -- that would turn a damaged filter into the widest
+    # possible one -- but as nobody: the entry stays out.
+    if "visible_to" in a:
+        vis = a["visible_to"]
+        if not isinstance(vis, list) or not vis or len(vis) > 64 \
+                or not all(isinstance(t, str) and _LABEL.match(t) for t in vis):
+            return None
+        out["visible_to"] = sorted(set(vis))
     return out
+
+
+def visible_for(entry, label):
+    """May the tenant with this label see (and install) the entry?"""
+    vis = entry.get("visible_to")
+    return vis is None or label in vis
 
 
 def read_list(base):

@@ -181,5 +181,47 @@ r, q = post({"app_id": "website", "source_id": "catalog-katalog", "channel": "te
 ok("mit Haken: in den Spool, mit der Bestaetigung",
    len(q) == 1 and q[0]["confirm_source"] == "catalog-katalog", q)
 
+print("\n=== Sichtbar fuer (RFC-0050 §9) ===")
+sources(src())
+snapshot("catalog-katalog", [entry("website"),
+                             entry("bdt-app", "1.2.0", visible_to=["pxx"])])
+r = c.get("/store", headers=H)
+t = r.get_data(as_text=True)
+ok("server_admin sieht beide, der Filter steht dabei",
+   "Website" in t and "Bdt-App" in t and "nur für pxx" in t, t[-600:])
+real_label = portal.tenant_label
+portal.tenant_label = lambda tid: {"T-PXX": "pxx", "T-BEC": "bec"}.get(tid, "")
+portal.caller_roles = lambda: {"tenant_admin"}
+portal.caller_scope = lambda: ("tenant_admin", "T-PXX")
+HT = {"X-OAAP-User": "chef", "X-OAAP-Roles": "tenant_admin"}
+t = c.get("/store", headers=HT).get_data(as_text=True)
+ok("tenant_admin von pxx sieht bdt-app (ohne den Filtersatz)",
+   "Bdt-App" in t and "Website" in t and "nur für" not in t, t[-600:])
+portal.caller_scope = lambda: ("tenant_admin", "T-BEC")
+t = c.get("/store", headers=HT).get_data(as_text=True)
+ok("tenant_admin von bec sieht bdt-app nicht -- und nichts verraet, dass es sie gibt",
+   "Bdt-App" not in t and "bdt-app" not in t and "Website" in t, t[-600:])
+portal.tenant_label = real_label
+portal.caller_roles = lambda: {"server_admin"}
+portal.caller_scope = lambda: ("server_admin", "")
+
+print("\n=== In den Katalog uebernehmen (Angebot) ===")
+sources(src())
+ok("eine Instanz aus einem Paket: Angebot mit dem Katalog",
+   (portal._catalog_put_offer("bdt-app-test", {"source": {"kind": "artifact"},
+                                               "app_id": "bdt-app", "version": "1.0.0"})
+    or {}).get("catalogs") == [{"id": "catalog-katalog", "name": "Betreiber-Katalog"}])
+ok("eine Instanz aus Git: kein Angebot (nur ein Paket beweist die Bytes)",
+   portal._catalog_put_offer("x", {"source": {"kind": "git"}}) is None)
+ok("der Katalog selbst: kein Angebot in sich hinein",
+   portal._catalog_put_offer("katalog", {"source": {"kind": "artifact"}}) is None)
+portal.caller_roles = lambda: {"tenant_admin"}
+ok("tenant_admin: kein Angebot (der Katalog ist des Betreibers)",
+   portal._catalog_put_offer("bdt-app-test", {"source": {"kind": "artifact"}}) is None)
+portal.caller_roles = lambda: {"server_admin"}
+sources()
+ok("ohne Katalog als Quelle: kein Angebot, das nur scheitern kann",
+   portal._catalog_put_offer("bdt-app-test", {"source": {"kind": "artifact"}}) is None)
+
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)

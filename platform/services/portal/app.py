@@ -3599,6 +3599,34 @@ INSTANCE_EDIT_BODY = """
      Ein Deploy-Token bekommt die Produktiv-Instanz dadurch nicht.</p>
 </div>
 {% endif %}
+{% if i.catalog_put %}
+<div class="card">
+  <h2>In den Katalog übernehmen</h2>
+  <p class="muted">Legt <strong>genau das Paket, das hier läuft</strong>
+     ({{ i.catalog_put.app_id }} {{ i.catalog_put.version }}) in den Paketkatalog —
+     ohne Herunter- und Hochladen. Von dort installieren und aktualisieren
+     <strong>andere Mandanten</strong> es über ihren Store (RFC-0050).</p>
+  <form method="post" action="/instances/{{ i.key }}/catalog-put">
+    <input type="hidden" name="tab" value="deployment">
+    {% if i.catalog_put.catalogs|length > 1 %}
+    <label>Katalog
+      <select name="catalog">
+        {% for c in i.catalog_put.catalogs %}
+        <option value="{{ c.id }}">{{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% else %}
+    <input type="hidden" name="catalog" value="{{ i.catalog_put.catalogs[0].id }}">
+    {% endif %}
+    <button>In den Katalog übernehmen</button>
+  </form>
+  <p class="muted">Das Paket kommt <strong>nicht freigegeben</strong> an: Was
+     andere Mandanten sehen, entscheidest Du im Katalog — dort auch, für
+     welche Mandanten („Sichtbar für“). Eine Version, die der Katalog schon hat,
+     lehnt er ab; eine Version wird nie überschrieben.</p>
+</div>
+{% endif %}
 {% if i.sideload %}
 <div class="card">
   <h2>Neues Paket hochladen</h2>
@@ -8207,6 +8235,30 @@ def require_store_sources():
     return None
 
 
+def _catalog_visible(apps):
+    """A catalog's entries as THIS caller may see them (RFC-0050 §9).
+
+    `visible_to` names tenants by label; absent = everybody. A
+    tenant_admin sees what names their tenant, and nothing tells them
+    that anything else exists (oaap.core.tenant 2.3 rule 2). A
+    server_admin sees everything -- they install into any tenant -- with
+    the filter shown; the host refuses an install into a tenant the
+    entry does not name, whoever asks.
+    """
+    role, mine = caller_scope()
+    if role == "server_admin":
+        out = []
+        for a in apps:
+            if isinstance(a.get("visible_to"), list):
+                a = dict(a, summary=("nur für " + ", ".join(a["visible_to"])
+                                     + " · " + str(a.get("summary") or "")))
+            out.append(a)
+        return out
+    label = tenant_label(mine) or "default"
+    return [a for a in apps
+            if not isinstance(a.get("visible_to"), list) or label in a["visible_to"]]
+
+
 def store_catalogue():
     """Fetch every enabled source and merge it into one catalogue."""
     fetched, errors = [], []
@@ -8225,6 +8277,7 @@ def store_catalogue():
                     data = json.load(f)
                 if data.get("error"):
                     raise ValueError(str(data["error"]))
+                data = dict(data, apps=_catalog_visible(data.get("apps") or []))
             else:
                 r = requests.get(src["url"], timeout=4)
                 r.raise_for_status()
@@ -9563,6 +9616,7 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "deploy_now": _deploy_now(name),
          "deploy_limit": DEPLOY_MAX_MINUTES,
          "promote": _promote_view(name, inst),
+         "catalog_put": _catalog_put_offer(name, inst),
          "sideload": _sideload_offer(name, inst),
          "pending": _pending_envelope(name),
          "hook_url": _hook_url(name),
@@ -10156,6 +10210,31 @@ def _promote_view(name, inst):
             "tenant": label, "local": base, "commit": git_commit[:12]}
 
 
+def _catalog_put_offer(name, inst):
+    """"In den Katalog übernehmen" (RFC-0050 §9), or None.
+
+    For the operator only (the catalog supplies other tenants), for an
+    instance that runs from a retained package (only that proves the
+    bytes), and only where a package catalog is a store source -- an
+    offer that can only fail is not an offer.
+    """
+    if "server_admin" not in caller_roles():
+        return None
+    if (inst.get("source") or {}).get("kind") != "artifact":
+        return None
+    cats = [{"id": s["id"], "name": s.get("name") or s["id"]}
+            for s in configured_sources()
+            if str(s.get("url") or "").startswith("catalog:")
+            and str(s["url"])[len("catalog:"):] != name]
+    if not cats:
+        return None
+    return {"catalogs": cats, "app_id": inst.get("app_id", ""),
+            "version": inst.get("version", "")}
+
+
+CATALOG_PUT_WAIT_SECONDS = 60   # the host waits up to 30 s for the catalog
+
+
 PROMOTE_WAIT_SECONDS = 180  # builds an image, like any other installation
 
 
@@ -10204,6 +10283,31 @@ def instance_promote(name):
         return _inst_back(name, err=res.get("message", "Übernahme fehlgeschlagen."))
     return redirect(f"/instances/{res.get('key') or target}?msg="
                     + quote(res.get("message", "Übernommen.")), code=303)
+
+
+@app.post("/instances/<name>/catalog-put")
+def instance_catalog_put(name):
+    """Hand this instance's retained package to the catalog, NOT released
+    (RFC-0050 §9). The portal forwards; the host re-checks role, source
+    and catalog, and the catalog re-checks the package."""
+    if "server_admin" not in caller_roles():
+        return ("Zugriff verweigert: der Paketkatalog ist Sache des "
+                "Betreibers (server_admin)."), 403
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+    catalog = (request.form.get("catalog") or "").strip()
+    if catalog and not _re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", catalog):
+        return _inst_back(name, err="Unbekannter Katalog.")
+    res = _queue_and_wait(name, {"action": "catalog-put", "catalog": catalog},
+                          CATALOG_PUT_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Die Übergabe läuft noch — sieh gleich im "
+                                    "Katalog nach, ob das Paket angekommen ist.")
+    if not res.get("ok"):
+        return _inst_back(name, err=res.get("message", "Übergabe fehlgeschlagen."))
+    return _inst_back(name, msg=res.get("message", "Übergeben.")
+                      + " Freigeben im Katalog bleibt Deine Entscheidung.")
 
 
 @app.post("/instances/<name>/rollback")
