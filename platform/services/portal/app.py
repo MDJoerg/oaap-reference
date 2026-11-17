@@ -2813,8 +2813,10 @@ INSTANCE_NEW_BODY = """
     <h2>Name der Instanz</h2>
     <label>Instanzname (optional) <input type="text" name="name"
            placeholder="leer = Kennung der App"></label>
-    <p class="muted">Der Name ist die Adresse der Instanz und lässt sich
-    später nicht ändern. Kleinbuchstaben, Ziffern und Bindestriche.</p>
+    <p class="muted">Der Name ist die Adresse der Instanz. Er muss nicht
+    der Kennung der App entsprechen und lässt sich später auf der
+    Instanzseite umbenennen (der alte Name antwortet dann noch eine
+    Weile weiter). Kleinbuchstaben, Ziffern und Bindestriche.</p>
     <p class="muted"><strong>Kanal: Test.</strong> Aus dem Portal
     angelegte Instanzen landen immer auf dem Test-Kanal — sie dürfen ein
     Deploy-Token bekommen, und ein erneutes Deployment derselben Version
