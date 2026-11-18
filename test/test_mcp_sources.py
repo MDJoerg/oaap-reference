@@ -165,7 +165,8 @@ src = (listed("gw") or [{}])[0]
 ok("… mit App, Version, Kanal, Pfad und der Adresse am Plattform-Gateway",
    src == {"name": "kp", "app": "kontext-probe", "version": "1.0.0", "channel": "production",
            "path": "/mcp", "address": f"http://{m.GATEWAY_CONTAINER}:8121/mcp",
-           "door": f"http://{m.GATEWAY_CONTAINER}:8120/platform/mcp/to/kp"}, src)
+           "door": f"http://{m.GATEWAY_CONTAINER}:8120/platform/mcp/to/kp",
+           "discover": f"http://{m.GATEWAY_CONTAINER}:8120/platform/mcp/discover/kp"}, src)
 ok("das Gateway des anderen Mandanten sieht nur seine eigene Quelle",
    [s["name"] for s in listed("fremd-gw") or []] == ["fremd-kp"], listed("fremd-gw"))
 ok("eine Quelle ohne mcp_sources traegt keine Liste",

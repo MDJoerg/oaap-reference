@@ -1747,30 +1747,45 @@ def _act_keys(issuer):
         return keys
 
 
-def _verify_act(scope):
-    """The forward-auth answer at an MCP gateway's door (procedure I)."""
-    target = request.args.get("instance", "")
+def _sources_key_gateway(scope, target):
+    """Step 1 at both MCP doors of a gateway (procedure I, discovery):
+    (gw, gateway principal, tenant, None) or (.., refusal).
+
+    The gateway's own key, limited to exactly this door's scope, and the
+    source in the gateway's tenant."""
     gw = act.gateway_of(scope)
     if not gw or not target:
-        return "Forbidden: not an MCP door", 403
-    # 1. The gateway's own key, limited to exactly this door's scope.
+        return gw, None, None, ("Forbidden: not an MCP door", 403)
     auth = request.headers.get("Authorization", "")
     if auth[:7].lower() != "bearer ":
-        return _key_refusal("invalid_token", "the gateway's sources key is missing")
+        return gw, None, None, _key_refusal(
+            "invalid_token", "the gateway's sources key is missing")
     token = auth[7:].strip()
     gwuser, _m, refusal = _by_key(token, scope)
     if refusal is not None:
-        return refusal
+        return gw, None, None, refusal
     m = KEY_TOKEN_RE.fullmatch(token)
     rec = next((k for k in load_keys() if m and k["id"] == m.group(1)), None)
     if not rec or rec.get("instance") != scope \
             or gwuser.get("username") != f"instance:{gw}" \
             or gwuser.get("kind") != "machine":
-        return _key_refusal("insufficient_scope",
-                            "only this gateway's sources key opens this door", 403)
+        return gw, None, None, _key_refusal(
+            "insufficient_scope",
+            "only this gateway's sources key opens this door", 403)
     want = resolve_tenant(request.args.get("tenant", ""))
     if want is None or resolve_tenant(gwuser.get("tenant")) != want:
-        return "Forbidden: the gateway and the source belong to different tenants", 403
+        return gw, None, None, (
+            "Forbidden: the gateway and the source belong to different tenants", 403)
+    return gw, gwuser, want, None
+
+
+def _verify_act(scope):
+    """The forward-auth answer at an MCP gateway's door (procedure I)."""
+    target = request.args.get("instance", "")
+    # 1. The gateway's own key, limited to exactly this door's scope.
+    gw, _gwuser, want, refusal = _sources_key_gateway(scope, target)
+    if refusal is not None:
+        return refusal
     # 2. The person's credential -- one of two, never both:
     #    the act token (a provider token exchanged for the platform), or
     #    since RFC-0074 the platform's OWN assertion addressed to this
@@ -1880,6 +1895,129 @@ def _act_answer(person, target, want, who, event, procedure):
 
 
 # ---------------------------------------------------------------------------
+# DISCOVERY (RFC-0073 §16, D14/D15): a gateway reads a source's catalog
+# without a person. The door /platform/mcp/discover/<source> sits next to
+# the door of procedure I on the gateway's own site; its forward_auth asks
+# /verify?discover=oaap.mcp.sources:<gateway>&instance=<source>&... and
+# carries the request body base64-encoded in DISCOVER_HEADER
+# (appctl.mcp_discover_lines; a header carries no line break).
+# The body is PARSED here -- never matched as text: a nested "method" or a
+# \u escape defeats every pattern. Only the catalog set passes; the app
+# sees the gateway's machine principal and no assertion (spec 2.11).
+DISCOVER_HEADER = "X-OAAP-MCP-Request"
+DISCOVER_MAX_BYTES = 8192
+DISCOVER_METHODS = frozenset({
+    "initialize", "notifications/initialized", "ping", "tools/list",
+    "resources/list", "resources/templates/list", "prompts/list"})
+DISCOVER_UI_SCHEME = "ui://"
+
+
+def _no_duplicate_keys(pairs):
+    seen = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(f"duplicate key {k!r}")
+        seen[k] = v
+    return seen
+
+
+def discover_body(b64):
+    """The request body from the door's header (strict base64, UTF-8):
+    '' for none, None when it does not decode."""
+    if not b64:
+        return ""
+    if len(b64) > (DISCOVER_MAX_BYTES * 4) // 3 + 8:
+        return None
+    try:
+        return base64.b64decode(b64, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def discover_refusal(http_method, raw):
+    """'' when this request may pass the discovery door, else why not.
+    `raw` is the decoded body; None means the header did not decode.
+
+    POST with exactly one JSON-RPC 2.0 request object whose method is in
+    DISCOVER_METHODS; DELETE (closing the session) without a body. Every
+    other shape -- a call, a read, a batch, a response, a GET, a duplicate
+    key, more than DISCOVER_MAX_BYTES -- is refused. Pure, for the tests."""
+    http_method = (http_method or "").upper()
+    if raw is None:
+        return "the request body did not arrive intact"
+    if http_method == "DELETE":
+        return "" if not raw else "a DELETE carries no body"
+    if http_method != "POST":
+        return f"{http_method or 'this method'} is not a catalog request"
+    if not raw:
+        return "no request body reached the check"
+    if len(raw.encode("utf-8", "surrogatepass")) > DISCOVER_MAX_BYTES:
+        return "the request is larger than a catalog request"
+    try:
+        msg = json.loads(raw, object_pairs_hook=_no_duplicate_keys)
+    except (ValueError, RecursionError):
+        return "the request is not one JSON object"
+    if not isinstance(msg, dict):
+        return "a batch or a bare value is not a catalog request"
+    if msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+        return "not a JSON-RPC 2.0 request"
+    if msg["method"] == "resources/read":
+        # The views of MCP Apps (RFC-0075) are part of the catalog: the
+        # gateway reads and pins what a tool names. ui:// and nothing else,
+        # and no parameter besides the URI (Jörg, 2026-11-18, §16 D14).
+        p = msg.get("params")
+        uri = p.get("uri") if isinstance(p, dict) else None
+        if not (isinstance(uri, str) and uri.startswith(DISCOVER_UI_SCHEME)
+                and len(uri) > len(DISCOVER_UI_SCHEME)
+                and set(p) <= {"uri", "_meta"}):
+            return "resources/read passes only for a view (ui://)"
+        return ""
+    if msg["method"] not in DISCOVER_METHODS:
+        return f"{msg['method']} is not a catalog request"
+    return ""
+
+
+def _verify_discover(scope):
+    """The forward-auth answer at a gateway's discovery door (§16)."""
+    target = request.args.get("instance", "")
+    gw, gwuser, want, refusal = _sources_key_gateway(scope, target)
+    if refusal is not None:
+        return refusal
+    # No person at this door, and no credential that would name one.
+    if request.headers.get(act.HEADER, "").strip() \
+            or request.headers.get(ACT_ASSERTION_HEADER, "").strip():
+        return _key_refusal("invalid_request", "the discovery door carries "
+                            "no person: neither an act token nor an assertion")
+    raw = discover_body(request.headers.get(DISCOVER_HEADER, ""))
+    why = discover_refusal(request.headers.get("X-Forwarded-Method", ""), raw)
+    method = ""
+    if not why and raw:
+        method = json.loads(raw)["method"]
+    who = f"instance:{gw}"
+    if why:
+        audit("mcp.discover", want, target, result="denied", who=who,
+              detail=why[:200])
+        return f"Forbidden: {why} (RFC-0073 §16)", 403
+    maint = maintenance_of(target)
+    if maint is not None and not may_pass_maintenance(gwuser, maint):
+        return maintenance_response(maint)
+    # The source's route, against the gateway's own principal (D15).
+    required = request.args.get("roles", "")
+    groups = request.args.get("groups", "")
+    if required and not set(required.split(",")) & set(gwuser["roles"]):
+        why = "the gateway's principal lacks a role of the source's route"
+    elif groups and not set(groups.split(",")) & set(gwuser.get("groups") or []):
+        why = "the gateway's principal is in no visibility group of the source"
+    if why:
+        audit("mcp.discover", want, target, result="denied", who=who, detail=why)
+        return f"Forbidden: {why}", 403
+    # One line per session opened, not per page of a list.
+    if method == "initialize":
+        audit("mcp.discover", want, target, who=who, detail="catalog read")
+    return "", 204, identity_headers(gwuser, "")
+
+
+# ---------------------------------------------------------------------------
 # PROCEDURE A (RFC-0074 §3.2): a chat acts at its tenant's MCP gateway as
 # the person speaking to it. The door /platform/mcp/via/<gateway>/ exists
 # only on the site of an instance declaring `mcp_client`, one block per
@@ -1959,6 +2097,8 @@ def verify():
     # `uri` is written by appctl), and it switches to a check of its own.
     if request.args.get("act"):
         return _verify_act(request.args.get("act", ""))
+    if request.args.get("discover"):
+        return _verify_discover(request.args.get("discover", ""))
     if request.args.get("via"):
         return _verify_via(request.args.get("via", ""))
     user, _method, refusal = resolve_principal(

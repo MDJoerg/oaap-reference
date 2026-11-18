@@ -15455,7 +15455,8 @@ def mcp_sources_of(insts, scope):
     the platform gateway serves the door: `address` is the source's own
     LAN port behind its routes' roles (procedure T with an agent key,
     RFC-0073 §6), `door` the block on the gateway's OWN site that carries
-    a signed-in person (procedure I, §4)."""
+    a signed-in person (procedure I, §4), `discover` the block next to it
+    that carries only the catalog requests, without a person (§16)."""
     me = insts.get(scope) or {}
     if not me.get("mcp_sources") or is_rehearsal(me):
         return []
@@ -15472,11 +15473,19 @@ def mcp_sources_of(insts, scope):
                     "path": path,
                     "address": f"http://{GATEWAY_CONTAINER}:{i['port']}{path}",
                     "door": (f"http://{GATEWAY_CONTAINER}:{me['port']}"
-                             f"{MCP_DOOR_PREFIX}{k}") if me.get("port") else ""})
+                             f"{MCP_DOOR_PREFIX}{k}") if me.get("port") else "",
+                    "discover": (f"http://{GATEWAY_CONTAINER}:{me['port']}"
+                                 f"{MCP_DISCOVER_PREFIX}{k}") if me.get("port") else ""})
     return out
 
 
 MCP_DOOR_PREFIX = "/platform/mcp/to/"
+# RFC-0073 §16 (D14): the discovery door. The body travels to identity as
+# this header, base64-encoded, which identity decodes and parses; the app gets the same bytes. Capped
+# here as well as in identity -- a catalog request is a few hundred bytes.
+MCP_DISCOVER_PREFIX = "/platform/mcp/discover/"
+MCP_DISCOVER_HEADER = "X-OAAP-MCP-Request"
+MCP_DISCOVER_MAX_BODY = "8KB"
 
 
 def mcp_door_specs(insts, scope):
@@ -15531,6 +15540,45 @@ def mcp_door_lines(insts, scope):
             lines.append("\t\trequest_header -Authorization")
             lines.append("\t\trequest_header -X-OAAP-Act-Token")
             lines.append("\t\trequest_header -X-OAAP-Act-Assertion")
+            lines += _proxy(d["target"], "\t\t")
+            lines.append("\t}")
+    return lines
+
+
+def mcp_discover_lines(insts, scope):
+    """The discovery doors on a consuming gateway's own site (RFC-0073 §16).
+
+    One per source, exactly where the door of procedure I is. A forward
+    auth sees headers only, and the method of an MCP call is in the body;
+    so the body goes to identity as one header ({http.request.body_base64}
+    reads it and puts it back -- measured 2026-11-18 on Caddy 2.11.4:
+    identity got the body as the header and no body, the app the same
+    bytes and not the header). Base64, because a header carries no line
+    break: with the plain body a pretty-printed request ended in a 502
+    (measured the same day); base64 carries every body unchanged. Identity
+    passes only the catalog methods and answers with the gateway's machine
+    principal, never a person (§16.2)."""
+    lines = []
+    for d in mcp_door_specs(insts, scope):
+        uri = f"/verify?roles={','.join(d['roles'])}"
+        if d["groups"]:
+            uri += f"&groups={','.join(d['groups'])}"
+        if d["tenant"]:
+            uri += f"&tenant={d['tenant']}"
+        uri += f"&instance={d['name']}&discover={mcp_sources_scope(scope)}"
+        door = MCP_DISCOVER_PREFIX + d["name"]
+        for matcher in (door, door + "/"):
+            lines.append(f"\thandle {matcher} {{")
+            lines += ["\t\trequest_body {", f"\t\t\tmax_size {MCP_DISCOVER_MAX_BODY}",
+                      "\t\t}"]
+            lines.append(f"\t\trewrite * {d['path']}")
+            lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
+                      f"\t\t\theader_up {MCP_DISCOVER_HEADER} {{http.request.body_base64}}",
+                      "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
+            lines.append("\t\trequest_header -Authorization")
+            lines.append("\t\trequest_header -X-OAAP-Act-Token")
+            lines.append("\t\trequest_header -X-OAAP-Act-Assertion")
+            lines.append(f"\t\trequest_header -{MCP_DISCOVER_HEADER}")
             lines += _proxy(d["target"], "\t\t")
             lines.append("\t}")
     return lines
@@ -16603,12 +16651,14 @@ def _site_identity_stale(body):
     # The source headers of RFC-0061 are stripped the same way and are
     # not identity headers; counting them would call every new site stale.
     # Neither is the act token of RFC-0073, stripped on an MCP door, nor
-    # the site-level strip of NOT_PLATFORM_HEADERS (checked below).
+    # the body header of the discovery door (§16), nor the site-level
+    # strip of NOT_PLATFORM_HEADERS (checked below).
     not_platform = {f"request_header -{h}" for h in NOT_PLATFORM_HEADERS}
     strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")
               and not ln.startswith("request_header -X-OAAP-Source-")
               and ln not in ("request_header -X-OAAP-Act-Token",
-                             "request_header -X-OAAP-Act-Assertion")
+                             "request_header -X-OAAP-Act-Assertion",
+                             f"request_header -{MCP_DISCOVER_HEADER}")
               and ln not in not_platform}
     if strips and strips != {f"request_header -{h}" for h in IDENTITY_HEADERS}:
         return True
@@ -16784,7 +16834,9 @@ CASES_MARKER = "# platform-feedback "
 # 6: /platform/mcp/sources on a consuming gateway's site (RFC-0073).
 # 7: the act assertion is stripped on a /platform/mcp/to door, and a
 #    chat's site carries /platform/mcp/gateways and its via doors (RFC-0074).
-CASES_BLOCK_FORMAT = 7
+# 8: a consuming gateway's site carries a discovery door per source
+#    (RFC-0073 §16).
+CASES_BLOCK_FORMAT = 8
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -16999,6 +17051,8 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
         lines.append("\t}")
         # RFC-0073 stage 2: procedure I, one door per source.
         lines += mcp_door_lines(insts, scope)
+        # RFC-0073 §16: the catalog without a person, next to each door.
+        lines += mcp_discover_lines(insts, scope)
     # RFC-0074 stage 1: on a chat's site, procedure A -- the list of its
     # tenant's gateways and one door per gateway. Never in maintenance,
     # never for a rehearsal (mcp_gateways_of asks the latter).
