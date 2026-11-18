@@ -7802,11 +7802,15 @@ def cmd_migrate_care_url(_args):
     changed = write_internal_care_caddy()
     told = []
     reg = load_registry()
+    names = ",".join(IDENTITY_HEADERS)
     for name, inst in sorted((reg.get("instances") or {}).items()):
         env = load_env(name, inst)
-        if env.get("OAAP_CARE_URL") == care_url():
+        # 0.1.307 (runtime 2.37): the identity headers, in the same pass --
+        # also an address-like fact, also learned at the next recreate.
+        if env.get("OAAP_CARE_URL") == care_url() and env.get("OAAP_IDENTITY_HEADERS") == names:
             continue
         env["OAAP_CARE_URL"] = care_url()
+        env["OAAP_IDENTITY_HEADERS"] = names
         save_env(name, env, inst)
         told.append(name)
     if changed:
@@ -17074,7 +17078,14 @@ IDENTITY_HEADERS = ("X-OAAP-User", "X-OAAP-Roles", "X-OAAP-User-Id",
                     # oaap.core.identity 2.11 (RFC-0066): stripped and
                     # copied like the five, and stripped AGAIN on every
                     # destination call that is not a propagation
-                    "X-OAAP-User-Assertion")
+                    "X-OAAP-User-Assertion",
+                    # 0.1.307 (RFC-0095 D2, identity 2.12): "<issuer> <sub>" of
+                    # the person's binding at the tenant's identity provider,
+                    # empty without one -- so an app (the MCP gateway's /me)
+                    # can match calls signed in at the realm to the person.
+                    # Same list, so stripped, copied and kept out of the log
+                    # like every other.
+                    "X-OAAP-User-Idp")
 ASSERTION_HEADER = "X-OAAP-User-Assertion"
 
 _COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
@@ -23195,6 +23206,10 @@ def _install_from_dir(pkg, args, source):
     # says when it reboots. An address, not a credential -- a rehearsal gets
     # it too, its desk session ends with the same reboot.
     env["OAAP_CARE_URL"] = care_url()
+    # 0.1.307 (runtime 2.37): which identity headers this platform sets and
+    # strips everywhere else. An app may believe a header only when it is
+    # named here -- an older platform let a client send X-OAAP-User-Idp itself.
+    env["OAAP_IDENTITY_HEADERS"] = ",".join(IDENTITY_HEADERS)
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     # RFC-0043: the instance's own names, canonical first, so the app

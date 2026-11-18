@@ -772,6 +772,20 @@ def user_assertion(user, instance):
                           (user.get("idp") or {}).get("propagate") or {})
 
 
+def user_idp(user):
+    """The seventh header's value (spec 2.12, RFC-0095 D2): "<issuer> <sub>" of the
+    person's binding at the tenant's OIDC identity provider, or "". An identifier,
+    never a token; the gateway keeps it out of the access log like the others."""
+    idp = user.get("idp") or {}
+    provider, subject = str(idp.get("provider") or ""), str(idp.get("subject") or "")
+    if not provider.startswith("oidc|") or not subject:
+        return ""
+    issuer = provider[len("oidc|"):]
+    if " " in issuer or " " in subject:
+        return ""
+    return _header_value(f"{issuer} {subject}")
+
+
 def identity_headers(user, instance=""):
     """The trusted headers the gateway copies onto the app's request.
 
@@ -798,6 +812,8 @@ def identity_headers(user, instance=""):
         # 0.6.2: always present, empty where there is none -- the same
         # overwrite rule as the five above.
         assertion.HEADER: user_assertion(user, instance),
+        # 0.1.307: always present, empty where there is none (the overwrite rule).
+        "X-OAAP-User-Idp": user_idp(user),
     }
 
 

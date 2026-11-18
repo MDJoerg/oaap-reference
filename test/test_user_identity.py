@@ -78,7 +78,7 @@ NEW = ("X-OAAP-User-Id", "X-OAAP-Display-Name", "X-OAAP-Email")
 # way out -- stripped and copied like the five, so it belongs on the list.
 ok("die Liste nennt die zwei alten, die drei neuen und die Zusicherung",
    appctl.IDENTITY_HEADERS == ("X-OAAP-User", "X-OAAP-Roles") + NEW
-   + ("X-OAAP-User-Assertion",),
+   + ("X-OAAP-User-Assertion", "X-OAAP-User-Idp"),
    appctl.IDENTITY_HEADERS)
 
 appctl_src = read(PLATFORM_DIR, "appctl.py")
