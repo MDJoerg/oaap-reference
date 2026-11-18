@@ -90,6 +90,7 @@ import authorization  # noqa: E402
 # yet: nothing inside a container needs it, and an admin credential is
 # not a thing to put within reach of one that does not.
 import idp_admin  # noqa: E402
+import user_filter  # noqa: E402
 import move  # noqa: E402
 # The cohort (RFC-0046): what a template may say and how a seat is
 # called. Pure; the acting is cmd_cohort below.
@@ -6242,7 +6243,7 @@ def resolve_instance_ref(reg, ref, tenant_label=""):
 # first argument is sometimes an access id or a token, and a resolver
 # that guessed which would be a second opinion about what was typed.
 INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
-                  "standby", "wake", "maintenance",
+                  "standby", "wake", "maintenance", "login-required",
                   "diagnose", "endpoint", "tile", "resources", "config",
                   "address", "throttle", "artifact", "promote", "catalog-put", "rehearse",
                   "rehearsal")
@@ -17091,6 +17092,10 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     sleeping = bool(scope) and scope in _sleeping
     if bool(scope) and scope in _maintained:
         login_only = True
+    # RFC-0092: the operator's switch. Only the ROUTES are tightened --
+    # /platform/* and the doors with their own credential stay as they are,
+    # which is why this is not simply login_only.
+    strict = bool(scope) and scope in strict_keys()
     # While a diagnosis window is open, THIS instance's requests are
     # logged to a file of its own (RFC-0038 D3). Here, in the one body
     # every entry point shares, so the window covers the LAN port, the
@@ -17147,8 +17152,9 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
                 lines.append(f"\t\treverse_proxy {target_c}:{target_p}")
             lines.append("\t}")
         lines.append(f"\thandle{matcher} {{")
-        gated = bool(roles or "public" not in r["roles"] or login_only)
-        if roles or "public" not in r["roles"] or login_only:
+        gated = bool(roles or "public" not in r["roles"] or login_only
+                     or strict)
+        if gated:
             # No explicit strip here: Caddy's directive order runs
             # request_header AFTER forward_auth, which would wipe the
             # verified headers again. forward_auth's copy_headers
@@ -19907,7 +19913,21 @@ def maintenance_of(inst):
     return m if isinstance(m, dict) and m else None
 
 
-_MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset()}
+_MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset(),
+               "strict": frozenset()}
+
+
+def login_required_of(inst):
+    """RFC-0092: the operator's switch 'login on every route', or None."""
+    m = (inst or {}).get("login_required")
+    return m if isinstance(m, dict) and m else None
+
+
+def strict_keys():
+    """The instances whose every route asks identity (RFC-0092), from the
+    same cached reading of the registry as mode_keys()."""
+    mode_keys()
+    return _MODE_CACHE["strict"]
 
 
 def mode_keys():
@@ -19930,6 +19950,8 @@ def mode_keys():
             k for k, i in insts.items() if i.get("state") in ("standby", "waking"))
         _MODE_CACHE["maintained"] = frozenset(
             k for k, i in insts.items() if maintenance_of(i))
+        _MODE_CACHE["strict"] = frozenset(
+            k for k, i in insts.items() if login_required_of(i))
         _MODE_CACHE["stamp"] = stamp
     return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
 
@@ -20171,6 +20193,43 @@ def maintenance_set(name, inst, on, message="", who="root", role="root"):
             else "is out of maintenance")
 
 
+def login_required_set(name, inst, on, reason="", who="root", role="root"):
+    """RFC-0092: every route of this instance asks identity, the manifest's
+    `public` ones included -- or back to what the package declares."""
+    reg = load_registry()
+    cur = reg["instances"][name]
+    if is_rehearsal(cur):
+        raise DiagnoseRefused("a rehearsal already asks for a login on every "
+                              "route (RFC-0030 2.15.2) -- there is nothing to "
+                              "switch")
+    if on:
+        if login_required_of(cur):
+            return "already asks for a login on every route"
+        cur["login_required"] = {"since": _iso_now(), "by": who,
+                                 "reason": (reason or "").strip()[:300]}
+    else:
+        if not login_required_of(cur):
+            return "does not ask for a login on every route"
+        cur.pop("login_required", None)
+    save_registry(reg)
+    _republish_sites(name, cur)
+    state_view_write()
+    public = sorted(r.get("path", "") for r in (cur.get("routes") or [])
+                    if "public" in (r.get("roles") or []))
+    audit_tenant("instance.login-required", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail=("an" if on else "aus")
+                 + (f" · oeffentliche Routen: {', '.join(public)}" if public
+                    else "")
+                 + (f" · Grund: {reason.strip()[:300]}" if on and reason
+                    and reason.strip() else ""))
+    if on:
+        return ("asks for a login on every route now"
+                + (f" -- closed to anonymous callers: {', '.join(public)}"
+                   if public else " (the package declares no public route)"))
+    return "is back to the routes its package declares"
+
+
 def _mode_cli(args, fn):
     reg = load_registry()
     inst = (reg.get("instances") or {}).get(args.name)
@@ -20194,6 +20253,12 @@ def cmd_standby(args):
 def cmd_wake(args):
     """`oaap app wake <instance>`."""
     _mode_cli(args, lambda n, i, who: wake_instance(n, i, who=who))
+
+
+def cmd_login_required(args):
+    """`oaap app login-required <instance> on|off [--reason TEXT]`."""
+    _mode_cli(args, lambda n, i, who: login_required_set(
+        n, i, args.switch == "on", args.reason, who=who))
 
 
 def cmd_maintenance(args):
@@ -22781,6 +22846,10 @@ def _install_from_dir(pkg, args, source):
     # maintenance", every protected route answered 503.
     if inst and maintenance_of(inst):
         reg["instances"][name]["maintenance"] = dict(inst["maintenance"])
+    # RFC-0092: "login on every route" is the operator's decision about
+    # this instance -- a package update must not reopen its public routes.
+    if inst and login_required_of(inst):
+        reg["instances"][name]["login_required"] = dict(inst["login_required"])
     # RFC-0068: an exception is the operator's decision, never the app's.
     if inst and egress_exception(inst):
         reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
@@ -24523,6 +24592,25 @@ def cmd_user(args):
         if not users:
             print("No users exist.")
             return
+        # I-55: --tenant was silently ignored here and listed the whole
+        # node (found on oaapx01 2026-11-17: 36 instead of 2).
+        tid = ""
+        if args.tenant:
+            tid = resolve_tenant_arg(args.tenant)
+            if not tid:
+                die(f"this node has no tenant '{args.tenant}'")
+        default = ensure_default_tenant()
+        f = user_filter.normalise({"q": args.search, "tenant": tid,
+                                   "state": args.state, "role": args.role,
+                                   "kind": args.kind})
+        f["tenant"] = tid
+        total = len(users)
+        users = [u for u in users if user_filter.matches(
+            u, f, tenant_of=lambda u: resolve_tenant(u.get("tenant"))
+            or default)]
+        if not users:
+            print(f"No user matches ({total} on this node).")
+            return
         for u in users:
             roles = ",".join(u["roles"]) or "-"
             groups = ",".join(u.get("groups") or []) or "-"
@@ -24531,6 +24619,8 @@ def cmd_user(args):
                 status += " (must change password)"
             print(f"{u['username']:<20} roles={roles:<32} groups={groups:<20} "
                   f"{status}{_when_note(u)}")
+        if len(users) != total:
+            print(f"-- {len(users)} of {total} users on this node")
         return
 
     if args.action == "add":
@@ -33359,7 +33449,7 @@ def cmd_process_deploys(_args):
                              or ensure_default_tenant(), subject=name,
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
-        elif action in ("standby", "wake", "maintenance"):
+        elif action in ("standby", "wake", "maintenance", "login-required"):
             # RFC-0059: the portal's own doors (the waking page, later the
             # buttons) -- the same functions the CLI runs.
             if not inst:
@@ -33373,6 +33463,11 @@ def cmd_process_deploys(_args):
                     elif action == "wake":
                         msg = wake_instance(name, inst, who=_who,
                                             role=act_role or "-")
+                    elif action == "login-required":
+                        msg = login_required_set(
+                            name, inst, bool(req.get("on")),
+                            str(req.get("reason") or ""), who=_who,
+                            role=act_role or "-")
                     else:
                         msg = maintenance_set(name, inst,
                                               bool(req.get("on")),
@@ -33416,6 +33511,7 @@ def cmd_process_deploys(_args):
                "diagnose-open": "portal", "diagnose-close": "portal",
                "diagnose-logs": "portal", "restart": "portal",
                "standby": "portal", "wake": "portal", "maintenance": "portal",
+               "login-required": "portal",
                "config": "portal", "token": "portal", "resources": "portal",
                "address": "portal", "throttle": "portal", "cohort": "api",
                "remove": "portal", "create": "portal",
@@ -36675,6 +36771,14 @@ def build_parser():
     pmt.add_argument("--message", default="",
                      help="the sentence shown to visitors")
     pmt.set_defaults(fn=cmd_maintenance)
+    plr = sub.add_parser("login-required",
+                         help="every route asks for a login, the package's "
+                              "public ones included (RFC-0092)")
+    plr.add_argument("name")
+    plr.add_argument("switch", choices=["on", "off"])
+    plr.add_argument("--reason", default="",
+                     help="why; goes into the tenant's log")
+    plr.set_defaults(fn=cmd_login_required)
     pdg = sub.add_parser("diagnose",
                          help="the portal's diagnosis window, from the "
                               "machine (RFC-0038 D2)")
@@ -37263,7 +37367,17 @@ def build_parser():
                     help="'add': the name shown in the portal")
     pu.add_argument("--tenant", default="",
                     help="'add': tenant label or id; default is this node's "
-                         "default tenant")
+                         "default tenant. 'list': only this tenant (I-55)")
+    pu.add_argument("--search", default="",
+                    help="'list': part of user name, display name or e-mail")
+    pu.add_argument("--state", default="",
+                    choices=[""] + list(user_filter.STATES),
+                    help="'list': active, inactive, scheduled, inbox (no "
+                         "role) or password (must change it)")
+    pu.add_argument("--role", default="",
+                    help="'list': only users holding this role")
+    pu.add_argument("--kind", default="", choices=["", "human", "machine"],
+                    help="'list': people or machines")
     pu.add_argument("--password-file", dest="password_file", default="",
                     help="'add': read the initial password from this file")
     pu.add_argument("--generate", action="store_true",

@@ -8,6 +8,7 @@ COPY portal/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY place.py .
 COPY idp.py .
+COPY user_filter.py .
 COPY metrics.py .
 COPY traffic.py .
 # oaap.core.updates 2.6: the host's care state, read from the file the

@@ -41,6 +41,7 @@ if os.path.isfile(os.path.join(_SIBLING, "place.py")):
     sys.path.insert(0, _SIBLING)
 import place  # noqa: E402
 import idp  # noqa: E402
+import user_filter  # noqa: E402
 import relay_view
 import twin_view
 import metrics_view
@@ -583,6 +584,37 @@ USERS_LIST_BODY = """
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
 {% if scope_note %}<p class="muted">Mandant <strong>{{ scope_note }}</strong> —
    Du siehst und verwaltest die Benutzer dieses Mandanten.</p>{% endif %}
+{% if total %}
+<form class="card" method="get" action="/users">
+<style>.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));
+   gap:.2rem .8rem;align-items:end}
+  .filters label{font-size:.82rem;color:var(--oaap-muted);display:block}
+  .filters select,.filters input{margin:.2rem 0 .6rem}</style>
+  <div class="filters">
+    <div style="grid-column:1/-1"><label for="q">Suche</label>
+      <input id="q" name="q" value="{{ f.q }}" placeholder="Benutzername, Anzeigename oder E-Mail"></div>
+    {% if show_tenant %}<div><label for="tenant">Mandant</label>
+      <select id="tenant" name="tenant"><option value="">alle</option>
+      {% for t in opt_tenant %}<option value="{{ t }}"
+        {{ 'selected' if f.tenant == t }}>{{ t }}</option>{% endfor %}</select></div>{% endif %}
+    <div><label for="state">Status</label>
+      <select id="state" name="state"><option value="">alle</option>
+      {% for v, l in opt_state.items() %}<option value="{{ v }}"
+        {{ 'selected' if f.state == v }}>{{ l }}</option>{% endfor %}</select></div>
+    <div><label for="role">Rolle</label>
+      <select id="role" name="role"><option value="">alle</option>
+      {% for r in opt_role %}<option value="{{ r }}"
+        {{ 'selected' if f.role == r }}>{{ r }}</option>{% endfor %}</select></div>
+    <div><label for="kind">Art</label>
+      <select id="kind" name="kind"><option value="">alle</option>
+      {% for v, l in opt_kind.items() %}<option value="{{ v }}"
+        {{ 'selected' if f.kind == v }}>{{ l }}</option>{% endfor %}</select></div>
+  </div>
+  <button>Filtern</button>
+  {% if filtered %}<a class="rowaction" href="/users" style="margin-left:.8rem">Zurücksetzen</a>{% endif %}
+  <span class="muted" style="margin-left:.8rem">{{ matched }} von {{ total }}</span>
+</form>
+{% endif %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
   <tr><th>Benutzername</th><th>Anzeigename</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Rollen</th><th>Gruppen</th><th>Status</th><th></th></tr>
@@ -594,11 +626,20 @@ USERS_LIST_BODY = """
     {% if show_tenant %}<td class="muted">{{ labels.get(u.tenant or default_tenant, "?") }}</td>{% endif %}
     <td>{{ u.roles|join(", ") }}</td>
     <td class="muted">{{ u.groups|join(", ") if u.groups else "–" }}</td>
-    <td><span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span></td>
+    <td><span class="badge {{ '' if u.active else 'off' }}">{{ 'aktiv' if u.active else 'inaktiv' }}</span>{% if u.active and (u.deactivate_at or u.delete_at) %}
+        <span class="badge todo" title="{{ u.schedule_reason }}">bis {{ (u.deactivate_at or u.delete_at)[:10] }}</span>{% endif %}{% if not u.roles %}
+        <span class="badge">Eingang</span>{% endif %}</td>
     <td><a class="rowaction" href="/users/{{ u.username }}">Bearbeiten</a></td>
   </tr>
+  {% else %}
+  <tr><td colspan="7" class="muted">Kein Benutzer passt zu diesem Filter.</td></tr>
   {% endfor %}
 </table>
+{% if pages|default(1) > 1 %}<p>
+  {% if pg > 1 %}<a class="rowaction" href="/users?{{ dict(query, page=pg-1)|urlencode }}">← zurück</a>{% endif %}
+  <span class="muted">Seite {{ pg }} von {{ pages }}</span>
+  {% if pg < pages %}<a class="rowaction" href="/users?{{ dict(query, page=pg+1)|urlencode }}">weiter →</a>{% endif %}
+</p>{% endif %}
 </div>
 <p class="muted">Benutzer werden nicht gelöscht, sondern deaktiviert —
 Apps können sie in ihren Daten referenzieren. Eine <strong>Maschine</strong>
@@ -4021,6 +4062,38 @@ INSTANCE_EDIT_BODY = """
     <button class="secondary">Wartungsmodus einschalten</button>
   </form>
   {% endif %}
+  {% if not i.mode.rehearsal %}
+  <hr>
+  {% if i.mode.strict %}
+  <p><span class="badge todo">Nur mit Anmeldung</span> Jede Route verlangt
+     eine Anmeldung, auch die öffentlichen des Pakets{% if i.mode.s_since %},
+     seit {{ i.mode.s_since }} UTC{% endif %}{% if i.mode.s_by %} (gesetzt von
+     <strong>{{ i.mode.s_by }}</strong>){% endif %}.{% if i.mode.s_reason %}
+     Grund: {{ i.mode.s_reason }}{% endif %}</p>
+  <form method="post" action="/instances/{{ i.key }}/login-required">
+    <input type="hidden" name="tab" value="diagnose">
+    <input type="hidden" name="op" value="off">
+    <button>Wieder wie im Paket</button>
+  </form>
+  {% else %}
+  <p><strong>Anmeldung auf allen Routen:</strong> Dann fragt jede Route die
+     Anmeldung ab, auch die, die das Paket öffentlich macht. Das Paket
+     ändert sich nicht.
+  {% if i.mode.public_routes %}Danach ohne Anmeldung nicht mehr erreichbar:
+     {% for p in i.mode.public_routes %}<code>{{ p }}</code>{{ ', ' if not loop.last }}{% endfor %}.
+     Maschinen, die diese Routen ohne Anmeldung aufrufen (Webhooks,
+     Anzeigen, Statusseiten), werden dann abgewiesen.
+  {% else %}Dieses Paket erklärt keine öffentliche Route; der Schalter
+     ändert nichts.{% endif %}</p>
+  <form method="post" action="/instances/{{ i.key }}/login-required">
+    <input type="hidden" name="tab" value="diagnose">
+    <input type="hidden" name="op" value="on">
+    <label>Grund (steht im Mandantenlog)
+      <input type="text" name="reason" maxlength="300"></label>
+    <button class="secondary">Anmeldung auf allen Routen einschalten</button>
+  </form>
+  {% endif %}
+  {% endif %}
 </div>
 
 """ + CARE_CARD + IMAGE_CARD + """
@@ -5581,11 +5654,32 @@ def users_list():
         return denied
     role, mine = caller_scope()
     users = identity_users()
-    return page(USERS_LIST_BODY, "Benutzer", "users", users=users,
+    labels = {t: tenant_label(t) for t in load_tenants()}
+    default = default_tenant_id()
+    show_tenant = multi_tenant() and role == "server_admin"
+    # I-55: filters in the link, so a filtered view can be shared. The
+    # list is already what this caller may see; the filter only narrows.
+    f = user_filter.normalise(request.args,
+                              tenants=set(labels.values()) if show_tenant
+                              else ())
+    if not show_tenant:
+        f["tenant"] = ""
+    total = len(users)
+    rows = [u for u in users if user_filter.matches(
+        u, f, tenant_of=lambda u: labels.get(u.get("tenant") or default, ""))]
+    shown, pg, pages = user_filter.page_of(rows, request.args.get("page", 1))
+    return page(USERS_LIST_BODY, "Benutzer", "users", users=shown,
+                total=total, matched=len(rows), f=f, filtered=any(f.values()),
+                pg=pg, pages=pages,
+                query={k: v for k, v in f.items() if v},
+                opt_state=user_filter.STATES, opt_kind=user_filter.KINDS,
+                opt_role=sorted({r for u in users for r in u.get("roles") or []}),
+                opt_tenant=sorted({labels.get(u.get("tenant") or default, "")
+                                   for u in users} - {""}),
                 # Named only where there is more than one to name.
-                show_tenant=multi_tenant() and role == "server_admin",
-                labels={t: tenant_label(t) for t in load_tenants()},
-                default_tenant=default_tenant_id(),
+                show_tenant=show_tenant,
+                labels=labels,
+                default_tenant=default,
                 scope_note=(tenant_name(mine) if role == "tenant_admin"
                             and multi_tenant() else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
@@ -11331,6 +11425,7 @@ def _mode_view(inst):
     """Standby und Wartung einer Instanz für die Karte (RFC-0059)."""
     state = inst.get("state") or ""
     m = inst.get("maintenance") or None
+    lr = inst.get("login_required") or None
     sb = inst.get("standby") or {}
     return {
         "state": state if state in ("standby", "waking") else "",
@@ -11340,6 +11435,15 @@ def _mode_view(inst):
         "m_since": str((m or {}).get("since", ""))[:19].replace("T", " "),
         "m_by": (m or {}).get("by", ""),
         "m_message": (m or {}).get("message", ""),
+        # RFC-0092: login on every route
+        "strict": bool(lr),
+        "s_since": str((lr or {}).get("since", ""))[:19].replace("T", " "),
+        "s_by": (lr or {}).get("by", ""),
+        "s_reason": (lr or {}).get("reason", ""),
+        "public_routes": sorted(r.get("path", "") for r in
+                                (inst.get("routes") or [])
+                                if "public" in (r.get("roles") or [])),
+        "rehearsal": bool(inst.get("rehearsal")),
     }
 
 
@@ -11392,6 +11496,20 @@ def instance_maintenance_button(name):
         "Wartungsmodus ist an — nur Verwalter kommen noch hinein." if on
         else "Wartungsmodus ist aus.",
         "Wartungsmodus konnte nicht umgeschaltet werden.",
+        "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
+
+
+@app.post("/instances/<name>/login-required")
+def instance_login_required_button(name):
+    """RFC-0092: jede Route fragt nach der Anmeldung, auch die öffentlichen."""
+    on = request.form.get("op") == "on"
+    reason = (request.form.get("reason") or "").strip()[:300] if on else ""
+    return _mode_action(
+        name, {"action": "login-required", "on": on, "reason": reason},
+        MAINTENANCE_WAIT_SECONDS,
+        "Jede Route verlangt jetzt eine Anmeldung." if on
+        else "Die Instanz folgt wieder den Routen ihres Pakets.",
+        "Der Schalter konnte nicht umgeschaltet werden.",
         "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
 
 
