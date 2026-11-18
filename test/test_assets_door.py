@@ -46,7 +46,7 @@ def manifest(**extra):
 
 
 print("=== Manifest ===")
-ok("0.15 ist die eigene Version", m.MANIFEST_MINOR == 15)
+ok("0.15 kennt die Plattform (0.16 seit RFC-0091 Stufe 3)", m.MANIFEST_MINOR >= 15)
 ok("assets.path unter einer Route: gültig",
    m.assets_door_error(manifest(assets={"path": "/oaap/assets"})) == "")
 cases = [({"path": "http://x/oaap"}, "local path"), ({"path": "//x/y"}, "local path"),

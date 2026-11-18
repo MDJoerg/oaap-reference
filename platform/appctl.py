@@ -5793,7 +5793,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 15     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 16     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -5818,7 +5818,10 @@ MANIFEST_MINOR = 15     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.14 adds link_state.path (RFC-0087 §8.1 -- a tunnel
                         # app says how its tunnel and its targets are);
                         # 0.15 adds assets.path (RFC-0087 §8.2 -- an app
-                        # names its assets and how they hang together)
+                        # names its assets and how they hang together);
+                        # 0.16 adds identity.oidc_client (RFC-0091 stage 3
+                        # -- an app signs in itself through its tenant's
+                        # realm, runtime 2.35)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -8109,6 +8112,32 @@ def cmd_idp(args):
 
     if action == "mail":
         return _idp_mail(args, name, c)
+
+    if action == "app":
+        # RFC-0091 stage 3, oaap.core.tenant 2.9.2: an app's own client in
+        # its tenant's space, or --off to disable it.
+        target = (args.instance or "").strip()
+        if not target:
+            die("which app? `oaap idp app <connector> --instance <name>`")
+        ok, said = app_idp_apply(
+            target, connector_name=name, off=bool(args.off),
+            dry_run=bool(args.dry_run),
+            accept_version=args.accept_version or "",
+            who=os.environ.get("SUDO_USER") or getpass.getuser())
+        if not ok:
+            print("")
+            for line in textwrap.wrap(said, 68):
+                print(line)
+            sys.exit(1)
+        if not args.dry_run:
+            print("")
+            print(said[0].upper() + said[1:] + ".")
+            if not args.off:
+                print("")
+                print("The secret went into the instance's environment and")
+                print("nowhere else. A name the instance gets later needs")
+                print("this command again; a redirect URI is never taken away.")
+        return
 
     if action == "mcp":
         # RFC-0073 stage 3, oaap.core.tenant 2.9.1: a gateway's two
@@ -13839,6 +13868,13 @@ def validate_manifest(m):
                 errs.append("mcp_sources: only 'read' is known")
             elif "read" in m["mcp_sources"] and not isinstance(m["mcp_sources"]["read"], bool):
                 errs.append("mcp_sources.read: true or false")
+        # Manifest 0.16 (runtime 2.35, RFC-0091 stage 3): the app asks for
+        # its own client in its tenant's realm. A typo here must not
+        # decide which address a realm sends a login code to.
+        if "identity" in m:
+            err = oidc_client_error(m)
+            if err:
+                errs.append(err)
         # Manifest 0.12 (RFC-0074 D5): an app that acts at its tenant's MCP
         # gateways as the person speaking to it (procedure A).
         if "mcp_client" in m:
@@ -15068,6 +15104,10 @@ def tenant_check_providers(tenants):
                 for cid in (r.get("audience"), r.get("signin")):
                     if cid:
                         want[cid] = f"a sign-in client of '{k}'"
+            r = i.get("oidc_idp") or {}
+            if r and not r.get("off") and r.get("client_id") \
+                    and resolve_tenant(i.get("tenant")) == tid:
+                want[r["client_id"]] = f"the client of '{k}'"
         admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
                                 c["admin_id"], c["admin_secret"],
                                 auth_realm=c.get("auth_realm", ""))
@@ -15270,6 +15310,277 @@ def mcp_idp_retire(name, inst, who="root"):
     print(f"WARNING: the sign-in clients of '{name}' could not be disabled "
           f"({why}). Disable them by hand in '{rec.get('space')}': "
           + ", ".join(ids) + ".")
+    return False
+
+
+# ------------------------------------- an app's own client (RFC-0091 stage 3)
+# Forgejo answers `git push` over HTTPS itself and cannot sit behind the
+# portal login, so it signs persons in through its tenant's realm. The
+# manifest asks (`identity.oidc_client`, runtime 2.35); the connector that
+# made the tenant's space makes ONE confidential client on an operator's
+# request (tenant 2.9.2), never at install. Three platform-owned variables
+# reach the instance; the record `oidc_idp` says what was made, never the
+# secret. Modelled on the gateway's clients above, on purpose.
+APP_OIDC_VARS = {"issuer": "OAAP_OIDC_ISSUER",
+                 "client_id": "OAAP_OIDC_CLIENT_ID",
+                 "secret": "OAAP_OIDC_CLIENT_SECRET"}
+OIDC_RESERVED_PREFIXES = ("/auth/", "/platform/")
+
+
+def oidc_client_error(m):
+    """'' when `identity:` is a valid declaration, else the sentence."""
+    d = m.get("identity")
+    if not isinstance(d, dict):
+        return "identity: object expected"
+    if set(d) - {"oidc_client"}:
+        return "identity: only 'oidc_client' is known"
+    c = d.get("oidc_client")
+    if c is None:
+        return ""
+    if not isinstance(c, dict):
+        return "identity.oidc_client: object expected"
+    if set(c) - {"redirect_paths", "groups_claim"}:
+        return ("identity.oidc_client: only 'redirect_paths' and "
+                "'groups_claim' are known")
+    if "groups_claim" in c and not isinstance(c["groups_claim"], bool):
+        return "identity.oidc_client.groups_claim: true or false"
+    paths = c.get("redirect_paths")
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 4:
+        return "identity.oidc_client.redirect_paths: a list of one to four paths"
+    for pth in paths:
+        if not isinstance(pth, str) or not MCP_PATH_RE.match(pth) \
+                or "//" in pth or ".." in pth:
+            return (f"identity.oidc_client.redirect_paths: '{pth}' is not a "
+                    "local path (/-rooted, no //, no .., no query)")
+        if any(pth.startswith(x) or pth + "/" == x
+               for x in OIDC_RESERVED_PREFIXES):
+            return (f"identity.oidc_client.redirect_paths: '{pth}' lies under "
+                    "/auth/ or /platform/, which belong to the platform "
+                    "(runtime 2.4)")
+    return ""
+
+
+def oidc_client_of(m_or_inst):
+    """The declaration of a manifest (or the copy in a registry record),
+    normalised, or {} -- {} also for anything invalid."""
+    src = m_or_inst or {}
+    if "identity" in src:                      # a manifest
+        if oidc_client_error(src):
+            return {}
+        c = src["identity"].get("oidc_client")
+    else:                                      # a registry record
+        c = src.get("oidc_client")
+    if not isinstance(c, dict) or not c:
+        return {}
+    paths = [x for x in (c.get("redirect_paths") or []) if isinstance(x, str)]
+    if not paths:
+        return {}
+    return {"redirect_paths": paths,
+            "groups_claim": c.get("groups_claim") is True}
+
+
+def app_redirect_uris(name, inst, paths, ext_conf=None):
+    """Every declared path under every public name, always https: behind
+    an edge the node speaks http, the browser and the realm see https
+    (the same lesson as the sandbox origins, 2026-11-08)."""
+    host, _edge = load_external_conf() if ext_conf is None else ext_conf
+    hosts = dict.fromkeys(instance_names(inst or {})
+                          + instance_auto_hosts(name, inst, ext_host=host))
+    return [f"https://{h}{pth}" for h in hosts for pth in paths]
+
+
+def app_idp_hint(name, tid):
+    """What install says about an app that wants its own client."""
+    t = load_tenants().get(resolve_tenant(tid) or "") or {}
+    prov = t.get("idp") or {}
+    if prov.get("connector") and prov.get("client_id"):
+        return (f"'{name}' can sign persons in through its tenant's realm "
+                f"(identity.oidc_client): `oaap idp app {prov['connector']} "
+                f"--instance {name}` makes its client. Until then it uses "
+                "its own accounts.")
+    return (f"'{name}' could sign persons in through a realm "
+            "(identity.oidc_client), and its tenant has no provider made by "
+            "a connector: it uses its own accounts (tenant 2.9.2).")
+
+
+def app_idp_target(name, connector_name=""):
+    """What an app's client would be made with, or why not.
+
+    Returns (inst, tid, tenant, connector name, connector, refusal)."""
+    inst = load_registry().get("instances", {}).get(name)
+    none = (None, "", {}, "", {})
+    if not inst:
+        return none + (f"no instance called '{name}' on this node",)
+    if not oidc_client_of(inst):
+        return none + (f"'{name}' does not sign persons in itself (its "
+                       "manifest has no `identity: {oidc_client: ...}`), so "
+                       "it has no use for a client",)
+    if is_rehearsal(inst):
+        return none + (f"'{name}' is a rehearsal (RFC-0030): it gets no "
+                       "client of its own",)
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    t = load_tenants().get(tid) or {}
+    label = t.get("label") or tid
+    prov = t.get("idp") or {}
+    if not prov.get("issuer") or not prov.get("client_id"):
+        return none + (f"the tenant '{label}' has no provider yet -- "
+                       f"`oaap idp provision <connector> --tenant {label}` "
+                       "first",)
+    by = prov.get("connector") or ""
+    if not by:
+        return none + (f"the tenant '{label}''s provider was named by hand "
+                       "(`oaap tenant idp`), so OAAP did not make its space "
+                       "and makes no clients in it: create the client by hand "
+                       "and configure the app yourself (oaap.core.tenant "
+                       "2.9.2)",)
+    if connector_name and connector_name != by:
+        return none + (f"the tenant '{label}''s provider was made by the "
+                       f"connector '{by}', not by '{connector_name}'",)
+    c = load_idp_connectors().get(by)
+    if not c:
+        return none + (f"the connector '{by}' that made the tenant '{label}''s "
+                       "provider is no longer on this node (`oaap idp list`)",)
+    return inst, tid, t, by, c, ""
+
+
+def _app_idp_env(name, inst, values):
+    """Write (values) or drop (None) the three variables; recreate the
+    container when anything changed. Returns whether it did."""
+    env = load_env(name, inst)
+    before = dict(env)
+    for field, var in APP_OIDC_VARS.items():
+        if values is None:
+            env.pop(var, None)
+        else:
+            env[var] = str(values.get(field) or "")
+    if env == before:
+        return False
+    save_env(name, env, inst)
+    recreate_instance_containers(name, instance_services(inst),
+                                 inst.get("storage") or [])
+    return True
+
+
+def app_idp_apply(name, connector_name="", off=False, dry_run=False,
+                  accept_version="", who="root", role="root", out=print):
+    """Make (or switch off) an app's own client. (ok, sentence)."""
+    inst, tid, t, cname, c, bad = app_idp_target(name, connector_name)
+    if bad:
+        return False, bad
+    prov = t["idp"]
+    label = t.get("label") or tid
+    space = prov.get("space") or idp_admin.space_for(label)
+    rec = dict(inst.get("oidc_idp") or {})
+    want = oidc_client_of(inst)
+    cid = rec.get("client_id") or idp_admin.app_client_for(instance_name(name, inst))
+    uris = app_redirect_uris(name, inst, want["redirect_paths"])
+    if off:
+        plan = idp_admin.app_off_plan(c["kind"], space, cid)
+    else:
+        plan = idp_admin.app_client_plan(c["kind"], space, cid,
+                                         want["groups_claim"])
+    bad = idp_admin.app_refusal(c["kind"]) or idp_admin.plan_refusal(plan)
+    if bad:
+        return False, bad
+    if not off and not uris:
+        return False, (f"'{name}' has no public name, so there is no address "
+                       "a realm could send a login code back to")
+    word = idp_admin.connector_of(c["kind"])["space_word"]
+    out(f"'{name}' -> {word} '{space}' at {c['base_url']} "
+        f"(connector '{cname}', tenant '{label}')")
+    if off:
+        out(f"  disable      {cid}")
+    else:
+        out(f"  client       {cid}  (confidential, code flow only"
+            + (", groups claim" if want["groups_claim"] else "") + ")")
+        for u in uris:
+            out(f"  redirect     {u}")
+    out("")
+    out("What this may call, in order:")
+    for line in idp_admin.plan_lines(plan):
+        out(line)
+    out("")
+    if dry_run:
+        out("Nothing was called: --dry-run.")
+        return True, "nothing was called (--dry-run)"
+    admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                            c["admin_id"], c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    accept = accept_version or c.get("accept_version", "")
+    reg = load_registry()
+    inst = reg["instances"][name]
+    if off:
+        ok, msg = admin.app_client_off(space, cid, accept)
+        for line in admin.trace:
+            out("  " + line)
+        if not ok:
+            audit_tenant("app.idp", tid, name, "failed", who=who, role=role,
+                         detail="off · " + msg)
+            return False, msg
+        changed = _app_idp_env(name, inst, None)
+        if rec:
+            rec["off"] = _iso_now()
+            rec["off_by"] = who
+            inst["oidc_idp"] = rec
+            save_registry(reg)
+        audit_tenant("app.idp", tid, name, who=who, role=role,
+                     detail=f"off · {space} · {cid} disabled, not deleted")
+        return True, (f"the client of '{name}' is off: {cid} disabled in the "
+                      f"{word} '{space}', not deleted"
+                      + ("; the container was recreated without the "
+                         "settings" if changed else ""))
+    ok, got, msg = admin.app_client(space, cid, uris, want["groups_claim"],
+                                    accept_version=accept)
+    for line in admin.trace:
+        out("  " + line)
+    if not ok:
+        audit_tenant("app.idp", tid, name, "failed", who=who, role=role,
+                     detail="on · " + msg)
+        return False, msg
+    changed = _app_idp_env(name, inst, got)
+    inst["oidc_idp"] = {"connector": cname, "space": space,
+                        "issuer": got["issuer"], "client_id": cid,
+                        "redirect_uris": got["redirect_uris"],
+                        "groups_claim": want["groups_claim"],
+                        "at": _iso_now(), "by": who}
+    save_registry(reg)
+    audit_tenant("app.idp", tid, name, who=who, role=role,
+                 detail=f"on · {space} · {cid} · {len(uris)} redirect URI(s)")
+    return True, (f"'{name}' signs persons in through {got['issuer']} as "
+                  f"{cid}"
+                  + ("; the container was recreated with the settings"
+                     if changed else "; the settings were already in place"))
+
+
+def app_idp_retire(name, inst, who="root"):
+    """At removal (or a redeploy without the declaration): disable the
+    client, never delete it, best effort. Returns whether it did."""
+    rec = (inst or {}).get("oidc_idp") or {}
+    if not rec or rec.get("off"):
+        return True
+    cid = rec.get("client_id") or ""
+    c = load_idp_connectors().get(rec.get("connector") or "")
+    why = ""
+    if not c:
+        why = f"the connector '{rec.get('connector')}' is no longer on this node"
+    else:
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        try:
+            ok, msg = admin.app_client_off(rec.get("space") or "", cid,
+                                           c.get("accept_version", ""))
+        except Exception as e:                # noqa: BLE001
+            ok, msg = False, str(e)
+        if ok:
+            print(f"The sign-in client of '{name}' is disabled in "
+                  f"'{rec.get('space')}', not deleted: {cid}.")
+            audit_tenant("app.idp", resolve_tenant(inst.get("tenant")) or "",
+                         name, who=who, detail=f"off · {cid} disabled, not deleted")
+            return True
+        why = msg
+    print(f"WARNING: the sign-in client of '{name}' could not be disabled "
+          f"({why}). Disable it by hand in '{rec.get('space')}': {cid}.")
     return False
 
 
@@ -18202,6 +18513,9 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_MCP_IDP_ISSUER", "OAAP_MCP_IDP_AUDIENCE",
                 "OAAP_MCP_IDP_SECRET", "OAAP_MCP_IDP_SIGNIN",
                 "OAAP_MCP_IDP_PLATFORM_AUDIENCE",
+                # RFC-0091 stage 3: written by `oaap idp app` only
+                "OAAP_OIDC_ISSUER", "OAAP_OIDC_CLIENT_ID",
+                "OAAP_OIDC_CLIENT_SECRET",
                 "OAAP_CARE_URL"}  # platform-owned, never operator-editable
 
 
@@ -22692,6 +23006,18 @@ def _install_from_dir(pkg, args, source):
             env.pop(v, None)
         print(f"'{name}' gets no sign-in settings (no mcp_sources, or a "
               "rehearsal): OAAP_MCP_IDP_* are no longer handed to the app.")
+    # RFC-0091 stage 3 (runtime 2.35): the app's own client is written by
+    # `oaap idp app` alone. A redeploy keeps the three; a rehearsal or a
+    # manifest without the declaration does not.
+    if not (oidc_client_of(m) and not is_artefact and not rehearsal) \
+            and any(v in env for v in APP_OIDC_VARS.values()):
+        for v in APP_OIDC_VARS.values():
+            env.pop(v, None)
+        print(f"'{name}' gets no sign-in client (no identity.oidc_client, or "
+              "a rehearsal): OAAP_OIDC_* are no longer handed to the app.")
+    elif oidc_client_of(m) and not is_artefact and not rehearsal \
+            and "OAAP_OIDC_CLIENT_ID" not in env:
+        print(app_idp_hint(name, twin_tenant))
     # RFC-0069 stage 3 (runtime 2.28): every instance is told where the node
     # says when it reboots. An address, not a credential -- a rehearsal gets
     # it too, its desk session ends with the same reboot.
@@ -22837,6 +23163,10 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.15 (RFC-0087 §8.2): where the node asks an app for its
         # assets (gateway:8099/a/<name>).
         "assets": ({"path": assets_door(m)} if assets_door(m) else {}),
+        # Manifest 0.16 (runtime 2.35, RFC-0091 stage 3): the app's wish
+        # for its own client in its tenant's realm. A wish, re-read on
+        # every install; what a connector made is `oidc_idp` below.
+        "oidc_client": oidc_client_of(m),
         "build": primary["build"],
         "storage": m.get("storage") or [],
         # non-HTTP endpoints the app DECLARES (RFC-0015) — re-read from the
@@ -22956,6 +23286,15 @@ def _install_from_dir(pkg, args, source):
         if not reg["instances"][name].get("mcp_sources") and not rec.get("off")                 and mcp_idp_retire(name, inst):
             rec["off"], rec["off_by"] = _iso_now(), "redeploy without mcp_sources"
         reg["instances"][name]["mcp_idp"] = rec
+    # RFC-0091 stage 3: what a connector made for this app is a fact about
+    # the provider -- kept. A redeploy that drops the declaration disables
+    # the client, like a removal (tenant 2.9.2).
+    if inst and inst.get("oidc_idp") and not rehearsal:
+        rec = dict(inst["oidc_idp"])
+        if not reg["instances"][name].get("oidc_client") and not rec.get("off") \
+                and app_idp_retire(name, inst):
+            rec["off"], rec["off_by"] = _iso_now(), "redeploy without identity.oidc_client"
+        reg["instances"][name]["oidc_idp"] = rec
     # a granted non-HTTP endpoint (RFC-0015) is the operator's decision to
     # open a port — it survives redeploy like the address. The container
     # was already recreated with its publish mapping (via `granted`).
@@ -23132,6 +23471,11 @@ def remove_instance(reg, name, purge):
         mcp_idp_retire(name, inst)
     except (Exception, SystemExit) as e:        # noqa: BLE001
         print(f"WARNING: the sign-in clients of '{local}' were not disabled: {e}.")
+    # RFC-0091 stage 3 / tenant 2.9.2: the app's own client, the same way.
+    try:
+        app_idp_retire(name, inst)
+    except (Exception, SystemExit) as e:        # noqa: BLE001
+        print(f"WARNING: the sign-in client of '{local}' was not disabled: {e}.")
     if not purge:
         # The kept instance.env is what a reinstall under this name reads.
         # Without its keys the reinstall mints fresh ones (it does so for
@@ -23141,6 +23485,7 @@ def remove_instance(reg, name, purge):
         kept_env = {k: v for k, v in env.items()
                     if k not in INSTANCE_KEY_VARS
                     and k not in MCP_IDP_VARS.values()
+                    and k not in APP_OIDC_VARS.values()
                     and k not in ("OAAP_CASES_URL", "OAAP_CARE_URL",
                                   "OAAP_MCP_SOURCES_URL",
                                   "OAAP_MCP_CLIENT_URL")}
@@ -36985,7 +37330,7 @@ def build_parser():
     pidp.add_argument("action",
                       choices=["list", "add", "remove", "check", "provision",
                                "settings", "export", "admin-group", "mail",
-                               "mcp"])
+                               "mcp", "app"])
     pidp.add_argument("--all", action="store_true",
                       help="for 'mail': every tenant that signs in through "
                            "this connector")

@@ -246,7 +246,8 @@ CONNECTOR_KINDS = {
             "people_key": "users",
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
-                  "export", "admin_group", "groups", "mail", "mcp_clients"),
+                  "export", "admin_group", "groups", "mail", "mcp_clients",
+                  "app_clients"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
@@ -264,7 +265,7 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
 OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups", "mail",
-                  "mcp_clients")
+                  "mcp_clients", "app_clients")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -2027,6 +2028,154 @@ def mcp_off_plan(kind, space, client_ids):
     return plan
 
 
+# ---------------------------------------------------------------------------
+# The client of an app (oaap.core.tenant 2.9.2, RFC-0091 stage 3)
+#
+# ONE confidential client per instance, for an app that signs persons in
+# itself through its tenant's realm (Forgejo: Git over HTTPS cannot pass
+# the portal login). The same posture as the gateway's clients: made on
+# an operator's request, extended and never replaced, disabled and never
+# deleted. The app gets its id and secret -- never anything that can
+# change the realm.
+
+def app_client_for(instance):
+    """`oaap-app-<instance>`, or '' -- named after the INSTANCE, so the
+    console says whose it is and two apps in one realm never share."""
+    base = re.sub(r"[^a-z0-9._-]", "-",
+                  (instance or "").strip().lower()).strip("-")
+    return ("oaap-app-" + base)[:64] if base else ""
+
+
+def _keycloak_app_client_body(client_id, redirect_uris, groups_claim=False,
+                              name=""):
+    """Confidential, authorization code and nothing else.
+
+    No implicit flow, no password grant, no service account: a secret
+    that leaks from the app can then redeem a code the realm handed to
+    one of the app's own addresses, and nothing more.
+    """
+    return {
+        "clientId": client_id,
+        "name": (name or "").strip() or f"OAAP-App ({client_id})",
+        "protocol": "openid-connect",
+        "enabled": True,
+        "publicClient": False,
+        "clientAuthenticatorType": "client-secret",
+        "standardFlowEnabled": True,
+        "implicitFlowEnabled": False,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": False,
+        "redirectUris": list(redirect_uris or []),
+        "webOrigins": [],
+        "protocolMappers": ([_keycloak_group_mapper()] if groups_claim else []),
+    }
+
+
+def _keycloak_app_repair(doc, redirects):
+    """What a FOUND client of this name needs. (refusal, put_body, changes).
+
+    A public client under the name is somebody else's arrangement and is
+    refused, unchanged. Otherwise only what 2.9.2 allows: enabled again
+    and our missing redirect URIs -- added, never taken away. The group
+    mapper is a separate call (`add_group_mapper`)."""
+    doc = dict(doc or {})
+    if doc.get("publicClient"):
+        return (f"a PUBLIC client called '{doc.get('clientId')}' is already "
+                "in this space -- an app's client must be confidential, and "
+                "OAAP does not turn somebody else's client into another "
+                "kind (RFC-0041 K3.3)"), None, []
+    want, changes = dict(doc), []
+    if doc.get("enabled") is False:
+        want["enabled"] = True
+        changes.append("enabled again")
+    absent = missing_redirects(doc, redirects)
+    if absent:
+        want["redirectUris"] = list(doc.get("redirectUris") or []) + absent
+        changes.append("redirect " + ", ".join(absent) + " added")
+    return "", (want if changes else None), changes
+
+
+# A second product is a file with these two functions and a row.
+_APP_BODIES = {
+    "keycloak": (_keycloak_app_client_body, _keycloak_app_repair),
+}
+
+
+def app_refusal(kind):
+    """Why this connector cannot make an app's client."""
+    bad = verb_refusal(kind, "app_clients")
+    if bad:
+        return bad
+    if (kind or "").strip().lower() not in _APP_BODIES:
+        return (f"the connector '{kind}' declares app_clients and has no "
+                "requests for it")
+    return ""
+
+
+def app_client_plan(kind, space, client_id, groups_claim=False):
+    """Every call making an app's client may make, in order."""
+    if app_refusal(kind):
+        return []
+    c = connector_of(kind)
+    word = c["space_word"]
+
+    def p(name, **kw):
+        return path_of(kind, name, space=space, **kw)
+
+    plan = [
+        {"verb": "version", "method": "GET", "when": "always", "writes": False,
+         "path": c["version_path"],
+         "why": f"which {c['product']} is this? checked against the pinned "
+                f"{c['pinned']} BEFORE anything is created"},
+        {"verb": "space", "method": "GET", "when": "always", "writes": False,
+         "path": p("space"),
+         "why": f"the tenant's {word} must be there -- this makes none"},
+        {"verb": "app_clients", "method": "GET", "when": "always",
+         "writes": False, "path": p("clients", query={"clientId": client_id}),
+         "why": f"is '{client_id}' already in this {word}?"},
+        {"verb": "app_clients", "method": "POST", "when": "absent",
+         "writes": True, "path": p("clients"),
+         "why": "create the app's confidential client (code flow only)"},
+        {"verb": "app_clients", "method": "PUT", "when": "found",
+         "writes": True, "path": p("client", uuid="<id>"),
+         "why": "enable it again and add missing redirect URIs -- "
+                "whichever is missing, nothing else, nothing taken away"},
+    ]
+    if groups_claim:
+        plan.append(
+            {"verb": "app_clients", "method": "POST", "when": "different",
+             "writes": True, "path": p("client_mappers", uuid="<id>"),
+             "why": "add the group claim, if a found client has none"})
+    plan.append(
+        {"verb": "app_clients", "method": "GET", "when": "always",
+         "writes": False, "path": p("client_secret", uuid="<id>"),
+         "why": "fetch the client's secret, handed to the instance and "
+                "kept nowhere else"})
+    return plan
+
+
+def app_off_plan(kind, space, client_id):
+    """Disabling an app's client: GET it, PUT `enabled: false`."""
+    if app_refusal(kind):
+        return []
+    c = connector_of(kind)
+    return [
+        {"verb": "version", "method": "GET", "when": "always",
+         "writes": False, "path": c["version_path"],
+         "why": f"which {c['product']} is this? checked before anything "
+                "is changed"},
+        {"verb": "app_clients", "method": "GET", "when": "always",
+         "writes": False,
+         "path": path_of(kind, "clients", space=space,
+                         query={"clientId": client_id}),
+         "why": f"is '{client_id}' there?"},
+        {"verb": "app_clients", "method": "PUT", "when": "found",
+         "writes": True,
+         "path": path_of(kind, "client", space=space, uuid="<id>"),
+         "why": "disable it -- never delete (RFC-0041 K3.3)"},
+    ]
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """An admin call is never followed anywhere.
 
@@ -3227,6 +3376,112 @@ class Admin:
                 return False, err
             self._note(f"disabled '{cid}' (not deleted)")
         return True, "disabled, none deleted"
+
+    def app_client(self, space, client_id, redirect_uris, groups_claim=False,
+                   title="", accept_version=""):
+        """Make (or complete) an app's client. (ok, result, sentence).
+
+        The found client is judged BEFORE anything is written. The
+        tenant's own client is not looked at: the app's client does not
+        depend on it, and a check that is not needed is a refusal
+        nobody can explain."""
+        bad = app_refusal(self.kind) or plan_refusal(
+            app_client_plan(self.kind, space, client_id, groups_claim))
+        if bad:
+            return False, {}, bad
+        bad = space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        if not client_id or not redirect_uris:
+            return False, {}, "a client id and at least one redirect URI are needed"
+        body_of, repair = _APP_BODIES[self.kind]
+        how, seen, err = self._ready(accept_version)
+        if err:
+            return False, {}, err
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        word = self.decl["space_word"]
+        if not exists:
+            return False, {}, (f"there is no {word} '{space}' at {self.base} "
+                               "-- this makes no space; the tenant's provider "
+                               "comes first (`oaap idp provision`)")
+        uuid, doc, err = self.find_client(space, client_id)
+        if err:
+            return False, {}, err
+        if uuid:
+            bad, put, changes = repair(doc, list(redirect_uris))
+            if bad:
+                return False, {}, bad
+            self._note(f"the client '{client_id}' was already there")
+            if put is not None:
+                err = self._put_client(space, uuid, put, "change a client")
+                if err:
+                    return False, {}, err
+                self._note(f"'{client_id}': " + "; ".join(changes))
+                doc = put
+            if groups_claim:
+                ok, msg = self.add_group_mapper(space, uuid, doc)
+                if not ok:
+                    return False, {}, msg
+        else:
+            status, answer, err = self._call(
+                "POST", self._path("clients", space=space),
+                body=body_of(client_id, list(redirect_uris), groups_claim,
+                             title))
+            if err:
+                return False, {}, err
+            if status == 403:
+                return False, {}, self._not_ours(space, "create a client")
+            if status not in (201, 204):
+                return False, {}, (
+                    f"creating the client '{client_id}' answered {status}"
+                    + (f": {answer.get('errorMessage')}"
+                       if isinstance(answer, dict)
+                       and answer.get("errorMessage") else ""))
+            self._note(f"created the client '{client_id}'")
+            uuid, doc, err = self.find_client(space, client_id)
+            if err:
+                return False, {}, err
+            if not uuid:
+                return False, {}, (f"the client '{client_id}' was created and "
+                                   "cannot be found again -- refusing to guess")
+        secret, err = self.client_secret(space, uuid)
+        if err:
+            return False, {}, err
+        return True, {
+            "issuer": issuer_for(self.kind, self.base, space),
+            "client_id": client_id, "secret": secret, "space": space,
+            "redirect_uris": sorted(set((doc or {}).get("redirectUris") or [])
+                                    | set(redirect_uris)),
+            "version": seen, "version_how": how,
+        }, f"the client '{client_id}' is ready in the {word} '{space}'"
+
+    def app_client_off(self, space, client_id, accept_version=""):
+        """Disable an app's client, never delete it. (ok, sentence)."""
+        bad = app_refusal(self.kind) or plan_refusal(
+            app_off_plan(self.kind, space, client_id))
+        if bad:
+            return False, bad
+        _how, _seen, err = self._ready(accept_version)
+        if err:
+            return False, err
+        uuid, doc, err = self.find_client(space, client_id)
+        if err:
+            return False, err
+        if not uuid:
+            self._note(f"'{client_id}' is not in the {self.decl['space_word']} "
+                       f"'{space}' -- nothing to disable")
+            return True, "not there"
+        if doc.get("enabled") is False:
+            self._note(f"'{client_id}' was already disabled")
+            return True, "already disabled"
+        err = self._put_client(space, uuid, dict(doc, enabled=False),
+                               "disable a client")
+        if err:
+            return False, err
+        self._note(f"disabled '{client_id}' (not deleted)")
+        return True, "disabled, not deleted"
 
     def client_states(self, space, client_ids):
         """{client id: 'enabled' | 'disabled' | 'absent'}, error.
