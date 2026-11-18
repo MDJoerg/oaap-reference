@@ -494,8 +494,8 @@ m.save_idp_connectors(held)
 print("B.12 Der Portal-Auftrag")
 br = src[src.index('elif action == "mcp_idp":'):]
 br = br[:br.index("elif action == ", 1)]
-ok("server_admin wird geprueft, bevor die Funktion laeuft",
-   br.index('act_role != "server_admin"') < br.index("mcp_idp_apply("), br[:400])
+ok("die Rolle (server_admin oder tenant_admin) wird geprueft, bevor die Funktion laeuft",
+   br.index('act_role not in ("server_admin", "tenant_admin")') < br.index("mcp_idp_apply("), br[:400])
 ok("eine Ablehnung steht im Protokoll", 'result="denied"' in br)
 
 print("")

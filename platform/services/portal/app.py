@@ -9826,7 +9826,7 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          # MCP (Portal 2.16, RFC-0073 Stufe 3): Quelle und Leser, die
          # Quellen eines Gateways und seine Anmeldung -- aus dem Register.
          "mcp": iv.mcp_view(name, inst, load_instances(), load_tenants(),
-                            server_admin="server_admin" in caller_roles(),
+                            manager=require_instance_admin(name) is None,
                             default_tid=default_tenant_id()),
          # RFC-0081 2.2: a test instance the node archive leaves out says so.
          "backup_out": (_backup_class()["skip_test"]
@@ -9952,16 +9952,16 @@ MCP_IDP_WAIT_SECONDS = 120  # the provider's calls, then the container is recrea
 def instance_mcp_idp(name):
     """A gateway's sign-in clients (oaap.core.portal 2.16, RFC-0073 stage 3).
 
-    server_admin's alone: the connector's credential creates clients at
-    somebody else's server and is the operator's (oaap.core.tenant 2.9).
-    Queued; the worker asks the role again and runs the same function as
-    `oaap idp mcp` -- the button is not the boundary."""
+    server_admin, or (0.1.309, L4) the tenant_admin of THIS instance: the
+    request chooses nothing -- the connector is the one that made the
+    tenant's space, the space is the tenant's own, the two client names
+    follow from the instance (oaap.core.tenant 2.9.1). The credential stays
+    the operator's and never leaves the node. Queued; the worker asks role
+    and tenant again and runs the same function as `oaap idp mcp` -- the
+    button is not the boundary."""
     denied = require_instance_admin(name)
     if denied:
         return denied
-    if "server_admin" not in caller_roles():
-        return ("Zugriff verweigert: Clients beim Anmeldedienst anlegen ist "
-                "Sache des Server-Admins.", 403)
     if not load_instances().get(name):
         return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
     op = request.form.get("op", "")

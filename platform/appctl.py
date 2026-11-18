@@ -33338,9 +33338,12 @@ def cmd_process_deploys(_args):
                     msg = str(e)
         elif action == "mcp_idp":
             # A gateway's sign-in from the portal (oaap.core.portal 2.16,
-            # RFC-0073 stage 3). server_admin's alone: the connector's
-            # credential creates clients at somebody else's server and is
-            # the operator's (oaap.core.tenant 2.9). The same function as
+            # RFC-0073 stage 3). server_admin, or (0.1.309, L4) the
+            # tenant_admin of the instance's tenant -- a request of another
+            # tenant never gets here (cross_tenant above). Nothing in the
+            # request is a choice: connector, space and client names follow
+            # from the tenant and the instance (oaap.core.tenant 2.9.1), and
+            # the credential stays the operator's. The same function as
             # `oaap idp mcp`, which writes its own tenant-log line; a
             # refused request is written here, because nothing ran.
             op = str(req.get("op") or "")
@@ -33351,10 +33354,10 @@ def cmd_process_deploys(_args):
                 msg = "unknown instance"
             elif op not in ("on", "off"):
                 msg = f"unknown mcp_idp op '{op}'"
-            elif act_role != "server_admin":
+            elif act_role not in ("server_admin", "tenant_admin"):
                 msg = ("making or disabling a gateway's sign-in clients "
-                       "requires server_admin -- the connector's credential "
-                       "is the operator's (oaap.core.tenant 2.9)")
+                       "requires server_admin or the tenant_admin of the "
+                       "instance (oaap.core.tenant 2.9.1)")
                 audit_tenant("mcp.idp", tid_here, subject=name,
                              result="denied", who=who,
                              role=act_role or "-", detail=msg)

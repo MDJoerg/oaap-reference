@@ -549,8 +549,12 @@ def _stamp(s):
     return str(s or "")[:16].replace("T", " ")
 
 
-def mcp_view(name, inst, instances, tenants, server_admin=False, default_tid=""):
-    """Die Karte MCP, oder None fuer eine Instanz ohne MCP."""
+def mcp_view(name, inst, instances, tenants, manager=False, default_tid=""):
+    """Die Karte MCP, oder None fuer eine Instanz ohne MCP.
+
+    `manager`: wer die Instanz verwalten darf (server_admin oder der
+    tenant_admin ihres Mandanten) -- seit 0.1.309 (L4) bekommt auch der
+    tenant_admin den Knopf „Anmeldung einrichten“."""
     door, reads = mcp_path(inst), bool((inst or {}).get("mcp_sources"))
     if not door and not reads:
         return None
@@ -592,5 +596,5 @@ def mcp_view(name, inst, instances, tenants, server_admin=False, default_tid="")
             out["why_not"] = ("Der Anmeldedienst des Mandanten wurde von Hand "
                               "eingetragen: die Clients von Hand anlegen und "
                               "MCPGW_* setzen.")
-        out["can_manage"] = bool(server_admin and not out["why_not"])
+        out["can_manage"] = bool(manager and not out["why_not"])
     return out

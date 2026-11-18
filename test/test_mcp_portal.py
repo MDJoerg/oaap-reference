@@ -65,8 +65,11 @@ def write_users(users):
         json.dump(users, f)
 
 
+OTHER, _ = m.tenant_create("anderer")
 write_users([{"username": "root", "roles": ["server_admin"], "tenant": "", "groups": [], "active": True},
-             {"username": "anna", "roles": ["tenant_admin"], "tenant": VU, "groups": [], "active": True}])
+             {"username": "anna", "roles": ["tenant_admin"], "tenant": VU, "groups": [], "active": True},
+             {"username": "bert", "roles": ["tenant_admin"], "tenant": OTHER, "groups": [], "active": True},
+             {"username": "niemand", "roles": ["user"], "tenant": VU, "groups": [], "active": True}])
 
 reg = m.load_registry()
 reg["instances"]["vuebung-mcpgw"] = {
@@ -107,11 +110,17 @@ def log(tid):
 
 
 print("=== der Worker urteilt ===")
+r = queue("niemand", "on")
+ok("ohne Rolle richtet niemand etwas ein, die Funktion laeuft nicht",
+   not r["ok"] and CALLS == [], (r, CALLS))
 r = queue("anna", "on")
-ok("ein tenant_admin richtet nichts ein, die Funktion laeuft nicht",
-   not r["ok"] and "server_admin" in r["message"] and CALLS == [], (r, CALLS))
-ok("... die Absage steht im Protokoll des Mandanten, mit ihr",
-   log(VU) == [("anna", "tenant_admin", "denied")], log(VU))
+ok("L4 (0.1.309): der tenant_admin der Instanz richtet ein -- dieselbe Funktion, mit seiner Rolle",
+   r["ok"] and CALLS == [{"name": "vuebung-mcpgw", "off": False, "who": "anna",
+                          "role": "tenant_admin"}], (r, CALLS))
+CALLS.clear()
+r = queue("bert", "on")
+ok("KOEDER: der tenant_admin eines ANDEREN Mandanten nicht, die Funktion laeuft nicht",
+   not r["ok"] and CALLS == [], (r, CALLS))
 r = queue("root", "sonstwas")
 ok("unbekannte Aktion: abgewiesen, nichts gerufen", not r["ok"] and CALLS == [], r)
 r = queue("root", "on")
@@ -157,7 +166,7 @@ INSTS = {"gw": gw(), "kp": src_inst(), "crm": {"tenant": "t1", "port": 8122},
 
 
 def render(name, insts=INSTS, admin=True):
-    v = iv.mcp_view(name, insts[name], insts, TEN, server_admin=admin, default_tid="t1")
+    v = iv.mcp_view(name, insts[name], insts, TEN, manager=admin, default_tid="t1")
     return v, CARD.render(i={"key": name, "mcp": v})
 
 
@@ -171,11 +180,11 @@ v, h = render("gw")
 ok("Gateway: die Quellen desselben Mandanten, ohne Generalprobe und Fremde",
    [q["name"] for q in v["sources"]] == ["kp"] and v["sources"][0]["door"]
    and "kp-probe" not in h and "fremd-kp" not in h, v["sources"])
-ok("nicht eingerichtet: der Satz und der Knopf fuer den server_admin",
+ok("nicht eingerichtet: der Satz und der Knopf fuer die Verwaltung der Instanz",
    "Nicht eingerichtet" in h and "Anmeldung einrichten" in h
    and 'action="/instances/gw/mcp-idp"' in h and 'value="on"' in h, h[-900:])
 v, h = render("gw", admin=False)
-ok("KOEDER: ein tenant_admin sieht den Stand, aber keinen Knopf",
+ok("KOEDER: wer die Instanz nicht verwaltet, sieht den Stand, aber keinen Knopf",
    "Nicht eingerichtet" in h and "<form" not in h, h[-600:])
 on = dict(INSTS, gw=gw(mcp_idp={"connector": "auth", "space": "vuebung",
                                 "issuer": "http://kc/realms/vuebung",
@@ -208,8 +217,12 @@ ok("Generalprobe: keine Quelle, kein Leser", v["rehearsal"] and "Generalprobe" i
 print("=== die Route ===")
 route = src[src.index("def instance_mcp_idp(name):"):]
 route = route[:route.index("\n@app.")]
-ok("die Rolle wird gefragt, bevor etwas in den Spool geht",
-   route.index('"server_admin" not in caller_roles()') < route.index("_queue_and_wait("), route[:300])
+ok("die Verwaltung der Instanz wird gefragt, bevor etwas in den Spool geht",
+   route.index("require_instance_admin(name)") < route.index("_queue_and_wait("), route[:300])
+ok("L4: kein eigener Riegel mehr nur fuer server_admin",
+   '"server_admin" not in caller_roles()' not in route)
+ok("die Karte bekommt den Knopf fuer jeden, der die Instanz verwaltet",
+   "manager=require_instance_admin(name) is None" in src)
 ok("nur on und off kommen in den Spool",
    route.index('op not in ("on", "off")') < route.index("_queue_and_wait("))
 
