@@ -258,7 +258,9 @@ check("keine App erfaehrt je ihren Mandanten",
 # auf dem Identitaet eine App erreicht -- dieselbe Regel, eigene Pruefung.
 act_fn = ident[ident.find("def _verify_act("):]
 act_fn = act_fn[:act_fn.find("\n@app.")]
-act_headers = act_fn[act_fn.rfind(", 204"):]
+# Only the return line: what follows the function in the file are the
+# comments of procedure A (RFC-0074), which name the tenant on purpose.
+act_headers = act_fn[act_fn.rfind(", 204"):].split("\n")[0]
 check("… auch nicht durch die Tuer eines MCP-Gateways (Verfahren I)",
       "def _verify_act(" in ident and act_headers.startswith(", 204, identity_headers(")
       and "tenant" not in act_headers, act_headers[:120])
@@ -275,11 +277,26 @@ links_src = read("services/portal/fleet_links.py")
 check("die Flotten-Auskunft holt keinen Mandanten selbst",
       "load_tenants" not in fleet and "TENANTS" not in fleet and "tenants.get(" not in fleet,
       "fleet_view reicht nur durch, was fleet_links nach der Preisgabe baut")
+# Die Regel selbst statt fester Anzahlen (Stufe 3b brachte eine dritte
+# Zeile, die Zaehlung wurde rot, die Regel galt weiter):
+#   - das Kennzeichen eines Mandanten wird genau EINMAL gelesen, in
+#     Disclosure.tenant -- ausser auf der lokalen Seite disclosure_view,
+#     die dem eigenen Verwalter seinen eigenen Mandanten zeigt;
+#   - jede Zeile, die einen Mandanten in eine Ausgabezeile schreibt,
+#     schreibt `tname`, und das `tname` davor kam aus d.tenant().
+_outbound = links_src.split("\ndef disclosure_view(")[0] + \
+    "\ndef " + links_src.split("\ndef disclosure_view(")[1].split("\ndef ", 1)[1]
+_lines = links_src.splitlines()
+_writes = [i for i, ln in enumerate(_lines) if 'row["tenant"] =' in ln]
+_from_disclosure = all(
+    _lines[i].strip() == 'row["tenant"] = tname'
+    and next((ln for ln in reversed(_lines[:i]) if "tname =" in ln), "")
+        .strip().startswith("tname = d.tenant(")
+    for i in _writes)
 check("ein Mandantenname entsteht nur in Disclosure.tenant / .thing (RFC-0087 §4)",
-      links_src.count('.get("label")') == 1
+      _outbound.count('.get("label")') == 1
       and 'return (self.tenants.get(tid) or {}).get("label") or tid' in links_src
-      and links_src.count('row["tenant"] = tname') == 2
-      and links_src.count("tname = d.tenant(") >= 2,
+      and len(_writes) >= 2 and _from_disclosure,
       "jede Stelle, die einen Mandanten in eine Zeile schreibt, fragt vorher die Preisgabe")
 
 check("identity schreibt den Mandantenspeicher nicht",

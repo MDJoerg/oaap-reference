@@ -452,7 +452,9 @@ check("abgelehnter Auftrag: Satz ohne ERROR-Vorsilbe, Journalzeilen (Dateinamen)
       and "ERROR" not in msg_, msg_)
 a.cmd_disk = _cmd
 check("Worker: Zweig `disk`, Antwortdatei fuer den Job, Ansicht im Minutentakt",
-      'elif action == "disk":' in src and '"tenant-profile", "disk"):' in src
+      # "disk" in the tuple of job actions -- the tuple grows (fleet-*,
+      # assets-set), so not its closing parenthesis
+      'elif action == "disk":' in src and '"tenant-profile", "disk",' in src
       and src.index("disk_view_write()", src.index("def state_view_write")) > 0)
 check("Minutentakt nur, wo Platten im Spiel sind (sonst kein lsblk auf jedem Knoten)",
       "if os.path.isfile(DISKS_FILE) or os.path.isfile(DISK_VIEW):\n            disk_view_write()"

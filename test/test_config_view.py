@@ -168,7 +168,7 @@ ok("das leere Geheimnis heisst 'nicht gesetzt'",
 ok("der plattform-eigene Schluessel bekommt keine Zeile",
    "OAAP_APP_SECRET" not in by)
 
-start = SRC.index('<form method="post" action="/instances/{{ i.key }}/config">')
+start = SRC.index('<form method="post" action="/instances/{{ i.key }}/config"')
 CARD = Template(SRC[start:SRC.index("</form>", start) + len("</form>")])
 html = CARD.render(i={"key": "gliss", "config": rows})
 ok("im Formular steht der echte Wert im Feld",

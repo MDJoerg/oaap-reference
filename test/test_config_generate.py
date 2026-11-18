@@ -112,7 +112,7 @@ print("")
 print("Der Knopf steht nur, wo die App ihren Wert selbst bestimmt")
 
 # Die ECHTE Vorlage der Konfigurationskarte.
-start = SRC.index('<form method="post" action="/instances/{{ i.key }}/config">')
+start = SRC.index('<form method="post" action="/instances/{{ i.key }}/config"')
 CARD = Template(SRC[start:SRC.index("</form>", start) + len("</form>")])
 
 

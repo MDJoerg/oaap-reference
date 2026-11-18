@@ -135,8 +135,10 @@ print("\n=== remove-profile verweigert bei bestehenden Schemas ===")
 # prüft stattdessen, dass der Code den Fall überhaupt kennt, bevor er
 # das Profil entfernt.
 ok("cmd_node prüft store_schemas() vor dem Entfernen",
-   "store_schemas()" in read("appctl.py").split("def cmd_node")[1].split(
-       "def read_manifest_version")[0])
+   # genau cmd_node( bis zur naechsten Funktion -- "def cmd_node" allein
+   # trifft auch cmd_node_* und eine feste Endmarke wandert mit dem Code
+   "store_schemas()" in read("appctl.py").split("\ndef cmd_node(")[1].split(
+       "\ndef ")[0])
 exited, out = call(m.cmd_node, action="remove-profile", profile="store")
 ok("ohne bestehende Schemas (kein Docker: store_schemas() == []) "
    "geht das Entfernen durch",
@@ -208,8 +210,9 @@ ok("cmd_data prüft auf 'permission denied' getrennt von einem echten "
 
 print("\n=== 'status'/'schemas' lesen ohne root, wie 'store list'/'node show' ===")
 appctl_src = read("appctl.py")
-main_body = appctl_src[appctl_src.index("read_only = ("):]
-main_body = main_body[:main_body.index("if not read_only")]
+# Die Regel steht inzwischen in is_read_only() -- eine Stelle fuer
+# main() (lehnt ab) und 'oaap help' (sagt es).
+main_body = appctl_src.split("def is_read_only(args):")[1].split("\ndef ")[0]
 ok("die read_only-Liste in main() kennt 'data status/schemas' -- ohne "
    "diesen Eintrag verlangt jeder Lesebefehl root, entgegen 'store "
    "list' und 'node show' (gefunden beim Prüfen auf oaap-test)",

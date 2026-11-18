@@ -269,7 +269,10 @@ CARD = ENV.from_string(card)
 # _destination_view aus der Quelle, ohne Flask
 ns = {"json": json, "DESTINATIONS_FILE": os.path.join(DATA, "destinations.json"),
       "CONNECT_STATE": os.path.join(DATA, "none.json"),
-      "resolve_tenant": lambda t: t, "_read_json": lambda p: None}
+      "resolve_tenant": lambda t: t, "_read_json": lambda p: None,
+      # 0.1.286: the view reads tunnels through _connect_data(); no state
+      # written means (conf, None) -- every tunnel reads as not connected
+      "_connect_data": lambda: ({}, None)}
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in ("_dest_target_label",
                                                            "_destination_view"):

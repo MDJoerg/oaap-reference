@@ -87,3 +87,24 @@ non-interactive consents: `OAAP_INSTALL_RUNTIME=1` (Docker),
 
 See [docs/walking-skeleton.md](docs/walking-skeleton.md) for the mapping
 to the spec's conformance tests and known limitations.
+
+## Running the tests
+
+The tests are plain Python files in `test/`, one per topic, each ending
+with exit code 0 when everything passed. Run them on **Linux**, the way
+the platform runs: several services lock files with `fcntl`, which
+Windows does not have, and the services pin their libraries in
+`requirements.txt`.
+
+```bash
+bash test/runner/run.sh                       # every test (~200 files)
+bash test/runner/run.sh test_cohort.py ...    # just these
+```
+
+The runner builds an image from the services' own `requirements.txt`
+(`test/runner/Dockerfile`), mounts the whole `oaap-root` checkout (so
+tests that read `oaap-spec` or `oaap-apps` find them), starts a
+throwaway PostgreSQL 16 for the time-series catalogue and removes it
+afterwards. It needs Docker — on Windows Docker Desktop and Git Bash.
+`test/.env` is hidden from the container. A file that reports `SKIP`
+(exit 2) counts as red: a skipped catalogue is not a green one.

@@ -89,7 +89,7 @@ ok("ohne Haken läuft der Schritt gar nicht",
 
 print("\n=== der Knoten ===")
 SEEN = []
-a._store_lookup = lambda app_id, source_id="", prefer="": (
+a._store_lookup = lambda app_id, source_id="", prefer="", tenant=None, label=None: (
     {"kind": "git", "url": "https://example.invalid/oaap-apps",
      "path": f"apps/{app_id}"}, "0.2.1",
     {"id": "oaap.platform", "name": "Plattform", "trust": "platform"})

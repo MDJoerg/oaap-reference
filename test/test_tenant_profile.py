@@ -105,7 +105,7 @@ CAT = {"webseite": ("verified", "plattform"), "rollen-rechte": ("verified", "pla
 LOOKUPS, INSTALLS = [], []
 
 
-def fake_lookup(app_id, source_id="", prefer=""):
+def fake_lookup(app_id, source_id="", prefer="", tenant=None, label=None):
     LOOKUPS.append((app_id, source_id))
     if app_id not in CAT:
         return None, "", None

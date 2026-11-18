@@ -105,13 +105,28 @@ ok("_tile_url fragt das Profil, bevor es einen Port-Link baut",
              portal, re.S))
 
 print("=== Köder: mit Docker die aufgelöste Compose-Datei ansehen ===")
-if shutil.which("docker"):
+# A `docker` that cannot run `compose` (the stand-in of test/runner, a
+# machine without the plugin) is no Docker for this bait: the first check
+# below used to pass on an EMPTY answer.
+def _compose_works():
+    if not shutil.which("docker"):
+        return False
+    try:
+        return subprocess.run(["docker", "compose", "version"],
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+if _compose_works():
     def ports(bind):
         e = dict(os.environ, OAAP_HTTP_PORT="80", **({"OAAP_APP_PORT_BIND": bind} if bind else {}))
         r = subprocess.run(["docker", "compose", "-f", os.path.join(PLATFORM, "docker-compose.yml"),
                             "config"], capture_output=True, text=True, env=e)
         return r.stdout
-    ok("ohne Variable: Bereich auf 0.0.0.0 oder ohne Host-IP", "host_ip: 127.0.0.1" not in ports(None))
+    plain = ports(None)
+    ok("ohne Variable: Bereich auf 0.0.0.0 oder ohne Host-IP",
+       "services:" in plain and "host_ip: 127.0.0.1" not in plain, plain[-300:])
     ok("mit Variable: host_ip 127.0.0.1", "127.0.0.1" in ports("127.0.0.1"))
 else:
     print("SKIP  kein docker auf dieser Maschine")

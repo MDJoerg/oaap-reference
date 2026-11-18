@@ -293,7 +293,7 @@ class Trust:
     pass
 
 
-a._store_lookup = lambda app_id, source_id="", prefer="": (
+a._store_lookup = lambda app_id, source_id="", prefer="", tenant=None, label=None: (
     {"kind": "git", "url": "https://forge.example/oaap-apps", "path": "apps/" + app_id,
      "ref": ""}, "0.1.2", {"id": "core", "name": "Core", "trust": "official"})
 REAL_LOAD_SECRETS = a.load_cohort_secrets
@@ -991,7 +991,11 @@ def job(op, args=None, role="tenant_admin", tid=None, actor="trainer", tpl_dir=N
     RID[0] += 1
     rid = "%032x" % RID[0]
     if tpl_dir:
-        shutil.copytree(tpl_dir, os.path.join(a.JOBS_DIR, rid, "template"))
+        # symlinks=True: the default FOLLOWS a link and copies its target
+        # as a plain file -- the link test below then never handed the
+        # host a link at all (found when the suite first ran on Linux).
+        shutil.copytree(tpl_dir, os.path.join(a.JOBS_DIR, rid, "template"),
+                        symlinks=True)
     AUDIT.clear()
     ok_, msg = a.cohort_job({"op": op, "args": args or {}}, rid, TID if tid is None else tid,
                             role, actor)
@@ -1056,7 +1060,7 @@ ok("derselbe Auftrag fuer den server_admin: er hat die Freiheit der Kommandozeil
 shutil.rmtree(a._cohort_path(TID, "kurs-git"), ignore_errors=True)
 
 real_lookup = a._store_lookup
-a._store_lookup = lambda app_id, source_id="", prefer="": (
+a._store_lookup = lambda app_id, source_id="", prefer="", tenant=None, label=None: (
     {"kind": "git", "url": "https://x/y", "path": "apps/" + app_id, "ref": ""},
     "0.1", {"id": "wild", "name": "Wild", "trust": "unverified"})
 t_unv = template(os.path.join(WORK, "t-unv"), mutate=lambda t: t.replace("kurs-2026-10", "kurs-unv"))

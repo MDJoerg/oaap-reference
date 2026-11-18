@@ -244,6 +244,13 @@ sys.path.insert(0, os.path.join(HERE, "..", "platform"))
 import appctl as a                                              # noqa: E402
 
 a.METRICS_DIR = STORE
+# Die Messwerte dieser Datei liegen auf einer festen Uhr (BASE ... END,
+# September 2026). `show` fragt "die letzten 24 h ab jetzt" -- mit der
+# echten Uhr war das Fenster ab Ende September leer und der Test rot,
+# ohne dass sich am Code etwas geaendert hatte. Also dieselbe Uhr wie
+# oben (Zeile mit m.window(..., now=END)).
+_real_window = a.metrics.window
+a.metrics.window = lambda d, k, now=None: _real_window(d, k, now=END + 180 if now is None else now)
 
 
 def run(action, window=None):
