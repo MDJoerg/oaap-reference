@@ -5213,6 +5213,8 @@ def write_exposures_caddy():
     # one on oaap-demo within a day (2026-11-11, l9scan) and asked it for
     # .env and id_rsa. Refused here like on every instance site.
     lines += guard_site_lines(GUARD_EXPOSURE_SCOPE, edge)
+    # What a device behind an exposure receives is ours, too.
+    lines += strip_not_platform()
     lines += ["\thandle /auth/* {"] + strip_identity() + \
              ["\t\treverse_proxy identity:8000", "\t}",
               "\thandle {", "\t\troute {"]
@@ -7648,6 +7650,10 @@ def cmd_migrate_identity_headers(_args):
     generated = [f for f in ("external.caddy", "instance-addresses.caddy")
                  if _site_identity_stale(
                      _read_file(os.path.join(CADDY_APPS_DIR, f)) or "")]
+    # 0.1.296: the exposure zone strips NOT_PLATFORM_HEADERS too. Its
+    # writer says whether the file changed, so this stays silent after.
+    if write_exposures_caddy():
+        generated.append(EXPOSE_SITE)
     if not stale and not generated:
         return
     print("")
@@ -16442,6 +16448,29 @@ ASSERTION_HEADER = "X-OAAP-User-Assertion"
 
 _COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
 
+# Names in the platform's namespace that the platform NEVER sets on a
+# request to an app (oaap.core.identity 2.6: no X-OAAP-Groups exists or
+# is planned; no tenant header either -- an app knows its tenant from
+# its own instance). Measured on oaap-test 2026-11-17: a client-sent
+# X-OAAP-Groups and X-OAAP-Tenant reached the app untouched, because the
+# anti-spoofing above only ever covered the names it copies -- and the
+# marketplace believed the groups. A header with OUR prefix that the
+# app receives must be one we wrote.
+#
+# Why a list and not `request_header -X-OAAP-*`: the strip has to run at
+# SITE level, before forward_auth (Caddy's order would otherwise wipe the
+# verified headers), and some X-OAAP-* names are legitimately sent BY
+# the client TO the gateway there -- the act token of an MCP door
+# (RFC-0073) is read by identity's /verify. A prefix strip would cut it.
+# X-OAAP-Tenant stays legitimate towards the platform itself: the
+# connector's /connect/tunnel on the portal apex, never an app site.
+NOT_PLATFORM_HEADERS = ("X-OAAP-Groups", "X-OAAP-Tenant")
+
+
+def strip_not_platform(indent="\t"):
+    """Site-level strip of the names the platform never sets (see above)."""
+    return [f"{indent}request_header -{h}" for h in NOT_PLATFORM_HEADERS]
+
 
 def strip_identity(indent="\t\t", keep=()):
     """Drop every client-sent identity header (contract guarantee 1).
@@ -16469,12 +16498,22 @@ def _site_identity_stale(body):
     lines = [ln.strip() for ln in (body or "").splitlines()]
     # The source headers of RFC-0061 are stripped the same way and are
     # not identity headers; counting them would call every new site stale.
-    # Neither is the act token of RFC-0073, stripped on an MCP door.
+    # Neither is the act token of RFC-0073, stripped on an MCP door, nor
+    # the site-level strip of NOT_PLATFORM_HEADERS (checked below).
+    not_platform = {f"request_header -{h}" for h in NOT_PLATFORM_HEADERS}
     strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")
               and not ln.startswith("request_header -X-OAAP-Source-")
               and ln not in ("request_header -X-OAAP-Act-Token",
-                             "request_header -X-OAAP-Act-Assertion")}
+                             "request_header -X-OAAP-Act-Assertion")
+              and ln not in not_platform}
     if strips and strips != {f"request_header -{h}" for h in IDENTITY_HEADERS}:
+        return True
+    # 0.1.296: every instance body (one per site, several in
+    # external.caddy / instance-addresses.caddy) carries the site-level
+    # strip once. Counted against its cases marker, which every instance
+    # body has and the portal apex body (also in external.caddy) has not.
+    bodies = sum(1 for ln in lines if ln.startswith(CASES_MARKER))
+    if any(lines.count(s) < bodies for s in not_platform):
         return True
     return any(ln.startswith("copy_headers ") and ln != _COPY_IDENTITY
                for ln in lines)
@@ -16974,6 +17013,9 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     # RFC does not turn on permanent per-instance logging.
     lines = list(diagnose_site_lines(scope))
     lines += guard_site_lines(scope, edge)
+    # Site level: runs before every handle block, so before forward_auth
+    # (NOT_PLATFORM_HEADERS says why a list and not a prefix).
+    lines += strip_not_platform()
     lines.append("\thandle /auth/* {")
     lines += strip_identity()
     lines.append("\t\treverse_proxy identity:8000")
