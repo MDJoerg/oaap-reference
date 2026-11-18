@@ -2164,17 +2164,23 @@ STORE_APP_BODY = """
     <p class="muted" style="margin:.2rem 0 .6rem">Wird im Mandanten
        <strong>{{ target.label }}</strong> installiert.</p>
     {% endif %}
-    {% if instances %}
-    <label for="new_name">Name der neuen Instanz</label>
-    <input id="new_name" name="name" required pattern="[a-z0-9][a-z0-9-]*"
-           placeholder="{{ a.id }}-2">
-    <input type="hidden" name="new" value="1">
-    {% else %}
-    <label for="new_name">Name der Instanz <span class="muted">(leer = {{ a.id }})</span></label>
+    {# I-61 (2026-11-18): the name counts INSIDE the chosen tenant. The
+       node-wide key is derived (<tenant>-<name>), never typed. Until
+       0.1.302 this field became mandatory with "<app>-2" as soon as the
+       caller could see ANY instance of the app -- for a server_admin one
+       in another tenant was enough, and keys like bec-bec-help followed. #}
+    <label for="new_name">Name im Mandanten <span class="muted">(leer = {{ a.id }})</span></label>
     <input id="new_name" name="name" pattern="[a-z0-9][a-z0-9-]*" placeholder="{{ a.id }}">
-    <p class="muted" style="margin:.1rem 0 .6rem">Der Name steht in der Adresse:
-       <code>&lt;Name&gt;.&lt;Mandant&gt;.…</code>. Ein unauffälliger Name lockt weniger
-       Scanner an als der Name der App.</p>
+    <input type="hidden" name="new" value="1">
+    <p class="muted" style="margin:.1rem 0 .6rem">Der Name gilt nur im Mandanten und steht in
+       der Adresse: <code>&lt;Name&gt;.&lt;Mandant&gt;.…</code>. Derselbe Name darf in
+       mehreren Mandanten vorkommen; auf dem Knoten heißt die Instanz dann
+       <code>&lt;Mandant&gt;-&lt;Name&gt;</code>, das setzt der Knoten selbst.
+       Ein unauffälliger Name lockt weniger Scanner an als der Name der App.</p>
+    {% if instances %}
+    <p class="muted" style="margin:0 0 .6rem">Schon vergeben:
+      {% for i in instances %}<code>{{ i.name }}</code>{% if i.tenant %} (in {{ i.tenant }}){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+      — im selben Mandanten braucht eine weitere Instanz einen anderen Namen.</p>
     {% endif %}
     <p style="margin:.2rem 0 .4rem"><strong>Wohin?</strong></p>
     <label class="checkline"><input type="radio" name="channel" value="production" checked>
@@ -8878,6 +8884,10 @@ def store_install():
     # updating the first). The host judges both again.
     update = request.form.get("update", "").strip()
     new_name = request.form.get("name", "").strip().lower()
+    # I-61: the dialog always asks for a NEW instance; an empty name is the
+    # app id, judged against the chosen tenant below and again on the host.
+    if request.form.get("new") and not new_name and not update:
+        new_name = app_id
     # A name on the FIRST install too: "mg" instead of the app id
     # (Jörg 2026-11-13) -- a name of its own is a new instance by name.
     wants_new = (bool(request.form.get("new"))

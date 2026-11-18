@@ -90,6 +90,8 @@ import authorization  # noqa: E402
 # yet: nothing inside a container needs it, and an admin credential is
 # not a thing to put within reach of one that does not.
 import idp_admin  # noqa: E402
+# RFC-0094: the documentation an app brings -- pure rules, tested on paper.
+import docs_publish  # noqa: E402
 import user_filter  # noqa: E402
 import move  # noqa: E402
 # The cohort (RFC-0046): what a template may say and how a seat is
@@ -5793,7 +5795,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 16     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 17     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -5821,7 +5823,10 @@ MANIFEST_MINOR = 16     # 0.2 adds app.class (runtime spec 2.10);
                         # names its assets and how they hang together);
                         # 0.16 adds identity.oidc_client (RFC-0091 stage 3
                         # -- an app signs in itself through its tenant's
-                        # realm, runtime 2.35)
+                        # realm, runtime 2.35);
+                        # 0.17 adds docs and docs_sources (RFC-0094 -- an
+                        # app brings its documentation, help in the same
+                        # tenant reads it, runtime 2.36)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -13868,6 +13873,13 @@ def validate_manifest(m):
                 errs.append("mcp_sources: only 'read' is known")
             elif "read" in m["mcp_sources"] and not isinstance(m["mcp_sources"]["read"], bool):
                 errs.append("mcp_sources.read: true or false")
+        # Manifest 0.17 (runtime 2.36, RFC-0094): the app's help products
+        # and help's wish to read them. A typo must not decide which files
+        # of a package reach another app.
+        if "docs" in m or "docs_sources" in m:
+            err = docs_publish.declaration_error(m)
+            if err:
+                errs.append(err)
         # Manifest 0.16 (runtime 2.35, RFC-0091 stage 3): the app asks for
         # its own client in its tenant's realm. A typo here must not
         # decide which address a realm sends a login code to.
@@ -15609,6 +15621,131 @@ def app_idp_retire(name, inst, who="root"):
     print(f"WARNING: the sign-in client of '{name}' could not be disabled "
           f"({why}). Disable it by hand in '{rec.get('space')}': {cid}.")
     return False
+
+
+# ------------------------------------------- documentation (RFC-0094)
+# An app declares help products (`docs:`); at every install, update,
+# promotion and removal the node copies exactly those folders out of the
+# bytes in service into `tenants/<tid>/docs/<instance-id>/<version>/`,
+# and keeps `tenants/<tid>/docs/index.json` -- what is current. A help
+# instance of the same tenant that declares `docs_sources` gets that
+# directory read-only at /oaap/docs. Keyed by instance ID, so a rename
+# moves nothing; only the current version is kept (RFC-0094 D3).
+DOCS_MOUNT = "/oaap/docs"
+
+
+def docs_root(tid):
+    return os.path.join(tenant_dir(tid), "docs")
+
+
+def docs_mount_of(name, stored, inst=None):
+    """The host directory to mount for a help instance, or ''."""
+    rec = {**(inst or {}), **(stored or {})}
+    if not rec.get("docs_sources") or is_rehearsal(rec):
+        return ""
+    tid = resolve_tenant(rec.get("tenant"))
+    if not tid:
+        return ""
+    root = docs_root(tid)
+    os.makedirs(root, mode=0o755, exist_ok=True)
+    os.chmod(root, 0o755)
+    return root
+
+
+def docs_publish_instance(name, inst, pkg):
+    """Copy the instance's help products out of the unpacked package; drop
+    what an earlier version left. Says what it did; returns the set."""
+    tid = resolve_tenant(inst.get("tenant"))
+    iid = inst.get("id")
+    if not tid or not iid:
+        return None
+    base = os.path.join(docs_root(tid), iid)
+    products = inst.get("docs") or []
+    if not products or is_rehearsal(inst):
+        if os.path.isdir(base):
+            shutil.rmtree(base, ignore_errors=True)
+            docs_index_refresh(tid)
+        return None
+    version = re.sub(r"[^0-9A-Za-z._+-]", "_", str(inst.get("version") or "0"))
+    os.makedirs(docs_root(tid), mode=0o755, exist_ok=True)
+    tmp = os.path.join(docs_root(tid), f".{iid}.new")
+    shutil.rmtree(tmp, ignore_errors=True)
+    dest = os.path.join(tmp, version)
+    os.makedirs(dest, mode=0o755)
+    published, dropped = docs_publish.extract(pkg, products, dest)
+    doc = {"v": 1, "instance": name, "name": instance_name(name, inst),
+           "instance_id": iid, "app_id": inst.get("app_id", ""),
+           "app_name": inst.get("app_name") or inst.get("app_id", ""),
+           "version": inst.get("version", ""), "channel": inst.get("channel", ""),
+           "published": _iso_now(), "products": published, "dropped": dropped}
+    docs_publish.write_json(os.path.join(dest, "docs.json"), doc)
+    for d, _sub, files in os.walk(tmp):
+        os.chmod(d, 0o755)
+    old = base + ".old"
+    shutil.rmtree(old, ignore_errors=True)
+    if os.path.isdir(base):
+        os.replace(base, old)
+    os.replace(tmp, base)
+    shutil.rmtree(old, ignore_errors=True)
+    docs_index_refresh(tid)
+    for p in published:
+        print(f"Documentation '{p['product']}' ({p['files']} files) handed to the "
+              f"tenant's help (RFC-0094).")
+    for x in dropped:
+        print(f"WARNING: documentation '{x['product']}' not handed over: {x['reason']}")
+    audit_tenant("instance.docs", tid, subject=instance_name(name, inst),
+                 detail=f"{doc['version']} · " + ", ".join(
+                     f"{p['product']} ({p['files']})" for p in published)
+                 + ("" if not dropped else " · dropped: " + ", ".join(
+                     x["product"] for x in dropped)))
+    return doc
+
+
+def docs_retire_instance(name, inst, reg=None):
+    tid = resolve_tenant((inst or {}).get("tenant"))
+    iid = (inst or {}).get("id")
+    if not tid or not iid:
+        return
+    base = os.path.join(docs_root(tid), iid)
+    if os.path.isdir(base):
+        shutil.rmtree(base, ignore_errors=True)
+        docs_index_refresh(tid, reg)
+
+
+def docs_index_refresh(tid, reg=None):
+    """Write `index.json`: every current documentation set of the tenant,
+    with the instance's CURRENT name and visibility from the registry."""
+    root = docs_root(tid)
+    if not os.path.isdir(root):
+        return None
+    reg = load_registry() if reg is None else reg
+    by_id = {i.get("id"): (k, i) for k, i in (reg.get("instances") or {}).items()
+             if resolve_tenant(i.get("tenant")) == tid}
+    sets = []
+    for iid in sorted(os.listdir(root)):
+        d = os.path.join(root, iid)
+        if iid.startswith(".") or not os.path.isdir(d) or iid not in by_id:
+            continue
+        key, inst = by_id[iid]
+        for version in sorted(os.listdir(d)):
+            meta = os.path.join(d, version, "docs.json")
+            try:
+                with open(meta, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (OSError, ValueError):
+                continue
+            sets.append({"dir": f"{iid}/{version}", "instance": key,
+                         "name": instance_name(key, inst),
+                         "app_id": doc.get("app_id", ""), "app_name": doc.get("app_name", ""),
+                         "version": doc.get("version", ""),
+                         "channel": inst.get("channel", ""),
+                         "visibility": inst.get("visibility") or {},
+                         "products": doc.get("products") or []})
+    t = load_tenants().get(tid) or {}
+    docs_publish.write_json(os.path.join(root, "index.json"), {
+        "v": 1, "tenant": t.get("label") or tid, "updated": _iso_now(),
+        "sets": sets})
+    return sets
 
 
 # ------------------------------------------------ MCP sources (RFC-0073)
@@ -18969,6 +19106,12 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
                 os.makedirs(x["host"], exist_ok=True)
                 mounts += ["-v", f"{x['host']}:{x['mount']}"
                            + (":ro" if x.get("ro") else "")]
+            # RFC-0094 (runtime 2.36): a help reads the documentation of
+            # its own tenant's apps, read-only. Asked of the registry like
+            # the shared folders; never for a rehearsal.
+            dmount = docs_mount_of(name, stored, inst)
+            if dmount:
+                mounts += ["-v", f"{dmount}:{DOCS_MOUNT}:ro"]
         for st in storage or []:
             if (st.get("service") or primary) != s["service"]:
                 continue
@@ -23177,6 +23320,11 @@ def _install_from_dir(pkg, args, source):
         # describe the app, neither is an operator's decision.
         "mcp": ({"path": mcp_door(m)} if mcp_door(m) else {}),
         "mcp_sources": mcp_sources_wanted(m),
+        # Manifest 0.17 (RFC-0094): the help products this app brings, and
+        # whether it is a help that reads those of its tenant. Re-read on
+        # every install, like `mcp`: both describe the app.
+        "docs": docs_publish.products_of(m),
+        "docs_sources": docs_publish.docs_sources_wanted(m),
         # Manifest 0.12 (RFC-0074): this app acts at its tenant's MCP
         # gateways as the person speaking to it.
         "mcp_client": mcp_client_wanted(m),
@@ -23350,6 +23498,12 @@ def _install_from_dir(pkg, args, source):
     # the record existed differ from the names it carries, the container
     # is recreated once here rather than told a wrong list.
     sync_instance_names(reg, only=name)
+    # RFC-0094 (runtime 2.36): hand the app's documentation to its tenant.
+    # Never fails the install -- a documentation problem is said, not fatal.
+    try:
+        docs_publish_instance(name, reg["instances"][name], pkg)
+    except Exception as e:                      # noqa: BLE001
+        print(f"WARNING: the documentation of '{name}' was not handed over: {e}")
     print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
     print(f"Entry point: port {port} (through the gateway, login required)")
     try:
@@ -23441,6 +23595,12 @@ def remove_instance(reg, name, purge):
             print(f"WARNING: grant base of '{name}' not removed: {e}", file=sys.stderr)
     for other in partners:
         teardown_link_network(name, other)
+    # RFC-0094: its documentation leaves the tenant's help with it
+    try:
+        docs_retire_instance(name, inst, reg)
+    except Exception as e:                      # noqa: BLE001
+        print(f"WARNING: the documentation of '{name}' was not removed: {e}",
+              file=sys.stderr)
     # drop the instance's own network (disconnects the gateway first)
     remove_app_network(name)
     site = os.path.join(CADDY_APPS_DIR, f"{name}.caddy")
@@ -23756,6 +23916,10 @@ def rename_instance(reg, key, new, grace, who="root"):
     refresh_generated_sites()
     refresh_name_links()
     reload_gateway()
+    try:
+        docs_index_refresh(tid)                 # RFC-0094: names in the index
+    except Exception:                           # noqa: BLE001
+        pass
     audit_tenant("instance.rename", tid, subject=new, detail=f"was '{local}'",
                  who=who)
     return new_key
