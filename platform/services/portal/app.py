@@ -5152,7 +5152,9 @@ def launchpad_tiles(user_roles, user_groups, host, user_tenant=None,
             "channel": channel,
             "channel_label": CHANNEL_LABELS.get(channel, channel),
             "description": inst.get("description", ""),
-            "url": _tile_url(name, inst, host, ext, on_lan),
+            # RFC-0095 D10: a caller whom the root would refuse opens the
+            # route their role reaches (the MCP gateway's /me), not a 403.
+            "url": _tile_url(name, inst, host, ext, on_lan) + iv.tile_entry(inst, user_roles),
             "rehearsal": iv.rehearsal_view(inst),
             # RFC-0036 D2: a developer-suggested section label, re-read
             # from the manifest at install time like app_class — never

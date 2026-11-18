@@ -129,6 +129,31 @@ def tile_visible(inst):
     return app_class(inst) != "service"
 
 
+def tile_entry(inst, roles):
+    """The path a tile opens for a caller with these roles -- "" for the root.
+
+    The launchpad shows an instance to everyone whose roles meet ANY of its
+    routes. An app whose root is `admin` and that has a smaller page for
+    persons (the MCP gateway's `/me`, RFC-0095 D10) would otherwise show a
+    tile that answers 403 on click. So: if the root route lets this caller
+    in (or is public, or the app declares no root route), the tile opens the
+    root as always; otherwise the first route, in manifest order, that does.
+    Display only -- the gateway checks every request regardless."""
+    routes = [r for r in (inst.get("routes") or []) if isinstance(r, dict)]
+    root = next((r for r in routes if (r.get("path") or "/").rstrip("/") == ""), None)
+    if root is None:
+        return ""
+    allowed = set(root.get("roles") or [])
+    if "public" in allowed or roles & allowed:
+        return ""
+    for r in routes:
+        allowed = set(r.get("roles") or [])
+        path = (r.get("path") or "").strip("/")
+        if path and "public" not in allowed and roles & allowed:
+            return path
+    return ""
+
+
 def tile_reason(inst):
     """One sentence for the instance page: why it is (not) on the launchpad.
 

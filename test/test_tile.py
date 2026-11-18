@@ -311,5 +311,27 @@ for fn in sorted(f for f in os.listdir(PORTAL) if f.endswith(".py")):
     ok(f"{fn}: jeder benutzte Modulname ist auch importiert",
        not missing, f"nirgends gebunden: {missing}")
 
+print("\n=== where the tile leads (RFC-0095 D10) ===")
+GW_ROUTES = [{"path": "/mcp", "roles": ["public"]},
+             {"path": "/.well-known/oauth-protected-resource", "roles": ["public"]},
+             {"path": "/me", "roles": ["user", "keyuser", "admin"]},
+             {"path": "/", "roles": ["admin"]}]
+ok("the MCP gateway: an admin opens the root",
+   iv.tile_entry(inst(routes=GW_ROUTES), {"admin", "user"}) == "")
+ok("a person opens /me, not the root that would answer 403",
+   iv.tile_entry(inst(routes=GW_ROUTES), {"user"}) == "me")
+ok("a public route is never the target (it is not the person's page)",
+   iv.tile_entry(inst(routes=[{"path": "/api", "roles": ["public"]},
+                              {"path": "/", "roles": ["admin"]}]), {"user"}) == "")
+ok("an app whose root lets the person in: root as always",
+   iv.tile_entry(inst(routes=[{"path": "/admin", "roles": ["admin"]},
+                              {"path": "/", "roles": ["user", "admin"]}]), {"user"}) == "")
+ok("an instance from before routes were recorded: root",
+   iv.tile_entry(inst(), {"user"}) == "")
+ok("the portal appends it to the tile's address",
+   "_tile_url(name, inst, host, ext, on_lan) + iv.tile_entry(inst, user_roles)"
+   in open(os.path.join(HERE, "..", "platform", "services", "portal", "app.py"),
+           encoding="utf-8").read())
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)
