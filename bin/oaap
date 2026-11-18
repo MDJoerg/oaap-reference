@@ -95,9 +95,17 @@ host_care.print_status(host_care.read(sys.argv[2]))' "$APP_DIR/services" "$OAAP_
   # RFC-0068: what Docker and the node say now; nothing on an open node.
   egress="$(python3 "$APP_DIR/appctl.py" egress-faults 2>/dev/null || true)"
   [ -z "$egress" ] || echo "$egress"
+  # 0.1.302 (L18): without the node's assertion key no person can act
+  # through a chat or an MCP gateway, and nothing else would say so.
+  akey="$(OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" assertion-key-state 2>/dev/null || echo unknown)"
+  case "$akey" in
+    present) echo "Assertion key: present" ;;
+    MISSING) echo "Assertion key: MISSING -- persons cannot act through chat or MCP gateways; run 'sudo oaap update'." ;;
+    *)       echo "Assertion key: unknown (run with sudo)" ;;
+  esac
   echo ""
   if [ "$running" -eq "$total" ] && [ "$total" -gt 0 ] && [ "$apps_running" -eq "$apps_total" ] \
-     && ! printf '%s' "$egress" | grep -q FAULT; then
+     && ! printf '%s' "$egress" | grep -q FAULT && [ "$akey" != "MISSING" ]; then
     echo "Overall: HEALTHY ($running/$total core services, $apps_running/$apps_total apps running$([ "$sleeping" -gt 0 ] && echo ", $sleeping in standby"))"
   else
     echo "Overall: DEGRADED ($running/$total core services, $apps_running/$apps_total apps running)"

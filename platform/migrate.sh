@@ -445,6 +445,14 @@ EOF
     || say "  WARNING: the rehearsal sweep timer could not be enabled."
 fi
 
+# --- the node's assertion key (0.1.302, L18) ---
+# identity signs a person's assertion with it; without it every chat round
+# and every MCP call on a person's behalf is refused. Before 0.1.302 it was
+# made only for delegation and principal propagation, so oaapx01 never had
+# one. Now every node has it. Silent when it is there.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-assertion-key \
+  2>&1 | sed 's/^/  /' || say "  WARNING: the assertion key could not be made -- persons cannot act through apps; run 'oaap status'."
+
 # --- keys of instances that no longer exist (0.1.202, RFC-0062 D4) ---
 # Before 0.1.202 removing an instance left its platform keys valid, and
 # they answered for the next instance of the same name. Cleared once;

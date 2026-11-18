@@ -15016,6 +15016,33 @@ def cmd_instance_keys(args):
         cmd_migrate_instance_keys(args)
 
 
+def cmd_migrate_assertion_key(_args):
+    """0.1.302 (L18): every node has its assertion key (oaap.core.identity
+    2.11). Made once; silent when it is already there."""
+    if ensure_assertion_key():
+        print("Made the node's assertion key (oaap.core.identity 2.11) -- "
+              "persons can now act through chat and MCP gateways.")
+
+
+def assertion_key_present():
+    """True or False; None when this process may not look (not root)."""
+    try:
+        with open(ASSERTION_KEY_FILE, encoding="ascii") as f:
+            return len(f.read().strip()) >= 64
+    except FileNotFoundError:
+        return False if os.access(ASSERTION_DIR, os.X_OK) \
+            or not os.path.exists(ASSERTION_DIR) else None
+    except PermissionError:
+        return None
+    except OSError:
+        return False
+
+
+def cmd_assertion_key_state(_args):
+    print({True: "present", False: "MISSING", None: "unknown"}[
+        assertion_key_present()])
+
+
 def cmd_migrate_instance_keys(_args):
     """D4: principals `instance:<name>` and authorization records whose
     instance is gone -- the keys of a removed instance before 0.1.202.
@@ -22929,13 +22956,12 @@ def _install_from_dir(pkg, args, source):
         env["OAAP_AUTHZ_URL"] = f"http://{GATEWAY_CONTAINER}/authz"
         print(f"Issued an authorization key for '{name}' (RFC-0045) -- "
               "OAAP_AUTHZ_KEY/OAAP_AUTHZ_URL are in its environment.")
-    # RFC-0067: delegation proves the person by the signed assertion, and
-    # without the node's key that header stays empty. Not behind the "key not
-    # minted yet" test above: a new version may be the first to declare it.
-    if authz_decl is not None and not is_artefact and not rehearsal \
-            and any(t.get("may_grant")
-                    for t in authz_decl.get("role_templates") or []):
-        ensure_assertion_key()
+    # 0.1.302 (L18): the node's assertion key, at EVERY install. It used to
+    # be made only for delegation (RFC-0067) and principal propagation; a
+    # chat or an MCP gateway needs it just as much, and on oaapx01 neither
+    # trigger had ever happened -- every round of the bec chat was refused.
+    # A list of "who needs it" was the bug, so there is no list any more.
+    ensure_assertion_key()
     # 0.3: the key of a tenant administrator's tool, minted once like the
     # others, and the door opened (or closed again) for the instance. Never
     # for a rehearsal: it would administer the PRODUCTION tenant.
@@ -37300,6 +37326,14 @@ def build_parser():
     pik.add_argument("--quiet", action="store_true",
                      help="say nothing when nothing is due (the nightly timer)")
     pik.set_defaults(fn=cmd_instance_keys)
+    pak = sub.add_parser("migrate-assertion-key",
+                         help="internal: make the node's assertion key if it "
+                              "is missing (0.1.302, oaap.core.identity 2.11)")
+    pak.set_defaults(fn=cmd_migrate_assertion_key)
+    pas = sub.add_parser("assertion-key-state",
+                         help="internal: print present, MISSING or unknown "
+                              "(for 'oaap status')")
+    pas.set_defaults(fn=cmd_assertion_key_state)
     pmk = sub.add_parser("migrate-instance-keys",
                          help="internal: retire keys, principals and authorization "
                               "records of instances that no longer exist (RFC-0062 D4)")

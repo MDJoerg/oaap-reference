@@ -694,6 +694,11 @@ else
   say "Store sources preconfigured."
 fi
 
+# The node's assertion key (0.1.302, oaap.core.identity 2.11): from the
+# first minute, not from the first app that happens to need it.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-assertion-key \
+  | sed 's/^/  /' || say "WARNING: the assertion key could not be made."
+
 # Containers must not start before the network has DNS (DHCP boot race
 # — suspected cause of 'store source unreadable' right after a reboot):
 # make network-online.target real for ifupdown; docker-ce already
