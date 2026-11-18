@@ -15641,7 +15641,11 @@ def docs_root(tid):
 def docs_mount_of(name, stored, inst=None):
     """The host directory to mount for a help instance, or ''."""
     rec = {**(inst or {}), **(stored or {})}
-    if not rec.get("docs_sources") or is_rehearsal(rec):
+    # An install hands in what its manifest declares; that wins over the
+    # registry, which still describes the version being replaced.
+    want = (inst["docs_sources"] if inst and "docs_sources" in inst
+            else rec.get("docs_sources"))
+    if not want or is_rehearsal(rec):
         return ""
     tid = resolve_tenant(rec.get("tenant"))
     if not tid:
@@ -23240,8 +23244,12 @@ def _install_from_dir(pkg, args, source):
 
     # per-instance storage, writable for the container user (guarantee 4);
     # every service container lands on the instance's own network (RFC-0016)
+    # RFC-0094: the manifest being installed decides the documentation
+    # mount -- the registry still holds the previous version's record
+    # (measured 18.11. on oaapx01: help 0.3.1 -> 0.4.0 came up without
+    # /oaap/docs until the next restart).
     recreate_instance_containers(name, services, m.get("storage") or [], granted,
-                                 inst=ident)
+                                 inst=dict(ident, docs_sources=docs_publish.docs_sources_wanted(m)))
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance

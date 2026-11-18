@@ -169,7 +169,23 @@ ok("Einhängepunkt für eine Hilfe mit docs_sources: der Ordner des Mandanten",
 ok("KÖDER: keiner ohne docs_sources, keiner für eine Generalprobe",
    a.docs_mount_of("bdt-x", {"id": "x", "tenant": tid}) == ""
    and a.docs_mount_of("bdt-help-probe", dict(help_inst, rehearsal={"of": "bdt-help"})) == "")
+old_help = {"id": "old000000000", "tenant": tid, "app_id": "help", "version": "0.3.1"}
+reg = a.load_registry()
+reg["instances"]["bdt-oldhelp"] = old_help
+a.save_registry(reg)
+ok("Update einer älteren Hilfe: das neue Manifest zählt, nicht das alte Register "
+   "(gemessen 18.11. auf oaapx01)",
+   a.docs_mount_of("bdt-oldhelp", dict(old_help, docs_sources=True), dict(old_help, docs_sources=True)) == root
+   and a.docs_mount_of("bdt-oldhelp", {}, dict(old_help, docs_sources=True)) == root)
+reg["instances"]["bdt-oldhelp"] = dict(old_help, docs_sources=True)
+a.save_registry(reg)
+ok("KÖDER: eine neue Version ohne docs_sources bekommt keinen Einhängepunkt mehr",
+   a.docs_mount_of("bdt-oldhelp", None, dict(old_help, docs_sources=False)) == "")
+del reg["instances"]["bdt-oldhelp"]
+a.save_registry(reg)
 src = open(a.__file__, encoding="utf-8").read()
+ok("die Installation reicht docs_sources des neuen Manifests weiter",
+   "inst=dict(ident, docs_sources=docs_publish.docs_sources_wanted(m))" in src)
 ok("lesend eingehängt", 'mounts += ["-v", f"{dmount}:{DOCS_MOUNT}:ro"]' in src)
 ok("die Installation legt ab, das Entfernen räumt ab",
    "docs_publish_instance(name, reg[\"instances\"][name], pkg)" in src
