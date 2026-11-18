@@ -7807,10 +7807,14 @@ def cmd_migrate_care_url(_args):
         env = load_env(name, inst)
         # 0.1.307 (runtime 2.37): the identity headers, in the same pass --
         # also an address-like fact, also learned at the next recreate.
-        if env.get("OAAP_CARE_URL") == care_url() and env.get("OAAP_IDENTITY_HEADERS") == names:
+        # 0.1.308 (runtime 2.38): the instance's portal page, same pass.
+        portal = portal_instance_url(name, inst.get("tenant") or "")
+        if env.get("OAAP_CARE_URL") == care_url() and env.get("OAAP_IDENTITY_HEADERS") == names \
+                and env.get("OAAP_PORTAL_URL", None) == portal:
             continue
         env["OAAP_CARE_URL"] = care_url()
         env["OAAP_IDENTITY_HEADERS"] = names
+        env["OAAP_PORTAL_URL"] = portal
         save_env(name, env, inst)
         told.append(name)
     if changed:
@@ -18152,6 +18156,23 @@ def tenant_place_hosts(ext_host=None):
     return out
 
 
+def portal_instance_url(name, tid, ext_host=None):
+    """0.1.308 (runtime 2.38, L5): the page of this instance in the portal, as
+    the tenant's administration reaches it -- `https://<label>.<node>/instances/
+    <name>` (the tenant's place, RFC-0042), `https://<node>/instances/<name>` in
+    the default tenant. An app links to it where it tells its administration to
+    do something there (the MCP gateway: "Anmeldung einrichten"). Empty without
+    an external name or for a tenant this node does not have -- then the app
+    names the way in words. Always https: behind an edge the edge terminates
+    TLS (the same reason as sandbox_origins_env)."""
+    ext = load_external() if ext_host is None else ext_host
+    prefixes = tenant_host_prefixes(tid) if tid else []
+    if not ext or not prefixes:
+        return ""
+    host = f"{prefixes[0]}.{ext}" if prefixes[0] else ext
+    return f"https://{host}/instances/{name}"
+
+
 def instance_names(inst):
     """Every public name this instance owns: the canonical address first
     (RFC-0009), then its aliases (RFC-0018). Empty if it has no own name.
@@ -23210,6 +23231,9 @@ def _install_from_dir(pkg, args, source):
     # strips everywhere else. An app may believe a header only when it is
     # named here -- an older platform let a client send X-OAAP-User-Idp itself.
     env["OAAP_IDENTITY_HEADERS"] = ",".join(IDENTITY_HEADERS)
+    # 0.1.308 (runtime 2.38, L5): where the administration finds this instance
+    # in the portal -- an address, like OAAP_CARE_URL; empty without one.
+    env["OAAP_PORTAL_URL"] = portal_instance_url(name, ident["tenant"])
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     # RFC-0043: the instance's own names, canonical first, so the app

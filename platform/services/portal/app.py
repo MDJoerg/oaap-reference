@@ -3189,6 +3189,7 @@ INSTANCE_EDIT_BODY = """
 </nav>
 
 <section class="panel {{ 'active' if tab == 'ueberblick' }}">
+""" + MCP_CARD + """
 <div class="card">
   <h2>Was die App mitbringt</h2>
   {% if i.description %}<p>{{ i.description }}</p>{% endif %}
@@ -3238,7 +3239,7 @@ INSTANCE_EDIT_BODY = """
      {% else %}Produktiv-Instanzen bekommen kein Deploy-Token; sie werden über
      den Store aktualisiert.{% endif %}</p>
 </div>
-""" + MCP_CARD + """</section>
+</section>
 
 <section class="panel {{ 'active' if tab == 'zugang' }}">
 <div class="card">

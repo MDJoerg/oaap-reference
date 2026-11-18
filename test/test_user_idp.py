@@ -42,6 +42,26 @@ src = open(os.path.join(PLATFORM_DIR, "appctl.py"), encoding="utf-8").read()
 ok("jede Instanz erfährt die Liste (bei der Installation und in der Migration)",
    src.count('env["OAAP_IDENTITY_HEADERS"]') >= 2)
 
+# 0.1.308 (runtime 2.38, L5): die Seite der Instanz im Portal.
+ok("jede Instanz erfährt ihre Portalseite (Installation und Migration)",
+   src.count('env["OAAP_PORTAL_URL"]') >= 2)
+_tenants = {"t-bec": {"label": "bec"}, "t-def": {"label": appctl.DEFAULT_TENANT_LABEL}}
+_old = appctl.load_tenants, appctl.former_labels
+appctl.load_tenants = lambda: _tenants
+appctl.former_labels = lambda t: []
+try:
+    ok("Mandant: https://<label>.<knoten>/instances/<name>",
+       appctl.portal_instance_url("bec-tools", "t-bec", ext_host="oaap.example") ==
+       "https://bec.oaap.example/instances/bec-tools")
+    ok("Standardmandant: https://<knoten>/instances/<name>",
+       appctl.portal_instance_url("wiki", "t-def", ext_host="oaap.example") ==
+       "https://oaap.example/instances/wiki")
+    ok("ohne externen Namen: leer", appctl.portal_instance_url("wiki", "t-def", ext_host="") == "")
+    ok("unbekannter Mandant: leer (fail closed)",
+       appctl.portal_instance_url("x", "t-gibtsnicht", ext_host="oaap.example") == "")
+finally:
+    appctl.load_tenants, appctl.former_labels = _old
+
 d = tempfile.mkdtemp(prefix="oaap-idp-")
 os.environ.update({"SESSION_SECRET": "s", "SETUP_TOKEN": "t", "INTERNAL_API_KEY": "k",
                    "OAAP_IDENTITY_DATA_DIR": d})
