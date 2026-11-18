@@ -3529,6 +3529,10 @@ def notify_minute(facts=None):
     except Exception as e:                          # noqa: BLE001
         print(f"notify: login locks: {type(e).__name__}: {e}", file=sys.stderr)
     try:
+        idp_watch_minute()
+    except Exception as e:                          # noqa: BLE001
+        print(f"idp watch: {type(e).__name__}: {e}", file=sys.stderr)
+    try:
         ledger_minute()
         report_minute()
     except Exception as e:                          # noqa: BLE001
@@ -3731,6 +3735,58 @@ def ledger_write_day(day, measured_now):
                     f.write(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n")
             os.replace(tmp, path)
     return lines
+
+
+# RFC-0091 §3.3: what the tenants' realms say, read once a day. A broker
+# somebody adds in the provider's console is otherwise only noticed the
+# next time an operator happens to run `oaap idp settings`.
+IDP_WATCH_STATE = os.path.join(APPS_DIR, "idp-watch.json")
+IDP_WATCH_AFTER = "05:10"
+
+
+def idp_watch_minute(now=None, force=False):
+    """Once a day after IDP_WATCH_AFTER: a pure read of every tenant realm
+    that came through a connector of this node, recorded like `oaap idp
+    settings` without flags records it. Writes nothing at the provider.
+    Returns [(label, sentence)]."""
+    now = now or time.time()
+    lt = time.localtime(now)
+    today = time.strftime("%Y-%m-%d", lt)
+    state = _report_json(IDP_WATCH_STATE) or {}
+    if not force and (state.get("day") == today
+                      or time.strftime("%H:%M", lt) < IDP_WATCH_AFTER):
+        return []
+    held = load_idp_connectors()
+    done = []
+    for tid, t in load_tenants().items():
+        provider = idp.provider_of(t) or {}
+        name = provider.get("connector") or ""
+        c = held.get(name)
+        if not c or idp_admin.verb_refusal(c["kind"], "settings"):
+            continue
+        pol = idp.policy_of(t)
+        space = (provider.get("space") or (pol["realm"] or {}).get("space")
+                 or idp_admin.space_for(t.get("label") or "")).strip().lower()
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                                c["admin_id"], c["admin_secret"],
+                                auth_realm=c.get("auth_realm", ""))
+        good, msg = admin.login()
+        if not good:
+            done.append((t.get("label"), "credential refused: " + msg))
+            continue
+        said, err = admin.read_settings(space)
+        if err:
+            done.append((t.get("label"), err))
+            continue
+        good, msg = tenant_record_realm_settings(tid, name, space, said,
+                                                 who="oaap", role="root",
+                                                 quiet_if_same=True)
+        done.append((t.get("label"), msg))
+    os.makedirs(os.path.dirname(IDP_WATCH_STATE), exist_ok=True)
+    with open(IDP_WATCH_STATE, "w", encoding="utf-8") as f:
+        json.dump({"day": today, "read": _iso_now(),
+                   "tenants": [[lbl, m] for lbl, m in done]}, f)
+    return done
 
 
 def ledger_minute(now=None):
@@ -8425,7 +8481,7 @@ def _idp_settings(args, name, c):
             wants["self_registration"], pol["group_map"],
             args.idp_reason if args.idp_reason is not None else pol["reason"],
             second_factor=wants.get("second_factor", pol["second_factor"]),
-            realm=pol["realm"])
+            realm=pol["realm"], broker_closed=pol["broker_closed"])
         if bad:
             print(f"Refused before anything at {c['base_url']} was touched.")
             print("")
@@ -8636,6 +8692,24 @@ def _print_idp(label, t):
     elif provider:
         print("  the space    never read -- `oaap idp settings <connector> "
               f"--tenant {label}`")
+    judged = idp.brokers_judged(pol)
+    if judged is None and realm:
+        print("  brokers      not read -- unknown, not none (RFC-0091)")
+    elif judged == []:
+        print("  brokers      none in the space (the registration page is "
+              "the only door)")
+    for b in judged or []:
+        print(f"  broker       {b['alias']} ({b['product'] or '?'}): "
+              + ("OPEN" if b["open"] else "closed"))
+        for wrapped in textwrap.wrap(b["why"], 60):
+            print("                 " + wrapped)
+        for w in b["warnings"]:
+            for wrapped in textwrap.wrap("WARNING: " + w, 60):
+                print("                 " + wrapped)
+    for alias, why in sorted(pol["broker_closed"].items()):
+        if not any(b["alias"] == alias for b in judged or []):
+            print(f"  broker       {alias}: acknowledged closed, not in the "
+                  "last reading")
     for line in idp.drift_lines(pol):
         print("")
         for wrapped in textwrap.wrap("DIFFERENT: " + line, 66):
@@ -10849,7 +10923,8 @@ def cmd_tenant(args):
         if not tid:
             die(f"no tenant with the label '{label}'")
         asked = (args.first_login, args.default_role, args.self_registration,
-                 args.group_map, args.second_factor)
+                 args.group_map, args.second_factor, args.broker_closed,
+                 args.broker_open)
         if all(a is None for a in asked):
             _print_idp(label, t)
             return
@@ -10867,11 +10942,23 @@ def cmd_tenant(args):
         self_reg = None
         if args.self_registration is not None:
             self_reg = args.self_registration == "on"
+        bclosed = None
+        if args.broker_closed is not None or args.broker_open is not None:
+            bclosed = {}
+            if args.broker_closed is not None:
+                if "=" not in args.broker_closed:
+                    die("--broker-closed wants alias=reason, e.g. "
+                        "partner-entra='one directory, partner X only'")
+                left, right = args.broker_closed.split("=", 1)
+                bclosed[left.strip()] = right.strip()
+            if args.broker_open is not None:
+                bclosed[args.broker_open.strip()] = None
         ok, msg = tenant_set_policy(
             tid, first_login=args.first_login, default_role=args.default_role,
             self_registration=self_reg, group_map=gmap,
             reason=args.idp_reason or "", second_factor=args.second_factor,
-            who=os.environ.get("SUDO_USER") or getpass.getuser())
+            who=os.environ.get("SUDO_USER") or getpass.getuser(),
+            broker_closed=bclosed)
         if not ok:
             die(msg)
         print(msg[0].upper() + msg[1:] + ".")
@@ -18974,7 +19061,8 @@ def tenant_clear_provider(tid, who="root", role="root"):
 
 
 def tenant_record_realm_settings(tid, connector, space, settings,
-                                 wanted=None, who="root", role="root"):
+                                 wanted=None, who="root", role="root",
+                                 quiet_if_same=False):
     """Write down what the provider's space ANSWERED. (ok, sentence).
 
     The only way a realm reading gets into a tenant record. It is a
@@ -19014,6 +19102,28 @@ def tenant_record_realm_settings(tid, connector, space, settings,
         if switch in (wanted or {}) and wanted[switch] == settings[switch]:
             pol[switch] = settings[switch]
         said.append(f"{switch}={idp_admin.switch_word(switch, settings[switch])}")
+    # RFC-0091 §3: the brokers, when they could be read. A door that is
+    # open now and was not open at the last reading is a matter for the
+    # tenant's log and for the people who get told (weekly report or at
+    # once, as routed) -- an operator who added it in the console may
+    # not know what it means for this tenant's first-login policy.
+    before = {d for d, _w in idp.open_doors(idp.policy_of(t))
+              if d.startswith("broker:")}
+    newly = []
+    if isinstance((settings or {}).get("brokers"), list):
+        reading["brokers"] = [b for b in (idp.broker_of(x)
+                                          for x in settings["brokers"]) if b]
+        said.append(f"{len(reading['brokers'])} Broker")
+        after = idp.open_doors(idp.policy_of(
+            {"idp_policy": dict(pol, realm=reading)}))
+        newly = [(d, w) for d, w in after
+                 if d.startswith("broker:") and d not in before]
+    # The daily watch reads every day; the tenant's log only hears about
+    # a reading that says something the last one did not.
+    same = quiet_if_same and not newly and {
+        k: v for k, v in idp.realm_reading(pol.get("realm")).items()
+        if k != "read"} == {k: v for k, v in idp.realm_reading(
+            reading).items() if k != "read"}
     pol["realm"] = reading
     pol.setdefault("first_login", idp.policy_of(t)["first_login"])
     pol["changed"] = _iso_now()
@@ -19021,17 +19131,32 @@ def tenant_record_realm_settings(tid, connector, space, settings,
     t["idp_policy"] = pol
     tenants[tid] = t
     save_tenants(tenants)
-    audit_tenant("tenant.idp-realm", tid, (space or ""), who=who, role=role,
-                 detail=" · ".join(said) + f" · gelesen am Ort '{space}'"
+    if not same:
+        audit_tenant("tenant.idp-realm", tid, (space or ""), who=who,
+                     role=role,
+                     detail=" · ".join(said) + f" · gelesen am Ort '{space}'"
                         + (f" ueber Konnektor '{connector}'" if connector
                            else ""))
+    for door, why in newly:
+        alias = door.split(":", 1)[1]
+        audit_tenant("tenant.idp-door", tid, alias, who=who, role=role,
+                     detail=f"neu offen am Ort '{space}': {why}")
+        notify_event("idp.door", tid, kurz=alias,
+                     text=(f"Am Anmeldedienst des Mandanten '{t['label']}' "
+                           f"(Ort '{space}') ist eine Tür offen, die bei der "
+                           f"letzten Lesung nicht offen war.\n\n{why}.\n\n"
+                           f"Erste Anmeldung bedeutet hier: "
+                           f"{idp.policy_of(t)['first_login']}. Prüfen: "
+                           f"sudo oaap tenant policy {t['label']}"),
+                     key=f"idp.door:{tid}:{alias}")
     return True, (f"'{t['label']}' now records what the space '{space}' "
                   "actually says")
 
 
 def tenant_set_policy(tid, first_login=None, default_role=None,
                       self_registration=None, group_map=None, reason="",
-                      second_factor=None, who="root", role="root"):
+                      second_factor=None, who="root", role="root",
+                      broker_closed=None):
     """What a first login through the provider BECOMES. (ok, sentence).
 
     K4b's authority is NOT checked here -- it is checked by
@@ -19061,12 +19186,30 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
     # page belongs to the REALM: a record that says "off" while the
     # space says "on" must not let the dangerous pair through
     # (RFC-0041 K7, found while building step 6).
+    # RFC-0091 §3.2: brokers the operator calls closed. `broker_closed`
+    # is the WHOLE new table (the CLI merges one line into it), and an
+    # entry without a reason is refused rather than dropped.
+    want_closed = dict(now["broker_closed"])
+    if broker_closed is not None:
+        for alias, why in broker_closed.items():
+            alias = str(alias).strip()
+            if not alias or len(alias) > idp.BROKER_ALIAS_MAX:
+                return False, f"'{alias}' is not a broker alias"
+            if why is None:
+                want_closed.pop(alias, None)
+            elif len(str(why).strip()) < idp.REASON_MIN:
+                return False, (f"calling the broker '{alias}' closed needs a "
+                               "reason -- who it admits and why that is "
+                               "enough (RFC-0091 §3.2)")
+            else:
+                want_closed[alias] = str(why).strip()
     bad = idp.policy_refusal(want_first, want_role, want_self, want_map,
                              want_reason, second_factor=want_factor,
-                             realm=now["realm"])
+                             realm=now["realm"], broker_closed=want_closed)
     if bad:
         return False, bad
     t["idp_policy"] = {"first_login": want_first,
+                       "broker_closed": want_closed,
                        "default_role": want_role,
                        "self_registration": want_self,
                        "second_factor": want_factor,
@@ -19088,7 +19231,10 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
               + (f" · {len(want_map)} Gruppenabbildung(en)" if want_map else "")
               + (f" · zweiter Faktor {want_factor}" if want_factor
                  else "")
-              + (f" · Begruendung: {want_reason}" if want_reason else ""))
+              + (f" · Begruendung: {want_reason}" if want_reason else "")
+              + "".join(f" · Broker {a} geschlossen: {w}" if w else
+                        f" · Broker {a} nicht mehr als geschlossen quittiert"
+                        for a, w in (broker_closed or {}).items()))
     audit_tenant("tenant.idp-policy", tid, want_first, who=who, role=role,
                  detail=detail)
     return True, (f"a first login in '{t['label']}' now means "
@@ -36910,6 +37056,11 @@ def build_parser():
     pten.add_argument("--group-map", dest="group_map", default=None,
                       help="realm-group=oaap-group,... -- an explicit local "
                            "mapping; an unmapped group grants nothing")
+    pten.add_argument("--broker-closed", dest="broker_closed", default=None,
+                      help="alias=reason -- acknowledge a broker of the "
+                           "realm as closed (RFC-0091 §3.2)")
+    pten.add_argument("--broker-open", dest="broker_open", default=None,
+                      help="alias -- withdraw that acknowledgement")
     pten.add_argument("--reason", dest="idp_reason", default=None,
                       help="why a dangerous combination is wanted, or for "
                            "'egress' why this is opened or excepted; goes "

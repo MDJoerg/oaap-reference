@@ -147,6 +147,12 @@ CONNECTOR_KINDS = {
             # RFC-0066 / destinations 2.9.6: who may edit an attribute a
             # destination acts on. Read only, never written.
             "user_profile": "/admin/realms/{space}/users/profile",
+            # RFC-0091 §3: the brokers in front of the realm -- other
+            # doors than the registration page. Read only, never
+            # written (D5): adding a door is the operator's act in the
+            # product's console.
+            "identity_providers":
+                "/admin/realms/{space}/identity-provider/instances",
             # RFC-0073 T6: is the person behind a binding's subject in
             # this space? Read only, one record by its id, never a list
             # and never written -- `never` below still holds. A narrow
@@ -948,7 +954,89 @@ def _keycloak_settings_read(docs):
         out["second_factor"] = (
             "required" if (action.get("enabled")
                            and action.get("defaultAction")) else "off")
+    brokers = (docs or {}).get("brokers")
+    if isinstance(brokers, list):
+        # Measured 2026-11-18 at 26.7.4: a broker that follows the
+        # realm's default carries NO flow alias of its own; the flow in
+        # force is then the realm's `firstBrokerLoginFlow`.
+        realm_flow = (realm.get("firstBrokerLoginFlow") or "")             if isinstance(realm, dict) else ""
+        out["brokers"] = [_keycloak_broker(b, realm_flow) for b in brokers
+                          if isinstance(b, dict) and b.get("alias")]
     return out
+
+
+# RFC-0091 §3.2, in Keycloak's words. Social providers whose population
+# is "anybody with an account there" -- Keycloak offers no switch that
+# narrows them. `google` and `microsoft` can be narrowed and are judged
+# by their config; everything else is "unknown" until the operator says.
+KEYCLOAK_SOCIAL_ANY = ("github", "gitlab", "bitbucket", "facebook",
+                       "twitter", "instagram", "linkedin",
+                       "linkedin-openid-connect", "stackoverflow", "paypal",
+                       "openshift-v3", "openshift-v4", "apple")
+KEYCLOAK_DEFAULT_FIRST_BROKER_FLOW = "first broker login"
+MICROSOFT_ANY_DIRECTORY = ("common", "organizations", "consumers")
+_MS_HOST = "login.microsoftonline.com"
+
+
+def _microsoft_directory(url):
+    """The directory segment of a Microsoft sign-in address, or None
+    when the address is not Microsoft's at all."""
+    u = str(url or "").strip()
+    if _MS_HOST not in u.lower():
+        return None
+    rest = u.lower().split(_MS_HOST, 1)[1].strip("/")
+    return rest.split("/", 1)[0] if rest else ""
+
+
+def _population(directory, domain=None):
+    """'domain:x' / 'directory:x' / 'any' from what the config named."""
+    if domain is not None:
+        d = str(domain).strip().lower()
+        return f"domain:{d}" if d and d != "*" else "any"
+    d = str(directory or "").strip().lower()
+    return f"directory:{d}" if d and d not in MICROSOFT_ANY_DIRECTORY \
+        else "any"
+
+
+def _keycloak_broker(rep, realm_flow=""):
+    """One identity provider of the realm, in OAAP's words.
+
+    `population` is the only judgement made here, and it is a reading of
+    the product's config, not a verdict: who may come through this door
+    as far as the CONFIG says. Whether that is open enough to matter is
+    idp.broker_door's sentence. Field names measured at 26.7.4 on
+    2026-11-18 (RFC-0091 stage 0): `hostedDomain`, `tenant`, `issuer`;
+    the client secret comes back masked.
+    """
+    cfg = rep.get("config") if isinstance(rep.get("config"), dict) else {}
+    product = str(rep.get("providerId") or "").strip().lower()
+    if product == "google":
+        population = _population(None, domain=cfg.get("hostedDomain") or "")
+    elif product == "microsoft":
+        population = _population(cfg.get("tenant") or "")
+    elif product in ("oidc", "keycloak-oidc"):
+        directory = None
+        for key in ("issuer", "authorizationUrl", "tokenUrl"):
+            directory = _microsoft_directory(cfg.get(key))
+            if directory is not None:
+                break
+        population = ("unknown" if directory is None
+                      else _population(directory))
+    elif product in KEYCLOAK_SOCIAL_ANY:
+        population = "any"
+    else:
+        population = "unknown"
+    flow = str(rep.get("firstBrokerLoginFlowAlias") or realm_flow
+               or "").strip()
+    return {
+        "alias": str(rep.get("alias") or "").strip(),
+        "product": product,
+        "enabled": rep.get("enabled") is not False,
+        "population": population,
+        "trust_email": bool(rep.get("trustEmail")),
+        "first_login_flow": flow,
+        "flow_default": flow in ("", KEYCLOAK_DEFAULT_FIRST_BROKER_FLOW),
+    }
 
 
 def _keycloak_settings_write(switch, value, doc, space):
@@ -2287,7 +2375,26 @@ class Admin:
             if status != 200:
                 return {}, f"reading the sign-in rules answered {status}"
             docs[where] = doc
+        self._read_brokers(space, docs)
         return settings_of(self.kind, docs), ""
+
+    def _read_brokers(self, space, docs):
+        """RFC-0091 §3.1: the brokers, into `docs["brokers"]` -- or left
+        out, with a line in the trace. Left out, never an empty list: a
+        broker list that could not be read is UNKNOWN, and an empty list
+        would say "no other door" about a realm nobody looked at. Not an
+        error for the switches either: a credential that may read them
+        and not the brokers still reports what it can."""
+        path = self._path("identity_providers", space=space)
+        if not path:
+            return
+        status, doc, err = self._call("GET", path)
+        if err or status != 200 or not isinstance(doc, list):
+            self._note("the brokers of this space could not be read ("
+                       + (err or f"answered {status}") + ") -- unknown, "
+                       "not none")
+            return
+        docs["brokers"] = doc
 
     def attribute_edits(self, space, names):
         """({name: "admin"|"self"|"absent"|""}, error). A pure read of

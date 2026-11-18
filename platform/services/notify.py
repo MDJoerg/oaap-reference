@@ -66,6 +66,12 @@ CATALOGUE = {
     "login.locked": {"category": "security", "scope": "tenant", "matter": False,
                      "title": "Eine Anmeldung wurde nach Fehlversuchen gesperrt",
                      "subject": "[{mandant}] Anmeldung gesperrt: {kurz}"},
+    # RFC-0091 §3.3: a broker in front of the tenant's realm is open now
+    # and was not at the last reading -- a door the first-login policy was
+    # never judged against. The tenant sees it; the node's operator moves it.
+    "idp.door": {"category": "security", "scope": "both", "matter": False,
+                 "title": "Eine neue offene Tür am Anmeldedienst",
+                 "subject": "[{mandant}] Anmeldedienst: offene Tür {kurz}"},
     # RFC-0084: an instance hands out a secret file when asked directly.
     # Critical: the gateway refuses the path, but the file is where any other
     # way in (a second proxy, a copy of the app) would serve it. Each scope

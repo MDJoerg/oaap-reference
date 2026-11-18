@@ -378,6 +378,10 @@ def policy_of(tenant):
     if factor not in SECOND_FACTOR_VALUES:
         factor = SECOND_FACTOR_DEFAULT
     return {
+        # RFC-0091 §3.2: brokers the OPERATOR has called closed, each
+        # with the reason that makes it so. Only the server_admin writes
+        # this (K4b); a line without a reason is no acknowledgement.
+        "broker_closed": broker_closed_of(p.get("broker_closed")),
         "first_login": first,
         "default_role": (p.get("default_role") or "").strip().lower(),
         "group_map": group_map,
@@ -415,6 +419,150 @@ def realm_reading(raw):
         out["self_registration"] = bool(r.get("self_registration"))
     if factor in SECOND_FACTOR_VALUES:
         out["second_factor"] = factor
+    # Absent means "not read", an empty list means "read, none there".
+    # The difference is the whole point: unknown must not read as safe.
+    if isinstance(r.get("brokers"), list):
+        out["brokers"] = [b for b in (broker_of(x) for x in r["brokers"])
+                          if b]
+    return out
+
+
+# --- RFC-0091 §3: brokers are doors too ---------------------------------
+#
+# A broker in front of the realm (Google, Entra, another OIDC/SAML
+# provider) lets people into the realm the way the registration page
+# does. K7's refusal was about the page alone; a Google broker without a
+# domain admits every Google account and slipped past it. The connector
+# translates the product's config into a `population`; what follows from
+# it is decided here, once, for the CLI, the portal and the refusal.
+
+BROKER_ALIAS_MAX = 80
+POPULATIONS = ("any", "unknown")      # plus "domain:<x>", "directory:<x>"
+
+
+def broker_of(raw):
+    """One broker reading, normalised -- or None."""
+    if not isinstance(raw, dict):
+        return None
+    alias = str(raw.get("alias") or "").strip()
+    if not alias or len(alias) > BROKER_ALIAS_MAX:
+        return None
+    pop = str(raw.get("population") or "").strip().lower()
+    if pop not in POPULATIONS and not (
+            pop.startswith("domain:") or pop.startswith("directory:")):
+        pop = "unknown"
+    return {"alias": alias,
+            "product": str(raw.get("product") or "").strip().lower()[:40],
+            "enabled": raw.get("enabled") is not False,
+            "population": pop,
+            "trust_email": bool(raw.get("trust_email")),
+            "first_login_flow": str(raw.get("first_login_flow") or "")[:80],
+            "flow_default": raw.get("flow_default") is not False}
+
+
+def broker_closed_of(raw):
+    """{alias: reason} the operator acknowledged, only lines with a reason."""
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            alias, why = str(k).strip(), str(v or "").strip()
+            if alias and len(alias) <= BROKER_ALIAS_MAX and \
+                    len(why) >= REASON_MIN:
+                out[alias] = why
+    return out
+
+
+def broker_door(broker, closed=None):
+    """(open, sentence) for one broker. The sentence says WHY.
+
+    "Closed" means the provider's own population is limited -- a domain,
+    one directory, or the operator's acknowledgement with a reason. It
+    does not mean everybody in that population is welcome; that is what
+    the first-login policy is for.
+    """
+    b = broker_of(broker) or {}
+    alias = b.get("alias", "?")
+    if not b.get("enabled", True):
+        return False, f"the broker '{alias}' is switched off"
+    why = (closed or {}).get(alias)
+    if why:
+        return False, (f"the broker '{alias}' is closed by the operator's "
+                       f"word: {why}")
+    pop = b.get("population", "unknown")
+    product = b.get("product") or "this"
+    if pop.startswith("domain:"):
+        return False, (f"the broker '{alias}' admits only the domain "
+                       f"{pop.split(':', 1)[1]}")
+    if pop.startswith("directory:"):
+        return False, (f"the broker '{alias}' admits only the directory "
+                       f"{pop.split(':', 1)[1]}")
+    if pop == "any":
+        return True, (f"the broker '{alias}' admits any {product} account")
+    return True, (f"the broker '{alias}' ({product}) admits whoever that "
+                  "provider lets through, as far as OAAP can tell -- until "
+                  "the operator acknowledges it as closed, with a reason")
+
+
+def broker_warnings(broker):
+    """Sentences about settings that undermine K4 INSIDE the realm.
+
+    OAAP binds to the realm's `sub`. A realm that merges a foreign
+    account into an existing user by e-mail has done the account
+    takeover one step before OAAP sees anything.
+    """
+    b = broker_of(broker) or {}
+    if not b.get("enabled", True):
+        return []
+    alias = b.get("alias", "?")
+    out = []
+    if b.get("trust_email"):
+        out.append(f"the broker '{alias}' trusts the e-mail address it is "
+                   "handed: an account there with somebody's address is "
+                   "treated as verified")
+    if not b.get("flow_default", True):
+        out.append(f"the broker '{alias}' uses its own first-login flow "
+                   f"'{b.get('first_login_flow')}': check that it never "
+                   "links an existing person by e-mail without asking "
+                   "them to sign in")
+    return out
+
+
+def brokers_judged(policy):
+    """Every broker of the last reading, judged -- or None if never read.
+
+    One list for the CLI and the portal, so the two cannot say different
+    things about the same door.
+    """
+    realm = (policy or {}).get("realm") or {}
+    if "brokers" not in realm:
+        return None
+    closed = (policy or {}).get("broker_closed") or {}
+    out = []
+    for raw in realm["brokers"] or []:
+        b = broker_of(raw)
+        if not b:
+            continue
+        is_open, why = broker_door(b, closed)
+        out.append(dict(b, open=is_open, why=why,
+                        warnings=broker_warnings(b)))
+    return out
+
+
+def open_doors(policy):
+    """[(door, sentence)] -- every way into the realm that is open.
+
+    `registration` when either half of self-registration is on, and
+    `broker:<alias>` for each open broker. K7's refusal reads this list,
+    so a door added here is judged everywhere at once.
+    """
+    p = policy or {}
+    out = []
+    if self_registration_open(p):
+        out.append(("registration", "the registration page lets anybody "
+                                    "register"))
+    for b in brokers_judged(p) or []:
+        if b["open"]:
+            out.append((f"broker:{b['alias']}", b["why"]))
     return out
 
 
@@ -466,6 +614,17 @@ def drift_lines(policy):
             f"{where} said "
             f"'{realm['second_factor']}' when it was last read "
             f"({realm['read'][:16]}).")
+    # RFC-0091 §3.3: a broker that opened AFTER the policy was set. The
+    # refusal could not see it then; it has to be said now.
+    if (p.get("first_login") or FIRST_LOGIN_DEFAULT) != "eingang" and \
+            len((p.get("reason") or "").strip()) < REASON_MIN:
+        for door, why in open_doors(p):
+            if door.startswith("broker:"):
+                out.append(
+                    f"{why}, and a first login here grants "
+                    f"'{p.get('default_role') or '?'}' with no reason "
+                    "recorded. Close the broker, acknowledge it as closed, "
+                    "or say why it may stay open (RFC-0091, RFC-0041 K7).")
     return out
 
 
@@ -509,7 +668,7 @@ def policy_target(role, own_tenant, wanted=""):
 
 def policy_refusal(first_login, default_role, self_registration,
                    group_map=None, reason="", second_factor=None,
-                   realm=None):
+                   realm=None, broker_closed=None):
     """The ONE sentence that refuses an identity policy.
 
     The combination that has to be caught here is `role`/`groups`
@@ -563,8 +722,19 @@ def policy_refusal(first_login, default_role, self_registration,
                 f"{', '.join(SECOND_FACTOR_VALUES)}. It says what the "
                 "PROVIDER'S space is asked to require; OAAP never checks "
                 "a second factor itself (RFC-0041 K7)")
-    open_here = self_registration_open(
-        {"self_registration": self_registration, "realm": realm})
+    doors = open_doors({"self_registration": self_registration,
+                        "realm": realm or {},
+                        "broker_closed": broker_closed_of(broker_closed)})
+    open_here = any(d == "registration" for d, _w in doors)
+    brokers_open = [w for d, w in doors if d.startswith("broker:")]
+    if brokers_open and not open_here and first != "eingang" and \
+            len((reason or "").strip()) < REASON_MIN:
+        return ("; ".join(brokers_open)
+                + f" -- and together with '{first}' that hands a role to "
+                "anybody it lets through. It is allowed only deliberately: "
+                "say why, and the reason goes into this tenant's log; or "
+                "close the broker, or acknowledge it as closed "
+                "(RFC-0091 §3, RFC-0041 K7)")
     if open_here and first != "eingang":
         if len((reason or "").strip()) < REASON_MIN:
             by_realm = (not self_registration) and bool(

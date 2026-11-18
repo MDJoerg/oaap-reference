@@ -2265,6 +2265,24 @@ TENANT_BODY = """
   <p class="muted">Zuletzt am Ort <code>{{ me.idp.realm_space }}</code>
      nachgelesen: {{ me.idp.realm_read }}.</p>
   {% endif %}
+  {% if me.idp.brokers %}
+  <p>Weitere Türen in den Anmeldedienst (Broker):</p>
+  <ul>
+  {% for b in me.idp.brokers %}
+    <li><code>{{ b.alias }}</code> ({{ b.product or '?' }}):
+      {% if not b.enabled %}abgeschaltet{% elif b.open %}<strong>offen</strong>
+      — jedes Konto, das dieser Dienst kennt, kommt herein{% else %}geschlossen{% endif %}
+      {% if b.trust_email %}<br><span class="muted">Achtung: übernimmt die
+        E-Mail-Adresse ungeprüft als bestätigt.</span>{% endif %}
+      {% if not b.flow_default %}<br><span class="muted">Achtung: eigener
+        Ablauf für die erste Anmeldung ({{ b.first_login_flow }}).</span>{% endif %}
+    </li>
+  {% endfor %}
+  </ul>
+  {% elif me.idp.realm_read and me.idp.brokers is none %}
+  <p class="muted">Ob weitere Türen (Broker) vor dem Anmeldedienst stehen,
+     wurde nicht gelesen.</p>
+  {% endif %}
   {% for line in me.idp.drift %}
   <p class="muted"><strong>Unterschied:</strong> {{ line }}</p>
   {% endfor %}
@@ -5844,6 +5862,9 @@ def _idp_view(t):
         "realm_read": (policy["realm"] or {}).get("read", "")[:16],
         "realm_space": (policy["realm"] or {}).get("space", ""),
         "drift": idp.drift_lines(policy),
+        # RFC-0091 §3: the other doors -- None when never read, which
+        # the page says instead of showing an empty list as "none".
+        "brokers": idp.brokers_judged(policy),
         # RFC-0056: the way to the people of this tenant's own realm.
         "console_url": idp.realm_console_url(provider),
     }
