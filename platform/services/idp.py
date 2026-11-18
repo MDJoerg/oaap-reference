@@ -332,6 +332,13 @@ GRANTABLE_AT_FIRST_LOGIN = ("admin", "keyuser", "user", "guest", "partner")
 NEVER_AT_FIRST_LOGIN = ("server_admin", "support", "tenant_admin")
 
 GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
+
+# RFC-0091 stage 2 (oaap.core.tenant 1.9 2.8.1): the roles a realm group
+# may carry. Shorter than GRANTABLE_AT_FIRST_LOGIN on purpose: the
+# tenant's own realm administrator moves people between groups, so a
+# mapping to keyuser or admin would let them make platform
+# administrators. Again a list of what IS allowed.
+ROLE_MAP_ROLES = ("guest", "partner", "user")
 REALM_GROUP_MAX = 120
 REASON_MIN = 10
 
@@ -385,6 +392,7 @@ def policy_of(tenant):
         "first_login": first,
         "default_role": (p.get("default_role") or "").strip().lower(),
         "group_map": group_map,
+        "role_map": role_map_of(p.get("role_map")),
         "self_registration": bool(p.get("self_registration")),
         "second_factor": factor,
         "reason": (p.get("reason") or "").strip(),
@@ -396,6 +404,99 @@ def policy_of(tenant):
         "realm": realm_reading(p.get("realm")),
         "set": bool(p),
     }
+
+
+def role_map_of(raw):
+    """{realm group path: role}, only lines that may stand (2.8.1).
+
+    Paths without the leading slash, because that is how `realm_groups`
+    hands them over. A line naming a role outside ROLE_MAP_ROLES is
+    dropped here as well as refused when written: a record edited by
+    hand must not grant what the refusal would not have let through.
+    """
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            key = str(k).strip().lstrip("/")
+            val = str(v).strip().lower()
+            if key and len(key) <= REALM_GROUP_MAX and val in ROLE_MAP_ROLES:
+                out[key] = val
+    return out
+
+
+def grants_at_login(first_login, role_map):
+    """Whether a provider login hands out a role at all.
+
+    `eingang` alone grants nothing; a role_map grants whatever group the
+    provider asserts, so it counts as granting for every rule that
+    exists because granting through an open door is dangerous.
+    """
+    return (first_login or FIRST_LOGIN_DEFAULT) != "eingang" or bool(role_map)
+
+
+def role_map_refusal(role_map):
+    """The sentence that refuses a role_map, or ''."""
+    if role_map is None:
+        return ""
+    if not isinstance(role_map, dict):
+        return "a role mapping is a table: realm group -> role"
+    for k, v in role_map.items():
+        key = str(k).strip().lstrip("/")
+        if not key or len(key) > REALM_GROUP_MAX:
+            return f"realm group '{k}' is empty or too long"
+        val = str(v).strip().lower()
+        if val not in ROLE_MAP_ROLES:
+            return (f"'{v}' cannot come from a realm group -- only "
+                    f"{', '.join(ROLE_MAP_ROLES)}. The tenant's own realm "
+                    "administrator moves people between groups, so a group "
+                    "that made admins would let them make platform "
+                    "administrators (RFC-0091 2, oaap.core.tenant 2.8.1)")
+    return ""
+
+
+def role_sync(user, policy, claims):
+    """(roles, role_source, changes) after one provider login (2.8.1).
+
+    Pure. `role_source` is {role: realm group} for the roles the mapping
+    gave; a role the record holds without an entry there was given by a
+    person and is never added, ended or re-labelled here. `changes` is a
+    list of (verb, role, group) -- 'added', 'ended', 'moved' -- for the
+    tenant's log; empty when nothing changed. `policy` may be a stored
+    `idp_policy` or the result of `policy_of`; only `role_map` is read.
+    """
+    mapping = role_map_of((policy or {}).get("role_map"))
+    roles = list((user or {}).get("roles") or [])
+    source = {r: g for r, g in ((user or {}).get("role_source") or {}).items()
+              if r in roles}
+    wanted = {}
+    for g in realm_groups(claims):
+        r = mapping.get(g)
+        if r and r not in wanted:
+            wanted[r] = g
+    changes = []
+    for r, g in sorted(source.items()):
+        if r not in wanted:
+            roles.remove(r)
+            del source[r]
+            changes.append(("ended", r, g))
+        elif wanted[r] != g:
+            source[r] = wanted[r]
+            changes.append(("moved", r, wanted[r]))
+    for r, g in sorted(wanted.items()):
+        if r in roles:
+            continue        # held already: by the mapping, or by hand
+        roles.append(r)
+        source[r] = g
+        changes.append(("added", r, g))
+    return roles, source, changes
+
+
+def role_changes_text(changes):
+    """One German line for the tenant's log, or ''."""
+    words = {"added": "erhalten", "ended": "beendet", "moved": "jetzt über"}
+    return " · ".join(
+        (f"{r} {words[v]} {g}" if v == "moved" else f"{r} {words[v]} ({g})")
+        for v, r, g in changes)
 
 
 def realm_reading(raw):
@@ -616,13 +717,15 @@ def drift_lines(policy):
             f"({realm['read'][:16]}).")
     # RFC-0091 §3.3: a broker that opened AFTER the policy was set. The
     # refusal could not see it then; it has to be said now.
-    if (p.get("first_login") or FIRST_LOGIN_DEFAULT) != "eingang" and \
+    if grants_at_login(p.get("first_login"), p.get("role_map")) and \
             len((p.get("reason") or "").strip()) < REASON_MIN:
+        gives = (f"'{p.get('default_role')}'" if p.get("default_role")
+                 else "roles per realm group")
         for door, why in open_doors(p):
             if door.startswith("broker:"):
                 out.append(
-                    f"{why}, and a first login here grants "
-                    f"'{p.get('default_role') or '?'}' with no reason "
+                    f"{why}, and a login here grants "
+                    f"{gives} with no reason "
                     "recorded. Close the broker, acknowledge it as closed, "
                     "or say why it may stay open (RFC-0091, RFC-0041 K7).")
     return out
@@ -668,7 +771,7 @@ def policy_target(role, own_tenant, wanted=""):
 
 def policy_refusal(first_login, default_role, self_registration,
                    group_map=None, reason="", second_factor=None,
-                   realm=None, broker_closed=None):
+                   realm=None, broker_closed=None, role_map=None):
     """The ONE sentence that refuses an identity policy.
 
     The combination that has to be caught here is `role`/`groups`
@@ -714,6 +817,11 @@ def policy_refusal(first_login, default_role, self_registration,
         if not GROUP_RE.match(str(oaap_group).strip().lower()):
             return (f"'{oaap_group}' is not a visibility group name "
                     "([a-z0-9][a-z0-9._-]*)")
+    why = role_map_refusal(role_map)
+    if why:
+        return why
+    grants = grants_at_login(first, role_map)
+    what = f"'{first}'" if first != "eingang" else "a role per realm group"
     factor = (second_factor if second_factor is not None
               else SECOND_FACTOR_DEFAULT)
     factor = str(factor).strip().lower()
@@ -727,19 +835,19 @@ def policy_refusal(first_login, default_role, self_registration,
                         "broker_closed": broker_closed_of(broker_closed)})
     open_here = any(d == "registration" for d, _w in doors)
     brokers_open = [w for d, w in doors if d.startswith("broker:")]
-    if brokers_open and not open_here and first != "eingang" and \
+    if brokers_open and not open_here and grants and \
             len((reason or "").strip()) < REASON_MIN:
         return ("; ".join(brokers_open)
-                + f" -- and together with '{first}' that hands a role to "
+                + f" -- and together with {what} that hands a role to "
                 "anybody it lets through. It is allowed only deliberately: "
                 "say why, and the reason goes into this tenant's log; or "
                 "close the broker, or acknowledge it as closed "
                 "(RFC-0091 §3, RFC-0041 K7)")
-    if open_here and first != "eingang":
+    if open_here and grants:
         if len((reason or "").strip()) < REASON_MIN:
             by_realm = (not self_registration) and bool(
                 (realm or {}).get("self_registration"))
-            return (f"self-registration together with '{first}' hands a role "
+            return (f"self-registration together with {what} hands a role "
                     "to anybody who can reach the registration page. It is "
                     "allowed only deliberately: say why, and the reason goes "
                     "into this tenant's log (RFC-0041 K7)"
@@ -786,9 +894,10 @@ def first_login_grant(policy, claims):
 def realm_groups(claims):
     """The groups the provider asserted, as plain strings.
 
-    Read ONLY so they can be looked up in the operator's mapping. A
-    name in this list is never used for anything else -- not as a role,
-    not as a group, not as a tenant.
+    Read ONLY so they can be looked up in the operator's mappings
+    (`group_map` for visibility groups, `role_map` for the three roles
+    2.8.1 allows). A name in this list is never used for anything else
+    -- never itself as a role, a group or a tenant.
     """
     raw = (claims or {}).get("groups")
     if isinstance(raw, str):

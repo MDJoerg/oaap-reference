@@ -690,9 +690,14 @@ USER_EDIT_BODY = """
     <p class="roles">
       {% for r in all_roles %}
       <label><input type="checkbox" name="roles" value="{{ r }}"
-             {{ 'checked' if r in u.roles }}>{{ r }}</label>
+             {{ 'checked' if r in u.roles }}>{{ r }}{% if u.role_source and u.role_source[r] %}
+             <span class="badge" title="bei jeder Anmeldung aus der Gruppe des Anmeldedienstes abgeglichen">über Gruppe {{ u.role_source[r] }}</span>{% endif %}</label>
       {% endfor %}
     </p>
+    {% if u.role_source %}<p class="muted">Rollen „über Gruppe“ kommen aus dem
+      Anmeldedienst und werden bei jeder Anmeldung abgeglichen: Wer die Gruppe
+      verlässt, verliert sie. Wird eine solche Rolle hier entfernt, kommt sie
+      mit der nächsten Anmeldung zurück, solange die Gruppe sie trägt.</p>{% endif %}
     <p class="muted">Rollenänderungen wirken ab der nächsten Anfrage des Benutzers.</p>
   </div>
   <div class="card">
@@ -2292,6 +2297,19 @@ TENANT_BODY = """
   {% endif %}
   <p>Wer sich zum <em>ersten Mal</em> anmeldet, bekommt:
      <strong>{{ me.idp.first_login_text }}</strong></p>
+  {% if me.idp.role_map %}
+  <p>Rollen je Gruppe im Anmeldedienst, bei <em>jeder</em> Anmeldung
+     abgeglichen:</p>
+  <ul>
+  {% for g, r in me.idp.role_map %}
+    <li>Gruppe <code>{{ g }}</code> → Rolle <strong>{{ r }}</strong></li>
+  {% endfor %}
+  </ul>
+  <p class="muted">Wer die Gruppe verlässt, verliert die Rolle bei der
+     nächsten Anmeldung. Eine Rolle, die hier jemand von Hand vergeben
+     hat, bleibt davon unberührt. Ändern kann die Tabelle nur der
+     Betreiber des Knotens.</p>
+  {% endif %}
   {% if me.idp.self_registration %}
   <p class="muted">Selbstregistrierung im Anmeldedienst ist eingeschaltet:
      Wer die Seite erreicht, bekommt hier eine Identität — und genau das,
@@ -5959,6 +5977,9 @@ def _idp_view(t):
         # RFC-0091 §3: the other doors -- None when never read, which
         # the page says instead of showing an empty list as "none".
         "brokers": idp.brokers_judged(policy),
+        # oaap.core.tenant 2.8.1: [(realm group, role)], synced at every
+        # provider login. Shown to the tenant, moved by the operator.
+        "role_map": sorted(policy["role_map"].items()),
         # RFC-0056: the way to the people of this tenant's own realm.
         "console_url": idp.realm_console_url(provider),
     }

@@ -708,7 +708,9 @@ def public_user(u):
             "must_change_password": bool(u.get("must_change_password")),
             "deactivate_at": u.get("deactivate_at", ""),
             "delete_at": u.get("delete_at", ""),
-            "schedule_reason": u.get("schedule_reason", "")}
+            "schedule_reason": u.get("schedule_reason", ""),
+            # oaap.core.tenant 2.8.1: which roles a realm group gave.
+            "role_source": dict(u.get("role_source") or {})}
 
 
 def _header_value(value):
@@ -2424,13 +2426,29 @@ def _idp_principal(tid, provider, claims):
                 u["idp"]["propagate"] = prop
             else:
                 u["idp"].pop("propagate", None)
+            # oaap.core.tenant 2.8.1: the roles a realm group gives, synced
+            # at every login -- only those the mapping gave, never one a
+            # person gave by hand. Under the same write lock as the rest.
+            new_roles, source, role_changes = idp.role_sync(u, policy, claims)
+            if role_changes:
+                u["roles"] = new_roles
+            if source:
+                u["role_source"] = source
+            else:
+                u.pop("role_source", None)
             save_users(users)
             audit("user.idp-login", tid, u["username"], who=u["username"],
                   role="-", detail=f"{pkey} · {factor or 'kein Faktor genannt'}"
                   + (" · Profil aktualisiert" if changed else ""))
+            if role_changes:
+                audit("user.idp-role-sync", tid, u["username"],
+                      who=u["username"], role="-",
+                      detail=idp.role_changes_text(role_changes))
             _authz_sync_login(tid, u.get("id", ""), u["username"], claims)
             return u, ""
         roles, groups = idp.first_login_grant(policy, claims)
+        roles, source, role_changes = idp.role_sync(
+            {"roles": roles}, policy, claims)
         username = idp.local_username(
             claims, [x.get("username", "") for x in users],
             prefix=idp.tenant_name_prefix(tenant_rec))
@@ -2452,6 +2470,8 @@ def _idp_principal(tid, provider, claims):
                     "bound": _now_iso(), "last_login": _now_iso(),
                     "factor": factor},
         }
+        if source:
+            record["role_source"] = source
         prop = idp.propagation_from(claims)
         if prop:
             record["idp"]["propagate"] = prop
@@ -2462,6 +2482,9 @@ def _idp_principal(tid, provider, claims):
                  f"Rollen: {','.join(roles) or '-'} · "
                  f"Gruppen: {','.join(groups) or '-'} · "
                  f"{factor or 'kein Faktor genannt'}")
+    if role_changes:
+        audit("user.idp-role-sync", tid, username, who=username, role="-",
+              detail=idp.role_changes_text(role_changes))
     _authz_sync_login(tid, record["id"], username, claims)
     return record, ""
 
@@ -3614,6 +3637,15 @@ def _update_user(username, body, users, actor_name, role, actor_tenant):
     was_roles, was_active = list(u["roles"]), u["active"]
     was_email, was_verified = u.get("email", ""), bool(u.get("email_verified"))
     u["roles"] = roles
+    # oaap.core.tenant 2.8.1: an origin only for a role still held. A role
+    # a person takes away the mapping gives back at the next login if
+    # the group still says so; one a person adds is theirs.
+    source = {r: g for r, g in (u.get("role_source") or {}).items()
+              if r in roles}
+    if source:
+        u["role_source"] = source
+    else:
+        u.pop("role_source", None)
     u["groups"] = groups
     u["active"] = active
     was_when = (u.get("deactivate_at", ""), u.get("delete_at", ""))

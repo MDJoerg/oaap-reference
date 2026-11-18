@@ -8482,7 +8482,8 @@ def _idp_settings(args, name, c):
             wants["self_registration"], pol["group_map"],
             args.idp_reason if args.idp_reason is not None else pol["reason"],
             second_factor=wants.get("second_factor", pol["second_factor"]),
-            realm=pol["realm"], broker_closed=pol["broker_closed"])
+            realm=pol["realm"], broker_closed=pol["broker_closed"],
+            role_map=pol["role_map"])
         if bad:
             print(f"Refused before anything at {c['base_url']} was touched.")
             print("")
@@ -8677,6 +8678,10 @@ def _print_idp(label, t):
     if pol["group_map"]:
         for realm_group, oaap_group in sorted(pol["group_map"].items()):
             print(f"  group map    {realm_group} -> {oaap_group}")
+    # oaap.core.tenant 2.8.1: synced at every provider login, for the
+    # roles the mapping gave and never for hand-given ones.
+    for realm_group, prole in sorted(pol["role_map"].items()):
+        print(f"  role map     {realm_group} -> {prole}  (every login)")
     print("  self-reg.    " + ("on" if pol["self_registration"] else "off"))
     print("  2nd factor   " + pol["second_factor"]
           + ("  (the realm asks; OAAP never checks it itself)"
@@ -10925,7 +10930,7 @@ def cmd_tenant(args):
             die(f"no tenant with the label '{label}'")
         asked = (args.first_login, args.default_role, args.self_registration,
                  args.group_map, args.second_factor, args.broker_closed,
-                 args.broker_open)
+                 args.broker_open, args.role_map)
         if all(a is None for a in asked):
             _print_idp(label, t)
             return
@@ -10940,6 +10945,17 @@ def cmd_tenant(args):
                     die(f"--group-map wants realm-group=oaap-group, got '{pair}'")
                 left, right = pair.split("=", 1)
                 gmap[left.strip()] = right.strip().lower()
+        rmap = None
+        if args.role_map is not None:
+            rmap = {}
+            for pair in args.role_map.split(","):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if "=" not in pair:
+                    die(f"--role-map wants realm-group=role, got '{pair}'")
+                left, right = pair.split("=", 1)
+                rmap[left.strip()] = right.strip().lower()
         self_reg = None
         if args.self_registration is not None:
             self_reg = args.self_registration == "on"
@@ -10959,7 +10975,7 @@ def cmd_tenant(args):
             self_registration=self_reg, group_map=gmap,
             reason=args.idp_reason or "", second_factor=args.second_factor,
             who=os.environ.get("SUDO_USER") or getpass.getuser(),
-            broker_closed=bclosed)
+            broker_closed=bclosed, role_map=rmap)
         if not ok:
             die(msg)
         print(msg[0].upper() + msg[1:] + ".")
@@ -19162,7 +19178,7 @@ def tenant_record_realm_settings(tid, connector, space, settings,
 def tenant_set_policy(tid, first_login=None, default_role=None,
                       self_registration=None, group_map=None, reason="",
                       second_factor=None, who="root", role="root",
-                      broker_closed=None):
+                      broker_closed=None, role_map=None):
     """What a first login through the provider BECOMES. (ok, sentence).
 
     K4b's authority is NOT checked here -- it is checked by
@@ -19185,6 +19201,9 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
     want_self = (bool(self_registration) if self_registration is not None
                  else now["self_registration"])
     want_map = group_map if group_map is not None else now["group_map"]
+    # oaap.core.tenant 2.8.1: realm group -> guest|partner|user. The WHOLE
+    # new table, like group_map; {} clears it.
+    want_roles = role_map if role_map is not None else now["role_map"]
     want_reason = (reason or "").strip() or now["reason"]
     want_factor = (second_factor if second_factor is not None
                    else now["second_factor"])
@@ -19211,15 +19230,18 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
                 want_closed[alias] = str(why).strip()
     bad = idp.policy_refusal(want_first, want_role, want_self, want_map,
                              want_reason, second_factor=want_factor,
-                             realm=now["realm"], broker_closed=want_closed)
+                             realm=now["realm"], broker_closed=want_closed,
+                             role_map=want_roles)
     if bad:
         return False, bad
+    want_roles = idp.role_map_of(want_roles)
     t["idp_policy"] = {"first_login": want_first,
                        "broker_closed": want_closed,
                        "default_role": want_role,
                        "self_registration": want_self,
                        "second_factor": want_factor,
                        "group_map": want_map,
+                       "role_map": want_roles,
                        "reason": want_reason,
                        # Kept as it was: this command records an
                        # INTENTION and has asked the space nothing, so
@@ -19235,6 +19257,10 @@ def tenant_set_policy(tid, first_login=None, default_role=None,
               + (" · Selbstregistrierung an" if want_self
                  else " · Selbstregistrierung aus")
               + (f" · {len(want_map)} Gruppenabbildung(en)" if want_map else "")
+              + ((" · Rollen je Realm-Gruppe: " + ", ".join(
+                  f"{g}={r}" for g, r in sorted(want_roles.items()))
+                  if want_roles else " · keine Rollen je Realm-Gruppe")
+                 if role_map is not None else "")
               + (f" · zweiter Faktor {want_factor}" if want_factor
                  else "")
               + (f" · Begruendung: {want_reason}" if want_reason else "")
@@ -37160,6 +37186,11 @@ def build_parser():
     pten.add_argument("--group-map", dest="group_map", default=None,
                       help="realm-group=oaap-group,... -- an explicit local "
                            "mapping; an unmapped group grants nothing")
+    pten.add_argument("--role-map", dest="role_map", default=None,
+                      help="realm-group=role,... -- a platform role per realm "
+                           "group, only guest|partner|user, synced at every "
+                           "provider login; '' clears it (oaap.core.tenant "
+                           "2.8.1)")
     pten.add_argument("--broker-closed", dest="broker_closed", default=None,
                       help="alias=reason -- acknowledge a broker of the "
                            "realm as closed (RFC-0091 §3.2)")
