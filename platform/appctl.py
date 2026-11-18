@@ -23488,6 +23488,15 @@ def _install_from_dir(pkg, args, source):
     # grant, like links -- a deployment must not undo them
     if carried_dest:
         reg["instances"][name]["destinations"] = carried_dest
+    # 0.1.305 (L24, measured on oaapx01 18.11.): the propagation grant
+    # (RFC-0066 D3) is the tenant_admin's decision like the binding it sits
+    # on -- an update dropped it, and the MCP gateway's calls went 403
+    # until someone granted it again. Carried for the needs still bound;
+    # a rehearsal carries no binding and so no grant.
+    carried_grants = sorted(g for g in ((inst or {}).get("propagate") or [])
+                            if g in carried_dest)
+    if carried_grants:
+        reg["instances"][name]["propagate"] = carried_grants
     # What this instance is a rehearsal OF, and when it goes away
     # (spec 2.15.1). Written LAST and unconditionally when present, so a
     # record cannot end up a rehearsal by data and an ordinary instance

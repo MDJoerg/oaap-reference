@@ -322,6 +322,18 @@ ok("... die Zusicherung bleibt, jede andere Identitaetszeile wird gestrichen",
 erp = site[site.find("path /destinations/erp"):]
 ok("an eine gewoehnliche Destination wird die Zusicherung gestrichen",
    "request_header -X-OAAP-User-Assertion" in erp[:erp.find("reverse_proxy")])
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    m._install_from_dir(pkg, args, {"kind": "local", "url": pkg, "path": ""})
+reg = m.load_registry()
+ok("L24: ein Update behaelt die Freigabe neben der Bindung (gemessen oaapx01 18.11.)",
+   reg["instances"][key].get("propagate") == ["a4h"]
+   and reg["instances"][key]["destinations"] == {"a4h": "a4h", "erp": "erp"},
+   reg["instances"][key])
+site = m._read_file(os.path.join(m.CADDY_APPS_DIR, m.DEST_SITE)) or ""
+start = site.find("path /destinations/a4h")
+blk = site[start:site.find("path /destinations/erp")] if "path /destinations/erp" in site[start:] else site[start:]
+ok("... und das Gateway leitet danach weiter an connect, nicht 403",
+   "rewrite * /propagate/a4h{uri}" in blk and "does not carry the signed-in person" not in blk, blk)
 m.destination_bind(m.load_registry(), key, "a4h")
 ok("neu binden ohne --propagate nimmt die Freigabe zurueck",
    "propagate" not in m.load_registry()["instances"][key])
