@@ -14422,7 +14422,9 @@ def messages_routes():
 # sits on this page, for the server_admin; the host judges both again.
 
 DEST_WAIT_SECONDS = 90
-DEST_OPS = ("add", "secret", "remove", "allow", "fingerprint", "ca", "sample")
+DEST_OPS = ("add", "secret", "remove", "allow", "fingerprint", "ca", "sample", "check")
+# RFC-0096 §3.3: what the host takes when a destination stores no check path
+CHECK_SAP_PATH = "/sap/bc/ui2/start_up"
 DEST_AUTH_WORDS = {"none": "keine", "basic": "Benutzer + Passwort", "bearer": "Bearer-Token",
                    "header": "eigene Kopfzeile", "principal_propagation": "Person durchreichen (Zertifikat)"}
 
@@ -14452,6 +14454,9 @@ def _destinations_facts(tid):
                      # 0.13 (L22): the pin and the claim rules, never the certificate
                      "pin": (auth.get("server_sha256") or "")[:16].upper(),
                      "claims": ", ".join(r_.get("name", "") for r_ in auth.get("user") or []),
+                     # RFC-0096: the chain test's GET path as the host takes it
+                     "check_path": (auth.get("check_path") or "" if "check_path" in auth else
+                                    CHECK_SAP_PATH if auth.get("name_check") == "sap" else ""),
                      "mail": d.get("kind") == "smtp",
                      "bound": bound.get(name, []),
                      "allowed": bool(d.get("closed_allow")) if "closed_allow" in d else None,
@@ -14578,6 +14583,27 @@ DESTINATIONS_BODY = """
   <p class="muted">Das Muster gilt eine Stunde und genügt, um die Regel anzulegen.</p>
 </div>
 {% endif %}
+{% if f.rows | selectattr("pin") | list %}
+<div class="card" id="kette">
+  <h2>Kette prüfen</h2>
+  <p class="muted">Meldet sich am Ziel als Prüfbenutzer <code>OAAP_CHECK</code> an — nie als eine
+  Person — mit einem Zertifikat der Zertifizierungsstelle dieses Mandanten, ruft einmal den Prüfpfad
+  auf und sagt, welches Glied der Kette hält: erreichbar, Serverzertifikat = Pin, CA vertraut,
+  Zuordnung zu einem Benutzer, Benutzer. Die Antwort des Ziels zeigt die Seite nicht. Im Ziel muss
+  es den Benutzer <code>OAAP_CHECK</code> geben, <strong>ohne jede Berechtigung</strong>. Nach jeder
+  Wartung oder jedem Neustart des Ziels wiederholen.</p>
+  {% if chain %}<pre style="white-space:pre-wrap">{{ chain.lines | join("\n") }}</pre>{% endif %}
+  {% for r in f.rows if r.pin %}
+  <form method="post" action="/destinationen/check{{ q }}#kette" style="margin-top:.5rem">
+    <input type="hidden" name="name" value="{{ r.name }}">
+    <code>{{ r.name }}</code>
+    {% if admin or (self_admin and r.own) %}<label style="display:inline">Prüfpfad
+      <input name="check_path" value="{{ r.check_path }}" maxlength="300" placeholder="leer = ohne" style="width:18rem"></label>
+    {% else %}<span class="muted">Prüfpfad {{ r.check_path or "—" }}</span>{% endif %}
+    <button class="btn secondary">Kette prüfen</button>
+  </form>{% endfor %}
+</div>
+{% endif %}
 {% if admin or self_admin %}
 <div class="card" id="person">
   <h2>Destination mit Person durchreichen (Zertifikat)</h2>
@@ -14613,6 +14639,7 @@ DESTINATIONS_BODY = """
     <p><label>Benutzer im Ziel aus dem Merkmal (Claim)<input name="claims" value="sap_user"></label></p>
     <p><label><input type="checkbox" name="name_check" value="sap" checked> SAP-Regeln für den Benutzernamen (A–Z, 0–9, _, höchstens 12)</label></p>
     <p><label>Gültigkeit eines Zertifikats in Minuten (1–60)<input name="lifetime" value="10" inputmode="numeric"></label></p>
+    <p><label>Prüfpfad für „Kette prüfen“ (leer = ohne)<input name="check_path" value="/sap/bc/ui2/start_up" maxlength="300"></label></p>
     <p><label>Nur falls der Knoten nicht lesen kann, wer das Merkmal ändern darf: wer hat von Hand geprüft, dass nur Administratoren es ändern, und wie?<input name="unchecked_claim" maxlength="200"></label></p>
     <p><label class="checkline"><input type="checkbox" name="compared" value="1" required>
       Ich habe den Fingerabdruck mit dem Administrator des Ziels verglichen (SAP: STRUST, eigenes
@@ -14647,11 +14674,12 @@ def destinations_page():
                                 request.args.get("err"))
 
 
-def _destinations_render(tid, label, role, msg, error, pin=None, pin_name="", pin_target=""):
+def _destinations_render(tid, label, role, msg, error, pin=None, pin_name="", pin_target="",
+                         chain=None):
     named = role == "server_admin" and tid != default_tenant_id()
     f = _destinations_facts(tid)
     return page(DESTINATIONS_BODY, "Destinationen", "destinations",
-                pin=pin, pin_name=pin_name, pin_target=pin_target,
+                pin=pin, pin_name=pin_name, pin_target=pin_target, chain=chain,
                 label=(label if tid != default_tenant_id() else ""),
                 f=f, admin=role == "server_admin",
                 self_admin=role == "tenant_admin" and f["may"], switch=named,
@@ -14681,7 +14709,7 @@ def destinations_post(op):
     may = role == "tenant_admin" and _destinations_facts(tid)["may"] and op != "allow"
     # 0.13 (L22): the CA's public half and a sample -- for the tenant's own
     # tenant_admin as well; the host asks again.
-    may = may or (role == "tenant_admin" and op in ("ca", "sample"))
+    may = may or (role == "tenant_admin" and op in ("ca", "sample", "check"))
     if role != "server_admin" and not may:
         return ("Zugriff verweigert: Destinationen anlegen und ändern ist Sache des "
                 "Server-Admins (oaap.net.destinations 2.7).", 403)
@@ -14694,6 +14722,8 @@ def destinations_post(op):
         args["target"] = (request.form.get("target") or "").strip()[:500]
     if op == "sample":
         args["sample"] = (request.form.get("sample") or "MUSTER").strip()[:12]
+    if op in ("check", "add") and "check_path" in request.form:
+        args["check_path"] = (request.form.get("check_path") or "").strip()[:300]
     if op == "add":
         for k, mx in (("kind", 8), ("target", 500), ("auth", 24), ("user", 254), ("header", 80),
                       ("accept_sha256", 100), ("claims", 200), ("name_check", 8),
@@ -14717,6 +14747,14 @@ def destinations_post(op):
         resp.headers["Content-Type"] = "application/x-x509-ca-cert"
         resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
         return resp
+    if op == "check" and res.get("ok") and isinstance(res.get("detail"), dict):
+        # RFC-0096: the same page with the result, link by link
+        d_ = res["detail"]
+        lines = [str(x)[:400] for x in (d_.get("lines") or [])][:20]
+        return _destinations_render(tid, label, role,
+                                    str(res.get("message") or "")[:600] if d_.get("ok") else None,
+                                    None if d_.get("ok") else str(res.get("message") or "")[:600],
+                                    chain={"lines": lines})
     if op == "fingerprint" and res.get("ok") and isinstance(res.get("detail"), dict):
         # 0.13 (L22) step 1 answered: the same page, with what to compare
         # and the form that pins it. Nothing is stored yet.

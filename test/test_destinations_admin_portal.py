@@ -364,7 +364,8 @@ ns = {"json": json, "DESTINATIONS_FILE": dfile, "default_tenant_id": lambda: DEF
       "load_instances": lambda: {"kunde-chat": {"tenant": KUNDE, "destinations": {"ki": "ki"}},
                                  "andere-x": {"tenant": ANDERE, "destinations": {"ki": "fremd"}}}}
 for node in tree.body:
-    if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "DEST_AUTH_WORDS" for t in node.targets):
+    if isinstance(node, ast.Assign) and any(getattr(t, "id", "") in ("DEST_AUTH_WORDS", "CHECK_SAP_PATH")
+                                            for t in node.targets):
         exec(compile(ast.Module([node], []), APP_PY, "exec"), ns)
     if isinstance(node, ast.FunctionDef) and node.name == "_destinations_facts":
         exec(compile(ast.Module([node], []), APP_PY, "exec"), ns)
@@ -424,6 +425,28 @@ ok("... mit so einer Destination: Zertifizierungsstelle und Muster zum Laden",
    and "/destinationen/ca" not in html_s, html_r)
 html_rt = TPL.render(f=pp_facts, admin=False, label="kunde", q="", msg=None, error=None)
 ok("... auch für den tenant_admin ohne Erlaubnis", 'action="/destinationen/ca"' in html_rt, html_rt)
+# RFC-0096: Kette prüfen
+pp_facts["rows"][-1]["check_path"] = "/sap/bc/ui2/start_up"
+html_c = TPL.render(f=pp_facts, admin=True, label="kunde", q="?tenant=kunde", msg=None, error=None)
+ok("RFC-0096: mit so einer Destination die Karte „Kette prüfen“, ein Knopf je gepinnter Destination",
+   'action="/destinationen/check?tenant=kunde#kette"' in html_c and html_c.count("/destinationen/check") == 1
+   and "OAAP_CHECK" in html_c and "ohne jede Berechtigung" in html_c, html_c)
+ok("... der server_admin darf den Prüfpfad ändern",
+   'name="check_path" value="/sap/bc/ui2/start_up"' in html_c, html_c)
+ok("... ohne gepinnte Destination keine Karte", "/destinationen/check" not in html_s)
+html_rt = TPL.render(f=pp_facts, admin=False, label="kunde", q="", msg=None, error=None)
+ok("... der tenant_admin ohne Erlaubnis prüft, sieht den Pfad, ändert ihn nicht",
+   'action="/destinationen/check#kette"' in html_rt and 'name="check_path"' not in html_rt
+   and "Prüfpfad /sap/bc/ui2/start_up" in html_rt, html_rt)
+pp_own = dict(pp_facts, may=True, rows=[dict(r_, own=True) for r_ in pp_facts["rows"]])
+html_co = TPL.render(f=pp_own, admin=False, self_admin=True, label="kunde", q="", msg=None, error=None)
+ok("... mit Erlaubnis an der eigenen: Pfad änderbar", 'name="check_path"' in html_co, html_co)
+html_cr = TPL.render(f=pp_facts, admin=True, label="kunde", q="?tenant=kunde", msg="Kette hält.", error=None,
+                     chain={"lines": ["hält           Ziel erreichbar", "<b>x</b>"]})
+ok("... das Ergebnis steht Zeile für Zeile auf der Seite, maskiert",
+   "hält           Ziel erreichbar" in html_cr and "<b>x</b>" not in html_cr, html_cr)
+ok("... Schritt 2 fragt den Prüfpfad gleich mit, SAP vorbelegt",
+   'name="check_path" value="/sap/bc/ui2/start_up"' in html_p, html_p)
 
 src = io.open(APP_PY, encoding="utf-8").read()
 route = src.split('@app.post("/destinationen/<op>")')[1].split("\n\n\n")[0]
@@ -434,6 +457,9 @@ ok("... einen tenant_admin nur mit Erlaubnis, und nie beim Schalter",
    'op != "allow"' in route and '["may"]' in route)
 ok("0.13: die Route reicht Vergleich und Fingerabdruck weiter, prüft sie aber nicht selbst",
    '"compared"' in route and '"accept_sha256"' in route and "_norm_fp" not in route)
+ok("RFC-0096: die Route lässt den tenant_admin prüfen und reicht den Prüfpfad nur weiter, wenn das Feld da ist",
+   'op in ("ca", "sample", "check")' in route and '"check_path" in request.form' in route
+   and "check_path_refusal" not in route)
 
 print("")
 print("PASS" if not fails else f"{fails} FEHLER")

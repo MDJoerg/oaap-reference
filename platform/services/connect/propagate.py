@@ -193,7 +193,8 @@ def ensure_ca(ca_dir, tenant_id, tenant_label, now=None):
     return cert, key, True
 
 
-def issue(ca_cert, ca_key, tenant_label, user, user_id, minutes, now=None):
+def issue(ca_cert, ca_key, tenant_label, user, user_id, minutes, now=None,
+          uri=""):
     """(cert_pem, key_pem, serial_hex, not_after). The person's certificate.
 
     `O=OAAP, OU=<tenant>, CN=<user>`, the person's UUID as a SAN URI for
@@ -221,10 +222,12 @@ def issue(ca_cert, ca_key, tenant_label, user, user_id, minutes, now=None):
              [ExtendedKeyUsageOID.CLIENT_AUTH]), False)
          .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
              ca_key.public_key()), False))
-    if user_id:
+    # RFC-0096 D7: the chain test names itself (`urn:oaap:check`) where a
+    # person's certificate carries the person's UUID.
+    san = uri or (f"urn:oaap:user:{user_id}" if user_id else "")
+    if san:
         b = b.add_extension(x509.SubjectAlternativeName(
-            [x509.UniformResourceIdentifier(f"urn:oaap:user:{user_id}")]),
-            False)
+            [x509.UniformResourceIdentifier(san)]), False)
     cert = b.sign(ca_key, hashes.SHA256())
     return (cert.public_bytes(serialization.Encoding.PEM),
             key.private_bytes(serialization.Encoding.PEM,
@@ -285,6 +288,141 @@ def client_context(cert_pem, key_pem, server_pem, tmp_dir=None):
         except OSError:
             pass
     return ctx
+
+
+# ------------------------------------------------- the chain test (RFC-0096)
+
+CHECK_USER = "OAAP_CHECK"          # D1/D2: reserved, never chosen per call
+CHECK_URI = "urn:oaap:check"       # D7
+CHECK_LINKS = ("reach", "pin", "ca", "mapping", "user")
+CHECK_BODY_MAX = 65536
+
+
+def chain_check(ca_dir, tenant_id, tenant_label, target, server_pem, pin,
+                path, timeout=15, user=CHECK_USER):
+    """Log in to a propagation destination's target as the reserved test
+    user and say which link of the chain holds (RFC-0096 §2).
+
+    -> {"links": [[link, state, why], ...], "serial", "status",
+        "fingerprint"} with state "held", "broke", "not reached" or
+    "not checked". The target's answer is read only as far as link 5
+    needs (the user name in a JSON `id`) and is never returned (D4).
+    The certificate lives for one minute, in this call only: it is not
+    cached and its key never leaves the process."""
+    import hashlib as _h
+    import http.client
+    import socket
+    import urllib.parse
+    out = {"links": [], "serial": "", "status": 0, "fingerprint": ""}
+
+    def mark(link, state, why=""):
+        out["links"].append([link, state, why])
+
+    def rest(after):
+        for name in CHECK_LINKS[CHECK_LINKS.index(after) + 1:]:
+            mark(name, "not reached")
+        return out
+
+    u = urllib.parse.urlsplit(target)
+    host, port = u.hostname or "", u.port or 443
+    base = (u.path or "").rstrip("/")
+    # 1 + 2: reach, and the certificate the target presents NOW = the pin
+    plain = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    plain.check_hostname = False
+    plain.verify_mode = ssl.CERT_NONE
+    try:
+        plain.set_ciphers("DEFAULT:@SECLEVEL=0")
+    except ssl.SSLError:
+        pass
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as e:
+        mark("reach", "broke", f"{host}:{port}: {e}")
+        return rest("reach")
+    mark("reach", "held", f"{host}:{port}")
+    try:
+        with sock, plain.wrap_socket(sock, server_hostname=host or None) as tls:
+            der = tls.getpeercert(binary_form=True) or b""
+    except (OSError, ssl.SSLError) as e:
+        mark("pin", "broke", f"no TLS: {e}")
+        return rest("pin")
+    fp = _h.sha256(der).hexdigest()
+    out["fingerprint"] = fp
+    if fp != (pin or "").lower():
+        mark("pin", "broke", fp)
+        return rest("pin")
+    mark("pin", "held", fp)
+    # 3: the handshake with the test user's certificate
+    ca_cert, ca_key, _made = ensure_ca(ca_dir, tenant_id, tenant_label)
+    cert_pem, key_pem, serial, _na = issue(ca_cert, ca_key, tenant_label,
+                                           user, "", 1, uri=CHECK_URI)
+    out["serial"] = serial
+    ctx = client_context(cert_pem, key_pem, server_pem)
+    want = base + (path or "/")
+    conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    try:
+        try:
+            conn.connect()
+        except ssl.SSLError as e:
+            mark("ca", "broke", f"TLS: {getattr(e, 'reason', None) or e}")
+            return rest("ca")
+        except OSError as e:
+            mark("ca", "broke", f"connection closed in the handshake: {e}")
+            return rest("ca")
+        try:
+            # no cookie, no reuse, no redirect -- like a person's call
+            conn.request("GET", want, headers={
+                "Accept": "application/json", "Connection": "close",
+                "User-Agent": "OAAP chain check (RFC-0096)"})
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read(CHECK_BODY_MAX)
+        except ssl.SSLError as e:
+            # TLS 1.3: a refused client certificate arrives as an alert
+            # on the first read, after the handshake looked complete
+            mark("ca", "broke", f"TLS: {getattr(e, 'reason', None) or e}")
+            return rest("ca")
+        except (ConnectionResetError, BrokenPipeError) as e:
+            mark("ca", "broke", f"connection closed after the handshake: {e}")
+            return rest("ca")
+        except (socket.timeout, TimeoutError):
+            mark("ca", "held")
+            mark("mapping", "broke", f"no answer within {timeout} s")
+            return rest("mapping")
+        except (OSError, http.client.HTTPException) as e:
+            mark("ca", "held")
+            mark("mapping", "broke", f"no readable answer: {e}")
+            return rest("mapping")
+    finally:
+        conn.close()
+    out["status"] = status
+    mark("ca", "held")
+    # 4: 401 = the certificate arrived, no user was made of it
+    if status == 401:
+        mark("mapping", "broke", "401")
+        return rest("mapping")
+    mark("mapping", "held", str(status))
+    # 5: the user, as far as the check path tells
+    if not path:
+        mark("user", "not checked", str(status))
+        return out
+    if not 200 <= status < 300:
+        mark("user", "broke", str(status))
+        return out
+    named = None
+    try:
+        doc = json.loads(body.decode("utf-8", "replace"))
+        if isinstance(doc, dict) and isinstance(doc.get("id"), str):
+            named = doc["id"]
+    except ValueError:
+        pass
+    if named is None:
+        mark("user", "held", f"{status}, the path names no user")
+    elif named.upper() == user:
+        mark("user", "held", f"{status}, {user}")
+    else:
+        mark("user", "broke", "another user")
+    return out
 
 
 class CertCache:

@@ -2444,6 +2444,31 @@ def destination_admin_job(req, actor):
             return True, f"Musterzertifikat für {name}", {"pem": pem, "file": f"oaap-{label}-muster-{name}.crt"}
         except DestinationRefused as exc:
             return False, str(exc), None
+    if op == "check":
+        # RFC-0096 D5: whoever sees the pin and loads the CA may run the
+        # chain test; the check path changes only with the destination
+        # (2.7, 2.7.1).
+        if role not in ("server_admin", "tenant_admin"):
+            return False, "requires server_admin or tenant_admin", None
+        name = str(a.get("name") or "")
+        try:
+            if "check_path" in a:
+                d = (load_destinations().get(tid) or {}).get(name) or {}
+                if str(a.get("check_path") or "").strip() != effective_check_path(d.get("auth")):
+                    if role != "server_admin" and not (
+                            tenant_admin_may(tid, "destinations")
+                            and d.get("author") == "tenant_admin"):
+                        return False, ("Den Prüfpfad ändert, wer die Destination ändern darf "
+                                       "(2.7, 2.7.1) -- nichts geprüft."), None
+                    destination_set_check_path(tid, name, str(a.get("check_path") or ""),
+                                               who=actor, role=role)
+            res = propagation_check(tid, name, who=actor, role=role)
+        except DestinationRefused as exc:
+            return False, str(exc), None
+        res["lines"] = chain_lines(res, de=True)
+        first = next((l_ for l_, s_, _w in res["links"] if s_ == "broke"), "")
+        return True, (f"Kette von „{name}“ hält." if res["ok"] else
+                      f"Kette von „{name}“ bricht bei: {CHECK_LINK_WORDS[first][1]}."), res
     by_tenant = role == "tenant_admin" and tenant_admin_may(tid, "destinations")
     if role != "server_admin" and not by_tenant:
         return False, ("adding, changing and removing destinations is the server_admin's "
@@ -2490,6 +2515,8 @@ def destination_admin_job(req, actor):
                       "name_check": "sap" if str(a.get("name_check") or "sap") == "sap" else "",
                       "lifetime": a.get("lifetime") or 10,
                       "unchecked_claim": f"{actor}: {unchecked}" if unchecked else ""}
+                if "check_path" in a:
+                    pp["check_path"] = str(a.get("check_path") or "")
             destination_add(tid, name, kind, str(a.get("target") or ""),
                             auth, str(a.get("user") or ""), str(a.get("header") or ""),
                             str(a.get("secret") or "") if auth not in ("none", "principal_propagation") else "",
@@ -4297,7 +4324,8 @@ def cmd_notify(args):
 def destination_add(tid, name, kind, target, auth_type="none", user="",
                     header="", secret="", who="root", role="root",
                     accept_sha256="", claims=(), name_check="",
-                    lifetime=10, unchecked_claim="", author=""):
+                    lifetime=10, unchecked_claim="", author="",
+                    check_path=None):
     if not re.fullmatch(DEST_NAME_RE, name or ""):
         raise DestinationRefused("a destination name is [a-z0-9-], 2-40 "
                                  "characters, starting and ending with a "
@@ -4345,6 +4373,12 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
     if auth_type == "principal_propagation":
         auth.update(_propagation_auth(tid, target_obj, accept_sha256, claims,
                                       name_check, lifetime, unchecked_claim))
+        if check_path is not None:
+            # RFC-0096 §3.3: the chain test's GET path; "" = none
+            bad = check_path_refusal(check_path)
+            if bad:
+                raise DestinationRefused(bad)
+            auth["check_path"] = check_path.strip()
     if auth_type == "basic":
         if not user or ":" in user or not re.fullmatch(r"[\x21-\x7e]+", user):
             raise DestinationRefused("basic needs a user without ':' or spaces")
@@ -4482,6 +4516,150 @@ def propagation_sample(tid, name):
         raise DestinationRefused("the connect service could not issue a sample: "
                                  + (r.stderr.strip().splitlines() or ["no answer"])[-1])
     return r.stdout
+
+
+# RFC-0096: the chain test. Run INSIDE connect like the sample above --
+# no HTTP route there issues a certificate without a person's assertion
+# (D3), so no app can borrow the test user.
+CHECK_SAP_PATH = "/sap/bc/ui2/start_up"
+CHECK_USER = "OAAP_CHECK"           # D1/D2, the same name as connect's propagate.CHECK_USER
+_CHECK_SCRIPT = (
+    "import sys, json, propagate\n"
+    "res = propagate.chain_check(propagate_dir, tid, label, target, server_pem, pin, path)\n"
+    "sys.stdout.write(json.dumps(res))\n")
+CHECK_LINK_WORDS = {
+    "reach": ("target reachable", "Ziel erreichbar"),
+    "pin": ("server certificate = pin", "Serverzertifikat = Pin"),
+    "ca": ("CA trusted by the target", "CA vom Ziel vertraut"),
+    "mapping": ("certificate mapped to a user", "Zuordnung zu einem Benutzer"),
+    "user": ("user and check path", "Benutzer und Prüfpfad"),
+}
+CHECK_STATE_WORDS = {
+    "held": ("holds", "hält"), "broke": ("BREAKS", "BRICHT"),
+    "not reached": ("not reached", "nicht erreicht"),
+    "not checked": ("not checked (no check path)", "nicht geprüft (kein Prüfpfad)"),
+}
+CHECK_BROKE = {
+    "reach": ("The target does not answer -- switched off, or a firewall between.",
+              "Das Ziel antwortet nicht -- aus, oder eine Firewall dazwischen."),
+    "pin": ("The target presents another certificate than the pinned one -- renewed "
+            "(SAP: STRUST)? Compare the fingerprint and add the destination again.",
+            "Das Ziel zeigt ein anderes Zertifikat als das gepinnte -- erneuert (SAP: "
+            "STRUST)? Fingerabdruck vergleichen und die Destination neu anlegen."),
+    "ca": ("The target refused the platform's certificate in the handshake -- the "
+           "tenant's CA is not in its trust list (SAP: STRUST, SSL server standard), "
+           "or it is another tenant's CA.",
+           "Das Ziel lehnt das Zertifikat der Plattform im Handshake ab -- die CA des "
+           "Mandanten fehlt in seiner Vertrauensliste (SAP: STRUST, SSL-Server "
+           "Standard), oder es ist die CA eines anderen Mandanten."),
+    "mapping": ("The certificate arrived, but no user was made of it (401). SAP: "
+                "login/certificate_mapping_rulebased in RZ11 (0 after a restart = "
+                "RZ10 missing), the CERTRULE rule (subject filter OU, O; made from a "
+                "sample of THIS CA), the user OAAP_CHECK in this client.",
+                "Das Zertifikat kam an, aber kein Benutzer wurde daraus (401). SAP: "
+                "login/certificate_mapping_rulebased in RZ11 (nach einem Neustart 0 = "
+                "RZ10 fehlt), die Regel in CERTRULE (Filter OU, O; aus einem Muster "
+                "DIESER CA), der Benutzer OAAP_CHECK in diesem Mandanten."),
+    "mapping-silent": ("The target took the certificate but gave no readable answer.",
+                       "Das Ziel nahm das Zertifikat an, gab aber keine lesbare Antwort."),
+    "user": ("Logged in, but the check path did not answer as expected -- user locked, "
+             "the service not active (SAP: SICF), or the target mapped the "
+             "certificate to another user.",
+             "Angemeldet, aber der Prüfpfad antwortet nicht wie erwartet -- Benutzer "
+             "gesperrt, Dienst nicht aktiv (SAP: SICF), oder das Ziel hat das "
+             "Zertifikat einem anderen Benutzer zugeordnet."),
+}
+
+
+def check_path_refusal(path):
+    """"" when `path` may be the chain test's GET path (RFC-0096 §3.3)."""
+    p = (path or "").strip()
+    if not p:
+        return ""
+    if len(p) > 300 or not re.fullmatch(r"/[\x21-\x7e]*", p) or p.startswith("//") \
+            or "#" in p or re.search(r"(^|/)\.\.(/|\?|$)", p):
+        return ("a check path is one path below the target, starting with /, "
+                "printable, without .. or # (e.g. /sap/bc/ui2/start_up)")
+    return ""
+
+
+def effective_check_path(auth):
+    """The stored path, or SAP's default for a destination with SAP name
+    rules; "" when none (D8: then the test ends after link 4)."""
+    if "check_path" in (auth or {}):
+        return auth.get("check_path") or ""
+    return CHECK_SAP_PATH if (auth or {}).get("name_check") == "sap" else ""
+
+
+def destination_set_check_path(tid, name, path, who="root", role="root"):
+    bad = check_path_refusal(path)
+    if bad:
+        raise DestinationRefused(bad)
+    dests = load_destinations()
+    d = (dests.get(tid) or {}).get(name)
+    if d is None:
+        raise DestinationRefused(f"this tenant has no destination '{name}'")
+    if (d.get("auth") or {}).get("type") != "principal_propagation":
+        raise DestinationRefused("a check path belongs to a principal_propagation "
+                                 "destination (RFC-0096)")
+    d["auth"]["check_path"] = (path or "").strip()
+    save_destinations(dests)
+    audit_tenant("destination.check-path", tid, subject=name, who=who, role=role,
+                 detail=d["auth"]["check_path"] or "(none)")
+
+
+def propagation_check(tid, name, who="root", role="root"):
+    """RFC-0096 stage 1: log in to the target as OAAP_CHECK and report each
+    link. -> the result of propagate.chain_check plus "path" and "ok".
+    Audited like every issued certificate (spec 2.9.9)."""
+    d = (load_destinations().get(tid) or {}).get(name)
+    if d is None:
+        raise DestinationRefused(f"this tenant has no destination '{name}'")
+    auth = d.get("auth") or {}
+    if auth.get("type") != "principal_propagation":
+        raise DestinationRefused("the chain test is for principal_propagation "
+                                 "destinations (RFC-0096)")
+    target = (d.get("target") or {}).get("direct", "")
+    if not target or not auth.get("server_cert"):
+        raise DestinationRefused("this destination has no direct target with a "
+                                 "pinned certificate")
+    path = effective_check_path(auth)
+    code = (f"propagate_dir={json.dumps('/ca')}; tid={json.dumps(tid)}; "
+            f"label={json.dumps(tenant_label(tid))}; target={json.dumps(target)}; "
+            f"server_pem={json.dumps(auth['server_cert'])}; "
+            f"pin={json.dumps(auth.get('server_sha256', ''))}; path={json.dumps(path)}\n"
+            + _CHECK_SCRIPT)
+    try:
+        r = subprocess.run(["docker", "exec", CONNECT_CONTAINER, "python", "-c", code],
+                           capture_output=True, text=True, timeout=90)
+        res = json.loads((r.stdout.strip().splitlines() or ["{}"])[-1])
+        if not isinstance(res.get("links"), list):
+            raise ValueError
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        err = locals().get("r")
+        last = (err.stderr.strip().splitlines() or ["no answer"])[-1] if err else "no answer"
+        raise DestinationRefused(f"the connect service could not run the chain test: {last}")
+    res["path"] = path
+    res["ok"] = all(s in ("held", "not checked") for _l, s, _w in res["links"])
+    audit_tenant("destination.propagation.check", tid, subject=name, who=who, role=role,
+                 result="ok" if res["ok"] else "failed",
+                 detail=f"user {CHECK_USER} · serial {res.get('serial') or '-'} · "
+                        + " ".join(f"{l_}:{s_.replace(' ', '-')}" for l_, s_, _w in res["links"]))
+    return res
+
+
+def chain_lines(res, de=False):
+    """The result, one line per link, the reason under the link that broke."""
+    i = 1 if de else 0
+    lines = []
+    for link, state, why in res.get("links") or []:
+        word = CHECK_LINK_WORDS.get(link, (link, link))[i]
+        lines.append(f"{CHECK_STATE_WORDS.get(state, (state, state))[i]:<14} {word}"
+                     + (f" ({why})" if why else ""))
+        if state == "broke":
+            key = "mapping-silent" if link == "mapping" and why != "401" else link
+            lines.append("               " + CHECK_BROKE.get(key, ("", ""))[i])
+    return lines
 
 
 def propagation_ca_text(tid):
@@ -4640,7 +4818,8 @@ def _dest_line(tid, name, d, dest_secrets, reg):
         a += (f" (as the signed-in person: "
               + ", ".join(r.get("name", "") for r in auth.get("user") or [])
               + f"; certificates {auth.get('lifetime_minutes', 10)} min; "
-              f"server pinned {fp[:16]}…; claim checked {auth.get('claim_check', '?')})")
+              f"server pinned {fp[:16]}…; claim checked {auth.get('claim_check', '?')}; "
+              f"check path {effective_check_path(auth) or '(none)'})")
     if d.get("secret"):
         a += (", secret set" if (dest_secrets.get(tid) or {}).get(name)
               else ", SECRET MISSING -- calls are refused until it is set")
@@ -4786,6 +4965,19 @@ def cmd_destination(args):
                   f"{tenant_label(tid)} --sample MUSTER > muster.cer")
             return
         name = args.name or die(f"'destination {args.action}' needs a name")
+        if args.action == "check":
+            # RFC-0096: log in as OAAP_CHECK, one GET, which link breaks
+            if args.check_path is not None:
+                destination_set_check_path(tid, name, args.check_path, who=who)
+            res = propagation_check(tid, name, who=who)
+            print(f"Chain test of '{name}' as {CHECK_USER}"
+                  + (f", GET {res['path']}" if res.get("path") else ", no check path")
+                  + (f", certificate {res['serial']}" if res.get("serial") else "") + ":")
+            for line in chain_lines(res):
+                print("  " + line)
+            if not res["ok"]:
+                sys.exit(1)
+            return
         if args.action == "add":
             auth_type = args.auth or "none"
             secret = ""
@@ -4798,7 +4990,8 @@ def cmd_destination(args):
                             claims=args.user_claim or (),
                             name_check=args.name_check,
                             lifetime=args.lifetime,
-                            unchecked_claim=args.unchecked_claim)
+                            unchecked_claim=args.unchecked_claim,
+                            check_path=args.check_path)
             if auth_type == "principal_propagation":
                 print("  It carries the signed-in person. The tenant's issuing "
                       "CA for the target: oaap destination ca --tenant "
@@ -37308,7 +37501,7 @@ def build_parser():
                                "(oaap.net.destinations 0.1, RFC-0033)")
     pdst.add_argument("action", choices=["list", "show", "add", "remove",
                                          "set-secret", "bind", "unbind",
-                                         "bindings", "ca"])
+                                         "bindings", "ca", "check"])
     pdst.add_argument("name", nargs="?",
                       help="the destination (list/show/add/remove/set-secret) "
                            "or the instance (bind/unbind/bindings)")
@@ -37341,6 +37534,10 @@ def build_parser():
                       help="ca: print a one-hour certificate of the tenant's CA "
                            "for this user name, to make the target's mapping "
                            "rule from (no key)")
+    pdst.add_argument("--check-path", default=None,
+                      help="principal_propagation (add, check): the chain test's GET "
+                           "path below the target, \"\" for none (default for SAP "
+                           "name rules: /sap/bc/ui2/start_up; RFC-0096)")
     pdst.add_argument("--propagate", action="store_true",
                       help="bind: grant that the app's calls carry the "
                            "signed-in person (RFC-0066)")
