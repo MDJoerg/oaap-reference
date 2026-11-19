@@ -2716,9 +2716,13 @@ def _provider_logout_url(out):
     (oaapx02, 2026-10-02). Best effort -- a provider that cannot be asked
     must not stop somebody from leaving, so every failure is "".
 
-    The return address is the callback, because that is the one address
-    the realm already knows for this host; the callback recognises a
-    return without a login attempt and goes to the login page.
+    The return address is the callback of the tenant's PLACE, because
+    that is the one address the realm knows (login_handoff starts every
+    sign-in there); the callback recognises a return without a login
+    attempt and goes to the login page. 0.1.313: until then it was the
+    callback of the host the person signed out on -- on an instance's
+    address (`vorgaenge.bec.<node>`) the realm answered "Ungültige
+    Redirect URI" and nobody could sign out there (bec, 2026-11-19).
     """
     tid = (out or {}).get("tenant") or ""
     if not tid:
@@ -2736,11 +2740,27 @@ def _provider_logout_url(out):
     if not ends["end_session"].lower().startswith(("http://", "https://")):
         return ""
     query = {"client_id": provider["client_id"],
-             "post_logout_redirect_uri": _oidc_redirect_uri()}
+             "post_logout_redirect_uri": _place_callback(tid)}
     if out.get("hint"):
         query["id_token_hint"] = out["hint"]
     sep = "&" if "?" in ends["end_session"] else "?"
     return ends["end_session"] + sep + urlencode(query)
+
+
+def _place_callback(tid):
+    """The callback at the tenant's place (`<label>.<node>`, the node's own
+    name for the default tenant) -- the address the realm registered. On a
+    LAN name or without an external name: this host's, as before."""
+    ext = _external_host()
+    host = _forwarded_host()
+    if not ext or not (host == ext or host.endswith("." + ext)):
+        return _oidc_redirect_uri()
+    tenants = known_tenants()
+    label = ((tenants.get(tid) or {}).get("label") or "").strip().lower()
+    place_host = ext if tid == default_tenant_id() else (f"{label}.{ext}" if label else "")
+    if not place_host:
+        return _oidc_redirect_uri()
+    return f"{_forwarded_scheme()}://{place_host}/auth/oidc/callback"
 
 
 @app.post("/auth/logout")

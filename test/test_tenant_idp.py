@@ -774,6 +774,24 @@ r = c.post("/auth/logout", headers={"Host": f"hbvp.{HOST}"})
 ok("ohne Sitzung bleibt es beim alten Weg",
    r.headers.get("Location") == "/auth/login", r.headers.get("Location"))
 
+# 0.1.313 (bec, 2026-11-19): Abmelden auf der Adresse einer INSTANZ. Der Realm
+# kennt nur die Rueckkehradresse des Mandanten-Ortes; die der Instanz lehnte
+# Keycloak mit „Ungueltige Redirect URI“ ab.
+r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
+params = dict(p.split("=", 1)
+              for p in r.headers["Location"].split("?", 1)[1].split("&"))
+CLAIMS.update({"sub": "S-ABMELDEN", "preferred_username": "abmelden",
+               "nonce": unquote(params["nonce"]),
+               "exp": int(time.time()) + 300})
+c.get(f"/auth/oidc/callback?code=DERCODE&state={params['state']}",
+      headers={"Host": f"hbvp.{HOST}"})
+r = c.post("/auth/logout", headers={"Host": f"vorgaenge.hbvp.{HOST}"})
+q = parse_qs(urlsplit(r.headers.get("Location", "")).query)
+ok("0.1.313: Abmelden auf der Adresse einer Instanz kehrt zum Ort des Mandanten zurueck "
+   "(die Adresse, die der Realm kennt), nicht zur Instanz",
+   r.status_code == 303 and q.get("post_logout_redirect_uri") == [f"http://hbvp.{HOST}/auth/oidc/callback"],
+   (r.status_code, q.get("post_logout_redirect_uri")))
+
 
 print("\nDie Anmeldung von der Adresse einer INSTANZ aus (Joergs Befund 2026-10-02)")
 # Wer eine Instanz-Adresse oeffnet und keine Sitzung hat, wurde bisher auf die
