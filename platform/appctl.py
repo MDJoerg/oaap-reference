@@ -246,6 +246,79 @@ def _network_exists(net):
                           capture_output=True, text=True).returncode == 0
 
 
+# oaap.apps.runtime 2.11 (0.2.73): every network the platform creates gets
+# its own small range. Docker's default pools hold ~31 networks; oaapx01
+# ran out at 33 on 2026-11-19. Not fixed host-wide in daemon.json: a node
+# may carry containers that are not OAAP's, and applying it needs a Docker
+# restart, which stops every app.
+INSTANCE_NET_POOL = "172.16.0.0/16"
+INSTANCE_NET_PREFIX = 26
+NET_CREATE_TRIES = 4
+
+
+def host_ranges():
+    """The host's own IPv4 addresses and routes, as networks. Empty when
+    `ip` cannot say -- then only Docker's own networks are avoided."""
+    out = []
+    for argv in (["ip", "-4", "-o", "addr", "show"],
+                 ["ip", "-4", "route", "show", "table", "all"]):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            words = line.split()
+            if "inet" in words:                      # addr: "... inet a.b.c.d/n ..."
+                cands = words[words.index("inet") + 1:][:1]
+            else:                                    # route: "[type] dest ..."
+                cands = words[:2]
+            for w in cands:
+                if w in ("default", "0.0.0.0/0"):
+                    continue
+                try:
+                    out.append(ipaddress.ip_network(w, strict=False))
+                except ValueError:
+                    continue
+    return out
+
+
+def free_subnet(taken, skip=()):
+    """The first /26 of the pool that overlaps nothing in `taken` and is not
+    in `skip`, as text; "" when the pool is used up."""
+    pool = ipaddress.ip_network(INSTANCE_NET_POOL)
+    taken = [t for t in taken if t.version == 4]
+    for cand in pool.subnets(new_prefix=INSTANCE_NET_PREFIX):
+        if str(cand) in skip:
+            continue
+        if not any(cand.overlaps(t) for t in taken):
+            return str(cand)
+    return ""
+
+
+def create_network(net, extra=()):
+    """`docker network create` with a range of its own (2.11, 0.2.73).
+
+    A range Docker refuses as overlapping (another network made between
+    reading and creating) is skipped and the next one tried. With the pool
+    used up the network is created without a range, as before 0.2.73."""
+    skip = set()
+    for _ in range(NET_CREATE_TRIES):
+        sub = free_subnet(docker_subnets() + host_ranges(), skip)
+        if not sub:
+            break
+        argv = ["docker", "network", "create", *extra, "--subnet", sub, net]
+        r = subprocess.run(argv, capture_output=True, text=True)
+        if r.returncode == 0:
+            return sub
+        if "overlap" not in (r.stderr or "").lower():
+            raise subprocess.CalledProcessError(r.returncode, argv, r.stdout, r.stderr)
+        skip.add(sub)
+    run(["docker", "network", "create", *extra, net])
+    return ""
+
+
 def ensure_app_network(name, closed=None):
     net = app_network(name)
     if closed is None:
@@ -255,7 +328,7 @@ def ensure_app_network(name, closed=None):
         if closed:
             _create_closed_network(net)
         else:
-            run(["docker", "network", "create", net])
+            create_network(net)
     elif closed:
         why = egress_network_fault(net)
         if why:
@@ -390,8 +463,8 @@ def instance_egress_closed(inst):
 
 
 def _create_closed_network(net):
-    run(["docker", "network", "create", "--internal", "-o",
-         f"{EGRESS_BRIDGE_OPTION}={egress_bridge_name(net)}", net])
+    create_network(net, ["--internal", "-o",
+                         f"{EGRESS_BRIDGE_OPTION}={egress_bridge_name(net)}"])
 
 
 def network_is_internal(net):
@@ -1346,7 +1419,7 @@ def setup_link_network(reg, a, b):
         if closed:
             _create_closed_network(net)
         else:
-            run(["docker", "network", "create", net])
+            create_network(net)
     for who in (a, b):
         c = reg["instances"][who]["container"]
         subprocess.run(["docker", "network", "connect", net, c],
