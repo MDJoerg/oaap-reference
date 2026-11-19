@@ -3535,8 +3535,10 @@ INSTANCE_EDIT_BODY = """
      das Protokoll des Mandanten vermerkt es.</p>
   {% else %}
   <p class="muted">Zuordnen und Lösen dauert einen Moment: Die App wird dabei mit der
-     neuen Umgebung neu gestartet. Neue Destinationen legt der Server-Admin auf der Seite
-     <a href="/destinationen">Destinationen</a> an. Ein Bedarf, den das Manifest nicht nennt, läuft
+     neuen Umgebung neu gestartet. Neue Destinationen entstehen auf der Seite
+     <a href="/destinationen">Destinationen</a> -- durch den Server-Admin, oder durch die
+     Verwaltung des Mandanten, wenn er es ihr erlaubt hat. Auf der Kommandozeile heißt
+     Zuordnen <code>oaap destination bind</code>. Ein Bedarf, den das Manifest nicht nennt, läuft
      über die Kommandozeile:
      <code>oaap destination bind {{ i.key }} &lt;destination&gt; --as &lt;bedarf&gt;</code></p>
   {% endif %}
@@ -14439,8 +14441,10 @@ DESTINATIONS_BODY = """
 <div class="card">
   <h2>Ziele dieses Mandanten</h2>
   <p class="muted">Eine Destination ist ein Ziel außerhalb der Apps — ein KI-Gateway, ein ERP, ein
-  Mailserver. Eine App erreicht es nur, wenn es ihr zugeordnet ist (Instanz → Destinationen →
-  Zuordnen). Die Zugangsdaten bleiben bei der Plattform; diese Seite zeigt sie nie.</p>
+  Mailserver. Eine App erreicht es nur, wenn es ihr zugeordnet ist: auf der Seite der Instanz,
+  Reiter <strong>Netz &amp; Adressen</strong>, Abschnitt Destinationen, Knopf <strong>Zuordnen</strong>
+  (auf der Kommandozeile heißt dasselbe <code>oaap destination bind</code>). Die Zugangsdaten
+  bleiben bei der Plattform; diese Seite zeigt sie nie.</p>
   {% if f.rows %}
   <table class="list"><tr><th>Name</th><th>Ziel</th><th>Anmeldung</th><th>Zugeordnet</th>{% if admin or self_admin %}<th></th>{% endif %}</tr>
   {% for r in f.rows %}<tr>

@@ -333,6 +333,12 @@ ok("... und fragt den Worker, sie schreibt die Registry nicht selbst",
    '"action": "destination"' in route and "save_registry" not in route)
 ok("... und gibt keine Rehearsal-Ausnahme weiter",
    "rehearsal_exception" not in route)
+ok("L16 (0.1.310): die Seite Destinationen nennt den Ort des Zuordnens und das Wort der Kommandozeile",
+   "Reiter <strong>Netz &amp; Adressen</strong>, Abschnitt Destinationen, Knopf <strong>Zuordnen</strong>" in src
+   and "Instanz → Destinationen →" not in src)
+ok("L16: die Instanzseite sagt, dass auch die Verwaltung des Mandanten Destinationen anlegen kann",
+   "Verwaltung des Mandanten, wenn er es ihr erlaubt hat" in src
+   and "Neue Destinationen legt der Server-Admin auf der Seite" not in src)
 
 print("")
 print("PASS" if not fails else f"{fails} FEHLER")
