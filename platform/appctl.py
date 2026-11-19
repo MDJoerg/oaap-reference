@@ -1968,6 +1968,37 @@ def fetch_server_cert(host, port):
     return ssl.DER_cert_to_PEM_cert(der), hashlib.sha256(der).hexdigest()
 
 
+def propagation_target_facts(target):
+    """What the portal shows before a pin (oaap.net.destinations 2.7.2):
+    host, SHA-256 (hex and shown), subject, issuer, end of validity and key
+    size of the certificate the target presents NOW -- read, not trusted.
+    The decoding is for the eye only; the pin is the fingerprint."""
+    scheme, host, port, _base = parse_dest_target("http", (target or "").strip())
+    if scheme != "https":
+        raise DestinationRefused("principal_propagation needs an https target: "
+                                 "the certificate travels in the TLS handshake")
+    # the same refusal as destination_add: a read is a connection too, and
+    # the page must not become a probe of the node's own networks
+    why = dest_target_refusal(host)
+    if why:
+        raise DestinationRefused(why)
+    pem, fp = fetch_server_cert(host, port or 443)
+    facts = {"host": f"{host}:{port or 443}", "fingerprint": fp,
+             "shown": ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper(),
+             "subject": "", "issuer": "", "not_after": "", "bits": 0}
+    try:
+        from cryptography import x509
+        c = x509.load_pem_x509_certificate(pem.encode())
+        facts["subject"] = c.subject.rfc4514_string()[:300]
+        facts["issuer"] = c.issuer.rfc4514_string()[:300]
+        end = getattr(c, "not_valid_after_utc", None) or c.not_valid_after
+        facts["not_after"] = end.strftime("%Y-%m-%d")
+        facts["bits"] = int(getattr(c.public_key(), "key_size", 0) or 0)
+    except Exception:                      # noqa: BLE001 -- shown, not judged
+        pass
+    return facts
+
+
 def _norm_fp(fp):
     return re.sub(r"[^0-9a-f]", "", (fp or "").lower())
 
@@ -2329,7 +2360,9 @@ def tenant_set_admin_may(tid, what, on, who="root", role="root"):
                   "made stays and works, and only the server_admin changes it")
 
 
-DEST_TENANT_AUTH = ("none", "basic", "bearer", "header")
+# 0.13 (L22): principal propagation too -- pinned, so a name that later
+# turns inward meets a failing handshake (oaap.net.destinations 2.7.2).
+DEST_TENANT_AUTH = ("none", "basic", "bearer", "header", "principal_propagation")
 
 
 def dest_tenant_refusal(name, kind, target, auth_type):
@@ -2365,7 +2398,8 @@ def dest_tenant_refusal(name, kind, target, auth_type):
 
 
 def destination_admin_job(req, actor):
-    """The portal's page "Destinationen" (oaap.net.destinations 0.10 §2.7) -> (ok, sentence).
+    """The portal's page "Destinationen" (oaap.net.destinations 0.10 §2.7)
+    -> (ok, sentence, detail or None).
 
     server_admin only, judged from the ACTOR's own record (acting_tenant), never
     from the request. The same functions as `oaap destination add|set-secret|
@@ -2376,58 +2410,109 @@ def destination_admin_job(req, actor):
     a = req.get("args") if isinstance(req.get("args"), dict) else {}
     tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
     if not tid:
-        return False, err or "requires server_admin"
+        return False, err or "requires server_admin", None
     if op == "allow":
         # oaap.core.tenant 1.7: the switch itself is the server_admin's.
         if role != "server_admin":
-            return False, "only the server_admin moves this switch (oaap.core.tenant 1.7)"
+            return False, "only the server_admin moves this switch (oaap.core.tenant 1.7)", None
         on = bool(a.get("on"))
         ok, said = tenant_set_admin_may(tid, "destinations", on, who=actor, role=role)
         if not ok:
-            return False, said
+            return False, said, None
         return True, ("Gespeichert: der Mandanten-Admin darf jetzt Destinationen selbst anlegen "
                       "(nur https, nur öffentliche Adressen)." if on else
                       "Gespeichert: der Mandanten-Admin legt keine Destinationen mehr an. Was er "
-                      "angelegt hat, bleibt und funktioniert; ändern kann es nur der Server-Admin.")
+                      "angelegt hat, bleibt und funktioniert; ändern kann es nur der Server-Admin."), None
+    if op in ("ca", "sample"):
+        # 0.13 (L22, spec 2.7.2): the public half of the tenant's CA and a
+        # sample of it (no key) -- what the target's administrator imports
+        # and makes the rule from. Public, so for the tenant's tenant_admin
+        # too, with or without the right of 2.7.1.
+        if role not in ("server_admin", "tenant_admin"):
+            return False, "requires server_admin or tenant_admin", None
+        label = tenant_label(tid)
+        try:
+            if op == "ca":
+                pem = propagation_ca_text(tid)
+                if not pem:
+                    return False, ("Dieser Mandant hat noch keine Zertifizierungsstelle -- sie entsteht "
+                                   "mit seiner ersten Destination „Person durchreichen“."), None
+                return True, "Zertifizierungsstelle des Mandanten", {
+                    "pem": pem, "file": f"oaap-{label}-ca.crt"}
+            name = str(a.get("sample") or "MUSTER").strip().upper()
+            pem = propagation_sample(tid, name)
+            return True, f"Musterzertifikat für {name}", {"pem": pem, "file": f"oaap-{label}-muster-{name}.crt"}
+        except DestinationRefused as exc:
+            return False, str(exc), None
     by_tenant = role == "tenant_admin" and tenant_admin_may(tid, "destinations")
     if role != "server_admin" and not by_tenant:
         return False, ("adding, changing and removing destinations is the server_admin's "
-                       "(spec 2.7), unless the server_admin handed it to this tenant (2.7.1)")
+                       "(spec 2.7), unless the server_admin handed it to this tenant (2.7.1)"), None
     name = str(a.get("name") or "")
     if by_tenant and op in ("secret", "remove"):
         d = (load_destinations().get(tid) or {}).get(name)
         if d is not None and d.get("author") != "tenant_admin":
             return False, ("the operator made this destination -- changing or removing it "
-                           "stays the server_admin's (2.7.1)")
+                           "stays the server_admin's (2.7.1)"), None
     try:
+        if op == "fingerprint":
+            # 0.13 (L22, spec 2.7.2) step 1: read what the target presents,
+            # trust nothing, store nothing.
+            target = str(a.get("target") or "").strip()
+            if by_tenant:
+                bad = dest_tenant_refusal(name or "x-x", "http", target, "principal_propagation")
+                if bad:
+                    return False, bad, None
+            facts = propagation_target_facts(target)
+            return True, (f"{facts['host']} zeigt ein Zertifikat mit SHA-256 {facts['shown']}. "
+                          "Noch nichts gespeichert."), facts
         if op == "add":
             auth = str(a.get("auth") or "none")
-            if auth not in ("none", "basic", "bearer", "header"):
-                return False, ("this page adds destinations with none, basic, bearer or header; "
-                               "principal propagation is the command line's")
+            if auth not in ("none", "basic", "bearer", "header", "principal_propagation"):
+                return False, ("this page adds destinations with none, basic, bearer, header "
+                               "or principal_propagation"), None
             kind = str(a.get("kind") or "http")
             if by_tenant:
                 bad = dest_tenant_refusal(name, kind, str(a.get("target") or ""), auth)
                 if bad:
-                    return False, bad
+                    return False, bad, None
+            pp = {}
+            if auth == "principal_propagation":
+                # step 2: only with the ticked comparison and the fingerprint
+                # the person saw; destination_add reads the certificate again.
+                if str(a.get("compared") or "") != "1" or not _norm_fp(str(a.get("accept_sha256") or "")):
+                    return False, ("Erst den Fingerabdruck mit dem Administrator des Ziels "
+                                   "vergleichen und das ankreuzen (SAP: STRUST) -- nichts "
+                                   "gespeichert."), None
+                unchecked = str(a.get("unchecked_claim") or "").strip()[:200]
+                pp = {"accept_sha256": str(a.get("accept_sha256") or ""),
+                      "claims": [c for c in re.split(r"[\s,]+", str(a.get("claims") or "")) if c],
+                      "name_check": "sap" if str(a.get("name_check") or "sap") == "sap" else "",
+                      "lifetime": a.get("lifetime") or 10,
+                      "unchecked_claim": f"{actor}: {unchecked}" if unchecked else ""}
             destination_add(tid, name, kind, str(a.get("target") or ""),
                             auth, str(a.get("user") or ""), str(a.get("header") or ""),
-                            str(a.get("secret") or "") if auth != "none" else "",
+                            str(a.get("secret") or "") if auth not in ("none", "principal_propagation") else "",
                             who=actor, role=role,
-                            author="tenant_admin" if by_tenant else "")
+                            author="tenant_admin" if by_tenant else "", **pp)
+            if pp:
+                return True, (f"Destination „{name}“ angelegt, Serverzertifikat gepinnt. Als "
+                              "Nächstes: die Zertifizierungsstelle des Mandanten beim Ziel "
+                              "importieren (SAP: STRUST, Regel in CERTRULE), dann die Destination "
+                              "einer Instanz zuordnen und dort „trägt die Person“ ankreuzen."), None
             return True, (f"Destination „{name}“ angelegt. Erreichbar wird sie erst, wenn eine "
-                          "Instanz sie zugeordnet bekommt (Instanz → Destinationen).")
+                          "Instanz sie zugeordnet bekommt (Instanz → Destinationen)."), None
         if op == "secret":
             read = destination_set_secret(tid, name, str(a.get("secret") or ""), who=actor, role=role)
             return True, (f"Geheimnis von „{name}“ gesetzt; das Gateway und jede zugeordnete "
                           "Instanz haben es jetzt." + (f" Für den geschlossenen Mandanten neu gelesen: "
-                                                        f"{read}" if read else ""))
+                                                        f"{read}" if read else "")), None
         if op == "remove":
             destination_remove(tid, name, who=actor, role=role)
-            return True, f"Destination „{name}“ entfernt, mit ihrem Geheimnis."
-        return False, f"unknown destination operation '{op}'"
+            return True, f"Destination „{name}“ entfernt, mit ihrem Geheimnis.", None
+        return False, f"unknown destination operation '{op}'", None
     except DestinationRefused as exc:
-        return False, str(exc)
+        return False, str(exc), None
 
 
 def mail_job(req, actor):
@@ -33315,19 +33400,38 @@ def cmd_process_deploys(_args):
                              or ensure_default_tenant(),
                              subject=name, result="denied", who=who,
                              role=act_role or "-", detail=msg)
-            elif op == "bind" and is_rehearsal(inst):
+            elif op in ("bind", "grant") and is_rehearsal(inst):
                 msg = (f"'{name}' is a rehearsal (RFC-0030) -- it reaches "
                        "nothing outward. Bind it by hand on the node with "
                        "--rehearsal-exception if it really must")
             else:
                 try:
+                    # 0.13 (L22, spec 2.9 item 7): the portal grants that a
+                    # binding carries the signed-in person, as --propagate
+                    # does -- the same people who bind (2.7).
+                    carry = bool(req.get("propagate"))
                     if op == "bind":
                         if destination_bind(reg, name, dname, need=need,
-                                            who=who, role=act_role or "-"):
+                                            who=who, role=act_role or "-",
+                                            propagate=carry):
                             ok, msg = True, (f"bound: '{name}' reaches "
-                                             f"'{dname}' as '{need or dname}'")
+                                             f"'{dname}' as '{need or dname}'"
+                                             + (", carrying the signed-in person"
+                                                if carry else ""))
                         else:
                             ok, msg = True, f"'{name}' is already bound to '{dname}'"
+                    elif op == "grant":
+                        bound = (inst.get("destinations") or {}).get(need)
+                        if not bound:
+                            raise DestinationRefused(f"'{name}' has no binding '{need}'")
+                        if destination_bind(reg, name, bound, need=need,
+                                            who=who, role=act_role or "-",
+                                            propagate=carry):
+                            ok, msg = True, (f"'{name}' now calls '{bound}' as the signed-in "
+                                             "person" if carry else
+                                             f"'{name}' no longer carries the person to '{bound}'")
+                        else:
+                            ok, msg = True, f"'{name}' -- unchanged"
                     elif op == "unbind":
                         destination_unbind(reg, name, need, who=who,
                                            role=act_role or "-")
@@ -33885,7 +33989,9 @@ def cmd_process_deploys(_args):
         elif action == "destination-admin":
             # oaap.net.destinations 0.10: the page "Destinationen". Role from the
             # ACTOR's record; the secret in this request goes with the claim.
-            ok, msg = destination_admin_job(req, actor)
+            ok, msg, _dd = destination_admin_job(req, actor)
+            if _dd is not None:
+                detail = _dd
             if not ok:
                 audit_tenant("destination." + str(req.get("op") or "?"),
                              act_tenant or ensure_default_tenant(),

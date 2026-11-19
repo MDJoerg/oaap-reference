@@ -3494,9 +3494,19 @@ INSTANCE_EDIT_BODY = """
               {% for o in d.options %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
             </select>
             <button>Zuordnen</button>
+            {% if d.pp_options %}<br><label class="checkline"><input type="checkbox" name="propagate" value="1">
+              trägt die angemeldete Person (nur bei {{ d.pp_options | join(", ") }})</label>{% endif %}
           </form>
           {% elif not i.rehearsal %}<br><span class="muted">Keine weitere http-Destination in diesem Mandanten.</span>{% endif %}
           {% elif d.bound %}
+          {% if d.carries %}<br>{% if d.granted %}<span class="badge">trägt die angemeldete Person</span>{% else %}<span class="muted">trägt die Person nicht — Aufrufe werden mit 403 abgewiesen</span>{% endif %}
+          {% if not i.rehearsal %}<form method="post" action="/instances/{{ i.key }}/destination">
+            <input type="hidden" name="tab" value="netz">
+            <input type="hidden" name="op" value="grant">
+            <input type="hidden" name="need" value="{{ d.need }}">
+            <input type="hidden" name="propagate" value="{{ '0' if d.granted else '1' }}">
+            <button class="secondary">{{ "Nicht mehr durchreichen" if d.granted else "Person durchreichen erlauben" }}</button>
+          </form>{% endif %}{% endif %}
           <form method="post" action="/instances/{{ i.key }}/destination">
             <input type="hidden" name="tab" value="netz">
             <input type="hidden" name="op" value="unbind">
@@ -3512,6 +3522,8 @@ INSTANCE_EDIT_BODY = """
               {% for o in d.options %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
             </select>
             <button>Zuordnen</button>
+            {% if d.pp_options %}<br><label class="checkline"><input type="checkbox" name="propagate" value="1">
+              trägt die angemeldete Person (nur bei {{ d.pp_options | join(", ") }})</label>{% endif %}
             {% if d.kind == "tcp" %}<br><span class="muted"><strong>Übergabe:</strong>
               Adresse und Zugangsdaten liegen danach in der Umgebung der App.</span>{% endif %}
           </form>
@@ -4781,7 +4793,14 @@ def _destination_view(inst):
                         sorted(n for n, o in own.items()
                                if o.get("kind") == decl.get("kind"))),
             "bound": bool(dname),
+            # 0.13 (L22, spec 2.9 item 7): does this binding carry the person?
+            "carries": ((d or {}).get("auth") or {}).get("type") == "principal_propagation",
+            "granted": need in (inst.get("propagate") or []),
         })
+    pp_names = {n for n, o in own.items()
+                if (o.get("auth") or {}).get("type") == "principal_propagation"}
+    for r_ in rows:
+        r_["pp_options"] = [o for o in r_["options"] if o in pp_names]
     taken = set(binds.values())
     for fname, decl in sorted(families.items()):
         rows.append({
@@ -4794,6 +4813,7 @@ def _destination_view(inst):
                               if o.get("kind") == "http" and n not in taken
                               and n not in needs and n not in binds),
         })
+        rows[-1]["pp_options"] = [o for o in rows[-1]["options"] if o in pp_names]
     return rows
 
 
@@ -9926,7 +9946,8 @@ def instance_destination(name):
     op = request.form.get("op", "bind")
     need = (request.form.get("need") or "").strip()
     dest = (request.form.get("destination") or "").strip()
-    if op not in ("bind", "unbind"):
+    carry = request.form.get("propagate") == "1"
+    if op not in ("bind", "unbind", "grant"):
         return _inst_back(name, err="Unbekannte Aktion.")
     if not need:
         return _inst_back(name, err="Kein Bedarf angegeben.")
@@ -9943,7 +9964,10 @@ def instance_destination(name):
         need = dest
     return _queue_and_redirect(
         name, {"action": "destination", "op": op, "need": need,
-               "destination": dest if op == "bind" else ""},
+               "destination": dest if op == "bind" else "",
+               # 0.13 (L22): "trägt die angemeldete Person" -- the host
+               # refuses it for any destination that does not carry one
+               "propagate": carry and op in ("bind", "grant")},
         DESTINATION_WAIT_SECONDS)
 
 
@@ -14398,7 +14422,7 @@ def messages_routes():
 # sits on this page, for the server_admin; the host judges both again.
 
 DEST_WAIT_SECONDS = 90
-DEST_OPS = ("add", "secret", "remove", "allow")
+DEST_OPS = ("add", "secret", "remove", "allow", "fingerprint", "ca", "sample")
 DEST_AUTH_WORDS = {"none": "keine", "basic": "Benutzer + Passwort", "bearer": "Bearer-Token",
                    "header": "eigene Kopfzeile", "principal_propagation": "Person durchreichen (Zertifikat)"}
 
@@ -14425,6 +14449,9 @@ def _destinations_facts(tid):
         rows.append({"name": name, "kind": d.get("kind", ""), "target": target,
                      "auth": DEST_AUTH_WORDS.get(auth.get("type", "none"), auth.get("type", "")),
                      "has_secret": auth.get("type", "none") not in ("none", "principal_propagation"),
+                     # 0.13 (L22): the pin and the claim rules, never the certificate
+                     "pin": (auth.get("server_sha256") or "")[:16].upper(),
+                     "claims": ", ".join(r_.get("name", "") for r_ in auth.get("user") or []),
                      "mail": d.get("kind") == "smtp",
                      "bound": bound.get(name, []),
                      "allowed": bool(d.get("closed_allow")) if "closed_allow" in d else None,
@@ -14450,7 +14477,7 @@ DESTINATIONS_BODY = """
   {% for r in f.rows %}<tr>
     <td><code>{{ r.name }}</code><br><span class="muted">{{ r.kind }}{% if r.created %} · {{ r.created }}{% endif %}{% if r.own %} · vom Mandanten{% endif %}</span></td>
     <td>{{ r.target or "—" }}</td>
-    <td>{{ r.auth }}</td>
+    <td>{{ r.auth }}{% if r.pin %}<br><span class="muted">gepinnt {{ r.pin }}…{% if r.claims %} · {{ r.claims }}{% endif %}</span>{% endif %}</td>
     <td>{% if r.bound %}{{ r.bound | join(", ") }}{% else %}<span class="muted">nichts</span>{% endif %}</td>
     {% if admin or self_admin %}<td>{% if r.mail %}<a class="rowaction" href="/nachrichten{{ q }}">auf „Nachrichten“</a>{% elif self_admin and not r.own %}<span class="muted">vom Betreiber angelegt</span>{% else %}
       {% if r.has_secret %}<details><summary class="rowaction">Geheimnis setzen</summary>
@@ -14502,7 +14529,7 @@ DESTINATIONS_BODY = """
   </form>
   <p class="muted">Der Betreiber hat diesem Mandanten das Anlegen erlaubt: nur <code>https</code>, und der Name muss
   auf öffentliche Adressen zeigen — der Knoten prüft das beim Speichern. Ändern und entfernen kannst du
-  nur, was du selbst angelegt hast.</p>
+  nur, was du selbst angelegt hast. Personen durchreichen (Zertifikat): eigene Karte unten.</p>
 </div>
 {% endif %}
 {% if admin %}
@@ -14531,9 +14558,72 @@ DESTINATIONS_BODY = """
     <button class="btn">Anlegen</button>
   </form>
   <p class="muted">Dieselben Prüfungen wie <code>oaap destination add</code>: Ziele in den eigenen Netzen des
-  Knotens werden abgewiesen. Personen durchreichen (Zertifikat) und SAP-Regeln gibt es nur an der
-  Kommandozeile. Für einen geschlossenen Mandanten liest der Knoten ein KI-Gateway beim Anlegen
+  Knotens werden abgewiesen. Personen durchreichen (Zertifikat) hat eine eigene Karte unten.
+  Für einen geschlossenen Mandanten liest der Knoten ein KI-Gateway beim Anlegen
   und erlaubt nur Ampel grün.</p>
+</div>
+{% endif %}
+{% if f.rows | selectattr("pin") | list %}
+<div class="card">
+  <h2>Für das Ziel: Zertifizierungsstelle und Muster</h2>
+  <p class="muted">Das Ziel einer Destination „Person durchreichen“ vertraut der Zertifizierungsstelle
+  dieses Mandanten (SAP: in STRUST in die Zertifikatsliste des SSL-Servers importieren) und ordnet
+  ihre Zertifikate mit einer Regel einem Benutzer zu (SAP: CERTRULE, aus einem Musterzertifikat
+  genau dieser Stelle). Beides ist öffentlich, ohne Schlüssel.</p>
+  <form method="post" action="/destinationen/ca{{ q }}" style="display:inline">
+    <button class="btn secondary">Zertifizierungsstelle laden</button></form>
+  <form method="post" action="/destinationen/sample{{ q }}" style="display:inline;margin-left:.6rem">
+    <label>Muster für<input name="sample" value="MUSTER" maxlength="12" pattern="[A-Za-z0-9_]{1,12}" style="width:9rem"></label>
+    <button class="btn secondary">Musterzertifikat laden</button></form>
+  <p class="muted">Das Muster gilt eine Stunde und genügt, um die Regel anzulegen.</p>
+</div>
+{% endif %}
+{% if admin or self_admin %}
+<div class="card" id="person">
+  <h2>Destination mit Person durchreichen (Zertifikat)</h2>
+  <p class="muted">Die App ruft das Ziel als die angemeldete Person auf: Die Plattform stellt bei jedem
+  Aufruf ein kurzlebiges Zertifikat für deren Benutzer im Ziel aus (etwa den SAP-Benutzer aus dem
+  Anmeldedienst). Das Ziel muss dafür der Zertifizierungsstelle dieses Mandanten vertrauen
+  (SAP: STRUST und CERTRULE). Anleitung: „Ein SAP-System für die Anmeldung als Person vorbereiten“
+  in der Hilfe.</p>
+  {% if not pin %}
+  <form method="post" action="/destinationen/fingerprint{{ q }}">
+    <p><label>Name (klein, Ziffern, Bindestrich)<input name="name" required pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]"></label></p>
+    <p><label>Ziel<input name="target" required pattern="https://.+" placeholder="https://host:port"></label></p>
+    <button class="btn">1. Zertifikat des Ziels lesen</button>
+  </form>
+  <p class="muted">Schritt 1 speichert nichts. Er zeigt den Fingerabdruck des Zertifikats, das das Ziel
+  jetzt vorzeigt; Schritt 2 pinnt genau dieses.</p>
+  {% else %}
+  <table class="mini">
+    <tr><th>Ziel</th><td><code>{{ pin.host }}</code></td></tr>
+    <tr><th>SHA-256</th><td><code style="word-break:break-all">{{ pin.shown }}</code></td></tr>
+    {% if pin.subject %}<tr><th>Inhaber</th><td>{{ pin.subject }}</td></tr>{% endif %}
+    {% if pin.issuer %}<tr><th>Aussteller</th><td>{{ pin.issuer }}{% if pin.issuer == pin.subject %} <span class="muted">(selbst signiert)</span>{% endif %}</td></tr>{% endif %}
+    {% if pin.not_after %}<tr><th>Gültig bis</th><td>{{ pin.not_after }}</td></tr>{% endif %}
+    {% if pin.bits %}<tr><th>Schlüssel</th><td>{{ pin.bits }} Bit{% if pin.bits < 2048 %} — <strong>schwach</strong>, wird nur gepinnt angenommen{% endif %}</td></tr>{% endif %}
+  </table>
+  <form method="post" action="/destinationen/add{{ q }}">
+    <input type="hidden" name="kind" value="http">
+    <input type="hidden" name="auth" value="principal_propagation">
+    <input type="hidden" name="name" value="{{ pin_name }}">
+    <input type="hidden" name="target" value="{{ pin_target }}">
+    <input type="hidden" name="accept_sha256" value="{{ pin.fingerprint }}">
+    <p>Name <code>{{ pin_name }}</code>, Ziel <code>{{ pin_target }}</code></p>
+    <p><label>Benutzer im Ziel aus dem Merkmal (Claim)<input name="claims" value="sap_user"></label></p>
+    <p><label><input type="checkbox" name="name_check" value="sap" checked> SAP-Regeln für den Benutzernamen (A–Z, 0–9, _, höchstens 12)</label></p>
+    <p><label>Gültigkeit eines Zertifikats in Minuten (1–60)<input name="lifetime" value="10" inputmode="numeric"></label></p>
+    <p><label>Nur falls der Knoten nicht lesen kann, wer das Merkmal ändern darf: wer hat von Hand geprüft, dass nur Administratoren es ändern, und wie?<input name="unchecked_claim" maxlength="200"></label></p>
+    <p><label class="checkline"><input type="checkbox" name="compared" value="1" required>
+      Ich habe den Fingerabdruck mit dem Administrator des Ziels verglichen (SAP: STRUST, eigenes
+      Zertifikat des SSL-Servers), er stimmt.</label></p>
+    <button class="btn">2. Anlegen und Zertifikat pinnen</button>
+    <a class="btn secondary" href="/destinationen{{ q }}#person">Abbrechen</a>
+  </form>
+  <p class="muted">Gepinnt heißt: Die Plattform redet für diese Destination nur mit genau diesem
+  Zertifikat. Zeigt das Ziel inzwischen ein anderes, wird nichts angelegt. Danach: die Destination
+  einer Instanz zuordnen und dort „trägt die angemeldete Person“ ankreuzen.</p>
+  {% endif %}
 </div>
 {% endif %}
 """
@@ -14553,16 +14643,22 @@ def destinations_page():
     tid, label, role = _destinations_target()
     if tid is None:
         return role
+    return _destinations_render(tid, label, role, request.args.get("msg"),
+                                request.args.get("err"))
+
+
+def _destinations_render(tid, label, role, msg, error, pin=None, pin_name="", pin_target=""):
     named = role == "server_admin" and tid != default_tenant_id()
     f = _destinations_facts(tid)
     return page(DESTINATIONS_BODY, "Destinationen", "destinations",
+                pin=pin, pin_name=pin_name, pin_target=pin_target,
                 label=(label if tid != default_tenant_id() else ""),
                 f=f, admin=role == "server_admin",
                 self_admin=role == "tenant_admin" and f["may"], switch=named,
                 through=(_through_suggestions(tid) if role == "server_admin" else []),
                 via=(_via_suggestions(tid) if role == "server_admin" else []),
                 q=(f"?tenant={quote(label)}" if named else ""),
-                msg=request.args.get("msg"), error=request.args.get("err"))
+                msg=msg, error=error)
 
 
 @app.post("/destinationen/<op>")
@@ -14583,6 +14679,9 @@ def destinations_post(op):
     # 2.7.1: a tenant_admin whom the server_admin allowed it -- but never the
     # switch itself. The host asks both questions again.
     may = role == "tenant_admin" and _destinations_facts(tid)["may"] and op != "allow"
+    # 0.13 (L22): the CA's public half and a sample -- for the tenant's own
+    # tenant_admin as well; the host asks again.
+    may = may or (role == "tenant_admin" and op in ("ca", "sample"))
     if role != "server_admin" and not may:
         return ("Zugriff verweigert: Destinationen anlegen und ändern ist Sache des "
                 "Server-Admins (oaap.net.destinations 2.7).", 403)
@@ -14591,8 +14690,14 @@ def destinations_post(op):
     args = {"tenant": tid, "name": (request.form.get("name") or "").strip()[:40]}
     if op == "allow":
         args = {"tenant": tid, "on": request.form.get("on") == "1"}
+    if op == "fingerprint":
+        args["target"] = (request.form.get("target") or "").strip()[:500]
+    if op == "sample":
+        args["sample"] = (request.form.get("sample") or "MUSTER").strip()[:12]
     if op == "add":
-        for k, mx in (("kind", 8), ("target", 500), ("auth", 24), ("user", 254), ("header", 80)):
+        for k, mx in (("kind", 8), ("target", 500), ("auth", 24), ("user", 254), ("header", 80),
+                      ("accept_sha256", 100), ("claims", 200), ("name_check", 8),
+                      ("lifetime", 4), ("unchecked_claim", 200), ("compared", 2)):
             args[k] = (request.form.get(k) or "").strip()[:mx]
         args["secret"] = (request.form.get("secret") or "")[:4096]
     elif op == "secret":
@@ -14605,6 +14710,19 @@ def destinations_post(op):
     if res is None:
         return redirect(f"{back}{joiner}err=" + quote(
             "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    if op in ("ca", "sample") and res.get("ok") and isinstance(res.get("detail"), dict):
+        d_ = res["detail"]
+        fname = _re.sub(r"[^A-Za-z0-9._-]", "_", str(d_.get("file") or "oaap.crt"))[:80]
+        resp = make_response(str(d_.get("pem") or ""))
+        resp.headers["Content-Type"] = "application/x-x509-ca-cert"
+        resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+        return resp
+    if op == "fingerprint" and res.get("ok") and isinstance(res.get("detail"), dict):
+        # 0.13 (L22) step 1 answered: the same page, with what to compare
+        # and the form that pins it. Nothing is stored yet.
+        return _destinations_render(tid, label, role, str(res.get("message") or "")[:600], None,
+                                    pin=res["detail"], pin_name=args["name"],
+                                    pin_target=args["target"])
     key = "msg" if res.get("ok") else "err"
     return redirect(f"{back}{joiner}{key}=" + quote(str(res.get("message") or "")[:600]), code=303)
 

@@ -240,6 +240,45 @@ r = queue("karin", K_ORDERS, op="umdrehen", need="erp")
 ok("eine unbekannte Aktion wird abgelehnt", not r["ok"] and "unknown" in r["message"], r)
 
 print("")
+print("=== 0.13 (L22): trägt die Person -- vom Portal gewährt ===")
+FP = "cd" * 32
+m.fetch_server_cert = lambda host, port: ("-----BEGIN CERTIFICATE-----\nAAA\n"
+                                          "-----END CERTIFICATE-----\n", FP)
+m.propagation_claim_check = lambda tid, claims: ({c: "admin" for c in claims}, "read from test realm")
+m.destination_add(KUNDE, "kunden-sap", "http", "https://sap.example.com:50001",
+                  "principal_propagation", accept_sha256=FP)
+queue("root", K_ORDERS, op="unbind", need="erp")
+
+
+def grants(key):
+    return list(m.load_registry()["instances"][key].get("propagate") or [])
+
+
+r = queue("karin", K_ORDERS, op="bind", need="erp", destination="kunden-sap", propagate=True)
+ok("ein tenant_admin bindet eine Person-durchreichen-Destination MIT Freigabe",
+   r["ok"] and binds(K_ORDERS).get("erp") == "kunden-sap" and grants(K_ORDERS) == ["erp"], r)
+ok("... das Protokoll sagt es, mit dem Menschen",
+   any(e["who"] == "karin" and "SIGNED-IN PERSON" in e.get("detail", "")
+       for e in log(KUNDE, "destination.bind")))
+r = queue("karin", K_ORDERS, op="grant", need="erp", propagate=False)
+ok("die Freigabe zurücknehmen: die Bindung bleibt, nur die Freigabe geht",
+   r["ok"] and binds(K_ORDERS).get("erp") == "kunden-sap" and grants(K_ORDERS) == [], r)
+r = queue("uwe", K_ORDERS, op="grant", need="erp", propagate=True)
+ok("ein Benutzer gewährt nichts", not r["ok"] and grants(K_ORDERS) == [], r)
+r = queue("karin", K_ORDERS, op="grant", need="erp", propagate=True)
+ok("der tenant_admin gewährt sie wieder", r["ok"] and grants(K_ORDERS) == ["erp"], r)
+r = queue("karin", K_ORDERS, op="grant", need="nichts", propagate=True)
+ok("... an einer Bindung, die es nicht gibt: abgewiesen", not r["ok"] and "no binding" in r["message"], r)
+queue("karin", K_ORDERS, op="unbind", need="erp")
+r = queue("karin", K_ORDERS, op="bind", need="erp", destination="kunden-erp", propagate=True)
+ok("die Freigabe an einer anderen Destination: abgewiesen, nichts gebunden",
+   not r["ok"] and "does not carry" in r["message"] and "erp" not in binds(K_ORDERS)
+   and grants(K_ORDERS) == [], r)
+r = queue("karin", K_ORDERS, op="bind", need="erp", destination="kunden-erp")
+ok("... ohne Freigabe geht sie wie immer", r["ok"] and binds(K_ORDERS).get("erp") == "kunden-erp", r)
+m.destination_remove(KUNDE, "kunden-sap")
+
+print("")
 print("=== die Generalprobe ===")
 reg = m.load_registry()
 reg["instances"][K_ORDERS]["rehearsal"] = {"of": "orders", "until": "2999-01-01T00:00:00Z"}
@@ -310,6 +349,40 @@ m.save_registry(reg)
 rows, html = page(K_ORDERS)
 ok("ein gebundener Bedarf bietet 'Loesen' an und kein Zuordnen mehr",
    html.count('value="unbind"') == 1 and html.count('value="bind"') == 1, html)
+ok("0.13: ohne Person-durchreichen-Destination kein Kreuz und kein Gewähren",
+   'name="propagate"' not in html and 'value="grant"' not in html, html)
+
+m.destination_add(KUNDE, "kunden-sap", "http", "https://sap.example.com:50001",
+                  "principal_propagation", accept_sha256=FP)
+with open(ns["DESTINATIONS_FILE"], "w", encoding="utf-8") as f:
+    json.dump({"destinations": m.load_destinations()}, f)
+reg = m.load_registry()
+reg["instances"][K_ORDERS]["destinations"] = {}
+m.save_registry(reg)
+rows, html = page(K_ORDERS)
+ok("0.13: unter den Wahlen eine Person-durchreichen-Destination: das Kreuz, mit ihrem Namen",
+   'name="propagate" value="1"' in html and "nur bei kunden-sap" in html, html)
+reg = m.load_registry()
+reg["instances"][K_ORDERS]["destinations"] = {"erp": "kunden-sap"}
+m.save_registry(reg)
+rows, html = page(K_ORDERS)
+ok("... gebunden ohne Freigabe: das sagt die Seite, mit dem Knopf zum Erlauben",
+   "trägt die Person nicht" in html and 'value="grant"' in html and "Person durchreichen erlauben" in html
+   and 'name="propagate" value="1"' in html, html)
+reg = m.load_registry()
+reg["instances"][K_ORDERS]["propagate"] = ["erp"]
+m.save_registry(reg)
+rows, html = page(K_ORDERS)
+ok("... mit Freigabe: das Abzeichen und der Knopf zum Zurücknehmen",
+   "trägt die angemeldete Person" in html and "Nicht mehr durchreichen" in html
+   and 'name="propagate" value="0"' in html, html)
+reg = m.load_registry()
+reg["instances"][K_ORDERS]["destinations"] = {"erp": "kunden-erp"}
+reg["instances"][K_ORDERS].pop("propagate", None)
+m.save_registry(reg)
+m.destination_remove(KUNDE, "kunden-sap")
+with open(ns["DESTINATIONS_FILE"], "w", encoding="utf-8") as f:
+    json.dump({"destinations": m.load_destinations()}, f)
 
 rows, html = page(K_ORDERS, rehearsal={"badge": "Generalprobe"})
 ok("an einer Generalprobe steht kein Zuordnen -- nur Loesen und die Anleitung fuer die Maschine",
@@ -333,6 +406,8 @@ ok("... und fragt den Worker, sie schreibt die Registry nicht selbst",
    '"action": "destination"' in route and "save_registry" not in route)
 ok("... und gibt keine Rehearsal-Ausnahme weiter",
    "rehearsal_exception" not in route)
+ok("0.13: die Route kennt „grant“ und reicht die Freigabe weiter, der Worker urteilt",
+   '"grant"' in route and '"propagate": carry' in route)
 ok("L16 (0.1.310): die Seite Destinationen nennt den Ort des Zuordnens und das Wort der Kommandozeile",
    "Reiter <strong>Netz &amp; Adressen</strong>, Abschnitt Destinationen, Knopf <strong>Zuordnen</strong>" in src
    and "Instanz → Destinationen →" not in src)

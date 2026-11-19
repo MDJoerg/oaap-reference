@@ -13,6 +13,9 @@ Festgehalten werden die Regeln, nicht der Knopf:
   Ergebnis, nicht im Protokoll, nicht in der Spool-Datei nach der Antwort;
 - die Seite zeigt einem tenant_admin die Liste seines Mandanten ohne Formulare,
   einem server_admin mit Formularen, und nie ein Geheimnis;
+- 0.13 (2.7.2, L22): Personen durchreichen auch hier, in zwei Schritten -- erst
+  lesen (nichts gespeichert), dann nur mit angekreuztem Vergleich und dem
+  Fingerabdruck, den das Ziel dann noch zeigt; auch der tenant_admin mit Erlaubnis;
 - 0.11 (2.7.1, oaap.core.tenant 1.7): der server_admin erlaubt es EINEM Mandanten;
   dann legt dessen tenant_admin https-Ziele auf öffentlichen Adressen an und
   ändert nur, was er selbst angelegt hat. Den Schalter selbst bewegt nur der
@@ -84,7 +87,7 @@ write_users([user("root", ["server_admin"]), user("karin", ["tenant_admin"], KUN
 # Namen ohne Netz: was ein Name auflöst, bestimmt der Test.
 DNS = {"api.example.com": "93.184.216.34", "ki.example.com": "93.184.216.35",
        "op.example.com": "93.184.216.36", "innen.example.com": "10.0.0.5",
-       "docker.example.com": "172.18.0.9"}
+       "docker.example.com": "172.18.0.9", "sap.example.com": "93.184.216.40"}
 _real_gai = m.socket.getaddrinfo
 
 
@@ -158,8 +161,8 @@ r = queue("root", "add", tenant=KUNDE, name="innen", kind="http", target="http:/
 ok("ein Ziel in den Netzen des Knotens wird abgewiesen", not r["ok"] and "innen" not in dests(KUNDE), r)
 r = queue("root", "add", tenant=KUNDE, name="sap", kind="http", target="https://sap.example.com/",
           auth="principal_propagation")
-ok("Personen durchreichen gibt es auf dieser Seite nicht (Kommandozeile)",
-   not r["ok"] and "command line" in r["message"] and "sap" not in dests(KUNDE), r)
+ok("0.13: Personen durchreichen ohne Schritt 1 und Vergleich: abgewiesen, nichts gespeichert",
+   not r["ok"] and "vergleichen" in r["message"] and "sap" not in dests(KUNDE), r)
 r = queue("root", "add", tenant=KUNDE, name="X Y", kind="http", target="https://a.example.com/", auth="none")
 ok("ein ungültiger Name wird abgewiesen", not r["ok"], r)
 r = queue("root", "add", tenant="gibtsnicht", name="ki2", kind="http", target="https://a.example.com/",
@@ -214,7 +217,7 @@ for nm, kind, target, auth, word in (
         ("weg", "http", "https://gibtsnicht.example.com/", "none", "does not resolve"),
         ("tun", "http", "via:t1/erp", "none", "tunnel"),
         ("mail", "http", "https://api.example.com/", "none", "Nachrichten"),
-        ("pp", "http", "https://api.example.com/", "principal_propagation", "command line"),
+        ("pp", "http", "https://api.example.com/", "principal_propagation", "vergleichen"),
         ("lokal", "http", "https://172.18.0.5/", "none", "")):
     r = queue("karin", "add", tenant=KUNDE, name=nm, kind=kind, target=target, auth=auth)
     ok(f"karin: {target} ({kind}, {auth}) abgewiesen" + (f" -- „{word}“" if word else ""),
@@ -253,6 +256,93 @@ with contextlib.redirect_stdout(io.StringIO()):
     m.cmd_tenant(argparse.Namespace(action="disallow", name="kunde", target="destinations"))
 ok("... und disallow", not m.tenant_admin_may(KUNDE, "destinations"))
 for nm in ("api", "op"):
+    m.destination_remove(KUNDE, nm)
+
+print("")
+print("=== 0.13 (L22): Personen durchreichen im Portal, bewusst gepinnt ===")
+FP = "ef" * 32
+PEM = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"
+m.fetch_server_cert = lambda host, port: (PEM, FP)
+EDIT = {"sap_user": "admin"}
+m.propagation_claim_check = lambda tid, claims: (
+    {c: EDIT.get(c, "") for c in claims}, "read from test realm")
+SAP = "https://sap.example.com:50001"
+r = queue("root", "fingerprint", tenant=KUNDE, name="sap", target=SAP)
+ok("Schritt 1 liest das Zertifikat, nennt den Fingerabdruck und speichert nichts",
+   r["ok"] and (r.get("detail") or {}).get("fingerprint") == FP and "EF:EF:EF" in r["message"]
+   and "sap" not in dests(KUNDE), r)
+r = queue("root", "fingerprint", tenant=KUNDE, name="sap", target="https://172.18.0.5:8443/")
+ok("... auch nicht für den server_admin aus den Netzen des Knotens (kein Abtasten über die Seite)",
+   not r["ok"] and "detail" not in r, r)
+ok("... ein http-Ziel hat kein Zertifikat zu lesen",
+   not queue("root", "fingerprint", tenant=KUNDE, name="sap", target="http://sap.example.com/")["ok"])
+r = queue("root", "add", tenant=KUNDE, name="sap", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP)
+ok("Schritt 2 ohne angekreuzten Vergleich: abgewiesen, nichts gespeichert",
+   not r["ok"] and "vergleichen" in r["message"] and "sap" not in dests(KUNDE), r)
+r = queue("root", "add", tenant=KUNDE, name="sap", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256="00" * 32, compared="1")
+ok("... zeigt das Ziel inzwischen ein anderes Zertifikat: abgewiesen, nichts gespeichert",
+   not r["ok"] and "SHA-256" in r["message"] and "sap" not in dests(KUNDE), r)
+r = queue("root", "add", tenant=KUNDE, name="sap", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP, compared="1",
+          claims="sap_user", name_check="sap", lifetime="5")
+a_ = (dests(KUNDE).get("sap") or {}).get("auth") or {}
+ok("mit Vergleich und demselben Fingerabdruck: gepinnt, mit Regeln und gelesener Prüfung",
+   r["ok"] and a_.get("server_sha256") == FP and a_.get("lifetime_minutes") == 5
+   and [u["name"] for u in a_.get("user", [])] == ["sap_user"] and a_.get("name_check") == "sap"
+   and a_.get("claim_check") == "read from test realm" and "author" not in dests(KUNDE)["sap"], r)
+ok("... das Protokoll nennt den Menschen und den Pin",
+   any(e["who"] == "root" and "pinned" in e.get("detail", "") for e in log(KUNDE, "destination.add")))
+EDIT["sap_user"] = "self"
+r = queue("root", "add", tenant=KUNDE, name="sap2", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP, compared="1")
+ok("ein Merkmal, das die Person selbst ändert: abgewiesen wie an der Kommandozeile",
+   not r["ok"] and "edit" in r["message"] and "sap2" not in dests(KUNDE), r)
+EDIT["sap_user"] = ""
+r = queue("root", "add", tenant=KUNDE, name="sap2", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP, compared="1")
+ok("nicht lesbar, wer es ändert: abgewiesen, mit dem Hinweis auf die Prüfung von Hand",
+   not r["ok"] and "unchecked-claim" in r["message"] and "sap2" not in dests(KUNDE), r)
+r = queue("root", "add", tenant=KUNDE, name="sap2", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP, compared="1",
+          unchecked_claim="in der Keycloak-Konsole nachgesehen")
+ok("... mit dem Satz von Hand: angelegt, der Satz steht mit dem Namen da",
+   r["ok"] and "root: in der Keycloak-Konsole" in dests(KUNDE)["sap2"]["auth"]["claim_check"], r)
+EDIT["sap_user"] = "admin"
+r = queue("karin", "fingerprint", tenant=KUNDE, name="ksap", target=SAP)
+ok("ein tenant_admin ohne Erlaubnis liest nicht einmal das Zertifikat",
+   not r["ok"] and "server_admin" in r["message"], r)
+queue("root", "allow", tenant=KUNDE, on=True)
+r = queue("karin", "fingerprint", tenant=KUNDE, name="ksap", target=SAP)
+ok("mit Erlaubnis: Schritt 1 für ein öffentliches Ziel", r["ok"] and "ksap" not in dests(KUNDE), r)
+r = queue("karin", "fingerprint", tenant=KUNDE, name="kin", target="https://innen.example.com/")
+ok("... ein Ziel auf einer internen Adresse: abgewiesen", not r["ok"] and "public" in r["message"], r)
+r = queue("karin", "add", tenant=KUNDE, name="ksap", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP, compared="1")
+ok("... Schritt 2: angelegt, als vom Mandanten",
+   r["ok"] and dests(KUNDE).get("ksap", {}).get("author") == "tenant_admin"
+   and dests(KUNDE)["ksap"]["auth"]["server_sha256"] == FP, r)
+r = queue("anna", "add", tenant=KUNDE, name="asap", kind="http", target=SAP,
+          auth="principal_propagation", accept_sha256=FP, compared="1")
+ok("... ein fremder tenant_admin schreibt nicht hinein", "asap" not in dests(KUNDE), r)
+queue("root", "allow", tenant=KUNDE, on=False)
+m.propagation_ca_text = lambda tid: "-----BEGIN CERTIFICATE-----\nCA-" + tid + "\n" if tid == KUNDE else ""
+m.propagation_sample = lambda tid, name: "-----BEGIN CERTIFICATE-----\nMUSTER-" + name + "\n"
+r = queue("karin", "ca", tenant=KUNDE)
+ok("die Zertifizierungsstelle bekommt der tenant_admin auch ohne Erlaubnis (öffentlich)",
+   r["ok"] and ("CA-" + KUNDE) in r["detail"]["pem"] and r["detail"]["file"] == "oaap-kunde-ca.crt", r)
+r = queue("karin", "sample", tenant=KUNDE, sample="jmueller")
+ok("... und ein Muster, in Großbuchstaben", r["ok"] and "MUSTER-JMUELLER" in r["detail"]["pem"], r)
+r = queue("uwe", "ca", tenant=KUNDE)
+ok("... ein Benutzer nicht", not r["ok"] and "pem" not in json.dumps(r), r)
+r = queue("anna", "ca", tenant=KUNDE)
+ok("... ein fremder tenant_admin bekommt nicht die Stelle dieses Mandanten",
+   ("CA-" + KUNDE) not in json.dumps(r), r)
+r = queue("root", "ca", tenant=ANDERE)
+ok("... ohne Destination „Person durchreichen“ gibt es noch keine, mit Satz",
+   not r["ok"] and "ersten Destination" in r["message"], r)
+for nm in ("sap", "sap2", "ksap"):
     m.destination_remove(KUNDE, nm)
 
 print("")
@@ -308,6 +398,32 @@ ok("... Knöpfe nur an der eigenen (erp), die des Betreibers ist markiert",
    html_k.count('action="/destinationen/remove') == 1 and "vom Betreiber angelegt" in html_k
    and "vom Mandanten" in html_k, html_k)
 ok("... und kein Schalter für ihn", "Einstellung des Mandanten" not in html_k)
+ok("0.13: der tenant_admin mit Erlaubnis bekommt Schritt 1 (ohne ?tenant)",
+   'action="/destinationen/fingerprint"' in html_k, html_k)
+ok("... der tenant_admin ohne Erlaubnis nicht", "/destinationen/fingerprint" not in html_t)
+ok("0.13: der server_admin bekommt Schritt 1 für den genannten Mandanten, nicht Schritt 2",
+   'action="/destinationen/fingerprint?tenant=kunde"' in html_s and 'name="compared"' not in html_s, html_s)
+pin = {"host": "sap.example.com:50001", "fingerprint": "ef" * 32, "shown": "EF:" * 31 + "EF",
+       "subject": "CN=*.dummy.nodomain", "issuer": "CN=*.dummy.nodomain", "not_after": "2038-01-01",
+       "bits": 1024}
+html_p = TPL.render(f=facts, admin=True, label="kunde", q="?tenant=kunde", msg=None, error=None,
+                    pin=pin, pin_name="sap", pin_target="https://sap.example.com:50001")
+ok("... nach Schritt 1: Fingerabdruck, Inhaber, selbst signiert, schwacher Schlüssel",
+   "EF:EF:EF" in html_p and "selbst signiert" in html_p and "schwach" in html_p, html_p)
+ok("... Schritt 2 trägt den Fingerabdruck und verlangt das Kreuz beim Vergleich",
+   'name="accept_sha256" value="' + "ef" * 32 + '"' in html_p
+   and 'name="compared" value="1" required' in html_p
+   and 'value="principal_propagation"' in html_p and "/destinationen/fingerprint" not in html_p, html_p)
+pp_facts = dict(facts, rows=facts["rows"] + [dict(facts["rows"][0], name="sap", auth="Person durchreichen (Zertifikat)",
+                                                  pin="EFEFEFEFEFEFEFEF", claims="sap_user", has_secret=False)])
+html_r = TPL.render(f=pp_facts, admin=True, label="kunde", q="?tenant=kunde", msg=None, error=None)
+ok("... in der Liste steht der Pin (16 Zeichen) und die Regel, nie das Zertifikat",
+   "gepinnt EFEFEFEFEFEFEFEF… · sap_user" in html_r and "BEGIN CERTIFICATE" not in html_r, html_r)
+ok("... mit so einer Destination: Zertifizierungsstelle und Muster zum Laden",
+   'action="/destinationen/ca?tenant=kunde"' in html_r and 'action="/destinationen/sample?tenant=kunde"' in html_r
+   and "/destinationen/ca" not in html_s, html_r)
+html_rt = TPL.render(f=pp_facts, admin=False, label="kunde", q="", msg=None, error=None)
+ok("... auch für den tenant_admin ohne Erlaubnis", 'action="/destinationen/ca"' in html_rt, html_rt)
 
 src = io.open(APP_PY, encoding="utf-8").read()
 route = src.split('@app.post("/destinationen/<op>")')[1].split("\n\n\n")[0]
@@ -316,6 +432,8 @@ ok("die Route weist jeden außer server_admin ab und schreibt nichts selbst",
    and "save_destinations" not in route and "_same_origin()" in route)
 ok("... einen tenant_admin nur mit Erlaubnis, und nie beim Schalter",
    'op != "allow"' in route and '["may"]' in route)
+ok("0.13: die Route reicht Vergleich und Fingerabdruck weiter, prüft sie aber nicht selbst",
+   '"compared"' in route and '"accept_sha256"' in route and "_norm_fp" not in route)
 
 print("")
 print("PASS" if not fails else f"{fails} FEHLER")
