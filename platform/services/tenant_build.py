@@ -82,12 +82,24 @@ STEP_TYPES = {
     # RFC-0056 inside a build: the group the tenant's own administrator
     # belongs in, in the tenant's realm (a group, never a person).
     "idp.admin_group": ((), ()),
-    "manual":         (("text", "done_when"), ()),
+    # RFC-0104 D1: an http destination of the tenant, assigned to an
+    # instance this build installs (`need` defaults to `name`). Never a
+    # secret: one that needs it is made without, and a `manual` step with
+    # done_when "destination.secret" waits for a human to enter it.
+    "destination.ensure": (("name", "instance", "target"),
+                           ("auth", "user", "header", "need")),
+    # `destination` and `instance` only with done_when "destination.secret"
+    "manual":         (("text", "done_when"), ("destination", "instance")),
     "backup.check":   ((), ()),
 }
 # `when` names a bool parameter: the step is skipped unless it is true.
 COMMON_KEYS = ("id", "type", "label_text", "when")
-DONE_WHEN = ("user.exists", "role.tenant_admin", "confirmed")
+DONE_WHEN = ("user.exists", "role.tenant_admin", "confirmed",
+             "destination.secret")
+# what a destination.ensure may say about its authentication: no
+# principal propagation (RFC-0066 needs a pinned certificate a profile
+# cannot know), no mailbox
+ENSURE_AUTH = ("none", "basic", "bearer", "header")
 
 STEP_STATES = ("pending", "running", "done", "failed", "waiting", "skipped")
 BUILD_STATES = ("running", "waiting", "failed", "done", "rolled-back")
@@ -418,6 +430,27 @@ def profile_problems(doc):
         if typ == "manual" and st.get("done_when") not in DONE_WHEN:
             out.append(f"{where} ('{sid}'): done_when is one of "
                        + ", ".join(DONE_WHEN))
+        if typ == "manual":
+            wants = st.get("done_when") == "destination.secret"
+            for k in ("destination", "instance"):
+                if wants and not st.get(k):
+                    out.append(f"{where} ('{sid}'): done_when destination.secret "
+                               f"needs '{k}'")
+                if not wants and k in st:
+                    out.append(f"{where} ('{sid}'): '{k}' belongs only to "
+                               "done_when destination.secret")
+        if typ == "destination.ensure":
+            auth = st.get("auth", "none")
+            if isinstance(auth, str) and not TEMPLATE_RE.search(auth)                     and auth not in ENSURE_AUTH:
+                out.append(f"{where} ('{sid}'): auth is one of "
+                           + ", ".join(ENSURE_AUTH))
+            if auth == "basic" and "user" not in st:
+                out.append(f"{where} ('{sid}'): auth basic needs 'user'")
+            if auth == "header" and "header" not in st:
+                out.append(f"{where} ('{sid}'): auth header needs 'header'")
+            for k in ("secret", "password", "token"):
+                if k in st:
+                    out.append(f"{where} ('{sid}'): a profile never holds a secret")
     return out
 
 

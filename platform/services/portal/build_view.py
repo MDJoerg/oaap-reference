@@ -31,6 +31,7 @@ STEP_TYPE = {
     "app.install": "Anwendung installieren",
     "authz.setup": "Rollen, Pakete und Gruppen aus den Vorlagen einrichten",
     "app.config": "Konfigurationswert einer Instanz setzen",
+    "destination.ensure": "Destination anlegen und zuordnen",
     "manual": "Ein Mensch erledigt das",
     "backup.check": "Sicherung prüfen",
 }

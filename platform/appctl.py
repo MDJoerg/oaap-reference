@@ -4325,7 +4325,10 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
                     header="", secret="", who="root", role="root",
                     accept_sha256="", claims=(), name_check="",
                     lifetime=10, unchecked_claim="", author="",
-                    check_path=None):
+                    check_path=None, secret_later=False):
+    """`secret_later` (RFC-0104 D1, a tenant build): a destination that needs
+    a secret is made without one; it is listed as SECRET MISSING and its
+    calls are refused until a human sets it (`set-secret`, the portal)."""
     if not re.fullmatch(DEST_NAME_RE, name or ""):
         raise DestinationRefused("a destination name is [a-z0-9-], 2-40 "
                                  "characters, starting and ending with a "
@@ -4389,7 +4392,8 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
         if header.lower() in {h.lower() for h in IDENTITY_HEADERS} | {"host"}:
             raise DestinationRefused(f"'{header}' is not a header a destination may set")
         auth["header"] = header
-    if auth_type not in ("none", "principal_propagation"):
+    later = secret_later and not secret
+    if auth_type not in ("none", "principal_propagation") and not later:
         check_dest_secret(auth_type, secret)
     dests = load_destinations()
     own = dests.setdefault(tid, {})
@@ -4405,13 +4409,14 @@ def destination_add(tid, name, kind, target, auth_type="none", user="",
         own[name]["author"] = author
     if auth_type == "principal_propagation":
         ensure_assertion_key()
-    if auth_type not in ("none", "principal_propagation"):
+    if auth_type not in ("none", "principal_propagation") and not later:
         s = load_dest_secrets()
         s.setdefault(tid, {})[name] = secret
         save_dest_secrets(s)
     save_destinations(dests)
     audit_tenant("destination.add", tid, subject=name, who=who, role=role,
                  detail=f"{kind} {target.strip()} auth {auth_type}"
+                 + (" · secret to be set by a human" if later else "")
                  + (f" · pinned {auth['server_sha256'][:16]}… · claims "
                     + ",".join(r['name'] for r in auth['user'])
                     + f" · checked: {auth['claim_check']}"
@@ -9929,6 +9934,17 @@ class _BuildDrivers:
         if typ == "app.install":
             key = self._instance_key(a["name"])
             return [f"instance:{key}"] if key else []
+        if typ == "destination.ensure":
+            # only what came into being after this build started
+            d = (load_destinations().get(tid) or {}).get(a["name"]) or {}
+            got = ([f"destination:{a['name']}"]
+                   if (d.get("created") or "") >= ctx["started"] else [])
+            key = self._instance_key(a["instance"])
+            need = a.get("need") or a["name"]
+            inst = load_registry()["instances"].get(key) or {}
+            if got and (inst.get("destinations") or {}).get(need) == a["name"]:
+                got.append(f"binding:{key}:{need}")
+            return got
         return []
 
     def rollback_refusal(self, state):
@@ -10237,6 +10253,18 @@ class _BuildDrivers:
     # manual --------------------------------------------------------------
     def _check_manual(self, a, ctx):
         when = a["done_when"]
+        if when == "destination.secret":
+            # RFC-0104 §5: that the secret is there, never what it is
+            tid, _t = self._tenant()
+            name = a.get("destination", "")
+            d = (load_destinations().get(tid or "") or {}).get(name)
+            if not d:
+                return ABSENT_, f"noch keine Destination '{name}'"
+            if not d.get("secret"):
+                return PRESENT_, f"'{name}' braucht kein Geheimnis"
+            if (load_dest_secrets().get(tid) or {}).get(name):
+                return PRESENT_, f"das Geheimnis von '{name}' ist eingetragen"
+            return ABSENT_, f"das Geheimnis von '{name}' fehlt noch"
         if when == "confirmed":
             if (ctx.get("step") or {}).get("confirmed"):
                 return PRESENT_, "ein Mensch hat es bestätigt"
@@ -10383,6 +10411,107 @@ class _BuildDrivers:
         # The key, never the value: it may be a secret, and the note goes
         # into the build's page and the tenant's audit log.
         return True, f"{a['key']} gesetzt{made_by}", []
+
+    # destination.ensure (RFC-0104 D1) ------------------------------------
+    @staticmethod
+    def _wish_target(target):
+        t = (target or "").strip()
+        if t.startswith("through:"):
+            local, name = parse_through(t)
+            return {"through": f"{local}/{name}"}
+        if t.startswith("via:"):
+            tunnel, offer = parse_via(t)
+            return {"via": f"{tunnel}/{offer}"}
+        return {"direct": t}
+
+    def _dest_differs(self, d, a):
+        """What of an existing destination differs from the wish, or ""."""
+        auth, want = d.get("auth") or {}, a.get("auth") or "none"
+        diff = []
+        if d.get("kind") != "http":
+            diff.append(f"Art {d.get('kind')} statt http")
+        try:
+            if (d.get("target") or {}) != self._wish_target(a["target"]):
+                diff.append(f"Ziel {dest_target_text(d)}")
+        except (DestinationRefused, ValueError):
+            diff.append("das gewünschte Ziel ist nicht lesbar")
+        if auth.get("type", "none") != want:
+            diff.append(f"Anmeldung {auth.get('type', 'none')} statt {want}")
+        elif want == "basic" and auth.get("user", "") != a.get("user", ""):
+            diff.append("ein anderer Benutzer")
+        elif want == "header" and auth.get("header", "") != a.get("header", ""):
+            diff.append("eine andere Kopfzeile")
+        return ", ".join(diff)
+
+    def _check_destination_ensure(self, a, ctx):
+        tid, _t = self._tenant()
+        if not tid:
+            return ABSENT_, "noch kein Mandant"
+        key = self._instance_key(a["instance"])
+        if not key:
+            return ABSENT_, f"noch keine Instanz '{a['instance']}' in diesem Mandanten"
+        d = (load_destinations().get(tid) or {}).get(a["name"])
+        if not d:
+            return ABSENT_, f"noch keine Destination '{a['name']}'"
+        diff = self._dest_differs(d, a)
+        if diff:
+            return CONFLICT_, (f"die Destination '{a['name']}' besteht anders als "
+                               f"gewünscht ({diff}); sie wird nicht angefasst")
+        need = a.get("need") or a["name"]
+        bound = ((load_registry()["instances"].get(key) or {})
+                 .get("destinations") or {}).get(need)
+        if bound == a["name"]:
+            return PRESENT_, (f"'{a['name']}' besteht und ist '{a['instance']}' "
+                              f"als {need} zugeordnet")
+        if bound:
+            return CONFLICT_, (f"'{a['instance']}' hat als {need} schon '{bound}' "
+                               "zugeordnet; das wird nicht ersetzt")
+        return ABSENT_, f"'{a['name']}' ist '{a['instance']}' noch nicht zugeordnet"
+
+    def _do_destination_ensure(self, a, ctx):
+        tid, _t = self._tenant()
+        key = self._instance_key(a["instance"])
+        if not tid or not key:
+            return False, (f"keine Instanz '{a['instance']}' in diesem Mandanten -- "
+                           "der Schritt gehört hinter ihr app.install"), []
+        made, notes = [], []
+        try:
+            if not (load_destinations().get(tid) or {}).get(a["name"]):
+                d = destination_add(tid, a["name"], "http", a["target"],
+                                    auth_type=a.get("auth") or "none",
+                                    user=a.get("user", ""), header=a.get("header", ""),
+                                    who=self.who, role=self.role, secret_later=True)
+                made.append(f"destination:{a['name']}")
+                notes.append(f"'{a['name']}' angelegt"
+                             + (" (das Geheimnis trägt ein Mensch ein)"
+                                if d.get("secret") else ""))
+            need = a.get("need") or a["name"]
+            if destination_bind(load_registry(), key, a["name"], need,
+                                who=self.who, role=self.role):
+                made.append(f"binding:{key}:{need}")
+                notes.append(f"'{a['instance']}' als {need} zugeordnet")
+        except DestinationRefused as exc:
+            return False, str(exc), made
+        return True, "; ".join(notes) or "nichts zu tun", made
+
+    def _undo_destination_ensure(self, a, item, ctx):
+        tid, _t = self._tenant()
+        kind, _s, rest = item.partition(":")
+        try:
+            if kind == "binding":
+                key, _s, need = rest.rpartition(":")
+                reg = load_registry()
+                if need not in ((reg["instances"].get(key) or {})
+                                .get("destinations") or {}):
+                    return True, "die Zuordnung war schon gelöst"
+                destination_unbind(reg, key, need, who=self.who, role=self.role)
+                return True, f"die Zuordnung {need} von '{key}' ist gelöst"
+            if not (load_destinations().get(tid or "") or {}).get(rest):
+                return True, f"die Destination '{rest}' war schon entfernt"
+            destination_remove(tid, rest, who=self.who, role=self.role)
+            return True, f"die Destination '{rest}' ist entfernt"
+        except DestinationRefused as exc:
+            return False, str(exc)
 
     # backup.check ---------------------------------------------------------
     def _check_backup_check(self, a, ctx):
