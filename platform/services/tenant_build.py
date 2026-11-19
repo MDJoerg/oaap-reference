@@ -88,14 +88,24 @@ STEP_TYPES = {
     # done_when "destination.secret" waits for a human to enter it.
     "destination.ensure": (("name", "instance", "target"),
                            ("auth", "user", "header", "need")),
-    # `destination` and `instance` only with done_when "destination.secret"
-    "manual":         (("text", "done_when"), ("destination", "instance")),
+    # RFC-0104 D2: what an instance's setup door should have in place --
+    # a list of items {kind, id, ...}; the app creates them by its own
+    # rules and never overwrites a human's work.
+    "app.setup":      (("name", "items"), ()),
+    # the arguments of the two reads that need them (MANUAL_READ_KEYS)
+    "manual":         (("text", "done_when"), ("destination", "instance",
+                                               "kind", "item")),
     "backup.check":   ((), ()),
 }
 # `when` names a bool parameter: the step is skipped unless it is true.
 COMMON_KEYS = ("id", "type", "label_text", "when")
 DONE_WHEN = ("user.exists", "role.tenant_admin", "confirmed",
-             "destination.secret")
+             "destination.secret", "setup.ready")
+# done_when -> the step keys it needs; no other done_when takes any
+MANUAL_READ_KEYS = {"destination.secret": ("destination", "instance"),
+                    "setup.ready": ("instance", "kind", "item")}
+SETUP_ITEMS_MAX = 40
+SECRET_WORDS = ("key", "token", "secret", "password", "credentials")
 # what a destination.ensure may say about its authentication: no
 # principal propagation (RFC-0066 needs a pinned certificate a profile
 # cannot know), no mailbox
@@ -368,8 +378,10 @@ def profile_problems(doc):
                 out.append(f"{where} ('{sid}', {typ}): '{k}' is not an "
                            f"argument of this step type")
         chooser = selection_param(st, params)
+        if typ == "app.setup":
+            out += _setup_items_problems(where, sid, st.get("items"), params)
         for k, v in st.items():
-            if k in ("id", "type"):
+            if k in ("id", "type") or (typ == "app.setup" and k == "items"):
                 continue
             if isinstance(v, str):
                 for ref in TEMPLATE_RE.findall(v):
@@ -431,14 +443,15 @@ def profile_problems(doc):
             out.append(f"{where} ('{sid}'): done_when is one of "
                        + ", ".join(DONE_WHEN))
         if typ == "manual":
-            wants = st.get("done_when") == "destination.secret"
-            for k in ("destination", "instance"):
-                if wants and not st.get(k):
-                    out.append(f"{where} ('{sid}'): done_when destination.secret "
+            need = MANUAL_READ_KEYS.get(st.get("done_when"), ())
+            for k in need:
+                if not st.get(k):
+                    out.append(f"{where} ('{sid}'): done_when {st.get('done_when')} "
                                f"needs '{k}'")
-                if not wants and k in st:
-                    out.append(f"{where} ('{sid}'): '{k}' belongs only to "
-                               "done_when destination.secret")
+            for k in ("destination", "instance", "kind", "item"):
+                if k in st and k not in need:
+                    out.append(f"{where} ('{sid}'): '{k}' is no argument of "
+                               f"done_when {st.get('done_when')}")
         if typ == "destination.ensure":
             auth = st.get("auth", "none")
             if isinstance(auth, str) and not TEMPLATE_RE.search(auth)                     and auth not in ENSURE_AUTH:
@@ -451,6 +464,84 @@ def profile_problems(doc):
             for k in ("secret", "password", "token"):
                 if k in st:
                     out.append(f"{where} ('{sid}'): a profile never holds a secret")
+    return out
+
+
+def _setup_items_problems(where, sid, items, params):
+    """An app.setup's items: a list of objects with a text `kind` and `id`;
+    values are text (parameters allowed), true/false, or lists of text.
+    Never a field that names a secret (RFC-0104 §3.1)."""
+    out = []
+    if not isinstance(items, list) or not items or len(items) > SETUP_ITEMS_MAX:
+        return [f"{where} ('{sid}'): items is a list of 1 to {SETUP_ITEMS_MAX} objects"]
+    for n, it in enumerate(items):
+        at = f"{where} ('{sid}') item {n + 1}"
+        if not isinstance(it, dict):
+            out.append(f"{at} must be an object")
+            continue
+        for k in ("kind", "id"):
+            if not isinstance(it.get(k), str) or not it.get(k):
+                out.append(f"{at} needs a text '{k}'")
+        for k, v in it.items():
+            if k.lower() in SECRET_WORDS:
+                out.append(f"{at}: a profile never holds a secret ('{k}')")
+                continue
+            texts = v if isinstance(v, list) else [v]
+            if isinstance(v, list) and not all(isinstance(x, str) for x in v):
+                out.append(f"{at}: '{k}' is a list of text")
+                continue
+            if isinstance(v, dict):
+                if not all(isinstance(x, str) for x in v.values()):
+                    out.append(f"{at}: '{k}' holds text only")
+                    continue
+                texts = list(v.values())
+            elif not isinstance(v, (str, bool, list)):
+                out.append(f"{at}: '{k}' is text, true/false or a list of text")
+                continue
+            for t in texts:
+                for ref in TEMPLATE_RE.findall(t) if isinstance(t, str) else ():
+                    if ref not in params:
+                        out.append(f"{at}: '{{{ref}}}' is not a declared parameter")
+                    elif (params[ref] or {}).get("kind") == "apps":
+                        out.append(f"{at}: '{{{ref}}}' is a choice of apps")
+    return out
+
+
+def _render_text(text, values, sid, where):
+    whole = TEMPLATE_RE.fullmatch(text)
+    if whole:
+        val = values.get(whole.group(1))
+        return None if val is None else val
+
+    def sub(m):
+        val = values.get(m.group(1))
+        if val is None:
+            raise Refusal(f"step '{sid}': {where} needs the parameter "
+                          f"'{m.group(1)}', which has no value")
+        return val
+    return TEMPLATE_RE.sub(sub, text)
+
+
+def render_items(items, values, sid):
+    """An app.setup's items with the parameters filled in. A field that is
+    exactly an unset "{p}" is dropped, as in render_step."""
+    out = []
+    for it in items or []:
+        row = {}
+        for k, v in it.items():
+            if isinstance(v, str):
+                r = _render_text(v, values, sid, f"'{k}'")
+                if r is not None:
+                    row[k] = r
+            elif isinstance(v, list):
+                row[k] = [x for x in (_render_text(t, values, sid, f"'{k}'")
+                                      for t in v) if x is not None]
+            elif isinstance(v, dict):
+                row[k] = {a: r for a, r in ((a, _render_text(t, values, sid, f"'{k}'"))
+                                            for a, t in v.items()) if r is not None}
+            else:
+                row[k] = v
+        out.append(row)
     return out
 
 
@@ -656,6 +747,9 @@ def render_step(step, values):
     out = {}
     for k, v in step.items():
         if k in ("id", "type", "label_text", "when"):
+            continue
+        if k == "items" and step.get("type") == "app.setup":
+            out[k] = render_items(v, values, step["id"])
             continue
         if isinstance(v, str):
             whole = TEMPLATE_RE.fullmatch(v)

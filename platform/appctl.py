@@ -6078,7 +6078,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 17     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 18     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -6109,7 +6109,11 @@ MANIFEST_MINOR = 17     # 0.2 adds app.class (runtime spec 2.10);
                         # realm, runtime 2.35);
                         # 0.17 adds docs and docs_sources (RFC-0094 -- an
                         # app brings its documentation, help in the same
-                        # tenant reads it, runtime 2.36)
+                        # tenant reads it, runtime 2.36);
+                        # 0.18 adds setup.path, ai_client.use and
+                        # ai_gateway.serve (RFC-0104 -- a tenant build sets
+                        # an app up through its door; a chat reaches its
+                        # tenant's model gateway without a key)
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -9870,6 +9874,60 @@ def _https_status(url):
         return 0
 
 
+# RFC-0104 §3.1: a tenant build asks an instance's setup door. The call
+# runs inside the identity container (on the platform network, where the
+# gateway's internal listener answers), with key and body on standard
+# input -- the key appears in no process list. The answer is the door's
+# JSON or one sentence.
+SETUP_CALL_SCRIPT = r"""
+import json, sys, urllib.error, urllib.request
+q = json.loads(sys.stdin.read())
+data = None if q["body"] is None else json.dumps(q["body"]).encode()
+req = urllib.request.Request(q["url"], data=data, method=q["method"], headers={
+    "Authorization": "Bearer " + q["key"], "X-OAAP-Setup-Actor": q["actor"],
+    "Content-Type": "application/json", "Accept": "application/json"})
+op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with op.open(req, timeout=60) as r:
+        status, raw = r.status, r.read(1048576)
+except urllib.error.HTTPError as e:
+    status, raw = e.code, e.read(65536)
+except Exception as e:
+    status, raw = 0, str(e).encode()
+print(json.dumps({"status": status, "body": raw.decode("utf-8", "replace")}))
+"""
+
+
+def setup_call(key, inst, method, body=None, query="", actor="root"):
+    """(doc, refusal) for one call to instance `key`'s setup door."""
+    if not setup_door(inst):
+        return None, f"'{key}' erklärt keine Einrichtungstür (setup)"
+    skey = load_env(key, inst).get("OAAP_SETUP_KEY", "")
+    if not skey:
+        return None, (f"'{key}' hat noch keinen Einrichtungsschlüssel -- die "
+                      "Instanz einmal neu ausrollen (oaap app redeploy)")
+    url = f"http://{GATEWAY_CONTAINER}:{HEALTH_PROBE_PORT}/s/{key}" + (
+        f"?{query}" if query else "")
+    q = json.dumps({"url": url, "method": method, "body": body, "key": skey,
+                    "actor": str(actor or "root")[:120]})
+    try:
+        r = subprocess.run(["docker", "exec", "-i", IDENTITY_CONTAINER,
+                            "python3", "-c", SETUP_CALL_SCRIPT],
+                           input=q, capture_output=True, text=True, timeout=90)
+        got = json.loads(r.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return None, f"die Einrichtungstür war nicht erreichbar ({type(exc).__name__})"
+    status, raw = got.get("status", 0), got.get("body", "")
+    if status != 200:
+        return None, (f"die Einrichtungstür von '{key}' antwortete "
+                      f"{status or 'nicht'}: {_brief(raw, 2)}")
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None, f"die Einrichtungstür von '{key}' antwortete kein JSON"
+    return (doc if isinstance(doc, dict) else {}), ""
+
+
 class _BuildDrivers:
     """What each step type does, reads and undoes on THIS node."""
 
@@ -10253,6 +10311,21 @@ class _BuildDrivers:
     # manual --------------------------------------------------------------
     def _check_manual(self, a, ctx):
         when = a["done_when"]
+        if when == "setup.ready":
+            # RFC-0104 §5: the instance's setup door says the item is ready
+            # (a supplier: credentials stored and its test answers)
+            key, inst, why = self._setup_target(a.get("instance", ""))
+            if why:
+                return ABSENT_, why
+            doc, why = self._setup(key, inst, "GET", query=urllib.parse.urlencode(
+                {"kind": a.get("kind", ""), "id": a.get("item", "")}))
+            if why:
+                return ABSENT_, why
+            if doc.get("ready") is True:
+                return PRESENT_, (f"{a.get('kind')} {a.get('item')} ist bereit"
+                                  + (f": {doc.get('note')}" if doc.get("note") else ""))
+            return ABSENT_, (f"{a.get('kind')} {a.get('item')} ist noch nicht bereit"
+                             + (f": {doc.get('note')}" if doc.get("note") else ""))
         if when == "destination.secret":
             # RFC-0104 §5: that the secret is there, never what it is
             tid, _t = self._tenant()
@@ -10512,6 +10585,86 @@ class _BuildDrivers:
             return True, f"die Destination '{rest}' ist entfernt"
         except DestinationRefused as exc:
             return False, str(exc)
+
+    # app.setup (RFC-0104 D2) ---------------------------------------------
+    def _setup_target(self, name):
+        """(key, inst, refusal) for an instance of this build with a door."""
+        key = self._instance_key(name)
+        if not key:
+            return "", None, f"noch keine Instanz '{name}' in diesem Mandanten"
+        inst = load_registry()["instances"].get(key) or {}
+        if not setup_door(inst):
+            return key, inst, f"'{name}' erklärt keine Einrichtungstür (setup)"
+        return key, inst, ""
+
+    def _setup(self, key, inst, method, body=None, query=""):
+        """(doc, refusal) -- one call through gateway:8099/s/<key>."""
+        return setup_call(key, inst, method, body, query, actor=self.who)
+
+    @staticmethod
+    def _setup_verdict(results):
+        bad = [r for r in results if r.get("result") in ("conflict", "refused")]
+        todo = [r for r in results if r.get("result") not in ("present",)]
+        return bad, todo
+
+    @staticmethod
+    def _setup_say(rows):
+        return "; ".join(f"{r.get('kind')} {r.get('id')}: {r.get('result')}"
+                         + (f" ({r.get('note')})" if r.get("note") else "")
+                         for r in rows)
+
+    def _check_app_setup(self, a, ctx):
+        key, inst, why = self._setup_target(a["name"])
+        if not key:
+            return ABSENT_, why
+        if why:
+            return CONFLICT_, why
+        doc, why = self._setup(key, inst, "POST",
+                               {"v": 1, "dry": True, "items": a["items"]})
+        if why:
+            return ABSENT_, why
+        bad, todo = self._setup_verdict(doc.get("results") or [])
+        if bad:
+            return CONFLICT_, self._setup_say(bad)
+        if todo:
+            return ABSENT_, "noch einzurichten: " + self._setup_say(todo)
+        return PRESENT_, f"'{a['name']}' hat alles wie gewünscht"
+
+    def _do_app_setup(self, a, ctx):
+        key, inst, why = self._setup_target(a["name"])
+        if why:
+            return False, why, []
+        doc, why = self._setup(key, inst, "POST",
+                               {"v": 1, "dry": False, "items": a["items"]})
+        if why:
+            return False, why, []
+        results = doc.get("results") or []
+        made = [f"setup:{key}:{r.get('kind')}:{r.get('id')}"
+                for r in results if r.get("result") == "made"]
+        bad, _todo = self._setup_verdict(results)
+        if bad:
+            return False, self._setup_say(bad), made
+        return True, self._setup_say(results), made
+
+    def _undo_app_setup(self, a, item, ctx):
+        _p, key, kind, iid = (item.split(":", 3) + ["", "", ""])[:4]
+        inst = load_registry()["instances"].get(key)
+        if not inst:
+            return True, f"die Instanz '{key}' ist schon entfernt"
+        doc, why = setup_call(key, inst, "POST",
+                              {"v": 1, "remove": [{"kind": kind, "id": iid}]},
+                              actor=self.who)
+        if why:
+            return False, why
+        r = (doc.get("results") or [{}])[0]
+        if r.get("result") in ("removed", "gone"):
+            return True, f"{kind} {iid}: {r.get('result')}"
+        if r.get("result") == "conflict":
+            # A human changed it since (RFC-0104 §3.1): it stays, by the
+            # app's rule, and the rollback goes on -- with --purge-instances
+            # the instance and its data go anyway.
+            return True, f"{kind} {iid} bleibt: {r.get('note', '')}"
+        return False, f"{kind} {iid}: {r.get('result')} ({r.get('note', '')})"
 
     # backup.check ---------------------------------------------------------
     def _check_backup_check(self, a, ctx):
@@ -14302,6 +14455,20 @@ def validate_manifest(m):
             err = oidc_client_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.18 (RFC-0104): the door a tenant build sets the app up
+        # through, and the two halves of the model way without a key.
+        if "setup" in m:
+            err = setup_door_error(m)
+            if err:
+                errs.append(err)
+        for fld, word in (("ai_client", "use"), ("ai_gateway", "serve")):
+            if fld in m:
+                if not isinstance(m[fld], dict):
+                    errs.append(f"{fld}: object expected")
+                elif set(m[fld]) - {word}:
+                    errs.append(f"{fld}: only '{word}' is known")
+                elif word in m[fld] and not isinstance(m[fld][word], bool):
+                    errs.append(f"{fld}.{word}: true or false")
         # Manifest 0.12 (RFC-0074 D5): an app that acts at its tenant's MCP
         # gateways as the person speaking to it (procedure A).
         if "mcp_client" in m:
@@ -15278,7 +15445,8 @@ def _cases_issue_submit_key(name, tenant_id):
 # env variable -> what it is. One table, read by every step above.
 INSTANCE_KEY_VARS = ("OAAP_PLATFORM_KEY", "OAAP_AUTHZ_KEY",
                      "OAAP_AUTHZ_ADMIN_KEY", "OAAP_CASES_KEY",
-                     "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_CLIENT_KEY")
+                     "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_CLIENT_KEY",
+                     "OAAP_AI_CLIENT_KEY")
 RENEW_DAYS = 30
 
 
@@ -15351,6 +15519,10 @@ def instance_keys_issue(name, tenant_id, app_id, which, administer=False, port=N
             out[var] = _mcp_issue_client_key(name, tenant_id)
             if port:
                 out["OAAP_MCP_CLIENT_URL"] = mcp_client_url(port)
+        elif var == "OAAP_AI_CLIENT_KEY":
+            out[var] = _ai_issue_client_key(name, tenant_id)
+            if port:
+                out["OAAP_AI_CLIENT_URL"] = ai_client_url(port)
     return out
 
 
@@ -16239,6 +16411,17 @@ def assets_door_error(m):
     return _door_path_error(m, "assets", "/oaap/assets")
 
 
+def setup_door_error(m):
+    """'' when `setup:` is a valid door (manifest 0.18, RFC-0104 §3.1)."""
+    return _door_path_error(m, "setup", "/oaap/setup")
+
+
+def setup_door(m_or_inst):
+    """The declared setup path of a manifest or a registry record, or ''."""
+    d = (m_or_inst or {}).get("setup")
+    return str(d.get("path") or "") if isinstance(d, dict) else ""
+
+
 def assets_door(m_or_inst):
     """The declared assets path of a manifest or a registry record, or ''."""
     d = (m_or_inst or {}).get("assets")
@@ -16518,8 +16701,8 @@ def mcp_client_url(port):
     return f"http://{GATEWAY_CONTAINER}:{port}/platform/mcp/gateways"
 
 
-def _mcp_issue_client_key(name, tenant_id):
-    """Key for 'instance:<name>', limited to mcp_client_scope(name)."""
+def _issue_client_key(name, tenant_id, scope, label):
+    """Key for 'instance:<name>', limited to `scope` (a client door)."""
     out = _identity_exec(
         "import json, os, app as m\n"
         "with m.users_rw() as users:\n"
@@ -16533,49 +16716,68 @@ def _mcp_issue_client_key(name, tenant_id):
         "                      'active': True})\n"
         "        m.save_users(users)\n"
         "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
-        "    'oaap.mcp.client (RFC-0074)', m.KEY_MAX_DAYS, 'root')\n"
+        "    os.environ['OAAP_T_LABEL'], m.KEY_MAX_DAYS, 'root')\n"
         "print(json.dumps(secret))\n",
         {"OAAP_T_NAME": f"instance:{name}", "OAAP_T_INST": name,
-         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": mcp_client_scope(name)})
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": scope,
+         "OAAP_T_LABEL": label})
     return json.loads(out)
 
 
-def mcp_gateways_of(insts, scope):
-    """The gateways a chat instance `scope` may act at (RFC-0074 §3.2).
+def _mcp_issue_client_key(name, tenant_id):
+    """Key for 'instance:<name>', limited to mcp_client_scope(name)."""
+    return _issue_client_key(name, tenant_id, mcp_client_scope(name),
+                             "oaap.mcp.client (RFC-0074)")
 
-    Same tenant, this node, declares `mcp_sources` (that is what makes an
-    app a gateway of its tenant), not a rehearsal, not the chat itself, with
-    a port. The chat itself must declare `mcp_client`, have a port and not
-    be a rehearsal. Sorted; each entry names the door on the chat's OWN
-    site that leads there."""
+
+# One door machinery, two kinds (RFC-0104 §4 mirrors RFC-0074): which
+# manifest flag makes a client, which makes a gateway, the door's prefix,
+# the path at the gateway, the header the door sets, the key's scope.
+VIA_KINDS = {
+    "mcp": {"client": "mcp_client", "gateway": "mcp_sources",
+            "prefix": MCP_VIA_PREFIX, "path": "/mcp",
+            "header": MCP_CLIENT_HEADER, "scope": MCP_CLIENT_SCOPE,
+            "list": "/platform/mcp/gateways"},
+}
+
+
+def _via_gateways(insts, scope, kind):
+    """The gateways of one kind a client instance `scope` may use.
+
+    Same tenant, this node, the gateway flag of the kind, not a rehearsal,
+    not the client itself, with a port. The client must carry the client
+    flag, have a port and not be a rehearsal. Sorted; each entry names the
+    door on the client's OWN site that leads there."""
+    k = VIA_KINDS[kind]
     me = insts.get(scope) or {}
-    if not me.get("mcp_client") or is_rehearsal(me) or not me.get("port"):
+    if not me.get(k["client"]) or is_rehearsal(me) or not me.get("port"):
         return []
     tenant = instance_tenant_ref(me)
     out = []
-    for k, i in sorted(insts.items()):
-        if k == scope or not i.get("mcp_sources") or is_rehearsal(i) \
+    for n, i in sorted(insts.items()):
+        if n == scope or not i.get(k["gateway"]) or is_rehearsal(i) \
                 or not i.get("port") or instance_tenant_ref(i) != tenant:
             continue
-        out.append({"name": k, "app": i.get("app_id") or "",
+        out.append({"name": n, "app": i.get("app_id") or "",
                     "version": i.get("version") or "",
                     "channel": i.get("channel") or "",
-                    "via": f"http://{GATEWAY_CONTAINER}:{me['port']}{MCP_VIA_PREFIX}{k}"})
+                    "via": f"http://{GATEWAY_CONTAINER}:{me['port']}{k['prefix']}{n}"})
     return out
 
 
-def mcp_via_specs(insts, scope):
-    """What each via door on chat `scope`'s site asks and where it goes:
-    the roles of the gateway's route that covers /mcp (the longest prefix,
+def _via_specs(insts, scope, kind):
+    """What each via door of one kind asks and where it goes: the roles of
+    the gateway's route that covers the kind's path (the longest prefix,
     without `public`), its visibility groups, its tenant and the container
     behind that route -- what a client of the gateway meets anyway."""
+    path = VIA_KINDS[kind]["path"]
     out = []
-    for g in mcp_gateways_of(insts, scope):
+    for g in _via_gateways(insts, scope, kind):
         i = insts.get(g["name"]) or {}
         routes = sorted(i.get("routes") or [], key=lambda r: len(r["path"]),
                         reverse=True)
-        r = next((r for r in routes if r["path"] == "/" or r["path"] == "/mcp"
-                  or "/mcp".startswith(r["path"].rstrip("/") + "/")), None)
+        r = next((r for r in routes if r["path"] == "/" or r["path"] == path
+                  or path.startswith(r["path"].rstrip("/") + "/")), None)
         if r is None or not i.get("container") or not i.get("svc_port"):
             continue
         c, p = i["container"], i["svc_port"]
@@ -16589,25 +16791,27 @@ def mcp_via_specs(insts, scope):
     return out
 
 
-def mcp_via_lines(insts, scope):
-    """The list and the via doors on a chat instance's own site.
+def _via_lines(insts, scope, kind):
+    """The list and the via doors of one kind on a client's own site.
 
     Order in Caddy: uri -> forward_auth -> request_header -> proxy, so
-    identity sees the chat's key and the act assertion, and the gateway
+    identity sees the client's key and the act assertion, and the gateway
     sees neither -- only the person's six headers and, set here and never
-    taken from the request, the name of the chat (X-OAAP-MCP-Client)."""
-    gws = mcp_gateways_of(insts, scope)
+    taken from the request, the name of the client."""
+    k = VIA_KINDS[kind]
+    gws = _via_gateways(insts, scope, kind)
     if not gws:
         return []
     me = insts.get(scope) or {}
     tenant = instance_tenant_ref(me)
+    cscope = f"{k['scope']}:{scope}"
     uri = "/verify?roles="
     if tenant:
         uri += f"&tenant={tenant}"
-    uri += f"&instance={mcp_client_scope(scope)}"
+    uri += f"&instance={cscope}"
     body = json.dumps({"v": 1, "gateways": gws}, sort_keys=True,
                       separators=(",", ":"))
-    lines = ["\thandle /platform/mcp/gateways {",
+    lines = [f"\thandle {k['list']} {{",
              "\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
              "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}",
              "\t\theader Content-Type application/json",
@@ -16615,33 +16819,103 @@ def mcp_via_lines(insts, scope):
     # Instance names, app ids, versions: no backtick in any of them.
     assert "`" not in body
     lines += [f"\t\trespond `{body}` 200", "\t}"]
-    for d in mcp_via_specs(insts, scope):
+    for d in _via_specs(insts, scope, kind):
         uri = f"/verify?roles={','.join(d['roles'])}"
         if d["groups"]:
             uri += f"&groups={','.join(d['groups'])}"
         if d["tenant"]:
             uri += f"&tenant={d['tenant']}"
-        uri += f"&instance={d['name']}&via={mcp_client_scope(scope)}"
-        door = f"{MCP_VIA_PREFIX}{d['name']}/"
+        uri += f"&instance={d['name']}&via={cscope}"
+        door = f"{k['prefix']}{d['name']}/"
         lines.append(f"\thandle {door}* {{")
-        lines.append(f"\t\turi replace {door} /mcp/ 1")
+        lines.append(f"\t\turi replace {door} {k['path']}/ 1")
         lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
                   "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
         lines.append("\t\trequest_header -Authorization")
         lines.append(f"\t\trequest_header -{MCP_ACT_ASSERTION}")
-        lines.append(f"\t\trequest_header {MCP_CLIENT_HEADER} {scope}")
+        lines.append(f"\t\trequest_header {k['header']} {scope}")
         lines += _proxy(d["target"], "\t\t")
         lines.append("\t}")
     return lines
 
 
-def mcp_via_digest(insts, scope):
+def _via_digest(insts, scope, kind):
     """Changes when a gateway comes, goes or changes what its door asks."""
-    gws = mcp_gateways_of(insts, scope)
+    gws = _via_gateways(insts, scope, kind)
     if not gws:
         return "-"
-    return hashlib.sha256(json.dumps([gws, mcp_via_specs(insts, scope)],
+    return hashlib.sha256(json.dumps([gws, _via_specs(insts, scope, kind)],
                                      sort_keys=True).encode()).hexdigest()[:12]
+
+
+def mcp_gateways_of(insts, scope):
+    """The MCP gateways a chat instance `scope` may act at (RFC-0074 §3.2):
+    instances declaring `mcp_sources` -- that makes an app a gateway."""
+    return _via_gateways(insts, scope, "mcp")
+
+
+def mcp_via_specs(insts, scope):
+    return _via_specs(insts, scope, "mcp")
+
+
+def mcp_via_lines(insts, scope):
+    return _via_lines(insts, scope, "mcp")
+
+
+def mcp_via_digest(insts, scope):
+    return _via_digest(insts, scope, "mcp")
+
+
+# ---------------------------------- AI client: procedure A for models (RFC-0104 §4)
+# A chat declares `ai_client: {use: true}`, a model gateway `ai_gateway:
+# {serve: true}`. The chat gets a key limited to `oaap.ai.client:<name>`
+# and on its own site /platform/ai/gateways and one door per model
+# gateway of its tenant, /platform/ai/via/<gateway>/ -> /v1/ there. The
+# gateway gets the person's headers and X-OAAP-AI-Client, never a key.
+AI_CLIENT_SCOPE = "oaap.ai.client"
+AI_VIA_PREFIX = "/platform/ai/via/"
+AI_CLIENT_HEADER = "X-OAAP-AI-Client"
+VIA_KINDS["ai"] = {"client": "ai_client", "gateway": "ai_gateway",
+                   "prefix": AI_VIA_PREFIX, "path": "/v1",
+                   "header": AI_CLIENT_HEADER, "scope": AI_CLIENT_SCOPE,
+                   "list": "/platform/ai/gateways"}
+
+
+def ai_client_scope(name):
+    return f"{AI_CLIENT_SCOPE}:{name}"
+
+
+def ai_client_wanted(m):
+    """Only a literal `ai_client: {use: true}`."""
+    d = m.get("ai_client")
+    return isinstance(d, dict) and d.get("use") is True
+
+
+def ai_gateway_wanted(m):
+    """Only a literal `ai_gateway: {serve: true}`."""
+    d = m.get("ai_gateway")
+    return isinstance(d, dict) and d.get("serve") is True
+
+
+def ai_client_url(port):
+    return f"http://{GATEWAY_CONTAINER}:{port}/platform/ai/gateways"
+
+
+def _ai_issue_client_key(name, tenant_id):
+    return _issue_client_key(name, tenant_id, ai_client_scope(name),
+                             "oaap.ai.client (RFC-0104)")
+
+
+def ai_gateways_of(insts, scope):
+    return _via_gateways(insts, scope, "ai")
+
+
+def ai_via_lines(insts, scope):
+    return _via_lines(insts, scope, "ai")
+
+
+def ai_via_digest(insts, scope):
+    return _via_digest(insts, scope, "ai")
 
 
 # ----------------------- business authorization (oaap.core.authorization 0.1)
@@ -17818,7 +18092,10 @@ def cases_marker(insts, scope):
             # RFC-0074: a chat's site carries a door per gateway of its
             # tenant, so it goes stale when a gateway comes, goes or moves
             + (f" via:{mcp_via_digest(insts, scope)}"
-               if me.get("mcp_client") else ""))
+               if me.get("mcp_client") else "")
+            # RFC-0104 §4: the same for the model gateways
+            + (f" ai:{ai_via_digest(insts, scope)}"
+               if me.get("ai_client") else ""))
 
 
 def _platform_site_lines(routes, groups, scope, tenant, login_only):
@@ -17959,6 +18236,10 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
     # never for a rehearsal (mcp_gateways_of asks the latter).
     if me.get("mcp_client") and not login_only:
         lines += mcp_via_lines(insts, scope)
+    # RFC-0104 §4: on a chat's site, the list of its tenant's model
+    # gateways and one door per gateway.
+    if me.get("ai_client") and not login_only:
+        lines += ai_via_lines(insts, scope)
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
     lines.append("\t\turi strip_prefix /platform")
@@ -18847,6 +19128,15 @@ def write_internal_health_caddy():
             lines.append(f"\t\t\trewrite * {lp}")
             lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
             lines.append("\t\t}")
+        # RFC-0104 §3.1: an app's setup door, for a tenant build. The
+        # query stays (setup.ready asks ?kind=&id=); the app checks its
+        # own setup key, which only the platform holds.
+        sp = setup_door(inst)
+        if sp:
+            lines.append(f"\t\thandle /s/{name} {{")
+            lines.append(f"\t\t\trewrite * {sp}?{{query}}")
+            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t}")
         # RFC-0087 §8.2: an app's assets door, for the status document
         ap = assets_door(inst)
         if ap:
@@ -19116,6 +19406,8 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_CASES_KEY", "OAAP_CASES_URL",
                 "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_SOURCES_URL",
                 "OAAP_MCP_CLIENT_KEY", "OAAP_MCP_CLIENT_URL",
+                # RFC-0104: the model way and the setup key
+                "OAAP_AI_CLIENT_KEY", "OAAP_AI_CLIENT_URL", "OAAP_SETUP_KEY",
                 # RFC-0073 stage 3: written by `oaap idp mcp` only
                 "OAAP_MCP_IDP_ISSUER", "OAAP_MCP_IDP_AUDIENCE",
                 "OAAP_MCP_IDP_SECRET", "OAAP_MCP_IDP_SIGNIN",
@@ -23610,6 +23902,26 @@ def _install_from_dir(pkg, args, source):
         env.pop("OAAP_MCP_CLIENT_URL", None)
         print(f"'{name}' no longer acts at MCP gateways: its key is no longer "
               "handed to the app.")
+    # RFC-0104 §4: the same for the tenant's model gateway (procedure A for
+    # models). Never for a rehearsal.
+    if ai_client_wanted(m) and not is_artefact and not rehearsal:
+        if "OAAP_AI_CLIENT_KEY" not in env:
+            env["OAAP_AI_CLIENT_KEY"] = _ai_issue_client_key(name, twin_tenant)
+            print(f"Issued an AI-client key for '{name}' (RFC-0104) -- "
+                  "OAAP_AI_CLIENT_KEY/OAAP_AI_CLIENT_URL are in its environment.")
+        env["OAAP_AI_CLIENT_URL"] = ai_client_url(port)
+    elif "OAAP_AI_CLIENT_KEY" in env:
+        env.pop("OAAP_AI_CLIENT_KEY", None)
+        env.pop("OAAP_AI_CLIENT_URL", None)
+        print(f"'{name}' no longer reaches a model gateway through the platform: "
+              "its key is no longer handed to the app.")
+    # RFC-0104 §3.1: the setup key. Random, made once, kept by the platform;
+    # only the build's call through gateway:8099/s/<name> carries it.
+    if setup_door(m):
+        if not env.get("OAAP_SETUP_KEY"):
+            env["OAAP_SETUP_KEY"] = secrets.token_urlsafe(32)
+    else:
+        env.pop("OAAP_SETUP_KEY", None)
     # RFC-0073 stage 3 (runtime 2.32.2): the sign-in settings are written
     # by `oaap idp mcp` alone. A redeploy keeps them (they are in the
     # loaded env); a rehearsal or a manifest without mcp_sources does not.
@@ -23782,6 +24094,12 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.12 (RFC-0074): this app acts at its tenant's MCP
         # gateways as the person speaking to it.
         "mcp_client": mcp_client_wanted(m),
+        # Manifest 0.18 (RFC-0104): the setup door (gateway:8099/s/<name>),
+        # the chat's model way without a key, and the model gateway that
+        # serves it.
+        "setup": ({"path": setup_door(m)} if setup_door(m) else {}),
+        "ai_client": ai_client_wanted(m),
+        "ai_gateway": ai_gateway_wanted(m),
         # Manifest 0.13 (RFC-0075): the sandbox page for MCP App views; the
         # gateway gives it a second, cookie-less origin.
         "ui_sandbox": ({"path": ui_sandbox_path(m)} if ui_sandbox_path(m) else {}),
@@ -24137,7 +24455,8 @@ def remove_instance(reg, name, purge):
                     and k not in APP_OIDC_VARS.values()
                     and k not in ("OAAP_CASES_URL", "OAAP_CARE_URL",
                                   "OAAP_MCP_SOURCES_URL",
-                                  "OAAP_MCP_CLIENT_URL")}
+                                  "OAAP_MCP_CLIENT_URL",
+                                  "OAAP_AI_CLIENT_URL", "OAAP_SETUP_KEY")}
         if kept_env != env:
             save_env(name, kept_env, inst)
     if purge:

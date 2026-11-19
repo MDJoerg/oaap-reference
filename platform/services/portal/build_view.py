@@ -32,6 +32,7 @@ STEP_TYPE = {
     "authz.setup": "Rollen, Pakete und Gruppen aus den Vorlagen einrichten",
     "app.config": "Konfigurationswert einer Instanz setzen",
     "destination.ensure": "Destination anlegen und zuordnen",
+    "app.setup": "In einer App einrichten (Einrichtungstür)",
     "manual": "Ein Mensch erledigt das",
     "backup.check": "Sicherung prüfen",
 }

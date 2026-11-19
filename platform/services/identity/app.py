@@ -2048,14 +2048,23 @@ def _verify_discover(scope):
 # used at the gateway (the rule of RFC-0073 §4.2).
 ACT_ASSERTION_HEADER = "X-OAAP-Act-Assertion"
 MCP_CLIENT_PREFIX = "oaap.mcp.client:"
+# RFC-0104 §4: the same door to the tenant's model gateway. One check for
+# both kinds; only the audit word differs.
+AI_CLIENT_PREFIX = "oaap.ai.client:"
+VIA_CLIENT_KINDS = ((MCP_CLIENT_PREFIX, "mcp.via"), (AI_CLIENT_PREFIX, "ai.via"))
 
 
 def _verify_via(scope):
     """The forward-auth answer at a chat's via door (procedure A)."""
     target = request.args.get("instance", "")
-    chat = act.gateway_of(scope, MCP_CLIENT_PREFIX)
+    chat, what = "", ""
+    for prefix, word in VIA_CLIENT_KINDS:
+        chat = act.gateway_of(scope, prefix)
+        if chat:
+            what = word
+            break
     if not chat or not target:
-        return "Forbidden: not an MCP client door", 403
+        return "Forbidden: not a client door", 403
     # 1. The chat's own key, limited to exactly this door's scope.
     auth = request.headers.get("Authorization", "")
     if auth[:7].lower() != "bearer ":
@@ -2083,10 +2092,10 @@ def _verify_via(scope):
     if not own:
         return _key_refusal("invalid_token", "no act assertion: procedure A "
                             "needs the assertion of the person speaking to the chat")
-    person, refusal = _act_assertion_person(own, chat, want, target, "mcp.via")
+    person, refusal = _act_assertion_person(own, chat, want, target, what)
     if refusal is not None:
         return refusal
-    return _act_answer(person, target, want, f"instance:{chat}", "mcp.via", "A")
+    return _act_answer(person, target, want, f"instance:{chat}", what, "A")
 
 
 @app.get("/verify")

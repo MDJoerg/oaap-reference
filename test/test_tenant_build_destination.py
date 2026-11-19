@@ -185,7 +185,7 @@ r = refused({"id": "x", "type": "manual", "text": "t", "done_when": "destination
              "destination": "ki"}, "needs 'instance'")
 ok("destination.secret ohne Instanz wird abgelehnt", *r)
 r = refused({"id": "x", "type": "manual", "text": "t", "done_when": "confirmed",
-             "destination": "ki"}, "belongs only to")
+             "destination": "ki"}, "is no argument of done_when")
 ok("'destination' an einem anderen done_when wird abgelehnt", *r)
 r = tb.render_step(prof["steps"][2], {"label": "kit1"})
 ok("der Parameter fuellt die Instanz", r["instance"] == "kit1-hilfe", r)
