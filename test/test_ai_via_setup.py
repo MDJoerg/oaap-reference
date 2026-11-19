@@ -339,6 +339,28 @@ ok("der Rueckbau schickt remove fuer genau dieses Element",
 v, note = d.check("app.setup", {"name": "kit1-chat", "items": step["items"]}, {})
 ok("eine Instanz ohne Einrichtungstuer: Konflikt mit Satz",
    v == tb.CONFLICT and "Einrichtungst" in note, (v, note))
+FLAKY = {"n": 2}
+real_fake = m.subprocess.run
+
+
+def starting_run(cmd, input=None, capture_output=True, text=True, timeout=None):
+    if FLAKY["n"] > 0:
+        FLAKY["n"] -= 1
+
+        class R:
+            stdout = json.dumps({"status": 502, "body": ""})
+            returncode = 0
+        return R()
+    return real_fake(cmd, input=input, capture_output=capture_output, text=text, timeout=timeout)
+
+
+m.subprocess.run = starting_run
+SLEPT = []
+m.time.sleep = lambda s: SLEPT.append(s)
+v, note = d.check("app.setup", step, {})
+ok("ein startender Container (502) wird abgewartet, nicht als Fehler gemeldet",
+   FLAKY["n"] == 0 and len(SLEPT) == 2 and v == tb.CONFLICT, (v, note, SLEPT))
+m.subprocess.run = real_fake
 wait = {"text": "Zugangsdaten eintragen", "done_when": "setup.ready",
         "instance": "kit1-modelle", "kind": "supplier", "item": "anthropic"}
 v, note = d.check("manual", wait, {})

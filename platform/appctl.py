@@ -9898,6 +9898,11 @@ print(json.dumps({"status": status, "body": raw.decode("utf-8", "replace")}))
 """
 
 
+SETUP_WAIT = 90            # seconds a starting container is waited for
+SETUP_RETRY_SECONDS = 3
+SETUP_STARTING = (0, 502, 503, 504)   # no answer yet, not a refusal
+
+
 def setup_call(key, inst, method, body=None, query="", actor="root"):
     """(doc, refusal) for one call to instance `key`'s setup door."""
     if not setup_door(inst):
@@ -9910,14 +9915,23 @@ def setup_call(key, inst, method, body=None, query="", actor="root"):
         f"?{query}" if query else "")
     q = json.dumps({"url": url, "method": method, "body": body, "key": skey,
                     "actor": str(actor or "root")[:120]})
-    try:
-        r = subprocess.run(["docker", "exec", "-i", IDENTITY_CONTAINER,
-                            "python3", "-c", SETUP_CALL_SCRIPT],
-                           input=q, capture_output=True, text=True, timeout=90)
-        got = json.loads(r.stdout or "{}")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        return None, f"die Einrichtungstür war nicht erreichbar ({type(exc).__name__})"
-    status, raw = got.get("status", 0), got.get("body", "")
+    # Measured on oaapx01 (kit1, 2026-11-19): app.config and
+    # destination.ensure recreate the container, and the next step met it
+    # still starting -- the gateway answered 502. A starting container is
+    # waited for (SETUP_WAIT seconds), never a refusal of the app itself.
+    deadline = time.time() + SETUP_WAIT
+    while True:
+        try:
+            r = subprocess.run(["docker", "exec", "-i", IDENTITY_CONTAINER,
+                                "python3", "-c", SETUP_CALL_SCRIPT],
+                               input=q, capture_output=True, text=True, timeout=90)
+            got = json.loads(r.stdout or "{}")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return None, f"die Einrichtungstür war nicht erreichbar ({type(exc).__name__})"
+        status, raw = got.get("status", 0), got.get("body", "")
+        if status not in SETUP_STARTING or time.time() >= deadline:
+            break
+        time.sleep(SETUP_RETRY_SECONDS)
     if status != 200:
         return None, (f"die Einrichtungstür von '{key}' antwortete "
                       f"{status or 'nicht'}: {_brief(raw, 2)}")
