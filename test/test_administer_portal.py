@@ -209,5 +209,50 @@ r = post(dict(FORM, confirm_administer="rollen-rechte"), "server_admin")
 ok("server_admin schickt sie, benannt nach der App",
    SENT[-1].get("confirm_administer") == "rollen-rechte", SENT[-1])
 
+print("\n=== ein UPDATE: die Frage trägt die Instanz zurück (0.1.320) ===")
+# Der Befund (20.11., pxx tools auf oaapx01): `{{ envelope.update }}` ist in
+# Jinja die Methode dict.update, nicht der Schlüssel -- das versteckte Feld
+# trug "<built-in method update ...>", und der Haken endete in "Diese
+# Instanz gibt es nicht (mehr)". Dieselbe Falle bei `need.update`. Hier
+# wird das Formular gerendert und genau so zurückgeschickt wie im Browser.
+import html as _html  # noqa: E402
+import re as _re  # noqa: E402
+
+portal.visible_instances = lambda: {"pxx-rechte": {"app_id": "rollen-rechte", "name": "rechte"}}
+
+
+def form_of(body, anchor):
+    part = body[body.index(anchor):]
+    part = part[:part.index("</form>")]
+    return {k: _html.unescape(v)
+            for k, v in _re.findall(r'name="([a-z_]+)"\s+value="([^"]*)"', part)}
+
+
+ANSWER = {"ok": False, "message": "refused: widens", "needs": "confirm_envelope",
+          "fingerprint": "0123456789abcdef", "notes": ["routes accept roles: /me (user)"]}
+UPD = {"app_id": "rollen-rechte", "source_id": "katalog", "update": "pxx-rechte"}
+r = post(UPD, "server_admin")
+body = r.get_data(as_text=True)
+ok("die Erweiterung wird zur Frage mit Haken", 'id="rahmen"' in body and "/me (user)" in body,
+   (r.status_code, body[-800:]))
+back = form_of(body, 'id="rahmen"') if 'id="rahmen"' in body else {}
+ok("das Formular trägt die Instanz, nicht eine Methode",
+   back.get("update") == "pxx-rechte", back)
+ANSWER = {"ok": True, "message": "deployed", "version": "0.2.1"}
+r = post(dict(back, confirm_envelope="0123456789abcdef"), "server_admin")
+ok("der Haken geht als Update derselben Instanz in den Spool",
+   SENT[-1].get("update") == "pxx-rechte"
+   and SENT[-1].get("confirm_envelope") == "0123456789abcdef", SENT[-1])
+from urllib.parse import unquote as _unquote  # noqa: E402
+ok("und nicht als „gibt es nicht (mehr)“",
+   "gibt es nicht" not in _unquote(r.headers.get("Location", "")), r.headers.get("Location"))
+
+ROLE["r"] = "server_admin"
+body = c.get("/store/katalog/rollen-rechte?need=administer&upd=pxx-rechte",
+             headers={"X-OAAP-User": "x"}).get_data(as_text=True)
+m = _re.search(r'<input type="hidden" name="update" value="([^"]*)">', body)
+ok("die Frage nach der Rechteverwaltung trägt die Instanz eines Updates",
+   bool(m) and _html.unescape(m.group(1)) == "pxx-rechte", m.group(0) if m else body[-1500:])
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)

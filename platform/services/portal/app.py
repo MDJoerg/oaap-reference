@@ -1982,7 +1982,7 @@ STORE_APP_BODY = """
                   this.querySelector('button').textContent='Wird installiert …'">
     <input type="hidden" name="app_id" value="{{ a.id }}">
     <input type="hidden" name="source_id" value="{{ a.source.id }}">
-    {% if need.update %}<input type="hidden" name="update" value="{{ need.update }}">{% endif %}
+    {% if need['update'] %}<input type="hidden" name="update" value="{{ need['update'] }}">{% endif %}
     {% if need.new_name %}<input type="hidden" name="new" value="1">
     <input type="hidden" name="name" value="{{ need.new_name }}">{% endif %}
     {% if need.channel %}<input type="hidden" name="channel" value="test">{% endif %}
@@ -2050,7 +2050,9 @@ STORE_APP_BODY = """
                   this.querySelector('button').textContent='Wird aktualisiert …'">
     <input type="hidden" name="app_id" value="{{ a.id }}">
     <input type="hidden" name="source_id" value="{{ a.source.id }}">
-    <input type="hidden" name="update" value="{{ envelope.update }}">
+    {# ['update'], nicht .update: bei einem dict ist .update in Jinja die Methode
+       (0.1.320, test_administer_portal). Ebenso need['update'] oben. #}
+    <input type="hidden" name="update" value="{{ envelope['update'] }}">
     {% if envelope.confirm_source %}<input type="hidden" name="confirm_source" value="{{ envelope.confirm_source }}">{% endif %}
     {% if envelope.confirm_administer %}<input type="hidden" name="confirm_administer" value="{{ envelope.confirm_administer }}">{% endif %}
     <label class="checkline"><input type="checkbox" name="confirm_envelope"
