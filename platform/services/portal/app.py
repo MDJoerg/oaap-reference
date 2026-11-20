@@ -46,6 +46,8 @@ import relay_view
 import twin_view
 import metrics_view
 import nav_view
+import tenant_health_view as thv
+import traffic  # noqa: E402  (the hour per host, for the tenant health page)
 # The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
@@ -183,6 +185,8 @@ STYLE = """
   .nodename{margin-left:auto;font-size:.85rem;opacity:.85;letter-spacing:.03em;
        white-space:nowrap}
   .nodename + .usermenu{margin-left:.6rem}
+  .tenantmenu + .usermenu{margin-left:.6rem}
+  .tenantmenu .menu{max-height:70vh;overflow-y:auto}
   .usermenu summary{list-style:none;cursor:pointer;display:flex;align-items:center;
        gap:.5rem;min-height:44px;padding:0 .9rem;border-radius:.4rem;
        background:rgba(127,127,127,.22);border:1px solid rgba(127,127,127,.45)}
@@ -311,6 +315,17 @@ STYLE = """
   .tile h3{margin:0;font-size:1.02rem;flex:1}
   .tile p{color:var(--oaap-muted);font-size:.9rem;margin:.5rem 0}
   .tile .meta{color:var(--oaap-muted);font-size:.8rem}
+  .apptile{position:relative;display:flex;flex-direction:column;min-height:9.5rem}
+  .apptile .tilecover{position:absolute;inset:0;border-radius:inherit;z-index:1}
+  .apptile .tilecover:focus-visible{outline:2px solid var(--oaap-blue-600);outline-offset:2px}
+  .apptile p.desc{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;
+       line-clamp:3;overflow:hidden;margin-bottom:.2rem}
+  .apptile.open p.desc{display:block;-webkit-line-clamp:unset;line-clamp:none}
+  .apptile .more{position:relative;z-index:2;align-self:flex-start;background:none;border:0;
+       padding:0;margin:0 0 .4rem;color:var(--oaap-blue-600);font-size:.8rem;cursor:pointer;
+       min-height:0;box-shadow:none}
+  .apptile .meta{margin-top:auto}
+  .apptile:has(.tilecover:hover){border-color:var(--oaap-blue-600);box-shadow:0 2px 8px rgba(37,99,235,.18)}
   .hexdot{flex:none}
   .badge{font-size:.72rem;padding:.15rem .55rem;border-radius:1rem;
        background:var(--oaap-blue-100);color:var(--oaap-ink);white-space:nowrap}
@@ -416,6 +431,23 @@ LAYOUT = STYLE + """
     {% endif %}
   </a>
   {% if node_name %}<span class="nodename" title="Name im Verbund">{{ node_name }}</span>{% endif %}
+  {# Jörg 20.11.: der server_admin wechselt den Mandanten über die Kopfzeile und
+     kommt von dort auch auf die Adresse des Knotens zurück. Nur Verweise auf
+     Adressen, die es ohnehin gibt -- jede Seite dort prüft selbst. #}
+  {% if tenant_switch %}
+  <details class="usermenu tenantmenu">
+    <summary title="Mandant wechseln"><span class="who">{{ tenant_switch.current }}</span>
+      <span aria-hidden="true">&#9662;</span></summary>
+    <div class="menu">
+      <div class="rolesline">Wechseln zu</div>
+      {% for t in tenant_switch.targets %}
+      <a href="{{ t.url }}"{% if t.here %} aria-current="page"{% endif %}>
+        {% if t.here %}&#10003;&nbsp;{% endif %}{{ t.title }}{% if t.label %}
+        <span class="muted">&nbsp;{{ t.label }}</span>{% endif %}</a>
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
   <details class="usermenu">
     <summary><span class="who">{{ user }}</span> <span aria-hidden="true">&#9662;</span></summary>
     <div class="menu">
@@ -539,7 +571,13 @@ DASHBOARD_BODY = """
        als Ausgangspunkt offen — der "Rückweg" ist der Tab-Wechsel,
        ohne Eingriff in fremde App-Seiten. Direkteinstieg per URL
        bleibt unberührt. #}
-    <a class="tile" href="{{ t.url }}" target="_blank" rel="noopener">
+    {# Jörg 20.11.: gleich hohe Kacheln -- die Beschreibung steht in drei
+       Zeilen, „mehr“ blendet sie auf, der Mauszeiger zeigt sie ganz. Darum
+       ist die Kachel kein <a> mehr (ein Knopf in einem Link ist keiner):
+       der Link liegt als Decke darüber, der Knopf über der Decke. #}
+    <div class="tile apptile">
+      <a class="tilecover" href="{{ t.url }}" target="_blank" rel="noopener"
+         aria-label="{{ t.name }} öffnen"></a>
       <div class="top">
         <svg class="hexdot" viewBox="0 0 100 100" width="20" height="20" aria-hidden="true">
           <polygon points="50,4 90,27 90,73 50,96 10,73 10,27" fill="none"
@@ -552,9 +590,10 @@ DASHBOARD_BODY = """
         {% if t.rehearsal %}<span class="badge todo">{{ t.rehearsal.badge }} ·
            {{ t.rehearsal.left_short }}</span>{% endif %}
       </div>
-      {% if t.description %}<p>{{ t.description }}</p>{% endif %}
+      {% if t.description %}<p class="desc" title="{{ t.description }}">{{ t.description }}</p>
+      <button type="button" class="more" hidden>mehr</button>{% endif %}
       <span class="meta">Version {{ t.version }}</span>
-    </a>
+    </div>
     {% endfor %}
   </div>
   {% endfor %}
@@ -563,6 +602,14 @@ DASHBOARD_BODY = """
   Ihre Rollen ist keine sichtbar. Apps installiert die Administration mit
   <code>oaap app install</code>.</p></div>
 {% endif %}
+<script>
+(function(){document.querySelectorAll('.apptile').forEach(function(t){
+  var p=t.querySelector('p.desc'),b=t.querySelector('button.more');
+  if(!p||!b)return;
+  if(p.scrollHeight>p.clientHeight+1)b.hidden=false;
+  b.addEventListener('click',function(){var o=t.classList.toggle('open');
+    b.textContent=o?'weniger':'mehr';});});})();
+</script>
 {% if hidden_count %}
 <p class="muted">{{ hidden_count }}
    {{ "weitere Instanz läuft" if hidden_count == 1 else "weitere Instanzen laufen" }}
@@ -1197,6 +1244,68 @@ KEY_SHOWN_BODY = """
   <p class="muted">Verloren? Stelle einen neuen aus und entziehe diesen —
      das ist der ganze Weg, es gibt kein Nachreichen.</p>
   <a class="btn" href="/keys">Fertig</a>
+</div>
+"""
+
+TENANT_HEALTH_BODY = """
+<div class="pagehead"><h1>Gesundheit · {{ tenant }}</h1>
+  {% if node_url %}<span><a class="rowaction" href="{{ node_url }}">Gesundheit des Knotens</a></span>{% endif %}</div>
+<p class="muted">Nur was diesen Mandanten angeht: seine Instanzen, ihre Daten und ihr
+   Verkehr. Knotenweite Werte (CPU, Speicher, Platte des Rechners) sieht der
+   Server-Admin an der Adresse des Knotens.</p>
+<div class="facts card">
+  <div><span class="k">Instanzen</span><span class="v">
+    <span class="dot {{ 'ok' if sum.ok == sum.total else 'warn' }}"></span>{{ sum.ok }} von {{ sum.total }} gesund</span></div>
+  <div><span class="k">Daten des Mandanten</span><span class="v">{{ size_h(trend.now) }}
+    {% if trend.day %}<span class="muted">(gemessen {{ trend.day }})</span>{% endif %}</span></div>
+  <div><span class="k">Veränderung</span><span class="v">7 Tage {{ trend.d7 }} · 30 Tage {{ trend.d30 }}</span></div>
+  <div><span class="k">Anfragen, letzte Stunde</span><span class="v">
+    {% if sum.req is none %}<span class="muted">keine gezählt</span>{% else %}{{ sum.req }}{% if sum.err %}
+    <span class="badge todo">{{ sum.err }} Fehler (5xx)</span>{% endif %}{% endif %}</span></div>
+  <div><span class="k">Neustarts</span><span class="v">{{ sum.restarts }}{% if sum.oom %}
+    <span class="badge todo">{{ sum.oom }} × Speicher voll</span>{% endif %}</span></div>
+  <div><span class="k">Sicherung</span><span class="v">{{ bk.word }}{% if bk.last %} ·
+    zuletzt {{ bk.last.when }}{% if bk.last.size %}, {{ bk.last.size }}{% endif %}{% elif bk.node_last %} ·
+    Knoten zuletzt {{ bk.node_last.when }}{% endif %}</span></div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Datengröße im Verlauf</h2>
+  {{ chart }}
+  <p class="muted">Alle Daten des Mandanten auf diesem Knoten, einmal am Tag gemessen
+     (dieselbe Zahl wie im Wochenbericht), die letzten 90 Messtage.</p>
+</div>
+
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Instanzen</h2>
+{% if rows %}
+<table>
+  <tr><th>Instanz</th><th>Status</th><th>App</th><th>Daten</th><th>Anfragen/h</th>
+      <th>Ø Dauer</th><th>Raus/h</th><th>CPU jetzt</th><th>Speicher jetzt</th><th>Neustarts</th></tr>
+  {% for r in rows %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/instances/{{ r.key }}">{{ r.name }}</a></td>
+    <td title="{{ r.detail }}"><span class="dot {{ r.state }}"></span>{{ r.label }}</td>
+    <td>{{ r.app_name }} <span class="muted">v{{ r.version }}</span>
+        {% if r.channel == 'test' %}<span class="badge test">Test</span>{% endif %}</td>
+    <td>{{ r.data }}</td>
+    <td>{% if r.req is none %}<span class="muted">—</span>{% else %}{{ r.req }}{% if r.err %}
+        <span class="badge todo" title="Antworten 5xx">{{ r.err }}</span>{% endif %}{% endif %}</td>
+    <td>{% if r.ms is none %}<span class="muted">—</span>{% else %}{{ r.ms }} ms{% endif %}</td>
+    <td>{{ r.out }}</td>
+    <td>{% if r.cpu is none %}<span class="muted">—</span>{% else %}{{ r.cpu }} %{% endif %}</td>
+    <td>{% if r.mem is none %}<span class="muted">—</span>{% else %}{{ r.mem }} MB{% endif %}</td>
+    <td>{{ r.restarts }}{% if r.oom %} <span class="badge todo">Speicher voll</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">Dieser Mandant hat keine Instanzen.</p>{% endif %}
+<p class="muted">Anfragen, Dauer und „Raus“: die letzte Stunde über die öffentlichen
+   Adressen{% if traffic_at %}, Stand {{ traffic_at }} UTC{% endif %} — Aufrufe über das LAN zählt der
+   Knoten nicht. Daten: Verzeichnis der Produktiv-Instanz, aufgefrischt nach jeder
+   Aktion an ihr. CPU und Speicher: nur, wenn die Instanz gerade zu den sechs
+   stärksten Containern des Knotens gehört; einen Verlauf je Instanz misst der
+   Knoten noch nicht.</p>
 </div>
 """
 
@@ -2732,7 +2841,11 @@ INSTANCES_LIST_BODY = """
   <tr><th>Instanz</th><th>Status</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Pflege</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
-    <td><a class="rowaction" href="/instances/{{ i.key }}">{{ i.name }}</a></td>
+    {# Jörg 20.11.: vorn die Seite der Instanz (neues Fenster), hinten das Bearbeiten --
+       vorher führten beide auf dieselbe Objektseite. #}
+    <td>{% if i.url %}<a class="rowaction" href="{{ i.url }}" target="_blank" rel="noopener"
+           title="{{ i.url }} in neuem Fenster öffnen">{{ i.name }} <span aria-hidden="true">&#8599;</span></a>
+        {% else %}{{ i.name }}{% endif %}</td>
     <td title="{{ i.status.detail }}"><span class="dot {{ i.status.state }}"></span>{{ i.status.label }}
         {% if i.maintenance %}<span class="badge todo">Wartung</span>{% endif %}</td>
     <td>{{ i.app_name }} <span class="muted">v{{ i.version }}</span></td>
@@ -3125,7 +3238,7 @@ INSTANCE_EDIT_BODY = """
   <p class="sub">{{ i.app_name }} {{ i.version }} · Kennung <code>{{ i.app_id }}</code></p>
   <div class="facts">
     <div><span class="k">Adresse</span><span class="v">
-      {% if i.address_url %}<a href="{{ i.address_url }}">{{ i.address_host }}</a>
+      {% if i.address_url %}<a href="{{ i.address_url }}" target="_blank" rel="noopener">{{ i.address_host }} <span aria-hidden="true">&#8599;</span></a>
       {% else %}— <span class="muted">(kein externer Name)</span>{% endif %}</span></div>
     <div><span class="k">Sichtbar für</span><span class="v">{{ i.visibility_label }}</span></div>
     <div><span class="k">Kachel</span><span class="v">{{ "im Launchpad" if i.tile_visible else "ausgeblendet" }}</span></div>
@@ -4655,6 +4768,29 @@ def _has_cohorts():
     return _cohort_scope()[0] is not None
 
 
+def tenant_switch(at):
+    """The header's tenant menu for a server_admin (Jörg 20.11.): the node's
+    own address first, then every tenant's place, the current one ticked.
+
+    None where it would point nowhere: no external name (a LAN-only node has
+    no tenant addresses) or a single tenant. The default tenant's place IS
+    the node's address (place.host_place), so it is the first entry."""
+    ext = external_host()
+    tenants = load_tenants()
+    if not ext or len(tenants) < 2:
+        return None
+    default = default_tenant_id()
+    targets = [{"title": "Knoten", "label": ext, "url": f"https://{ext}/", "here": not at}]
+    for tid, t in sorted(tenants.items(), key=lambda kv: (kv[1].get("name") or kv[1].get("label") or "").lower()):
+        label = t.get("label") or ""
+        if not label or tid == default:
+            continue
+        targets.append({"title": t.get("name") or label, "label": label,
+                        "url": f"https://{label}.{ext}/", "here": tid == at})
+    here = next((x for x in targets if x["here"]), targets[0])
+    return {"current": "Knoten" if here is targets[0] else here["label"], "targets": targets}
+
+
 def page(body_template, title, active, status=200, **ctx):
     body = render_template_string(body_template, **ctx)
     roles = request.headers.get("X-OAAP-Roles", "")
@@ -4679,7 +4815,8 @@ def page(body_template, title, active, status=200, **ctx):
         # administrator or a tenant's. On a single-tenant node nobody
         # holds tenant_admin, so this reads exactly as before.
         "is_user_admin": bool(caller & {"server_admin", "tenant_admin"}),
-        "can_health": bool(caller & {"server_admin", "support"}),
+        # Jörg 20.11.: a tenant_admin gets the health of THEIR tenant
+        "can_health": bool(caller & {"server_admin", "support", "tenant_admin"}),
         # The catalogue is for whoever may install into a tenant
         # (RFC-0022 §4); the SOURCES stay the node operator's
         # (oaap.core.portal 2.6). Two rights, therefore two flags.
@@ -4707,11 +4844,12 @@ def page(body_template, title, active, status=200, **ctx):
     # page title -- for the node's operators only: it is how WE call the
     # node, not known outside, so a tenant's people do not see it.
     node_name = node_identity_view()["alias"] if caller & {"server_admin", "support"} else ""
+    switch = tenant_switch(at) if "server_admin" in caller and multi else None
     return render_template_string(
         LAYOUT,
         nav_groups=groups, show_side=nav_view.show_side(groups), jumps=jumps,
         title=title, active=active, body=Markup(body), logo=LOGO_SVG,
-        node_name=node_name, place=face, at_place=bool(at), show_face=show_face,
+        node_name=node_name, tenant_switch=switch, place=face, at_place=bool(at), show_face=show_face,
         theme_style=Markup(place.theme_style(face) if show_face else ""),
         user=request.headers.get("X-OAAP-User", "?"), roles=roles or "?",
         is_server_admin="server_admin" in caller,
@@ -7091,10 +7229,78 @@ def health_verlauf():
     return metrics_view.block(METRICS_DIR, request.args.get("w", ""))
 
 
+def _health_scope():
+    """Whose health this request asks for: (tenant_id or None, refusal or None).
+
+    Jörg 20.11.: in a tenant's context the page is THAT tenant's -- at a
+    tenant's address for everyone (a server_admin included, the same rule
+    RFC-0042 T2 gives the place), and for a tenant_admin everywhere, since
+    their own tenant is the only one they have. The node page stays the
+    operator's at the node's own address."""
+    roles = caller_roles()
+    at = request_place()[0]
+    role, mine = caller_scope()
+    if at:
+        if roles & {"server_admin", "support"} or (role == "tenant_admin" and mine == at):
+            return at, None
+        return None, ("Zugriff verweigert: die Gesundheit dieses Mandanten sieht sein "
+                      "Mandanten-Admin oder der Server-Admin.", 403)
+    if roles & {"server_admin", "support"}:
+        return None, None
+    if role == "tenant_admin" and mine:
+        return mine, None
+    return None, ("Zugriff verweigert: Gesundheit erfordert die Rolle server_admin, "
+                  "support oder tenant_admin.", 403)
+
+
+TENANT_LEDGER_DIR = "/apps-registry/report-ledger"
+
+
+def _tenant_hosts(key, inst):
+    return [h for h in (inst.get("address"), instance_auto_host(key, inst),
+                        *(inst.get("aliases") or [])) if h]
+
+
+def tenant_health(tid):
+    """The health page of ONE tenant (tenant_health_view says what and why)."""
+    insts = {k: i for k, i in load_instances().items()
+             if (resolve_tenant(i.get("tenant")) or "") == tid}
+    probed = fleet_view.probe_all(
+        [(n, i) for n, i in insts.items() if not _sleep_status(i)], _instance_probe)
+    probed.update({n: _sleep_status(i) for n, i in insts.items() if _sleep_status(i)})
+    state = (_read_json(STATE_VIEW) or {}).get("instances") or {}
+    sizes = _rehearsal_options().get("instances") or {}
+    snap = traffic.snapshot(METRICS_DIR)
+    rows = thv.instance_rows(insts, probed, state, sizes, snap, _tenant_hosts)
+    series = thv.tenant_bytes_series(
+        report.read_ledger(os.path.join(TENANT_LEDGER_DIR, tid + ".jsonl")))
+    at = snap.get("at")
+    return page(TENANT_HEALTH_BODY, "Gesundheit", "health",
+                tenant=tenant_name(tid) or tenant_label(tid), rows=rows,
+                sum=thv.summary(rows), trend=thv.trend(series),
+                size_h=thv.size, chart=Markup(thv.chart(series)),
+                bk=_tenant_backup_facts(tid),
+                traffic_at=(datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%d %H:%M")
+                            if isinstance(at, (int, float)) else ""),
+                node_url=_node_health_url())
+
+
+def _node_health_url():
+    """The way back to the node's own health page -- a server_admin's, and
+    only from a tenant's address (at the node's address they are on it)."""
+    ext = external_host()
+    if not ext or "server_admin" not in caller_roles() or not request_place()[0]:
+        return ""
+    return f"https://{ext}/health"
+
+
 @app.get("/health")
 def health():
-    if not caller_roles() & {"server_admin", "support"}:
-        return "Zugriff verweigert: Gesundheit erfordert die Rolle server_admin oder support.", 403
+    tid, refusal = _health_scope()
+    if refusal:
+        return refusal
+    if tid:
+        return tenant_health(tid)
 
     core = _core_states()
     # The event relay (RFC-0032 §1.5, relay_view.py) -- health page only,
@@ -7830,6 +8036,13 @@ def _deploy_auth(name, allow_creation=False):
             return {}, None
     _deploy_failed(key)
     return DENIED, 403
+
+
+def _site_url(name, inst):
+    """Where the instance itself answers, as the object page names it: its own
+    name, else the automatic one, else the LAN port (`_entry_url`)."""
+    address = (inst or {}).get("address", "")
+    return f"https://{address}/" if address else _entry_url(name, inst)
 
 
 def _entry_url(name, inst):
@@ -9165,6 +9378,7 @@ def instances_list():
         st = _sleep_status(inst) or probed.get(name) or ("unknown", "Unbekannt", "")
         rows.append({
             "key": name, "name": local_name(name, inst),
+            "url": _site_url(name, inst),
             "status": {"state": st[0], "label": st[1], "detail": st[2]},
             "maintenance": bool(inst.get("maintenance")),
             "app_name": inst.get("app_name", name),

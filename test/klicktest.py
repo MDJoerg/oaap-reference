@@ -232,7 +232,7 @@ ok("sie warnt, dass Verstecken niemanden aussperrt",
 # Kacheln zaehlen statt Namen suchen: eindeutig, auch wenn zwei
 # Instanzen dieselbe App fahren.
 def tiles_now():
-    return get("/")[1].count('class="tile"')
+    return get("/")[1].count('class="tile apptile"')
 
 
 before = tiles_now()
