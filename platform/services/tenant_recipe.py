@@ -18,8 +18,15 @@ Rules that carry the design:
   (`install: true`); the recipe itself never carries an app.install step.
 * A run is preceded by a preview of the same values; a conflict in the
   preview stops the run before anything happens (D6).
+* Stage 2 (RFC-0109 sections 4, 5): a value can be CHOSEN from what an app
+  has (`setup_item`, read through the app's setup door), a light can follow
+  the chosen item (`light`), and the operator RELEASES a recipe for a
+  tenant (`recipe:<id>@<major>` in the tenant's `tenant_admin_may`), after
+  which that tenant's tenant_admin runs it -- own tenant, filled steps
+  inside the scope of section 5.
 """
 import json
+import re
 
 import tenant_build as tb
 
@@ -30,7 +37,14 @@ TOP_KEYS = ("recipe", "id", "version", "title", "description", "needs",
 # makes or shapes the tenant; app.install comes only from `needs`
 STEP_TYPES = ("app.config", "destination.ensure", "app.setup", "manual",
               "backup.check")
-PARAM_KINDS = ("text", "word", "bool", "color")
+PARAM_KINDS = ("text", "word", "bool", "color", "setup_item", "light")
+LIGHTS = ("green", "yellow", "red")
+LIGHT_RANK = {"green": 0, "yellow": 1, "red": 2}
+LIGHT_DE = {"green": "grün", "yellow": "gelb", "red": "rot"}
+SETUP_ITEM_MAX = 128
+# a release in the tenant record: the recipe's id and its MAJOR version --
+# a new major version needs a new release (section 5)
+RELEASE_RE = re.compile(r"^recipe:([a-z0-9][a-z0-9-]{0,62})@([0-9]{1,4})$")
 RESERVED = ("label", "tenant", tb.SELECTION_REF)
 KEY_SUFFIX = "_key"
 NEED_KEYS = ("app", "label", "install", "name")
@@ -104,6 +118,25 @@ def recipe_problems(doc):
         if not isinstance(spec, dict) or spec.get("kind") not in PARAM_KINDS:
             out.append(f"parameter '{name}' needs a kind of "
                        + "/".join(PARAM_KINDS))
+            continue
+        if spec["kind"] == "setup_item":
+            if spec.get("need") not in needs:
+                out.append(f"parameter '{name}': 'need' names one of the recipe's "
+                           "needs (the app whose setup door lists the choices)")
+            if not tb.WORD_RE.match(str(spec.get("item_kind") or "")):
+                out.append(f"parameter '{name}': 'item_kind' is the kind the setup "
+                           "door lists (e.g. alias)")
+        elif spec["kind"] == "light":
+            src = spec.get("from")
+            if src is not None and (src not in params or not isinstance(params[src], dict)
+                                    or params[src].get("kind") != "setup_item"):
+                out.append(f"parameter '{name}': 'from' names a parameter of kind "
+                           "setup_item")
+            if "default" in spec and spec["default"] not in LIGHTS:
+                out.append(f"parameter '{name}': the default is green, yellow or red")
+        elif "need" in spec or "item_kind" in spec or "from" in spec:
+            out.append(f"parameter '{name}': 'need', 'item_kind' and 'from' belong "
+                       "to the kinds setup_item and light")
 
     steps = doc.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -143,10 +176,25 @@ def as_profile(doc):
         if isinstance(spec, dict) and spec.get("install") is True:
             steps.append({"id": _install_step_id(n), "type": "app.install",
                           "app": spec.get("app"), "name": "{" + n + "}"})
-    params.update(doc.get("params") or {})
+    for name, spec in (doc.get("params") or {}).items():
+        params[name] = _engine_param(spec)
     return {"profile": tb.PROFILE_FORMAT, "id": doc.get("id"),
             "version": doc.get("version", ""), "title": doc.get("title", ""),
             "params": params, "steps": steps + list(doc.get("steps") or [])}
+
+
+def _engine_param(spec):
+    """A recipe parameter as the engine judges it. A chosen item is a text
+    (an id of the app, judged against the app's own list before the run);
+    a light is a word, judged against the three lights there too."""
+    if not isinstance(spec, dict) or spec.get("kind") not in ("setup_item", "light"):
+        return spec
+    out = {k: v for k, v in spec.items() if k in ("label", "default", "required")}
+    if spec["kind"] == "setup_item":
+        out.update(kind="text", max=SETUP_ITEM_MAX)
+    else:
+        out["kind"] = "word"
+    return out
 
 
 def read_recipe_file(path):
@@ -226,6 +274,136 @@ def resolve_needs(doc, instances, given, planned_key):
         if n not in (doc.get("needs") or {}):
             problems.append(f"'{n}' ist keine benötigte App dieses Rezepts")
     return values, problems, chosen
+
+
+# ------------------------------------------ values from an app (section 4)
+
+def item_params(doc):
+    """[(name, spec)] of the parameters chosen from an app's setup door."""
+    return [(n, sp) for n, sp in ((doc or {}).get("params") or {}).items()
+            if isinstance(sp, dict) and sp.get("kind") == "setup_item"]
+
+
+def judge_choices(doc, given, lists):
+    """-> (values, problems, choices). Fills and judges the parameters of
+    kind setup_item and light (RFC-0109 section 4); the rest passes.
+
+    `lists`: {param: [items] or a sentence why the door gave no list}. An
+    item is {"id", "title", "light"?, "light_min"?} as the door says it.
+
+    * setup_item: a given id must be in the list; nothing given -> the
+      default when it is in the list (or the only item), else the person
+      must choose. When the door gave no list (an older app), the given
+      value or the default stands as in stage 1, and the choice says so.
+    * light with `from`: nothing given -> the chosen item's light (the
+      worst it can reach, the honest ceiling). A ceiling stricter than the
+      best the item can reach is refused: the chat could never use it.
+    """
+    values, problems, choices = dict(given or {}), [], {}
+    params = (doc or {}).get("params") or {}
+    picked = {}
+    for name, spec in item_params(doc):
+        got = lists.get(name)
+        val = str(values.get(name) or "").strip()
+        ch = {"need": spec.get("need"), "item_kind": spec.get("item_kind"),
+              "label": spec.get("label") or name, "items": [], "note": ""}
+        if not isinstance(got, list):
+            ch["note"] = str(got or "keine Liste")
+            val = val or str(spec.get("default") or "")
+            if val:
+                values[name] = val
+            choices[name] = dict(ch, value=val)
+            continue
+        items = [i for i in got if isinstance(i, dict) and isinstance(i.get("id"), str)]
+        ch["items"] = [{k: i[k] for k in ("id", "title", "light", "light_min") if k in i}
+                       for i in items]
+        ids = [i["id"] for i in items]
+        if val and val not in ids:
+            problems.append(f"'{val}' gibt es bei {spec.get('need')} nicht als "
+                            f"{spec.get('item_kind')}"
+                            + (f" (es gibt: {', '.join(ids[:12])})" if ids else
+                               " (dort gibt es noch keinen)"))
+            val = ""
+        elif not val:
+            dft = str(spec.get("default") or "")
+            if dft in ids:
+                val = dft
+            elif len(ids) == 1:
+                val = ids[0]
+            else:
+                problems.append(f"bitte wählen: {spec.get('label') or name}"
+                                + ("" if ids else f" -- bei {spec.get('need')} gibt es "
+                                   f"noch keinen {spec.get('item_kind')}"))
+        if val:
+            values[name] = val
+            picked[name] = next(i for i in items if i["id"] == val)
+        else:
+            values.pop(name, None)
+        choices[name] = dict(ch, value=val)
+    for name, spec in params.items():
+        if not isinstance(spec, dict) or spec.get("kind") != "light":
+            continue
+        item = picked.get(spec.get("from") or "")
+        val = str(values.get(name) or "").strip()
+        if not val:
+            val = (item or {}).get("light") or spec.get("default") or ""
+        ch = {"light": True, "from": spec.get("from") or "",
+              "label": spec.get("label") or name,
+              "suggested": (item or {}).get("light") or ""}
+        if val not in LIGHTS:
+            problems.append(f"{spec.get('label') or name}: green, yellow oder red")
+            values.pop(name, None)
+            choices[name] = dict(ch, value="")
+            continue
+        floor = (item or {}).get("light_min") or (item or {}).get("light")
+        if floor in LIGHTS and LIGHT_RANK[val] < LIGHT_RANK[floor]:
+            problems.append(
+                f"{spec.get('label') or name}: {LIGHT_DE[val]} ist strenger als alles, "
+                f"was '{values.get(spec.get('from'))}' erreichen kann ({LIGHT_DE[floor]}) "
+                "-- der Chat könnte es nie benutzen")
+        values[name] = val
+        choices[name] = dict(ch, value=val)
+    return values, problems, choices
+
+
+# ------------------------------------------------- releases (section 5)
+
+def major_of(version):
+    m = re.match(r"^([0-9]{1,4})\.", str(version or ""))
+    return int(m.group(1)) if m else 0
+
+
+def release_word(rid, version_or_major):
+    major = (version_or_major if isinstance(version_or_major, int)
+             else major_of(version_or_major))
+    return f"recipe:{rid}@{major}"
+
+
+def released(may, rid, version):
+    """Is this recipe, in this major version, released in `may` (the
+    tenant's `tenant_admin_may` list)?"""
+    return release_word(rid, version) in (may or [])
+
+
+def releases_of(may, rid=None):
+    """[(id, major)] of the recipe releases in a `tenant_admin_may` list."""
+    out = []
+    for w in may or []:
+        m = RELEASE_RE.match(str(w))
+        if m and (rid is None or m.group(1) == rid):
+            out.append((m.group(1), int(m.group(2))))
+    return out
+
+
+def filled_plan(profile, values):
+    """[(id, type, args)] of the active steps AFTER the placeholders are
+    filled -- what the tenant_admin scope is judged on (S5)."""
+    out = []
+    for st in tb.steps_of(profile, values):
+        if not tb.step_active(st, values):
+            continue
+        out.append((st["id"], st["type"], tb.render_step(st, values)))
+    return out
 
 
 # ------------------------------------------------------ the preview (D6)

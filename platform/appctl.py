@@ -2406,6 +2406,9 @@ def tenant_set_admin_may(tid, what, on, who="root", role="root"):
     and from then on only the server_admin changes them."""
     if role not in ("root", "server_admin"):
         return False, "only the server_admin moves this switch (oaap.core.tenant 1.7)"
+    if str(what).startswith("recipe:"):
+        # RFC-0109 section 5: a recipe's release lives in the same list
+        return tenant_recipe_release(tid, what, on, who=who, role=role)
     if what not in TENANT_ADMIN_MAY:
         return False, (f"there is no right '{what}' to hand over -- known: "
                        + ", ".join(sorted(TENANT_ADMIN_MAY)))
@@ -10909,7 +10912,8 @@ def job_result_fill(req, rid, ok, msg):
     same gap.
     """
     if str(req.get("action") or "") not in (
-            "cohort", "tenant-build", "tenant-request", "tenant-request-submit",
+            "cohort", "tenant-build", "tenant-recipe", "tenant-request",
+            "tenant-request-submit",
             "tenant-profile", "disk", "fleet-disclose", "fleet-pair",
             "fleet-pair-public", "assets-set"):
         return
@@ -11546,13 +11550,87 @@ def tenant_recipes():
     return out
 
 
+RECIPE_ROLES = ("root", "server_admin", "tenant_admin")
+
+
 def _recipe_role(role):
-    # Stage 1 (RFC-0109 section 10): the operator only. A tenant_admin runs
-    # a RELEASED recipe through the portal from stage 2, after
-    # tenant_recipe.tenant_admin_scope_problems has passed.
-    if role not in ("root", "server_admin"):
-        raise tenant_build.Refusal("a recipe is run by server_admin (for a "
-                                   "tenant_admin: from stage 2, once released)")
+    if role not in RECIPE_ROLES:
+        raise tenant_build.Refusal("a recipe is run by server_admin, or by the "
+                                   "tenant_admin of a tenant it is released for")
+
+
+def _recipe_tenant_gate(role, actor_tid, tid, t, doc):
+    """RFC-0109 section 5: the operator runs any recipe in any tenant; a
+    tenant_admin only in their OWN tenant (S2: judged by id, from the
+    actor's record, never from the request) and only a recipe the operator
+    released for that tenant in this major version."""
+    _recipe_role(role)
+    if role != "tenant_admin":
+        return
+    if not actor_tid or tid != actor_tid:
+        raise tenant_build.Refusal("a tenant_admin runs recipes in their own "
+                                   "tenant only")
+    if tid == default_tenant_id():
+        raise tenant_build.Refusal("the node's own tenant is the operator's")
+    if not tenant_recipe.released(t.get("tenant_admin_may"), doc.get("id"),
+                                  doc.get("version")):
+        raise tenant_build.Refusal(
+            f"the recipe '{doc.get('id')}' (version "
+            f"{tenant_build.profile_version(doc) or '?'}) is not released for "
+            f"'{t.get('label')}' -- the operator releases it (Aufbau, "
+            "Rezepte: Freigeben für)")
+
+
+def _recipe_config_secret(tid):
+    """config_is_secret(name, key) for the scope check: what the instance's
+    manifest says. A key the manifest does not declare counts as secret --
+    the scope is 'a non-secret key the manifest declares' (section 5)."""
+    insts = tenant_instances(load_registry(), tid)
+
+    def judge(name, key):
+        for k, i in insts.items():
+            if instance_name(k, i) == name:
+                for c in i.get("config") or []:
+                    if c.get("key") == key:
+                        return bool(c.get("secret"))
+                return True
+        return any(w in str(key).lower() for w in tenant_build.SECRET_WORDS)
+    return judge
+
+
+def _recipe_scope_gate(role, tid, profile, values):
+    """S5: the tenant_admin's scope, judged on the FILLED steps."""
+    if role != "tenant_admin":
+        return
+    problems = tenant_recipe.tenant_admin_scope_problems(
+        tenant_recipe.filled_plan(profile, values), _recipe_config_secret(tid))
+    if problems:
+        raise tenant_build.Refusal(
+            "this recipe has a step a tenant_admin may not run alone, nothing "
+            "was done -- ask the operator: " + "; ".join(problems[:5]))
+
+
+def _recipe_list_reader():
+    """read(instance key, item kind) -> [items] or a sentence: the app's
+    setup door, `GET ?kind=` (RFC-0109 section 4). An app without that read
+    (an older version) answers 400, and the recipe falls back to typed
+    values with a note."""
+    reg = load_registry()
+
+    def read(key, item_kind):
+        inst = (reg.get("instances") or {}).get(key)
+        if not inst:
+            return "die Instanz gibt es noch nicht (sie wird erst installiert)"
+        doc, bad = setup_call(key, inst, "GET", query="kind=" + urllib.parse.quote(
+            str(item_kind), safe=""))
+        if bad:
+            return ("die App nennt keine Liste (ältere Fassung?) -- der Wert wird "
+                    "genommen, wie er eingegeben ist")
+        items = doc.get("items")
+        if not isinstance(items, list):
+            return "die App nennt keine Liste -- der Wert wird genommen, wie er ist"
+        return items
+    return read
 
 
 def _recipe_instances(tid):
@@ -11563,9 +11641,15 @@ def _recipe_instances(tid):
             if not is_rehearsal(i)]
 
 
-def _recipe_prepare(rid, label, given, role, doc=None, digest=None):
-    """-> (doc, digest, profile, values, chosen) with every step rendered
-    once, so a refusal in the last step is found before the first runs."""
+def _recipe_prepare(rid, label, given, role, doc=None, digest=None,
+                    actor_tid=None, read_list=None, soft=False):
+    """-> (doc, digest, profile, values, chosen, choices, problems) with
+    every step rendered once, so a refusal in the last step is found before
+    the first runs.
+
+    `soft` (the preview): a value that must still be chosen is returned in
+    `problems` with the choices, instead of a refusal -- the person sees
+    the lists and chooses. Everything else refuses in both modes."""
     _recipe_role(role)
     label = str(label or "").strip().lower()
     tid, t = tenant_by_label(label, include_former=False)
@@ -11575,6 +11659,7 @@ def _recipe_prepare(rid, label, given, role, doc=None, digest=None):
                                    "is made by a profile)")
     if doc is None:
         doc, digest, _raw = tenant_recipe.read_recipe_file(tenant_recipe_path(rid))
+    _recipe_tenant_gate(role, actor_tid, tid, t, doc)
     needs = set(tenant_recipe.need_names(doc))
     given = dict(given or {})
     picks = {k: v for k, v in given.items() if k in needs}
@@ -11586,13 +11671,31 @@ def _recipe_prepare(rid, label, given, role, doc=None, digest=None):
         doc, _recipe_instances(tid), picks, lambda loc: instance_key(tid, loc))
     if problems:
         raise tenant_build.Refusal("; ".join(problems))
+    lists = {}
+    item_params = tenant_recipe.item_params(doc)
+    if item_params:
+        read_list = read_list or _recipe_list_reader()
+        for pname, spec in item_params:
+            c = chosen.get(spec.get("need")) or {}
+            lists[pname] = (read_list(c["key"], spec.get("item_kind"))
+                            if c and not c.get("install") else
+                            "die App wird erst installiert -- der Wert wird "
+                            "genommen, wie er ist")
+    rest, problems, choices = tenant_recipe.judge_choices(doc, rest, lists)
+    if problems:
+        if soft:
+            return doc, digest, None, None, chosen, choices, problems
+        raise tenant_build.Refusal("; ".join(problems))
     profile = tenant_recipe.as_profile(doc)
     values, problems = tenant_build.param_values(
         profile, dict(rest, label=label, tenant=label, **vals))
     if problems:
+        if soft:
+            return doc, digest, None, None, chosen, choices, problems
         raise tenant_build.Refusal("; ".join(problems))
     tenant_build.plan(profile, values)
-    return doc, digest, profile, values, chosen
+    _recipe_scope_gate(role, tid, profile, values)
+    return doc, digest, profile, values, chosen, choices, []
 
 
 def _recipe_ctx(values):
@@ -11600,22 +11703,36 @@ def _recipe_ctx(values):
             "state": {"steps": []}, "values": values}
 
 
-def tenant_recipe_preview(rid, label, given, who, role, drivers=None):
-    """What a run would do, step by step, nothing done (RFC-0109 D6)."""
-    doc, digest, profile, values, chosen = _recipe_prepare(rid, label, given, role)
+def tenant_recipe_preview(rid, label, given, who, role, drivers=None,
+                          actor_tid=None, read_list=None):
+    """What a run would do, step by step, nothing done (RFC-0109 D6). With
+    the choices the apps offer; a value still to choose is a `problem`
+    beside them, and then there are no rows yet."""
+    doc, digest, profile, values, chosen, choices, problems = _recipe_prepare(
+        rid, label, given, role, actor_tid=actor_tid, read_list=read_list,
+        soft=True)
+    base = {"recipe": doc["id"], "version": tenant_build.profile_version(doc),
+            "digest": digest, "title": doc.get("title", ""),
+            "tenant": str(label or "").strip().lower(), "needs": chosen,
+            "choices": choices, "problems": problems}
+    if problems:
+        return dict(base, rows=[], params={
+            k: v for k, v in (given or {}).items()
+            if k not in tenant_recipe.need_names(doc)})
     drivers = drivers or _BuildDrivers(values["label"], who, role)
     rows = tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values))
-    return {"recipe": doc["id"], "version": tenant_build.profile_version(doc),
-            "digest": digest, "title": doc.get("title", ""),
-            "tenant": values["label"], "needs": chosen, "rows": rows,
-            "params": {k: v for k, v in values.items()
-                       if k not in ("label", "tenant")}}
+    return dict(base, rows=rows, params={k: v for k, v in values.items()
+                                         if k not in ("label", "tenant")
+                                         and not k.endswith(tenant_recipe.KEY_SUFFIX)
+                                         and k not in chosen})
 
 
-def tenant_recipe_run(rid, label, given, who, role, drivers=None):
+def tenant_recipe_run(rid, label, given, who, role, drivers=None,
+                      actor_tid=None, read_list=None):
     """Preview, then run -> the run's state. A conflict in the preview stops
     it before anything happens (RFC-0109 D6)."""
-    doc, digest, profile, values, chosen = _recipe_prepare(rid, label, given, role)
+    doc, digest, profile, values, chosen, _choices, _p = _recipe_prepare(
+        rid, label, given, role, actor_tid=actor_tid, read_list=read_list)
     held = tenant_recipe.open_run_for(RECIPE_RUN_DIR, values["label"])
     if held:
         raise tenant_build.Refusal(
@@ -11649,11 +11766,19 @@ def tenant_recipe_run(rid, label, given, who, role, drivers=None):
 
 
 def _recipe_drive(state, profile, drivers):
-    with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
-        return tenant_build.run(state, profile, drivers, RECIPE_RUN_DIR)
+    try:
+        with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
+            return tenant_build.run(state, profile, drivers, RECIPE_RUN_DIR)
+    finally:
+        tenant_recipe_view_write()
 
 
-def _recipe_load(run_id, role):
+def _recipe_load(run_id, role, actor_tid=None, undo=False):
+    """A run, its recipe's profile and digest -- for the operator, or for
+    the tenant_admin of the run's tenant. Going on (continue, confirm)
+    needs the release and the scope as at the start; taking back (undo)
+    only the own tenant: a withdrawn release must not keep a tenant from
+    removing what a run made in it."""
     _recipe_role(role)
     state = tenant_build.load_state(RECIPE_RUN_DIR, run_id)
     if state.get("kind") != "recipe":
@@ -11662,38 +11787,217 @@ def _recipe_load(run_id, role):
                                      state.get("digest"))
     doc, digest, _raw = tenant_recipe.read_recipe_file(
         kept or tenant_recipe_path(state["recipe"]))
-    return state, tenant_recipe.as_profile(doc), digest
+    profile = tenant_recipe.as_profile(doc)
+    if role == "tenant_admin":
+        tid, t = tenant_by_label(state.get("label", ""), include_former=False)
+        if not tid or tid != actor_tid:
+            raise tenant_build.Refusal("a tenant_admin acts on the runs of their "
+                                       "own tenant only")
+        if not undo:
+            _recipe_tenant_gate(role, actor_tid, tid, t, doc)
+            _recipe_scope_gate(role, tid, profile, state.get("values") or {})
+    return state, profile, digest
 
 
-def tenant_recipe_continue(run_id, who, role, drivers=None, purge=False):
-    state, profile, digest = _recipe_load(run_id, role)
+def tenant_recipe_continue(run_id, who, role, drivers=None, purge=False,
+                           actor_tid=None):
+    state, profile, digest = _recipe_load(run_id, role, actor_tid)
     if state["state"] in ("done", "rolled-back"):
         raise tenant_build.Refusal(f"run {run_id} is {state['state']}")
     if digest != state["digest"]:
         raise tenant_build.Refusal("the recipe file changed since this run "
                                    "started; start a new run instead")
     if state.get("rolling_back"):
-        return tenant_recipe_rollback(run_id, who, role, drivers, purge)
+        return tenant_recipe_rollback(run_id, who, role, drivers, purge,
+                                      actor_tid=actor_tid)
     return _recipe_drive(state, profile,
                          drivers or _BuildDrivers(state["label"], who, role))
 
 
-def tenant_recipe_confirm(run_id, step, who, role, drivers=None):
-    state, profile, _digest = _recipe_load(run_id, role)
+def tenant_recipe_confirm(run_id, step, who, role, drivers=None, actor_tid=None):
+    state, profile, _digest = _recipe_load(run_id, role, actor_tid)
     tenant_build.confirm(state, step, RECIPE_RUN_DIR)
     return _recipe_drive(state, profile,
                          drivers or _BuildDrivers(state["label"], who, role))
 
 
-def tenant_recipe_rollback(run_id, who, role, drivers=None, purge=False):
+def tenant_recipe_rollback(run_id, who, role, drivers=None, purge=False,
+                           actor_tid=None):
     """Undo what THIS run made, in reverse; an item a human changed since
-    stays by the app's own rule (RFC-0104 section 3.1)."""
-    state, profile, _digest = _recipe_load(run_id, role)
+    stays by the app's own rule (RFC-0104 section 3.1). A tenant_admin
+    never removes instances (purge is the operator's)."""
+    state, profile, _digest = _recipe_load(run_id, role, actor_tid, undo=True)
+    if role == "tenant_admin":
+        purge = False
     if state["state"] == "rolled-back" and not state.get("rolling_back"):
         raise tenant_build.Refusal(f"run {run_id} is already rolled back")
     drivers = drivers or _BuildDrivers(state["label"], who, role, purge=purge)
-    with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
-        return tenant_build.rollback(state, profile, drivers, RECIPE_RUN_DIR)
+    try:
+        with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
+            return tenant_build.rollback(state, profile, drivers, RECIPE_RUN_DIR)
+    finally:
+        tenant_recipe_view_write()
+
+
+RECIPE_VIEW = os.path.join(APPS_DIR, "recipe-view.json")
+RECIPE_VIEW_KEEP = 100
+
+
+def tenant_recipe_view_write():
+    """Recipes, their releases and the latest runs, where the portal reads
+    (RFC-0109 stage 2, page Einrichten). Like the build view: no secret by
+    rule (S3), world-readable on the host; the portal shows a tenant_admin
+    only their own tenant's rows."""
+    try:
+        tenants = load_tenants()
+        dflt = default_tenant_id()
+        tlist = sorted(({"label": t.get("label", ""), "name": t.get("name") or ""}
+                        for tid, t in tenants.items()
+                        if tid != dflt and t.get("label") and not t.get("former")),
+                       key=lambda x: x["label"])
+        recipes = []
+        for rid, title, ver, problem in tenant_recipes():
+            row = {"id": rid, "title": title, "version": ver, "problem": problem}
+            if not problem:
+                doc, dg, _raw = tenant_recipe.read_recipe_file(tenant_recipe_path(rid))
+                row.update(
+                    digest=dg, major=tenant_recipe.major_of(ver),
+                    description=str(doc.get("description") or "")[:1200],
+                    needs={n: {"app": sp.get("app"), "label": sp.get("label") or n,
+                               "install": sp.get("install") is True}
+                           for n, sp in (doc.get("needs") or {}).items()},
+                    params=doc.get("params") or {},
+                    steps=[{"id": x["id"], "type": x["type"]} for x in doc["steps"]],
+                    released_for=sorted(
+                        t.get("label", "") for tid, t in tenants.items()
+                        if tenant_recipe.released(t.get("tenant_admin_may"), rid, ver)),
+                    releases={t.get("label", ""): [m for _r, m in tenant_recipe.releases_of(
+                        t.get("tenant_admin_may"), rid)]
+                        for tid, t in tenants.items()
+                        if tenant_recipe.releases_of(t.get("tenant_admin_may"), rid)})
+            recipes.append(row)
+        runs = sorted(tenant_build.list_states(RECIPE_RUN_DIR),
+                      key=lambda st: st.get("created", ""), reverse=True)
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = RECIPE_VIEW + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "written": _iso_now(), "tenants": tlist,
+                       "recipes": recipes, "runs": runs[:RECIPE_VIEW_KEEP]}, f)
+        os.replace(tmp, RECIPE_VIEW)
+        os.chmod(RECIPE_VIEW, 0o644)
+        return True
+    except (OSError, ValueError, KeyError, TypeError, SystemExit,
+            tenant_build.Refusal) as e:
+        print(f"WARNING: could not write {RECIPE_VIEW}: {e}", flush=True)
+        return False
+
+
+def tenant_recipe_release(tid, what, on, who="root", role="root"):
+    """Release a recipe for one tenant's tenant_admin, or take the release
+    back (RFC-0109 section 5) -> (ok, sentence). `what` is
+    `recipe:<id>[@<major>]`; without a major the recipe's current one.
+    The release is the operator's permission for exactly that recipe's
+    steps, and a new major version needs a new release."""
+    if role not in ("root", "server_admin"):
+        return False, "only the server_admin releases a recipe (RFC-0109 section 5)"
+    m = re.match(r"^recipe:([a-z0-9][a-z0-9-]{0,62})(?:@([0-9]{1,4}))?$", str(what))
+    if not m:
+        return False, "a release is recipe:<id> or recipe:<id>@<major>"
+    rid, major = m.group(1), m.group(2)
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    if tid == default_tenant_id():
+        return False, ("the node's own tenant is the operator's -- there is no "
+                       "tenant_admin to release a recipe for")
+    label = t.get("label", "?")
+    have = set(t.get("tenant_admin_may") or [])
+    if major is None:
+        if on:
+            try:
+                doc, _d, _r = tenant_recipe.read_recipe_file(tenant_recipe_path(rid))
+            except tenant_build.Refusal as exc:
+                return False, f"the recipe '{rid}' cannot be released: {exc}"
+            words = {tenant_recipe.release_word(rid, doc.get("version"))}
+        else:
+            words = {f"recipe:{r}@{mj}" for r, mj in
+                     tenant_recipe.releases_of(have, rid)}
+    else:
+        words = {f"recipe:{rid}@{int(major)}"}
+    new = (have | words) if on else (have - words)
+    if new == have:
+        return True, (f"unchanged: '{rid}' is {'' if on else 'not '}released for "
+                      f"'{label}'")
+    t["tenant_admin_may"] = sorted(new)
+    tenants[tid] = t
+    save_tenants(tenants)
+    for w in sorted((words - have) if on else (have & words)):
+        audit_tenant("tenant.recipe.release" if on else "tenant.recipe.unrelease",
+                     tid, subject=w, who=who, role=role,
+                     detail=("the tenant_admin may run this recipe in this tenant"
+                             if on else "the tenant_admin may no longer run it; "
+                             "what earlier runs made stays"))
+    tenant_recipe_view_write()
+    return True, (f"'{rid}' is released for the tenant_admin of '{label}' "
+                  f"({', '.join(sorted(words))})" if on else
+                  f"'{rid}' is no longer released for '{label}'; what earlier "
+                  "runs made stays, and its runs can still be rolled back")
+
+
+def tenant_recipe_job(req, act_tenant, role, actor):
+    """One recipe operation from the portal -> (ok, sentence, extra). Role
+    and tenant come from the ACTOR's own record (the worker derives them),
+    never from the request; the request names the tenant's label, and a
+    tenant_admin's must be their own (judged in the gate)."""
+    op = str(req.get("op") or "")
+    a = req.get("args")
+    a = a if isinstance(a, dict) else {}
+    rid, label = str(a.get("recipe") or ""), str(a.get("tenant") or "")
+    run_id = str(a.get("run") or "")
+    params = a.get("params") or {}
+    if not isinstance(params, dict) or any(
+            not isinstance(k, str) or not isinstance(v, (str, int)) for k, v in params.items()):
+        return False, "'params' must be an object of text values", {}
+    params = {k: str(v) for k, v in params.items()}
+    if role not in RECIPE_ROLES:
+        return False, "a recipe needs server_admin or tenant_admin", {}
+    try:
+        if op == "preview":
+            p = tenant_recipe_preview(rid, label, params, actor, role,
+                                      actor_tid=act_tenant)
+            blockers = tenant_recipe.preview_blockers(p["rows"])
+            msg = ("Bitte wählen: " + "; ".join(p["problems"]) if p["problems"] else
+                   "Die Vorschau hat etwas gefunden, das den Lauf anhält." if blockers else
+                   "Alles ist vorhanden; ein Lauf hätte nichts zu tun."
+                   if all(r["verdict"] in ("present", "skipped") for r in p["rows"]) else
+                   "Vorschau fertig; nichts wurde geändert.")
+            return True, msg, {"preview": p}
+        if op == "run":
+            st = tenant_recipe_run(rid, label, params, actor, role, actor_tid=act_tenant)
+        elif op == "continue":
+            st = tenant_recipe_continue(run_id, actor, role, actor_tid=act_tenant)
+        elif op == "confirm":
+            st = tenant_recipe_confirm(run_id, str(a.get("step") or ""), actor, role,
+                                       actor_tid=act_tenant)
+        elif op == "rollback":
+            st = tenant_recipe_rollback(run_id, actor, role, actor_tid=act_tenant)
+        elif op in ("release", "unrelease"):
+            tid, _t = tenant_by_label(label.strip().lower(), include_former=False)
+            if not tid:
+                return False, f"there is no tenant '{label}'", {}
+            ok, msg = tenant_recipe_release(
+                tid, f"recipe:{rid}" + (f"@{a['major']}" if str(a.get("major") or "").isdigit()
+                                        else ""), op == "release", who=actor, role=role)
+            return ok, msg, {}
+        else:
+            return False, f"unknown recipe operation '{op}'", {}
+    except tenant_build.Refusal as exc:
+        return False, str(exc), {}
+    bad = next((r for r in st["steps"] if r["state"] == "failed"), None)
+    tail = f" -- {bad['id']}: {bad['note']}" if bad else ""
+    return (st["state"] != "failed", f"Lauf {st['id']}: {st['state']}{tail}",
+            {"run": st["id"]})
 
 
 def _print_recipe_preview(p, as_json=False):
@@ -11705,10 +12009,22 @@ def _print_recipe_preview(p, as_json=False):
     for n, c in p["needs"].items():
         print(f"  {n:<10} {c['app']:<14} {c['name']}"
               + ("  (wird installiert)" if c["install"] else ""))
+    for n, c in (p.get("choices") or {}).items():
+        if c.get("light"):
+            print(f"  {n:<10} Ampel {c['value'] or '?'}"
+                  + (f" (das Modell erreicht {c['suggested']})" if c.get("suggested") else ""))
+            continue
+        ids = ", ".join(i["id"] for i in c.get("items") or [])
+        print(f"  {n:<10} {c['value'] or '?'}  aus {c['need']}/{c['item_kind']}: "
+              + (ids or c.get("note") or "(keine)"))
+    for prob in p.get("problems") or []:
+        print(f"  BITTE      {prob}")
     for r in p["rows"]:
         print(f"  {tenant_recipe.SAY.get(r['verdict'], r['verdict']):<16} "
               f"{r['id']:<16} {r['type']:<18} {r['note']}")
-    if tenant_recipe.preview_blockers(p["rows"]):
+    if p.get("problems"):
+        print("Erst wählen (oben, BITTE); so startet kein Lauf.")
+    elif tenant_recipe.preview_blockers(p["rows"]):
         print("Ein Lauf würde hier anhalten, bevor er etwas tut.")
     elif all(r["verdict"] in ("present", "skipped") for r in p["rows"]):
         print("Alles ist vorhanden; ein Lauf hätte nichts zu tun.")
@@ -12001,7 +12317,9 @@ def cmd_tenant(args):
         what = (args.target or "").strip()
         if not what:
             die(f"which right? oaap tenant {args.action} {label} <right> -- known: "
-                + ", ".join(f"{k} ({v})" for k, v in sorted(TENANT_ADMIN_MAY.items())))
+                + ", ".join(f"{k} ({v})" for k, v in sorted(TENANT_ADMIN_MAY.items()))
+                + "; and recipe:<id>[@<major>] (RFC-0109: release a setup recipe "
+                "for this tenant's tenant_admin)")
         ok, msg = tenant_set_admin_may(tid, what, args.action == "allow",
                                        who=os.environ.get("SUDO_USER") or getpass.getuser())
         if not ok:
@@ -21299,6 +21617,7 @@ def state_view_write(reg=None):
         os.chmod(STATE_VIEW, 0o644)
         cohort_view_write()
         tenant_build_view_write()
+        tenant_recipe_view_write()
         tenant_request_view_write()
         # Only where disks are in use: the first `oaap disk` command makes
         # the view, and a node that never ran one is not asked for its
@@ -35176,6 +35495,27 @@ def cmd_process_deploys(_args):
                                          or _bid or ""),
                              result="denied", who=actor or "api",
                              role=act_role or "-", detail=msg)
+        elif action == "tenant-recipe":
+            # RFC-0109 stage 2: a recipe from the page Einrichten (preview,
+            # run, continue, confirm, rollback) or a release from Aufbau.
+            # Role and tenant from the ACTOR's record (above).
+            ok, msg, _extra = tenant_recipe_job(req, act_tenant, act_role, actor)
+            tenant_recipe_view_write()
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(dict({"id": rid, "op": req.get("op", ""), "ok": ok,
+                                    "message": msg, "finished": _iso_now()},
+                                   **_extra), f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                _rargs = req.get("args") if isinstance(req.get("args"), dict) else {}
+                audit_tenant("tenant.recipe.denied", act_tenant or ensure_default_tenant(),
+                             subject=str(_rargs.get("recipe") or _rargs.get("run") or ""),
+                             result="denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg[:300])
         elif action in ("tenant-request", "tenant-request-submit"):
             # RFC-0055 stage 4. "tenant-request" is the operator's side
             # (invite, revoke, approve, reject): role and actor come from

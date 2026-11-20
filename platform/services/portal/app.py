@@ -28,6 +28,7 @@ from flask import (Flask, g, make_response, redirect, render_template_string,
 from markupsafe import Markup
 
 import build_view
+import recipe_view
 import cohort_view
 import disk_view
 import fleet_view
@@ -4858,6 +4859,9 @@ def page(body_template, title, active, status=200, **ctx):
         # The tenant build pages (RFC-0055 stage 3): an operator at the
         # node's own address, nobody else, nowhere else.
         "can_build": _can_build(),
+        # RFC-0109 stage 2: the page Einrichten, in a tenant's context --
+        # its tenant_admin, or the operator at the tenant's place.
+        "can_setup": _recipe_scope() is not None,
         "has_cohorts": _has_cohorts(),
         "show_tenant_admin": multi and bool(caller & {"server_admin", "tenant_admin"}),
         # The page "Flotte" (RFC-0087 §4): the ceiling is the server_admin's,
@@ -13150,6 +13154,35 @@ haben.</p>
 </table>
 {% else %}<p class="muted">Noch kein Aufbau.</p>{% endif %}
 </div>
+{% if recipes %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Rezepte</h2>
+<p class="muted">Kleine Einrichtungen für einen Mandanten, den es schon gibt (RFC-0109). Ein
+Rezept, das niemandem freigegeben ist, führt nur der Betreiber aus; nach der Freigabe der
+<code>tenant_admin</code> des Mandanten selbst, unter „Einrichten“. Eine neue Hauptversion
+braucht eine neue Freigabe.</p>
+<table>
+  <tr><th>Rezept</th><th>Version</th><th>Freigegeben für</th><th></th></tr>
+  {% for r in recipes %}
+  <tr>
+    <td><strong>{{ r.title or r.id }}</strong><br><span class="muted">{{ r.id }}</span>
+      {% if r.problem %}<br><span class="err">abgelehnt: {{ r.problem }}</span>{% endif %}</td>
+    <td>{{ r.version }}</td>
+    <td>{{ r.released_text }}</td>
+    <td>{% if not r.problem and recipe_tenants %}
+      <form method="post" action="/aufbau/rezepte/freigabe" style="display:inline">
+        <input type="hidden" name="recipe" value="{{ r.id }}">
+        <select name="tenant" aria-label="Mandant">{% for t in recipe_tenants %}
+          <option value="{{ t.label }}">{{ t.label }}{% if t.name %} – {{ t.name }}{% endif %}</option>{% endfor %}
+        </select>
+        <button class="btn" name="op" value="release">Freigeben</button>
+        <button class="rowaction" name="op" value="unrelease">Zurücknehmen</button>
+      </form>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
 <p class="muted">Anhalten gibt es nicht: ein Aufbau läuft bis zu einem Wartepunkt oder
 bis zu einem Fehler. Dieselbe Mechanik steht in der Verwaltungs-API
 (<code>/api/v1/operator/tenant-builds</code>, nur mit einer Anmeldung als
@@ -13330,11 +13363,36 @@ def build_page():
     if sc is None:
         return _build_denied()
     view = _build_view()
+    rv = _recipe_view()
     return page(BUILD_LIST_BODY, "Aufbau", "build",
                 rows=build_view.rows(view), profiles=build_view.profiles(view),
                 pending=build_view.pending_count(_request_view()),
+                recipes=[dict(r, released_text=recipe_view.released_text(r))
+                         for r in rv.get("recipes") or []],
+                recipe_tenants=rv.get("tenants") or [],
                 job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
                 error=request.args.get("err"))
+
+
+@app.post("/aufbau/rezepte/freigabe")
+def recipe_release_page():
+    """Release a recipe for one tenant, or take it back (RFC-0109 section 5)
+    -- a request the host judges again (only the server_admin)."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    op = request.form.get("op", "")
+    rid = request.form.get("recipe", "")
+    label = request.form.get("tenant", "")
+    known = {t.get("label") for t in _recipe_view().get("tenants") or []}
+    if (op not in ("release", "unrelease") or not recipe_view.RECIPE_RE.match(rid)
+            or label not in known):
+        return redirect("/aufbau?err=" + quote("Rezept oder Mandant unbekannt; nichts geändert."))
+    jid = management_api.enqueue(sc[0], sc[1], op, {"recipe": rid, "tenant": label},
+                                 action="tenant-recipe")
+    return redirect(f"/aufbau?job={jid}")
 
 
 def _build_new(pid, values=None, error=None, status=200):
@@ -13447,6 +13505,350 @@ def build_act_page(bid, verb):
         args["purge_accounts"] = False
     rid = management_api.enqueue(sc[0], sc[1], verb, args, action="tenant-build")
     return redirect(f"/aufbau/{bid}?job={rid}")
+
+
+# ---------------------------------------------------------------------------
+# Einrichten (RFC-0109 stage 2, oaap.core.portal): recipes in a tenant that
+# exists. The page reads `recipe-view.json` (written by the host) and writes
+# only into the spool (action `tenant-recipe`); the host judges every request
+# again, with the role and tenant of the ACTOR's record. A tenant_admin sees
+# only the recipes released for their tenant and only their tenant's runs.
+
+RECIPE_VIEW_FILE = "/apps-registry/recipe-view.json"
+
+
+def _recipe_view():
+    try:
+        with open(RECIPE_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _recipe_scope():
+    """(tenant_id, label, role) of whoever may use Einrichten here, else None.
+
+    A tenant_admin: their own tenant (from their record), at their place or
+    the node's address -- never at another tenant's place. A server_admin:
+    at a tenant's place, that tenant; at the node's address there is no
+    tenant to set up (the header's tenant menu leads there)."""
+    role, mine = caller_scope()
+    at = host_tenant_scope(request.host)[0]
+    if role == "tenant_admin":
+        if not mine or (at and at != mine):
+            return None
+        tid = mine
+    elif role == "server_admin":
+        if not at:
+            return None
+        tid = at
+    else:
+        return None
+    label = (load_tenants().get(tid) or {}).get("label") or ""
+    return (tid, label, role) if label else None
+
+
+def _recipe_denied():
+    role, _mine = caller_scope()
+    if role == "server_admin":
+        return ("Einrichten gibt es am Ort eines Mandanten -- oben im Menü den "
+                "Mandanten wählen."), 404
+    return "Zugriff verweigert: erfordert die Rolle tenant_admin oder server_admin.", 403
+
+
+def _recipe_job(tid, role, rid):
+    """What became of a request this page sent: banner, and the preview or
+    the run it produced."""
+    if not management_api.JOB_RE.match(rid or ""):
+        return None
+    meta = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "meta.json"))
+    if not management_api._may_see(meta, tid, role):
+        return None
+    st = management_api.job_status(management_api.SPOOL_DIR, rid)
+    if st is None:
+        return None
+    if st != "done":
+        return {"done": False, "failed": False, "preview": None, "run": "",
+                "text": "Der Auftrag " + ("läuft" if st == "running" else "wartet")
+                        + " auf dem Knoten — diese Seite lädt sich neu."}
+    res = management_api.read_json(
+        os.path.join(management_api.SPOOL_DIR, "jobs", rid, "result.json")) or {}
+    good = bool(res.get("ok"))
+    return {"done": True, "failed": not good, "run": str(res.get("run") or ""),
+            "preview": res.get("preview") if isinstance(res.get("preview"), dict) else None,
+            "text": res.get("message") or ("Erledigt." if good else "Fehlgeschlagen.")}
+
+
+RECIPE_BANNER = """
+{% if job %}
+<div class="card"><p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p>
+{% if job.run and job.done %}<p><a class="btn" href="/einrichten/lauf/{{ job.run }}">Zum Lauf</a></p>{% endif %}
+</div>
+{% if not job.done %}<script>setTimeout(function(){location.reload();}, 3000);</script>{% endif %}
+{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+"""
+
+RECIPE_LIST_BODY = """
+<div class="pagehead"><h1>Einrichten</h1></div>
+<p class="muted">Kleine Einrichtungen für <strong>{{ label }}</strong>, auch im Nachgang:
+erst „Was fehlt noch?“ (die Vorschau, sie ändert nichts), dann „Einrichten“. Nichts, was ein
+Mensch angelegt hat, wird überschrieben.</p>
+""" + RECIPE_BANNER + """
+<div class="card">
+<h2>Rezepte</h2>
+{% if recipes %}
+<table>
+  <tr><th>Rezept</th><th>Braucht</th><th></th></tr>
+  {% for r in recipes %}
+  <tr>
+    <td><strong>{{ r.title or r.id }}</strong> <span class="muted">{{ r.version }}</span>
+      {% if r.problem %}<br><span class="err">abgelehnt: {{ r.problem }}</span>{% endif %}
+      {% if r.description %}<br><span class="muted">{{ r.description[:240] }}{% if r.description|length > 240 %} …{% endif %}</span>{% endif %}
+      {% if role == 'server_admin' and r.runnable and not r.released_here %}<br><span class="muted">Für diesen Mandanten nicht freigegeben – nur der Betreiber führt es aus.</span>{% endif %}</td>
+    <td>{% for n, nd in (r.needs or {}).items() %}{{ nd.label }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+    <td>{% if r.runnable %}<a class="btn" href="/einrichten/rezept/{{ r.id }}">Was fehlt noch?</a>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">Für diesen Mandanten ist noch kein Rezept freigegeben. Der Betreiber
+gibt Rezepte frei; brauchst Du eines, frag ihn.</p>{% endif %}
+</div>
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Läufe</h2>
+{% if runs %}
+<table>
+  <tr><th>Rezept</th><th>Zustand</th><th>Gestartet</th><th></th></tr>
+  {% for r in runs %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">{{ r.title or r.recipe }}</a>{% if r.version %} <span class="muted">{{ r.version }}</span>{% endif %}</td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span></td>
+    <td>{{ r.created }}<br><span class="muted">{{ r.by }}</span></td>
+    <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">Ansehen</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">Noch kein Lauf in diesem Mandanten.</p>{% endif %}
+</div>
+"""
+
+RECIPE_FORM_BODY = """
+<a class="back" href="/einrichten">← Zurück zu Einrichten</a>
+<div class="pagehead"><h1>{{ recipe.title or recipe.id }}</h1></div>
+<p class="muted">Rezept <code>{{ recipe.id }}</code> {{ recipe.version }} im Mandanten
+<strong>{{ label }}</strong>.{% if recipe.description %} {{ recipe.description }}{% endif %}</p>
+""" + RECIPE_BANNER + """
+<div class="card">
+<h2>Werte</h2>
+<form method="post" action="/einrichten/rezept/{{ recipe.id }}/vorschau">
+{% for f in fields %}
+  <p><label for="f-{{ f.name }}"><strong>{{ f.label }}</strong></label><br>
+  {% if f.kind == 'need' %}
+    <input id="f-{{ f.name }}" name="{{ f.name }}" value="{{ f.value }}" placeholder="leer = die einzige Instanz der App {{ f.app }}">
+    <span class="muted">App {{ f.app }}{% if f.install %}; fehlt sie, wird sie installiert{% endif %}</span>
+  {% elif f.kind == 'setup_item' and f.entries %}
+    <select id="f-{{ f.name }}" name="{{ f.name }}">
+      {% if not f.value %}<option value="">– bitte wählen –</option>{% endif %}
+      {% for i in f.entries %}<option value="{{ i.id }}" {% if i.id == f.value %}selected{% endif %}>{{ i.id }}{% if i.title and i.title != i.id %} – {{ i.title }}{% endif %}{% if i.light %} ({{ i.light }}){% endif %}</option>{% endfor %}
+    </select> <span class="muted">aus {{ f.source }}</span>
+  {% elif f.kind == 'light' %}
+    <select id="f-{{ f.name }}" name="{{ f.name }}">
+      <option value="" {% if not f.value %}selected{% endif %}>– wie das Modell –</option>
+      {% for o in f.options %}<option value="{{ o.value }}" {% if o.selected %}selected{% endif %}>{{ o.text }}</option>{% endfor %}
+    </select>
+  {% elif f.kind == 'bool' %}
+    <input type="checkbox" id="f-{{ f.name }}" name="{{ f.name }}" value="1" {% if f.checked %}checked{% endif %}>
+  {% else %}
+    <input id="f-{{ f.name }}" name="{{ f.name }}" value="{{ f.value }}">
+    {% if f.kind == 'setup_item' %}<span class="muted">{{ f.note or 'Die Liste kommt mit der Vorschau.' }}</span>{% endif %}
+  {% endif %}</p>
+{% endfor %}
+<button class="btn">Was fehlt noch?</button>
+<span class="muted">Die Vorschau fragt die Apps und ändert nichts.</span>
+</form>
+</div>
+{% if preview %}
+<div class="card {{ 'warn' if state in ('choose', 'blocked') else '' }}">
+<h2>Vorschau</h2>
+{% if preview.problems %}<ul>{% for p in preview.problems %}<li class="err">{{ p }}</li>{% endfor %}</ul>{% endif %}
+{% if rows %}
+<table>
+  <tr><th>Schritt</th><th>Was</th><th>Ergebnis</th><th>Hinweis</th></tr>
+  {% for r in rows %}
+  <tr><td>{{ r.id }}</td><td>{{ r.type }}</td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.verdict }}</span></td>
+    <td>{{ r.note }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if state == 'complete' %}<p class="ok">Alles ist vorhanden; ein Lauf hätte nichts zu tun.</p>
+{% elif state == 'blocked' %}<p class="err">Ein Lauf hielte hier an, bevor er etwas tut. Den Konflikt in der App klären oder den Betreiber fragen.</p>
+{% elif state == 'ready' %}
+<form method="post" action="/einrichten/rezept/{{ recipe.id }}/lauf">
+  {% for k, v in run_values.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <button class="btn">Einrichten</button>
+  <span class="muted">Mit genau diesen Werten; der Knoten prüft vorher noch einmal.</span>
+</form>{% endif %}
+</div>
+{% endif %}
+"""
+
+RECIPE_RUN_BODY = """
+<a class="back" href="/einrichten">← Zurück zu Einrichten</a>
+<div class="pagehead"><h1>{{ b.title or b.recipe }}</h1></div>
+<p class="muted">Lauf <code>{{ b.id }}</code> · {{ b.version }} · gestartet {{ b.created }} von {{ b.by }} ·
+<span class="badge {{ '' if b.tone == 'ok' else 'off' if b.tone == 'off' else 'todo' }}">{{ b.state }}</span> · {{ b.progress }}</p>
+""" + RECIPE_BANNER + """
+{% if b.waiting %}
+<div class="card warn">
+  <h2>Hier ist ein Mensch gefragt</h2>
+  <p>{{ b.waiting.text }}</p>
+  <form method="post" action="/einrichten/lauf/{{ b.id }}/continue" style="display:inline">
+    <button class="btn">Weiter prüfen</button></form>
+  {% if b.waiting.confirmable %}
+  <form method="post" action="/einrichten/lauf/{{ b.id }}/confirm" style="display:inline">
+    <input type="hidden" name="step" value="{{ b.waiting.id }}">
+    <button class="btn">Bestätigt</button></form>
+  {% endif %}
+</div>
+{% elif b.failed %}
+<div class="card warn"><h2>Stehengeblieben</h2>
+  <p><strong>{{ b.failed.type }}</strong> ({{ b.failed.id }}): {{ b.failed.note }}</p>
+  <form method="post" action="/einrichten/lauf/{{ b.id }}/continue"><button class="btn">Erneut versuchen</button></form>
+</div>
+{% endif %}
+<div class="card">
+<h2>Schritte</h2>
+<table>
+  <tr><th>Schritt</th><th>Was</th><th>Zustand</th><th>Hinweis</th></tr>
+  {% for s in b.steps %}
+  <tr><td>{{ s.id }}</td><td>{{ s.type }}</td><td>{{ s.state }}</td><td>{{ s.note }}</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% if b.rollbackable %}
+<div class="card">
+<h2>Rückgängig</h2>
+<p class="muted">Nimmt zurück, was <strong>dieser</strong> Lauf angelegt hat, in umgekehrter
+Reihenfolge. Was ein Mensch seitdem geändert hat, bleibt; Instanzen werden nie gelöscht.</p>
+<form method="post" action="/einrichten/lauf/{{ b.id }}/rollback">
+  <label><input type="checkbox" name="confirm" value="1"> Ja, diesen Lauf zurücknehmen</label>
+  <button class="btn">Rückgängig</button>
+</form>
+</div>
+{% endif %}
+"""
+
+
+@app.get("/einrichten")
+def recipe_page():
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    tid, label, role = sc
+    rv = _recipe_view()
+    return page(RECIPE_LIST_BODY, "Einrichten", "setup", label=label, role=role,
+                recipes=recipe_view.recipes_for(rv, label, role),
+                runs=recipe_view.runs_for(rv, label),
+                job=_recipe_job(tid, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+def _recipe_form(sc, rid, status=200, error=None):
+    tid, label, role = sc
+    recipe = recipe_view.find_recipe(_recipe_view(), rid, label, role)
+    if recipe is None:
+        return redirect("/einrichten?err=" + quote(
+            "Dieses Rezept gibt es hier nicht (oder es ist nicht freigegeben)."))
+    job = _recipe_job(tid, role, request.args.get("job", ""))
+    preview = (job or {}).get("preview")
+    if preview and (preview.get("recipe") != rid or preview.get("tenant") != label):
+        preview = None
+    run_values = {}
+    if preview and recipe_view.preview_state(preview) == "ready":
+        run_values = dict(preview.get("params") or {})
+        run_values.update({n: c.get("name", "") for n, c in (preview.get("needs") or {}).items()
+                           if not c.get("install")})
+    return page(RECIPE_FORM_BODY, recipe.get("title") or rid, "setup", status=status,
+                recipe=recipe, label=label, fields=recipe_view.fields(recipe, preview),
+                job=job if not preview else dict(job, text=job["text"]), preview=preview,
+                rows=recipe_view.preview_rows(preview),
+                state=recipe_view.preview_state(preview), run_values=run_values,
+                error=error or request.args.get("err"))
+
+
+@app.get("/einrichten/rezept/<rid>")
+def recipe_form_page(rid):
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    return _recipe_form(sc, rid)
+
+
+@app.post("/einrichten/rezept/<rid>/<verb>")
+def recipe_start_page(rid, verb):
+    """The preview ("Was fehlt noch?") and the run ("Einrichten") -- both a
+    request to the host, which takes the preview again before a run."""
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    recipe = recipe_view.find_recipe(_recipe_view(), rid, label, role)
+    if recipe is None or verb not in ("vorschau", "lauf"):
+        return redirect("/einrichten?err=" + quote(
+            "Dieses Rezept gibt es hier nicht (oder es ist nicht freigegeben)."))
+    params = recipe_view.start_params(recipe, request.form)
+    op = "preview" if verb == "vorschau" else "run"
+    jid = management_api.enqueue(tid, role, op, {"recipe": rid, "tenant": label,
+                                                 "params": params},
+                                 action="tenant-recipe")
+    if op == "preview":
+        return redirect(f"/einrichten/rezept/{rid}?job={jid}")
+    return redirect(f"/einrichten?job={jid}")
+
+
+@app.get("/einrichten/lauf/<run_id>")
+def recipe_run_page(run_id):
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    tid, label, role = sc
+    st = recipe_view.find_run(_recipe_view(), run_id, label)
+    if st is None:
+        return redirect("/einrichten?err=" + quote("Diesen Lauf gibt es in diesem Mandanten nicht."))
+    return page(RECIPE_RUN_BODY, st.get("title") or "Lauf", "setup",
+                b=recipe_view.run_detail(st),
+                job=_recipe_job(tid, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/einrichten/lauf/<run_id>/<verb>")
+def recipe_run_act_page(run_id, verb):
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    st = recipe_view.find_run(_recipe_view(), run_id, label)
+    if st is None or verb not in ("continue", "confirm", "rollback"):
+        return redirect("/einrichten")
+    args = {"run": run_id, "tenant": label}
+    if verb == "confirm":
+        waiting = recipe_view.run_detail(st)["waiting"]
+        step = request.form.get("step", "")
+        if not waiting or waiting["id"] != step or not waiting["confirmable"]:
+            return redirect(f"/einrichten/lauf/{run_id}?err=" + quote(
+                "Dieser Schritt wartet nicht auf eine Bestätigung."))
+        args["step"] = step
+    if verb == "rollback" and request.form.get("confirm") != "1":
+        return redirect(f"/einrichten/lauf/{run_id}?err=" + quote(
+            "Bitte bestätigen; nichts wurde zurückgenommen."))
+    jid = management_api.enqueue(tid, role, verb, args, action="tenant-recipe")
+    return redirect(f"/einrichten/lauf/{run_id}?job={jid}")
 
 
 # ---------------------------------------------------------------------------

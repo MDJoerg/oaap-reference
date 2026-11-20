@@ -1,0 +1,161 @@
+"""Die Seite Einrichten (RFC-0109 Stufe 2): Rezepte in einem bestehenden Mandanten.
+
+Gelesen wird `recipe-view.json` (vom Host geschrieben: Rezepte, ihre
+Freigaben, die Mandanten, die letzten Läufe); geändert wird nur über
+Aufträge (Aktion `tenant-recipe`), die der Host noch einmal beurteilt --
+Rolle und Mandant aus dem Datensatz des Auslösers, nie aus der Anfrage.
+Hier steht nur, was die Seite zeigt und wie aus einem Formular die Werte
+eines Rezepts werden: ohne Flask, damit es sich ohne Portal prüfen lässt.
+
+Was ein tenant_admin sieht, entscheidet die Freigabe: nur Rezepte, die der
+Betreiber für SEINEN Mandanten freigegeben hat, und nur die Läufe seines
+Mandanten. Der Betreiber sieht am Ort eines Mandanten jedes Rezept.
+"""
+import re
+
+import build_view
+
+RECIPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+RUN_RE = re.compile(r"^r-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
+PARAM_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
+VALUE_MAX = 200
+LIGHT_WORDS = (("green", "grün"), ("yellow", "gelb"), ("red", "rot"))
+VERDICT = {"present": ("vorhanden", "ok"), "absent": ("wird angelegt", "todo"),
+           "conflict": ("Konflikt", "err"), "skipped": ("nicht gewünscht", "off"),
+           "refused": ("abgelehnt", "err")}
+
+
+def recipes_for(view, label, role):
+    """Die Rezepte, die diese Person in diesem Mandanten sieht."""
+    out = []
+    for r in (view or {}).get("recipes") or []:
+        if r.get("problem"):
+            if role == "server_admin":
+                out.append(dict(r, runnable=False))
+            continue
+        mine = label in (r.get("released_for") or [])
+        if role == "server_admin" or (role == "tenant_admin" and mine):
+            out.append(dict(r, runnable=True, released_here=mine))
+    return out
+
+
+def find_recipe(view, rid, label, role):
+    if not RECIPE_RE.match(str(rid or "")):
+        return None
+    return next((r for r in recipes_for(view, label, role)
+                 if r["id"] == rid and r.get("runnable")), None)
+
+
+def runs_for(view, label):
+    """Die Läufe dieses Mandanten für die Liste, neueste zuerst."""
+    out = []
+    for st in (view or {}).get("runs") or []:
+        if st.get("label") != label:
+            continue
+        text, tone = build_view.state_label(st.get("state"))
+        out.append({"id": st.get("id", ""), "recipe": st.get("recipe", ""),
+                    "title": st.get("title", ""), "state": text, "tone": tone,
+                    "by": st.get("by", ""), "created": build_view._when(st.get("created")),
+                    "version": build_view.version_text(st.get("version"))})
+    return out
+
+
+def find_run(view, run_id, label):
+    if not RUN_RE.match(str(run_id or "")):
+        return None
+    return next((st for st in (view or {}).get("runs") or []
+                 if st.get("id") == run_id and st.get("label") == label), None)
+
+
+def run_detail(st):
+    """Ein Lauf wie ein Aufbau (derselbe Zustand der Engine), ohne Instanzen-
+    Haken: ein Rezept löscht nie eine Instanz von der Seite aus."""
+    d = build_view.detail(st)
+    d["recipe"] = st.get("recipe", "")
+    d["title"] = st.get("title", "")
+    d["needs"] = st.get("needs") or {}
+    return d
+
+
+def light_options(chosen, suggested=""):
+    return [{"value": v, "text": t + (" (vom Modell vorgeschlagen)" if v == suggested else ""),
+             "selected": v == chosen} for v, t in LIGHT_WORDS]
+
+
+def fields(recipe, preview=None):
+    """Das Formular: erst die Apps (leer = die einzige Instanz der App), dann
+    die Werte. Mit einer Vorschau stehen die Listen der Apps zur Wahl und
+    die Werte, die die Vorschau benutzt hat."""
+    choices = (preview or {}).get("choices") or {}
+    used = dict((preview or {}).get("params") or {})
+    needs_used = {n: c.get("name", "") for n, c in ((preview or {}).get("needs") or {}).items()}
+    out = []
+    for n, spec in (recipe.get("needs") or {}).items():
+        out.append({"name": n, "kind": "need", "label": spec.get("label") or n,
+                    "app": spec.get("app", ""), "value": needs_used.get(n, ""),
+                    "install": bool(spec.get("install"))})
+    for n, spec in (recipe.get("params") or {}).items():
+        kind = spec.get("kind", "text")
+        f = {"name": n, "kind": kind, "label": spec.get("label") or n,
+             "value": str(used.get(n, "") or (choices.get(n) or {}).get("value", "")
+                          or spec.get("default", "") or "")}
+        ch = choices.get(n) or {}
+        if kind == "setup_item":
+            f["entries"] = ch.get("items") or []
+            f["note"] = ch.get("note", "")
+            f["source"] = f"{spec.get('need')}/{spec.get('item_kind')}"
+        elif kind == "light":
+            f["options"] = light_options(f["value"], ch.get("suggested", ""))
+        elif kind == "bool":
+            f["checked"] = f["value"] in ("true", "yes", "ja", "1", "True")
+        out.append(f)
+    return out
+
+
+def start_params(recipe, form):
+    """Die Werte aus einem Formular: nur Namen, die das Rezept kennt, nur
+    nicht leere Texte, gekürzt. Ein leerer Bedarf heißt „die einzige
+    Instanz“ und geht nicht mit; der Host prüft alles noch einmal."""
+    names = list((recipe.get("needs") or {})) + list((recipe.get("params") or {}))
+    out = {}
+    for n in names:
+        if not PARAM_RE.match(n):
+            continue
+        spec = (recipe.get("params") or {}).get(n) or {}
+        if spec.get("kind") == "bool":
+            out[n] = "true" if form.get(n) in ("1", "true", "on") else "false"
+            continue
+        v = str(form.get(n) or "").strip()[:VALUE_MAX]
+        if v:
+            out[n] = v
+    return out
+
+
+def preview_rows(preview):
+    rows = []
+    for r in (preview or {}).get("rows") or []:
+        text, tone = VERDICT.get(r.get("verdict"), (r.get("verdict", ""), "off"))
+        rows.append({"id": r.get("id", ""), "type": build_view.STEP_TYPE.get(
+            r.get("type"), r.get("type", "")), "verdict": text, "tone": tone,
+            "note": r.get("note", "")})
+    return rows
+
+
+def preview_state(preview):
+    """Was die Vorschau sagt: zu wählen, Halt, nichts zu tun, oder bereit."""
+    if not preview:
+        return "none"
+    if preview.get("problems"):
+        return "choose"
+    rows = preview.get("rows") or []
+    if any(r.get("verdict") in ("conflict", "refused") for r in rows):
+        return "blocked"
+    if all(r.get("verdict") in ("present", "skipped") for r in rows):
+        return "complete"
+    return "ready"
+
+
+def released_text(recipe):
+    """„pxx, bec“ oder „niemandem (nur der Betreiber)“."""
+    rel = recipe.get("released_for") or []
+    return ", ".join(rel) if rel else "niemandem (nur der Betreiber)"
