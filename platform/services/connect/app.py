@@ -146,7 +146,11 @@ RECHECK_EVERY = int(os.environ.get("CONNECT_RECHECK", "60"))
 SESSION_COOKIE = "oaap_session"
 IDENTITY_HEADERS = ("X-OAAP-User", "X-OAAP-Roles", "X-OAAP-User-Id",
                     "X-OAAP-Display-Name", "X-OAAP-Email",
-                    "X-OAAP-User-Assertion")
+                    "X-OAAP-User-Assertion",
+                    # 0.1.307 (RFC-0095 D2): the realm binding, on the same
+                    # list as in appctl -- answered empty on a public
+                    # exposure, passed on from identity on a person's one
+                    "X-OAAP-User-Idp")
 # RFC 7230 6.1 plus the ones a proxy must never pass on. X-Forwarded-*
 # would tell the backend where the call came from on the OUTER node --
 # nothing it has a use for, and nothing the inner side chose to learn.
