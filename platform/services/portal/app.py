@@ -13025,6 +13025,12 @@ BUILD_DETAIL_BODY = """
       Auch die <strong>Daten der Instanzen</strong> löschen, die dieser Aufbau angelegt hat (nicht umkehrbar).
       Ohne Haken lehnt der Rückbau ab: erhaltene Daten würden den Mandanten festhalten.</label>
     {% endif %}
+    {% if b.made_tenant %}
+    <label class="seatopt"><input type="checkbox" name="purge_accounts" value="1">
+      Auch die <strong>Konten im Mandanten</strong> löschen, etwa die erste Verwaltung (nicht umkehrbar).
+      Nie ein server_admin, nie ein Konto mit gültigem API-Schlüssel; Personen im Realm bleiben.
+      Ohne Haken lehnt der Rückbau ab, wenn der Mandant Konten hat: sie würden ihn festhalten.</label>
+    {% endif %}
     <label>Zur Bestätigung das Kürzel eintippen: <code>{{ b.label }}</code>
       <input type="text" name="confirm" autocomplete="off" required></label>
     <button class="btn" style="background:#b91c1c">Zurückbauen</button>
@@ -13152,8 +13158,10 @@ def build_act_page(bid, verb):
                 f"Der eingegebene Text passt nicht zu '{b.get('label')}'; "
                 "nichts wurde zurückgebaut."))
         args["purge_instances"] = request.form.get("purge_instances") == "1"
+        args["purge_accounts"] = request.form.get("purge_accounts") == "1"
     if verb == "continue":
         args["purge_instances"] = False
+        args["purge_accounts"] = False
     rid = management_api.enqueue(sc[0], sc[1], verb, args, action="tenant-build")
     return redirect(f"/aufbau/{bid}?job={rid}")
 

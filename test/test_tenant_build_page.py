@@ -307,7 +307,8 @@ bid = B_WAIT["id"]
 r = c.post(f"/aufbau/{bid}/continue", headers=H)
 ok("Fortsetzen: Auftrag ohne Datenloeschung",
    r.status_code == 302 and QUEUED[-1]["op"] == "continue"
-   and QUEUED[-1]["args"] == {"build": bid, "purge_instances": False}, QUEUED[-1:])
+   and QUEUED[-1]["args"] == {"build": bid, "purge_instances": False,
+                                 "purge_accounts": False}, QUEUED[-1:])
 r = c.post(f"/aufbau/{bid}/confirm", headers=H, data={"step": "admin"})
 ok("Bestaetigen des wartenden Schritts: Auftrag mit dem Schritt",
    QUEUED[-1]["op"] == "confirm" and QUEUED[-1]["args"] == {"build": bid, "step": "admin"})
@@ -326,7 +327,7 @@ ok("Zurueckbauen ganz ohne Eingabe: abgewiesen", len(QUEUED) == n)
 r = c.post(f"/aufbau/{bid}/rollback", headers=H, data={"confirm": "vwait"})
 ok("Zurueckbauen mit dem Kuerzel: Auftrag, die Daten der Instanzen bleiben",
    QUEUED[-1]["op"] == "rollback" and QUEUED[-1]["args"] == {
-       "build": bid, "purge_instances": False}, QUEUED[-1])
+       "build": bid, "purge_instances": False, "purge_accounts": False}, QUEUED[-1])
 r = c.post(f"/aufbau/{B_FAIL['id']}/rollback", headers=H,
            data={"confirm": "vfail", "purge_instances": "1"})
 ok("...nur mit dem gesetzten Haken gehen sie mit",

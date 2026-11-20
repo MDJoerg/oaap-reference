@@ -3975,6 +3975,59 @@ def _delete_user(username, users, actor_name, role, actor_tenant):
     return {"ok": True, "id": u.get("id", "")}
 
 
+def _delete_tenant_accounts(tenant, users, actor_name, role, dry=False):
+    """Every local account of one tenant, for a rollback that removes the
+    tenant itself (RFC-0055 §11, RFC-0104 2026-11-20).
+
+    The last-tenant_admin rule of `_delete_user` protects a tenant that
+    goes on; here the tenant goes, so nobody is left to manage -- that
+    rule does not apply. The others do: a server_admin is never deleted
+    this way, and a user with a working API key is named, not deleted.
+    All or nothing: one refusal deletes nobody. Realm persons are not
+    accounts of this file and stay. `dry` only answers who would go.
+    """
+    if role != "server_admin":
+        return {"error": "Nur ein server_admin entfernt die Konten eines "
+                         "Mandanten."}, 403
+    # Never `resolve_tenant("")`: an empty reference means the DEFAULT
+    # tenant there, and this deletes every account of what it finds.
+    ref = (tenant or "").strip()
+    known = known_tenants()
+    tid = ref if ref in known else next(
+        (k for k, t in known.items() if ref and (t or {}).get("label") == ref), "")
+    if not tid or tid == default_tenant_id():
+        return {"error": "Mandant nicht gefunden."}, 404
+    mine = [u for u in users if resolve_tenant(u.get("tenant")) == tid]
+    admins = [u["username"] for u in mine if "server_admin" in u["roles"]]
+    if admins:
+        return {"error": "Ein server_admin wird nicht gelöscht — zuerst die "
+                         "Rolle abgeben: " + ", ".join(admins)}, 409
+    now = _now_iso()
+    keyed = sorted({k["principal"] for k in load_keys()
+                    if k["principal"] in {u["username"] for u in mine}
+                    and not k["revoked"]
+                    and (not k.get("expires") or k["expires"] > now)})
+    if keyed:
+        return {"error": "Gültige API-Schlüssel — zuerst entziehen: "
+                         + ", ".join(keyed), "keys": keyed}, 409
+    names = [u["username"] for u in mine]
+    if dry:
+        return {"ok": True, "would_delete": names}, 200
+    for u in mine:
+        users.remove(u)
+    save_users(users)
+    with authz_rw() as st:
+        changed = False
+        for u in mine:
+            changed = authz.end_for_subject(st, u.get("id", ""), who=actor_name) or changed
+        if changed:
+            save_authz(st)
+    for u in mine:
+        audit("user.delete", tid, u["username"], who=actor_name, role=role,
+              detail=f"id {u.get('id', '')}; Rückbau des Mandanten")
+    return {"ok": True, "deleted": names}, 200
+
+
 # ---------------------------------------------------------------------------
 # BUSINESS AUTHORIZATION (oaap.core.authorization 0.1, RFC-0045 stages 1+2)
 #

@@ -298,6 +298,8 @@ def detail(build):
             failed = row
     made_instances = any(m.startswith("instance:") for r in build.get("steps") or []
                          for m in r.get("made") or [])
+    made_tenant = any(m.startswith("tenant:") for r in build.get("steps") or []
+                      for m in r.get("made") or [])
     return {"id": build.get("id", ""), "label": build.get("label", ""),
             "profile": build.get("profile", ""), "state": label, "tone": tone,
             # RFC-0079 D4: which file this build ran
@@ -310,6 +312,7 @@ def detail(build):
             "rolling_back": bool(build.get("rolling_back")),
             "rollbackable": build.get("state") != "rolled-back",
             "made_instances": made_instances,
+            "made_tenant": made_tenant,
             "running": build.get("state") == "running"}
 
 

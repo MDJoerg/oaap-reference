@@ -10019,12 +10019,15 @@ class _BuildDrivers:
     """What each step type does, reads and undoes on THIS node."""
 
     def __init__(self, label, who="root", role="root", probe=None,
-                 sleep=None, purge=False):
+                 sleep=None, purge=False, accounts=False):
         self.label = label
         self.who, self.role = who, role
         # A rollback keeps an instance's data unless the operator said, in
         # words, that the data this build's instance collected may go too.
         self.purge = purge
+        # ... and keeps the tenant's local accounts unless the operator said
+        # they may go with the tenant (RFC-0055 §11, 2026-11-20).
+        self.accounts = accounts
         self.probe = probe or _https_status
         self.sleep = sleep or time.sleep
 
@@ -10108,6 +10111,23 @@ class _BuildDrivers:
                     "halbem Weg stehen. Erlaube, dass die Daten dieser Instanzen "
                     "mit gelöscht werden (--purge-instances / der Haken auf der "
                     "Seite), oder entferne die Instanzen und ihre Daten vorher selbst")
+        # The same for the tenant's local accounts (2026-11-20, kit1 on
+        # oaapx01): the first administrator a build waits for is an account
+        # of the tenant, and an account holds the tenant.
+        tid, t = self._tenant()
+        if (not self.accounts and t
+                and any(m == f"tenant:{tid}" for m in made)):
+            try:
+                code, body = tenant_accounts_delete(tid, self.who, dry=True)
+            except (Exception, SystemExit):     # identity unreachable: the
+                code, body = 0, {}              # undo step says it then
+            names = (body.get("would_delete") or []) if code == 200 else []
+            if names:
+                return (f"der Mandant hat {len(names)} Konto/Konten "
+                        f"({', '.join(names)}); ein Konto hält den Mandanten "
+                        "fest -- der Rückbau bliebe auf halbem Weg stehen. "
+                        "Erlaube, dass die Konten mit dem Mandanten gelöscht "
+                        "werden (--purge-accounts / der Haken auf der Seite)")
         return ""
 
     # tenant.create -------------------------------------------------------
@@ -10130,10 +10150,23 @@ class _BuildDrivers:
         return ok, note, ([f"tenant:{tid}"] if ok and tid else [])
 
     def _undo_tenant_create(self, a, item, ctx):
-        if not self._tenant()[1]:
+        tid, t = self._tenant()
+        if not t:
             return True, "der Mandant war schon entfernt"
-        return self._verb(["tenant", "remove", self.label, "--yes"],
-                          "der (leere) Mandant wurde entfernt")
+        gone = ""
+        if self.accounts:
+            code, body = tenant_accounts_delete(tid, self.who)
+            if code != 200:
+                return False, ("die Konten des Mandanten bleiben: "
+                               + str(body.get("error") or f"identity {code}"))
+            if body.get("deleted"):
+                gone = f"; Konten gelöscht: {', '.join(body['deleted'])}"
+        ok, note = self._verb(["tenant", "remove", self.label, "--yes"],
+                              "der (leere) Mandant wurde entfernt")
+        if not ok and not self.accounts and "user account" in note:
+            note += (" -- die Konten gehen mit, wenn du es sagst "
+                     "(--purge-accounts / der Haken auf der Seite)")
+        return ok, note + gone
 
     # address.ensure / address.wait ----------------------------------------
     def _check_address_ensure(self, a, ctx):
@@ -10874,6 +10907,7 @@ def tenant_build_job(req, role, actor):
     if role != "server_admin":
         return False, "building a tenant needs server_admin", bid
     purge = bool(a.get("purge_instances"))
+    accounts = bool(a.get("purge_accounts"))
     try:
         if op == "start":
             params = a.get("params")
@@ -10886,12 +10920,14 @@ def tenant_build_job(req, role, actor):
                 str(a.get("profile") or ""),
                 {k: str(v) for k, v in params.items()}, actor, role)
         elif op == "continue":
-            state = tenant_build_continue(bid, actor, role, purge=purge)
+            state = tenant_build_continue(bid, actor, role, purge=purge,
+                                          accounts=accounts)
         elif op == "confirm":
             state = tenant_build_confirm(bid, str(a.get("step") or ""),
                                          actor, role)
         elif op == "rollback":
-            state = tenant_build_rollback(bid, actor, role, purge=purge)
+            state = tenant_build_rollback(bid, actor, role, purge=purge,
+                                          accounts=accounts)
         else:
             return False, f"unknown build operation '{op}'", bid
     except tenant_build.Refusal as exc:
@@ -11276,7 +11312,8 @@ def _build_load(bid, who, role):
     return state, profile, digest
 
 
-def tenant_build_continue(bid, who, role, drivers=None, purge=False):
+def tenant_build_continue(bid, who, role, drivers=None, purge=False,
+                          accounts=False):
     state, profile, digest = _build_load(bid, who, role)
     if state["state"] in ("done", "rolled-back"):
         raise tenant_build.Refusal(f"build {bid} is {state['state']}")
@@ -11285,7 +11322,8 @@ def tenant_build_continue(bid, who, role, drivers=None, purge=False):
             "the profile file changed since this build started (its digest "
             "differs); start a new build instead of continuing this one")
     if state.get("rolling_back"):
-        return _build_rollback_drive(state, profile, who, role, drivers, purge)
+        return _build_rollback_drive(state, profile, who, role, drivers, purge,
+                                     accounts)
     return _build_drive(state, profile, who, role, drivers)
 
 
@@ -11296,17 +11334,20 @@ def tenant_build_confirm(bid, step, who, role, drivers=None):
 
 
 def _build_rollback_drive(state, profile, who, role, drivers=None,
-                          purge=False):
-    drivers = drivers or _BuildDrivers(state["label"], who, role, purge=purge)
+                          purge=False, accounts=False):
+    drivers = drivers or _BuildDrivers(state["label"], who, role, purge=purge,
+                                       accounts=accounts)
     with tenant_build.RunLock(BUILD_DIR, state["id"]):
         return tenant_build.rollback(state, profile, drivers, BUILD_DIR)
 
 
-def tenant_build_rollback(bid, who, role, drivers=None, purge=False):
+def tenant_build_rollback(bid, who, role, drivers=None, purge=False,
+                          accounts=False):
     state, profile, _digest = _build_load(bid, who, role)
     if state["state"] == "rolled-back":
         raise tenant_build.Refusal(f"build {bid} is already rolled back")
-    return _build_rollback_drive(state, profile, who, role, drivers, purge)
+    return _build_rollback_drive(state, profile, who, role, drivers, purge,
+                                 accounts)
 
 
 def _print_build(state, as_json=False):
@@ -11385,7 +11426,8 @@ def _tenant_build_cli(args):
                 die(f"which build? oaap tenant build {sub} <build id>")
             if sub == "continue":
                 got = tenant_build_continue(
-                    arg, who, "root", purge=bool(args.purge_instances))
+                    arg, who, "root", purge=bool(args.purge_instances),
+                    accounts=bool(args.purge_accounts))
             elif sub == "confirm":
                 if not args.step:
                     die("which step? oaap tenant build confirm <id> --step <id>")
@@ -11402,6 +11444,22 @@ def _tenant_build_cli(args):
                         print("  (this build made nothing)")
                     print("The realm and every person in it stay. A tenant "
                           "that holds anything is not removed.")
+                    if any(m.startswith("tenant:") for _s, m in made):
+                        try:
+                            code, body = tenant_accounts_delete(
+                                state["label"], who, dry=True)
+                        except (Exception, SystemExit):
+                            code, body = 0, {"error": "identity antwortet "
+                                                      "nicht; nicht geprüft"}
+                        names = body.get("would_delete") or []
+                        if code == 200 and names:
+                            print(f"The tenant holds {len(names)} local "
+                                  f"account(s): {', '.join(names)} -- they "
+                                  "keep it from being removed. To delete them "
+                                  "with the tenant, say so: --purge-accounts")
+                        elif code not in (200, 404):
+                            print("Accounts: " + str(body.get("error") or code),
+                                  flush=True)
                     if any(m.startswith("instance:") for _s, m in made):
                         print("The data of the instance(s) above is KEPT "
                               "(and then keeps the tenant from being "
@@ -11410,7 +11468,8 @@ def _tenant_build_cli(args):
                     print("Nothing was changed. Add --yes to do it.")
                     return
                 got = tenant_build_rollback(
-                    arg, who, "root", purge=bool(args.purge_instances))
+                    arg, who, "root", purge=bool(args.purge_instances),
+                    accounts=bool(args.purge_accounts))
             _print_build(got, as_json)
             if got["state"] == "failed":
                 sys.exit(1)
@@ -25881,6 +25940,16 @@ def cmd_support_cleanup_note(args):
 # create whom, what deletion refuses) live there once. Each returns
 # (http-like status, body), the shape identity's own functions answer in.
 
+def tenant_accounts_delete(tenant, actor, dry=False):
+    """All local accounts of one tenant, for the rollback that removes it
+    (identity's `_delete_tenant_accounts`). -> (code, body)."""
+    return _identity_user_call(
+        "with m.users_rw() as users:\n"
+        "    body, code = m._delete_tenant_accounts(a['tenant'], users,\n"
+        "        os.environ['OAAP_U_ACTOR'], 'server_admin', dry=a['dry'])",
+        {"tenant": tenant, "dry": bool(dry)}, actor or _operator_name())
+
+
 def _identity_user_call(fn, args_json, actor):
     """Run one of identity's user functions as the node's operator.
 
@@ -38639,6 +38708,11 @@ def build_parser():
                       action="store_true",
                       help="for 'build rollback': delete the data of the "
                            "instances this build installed, too")
+    pten.add_argument("--purge-accounts", dest="purge_accounts",
+                      action="store_true",
+                      help="for 'build rollback': delete the tenant's local "
+                           "accounts with it (never a server_admin, never "
+                           "one with a working API key; realm persons stay)")
     pten.add_argument("--step", default=None,
                       help="for 'build confirm': the waiting step")
     pten.add_argument("--json", dest="as_json", action="store_true",

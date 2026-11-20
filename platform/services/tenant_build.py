@@ -348,6 +348,11 @@ def profile_problems(doc):
                        + "/".join(PARAM_KINDS))
         elif spec["kind"] == "apps":
             out += _apps_spec_problems(name, spec)
+        if isinstance(spec, dict) and "distinct" in spec and (
+                spec.get("kind") not in ("word", "text")
+                or not WORD_RE.match(str(spec.get("distinct") or ""))):
+            out.append(f"parameter '{name}': 'distinct' names a group (a short "
+                       "lowercase word) and goes with kind word or text")
     if "label" not in params or (params.get("label") or {}).get("kind") != "label":
         out.append("a profile needs a parameter 'label' of kind label")
     steps = doc.get("steps")
@@ -712,6 +717,20 @@ def param_values(profile, given, label_check=None):
             problems.append(f"parameter '{name}': {bad}")
         else:
             values[name] = str(val)
+    # `distinct`: parameters of one group must differ -- two instance names
+    # of a profile that came out the same would make the second install
+    # meet the first (RFC-0104, the names an operator sets before the start).
+    groups = {}
+    for name, spec in params.items():
+        grp = spec.get("distinct") if isinstance(spec, dict) else None
+        val = values.get(name)
+        if grp and val is not None:
+            groups.setdefault(grp, {}).setdefault(val.strip().lower(), []).append(name)
+    for grp, by_val in groups.items():
+        for val, names in by_val.items():
+            if len(names) > 1:
+                problems.append(f"parameters {', '.join(repr(n) for n in names)}: "
+                                f"'{val}' twice -- these must differ")
     return values, problems
 
 

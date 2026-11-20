@@ -517,6 +517,7 @@ def build_verb(bid, verb):
         args["step"] = step
     if verb in ("continue", "rollback"):
         args["purge_instances"] = body.get("purge_instances") is True
+        args["purge_accounts"] = body.get("purge_accounts") is True
     return _build_submit(tid, role, verb, args)
 
 
