@@ -176,8 +176,9 @@ r = refused({"id": "x", "type": "destination.ensure", "name": "ki", "instance": 
              "target": "https://x", "auth": "bearer", "secret": "sk-1"}, "never holds a secret")
 ok("ein Geheimnis im Profil wird abgelehnt", *r)
 r = refused({"id": "x", "type": "destination.ensure", "name": "sap", "instance": "c",
-             "target": "https://x", "auth": "principal_propagation"}, "auth is one of")
-ok("Durchreichen der Person ist keine Anmeldung fuer ein Profil", *r)
+             "target": "https://x", "auth": "principal_propagation"}, "pin_step")
+ok("Durchreichen der Person nur mit einem frueheren Schritt, in dem ein Mensch den "
+   "Fingerabdruck verglich (RFC-0109 Stufe 3); nie ein Pin im Profil", *r)
 r = refused({"id": "x", "type": "destination.ensure", "name": "b", "instance": "c",
              "target": "https://x", "auth": "basic"}, "needs 'user'")
 ok("basic ohne Benutzer wird abgelehnt", *r)

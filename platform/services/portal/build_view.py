@@ -35,6 +35,9 @@ STEP_TYPE = {
     "app.setup": "In einer App einrichten (Einrichtungstür)",
     "manual": "Ein Mensch erledigt das",
     "backup.check": "Sicherung prüfen",
+    # RFC-0109 Stufe 3
+    "idp.claim": "Attribut und Scope im Anmeldedienst",
+    "destination.bind": "Destination zuordnen (auch als die Person)",
 }
 OPEN_STATES = ("running", "waiting", "failed")
 BUILD_RE = re.compile(r"^b-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
@@ -292,8 +295,17 @@ def detail(build):
                "human": r.get("type") == "manual"}
         steps.append(row)
         if st == "waiting" and waiting is None:
-            waiting = {**row, "text": r.get("text") or r.get("note", ""),
-                       "confirmable": r.get("done_when") == "confirmed"}
+            # RFC-0109 Stufe 3: was der Knoten las, steht im Hinweis (der
+            # Fingerabdruck, das gebrochene Glied der Kette)
+            reads = r.get("done_when") in ("server.compared", "destination.check")
+            fp = str(r.get("offered_sha256") or "")
+            waiting = {**row, "text": (r.get("note") if reads else None)
+                       or r.get("text") or r.get("note", ""),
+                       "confirmable": r.get("done_when") == "confirmed"
+                       or (r.get("done_when") == "server.compared" and len(fp) == 64),
+                       "compare": r.get("done_when") == "server.compared",
+                       "fingerprint": fp,
+                       "shown": ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()}
         if st == "failed" and failed is None:
             failed = row
     made_instances = any(m.startswith("instance:") for r in build.get("steps") or []

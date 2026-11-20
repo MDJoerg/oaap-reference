@@ -31,6 +31,8 @@ PROFILE_FORMAT = "oaap.tenant-profile/1"
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 PARAM_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 WORD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# the attributes the platform propagates (idp.PROPAGATE_CLAIM_RE, oaap.core.identity 2.11)
+CLAIM_RE = re.compile(r"sap_user(_[a-z0-9]{1,16})?")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # b- a build (RFC-0055), r- a run of a recipe (RFC-0109): one engine, one
 # state format, two folders.
@@ -89,29 +91,63 @@ STEP_TYPES = {
     # secret: one that needs it is made without, and a `manual` step with
     # done_when "destination.secret" waits for a human to enter it.
     "destination.ensure": (("name", "instance", "target"),
-                           ("auth", "user", "header", "need")),
+                           ("auth", "user", "header", "need",
+                            # RFC-0109 section 12 (stage 3): principal
+                            # propagation, pinned to the fingerprint a human
+                            # compared and confirmed in an earlier manual
+                            # step (done_when server.compared) -- `pin_step`
+                            # names it. Never a fingerprint in the profile.
+                            "pin_step", "claim", "name_check", "check_path")),
+    # RFC-0109 section 12: inside a realm the tenant already has -- the
+    # attribute the platform propagates (only administrators may edit it),
+    # a client scope that puts it into the token, on the platform's client.
+    # Made by the tenant's connector; nothing is ever deleted there.
+    "idp.claim":      (("claim",), ("scope",)),
+    # RFC-0109 section 12: bind an instance to a destination of its tenant,
+    # with `propagate: "true"` acting as the signed-in person -- a step of
+    # its own, after the chain test, not part of destination.ensure.
+    "destination.bind": (("name", "destination"), ("need", "propagate")),
     # RFC-0104 D2: what an instance's setup door should have in place --
     # a list of items {kind, id, ...}; the app creates them by its own
     # rules and never overwrites a human's work.
     "app.setup":      (("name", "items"), ()),
     # the arguments of the two reads that need them (MANUAL_READ_KEYS)
     "manual":         (("text", "done_when"), ("destination", "instance",
-                                               "kind", "item")),
+                                               "kind", "item", "target")),
     "backup.check":   ((), ()),
+    # RFC-0109 D9 (stage 3): a recipe's steps inside a profile. Expanded when
+    # the profile is read (RECIPE_EXPANDER), never driven as itself: `needs`
+    # is NEED=INSTANCE[,...], `with` is PARAM=VALUE[,...] (values may hold
+    # the profile's own placeholders).
+    "recipe.apply":   (("recipe",), ("needs", "with")),
 }
+# set by appctl: (profile, pins) -> (expanded profile, {recipe: digest},
+# problems); None leaves recipe.apply as it is (and nothing can drive it)
+RECIPE_EXPANDER = None
 # `when` names a bool parameter: the step is skipped unless it is true.
 COMMON_KEYS = ("id", "type", "label_text", "when")
 DONE_WHEN = ("user.exists", "role.tenant_admin", "confirmed",
-             "destination.secret", "setup.ready")
+             "destination.secret", "setup.ready",
+             # RFC-0109 section 12: the target's server certificate, read by
+             # the node, compared by a human and confirmed WITH the
+             # fingerprint they compared; and the chain test (RFC-0096)
+             "server.compared", "destination.check")
 # done_when -> the step keys it needs; no other done_when takes any
 MANUAL_READ_KEYS = {"destination.secret": ("destination", "instance"),
-                    "setup.ready": ("instance", "kind", "item")}
+                    "setup.ready": ("instance", "kind", "item"),
+                    "server.compared": ("target",),
+                    "destination.check": ("destination",)}
+# a waiting step of these says what the node read beside its text (the
+# fingerprint to compare, the link of the chain that broke)
+MANUAL_SHOWS_READING = ("server.compared", "destination.check")
+PROPAGATION_KEYS = ("pin_step", "claim", "name_check", "check_path")
 SETUP_ITEMS_MAX = 40
 SECRET_WORDS = ("key", "token", "secret", "password", "credentials")
-# what a destination.ensure may say about its authentication: no
-# principal propagation (RFC-0066 needs a pinned certificate a profile
-# cannot know), no mailbox
-ENSURE_AUTH = ("none", "basic", "bearer", "header")
+# what a destination.ensure may say about its authentication: no mailbox.
+# Principal propagation (RFC-0066) only with `pin_step`: the pinned
+# certificate is never in the profile, a human confirms it during the run
+# (RFC-0109 section 12).
+ENSURE_AUTH = ("none", "basic", "bearer", "header", "principal_propagation")
 
 STEP_STATES = ("pending", "running", "done", "failed", "waiting", "skipped")
 BUILD_STATES = ("running", "waiting", "failed", "done", "rolled-back")
@@ -300,8 +336,13 @@ def upload_problems(doc, known_apps=None):
     return out
 
 
-def read_profile_file(path):
-    """-> (profile dict, digest). Raises Refusal with one sentence."""
+def read_profile_file(path, pins=None):
+    """-> (profile dict, digest). Raises Refusal with one sentence.
+
+    RFC-0109 D9: a `recipe.apply` is expanded here, before the profile's
+    checks, by RECIPE_EXPANDER; `pins` ({recipe: digest}, from a build's
+    state) makes continue and rollback expand the same recipe files. The
+    expanded profile says which it used under `_recipes`."""
     try:
         size = os.path.getsize(path)
         if size > MAX_PROFILE_BYTES:
@@ -315,6 +356,12 @@ def read_profile_file(path):
         doc = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         raise Refusal("the profile is not valid JSON")
+    if RECIPE_EXPANDER is not None and isinstance(doc, dict):
+        doc, used, problems = RECIPE_EXPANDER(doc, pins)
+        if problems:
+            raise Refusal("the profile is refused: " + "; ".join(problems[:5]))
+        if used:
+            doc["_recipes"] = used
     problems = profile_problems(doc)
     if problems:
         raise Refusal("the profile is refused: " + "; ".join(problems[:5])
@@ -455,7 +502,7 @@ def profile_problems(doc):
                 if not st.get(k):
                     out.append(f"{where} ('{sid}'): done_when {st.get('done_when')} "
                                f"needs '{k}'")
-            for k in ("destination", "instance", "kind", "item"):
+            for k in ("destination", "instance", "kind", "item", "target"):
                 if k in st and k not in need:
                     out.append(f"{where} ('{sid}'): '{k}' is no argument of "
                                f"done_when {st.get('done_when')}")
@@ -471,6 +518,41 @@ def profile_problems(doc):
             for k in ("secret", "password", "token"):
                 if k in st:
                     out.append(f"{where} ('{sid}'): a profile never holds a secret")
+            if auth == "principal_propagation":
+                pin = st.get("pin_step")
+                earlier = {x.get("id"): x for x in steps[:i] if isinstance(x, dict)}
+                ref = earlier.get(pin) or {}
+                if not pin or ref.get("type") != "manual" \
+                        or ref.get("done_when") != "server.compared":
+                    out.append(f"{where} ('{sid}'): principal_propagation needs "
+                               "'pin_step' naming an EARLIER manual step with "
+                               "done_when server.compared -- the certificate is "
+                               "pinned to what a human compared, never to a "
+                               "value in the profile")
+                elif ref.get("target") != st.get("target"):
+                    out.append(f"{where} ('{sid}'): the pin step '{pin}' compares "
+                               "another target")
+                if st.get("name_check") not in (None, "", "sap"):
+                    out.append(f"{where} ('{sid}'): name_check is 'sap' or absent")
+            elif any(k in st for k in PROPAGATION_KEYS):
+                out.append(f"{where} ('{sid}'): "
+                           + ", ".join(k for k in PROPAGATION_KEYS if k in st)
+                           + " belong to auth principal_propagation")
+        if typ == "idp.claim":
+            claim = st.get("claim")
+            if isinstance(claim, str) and not TEMPLATE_RE.search(claim) \
+                    and not CLAIM_RE.fullmatch(claim):
+                out.append(f"{where} ('{sid}'): claim is sap_user or sap_user_<x> "
+                           "(the attributes the platform propagates)")
+            scope = st.get("scope", "sap")
+            if isinstance(scope, str) and not TEMPLATE_RE.search(scope) \
+                    and not WORD_RE.match(scope):
+                out.append(f"{where} ('{sid}'): scope is a short lowercase word")
+        if typ == "destination.bind":
+            prop = st.get("propagate", "false")
+            if isinstance(prop, str) and not TEMPLATE_RE.search(prop) \
+                    and prop not in ("true", "false"):
+                out.append(f"{where} ('{sid}'): propagate is \"true\" or \"false\"")
     return out
 
 
@@ -1067,8 +1149,10 @@ def run(state, profile, drivers, root, now=iso_now):
                     drivers, now)
             continue
         if typ == "manual":
-            return _stop(state, rec, "waiting", _sentence(args["text"], TEXT_LIMIT),
-                         root, drivers, now)
+            said = _sentence(args["text"], TEXT_LIMIT)
+            if args.get("done_when") in MANUAL_SHOWS_READING and note:
+                said += " -- " + _sentence(note, 600)
+            return _stop(state, rec, "waiting", said, root, drivers, now)
         res, bad = _safe(drivers.do, typ, args, ctx)
         if res is None:
             return _stop(state, rec, "failed", bad, root, drivers, now)
@@ -1113,8 +1197,13 @@ def _stop(state, rec, kind, note, root, drivers, now):
     return state
 
 
-def confirm(state, step_id, root):
-    """A human says a `manual` step with done_when 'confirmed' is done."""
+def confirm(state, step_id, root, value=""):
+    """A human says a `manual` step with done_when 'confirmed' is done.
+
+    RFC-0109 section 12: a step with done_when 'server.compared' is
+    confirmed WITH the fingerprint the human compared (`value`); the
+    driver's next read pins exactly that, and only while the target still
+    presents it."""
     for rec in state["steps"]:
         if rec["id"] == step_id:
             if rec["type"] != "manual":
@@ -1122,6 +1211,15 @@ def confirm(state, step_id, root):
             if rec["state"] != "waiting":
                 raise Refusal(f"step '{step_id}' is not waiting "
                               f"(it is {rec['state']})")
+            if rec.get("done_when") == "server.compared":
+                fp = re.sub(r"[^0-9a-f]", "", str(value or "").lower())
+                if len(fp) != 64:
+                    raise Refusal(f"step '{step_id}' is confirmed with the SHA-256 "
+                                  "fingerprint you compared (64 hex digits)")
+                if rec.get("offered_sha256") and fp != rec["offered_sha256"]:
+                    raise Refusal("that is not the fingerprint the target showed; "
+                                  "nothing was confirmed")
+                rec["accepted_sha256"] = fp
             rec["confirmed"] = True
             save_state(root, state)
             return state

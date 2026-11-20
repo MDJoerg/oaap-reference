@@ -160,7 +160,8 @@ print("=== wer, und wo ===")
 r = c.get("/einrichten", headers=H)
 t = r.get_data(as_text=True)
 ok("tenant_admin von kunde an seinem Ort: das freigegebene Rezept, seine Läufe, der Menüpunkt",
-   r.status_code == 200 and "Hilfe-Assistent im Chat" in t and "Nur Betreiber" not in t
+   r.status_code == 200 and "Hilfe-Assistent im Chat" in t
+   and "Nur Betreiber" not in t.split("Anfragen an den Betreiber")[0]
    and RUN_K["id"] in t and RUN_P["id"] not in t and 'href="/einrichten"' in t, t[-800:])
 as_("tenant_admin", "t-pxx", "t-pxx")
 t = c.get("/einrichten", headers=H).get_data(as_text=True)
@@ -273,6 +274,40 @@ as_("tenant_admin", "t-kunde", None)
 r = c.post("/aufbau/rezepte/freigabe", headers=H,
            data={"recipe": "nur-betreiber", "tenant": "kunde", "op": "release"})
 ok("ein tenant_admin gibt nichts frei: 403", r.status_code == 403 and len(QUEUED) == n + 1)
+
+print("=== Stufe 3: Fingerabdruck vergleichen ===")
+FPX = "ab" * 32
+RUN_W = dict(RUN_K, id="r-20261120t110000-kunde", state="waiting", recipe="sap-sso",
+             title="SAP SSO einrichten",
+             steps=[{"id": "zertifikat", "type": "manual", "state": "waiting",
+                     "done_when": "server.compared", "offered_sha256": FPX,
+                     "text": "vergleichen", "note": "vergleichen -- das Ziel zeigt SHA-256 AB:AB"}])
+json.dump({"schema": "0.2", **dict(VIEW, runs=[RUN_W, RUN_P, RUN_K])}, open(VF, "w"))
+as_("tenant_admin", "t-kunde", "t-kunde")
+t = c.get(f"/einrichten/lauf/{RUN_W['id']}", headers=H).get_data(as_text=True)
+ok("der wartende Schritt zeigt den Fingerabdruck und den Haken zum Vergleichen",
+   "AB:AB:AB" in t and 'name="compared"' in t and "pinnen" in t, t[-1500:])
+n = len(QUEUED)
+r = c.post(f"/einrichten/lauf/{RUN_W['id']}/confirm", headers=H, data={"step": "zertifikat"})
+ok("ohne Haken: nichts im Spool", len(QUEUED) == n and "err=" in r.headers["Location"])
+r = c.post(f"/einrichten/lauf/{RUN_W['id']}/confirm", headers=H,
+           data={"step": "zertifikat", "compared": "1", "value": "cd" * 32})
+q = QUEUED[-1]
+ok("mit Haken: confirm mit dem angebotenen Fingerabdruck, nie einem eingetippten",
+   len(QUEUED) == n + 1 and q["op"] == "confirm" and q["args"]["value"] == FPX
+   and q["args"]["step"] == "zertifikat", q)
+
+print("=== Stufe 3: Einrichten… von der Seite einer Instanz ===")
+ok("die Rezepte, die eine App brauchen -- nur, was diese Person hier ausführen darf",
+   rv.recipes_needing(VIEW, "kunde", "tenant_admin", "help")
+   == [{"id": "hilfe-assistent", "title": "Hilfe-Assistent im Chat", "need": "help"}]
+   and rv.recipes_needing(VIEW, "pxx", "tenant_admin", "help") == []
+   and [r["id"] for r in rv.recipes_needing(VIEW, "pxx", "server_admin", "help")]
+   == ["hilfe-assistent", "nur-betreiber"])
+as_("tenant_admin", "t-kunde", "t-kunde")
+t = c.get("/einrichten/rezept/hilfe-assistent?help=hilfe&boese=x", headers=H).get_data(as_text=True)
+ok("der Link füllt die Instanz vor, sonst nichts",
+   'name="help" value="hilfe"' in t and "boese" not in t, t[-1200:])
 
 print("")
 print("PASS: alles" if not fails else f"FAIL: {fails}")

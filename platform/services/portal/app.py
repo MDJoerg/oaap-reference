@@ -3333,6 +3333,15 @@ INSTANCE_EDIT_BODY = """
 </nav>
 
 <section class="panel {{ 'active' if tab == 'ueberblick' }}">
+{% if i.setup_recipes %}
+<div class="card" id="einrichten">
+  <h2>Einrichten…</h2>
+  <p class="muted">Rezepte, die mit dieser App arbeiten. „Was fehlt noch?“ fragt die Apps und ändert nichts.</p>
+  <ul>{% for r in i.setup_recipes %}
+    <li><a href="/einrichten/rezept/{{ r.id }}?{{ r.need }}={{ i.name|urlencode }}">{{ r.title }}</a></li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
 """ + MCP_CARD + """
 <div class="card">
   <h2>Was die App mitbringt</h2>
@@ -10141,6 +10150,12 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
             instance_metrics.window(METRICS_DIR, tid, name, wkey, now=now), wkey, now,
             f"/instances/{quote(name)}?tab=diagnose&", "Verlauf", "verlauf"))
         i["mx_style"] = Markup(metrics_view.STYLE)
+    # RFC-0109 §7 (stage 3): "Einrichten…" -- the recipes that need this
+    # app, for whoever may run them in this instance's tenant
+    sc = _recipe_scope()
+    i["setup_recipes"] = (recipe_view.recipes_needing(
+        _recipe_view(), sc[1], sc[2], inst.get("app_id", ""))
+        if sc and sc[0] == tid and not inst.get("rehearsal") else [])
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
                 # Carried back by _inst_back after a refused removal, so
@@ -13183,6 +13198,31 @@ braucht eine neue Freigabe.</p>
 </table>
 </div>
 {% endif %}
+<div class="card" id="anfragen" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Anfragen der Mandanten</h2>
+<p class="muted">Ein <code>tenant_admin</code> fragt unter „Einrichten“ beim Betreiber an. Die
+Plattform schreibt die Anfrage als Vorgang in den Posteingang unten (eine Instanz der App
+Vorgänge im eigenen Mandanten des Knotens); ohne Posteingang geht sie als Nachricht an die
+Verteiler des Knotens. Antworten im Vorgang sieht der Mandant auf seiner Seite.</p>
+<form method="post" action="/aufbau/rezepte/posteingang">
+  <label for="q-inbox"><strong>Posteingang</strong></label>
+  <select id="q-inbox" name="inbox"><option value="off" {% if not recipe_inbox %}selected{% endif %}>– keiner (Nachricht) –</option>
+    {% for k in recipe_inbox_choices %}<option value="{{ k }}" {% if k == recipe_inbox %}selected{% endif %}>{{ k }}</option>{% endfor %}
+  </select>
+  <button class="btn">Speichern</button>
+  {% if not recipe_inbox_choices %}<span class="muted">Im eigenen Mandanten des Knotens läuft keine Vorgänge-Instanz.</span>{% endif %}
+</form>
+{% if recipe_requests %}
+<table>
+  <tr><th>Mandant</th><th>Anfrage</th><th>Stand</th><th>Gestellt</th></tr>
+  {% for q in recipe_requests %}
+  <tr><td>{{ q.label }}</td><td><strong>{{ q.what }}</strong>{% if q.text and q.text != q.what %}<br><span class="muted">{{ q.text[:200] }}</span>{% endif %}</td>
+    <td><span class="badge {{ '' if q.tone == 'ok' else 'off' if q.tone == 'off' else 'todo' }}">{{ q.state }}</span>{% if q.case %}<br><span class="muted">{{ q.case }}</span>{% endif %}</td>
+    <td>{{ q.created }}<br><span class="muted">{{ q.by }}</span></td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">Keine offene Anfrage.</p>{% endif %}
+</div>
 <p class="muted">Anhalten gibt es nicht: ein Aufbau läuft bis zu einem Wartepunkt oder
 bis zu einem Fehler. Dieselbe Mechanik steht in der Verwaltungs-API
 (<code>/api/v1/operator/tenant-builds</code>, nur mit einer Anmeldung als
@@ -13265,13 +13305,24 @@ BUILD_NEW_BODY = """
 BUILD_DETAIL_BODY = """
 <a class="back" href="/aufbau">← Zurück zur Liste</a>
 """ + BUILD_BANNER + """
+{% if b.raw_state == 'done' and setup_url %}
+<div class="card"><p>Fertig. Was später dazukommt, richtet der Mandant unter
+<a href="{{ setup_url }}">Einrichten</a> ein (Rezepte, RFC-0109) -- auch sein
+<code>tenant_admin</code>, sobald Du ihm ein Rezept freigibst.</p></div>
+{% endif %}
 {% if b.waiting %}
 <div class="card warn">
   <h2>Hier ist ein Mensch gefragt</h2>
   <p>{{ b.waiting.text }}</p>
   <form method="post" action="/aufbau/{{ b.id }}/continue" style="display:inline">
     <button class="btn">Weiter prüfen</button></form>
-  {% if b.waiting.confirmable %}
+  {% if b.waiting.confirmable and b.waiting.compare %}
+  <form method="post" action="/aufbau/{{ b.id }}/confirm">
+    <input type="hidden" name="step" value="{{ b.waiting.id }}">
+    <p>Fingerabdruck (SHA-256), den das Ziel jetzt zeigt:<br><code style="word-break:break-all">{{ b.waiting.shown }}</code></p>
+    <label><input type="checkbox" name="compared" value="1"> Mit dem Zertifikat in STRUST verglichen; er stimmt überein</label>
+    <button class="btn">Stimmt überein – pinnen</button></form>
+  {% elif b.waiting.confirmable %}
   <form method="post" action="/aufbau/{{ b.id }}/confirm" style="display:inline">
     <input type="hidden" name="step" value="{{ b.waiting.id }}">
     <button class="btn">Bestätigt</button></form>
@@ -13370,6 +13421,9 @@ def build_page():
                 recipes=[dict(r, released_text=recipe_view.released_text(r))
                          for r in rv.get("recipes") or []],
                 recipe_tenants=rv.get("tenants") or [],
+                recipe_requests=recipe_view.open_requests(rv),
+                recipe_inbox=rv.get("inbox") or "",
+                recipe_inbox_choices=rv.get("inbox_choices") or [],
                 job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
                 error=request.args.get("err"))
 
@@ -13393,6 +13447,23 @@ def recipe_release_page():
     jid = management_api.enqueue(sc[0], sc[1], op, {"recipe": rid, "tenant": label},
                                  action="tenant-recipe")
     return redirect(f"/aufbau?job={jid}")
+
+
+@app.post("/aufbau/rezepte/posteingang")
+def recipe_inbox_page():
+    """Name the node's request inbox (RFC-0109 section 13) -- the host
+    judges it again (a production `vorgaenge` of the node's own tenant)."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    inbox = request.form.get("inbox", "")
+    if inbox != "off" and inbox not in (_recipe_view().get("inbox_choices") or []):
+        return redirect("/aufbau?err=" + quote("Diesen Posteingang gibt es nicht; nichts geändert."))
+    jid = management_api.enqueue(sc[0], sc[1], "inbox", {"inbox": inbox},
+                                 action="tenant-recipe")
+    return redirect(f"/aufbau?job={jid}#anfragen")
 
 
 def _build_new(pid, values=None, error=None, status=200):
@@ -13468,7 +13539,10 @@ def build_detail_page(bid):
         return page(BUILD_LIST_BODY, "Aufbau", "build", status=404,
                     rows=build_view.rows(view), profiles=build_view.profiles(view),
                     job=None, error="Diesen Aufbau gibt es nicht.")
+    ext = external_host()
     return page(BUILD_DETAIL_BODY, b.get("label", "Aufbau"), "build",
+                setup_url=(f"https://{b.get('label')}.{ext}/einrichten"
+                           if ext and b.get("label") else ""),
                 b=build_view.detail(b), job=_build_job_note(
                     sc[0], sc[1], request.args.get("job", "")),
                 error=request.args.get("err"))
@@ -13493,6 +13567,11 @@ def build_act_page(bid, verb):
             return redirect(f"/aufbau/{bid}?err=" + quote(
                 "Dieser Schritt wartet nicht auf eine Bestätigung."))
         args["step"] = step
+        if waiting.get("compare"):
+            if request.form.get("compared") != "1":
+                return redirect(f"/aufbau/{bid}?err=" + quote(
+                    "Bitte erst vergleichen und den Haken setzen; nichts wurde gepinnt."))
+            args["value"] = waiting["fingerprint"]
     if verb == "rollback":
         if request.form.get("confirm", "").strip() != b.get("label"):
             return redirect(f"/aufbau/{bid}?err=" + quote(
@@ -13631,6 +13710,38 @@ gibt Rezepte frei; brauchst Du eines, frag ihn.</p>{% endif %}
 </table>
 {% else %}<p class="muted">Noch kein Lauf in diesem Mandanten.</p>{% endif %}
 </div>
+<div class="card" id="anfragen" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Anfragen an den Betreiber</h2>
+<p class="muted">Ein Rezept, das hier nicht freigegeben ist, ein Schritt, den Du nicht allein
+ausführen darfst, oder etwas ganz anderes: frag den Betreiber. Die Plattform schreibt die
+Anfrage für Dich {% if inbox %}als Vorgang in seinen Posteingang{% else %}als Nachricht an ihn{% endif %};
+seine Antworten stehen hier.</p>
+{% if requests %}
+<table>
+  <tr><th>Anfrage</th><th>Stand</th><th>Gestellt</th></tr>
+  {% for q in requests %}
+  <tr><td><strong>{{ q.what }}</strong>{% if q.recipe %} <span class="muted">Rezept {{ q.recipe }}</span>{% endif %}
+      {% if q.text and q.text != q.what %}<br><span class="muted" style="white-space:pre-wrap">{{ q.text[:400] }}</span>{% endif %}
+      {% for x in q.replies %}<br><span class="muted">{{ x.by }}{% if x.status_label %} ({{ x.status_label }}){% endif %}:</span> <span style="white-space:pre-wrap">{{ x.text }}</span>{% endfor %}
+      {% if q.note and q.tone == 'err' %}<br><span class="err">{{ q.note }}</span>{% endif %}</td>
+    <td><span class="badge {{ '' if q.tone == 'ok' else 'off' if q.tone == 'off' else 'todo' }}">{{ q.state }}</span>{% if q.case %}<br><span class="muted">{{ q.case }}</span>{% endif %}</td>
+    <td>{{ q.created }}<br><span class="muted">{{ q.by }}</span></td></tr>
+  {% endfor %}
+</table>
+<form method="post" action="/einrichten/anfragen/stand"><button class="rowaction">Stand holen</button></form>
+{% else %}<p class="muted">Noch keine Anfrage.</p>{% endif %}
+<h3>Beim Betreiber anfragen</h3>
+<form method="post" action="/einrichten/anfrage">
+  <p><label for="q-recipe"><strong>Rezept</strong> (wenn es um eines geht)</label><br>
+  <select id="q-recipe" name="recipe"><option value="">– keines, nur Text –</option>
+    {% for r in requestable %}<option value="{{ r.id }}">{{ r.title }} ({{ r.id }})</option>{% endfor %}
+  </select></p>
+  <p><label for="q-text"><strong>Was wird gebraucht?</strong></label><br>
+  <textarea id="q-text" name="text" rows="4" maxlength="2000" style="width:100%" placeholder="z. B. Wir brauchen SAP SSO für unser System A4H."></textarea></p>
+  <button class="btn">Beim Betreiber anfragen</button>
+  <span class="muted">Kein Passwort und kein Schlüssel hier hinein – der Betreiber fragt nach, wenn er etwas braucht.</span>
+</form>
+</div>
 """
 
 RECIPE_FORM_BODY = """
@@ -13684,6 +13795,14 @@ RECIPE_FORM_BODY = """
 {% endif %}
 {% if state == 'complete' %}<p class="ok">Alles ist vorhanden; ein Lauf hätte nichts zu tun.</p>
 {% elif state == 'blocked' %}<p class="err">Ein Lauf hielte hier an, bevor er etwas tut. Den Konflikt in der App klären oder den Betreiber fragen.</p>
+<form method="post" action="/einrichten/anfrage">
+  <input type="hidden" name="recipe" value="{{ recipe.id }}">
+  {% for k, v in (preview.params or {}).items() %}<input type="hidden" name="v_{{ k }}" value="{{ v }}">{% endfor %}
+  <p><label for="q-text">Was soll der Betreiber wissen?</label><br>
+  <textarea id="q-text" name="text" rows="3" maxlength="2000" style="width:100%"></textarea></p>
+  <button class="btn">Beim Betreiber anfragen</button>
+  <span class="muted">Die Anfrage nimmt diese Vorschau mit, nichts sonst.</span>
+</form>
 {% elif state == 'ready' %}
 <form method="post" action="/einrichten/rezept/{{ recipe.id }}/lauf">
   {% for k, v in run_values.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
@@ -13706,7 +13825,13 @@ RECIPE_RUN_BODY = """
   <p>{{ b.waiting.text }}</p>
   <form method="post" action="/einrichten/lauf/{{ b.id }}/continue" style="display:inline">
     <button class="btn">Weiter prüfen</button></form>
-  {% if b.waiting.confirmable %}
+  {% if b.waiting.confirmable and b.waiting.compare %}
+  <form method="post" action="/einrichten/lauf/{{ b.id }}/confirm">
+    <input type="hidden" name="step" value="{{ b.waiting.id }}">
+    <p>Fingerabdruck (SHA-256), den das Ziel jetzt zeigt:<br><code style="word-break:break-all">{{ b.waiting.shown }}</code></p>
+    <label><input type="checkbox" name="compared" value="1"> Ich habe ihn mit dem Zertifikat in STRUST verglichen; er stimmt überein</label>
+    <button class="btn">Stimmt überein – pinnen</button></form>
+  {% elif b.waiting.confirmable %}
   <form method="post" action="/einrichten/lauf/{{ b.id }}/confirm" style="display:inline">
     <input type="hidden" name="step" value="{{ b.waiting.id }}">
     <button class="btn">Bestätigt</button></form>
@@ -13751,6 +13876,8 @@ def recipe_page():
     return page(RECIPE_LIST_BODY, "Einrichten", "setup", label=label, role=role,
                 recipes=recipe_view.recipes_for(rv, label, role),
                 runs=recipe_view.runs_for(rv, label),
+                requests=recipe_view.requests_for(rv, label),
+                requestable=recipe_view.requestable(rv), inbox=rv.get("inbox") or "",
                 job=_recipe_job(tid, role, request.args.get("job", "")),
                 error=request.args.get("err"))
 
@@ -13771,7 +13898,8 @@ def _recipe_form(sc, rid, status=200, error=None):
         run_values.update({n: c.get("name", "") for n, c in (preview.get("needs") or {}).items()
                            if not c.get("install")})
     return page(RECIPE_FORM_BODY, recipe.get("title") or rid, "setup", status=status,
-                recipe=recipe, label=label, fields=recipe_view.fields(recipe, preview),
+                recipe=recipe, label=label,
+                fields=recipe_view.fields(recipe, preview, prefill=request.args),
                 job=job if not preview else dict(job, text=job["text"]), preview=preview,
                 rows=recipe_view.preview_rows(preview),
                 state=recipe_view.preview_state(preview), run_values=run_values,
@@ -13810,6 +13938,39 @@ def recipe_start_page(rid, verb):
     return redirect(f"/einrichten?job={jid}")
 
 
+@app.post("/einrichten/anfrage")
+def recipe_request_page():
+    """"Beim Betreiber anfragen" (RFC-0109 section 13) -- a request the host
+    writes as a case (or a message); the tenant is the actor's own."""
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    got, why = recipe_view.request_form(request.form, _recipe_view())
+    if got is None:
+        return redirect("/einrichten?err=" + quote(why + " Nichts wurde gesendet.") + "#anfragen")
+    rid, values, text = got
+    jid = management_api.enqueue(tid, role, "request",
+                                 {"recipe": rid, "tenant": label, "params": values,
+                                  "text": text}, action="tenant-recipe")
+    return redirect(f"/einrichten?job={jid}#anfragen")
+
+
+@app.post("/einrichten/anfragen/stand")
+def recipe_requests_read_page():
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    jid = management_api.enqueue(tid, role, "requests", {"tenant": label},
+                                 action="tenant-recipe")
+    return redirect(f"/einrichten?job={jid}#anfragen")
+
+
 @app.get("/einrichten/lauf/<run_id>")
 def recipe_run_page(run_id):
     sc = _recipe_scope()
@@ -13844,6 +14005,13 @@ def recipe_run_act_page(run_id, verb):
             return redirect(f"/einrichten/lauf/{run_id}?err=" + quote(
                 "Dieser Schritt wartet nicht auf eine Bestätigung."))
         args["step"] = step
+        if waiting.get("compare"):
+            # the fingerprint the node offered, never one typed here; the
+            # host checks it again against what the target shows NOW
+            if request.form.get("compared") != "1":
+                return redirect(f"/einrichten/lauf/{run_id}?err=" + quote(
+                    "Bitte erst vergleichen und den Haken setzen; nichts wurde gepinnt."))
+            args["value"] = waiting["fingerprint"]
     if verb == "rollback" and request.form.get("confirm") != "1":
         return redirect(f"/einrichten/lauf/{run_id}?err=" + quote(
             "Bitte bestätigen; nichts wurde zurückgenommen."))

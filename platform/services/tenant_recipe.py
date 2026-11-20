@@ -10,7 +10,10 @@ may act in. Everything that touches the node is appctl's.
 Rules that carry the design:
 
 * A recipe never creates or shapes a tenant: no tenant.create, tenant.face,
-  tenant.policy, address.*, idp.*.
+  tenant.policy, address.*, idp.provision, idp.admin_group. Stage 3
+  (section 12): `idp.claim` works INSIDE the realm the tenant already has
+  (an attribute only administrators edit, a client scope), and
+  `destination.bind` binds with "acts as the person" after the chain test.
 * It names the APPS it needs; the instances are this tenant's, chosen by
   the person or pre-selected when the tenant has exactly one. A name that
   is not an instance of that app IN THIS TENANT is refused (S2).
@@ -36,7 +39,7 @@ TOP_KEYS = ("recipe", "id", "version", "title", "description", "needs",
 # what a recipe may do -- the profile's vocabulary minus everything that
 # makes or shapes the tenant; app.install comes only from `needs`
 STEP_TYPES = ("app.config", "destination.ensure", "app.setup", "manual",
-              "backup.check")
+              "backup.check", "idp.claim", "destination.bind")
 PARAM_KINDS = ("text", "word", "bool", "color", "setup_item", "light")
 LIGHTS = ("green", "yellow", "red")
 LIGHT_RANK = {"green": 0, "yellow": 1, "red": 2}
@@ -413,8 +416,16 @@ def preview(profile, values, drivers, ctx):
 
     verdict: present | absent | conflict | skipped | refused (the step
     cannot even be rendered or read). The setup doors answer their own dry
-    run inside the check (RFC-0104 D2)."""
+    run inside the check (RFC-0104 D2).
+
+    Stage 3 (measured on oaap-test, 2026-11-20): behind a manual step that
+    still waits for a human, what the apps say NOW about a later step may
+    depend on that human (a catalog only a person can read, a server made
+    two steps earlier). A conflict or refusal there is `later` -- shown
+    with its sentence, not a blocker; the run checks the step again before
+    it does it, and stops there."""
     rows = []
+    waits_for = ""
     for st in tb.steps_of(profile, values):
         row = {"id": st["id"], "type": st["type"]}
         if not tb.step_active(st, values):
@@ -426,9 +437,16 @@ def preview(profile, values, drivers, ctx):
             continue
         res, bad = tb._safe(drivers.check, st["type"], args, dict(ctx, step=row))
         if res is None:
-            rows.append(dict(row, verdict="refused", note=bad))
+            rows.append(dict(row, verdict="later" if waits_for else "refused",
+                             note=(f"erst nach '{waits_for}' prüfbar: " if waits_for else "")
+                             + str(bad)))
             continue
-        rows.append(dict(row, verdict=res[0], note=tb._sentence(res[1])))
+        verdict, note = res[0], tb._sentence(res[1])
+        if waits_for and verdict == tb.CONFLICT:
+            verdict, note = "later", f"erst nach '{waits_for}' prüfbar: {note}"
+        rows.append(dict(row, verdict=verdict, note=note))
+        if st["type"] == "manual" and verdict != tb.PRESENT and not waits_for:
+            waits_for = st["id"]
     return rows
 
 
@@ -440,7 +458,7 @@ def preview_blockers(rows):
 
 SAY = {tb.PRESENT: "vorhanden", tb.ABSENT: "wird angelegt",
        tb.CONFLICT: "Konflikt", "skipped": "nicht gewünscht",
-       "refused": "abgelehnt"}
+       "refused": "abgelehnt", "later": "erst danach prüfbar"}
 
 
 # ------------------------------------------------- tenant_admin scope (§5)
@@ -453,7 +471,11 @@ def tenant_admin_scope_problems(plan, config_is_secret=None):
     asks the app's manifest; without it a key is judged by its name."""
     out = []
     for sid, typ, a in plan:
-        if typ in ("app.setup", "manual", "backup.check", "app.install"):
+        # stage 3 (section 12): the operator's release of a recipe is the
+        # moment he says "this tenant may connect its own SAP system" -- an
+        # attribute in its own realm, a bind in its own tenant
+        if typ in ("app.setup", "manual", "backup.check", "app.install",
+                   "idp.claim", "destination.bind"):
             continue
         if typ == "app.config":
             key = str(a.get("key") or "")
@@ -464,7 +486,9 @@ def tenant_admin_scope_problems(plan, config_is_secret=None):
                            "erzeugter Wert -- das tut nur der Betreiber")
             continue
         if typ == "destination.ensure":
-            if (a.get("auth") or "none") != "none":
+            # principal propagation carries no secret (the issuing key never
+            # leaves the node) and is pinned to what a human compared
+            if (a.get("auth") or "none") not in ("none", "principal_propagation"):
                 out.append(f"Schritt '{sid}': eine Destination mit Zugangsdaten "
                            "legt nur der Betreiber an")
             continue
@@ -491,3 +515,129 @@ def new_run_state(doc, digest, values, chosen, by, now=None):
 def open_run_for(root, label):
     """The unfinished run in this tenant, or None (one at a time)."""
     return tb.open_build_for(root, label)
+
+
+# ------------------------------------------------------- recipe.apply (D9)
+# RFC-0109 D9 (stage 3): a profile step `recipe.apply` is made of the same
+# pieces a tenant_admin can repeat later. It is EXPANDED when the profile is
+# read -- before the profile's own checks -- into the recipe's steps, with
+# ids prefixed by the step's id, the needs named as instances of the build,
+# `{tenant}` as the build's `{label}`, and the recipe's parameters from
+# `with` (or their defaults). The build keeps the digest of every recipe it
+# expanded, so continue and rollback expand the same file again.
+
+PAIR_RE = re.compile(r"^\s*([a-z][a-z0-9_]{0,30})\s*=\s*(.*?)\s*$")
+_REF = re.compile(r"\{([a-z][a-z0-9_]*)\}")
+
+
+def _pairs(text, what):
+    out, bad = {}, []
+    for part in [x for x in str(text or "").split(",") if x.strip()]:
+        m = PAIR_RE.match(part)
+        if not m:
+            bad.append(f"{what}: '{part.strip()}' is not name=value")
+            continue
+        out[m.group(1)] = m.group(2)
+    return out, bad
+
+
+def _subst(value, mapping, missing):
+    if isinstance(value, str):
+        def one(m):
+            if m.group(1) in mapping:
+                return mapping[m.group(1)]
+            missing.add(m.group(1))
+            return m.group(0)
+        return _REF.sub(one, value)
+    if isinstance(value, list):
+        return [_subst(v, mapping, missing) for v in value]
+    if isinstance(value, dict):
+        return {k: _subst(v, mapping, missing) for k, v in value.items()}
+    return value
+
+
+def expand_apply(profile, load):
+    """-> (profile with every recipe.apply replaced, {recipe id: digest},
+    problems). `load(rid)` -> (recipe doc, digest) or raises Refusal."""
+    steps = (profile or {}).get("steps")
+    if not isinstance(steps, list) or not any(
+            isinstance(s, dict) and s.get("type") == "recipe.apply" for s in steps):
+        return profile, {}, []
+    out_steps, used, problems = [], {}, []
+    for st in steps:
+        if not isinstance(st, dict) or st.get("type") != "recipe.apply":
+            out_steps.append(st)
+            continue
+        sid = str(st.get("id") or "")
+        where = f"step '{sid}' (recipe.apply)"
+        extra = sorted(set(st) - {"id", "type", "recipe", "needs", "with", "when"})
+        if extra:
+            problems.append(f"{where}: {', '.join(extra)} is not an argument of recipe.apply")
+            continue
+        rid = str(st.get("recipe") or "")
+        try:
+            doc, digest = load(rid)
+        except tb.Refusal as exc:
+            problems.append(f"{where}: {exc}")
+            continue
+        bad = recipe_problems(doc)
+        if bad:
+            problems.append(f"{where}: the recipe '{rid}' is refused: {bad[0]}")
+            continue
+        used[rid] = digest
+        needs, b1 = _pairs(st.get("needs"), f"{where} needs")
+        given, b2 = _pairs(st.get("with"), f"{where} with")
+        problems += b1 + b2
+        mapping = {"tenant": "{label}"}
+        for n, spec in (doc.get("needs") or {}).items():
+            if isinstance(spec, dict) and spec.get("install") is True:
+                problems.append(f"{where}: the recipe installs '{spec.get('app')}' itself "
+                                "(install: true) -- in a profile the app.install is the "
+                                "profile's own step")
+            if not needs.get(n):
+                problems.append(f"{where}: needs names the instance for '{n}' "
+                                f"(app {(spec or {}).get('app')}), e.g. {n}=<instance>")
+            mapping[n] = needs.get(n, "")
+            # the node-wide key of an instance of the tenant being built:
+            # `<label>-<name>` (instance_key, RFC-0025 section 8.1)
+            mapping[n + KEY_SUFFIX] = "{label}-" + needs.get(n, "")
+        for n in needs:
+            if n not in (doc.get("needs") or {}):
+                problems.append(f"{where}: '{n}' is not a need of the recipe '{rid}'")
+        params = doc.get("params") or {}
+        for n in given:
+            if n not in params:
+                problems.append(f"{where}: '{n}' is not a parameter of the recipe '{rid}'")
+        for n, spec in params.items():
+            if n in given:
+                val = given[n]
+            elif "default" in (spec or {}):
+                val = str(spec["default"])
+            elif (spec or {}).get("required"):
+                problems.append(f"{where}: the recipe needs '{n}' (with: {n}=...)")
+                continue
+            else:
+                val = ""
+            if (spec or {}).get("kind") == "light" and not _REF.search(val) \
+                    and val not in LIGHTS:
+                problems.append(f"{where}: '{n}' is green, yellow or red")
+            mapping[n] = val
+        ids = {s["id"]: f"{sid}-{s['id']}" for s in doc.get("steps") or []
+               if isinstance(s, dict) and s.get("id")}
+        for rs in doc.get("steps") or []:
+            missing = set()
+            new = {k: (v if k in ("id", "type") else _subst(v, mapping, missing))
+                   for k, v in rs.items()}
+            new["id"] = ids.get(rs.get("id"), sid)
+            if "pin_step" in new:
+                new["pin_step"] = ids.get(rs.get("pin_step"), new["pin_step"])
+            if st.get("when"):
+                new["when"] = st["when"]
+            if not tb.ID_RE.match(new["id"]):
+                problems.append(f"{where}: '{new['id']}' is too long for a step id -- "
+                                "a shorter id for the recipe.apply step")
+            if missing:
+                problems.append(f"{where}: '{rid}' step '{rs.get('id')}' needs "
+                                + ", ".join(sorted(missing)))
+            out_steps.append(new)
+    return dict(profile, steps=out_steps), used, problems

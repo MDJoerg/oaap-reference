@@ -145,8 +145,19 @@ CONNECTOR_KINDS = {
             "realm_role_composites":
                 "/admin/realms/{space}/roles/{alias}/composites",
             # RFC-0066 / destinations 2.9.6: who may edit an attribute a
-            # destination acts on. Read only, never written.
+            # destination acts on. Read by the destination check; since
+            # RFC-0109 stage 3 (verb `claims`) an attribute OAAP propagates
+            # is APPENDED when it is missing -- editable by administrators
+            # only. An existing attribute is never changed.
             "user_profile": "/admin/realms/{space}/users/profile",
+            # RFC-0109 section 12 (verb `claims`): the client scope that
+            # puts the attribute into the token, and the platform client's
+            # default scopes. `{alias}` carries the scope's id.
+            "client_scopes": "/admin/realms/{space}/client-scopes",
+            "client_default_scopes":
+                "/admin/realms/{space}/clients/{uuid}/default-client-scopes",
+            "client_default_scope":
+                "/admin/realms/{space}/clients/{uuid}/default-client-scopes/{alias}",
             # RFC-0091 §3: the brokers in front of the realm -- other
             # doors than the registration page. Read only, never
             # written (D5): adding a door is the operator's act in the
@@ -247,7 +258,7 @@ CONNECTOR_KINDS = {
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
                   "export", "admin_group", "groups", "mail", "mcp_clients",
-                  "app_clients"),
+                  "app_clients", "claims"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
@@ -265,7 +276,7 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
 OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups", "mail",
-                  "mcp_clients", "app_clients")
+                  "mcp_clients", "app_clients", "claims")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -2210,6 +2221,54 @@ def attribute_edit_of(kind, doc, name):
     return "absent"
 
 
+# RFC-0109 section 12 (stage 3): the claim a destination with principal
+# propagation acts on, made inside a space the tenant already has. Three
+# parts, each judged on its own and each only ADDED: the attribute (edited
+# by administrators only -- the property destinations 2.9.6 reads), a
+# client scope with a mapper that puts it into the token, and that scope
+# among the platform client's default scopes. Nothing that is there is
+# changed; something that is there and differs is a conflict, said in a
+# sentence, and the person fixes it in the product.
+CLAIM_PARTS = ("attribute", "scope", "default")
+SAP_USER_MAX = 12
+
+
+def claim_attribute(claim):
+    """The attribute as Keycloak's declarative user profile takes it."""
+    return {"name": claim, "displayName": "SAP-Benutzer",
+            "permissions": {"view": ["admin", "user"], "edit": ["admin"]},
+            "multivalued": False,
+            "validations": {"length": {"max": SAP_USER_MAX},
+                            "pattern": {"pattern": "^[A-Z0-9_]+$",
+                                        "error-message": "Großbuchstaben, Ziffern, _"}}}
+
+
+def claim_scope_body(scope, claim):
+    return {"name": scope, "protocol": "openid-connect",
+            "description": f"OAAP: {claim} in the token (RFC-0066, RFC-0109)",
+            "attributes": {"include.in.token.scope": "true",
+                           "display.on.consent.screen": "false"},
+            "protocolMappers": [{
+                "name": claim, "protocol": "openid-connect",
+                "protocolMapper": "oidc-usermodel-attribute-mapper",
+                "config": {"user.attribute": claim, "claim.name": claim,
+                           "jsonType.label": "String", "id.token.claim": "true",
+                           "access.token.claim": "true", "userinfo.token.claim": "true",
+                           "multivalued": "false"}}]}
+
+
+def scope_carries(scope_doc, claim):
+    """Does this client scope put attribute `claim` into the ID token as
+    `claim`? Read from its mappers, never assumed from its name."""
+    for m in (scope_doc or {}).get("protocolMappers") or []:
+        cfg = m.get("config") or {}
+        if (m.get("protocolMapper") == "oidc-usermodel-attribute-mapper"
+                and cfg.get("user.attribute") == claim and cfg.get("claim.name") == claim
+                and str(cfg.get("id.token.claim", "")).lower() == "true"):
+            return True
+    return False
+
+
 class Admin:
     """A provider's admin API, held by this node.
 
@@ -2544,6 +2603,117 @@ class Admin:
                        "not none")
             return
         docs["brokers"] = doc
+
+    def person_claim(self, space, client_id, claim, scope, dry=True):
+        """RFC-0109 section 12: (parts, error). `parts` is a list of
+        (part, verdict, sentence), verdict "present", "absent" (dry: would
+        be added), "made" or "conflict". With dry=False the absent parts
+        are added in order and the list says what was made. Never changes
+        what is there; never deletes."""
+        parts = []
+        # 1. the attribute
+        path = self._path("user_profile", space=space)
+        status, doc, err = self._call("GET", path)
+        if err:
+            return [], err
+        if status == 403:
+            return [], self._not_ours(space, "read the user profile")
+        if status != 200 or not isinstance(doc, dict):
+            return [], f"reading the user profile of '{space}' answered {status}"
+        edit = attribute_edit_of(self.kind, doc, claim)
+        if edit == "self":
+            parts.append(("attribute", "conflict",
+                          f"'{claim}' exists and the person may edit it -- anybody could "
+                          "set it to anybody's user name; OAAP does not change it "
+                          "(Keycloak: realm settings, user profile, the attribute, who "
+                          "can edit: admin only)"))
+        elif edit == "admin":
+            parts.append(("attribute", "present", f"'{claim}' exists, edited by "
+                          "administrators only"))
+        elif dry:
+            parts.append(("attribute", "absent", f"'{claim}' would be added, edited "
+                          "by administrators only"))
+        else:
+            new = dict(doc)
+            new["attributes"] = list(doc.get("attributes") or []) + [claim_attribute(claim)]
+            st, _d, err = self._call("PUT", path, body=new)
+            if err:
+                return parts, err
+            if st == 403:
+                return parts, self._not_ours(space, "add an attribute")
+            if st not in (200, 204):
+                return parts, f"adding the attribute '{claim}' answered {st}"
+            self._note(f"added the attribute '{claim}' (edit: admin)")
+            parts.append(("attribute", "made", f"'{claim}' added, edited by "
+                          "administrators only"))
+        # 2. the client scope
+        spath = self._path("client_scopes", space=space)
+        status, scopes, err = self._call("GET", spath)
+        if err:
+            return parts, err
+        if status == 403:
+            return parts, self._not_ours(space, "read the client scopes")
+        if status != 200 or not isinstance(scopes, list):
+            return parts, f"reading the client scopes answered {status}"
+        found = next((x for x in scopes if x.get("name") == scope), None)
+        if found and not scope_carries(found, claim):
+            parts.append(("scope", "conflict",
+                          f"a client scope '{scope}' exists and does not put '{claim}' "
+                          "into the ID token -- OAAP does not change somebody else's "
+                          "scope; fix it in the product or choose another name"))
+        elif found:
+            parts.append(("scope", "present", f"client scope '{scope}' carries '{claim}'"))
+        elif dry:
+            parts.append(("scope", "absent", f"client scope '{scope}' would be added "
+                          f"with a mapper for '{claim}'"))
+        else:
+            st, _d, err = self._call("POST", spath, body=claim_scope_body(scope, claim))
+            if err:
+                return parts, err
+            if st == 403:
+                return parts, self._not_ours(space, "add a client scope")
+            if st not in (201, 204):
+                return parts, f"adding the client scope '{scope}' answered {st}"
+            st, scopes, err = self._call("GET", spath)
+            found = next((x for x in (scopes if isinstance(scopes, list) else [])
+                          if x.get("name") == scope), None)
+            if err or not found:
+                return parts, err or f"the client scope '{scope}' was added and is not listed"
+            self._note(f"added the client scope '{scope}'")
+            parts.append(("scope", "made", f"client scope '{scope}' added with a mapper "
+                          f"for '{claim}'"))
+        # 3. the scope on the platform's client, as a default
+        uuid, _cdoc, err = self.find_client(space, client_id)
+        if err:
+            return parts, err
+        if not uuid:
+            return parts, f"the client '{client_id}' is not in '{space}'"
+        dpath = self._path("client_default_scopes", space=space, uuid=uuid)
+        status, dflt, err = self._call("GET", dpath)
+        if err:
+            return parts, err
+        if status != 200 or not isinstance(dflt, list):
+            return parts, f"reading the default scopes of '{client_id}' answered {status}"
+        if any(x.get("name") == scope for x in dflt):
+            parts.append(("default", "present", f"'{scope}' is a default scope of "
+                          f"'{client_id}'"))
+        elif dry or not found:
+            parts.append(("default", "absent", f"'{scope}' would become a default scope "
+                          f"of '{client_id}'"))
+        else:
+            st, _d, err = self._call("PUT", path_of(self.kind, "client_default_scope",
+                                                    space=space, uuid=uuid,
+                                                    alias=found.get("id", "")))
+            if err:
+                return parts, err
+            if st == 403:
+                return parts, self._not_ours(space, "give the client a default scope")
+            if st not in (200, 204):
+                return parts, f"adding '{scope}' to the client's default scopes answered {st}"
+            self._note(f"'{scope}' is now a default scope of '{client_id}'")
+            parts.append(("default", "made", f"'{scope}' is now a default scope of "
+                          f"'{client_id}'"))
+        return parts, ""
 
     def attribute_edits(self, space, names):
         """({name: "admin"|"self"|"absent"|""}, error). A pure read of

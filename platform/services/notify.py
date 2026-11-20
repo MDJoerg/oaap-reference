@@ -111,6 +111,11 @@ CATALOGUE = {
     "hub.unreachable": {"category": "critical", "scope": "node", "matter": True,
                         "title": "Die Zentrale der Flotte ist nicht erreichbar",
                         "subject": "[{knoten}] Zentrale nicht erreichbar: {kurz}"},
+    # RFC-0109 section 13: a tenant asks the operator, and the node has no
+    # request inbox (or it did not answer) -- the request goes as a message.
+    "recipe.request": {"category": "operations", "scope": "node", "matter": False,
+                       "title": "Ein Mandant fragt beim Betreiber an",
+                       "subject": "[{knoten}] Anfrage aus {kurz}"},
 }
 
 # RFC-0083 2.3: how a routing line delivers. "now" -- a mail at once (and,

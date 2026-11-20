@@ -79,6 +79,8 @@ import idp  # noqa: E402
 import tenant_build  # noqa: E402
 # Setup recipes for an existing tenant (RFC-0109): the same engine.
 import tenant_recipe  # noqa: E402
+# ... and a tenant's requests to the operator (RFC-0109 section 13).
+import recipe_request  # noqa: E402
 import gen_values  # noqa: E402
 # Invitations and requests in front of a build (RFC-0055 stage 4).
 import tenant_request  # noqa: E402
@@ -3700,6 +3702,7 @@ def state_index_minute():
         node_identity_refresh()
     except Exception as e:                          # noqa: BLE001
         print(f"node identity: {type(e).__name__}: {e}", file=sys.stderr)
+    recipe_requests_minute()
     return state_view_write()
 
 
@@ -10126,6 +10129,11 @@ class _BuildDrivers:
             if got and (inst.get("destinations") or {}).get(need) == a["name"]:
                 got.append(f"binding:{key}:{need}")
             return got
+        if typ == "destination.bind":
+            # a propagation granted by THIS step cannot be told from one a
+            # human granted after the step began; nothing is claimed -- a
+            # rollback then leaves it, which is the safe side for a person
+            return []
         return []
 
     def rollback_refusal(self, state):
@@ -10464,6 +10472,10 @@ class _BuildDrivers:
     # manual --------------------------------------------------------------
     def _check_manual(self, a, ctx):
         when = a["done_when"]
+        if when == "server.compared":
+            return self._check_server_compared(a, ctx)
+        if when == "destination.check":
+            return self._check_destination_check(a, ctx)
         if when == "setup.ready":
             # RFC-0104 §5: the instance's setup door says the item is ready
             # (a supplier: credentials stored and its test answers)
@@ -10494,6 +10506,13 @@ class _BuildDrivers:
         if when == "confirmed":
             if (ctx.get("step") or {}).get("confirmed"):
                 return PRESENT_, "ein Mensch hat es bestätigt"
+            # RFC-0109 stage 3: a recipe asks a human once per tenant. A
+            # finished run of the same recipe in this tenant that confirmed
+            # this step answers it (a rolled-back run does not).
+            earlier = self._confirmed_before(ctx, (ctx.get("step") or {}).get("id")
+                                             or a.get("id", ""))
+            if earlier:
+                return PRESENT_, earlier
             return ABSENT_, "wartet auf die Bestätigung durch einen Menschen"
         tid, _t = self._tenant()
         users = _read_identity_users()
@@ -10650,10 +10669,17 @@ class _BuildDrivers:
             return {"via": f"{tunnel}/{offer}"}
         return {"direct": t}
 
-    def _dest_differs(self, d, a):
+    def _dest_differs(self, d, a, ctx=None):
         """What of an existing destination differs from the wish, or ""."""
         auth, want = d.get("auth") or {}, a.get("auth") or "none"
         diff = []
+        if want == "principal_propagation" and auth.get("type") == want:
+            claims = [r.get("name") for r in auth.get("user") or []]
+            if claims != [a.get("claim") or PROPAGATION_DEFAULT_CLAIM]:
+                diff.append("Claim " + ",".join(c or "?" for c in claims))
+            pin = self._pin_of(a, ctx)
+            if pin and auth.get("server_sha256") != pin:
+                diff.append("gepinnt auf ein anderes Zertifikat")
         if d.get("kind") != "http":
             diff.append(f"Art {d.get('kind')} statt http")
         try:
@@ -10679,7 +10705,7 @@ class _BuildDrivers:
         d = (load_destinations().get(tid) or {}).get(a["name"])
         if not d:
             return ABSENT_, f"noch keine Destination '{a['name']}'"
-        diff = self._dest_differs(d, a)
+        diff = self._dest_differs(d, a, ctx)
         if diff:
             return CONFLICT_, (f"die Destination '{a['name']}' besteht anders als "
                                f"gewünscht ({diff}); sie wird nicht angefasst")
@@ -10702,7 +10728,24 @@ class _BuildDrivers:
                            "der Schritt gehört hinter ihr app.install"), []
         made, notes = [], []
         try:
-            if not (load_destinations().get(tid) or {}).get(a["name"]):
+            if not (load_destinations().get(tid) or {}).get(a["name"]) \
+                    and a.get("auth") == "principal_propagation":
+                # RFC-0109 section 12: pinned to exactly what a human compared
+                # in the pin step; destination_add refuses when the target
+                # presents another certificate now
+                pin = self._pin_of(a, ctx)
+                if not pin:
+                    return False, (f"der Fingerabdruck ist noch nicht verglichen und "
+                                   f"bestätigt (Schritt {a.get('pin_step')})"), []
+                destination_add(tid, a["name"], "http", a["target"],
+                                auth_type="principal_propagation", accept_sha256=pin,
+                                claims=[a.get("claim") or PROPAGATION_DEFAULT_CLAIM],
+                                name_check=a.get("name_check") or "",
+                                check_path=a.get("check_path") if "check_path" in a else None,
+                                who=self.who, role=self.role)
+                made.append(f"destination:{a['name']}")
+                notes.append(f"'{a['name']}' angelegt, Zertifikat gepinnt ({pin[:16]}…)")
+            elif not (load_destinations().get(tid) or {}).get(a["name"]):
                 d = destination_add(tid, a["name"], "http", a["target"],
                                     auth_type=a.get("auth") or "none",
                                     user=a.get("user", ""), header=a.get("header", ""),
@@ -10738,6 +10781,190 @@ class _BuildDrivers:
             return True, f"die Destination '{rest}' ist entfernt"
         except DestinationRefused as exc:
             return False, str(exc)
+
+    # RFC-0109 section 12 (stage 3) ---------------------------------------
+    def _confirmed_before(self, ctx, sid):
+        """'bestätigt im Lauf … von …', or "": the latest finished run of
+        this recipe in this tenant that confirmed step `sid`."""
+        rid = (ctx or {}).get("recipe") or ((ctx or {}).get("state") or {}).get("recipe")
+        if not rid or not sid:
+            return ""
+        runs = sorted((st for st in tenant_build.list_states(RECIPE_RUN_DIR)
+                       if st.get("kind") == "recipe" and st.get("recipe") == rid
+                       and st.get("label") == self.label and st.get("state") == "done"),
+                      key=lambda st: st.get("created", ""), reverse=True)
+        for st in runs:
+            for rec in st.get("steps") or []:
+                if rec.get("id") == sid and rec.get("confirmed"):
+                    return f"bestätigt im Lauf {st['id']} (von {st.get('by') or '?'})"
+        return ""
+
+    def _pin_of(self, a, ctx):
+        """The fingerprint a human confirmed in this run's pin step, or ""."""
+        sid = (a or {}).get("pin_step")
+        for rec in ((ctx or {}).get("state") or {}).get("steps") or []:
+            if rec.get("id") == sid:
+                return rec.get("accepted_sha256") or ""
+        return ""
+
+    def _idp_admin(self):
+        """(admin, provider, refusal) for the tenant's own sign-in service,
+        through the connector that made it."""
+        tid, t = self._tenant()
+        provider = idp.provider_of(t or {})
+        cname, space = provider.get("connector") or "", provider.get("space") or ""
+        if not cname or not space:
+            return None, provider, ("der Anmeldedienst dieses Mandanten wurde nicht von einem "
+                                    "Konnektor dieses Knotens angelegt -- Attribut und Scope "
+                                    "trägt ein Mensch in der Konsole ein")
+        c = load_idp_connectors().get(cname)
+        if not c:
+            return None, provider, f"der Konnektor '{cname}' ist nicht auf diesem Knoten"
+        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"], c["admin_id"],
+                                c["admin_secret"], auth_realm=c.get("auth_realm", ""))
+        ok, msg = admin.login()
+        if not ok:
+            return None, provider, msg
+        return admin, provider, ""
+
+    def _claim_parts(self, a, dry):
+        admin, provider, why = self._idp_admin()
+        if why:
+            return None, why
+        parts, err = admin.person_claim(provider["space"], provider.get("client_id") or "",
+                                        a["claim"], a.get("scope") or "sap", dry=dry)
+        if err:
+            return None, err
+        return parts, ""
+
+    @staticmethod
+    def _claim_say(parts):
+        return "; ".join(f"{p}: {n}" for p, _v, n in parts)
+
+    def _check_idp_claim(self, a, ctx):
+        parts, why = self._claim_parts(a, dry=True)
+        if parts is None:
+            return CONFLICT_, why
+        if any(v == "conflict" for _p, v, _n in parts):
+            return CONFLICT_, self._claim_say([x for x in parts if x[1] == "conflict"])
+        if all(v == "present" for _p, v, _n in parts):
+            return PRESENT_, self._claim_say(parts)
+        return ABSENT_, "noch einzurichten: " + self._claim_say(
+            [x for x in parts if x[1] != "present"])
+
+    def _do_idp_claim(self, a, ctx):
+        parts, why = self._claim_parts(a, dry=False)
+        if parts is None:
+            return False, why, []
+        bad = [x for x in parts if x[1] == "conflict"]
+        # Nothing here is ever removed again (the connector has no DELETE,
+        # K3.3): `made` stays empty, and an undo leaves the realm as it is.
+        return not bad, self._claim_say(parts), []
+
+    def _check_destination_bind(self, a, ctx):
+        tid, _t = self._tenant()
+        key = self._instance_key(a["name"])
+        if not key:
+            return ABSENT_, f"noch keine Instanz '{a['name']}' in diesem Mandanten"
+        d = (load_destinations().get(tid or "") or {}).get(a["destination"])
+        if not d:
+            return ABSENT_, f"noch keine Destination '{a['destination']}'"
+        need = a.get("need") or a["destination"]
+        inst = load_registry()["instances"].get(key) or {}
+        bound = (inst.get("destinations") or {}).get(need)
+        want = str(a.get("propagate") or "false") == "true"
+        if bound and bound != a["destination"]:
+            return CONFLICT_, (f"'{a['name']}' hat als {need} schon '{bound}' zugeordnet; "
+                               "das wird nicht ersetzt")
+        if bound and (need in (inst.get("propagate") or [])) == want:
+            return PRESENT_, (f"'{a['destination']}' ist '{a['name']}' als {need} zugeordnet"
+                              + (", trägt die angemeldete Person" if want else ""))
+        return ABSENT_, (f"'{a['name']}' bekommt '{a['destination']}' als {need}"
+                         + (", als die angemeldete Person" if want else ""))
+
+    def _do_destination_bind(self, a, ctx):
+        key = self._instance_key(a["name"])
+        if not key:
+            return False, f"keine Instanz '{a['name']}' in diesem Mandanten", []
+        need = a.get("need") or a["destination"]
+        want = str(a.get("propagate") or "false") == "true"
+        reg = load_registry()
+        was = (reg["instances"].get(key) or {}).get("destinations") or {}
+        try:
+            changed = destination_bind(reg, key, a["destination"], need, who=self.who,
+                                       role=self.role, propagate=want)
+        except DestinationRefused as exc:
+            return False, str(exc), []
+        if not changed:
+            return True, "nichts zu tun", []
+        item = (f"propagate:{key}:{need}" if want and was.get(need) == a["destination"]
+                else f"binding:{key}:{need}")
+        return True, (f"'{a['name']}' als {need} zugeordnet"
+                      + (", trägt die angemeldete Person" if want else "")), [item]
+
+    def _undo_destination_bind(self, a, item, ctx):
+        kind, _s, rest = item.partition(":")
+        key, _s, need = rest.rpartition(":")
+        reg = load_registry()
+        inst = reg["instances"].get(key) or {}
+        try:
+            if kind == "propagate":
+                if need not in (inst.get("propagate") or []):
+                    return True, "die Person wurde schon nicht mehr durchgereicht"
+                destination_bind(reg, key, (inst.get("destinations") or {}).get(need, ""),
+                                 need, who=self.who, role=self.role, propagate=False)
+                return True, f"'{key}' reicht als {need} keine Person mehr durch"
+            if need not in (inst.get("destinations") or {}):
+                return True, "die Zuordnung war schon gelöst"
+            destination_unbind(reg, key, need, who=self.who, role=self.role)
+            return True, f"die Zuordnung {need} von '{key}' ist gelöst"
+        except DestinationRefused as exc:
+            return False, str(exc)
+
+    def _check_server_compared(self, a, ctx):
+        tid, _t = self._tenant()
+        target = (a.get("target") or "").strip()
+        try:
+            scheme, host, port, _b = parse_dest_target("http", target)
+            if scheme != "https":
+                return CONFLICT_, "das Ziel braucht https: das Zertifikat kommt im TLS-Handshake"
+            why = dest_target_refusal(host)
+            if why:
+                return CONFLICT_, why
+            _pem, fp = fetch_server_cert(host, port or 443)
+        except DestinationRefused as exc:
+            return ABSENT_, str(exc)
+        shown = ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()
+        for _n, d in (load_destinations().get(tid or "") or {}).items():
+            if ((d.get("target") or {}).get("direct") == target
+                    and (d.get("auth") or {}).get("server_sha256") == fp):
+                return PRESENT_, f"schon gepinnt, und das Ziel zeigt es noch: {shown}"
+        rec = ctx.get("step") if isinstance(ctx.get("step"), dict) else None
+        acc = (rec or {}).get("accepted_sha256") or ""
+        if acc == fp:
+            return PRESENT_, f"verglichen und bestätigt: {shown}"
+        if acc:
+            return CONFLICT_, ("das Ziel zeigt inzwischen ein anderes Zertifikat als das "
+                               f"bestätigte ({shown}) -- neu vergleichen")
+        if rec is not None:
+            rec["offered_sha256"] = fp
+        return ABSENT_, (f"das Ziel zeigt SHA-256 {shown} -- mit dem eigenen Zertifikat des "
+                         "SSL-Server-PSE in STRUST vergleichen und mit genau diesem "
+                         "Fingerabdruck bestätigen")
+
+    def _check_destination_check(self, a, ctx):
+        tid, _t = self._tenant()
+        name = a.get("destination", "")
+        if not (load_destinations().get(tid or "") or {}).get(name):
+            return ABSENT_, f"noch keine Destination '{name}'"
+        try:
+            res = propagation_check(tid, name, who=self.who, role=self.role)
+        except DestinationRefused as exc:
+            return ABSENT_, str(exc)
+        lines = [" ".join(x.split()) for x in chain_lines(res, de=True)]
+        if res.get("ok"):
+            return PRESENT_, "die Kette hält: " + "; ".join(lines[:6])
+        return ABSENT_, "die Kette hält noch nicht: " + "; ".join(lines)
 
     # app.setup (RFC-0104 D2) ---------------------------------------------
     def _setup_target(self, name):
@@ -10958,7 +11185,7 @@ def tenant_build_job(req, role, actor):
                                           accounts=accounts)
         elif op == "confirm":
             state = tenant_build_confirm(bid, str(a.get("step") or ""),
-                                         actor, role)
+                                         actor, role, value=str(a.get("value") or ""))
         elif op == "rollback":
             state = tenant_build_rollback(bid, actor, role, purge=purge,
                                           accounts=accounts)
@@ -11314,6 +11541,9 @@ def tenant_build_start(pid, given, who, role, dry_run=False, drivers=None):
     if dry_run:
         return {"plan": steps, "profile": profile["id"], "label": label}
     state = tenant_build.new_state(profile, digest, values, who)
+    if profile.get("_recipes"):
+        # RFC-0109 D9: the recipe files this build expanded, by digest
+        state["recipes"] = dict(profile["_recipes"])
     # RFC-0079 D5: the very file this build runs is kept under its digest,
     # so it can be continued after a newer version replaced it.
     try:
@@ -11342,7 +11572,7 @@ def _build_load(bid, who, role):
     kept = tenant_build.history_path(PROFILE_DIR, state["profile"],
                                      state.get("digest"))
     profile, digest = tenant_build.read_profile_file(
-        kept or tenant_build_profile_path(state["profile"]))
+        kept or tenant_build_profile_path(state["profile"]), pins=state.get("recipes"))
     return state, profile, digest
 
 
@@ -11361,9 +11591,9 @@ def tenant_build_continue(bid, who, role, drivers=None, purge=False,
     return _build_drive(state, profile, who, role, drivers)
 
 
-def tenant_build_confirm(bid, step, who, role, drivers=None):
+def tenant_build_confirm(bid, step, who, role, drivers=None, value=""):
     state, profile, digest = _build_load(bid, who, role)
-    tenant_build.confirm(state, step, BUILD_DIR)
+    tenant_build.confirm(state, step, BUILD_DIR, value=value)
     return _build_drive(state, profile, who, role, drivers)
 
 
@@ -11465,7 +11695,8 @@ def _tenant_build_cli(args):
             elif sub == "confirm":
                 if not args.step:
                     die("which step? oaap tenant build confirm <id> --step <id>")
-                got = tenant_build_confirm(arg, args.step, who, "root")
+                got = tenant_build_confirm(arg, args.step, who, "root",
+                                           value=getattr(args, "fingerprint", "") or "")
             else:
                 if not args.yes:
                     state = tenant_build.load_state(BUILD_DIR, arg)
@@ -11529,6 +11760,36 @@ def tenant_recipe_path(rid):
     if not tenant_build.ID_RE.match(str(rid or "")):
         raise tenant_build.Refusal(f"'{rid}' is not a recipe name")
     return os.path.join(RECIPE_DIR, rid + ".json")
+
+
+def _profile_recipe_expander(doc, pins=None):
+    """RFC-0109 D9: recipe.apply in a profile -> the recipe's steps. With
+    `pins` (a build's state) by digest from the recipe history first, so a
+    newer recipe file never changes a build that began on an older one."""
+    pins = pins or {}
+
+    def load(rid):
+        kept = tenant_build.history_path(RECIPE_DIR, rid, pins[rid]) if rid in pins else None
+        if rid in pins and not kept:
+            # the pinned file is not in the history: only the current file
+            # with the SAME digest will do
+            rdoc, dg, _raw = tenant_recipe.read_recipe_file(tenant_recipe_path(rid))
+            if dg != pins[rid]:
+                raise tenant_build.Refusal(
+                    f"the recipe '{rid}' changed since this build began and the "
+                    "file it began with is not kept -- roll the build back")
+            return rdoc, dg
+        rdoc, dg, raw = tenant_recipe.read_recipe_file(kept or tenant_recipe_path(rid))
+        if not kept:
+            try:
+                tenant_build.history_put(RECIPE_DIR, rid, raw, "")
+            except OSError:
+                pass
+        return rdoc, dg
+    return tenant_recipe.expand_apply(doc, load)
+
+
+tenant_build.RECIPE_EXPANDER = _profile_recipe_expander
 
 
 def tenant_recipes():
@@ -11698,9 +11959,9 @@ def _recipe_prepare(rid, label, given, role, doc=None, digest=None,
     return doc, digest, profile, values, chosen, choices, []
 
 
-def _recipe_ctx(values):
+def _recipe_ctx(values, rid=""):
     return {"label": values["label"], "started": _iso_now(),
-            "state": {"steps": []}, "values": values}
+            "state": {"steps": []}, "values": values, "recipe": rid}
 
 
 def tenant_recipe_preview(rid, label, given, who, role, drivers=None,
@@ -11720,7 +11981,7 @@ def tenant_recipe_preview(rid, label, given, who, role, drivers=None,
             k: v for k, v in (given or {}).items()
             if k not in tenant_recipe.need_names(doc)})
     drivers = drivers or _BuildDrivers(values["label"], who, role)
-    rows = tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values))
+    rows = tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values, doc["id"]))
     return dict(base, rows=rows, params={k: v for k, v in values.items()
                                          if k not in ("label", "tenant")
                                          and not k.endswith(tenant_recipe.KEY_SUFFIX)
@@ -11740,7 +12001,7 @@ def tenant_recipe_run(rid, label, given, who, role, drivers=None,
             f"({held['state']}); continue it or roll it back first")
     drivers = drivers or _BuildDrivers(values["label"], who, role)
     blockers = tenant_recipe.preview_blockers(
-        tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values)))
+        tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values, doc["id"])))
     if blockers:
         raise tenant_build.Refusal(
             "the preview found what stops this recipe, nothing was done: "
@@ -11795,7 +12056,7 @@ def _recipe_load(run_id, role, actor_tid=None, undo=False):
                                        "own tenant only")
         if not undo:
             _recipe_tenant_gate(role, actor_tid, tid, t, doc)
-            _recipe_scope_gate(role, tid, profile, state.get("values") or {})
+            _recipe_scope_gate(role, tid, profile, state.get("params") or {})
     return state, profile, digest
 
 
@@ -11814,9 +12075,10 @@ def tenant_recipe_continue(run_id, who, role, drivers=None, purge=False,
                          drivers or _BuildDrivers(state["label"], who, role))
 
 
-def tenant_recipe_confirm(run_id, step, who, role, drivers=None, actor_tid=None):
+def tenant_recipe_confirm(run_id, step, who, role, drivers=None, actor_tid=None,
+                          value=""):
     state, profile, _digest = _recipe_load(run_id, role, actor_tid)
-    tenant_build.confirm(state, step, RECIPE_RUN_DIR)
+    tenant_build.confirm(state, step, RECIPE_RUN_DIR, value=value)
     return _recipe_drive(state, profile,
                          drivers or _BuildDrivers(state["label"], who, role))
 
@@ -11878,11 +12140,25 @@ def tenant_recipe_view_write():
             recipes.append(row)
         runs = sorted(tenant_build.list_states(RECIPE_RUN_DIR),
                       key=lambda st: st.get("created", ""), reverse=True)
+        # RFC-0109 section 13: the requests, without what the portal does
+        # not show (the full preview stays in the record on the host)
+        requests_ = [dict({k: r.get(k) for k in (
+            "id", "label", "by", "by_name", "recipe", "version", "title", "text",
+            "created", "delivery", "case", "note", "case_status", "case_label",
+            "replies", "read", "released")},
+            state=recipe_request.state_text(r), open=recipe_request.is_open(r))
+            for r in recipe_request.all_requests(RECIPE_REQUEST_DIR)][:RECIPE_VIEW_KEEP]
+        inbox_key, _inbox = recipe_inbox()
         os.makedirs(APPS_DIR, exist_ok=True)
         tmp = RECIPE_VIEW + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"schema": "0.1", "written": _iso_now(), "tenants": tlist,
-                       "recipes": recipes, "runs": runs[:RECIPE_VIEW_KEEP]}, f)
+            json.dump({"schema": "0.2", "written": _iso_now(), "tenants": tlist,
+                       "recipes": recipes, "runs": runs[:RECIPE_VIEW_KEEP],
+                       "requests": requests_, "inbox": inbox_key,
+                       "inbox_choices": sorted(
+                           k for k, i in (load_registry().get("instances") or {}).items()
+                           if i.get("app_id") == CASES_APP_ID
+                           and not recipe_inbox_refusal(k, i))}, f)
         os.replace(tmp, RECIPE_VIEW)
         os.chmod(RECIPE_VIEW, 0o644)
         return True
@@ -11938,11 +12214,254 @@ def tenant_recipe_release(tid, what, on, who="root", role="root"):
                      detail=("the tenant_admin may run this recipe in this tenant"
                              if on else "the tenant_admin may no longer run it; "
                              "what earlier runs made stays"))
+    if on:
+        recipe_requests_released(label, rid, sorted(words), who)
     tenant_recipe_view_write()
     return True, (f"'{rid}' is released for the tenant_admin of '{label}' "
                   f"({', '.join(sorted(words))})" if on else
                   f"'{rid}' is no longer released for '{label}'; what earlier "
                   "runs made stays, and its runs can still be rolled back")
+
+
+# ---------------------------------------------------------------------------
+# RFC-0109 section 13 (stage 3): a tenant's requests to the operator. The
+# PLATFORM writes the request as a case into the node's request inbox -- a
+# `vorgaenge` instance of the default tenant the operator names -- through
+# that app's node door (RFC-0069 stage 2: the principal platform:<inbox>,
+# whose key opens only that door). The tenant needs nothing in the default
+# tenant. Without an inbox: a message to the node's owners (RFC-0080).
+
+RECIPE_REQUEST_DIR = os.path.join(DATA_DIR, "data", "recipe-requests")
+RECIPE_INBOX_FILE = os.path.join(APPS_DIR, "recipe-inbox.json")
+RECIPE_REQUEST_READ_EVERY = 600          # seconds between readings of open cases
+RECIPE_REQUEST_STAMP = os.path.join(APPS_DIR, ".recipe-requests-read")
+
+
+def _identity_display_name(username):
+    u = next((x for x in (_read_identity_users() or [])
+              if x.get("username") == (username or "")), None)
+    return str((u or {}).get("display_name") or username or "")
+
+
+def recipe_inbox_refusal(key, inst):
+    if not inst:
+        return f"there is no instance '{key}' on this node"
+    if inst.get("app_id") != CASES_APP_ID:
+        return f"'{key}' is not an instance of the app {CASES_APP_ID}"
+    if _instance_tenant_id(inst) != default_tenant_id():
+        return ("the request inbox lives in the node's own tenant -- the operator's "
+                "cases, not a customer's")
+    if is_rehearsal(inst) or (inst.get("channel") or "production") != "production":
+        return f"'{key}' is not a production instance"
+    if not inst.get("port"):
+        return f"'{key}' has no port the node can reach"
+    return ""
+
+
+def recipe_inbox():
+    """(instance key, record) of the node's request inbox, or ("", None).
+    Named by the operator; must still be a production `vorgaenge` of the
+    default tenant, not a rehearsal -- else it is no inbox now."""
+    try:
+        with open(RECIPE_INBOX_FILE, encoding="utf-8") as f:
+            key = str((json.load(f) or {}).get("inbox") or "")
+    except (OSError, ValueError):
+        return "", None
+    inst = (load_registry().get("instances") or {}).get(key)
+    return (key, inst) if key and not recipe_inbox_refusal(key, inst) else ("", None)
+
+
+def recipe_inbox_set(name, who="root", role="root"):
+    """Name the request inbox (an instance of the default tenant), or "off".
+    -> the instance key, or "" for off."""
+    if role not in ("root", "server_admin"):
+        raise tenant_build.Refusal("only the server_admin names the request inbox")
+    name = str(name or "").strip()
+    if name in ("off", "aus", ""):
+        try:
+            os.remove(RECIPE_INBOX_FILE)
+        except FileNotFoundError:
+            pass
+        audit_tenant("tenant.recipe.inbox", default_tenant_id(), subject="off",
+                     who=who, role=role, detail="requests go as messages to the node's owners")
+        tenant_recipe_view_write()
+        return ""
+    reg = load_registry()
+    key, inst = find_instance(reg, default_tenant_id(), name)
+    if inst is None:
+        key, inst = name, (reg.get("instances") or {}).get(name)
+    why = recipe_inbox_refusal(key, inst)
+    if why:
+        raise tenant_build.Refusal(why)
+    host_care._write_json(RECIPE_INBOX_FILE, {"inbox": key, "set_by": who,
+                                              "set": _iso_now()}, mode=0o644)
+    audit_tenant("tenant.recipe.inbox", default_tenant_id(), subject=key, who=who,
+                 role=role, detail="tenants' requests to the operator become cases here")
+    tenant_recipe_view_write()
+    return key
+
+
+def _recipe_request_deliver(req):
+    """Into the inbox as a case, else as a message. Writes the delivery
+    into the record; never raises."""
+    host = socket.gethostname()
+    key, inst = recipe_inbox()
+    if inst is not None:
+        try:
+            st, ans = _node_case_post(key, inst, {
+                "op": "open", "object": "request", "ref": req["id"], "node": host,
+                "from": f"{req['label']} · {req.get('by_name') or req.get('by')}",
+                "title": recipe_request.case_title(req),
+                "body": recipe_request.case_body(req, host)})
+            if st in (200, 201) and ans.get("number"):
+                req.update(delivery="sent", inbox=key, case=str(ans["number"]),
+                           case_status="new", case_label="neu", note="")
+                return req
+            req["note"] = (f"der Posteingang {key} antwortete {st}"
+                           + (f": {str(ans.get('error'))[:160]}" if ans.get("error") else ""))
+        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            req["note"] = f"der Posteingang {key} war nicht erreichbar: {type(e).__name__}"
+    queued = notify_event("recipe.request", default_tenant_id(), kurz=req["label"],
+                          text=recipe_request.message_text(req, host), key=req["id"])
+    if queued:
+        req["delivery"] = "message"
+        if not req.get("note"):
+            req["note"] = "kein Posteingang für Anfragen benannt"
+    else:
+        req["delivery"] = "failed"
+        req["note"] = ((req.get("note") or "") + "; auch die Nachricht ging nicht "
+                       "in den Ausgang").lstrip("; ")
+    return req
+
+
+def tenant_recipe_request(label, who, role, actor_tid=None, recipe="", values=None,
+                          text=""):
+    """A tenant_admin asks the operator -> the request record (delivered).
+
+    S2: a tenant_admin asks for their OWN tenant only, judged by id. The
+    request carries what they typed and what the preview showed THEM: a
+    preview is taken as them, and its refusal is the reason they ask."""
+    _recipe_role(role)
+    label = str(label or "").strip().lower()
+    tid, t = tenant_by_label(label, include_former=False)
+    if not t:
+        raise tenant_build.Refusal(f"there is no tenant '{label}'")
+    if tid == default_tenant_id():
+        raise tenant_build.Refusal("the node's own tenant is the operator's -- "
+                                   "there is nobody to ask")
+    if role == "tenant_admin" and (not actor_tid or tid != actor_tid):
+        raise tenant_build.Refusal("a tenant_admin asks for their own tenant only")
+    if len(recipe_request.open_of(RECIPE_REQUEST_DIR, label)) >= recipe_request.MAX_OPEN:
+        raise tenant_build.Refusal(
+            f"'{label}' has {recipe_request.MAX_OPEN} open requests -- wait for "
+            "the operator's answers first")
+    title, version, seen = "", "", {}
+    values = {k: str(v) for k, v in (values or {}).items()}
+    bad = recipe_request.values_problems(values)
+    if bad:
+        raise tenant_build.Refusal("; ".join(bad))
+    if recipe:
+        try:
+            doc, _dg, _raw = tenant_recipe.read_recipe_file(tenant_recipe_path(recipe))
+        except tenant_build.Refusal:
+            raise tenant_build.Refusal(f"this node has no recipe '{recipe}' -- say in "
+                                       "words what you need")
+        title, version = doc.get("title", ""), tenant_build.profile_version(doc)
+        try:
+            p = tenant_recipe_preview(recipe, label, values, who, role,
+                                      actor_tid=actor_tid)
+            seen = recipe_request.preview_summary(p)
+        except tenant_build.Refusal as exc:
+            seen = recipe_request.preview_summary(refused=str(exc))
+    try:
+        req = recipe_request.new_request(
+            label, who, _identity_display_name(who), recipe=recipe, version=version,
+            title=title, values=values, text=text, seen=seen)
+    except recipe_request.Refusal as exc:
+        raise tenant_build.Refusal(str(exc))
+    recipe_request.unique_id(RECIPE_REQUEST_DIR, req)
+    recipe_request.save(RECIPE_REQUEST_DIR, req)
+    _recipe_request_deliver(req)
+    recipe_request.save(RECIPE_REQUEST_DIR, req)
+    audit_tenant("tenant.recipe.request", tid, subject=req["id"], who=who, role=role,
+                 result="ok" if req["delivery"] != "failed" else "failed",
+                 detail=(f"recipe {recipe} " if recipe else "")
+                        + recipe_request.DELIVERY_DE.get(req["delivery"], req["delivery"])
+                        + (f" {req['inbox']} {req['case']}" if req.get("case") else "")
+                        + (f" ({req['note']})" if req.get("note") else ""))
+    tenant_recipe_view_write()
+    return req
+
+
+def recipe_requests_refresh(label=None, force=False):
+    """Read the cases of open requests back (state and the operator's
+    replies) -> how many changed. At most every READ_EVERY seconds unless
+    forced; one that does not answer is tried at the next reading."""
+    if not force:
+        try:
+            if time.time() - os.path.getmtime(RECIPE_REQUEST_STAMP) < RECIPE_REQUEST_READ_EVERY:
+                return 0
+        except OSError:
+            pass
+        try:
+            os.makedirs(APPS_DIR, exist_ok=True)
+            with open(RECIPE_REQUEST_STAMP, "w", encoding="utf-8") as f:
+                f.write(_iso_now())
+        except OSError:
+            pass
+    changed = 0
+    reg = load_registry()
+    host = socket.gethostname()
+    for req in recipe_request.all_requests(RECIPE_REQUEST_DIR):
+        if label and req.get("label") != label:
+            continue
+        if req.get("delivery") != "sent" or not recipe_request.is_open(req):
+            continue
+        inst = (reg.get("instances") or {}).get(req.get("inbox") or "")
+        if not inst:
+            continue
+        try:
+            st, ans = _node_case_post(req["inbox"], inst, {
+                "op": "read", "number": req["case"], "node": host})
+        except (OSError, ValueError, subprocess.CalledProcessError) as e:
+            print(f"recipe requests: {req['id']}: {type(e).__name__}", file=sys.stderr)
+            continue
+        if st == 200:
+            if recipe_request.apply_reading(req, ans):
+                changed += 1
+            recipe_request.save(RECIPE_REQUEST_DIR, req)
+    if changed:
+        tenant_recipe_view_write()
+    return changed
+
+
+def recipe_requests_released(label, rid, words, who):
+    """A release answers the open requests of that tenant for that recipe:
+    each is marked, and its case gets a note (the release links to it)."""
+    host = socket.gethostname()
+    reg = load_registry()
+    for req in recipe_request.open_of(RECIPE_REQUEST_DIR, label):
+        if req.get("recipe") != rid or req.get("released"):
+            continue
+        req["released"] = _iso_now()
+        inst = (reg.get("instances") or {}).get(req.get("inbox") or "")
+        if req.get("delivery") == "sent" and inst:
+            try:
+                _node_case_post(req["inbox"], inst, {
+                    "op": "note", "number": req["case"], "node": host,
+                    "text": f"Freigegeben für {label}: {', '.join(words)} (von {who}). "
+                            "Der tenant_admin sieht es auf seiner Seite Einrichten."})
+            except (OSError, ValueError, subprocess.CalledProcessError):
+                pass
+        recipe_request.save(RECIPE_REQUEST_DIR, req)
+
+
+def recipe_requests_minute():
+    """The minute job's part: read open cases back, every READ_EVERY."""
+    try:
+        recipe_requests_refresh()
+    except Exception as e:                          # noqa: BLE001
+        print(f"recipe requests: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 def tenant_recipe_job(req, act_tenant, role, actor):
@@ -11979,9 +12498,33 @@ def tenant_recipe_job(req, act_tenant, role, actor):
             st = tenant_recipe_continue(run_id, actor, role, actor_tid=act_tenant)
         elif op == "confirm":
             st = tenant_recipe_confirm(run_id, str(a.get("step") or ""), actor, role,
-                                       actor_tid=act_tenant)
+                                       actor_tid=act_tenant, value=str(a.get("value") or ""))
         elif op == "rollback":
             st = tenant_recipe_rollback(run_id, actor, role, actor_tid=act_tenant)
+        elif op == "request":
+            r = tenant_recipe_request(label, actor, role, actor_tid=act_tenant,
+                                      recipe=rid, values=params,
+                                      text=str(a.get("text") or "")[:recipe_request.TEXT_MAX + 1])
+            return (r["delivery"] != "failed",
+                    f"Anfrage {r['id']}: {recipe_request.DELIVERY_DE[r['delivery']]}"
+                    + (f" ({r['case']})" if r.get("case") else "")
+                    + (f" -- {r['note']}" if r.get("note") and r["delivery"] != "sent" else ""),
+                    {"request": r["id"]})
+        elif op == "requests":
+            _recipe_role(role)
+            if role == "tenant_admin":
+                tid_, _t = tenant_by_label(label.strip().lower(), include_former=False)
+                if not tid_ or tid_ != act_tenant:
+                    return False, "a tenant_admin reads their own tenant's requests only", {}
+            n = recipe_requests_refresh(label.strip().lower() or None, force=True)
+            return True, (f"{n} Anfrage(n) mit neuem Stand." if n else
+                          "Der Stand ist aktuell."), {}
+        elif op == "inbox":
+            if role not in ("server_admin", "root"):
+                return False, "only the server_admin names the request inbox", {}
+            key = recipe_inbox_set(str(a.get("inbox") or ""), who=actor, role=role)
+            return True, (f"Anfragen der Mandanten werden Vorgänge in {key}." if key else
+                          "Kein Posteingang: Anfragen gehen als Nachricht an den Betreiber."), {}
         elif op in ("release", "unrelease"):
             tid, _t = tenant_by_label(label.strip().lower(), include_former=False)
             if not tid:
@@ -12020,7 +12563,7 @@ def _print_recipe_preview(p, as_json=False):
     for prob in p.get("problems") or []:
         print(f"  BITTE      {prob}")
     for r in p["rows"]:
-        print(f"  {tenant_recipe.SAY.get(r['verdict'], r['verdict']):<16} "
+        print(f"  {tenant_recipe.SAY.get(r['verdict'], r['verdict']):<19} "
               f"{r['id']:<16} {r['type']:<18} {r['note']}")
     if p.get("problems"):
         print("Erst wählen (oben, BITTE); so startet kein Lauf.")
@@ -12095,6 +12638,47 @@ def _tenant_recipe_cli(args):
             if not rows:
                 print("No recipe runs yet.")
             return
+        if sub == "inbox":
+            # RFC-0109 section 13: where the tenants' requests become cases
+            if arg:
+                key = recipe_inbox_set(arg, who, "root")
+                print(f"Requests of the tenants become cases in '{key}'." if key else
+                      "No request inbox: requests go as a message to the node's owners.")
+                return
+            key, _i = recipe_inbox()
+            print(f"Request inbox: {key}" if key else
+                  "No request inbox -- requests go as a message to the node's owners "
+                  "(oaap tenant recipe inbox <vorgaenge instance of the default tenant>).")
+            return
+        if sub == "request":
+            if not label:
+                die("oaap tenant recipe request [<recipe>] --tenant <label> "
+                    "--text \"what is needed\" [--param key=value]")
+            r = tenant_recipe_request(label, who, "root", recipe=arg or "",
+                                      values=given, text=getattr(args, "recipe_text", "") or "")
+            print(f"Request {r['id']}: {recipe_request.DELIVERY_DE[r['delivery']]}"
+                  + (f" {r['inbox']} {r['case']}" if r.get("case") else "")
+                  + (f" -- {r['note']}" if r.get("note") else ""))
+            if r["delivery"] == "failed":
+                sys.exit(1)
+            return
+        if sub == "requests":
+            if getattr(args, "recipe_refresh", False):
+                print(f"{recipe_requests_refresh(label or None, force=True)} changed.")
+            rows = [r for r in recipe_request.all_requests(RECIPE_REQUEST_DIR)
+                    if not label or r.get("label") == label]
+            if as_json:
+                print(json.dumps(rows, indent=1, ensure_ascii=False))
+                return
+            for r in rows:
+                print(f"  {r['id']:<34} {recipe_request.state_text(r):<28} "
+                      f"{r.get('recipe') or '-':<18} {r.get('case') or ''}")
+                for x in (r.get("replies") or [])[-3:]:
+                    print(f"      {x.get('by', '')}: {x.get('status_label') or ''} "
+                          f"{x.get('text', '')[:100]}")
+            if not rows:
+                print("No requests.")
+            return
         if sub in ("continue", "confirm", "rollback"):
             if not arg:
                 die(f"which run? oaap tenant recipe {sub} <run id>")
@@ -12104,7 +12688,8 @@ def _tenant_recipe_cli(args):
             elif sub == "confirm":
                 if not args.step:
                     die("which step? oaap tenant recipe confirm <id> --step <id>")
-                got = tenant_recipe_confirm(arg, args.step, who, "root")
+                got = tenant_recipe_confirm(arg, args.step, who, "root",
+                                            value=getattr(args, "fingerprint", "") or "")
             else:
                 if not args.yes:
                     state = tenant_build.load_state(RECIPE_RUN_DIR, arg)
@@ -12128,7 +12713,9 @@ def _tenant_recipe_cli(args):
         die(str(exc))
     die("oaap tenant recipe list | preview <recipe> --tenant <label> | "
         "run <recipe> --tenant <label> | runs | show <run> | continue <run> | "
-        "confirm <run> --step <id> | rollback <run> [--yes]")
+        "confirm <run> --step <id> | rollback <run> [--yes] | "
+        "request [<recipe>] --tenant <label> --text ... | requests [--refresh] | "
+        "inbox [<instance>|off]")
 
 
 TENANT_DRY_RUN_ACTIONS = frozenset({"adopt", "build"})
@@ -39382,6 +39969,13 @@ def build_parser():
     pten.add_argument("--tenant", dest="recipe_tenant", default=None,
                       help="for 'recipe preview|run': the existing tenant "
                            "the recipe works in")
+    pten.add_argument("--fingerprint", default="",
+                      help="for 'build|recipe confirm': the SHA-256 a human compared "
+                           "(a step with done_when server.compared, RFC-0109)")
+    pten.add_argument("--text", dest="recipe_text", default="",
+                      help="for 'recipe request': what the tenant needs, in words")
+    pten.add_argument("--refresh", dest="recipe_refresh", action="store_true",
+                      help="for 'recipe requests': read the cases back now")
     pten.add_argument("--param", action="append", default=[],
                       metavar="KEY=VALUE",
                       help="for 'build start': a parameter of the profile "
