@@ -10948,9 +10948,17 @@ class _BuildDrivers:
                                f"bestätigte ({shown}) -- neu vergleichen")
         if rec is not None:
             rec["offered_sha256"] = fp
-        return ABSENT_, (f"das Ziel zeigt SHA-256 {shown} -- mit dem eigenen Zertifikat des "
-                         "SSL-Server-PSE in STRUST vergleichen und mit genau diesem "
-                         "Fingerabdruck bestätigen")
+        if rec is None or "state" not in rec:
+            # a preview: nothing to do yet -- said as information, not as a task
+            return ABSENT_, (f"wird im Lauf verglichen: der Server unter {target} zeigt "
+                             f"ein Zertifikat mit dem Fingerabdruck {shown}")
+        return ABSENT_, (f"Bitte prüfen, ob unter {target} wirklich Ihr SAP-System "
+                         f"antwortet. Der Server zeigt ein Zertifikat mit dem Fingerabdruck "
+                         f"(SHA-256) {shown}. Vergleichen Sie ihn mit dem des SAP-Systems: "
+                         "in STRUST „SSL Server Standard“ öffnen und auf „Eigenes Zertifikat“ "
+                         "doppelklicken -- oder im Browser die Adresse öffnen, aufs Schloss "
+                         "und „Zertifikat“ klicken. Stimmt er überein, unten den Haken setzen "
+                         "und „Stimmt überein – pinnen“ wählen; eintippen müssen Sie nichts")
 
     def _check_destination_check(self, a, ctx):
         tid, _t = self._tenant()

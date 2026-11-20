@@ -13860,7 +13860,11 @@ RECIPE_RUN_BODY = """
   <form method="post" action="/einrichten/lauf/{{ b.id }}/confirm">
     <input type="hidden" name="step" value="{{ b.waiting.id }}">
     <p>Fingerabdruck (SHA-256), den das Ziel jetzt zeigt:<br><code style="word-break:break-all">{{ b.waiting.shown }}</code></p>
-    <label><input type="checkbox" name="compared" value="1"> Ich habe ihn mit dem Zertifikat in STRUST verglichen; er stimmt überein</label>
+    <p class="muted">Wo steht der Fingerabdruck des SAP-Systems? In STRUST links „SSL Server Standard“
+    öffnen, oben unter „Eigenes Zertifikat“ doppelklicken; zeigt STRUST kein SHA-256, die Adresse im
+    Browser öffnen, aufs Schloss und „Zertifikat“ klicken. Er muss Zeichen für Zeichen gleich sein.
+    Gepinnt heißt: die Plattform spricht danach nur mit genau diesem Server.</p>
+    <label><input type="checkbox" name="compared" value="1"> Ich habe ihn verglichen; er stimmt überein</label>
     <button class="btn">Stimmt überein – pinnen</button></form>
   {% elif b.waiting.confirmable %}
   <form method="post" action="/einrichten/lauf/{{ b.id }}/confirm" style="display:inline">

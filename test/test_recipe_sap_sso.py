@@ -196,6 +196,7 @@ rows = {r["id"]: r for r in pv["rows"]}
 ok("zehn Schritte; das Attribut, die Destination, der Server werden angelegt",
    len(pv["rows"]) == 10 and rows["attribut"]["verdict"] == "absent"
    and rows["ziel"]["verdict"] == "absent" and rows["server"]["verdict"] == "absent", pv["rows"])
+rows_first_note = rows["zertifikat"]["note"]
 ok("der Fingerabdruck steht schon in der Vorschau zum Vergleichen",
    rows["zertifikat"]["verdict"] == "absent" and "AB:AB:AB" in rows["zertifikat"]["note"],
    rows["zertifikat"])
@@ -227,6 +228,10 @@ ok("das Attribut ist angelegt (über den Konnektor), der Lauf wartet am Zertifik
 ok("…mit dem Fingerabdruck im Hinweis und als angebotener Wert",
    "AB:AB" in steps["zertifikat"]["note"] and steps["zertifikat"].get("offered_sha256") == FP,
    steps["zertifikat"])
+ok("die Vorschau sagt es als Auskunft, der Lauf als Bitte mit dem Weg (STRUST oder Browser, Haken)",
+   rows_first_note.startswith("wird im Lauf verglichen")
+   and "STRUST" in steps["zertifikat"]["note"] and "Haken" in steps["zertifikat"]["note"],
+   (rows_first_note, steps["zertifikat"]["note"]))
 ok("im Anmeldedienst steht kein Gemachtes zum Rückbau (nie DELETE)",
    steps["attribut"].get("made") in (None, []), steps["attribut"])
 rid = st["id"]
