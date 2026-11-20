@@ -528,7 +528,7 @@ def client_for(node_name):
     return ("oaap-" + node.strip("-"))[:64] or "oaap"
 
 
-def redirect_uris_for(tenant_label, host, plain=False):
+def redirect_uris_for(tenant_label, host, plain=False, domain=""):
     """Every address at which this node's login may come back.
 
     The redirect URI must match to the character, and the scheme in it
@@ -558,7 +558,12 @@ def redirect_uris_for(tenant_label, host, plain=False):
     if not label or not host:
         return []
     schemes = ("https", "http") if plain else ("https",)
-    return [f"{s}://{label}.{host}/auth/oidc/callback" for s in schemes]
+    out = [f"{s}://{label}.{host}/auth/oidc/callback" for s in schemes]
+    # RFC-0115: the tenant's own domain is a place too; its login comes back there
+    domain = (domain or "").strip().lower()
+    if domain:
+        out += [f"{s}://{domain}/auth/oidc/callback" for s in schemes]
+    return out
 
 
 def space_refusal(kind, space):

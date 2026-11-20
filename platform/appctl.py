@@ -6505,9 +6505,19 @@ def instance_auto_hosts(name, inst, ext_host=None):
     # recently -- the same grace a renamed tenant label gets, for the
     # same reason (RFC-0026 3.3).
     names = [instance_name(name, inst)] + former_names(inst)
-    prefixes = tenant_host_prefixes(resolve_tenant((inst or {}).get("tenant")))
-    return [f"{local}.{p}.{ext}" if p else f"{local}.{ext}"
-            for local in names for p in prefixes]
+    tid = resolve_tenant((inst or {}).get("tenant"))
+    prefixes = tenant_host_prefixes(tid)
+    out = [f"{local}.{p}.{ext}" if p else f"{local}.{ext}"
+           for local in names for p in prefixes]
+    # RFC-0115: the tenant's own domain carries every instance too,
+    # `<instance>.<domain>` -- printed first while it is canonical (§5).
+    # Only for a tenant that resolves: fail closed exactly as above.
+    t = load_tenants().get(tid or "") if prefixes else None
+    dom = place.tenant_domain(t)
+    if dom:
+        mine = [f"{local}.{dom}" for local in names]
+        out = mine + out if place.domain_canonical(t) else out + mine
+    return out
 
 
 def tenant_slug(tid):
@@ -8358,7 +8368,8 @@ def cmd_idp(args):
         client_id = (args.client_id
                      or idp_admin.client_for(host)).strip()
         plain = bool(getattr(args, "plain_callback", False))
-        uris = idp_admin.redirect_uris_for(label, host, plain=plain)
+        uris = idp_admin.redirect_uris_for(label, host, plain=plain,
+                                           domain=place.tenant_domain(t))
         bad = idp_admin.space_refusal(c["kind"], space)
         if bad:
             die(bad)
@@ -12813,6 +12824,9 @@ def cmd_tenant(args):
     if args.action == "egress":
         return _tenant_egress_cli(args)
 
+    if args.action == "domain":
+        return _tenant_domain_cli(args, tenants)
+
     if args.action == "create":
         label = (args.name or "").strip().lower()
         _tenant_write_common(label, "create")
@@ -13260,6 +13274,129 @@ def cmd_tenant(args):
     # oaap.core.tenant 1.7: what the server_admin handed to its tenant_admin.
     may = t.get("tenant_admin_may") or []
     print(f"Tenant admin may also: {', '.join(may) if may else '(nothing beyond the role)'}")
+    dom = t.get("domain") or {}
+    if dom.get("name"):
+        print(f"Domain:    {dom['name']} ({dom.get('state', '?')}"
+              + (f", checked {dom['checked']}" if dom.get("checked") else "") + ")")
+
+
+# ------------------------------------------------ a tenant's own domain (RFC-0115)
+def _resolve_addrs(host):
+    try:
+        return {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+    except (OSError, UnicodeError):
+        return set()
+
+
+def domain_dns_check(name, ext, resolve=_resolve_addrs):
+    """(ok, sentence): do the domain AND a random name below it resolve to
+    where the node's own external name resolves? (RFC-0115 §2, D2)
+
+    Compared with the node's own name rather than with an address this node
+    believes it has: directly and behind an edge alike, that name points at
+    the entry the world uses, and the domain must point at the same one.
+    The random name proves the wildcard, so every `<instance>.<domain>` will
+    resolve and get its certificate."""
+    want = resolve(ext)
+    if not want:
+        return False, f"this node's own name {ext} resolves nowhere from here -- nothing to compare with"
+    probe = f"oaap-check-{secrets.token_hex(4)}.{name}"
+    apex, below = resolve(name), resolve(probe)
+    if not apex & want:
+        return False, (f"{name} resolves to {', '.join(sorted(apex)) or 'nothing'}, "
+                       f"{ext} to {', '.join(sorted(want))}: add `{name}  A/AAAA` for these addresses")
+    if not below & want:
+        return False, (f"{name} fits, but {probe} resolves to {', '.join(sorted(below)) or 'nothing'}: "
+                       f"add the wildcard `*.{name}` for the same addresses")
+    return True, f"{name} and *.{name} resolve to {', '.join(sorted(apex & want))}, as {ext} does"
+
+
+def _tenant_domain_cli(args, tenants):
+    """`oaap tenant domain <label> [<domain>|check|off|remove]` (RFC-0115).
+
+    Only here, on the node, by root: binding a domain to a tenant is the
+    operator's act (D1). A domain names nothing until DNS shows it points
+    here (`check`, D2)."""
+    label = (args.name or "").strip().lower()
+    tid, _t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the current label '{label}'")
+    t = tenants[tid]
+    if tid == default_tenant_id():
+        die("the default tenant's place is this node's own name -- it has no domain of its own")
+    ext = load_external()
+    what = (args.target or "").strip().lower().rstrip(".")
+    dom = dict(t.get("domain") or {})
+    if not what:
+        if not dom.get("name"):
+            print(f"Tenant '{label}' has no own domain.")
+            print(f"  sudo oaap tenant domain {label} <domain>")
+        else:
+            print(f"{dom['name']}: {dom.get('state', '?')}"
+                  + (f" (checked {dom['checked']}: {dom.get('said', '')})" if dom.get("checked") else ""))
+        return
+    if what in ("off", "remove"):
+        if not dom.get("name"):
+            die(f"tenant '{label}' has no own domain")
+        if what == "off":
+            dom["state"] = "off"
+            t["domain"] = dom
+        else:
+            t.pop("domain", None)
+        save_tenants(tenants)
+        audit_tenant("tenant.domain", tid, label, detail=f"{what} {dom['name']}")
+        refresh_generated_sites()
+        reload_gateway()
+        print(f"{dom['name']}: {'switched off' if what == 'off' else 'removed'}. "
+              f"Names below it answer nothing here any more; {label}.{ext} keeps working.")
+        return
+    if what != "check":
+        if not ext:
+            die("this node has no external name yet (`oaap external set` first) -- "
+                "a domain is checked against it")
+        bad = place.domain_refusal(what, ext, tenants, tid)
+        if bad:
+            die(bad)
+        dom = {"name": what, "state": "pending", "canonical": dom.get("canonical") or "domain"}
+        t["domain"] = dom
+        save_tenants(tenants)
+        audit_tenant("tenant.domain", tid, label, detail=f"set {what} (pending)")
+        print(f"{what} is entered for tenant '{label}', pending until DNS points here.")
+    if not dom.get("name"):
+        die(f"tenant '{label}' has no own domain")
+    ok_, said = domain_dns_check(dom["name"], ext)
+    dom.update(checked=_iso_now(), said=said)
+    was = dom.get("state")
+    if ok_ and was != "off":
+        dom["state"] = "active"
+    t["domain"] = dom
+    save_tenants(tenants)
+    print(("DNS: " if ok_ else "DNS does not fit yet: ") + said)
+    if dom["state"] != "active":
+        print(f"Nothing is served under {dom['name']} until it fits: "
+              f"`sudo oaap tenant domain {label} check` again.")
+        if was == "off":
+            print("The domain is switched off; set it again to switch it on.")
+        return
+    audit_tenant("tenant.domain", tid, label, detail=f"active {dom['name']}")
+    refresh_generated_sites()
+    reload_gateway()
+    _host, edge = load_external_conf()
+    print("")
+    print(f"Active. {dom['name']} shows the place and login of '{label}', "
+          f"<instance>.{dom['name']} each of its instances;")
+    print(f"{label}.{ext} and <instance>.{label}.{ext} keep answering.")
+    if edge:
+        print(f"This node is behind the edge {edge}: on the edge node, route the domain here --")
+        print(f"  sudo oaap edge add {dom['name']} <this node's LAN address>")
+    else:
+        print("Certificates for each name are fetched on first contact.")
+    print("")
+    print("The tenant's provider must accept the new return address:")
+    print(f"  https://{dom['name']}/auth/oidc/callback")
+    print(f"A Keycloak realm made by `oaap idp provision` gets it when you run that again for '{label}';")
+    print("any other provider: add it there. Until then a provider login on the domain is refused by the provider.")
+    print("Apps learn the new names (OAAP_INSTANCE_NAMES) at their next start.")
 
 
 # ------------------------------------------------ node profiles (RFC-0011)
@@ -17914,7 +18051,10 @@ def instance_sandbox_hosts(name, inst, ext_host=None, reg=None):
     behind one name. A rehearsal gets none (spec 2.15.2)."""
     if not ui_sandbox_path(inst) or is_rehearsal(inst or {}):
         return []
-    autos = instance_auto_hosts(name, inst, ext_host=ext_host)
+    # RFC-0115 D6: sandbox origins stay on the node's names
+    tenants = load_tenants()
+    autos = [h for h in instance_auto_hosts(name, inst, ext_host=ext_host)
+             if place.domain_of_host(h, tenants)[0] is None]
     reg = reg or load_registry()
     taken = {h for k, i in reg["instances"].items() if k != name
              for h in instance_auto_hosts(k, i, ext_host=ext_host)}
@@ -20179,6 +20319,26 @@ def write_external_caddy():
         lines += _LOG_BLOCK
         lines += _portal_site_body()
         lines.append("}")
+    # RFC-0115: a tenant's own domain -- its place on the apex (the same
+    # portal, the host says which tenant), and below it nothing but the
+    # instances: behind an edge every other name gets 404 instead of the
+    # node's catch-all (stage 0 finding 3). Directly, an unknown name has
+    # no certificate and so never reaches a page at all.
+    domains = [(tid, place.tenant_domain(t)) for tid, t in sorted(load_tenants().items())
+               if place.tenant_domain(t)]
+    for _tid, dom in domains:
+        lines.append(f"# {dom} -> the own domain of tenant {_tid} (RFC-0115)")
+        lines.append(f"{scheme}://{dom} {{")
+        if edge:
+            lines += _edge_guard(edge)
+        lines += _LOG_BLOCK
+        lines += _portal_site_body()
+        lines.append("}")
+        if edge:
+            lines.append(f"{scheme}://*.{dom} {{")
+            lines += _edge_guard(edge)
+            lines.append("\trespond 404")
+            lines.append("}")
     if not edge:
         # The bare :80 catch-all would happily serve plain HTTP for the
         # external names — redirect them to HTTPS explicitly.
@@ -20191,6 +20351,8 @@ def write_external_caddy():
             for _prefix in tenant_host_prefixes(_tid):
                 if _prefix:
                     redirs.append(f"http://*.{_prefix}.{host}")
+        for _tid, dom in domains:
+            redirs += [f"http://{dom}", f"http://*.{dom}"]
         lines.append(", ".join(redirs) + " {")
         lines.append("\tredir https://{host}{uri} permanent")
         lines.append("}")
@@ -40004,14 +40166,16 @@ def build_parser():
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
-                               "build", "recipe", "egress", "allow", "disallow"])
+                               "build", "recipe", "egress", "allow", "disallow",
+                               "domain"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "
                            "-- every collision is named and nothing is "
                            "merged (RFC-0041 K6)")
     pten.add_argument("name", nargs="?", help="tenant label (default: 'default')")
-    pten.add_argument("target", nargs="?", help="the new label, for 'rename'")
+    pten.add_argument("target", nargs="?", help="the new label, for 'rename'; for 'domain': "
+                                                  "a domain to bind (RFC-0115), or check|off|remove")
     pten.add_argument("--name", dest="title", default="",
                       help="the customer's name in plain words, e.g. 'Kunde Meier GmbH'")
     pten.add_argument("--account", default="",

@@ -59,6 +59,13 @@ def host_place(host, ext_host, tenants, default_tid, now_iso):
     """
     host = (host or "").split(":")[0].lower()
     ext = (ext_host or "").lower()
+    # RFC-0115: a tenant's own domain names that tenant exactly like its
+    # label does. A name BELOW it is an instance's site (the gateway has
+    # one per instance and answers everything else with 404), so it names
+    # no place here -- the login there is handed to the domain's place.
+    dtid, apex = domain_of_host(host, tenants)
+    if dtid is not None:
+        return (dtid, True) if apex else (None, True)
     if not ext or host == ext or not host.endswith("." + ext):
         return None, True
     label = host[: -len(ext) - 1]
@@ -75,6 +82,104 @@ def host_place(host, ext_host, tenants, default_tid, now_iso):
     if default_tid and tid == default_tid:
         return None, False
     return tid, True
+
+
+# ---------------------------------------------------------------------------
+# A tenant's own domain (RFC-0115)
+
+DOMAIN_RE = re.compile(r"(?=.{4,200}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
+DOMAIN_STATES = ("pending", "active", "off")
+
+
+def tenant_domain(t):
+    """The tenant's ACTIVE own domain, or "". A pending or switched-off
+    domain names nothing anywhere -- the gateway writes no site for it and
+    no reader resolves it (RFC-0115 §2, §7.3)."""
+    d = (t or {}).get("domain") or {}
+    name = str(d.get("name") or "").strip().lower()
+    return name if name and d.get("state") == "active" else ""
+
+
+def domain_canonical(t):
+    """Is the domain the name printed first? Only an active one, and
+    only while the operator has not said `node` (RFC-0115 §5, D3)."""
+    return bool(tenant_domain(t)) and ((t.get("domain") or {}).get("canonical") or "domain") == "domain"
+
+
+def domain_of_host(host, tenants):
+    """(tenant_id, is_apex) for a host at or below an active tenant domain,
+    else (None, False)."""
+    host = (host or "").split(":")[0].lower().rstrip(".")
+    if not host:
+        return None, False
+    for tid, t in sorted((tenants or {}).items()):
+        d = tenant_domain(t)
+        if not d:
+            continue
+        if host == d:
+            return tid, True
+        if host.endswith("." + d):
+            return tid, False
+    return None, False
+
+
+def domain_refusal(name, ext_host, tenants, tid):
+    """Why `name` may not become tenant `tid`'s domain, or "".
+
+    Never the node's own name or a name below it (those are the node's,
+    RFC-0042), never a name ABOVE the node's (its wildcard would swallow
+    the node), never a name another tenant holds or that overlaps it --
+    one domain names exactly one tenant (§7.2)."""
+    name = (name or "").strip().lower().rstrip(".")
+    ext = (ext_host or "").strip().lower()
+    if not DOMAIN_RE.fullmatch(name):
+        return f"'{name}' is not a domain name (letters, digits, hyphens, dots; e.g. bec.example.org)"
+    if ext and (name == ext or name.endswith("." + ext)):
+        return f"'{name}' is this node's own name or below it -- the tenant already answers there"
+    if ext and ext.endswith("." + name):
+        return f"'{name}' lies above this node's name '{ext}': its wildcard would take the node's names"
+    for other, t in (tenants or {}).items():
+        if other == tid:
+            continue
+        o = str(((t or {}).get("domain") or {}).get("name") or "").lower()
+        if o and (o == name or o.endswith("." + name) or name.endswith("." + o)):
+            return f"'{name}' overlaps '{o}', the domain of tenant '{t.get('label', other)}'"
+    return ""
+
+
+def cookie_scope(host, ext_host, tenants):
+    """The domain a session cookie set on this host is widened to, or ""
+    (host-only). A tenant domain keeps its own cookie, never shared with
+    the node's names or another tenant (RFC-0115 §4, D4)."""
+    host = (host or "").split(":")[0].lower()
+    dtid, _apex = domain_of_host(host, tenants)
+    if dtid is not None:
+        return tenant_domain(tenants[dtid])
+    ext = (ext_host or "").lower()
+    if ext and (host == ext or host.endswith("." + ext)):
+        return ext
+    return ""
+
+
+def place_host_of(tid, tenants, ext_host, default_tid, host=""):
+    """The host of tenant `tid`'s place that a login from `host` belongs to.
+
+    From a host at or below the tenant's own domain: the domain, because
+    only there does the cookie of that login reach the host again. From
+    anywhere else: `<label>.<node>` (the node's own name for the default
+    tenant), as before. "" when there is none."""
+    t = (tenants or {}).get(tid) or {}
+    d = tenant_domain(t)
+    h = (host or "").split(":")[0].lower()
+    if d and (h == d or h.endswith("." + d)):
+        return d
+    ext = (ext_host or "").lower()
+    if not ext:
+        return ""
+    if default_tid and tid == default_tid:
+        return ext
+    label = (t.get("label") or "").strip().lower()
+    return f"{label}.{ext}" if label else ""
 
 
 def tenant_id_by_label(label, tenants, now_iso):

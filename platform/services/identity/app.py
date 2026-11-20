@@ -387,11 +387,14 @@ class DomainAwareSessionInterface(SecureCookieSessionInterface):
     """
 
     def get_cookie_domain(self, app):
-        ext = _external_host()
-        if ext:
-            host = request.host.split(":")[0].lower()
-            if host == ext or host.endswith("." + ext):
-                return ext
+        # RFC-0115: a tenant's own domain gets a cookie of its own, never
+        # shared with the node's names (place.cookie_scope, D4)
+        try:
+            scope = place.cookie_scope(request.host, _external_host(), known_tenants())
+        except Exception:        # noqa: BLE001 -- a login must survive a bad store
+            scope = ""
+        if scope:
+            return scope
         return super().get_cookie_domain(app)
 
 
@@ -929,9 +932,13 @@ def _return_host(raw):
     """
     ext = _external_host()
     h = str(raw or "").strip().lower()
-    if not ext or not h or not re.fullmatch(r"[a-z0-9.-]{1,253}", h):
+    if not h or not re.fullmatch(r"[a-z0-9.-]{1,253}", h):
         return ""
-    return h if (h == ext or h.endswith("." + ext)) else ""
+    # RFC-0115: the same cookie scope as the host the login happens on --
+    # the node's names for the node's names, a tenant domain for itself
+    tenants = known_tenants()
+    here = place.cookie_scope(_forwarded_host(), ext, tenants)
+    return h if here and place.cookie_scope(h, ext, tenants) == here else ""
 
 
 def login_handoff(target):
@@ -954,9 +961,12 @@ def login_handoff(target):
     """
     ext = _external_host()
     host = _forwarded_host()
-    if not ext or not host.endswith("." + ext):
-        return ""
     tenants = known_tenants()
+    # RFC-0115: a host below a tenant's own domain is handed to that
+    # domain's place, where the cookie of the login reaches it again
+    under_domain = place.domain_of_host(host, tenants)[0] is not None
+    if not under_domain and (not ext or not host.endswith("." + ext)):
+        return ""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     dflt = default_tenant_id()
     tid_here, _resolved = place.host_place(host, ext, tenants, dflt, now)
@@ -968,9 +978,8 @@ def login_handoff(target):
     provider, secret = tenant_provider(ref)
     if not provider or not secret:
         return ""
-    label = (tenants[ref].get("label") or "").strip().lower()
-    place_host = ext if ref == dflt else f"{label}.{ext}"
-    if place_host == host or not label:
+    place_host = place.place_host_of(ref, tenants, ext, dflt, host)
+    if not place_host or place_host == host:
         return ""
     return (f"{_forwarded_scheme()}://{place_host}/auth/oidc/start?"
             + urlencode({"next": target, "back": host} if target
@@ -2762,11 +2771,11 @@ def _place_callback(tid):
     LAN name or without an external name: this host's, as before."""
     ext = _external_host()
     host = _forwarded_host()
-    if not ext or not (host == ext or host.endswith("." + ext)):
-        return _oidc_redirect_uri()
     tenants = known_tenants()
-    label = ((tenants.get(tid) or {}).get("label") or "").strip().lower()
-    place_host = ext if tid == default_tenant_id() else (f"{label}.{ext}" if label else "")
+    # RFC-0115: on a tenant's own domain the place IS the domain
+    if not place.cookie_scope(host, ext, tenants):
+        return _oidc_redirect_uri()
+    place_host = place.place_host_of(tid, tenants, ext, default_tenant_id(), host)
     if not place_host:
         return _oidc_redirect_uri()
     return f"{_forwarded_scheme()}://{place_host}/auth/oidc/callback"
