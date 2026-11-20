@@ -32,7 +32,9 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 PARAM_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 WORD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-BUILD_ID_RE = re.compile(r"^b-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
+# b- a build (RFC-0055), r- a run of a recipe (RFC-0109): one engine, one
+# state format, two folders.
+BUILD_ID_RE = re.compile(r"^[br]-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
 TEMPLATE_RE = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 
 PARAM_KINDS = ("label", "text", "color", "connector", "word", "bool", "apps")
@@ -805,9 +807,9 @@ def step_active(step, values):
 
 # ------------------------------------------------------------- the state
 
-def new_build_id(label, now=None):
+def new_build_id(label, now=None, prefix="b"):
     t = (now or datetime.now(timezone.utc)).strftime("%Y%m%dt%H%M%S")
-    return f"b-{t}-{label}"
+    return f"{prefix}-{t}-{label}"
 
 
 def _new_step(s, values):
@@ -967,6 +969,12 @@ def _save(root, state, drivers):
             pass
 
 
+def _event(state, what):
+    """tenant.build.<what>, or tenant.recipe.<what> for a recipe's run: the
+    tenant's log says which of the two acted in its name."""
+    return f"tenant.{'recipe' if state.get('kind') == 'recipe' else 'build'}.{what}"
+
+
 def _audit(drivers, event, step, result, detail=""):
     fn = getattr(drivers, "audit", None)
     if fn:
@@ -1085,14 +1093,14 @@ def run(state, profile, drivers, root, now=iso_now):
                 drivers, now)
     state["state"] = "done"
     _save(root, state, drivers)
-    _audit(drivers, "tenant.build.done", "", "ok", state["id"])
+    _audit(drivers, _event(state, "done"), "", "ok", state["id"])
     return state
 
 
 def _finish(state, rec, note, root, drivers, now):
     rec["state"], rec["note"], rec["finished"] = "done", note, now()
     _save(root, state, drivers)
-    _audit(drivers, "tenant.build.step", rec["id"], "ok", note)
+    _audit(drivers, _event(state, "step"), rec["id"], "ok", note)
 
 
 def _stop(state, rec, kind, note, root, drivers, now):
@@ -1101,7 +1109,7 @@ def _stop(state, rec, kind, note, root, drivers, now):
     rec["finished"] = now() if kind == "failed" else ""
     state["state"] = "waiting" if kind == "waiting" else "failed"
     _save(root, state, drivers)
-    _audit(drivers, "tenant.build.step", rec["id"], kind, rec["note"])
+    _audit(drivers, _event(state, "step"), rec["id"], kind, rec["note"])
     return state
 
 
@@ -1159,7 +1167,7 @@ def rollback(state, profile, drivers, root, now=iso_now):
                              + _sentence(bad or res[1]), root, drivers, now)
             rec["made"].remove(item)
             _save(root, state, drivers)
-            _audit(drivers, "tenant.build.rollback", rec["id"], "ok",
+            _audit(drivers, _event(state, "rollback"), rec["id"], "ok",
                    _sentence(res[1]))
         rec["state"], rec["note"] = "pending", "zurückgebaut"
         _save(root, state, drivers)

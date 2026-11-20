@@ -77,6 +77,8 @@ import place  # noqa: E402  (after the path insert, necessarily)
 import idp  # noqa: E402
 # The tenant build profile (RFC-0055): the pure half of a build.
 import tenant_build  # noqa: E402
+# Setup recipes for an existing tenant (RFC-0109): the same engine.
+import tenant_recipe  # noqa: E402
 import gen_values  # noqa: E402
 # Invitations and requests in front of a build (RFC-0055 stage 4).
 import tenant_request  # noqa: E402
@@ -11508,6 +11510,311 @@ def _tenant_build_cli(args):
         "continue <id> | confirm <id> --step <id> | rollback <id> [--yes]")
 
 
+# ------------------------------------------------ setup recipes (RFC-0109)
+#
+# A recipe runs the build engine against a tenant that ALREADY exists. Its
+# runs live beside the builds, in their own folder, with ids r-...; the
+# drivers are the build's, so a step does on a recipe's run exactly what it
+# does in a build.
+
+RECIPE_DIR = os.path.join(DATA_DIR, "recipes")
+RECIPE_RUN_DIR = os.path.join(DATA_DIR, "data", "tenant-recipe-runs")
+
+
+def tenant_recipe_path(rid):
+    if not tenant_build.ID_RE.match(str(rid or "")):
+        raise tenant_build.Refusal(f"'{rid}' is not a recipe name")
+    return os.path.join(RECIPE_DIR, rid + ".json")
+
+
+def tenant_recipes():
+    """[(id, title, version, problem or '')] for every file in the folder."""
+    out = []
+    try:
+        names = sorted(os.listdir(RECIPE_DIR))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        try:
+            doc, _d, _r = tenant_recipe.read_recipe_file(os.path.join(RECIPE_DIR, n))
+            out.append((n[:-5], doc.get("title", ""),
+                        tenant_build.profile_version(doc), ""))
+        except tenant_build.Refusal as exc:
+            out.append((n[:-5], "", "", str(exc)))
+    return out
+
+
+def _recipe_role(role):
+    # Stage 1 (RFC-0109 section 10): the operator only. A tenant_admin runs
+    # a RELEASED recipe through the portal from stage 2, after
+    # tenant_recipe.tenant_admin_scope_problems has passed.
+    if role not in ("root", "server_admin"):
+        raise tenant_build.Refusal("a recipe is run by server_admin (for a "
+                                   "tenant_admin: from stage 2, once released)")
+
+
+def _recipe_instances(tid):
+    """[(key, local name, app id)] of this tenant -- the only instances a
+    recipe's needs can name (RFC-0109 S2)."""
+    return [(k, instance_name(k, i), str(i.get("app_id") or ""))
+            for k, i in sorted(tenant_instances(load_registry(), tid).items())
+            if not is_rehearsal(i)]
+
+
+def _recipe_prepare(rid, label, given, role, doc=None, digest=None):
+    """-> (doc, digest, profile, values, chosen) with every step rendered
+    once, so a refusal in the last step is found before the first runs."""
+    _recipe_role(role)
+    label = str(label or "").strip().lower()
+    tid, t = tenant_by_label(label, include_former=False)
+    if not t:
+        raise tenant_build.Refusal(f"there is no tenant '{label}' -- a recipe "
+                                   "works in a tenant that exists (a new one "
+                                   "is made by a profile)")
+    if doc is None:
+        doc, digest, _raw = tenant_recipe.read_recipe_file(tenant_recipe_path(rid))
+    needs = set(tenant_recipe.need_names(doc))
+    given = dict(given or {})
+    picks = {k: v for k, v in given.items() if k in needs}
+    rest = {k: v for k, v in given.items() if k not in needs}
+    for k in ("label", "tenant") + tuple(n + tenant_recipe.KEY_SUFFIX for n in needs):
+        if k in rest:
+            raise tenant_build.Refusal(f"'{k}' is set by the node, not given")
+    vals, problems, chosen = tenant_recipe.resolve_needs(
+        doc, _recipe_instances(tid), picks, lambda loc: instance_key(tid, loc))
+    if problems:
+        raise tenant_build.Refusal("; ".join(problems))
+    profile = tenant_recipe.as_profile(doc)
+    values, problems = tenant_build.param_values(
+        profile, dict(rest, label=label, tenant=label, **vals))
+    if problems:
+        raise tenant_build.Refusal("; ".join(problems))
+    tenant_build.plan(profile, values)
+    return doc, digest, profile, values, chosen
+
+
+def _recipe_ctx(values):
+    return {"label": values["label"], "started": _iso_now(),
+            "state": {"steps": []}, "values": values}
+
+
+def tenant_recipe_preview(rid, label, given, who, role, drivers=None):
+    """What a run would do, step by step, nothing done (RFC-0109 D6)."""
+    doc, digest, profile, values, chosen = _recipe_prepare(rid, label, given, role)
+    drivers = drivers or _BuildDrivers(values["label"], who, role)
+    rows = tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values))
+    return {"recipe": doc["id"], "version": tenant_build.profile_version(doc),
+            "digest": digest, "title": doc.get("title", ""),
+            "tenant": values["label"], "needs": chosen, "rows": rows,
+            "params": {k: v for k, v in values.items()
+                       if k not in ("label", "tenant")}}
+
+
+def tenant_recipe_run(rid, label, given, who, role, drivers=None):
+    """Preview, then run -> the run's state. A conflict in the preview stops
+    it before anything happens (RFC-0109 D6)."""
+    doc, digest, profile, values, chosen = _recipe_prepare(rid, label, given, role)
+    held = tenant_recipe.open_run_for(RECIPE_RUN_DIR, values["label"])
+    if held:
+        raise tenant_build.Refusal(
+            f"run {held['id']} in '{held['label']}' is not finished "
+            f"({held['state']}); continue it or roll it back first")
+    drivers = drivers or _BuildDrivers(values["label"], who, role)
+    blockers = tenant_recipe.preview_blockers(
+        tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values)))
+    if blockers:
+        raise tenant_build.Refusal(
+            "the preview found what stops this recipe, nothing was done: "
+            + "; ".join(f"{r['id']}: {r['note']}" for r in blockers[:5]))
+    state = tenant_recipe.new_run_state(doc, digest, values, chosen, who)
+    # An id names a second; a second run in the same second (found by the
+    # test: a run right after one that found everything present) must not
+    # overwrite the first run's state, or its rollback is lost.
+    base, n = state["id"], 1
+    while os.path.exists(tenant_build.state_path(RECIPE_RUN_DIR, state["id"])):
+        n += 1
+        state["id"] = f"{base}-{n}"
+    # the very file this run uses is kept under its digest (RFC-0079 D5)
+    try:
+        with open(tenant_recipe_path(rid), "rb") as f:
+            raw = f.read()
+        if tenant_build.digest_of(raw) == digest:
+            tenant_build.history_put(RECIPE_DIR, rid, raw, "")
+    except OSError:
+        pass
+    tenant_build.save_state(RECIPE_RUN_DIR, state)
+    return _recipe_drive(state, profile, drivers)
+
+
+def _recipe_drive(state, profile, drivers):
+    with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
+        return tenant_build.run(state, profile, drivers, RECIPE_RUN_DIR)
+
+
+def _recipe_load(run_id, role):
+    _recipe_role(role)
+    state = tenant_build.load_state(RECIPE_RUN_DIR, run_id)
+    if state.get("kind") != "recipe":
+        raise tenant_build.Refusal(f"'{run_id}' is not a recipe's run")
+    kept = tenant_build.history_path(RECIPE_DIR, state["recipe"],
+                                     state.get("digest"))
+    doc, digest, _raw = tenant_recipe.read_recipe_file(
+        kept or tenant_recipe_path(state["recipe"]))
+    return state, tenant_recipe.as_profile(doc), digest
+
+
+def tenant_recipe_continue(run_id, who, role, drivers=None, purge=False):
+    state, profile, digest = _recipe_load(run_id, role)
+    if state["state"] in ("done", "rolled-back"):
+        raise tenant_build.Refusal(f"run {run_id} is {state['state']}")
+    if digest != state["digest"]:
+        raise tenant_build.Refusal("the recipe file changed since this run "
+                                   "started; start a new run instead")
+    if state.get("rolling_back"):
+        return tenant_recipe_rollback(run_id, who, role, drivers, purge)
+    return _recipe_drive(state, profile,
+                         drivers or _BuildDrivers(state["label"], who, role))
+
+
+def tenant_recipe_confirm(run_id, step, who, role, drivers=None):
+    state, profile, _digest = _recipe_load(run_id, role)
+    tenant_build.confirm(state, step, RECIPE_RUN_DIR)
+    return _recipe_drive(state, profile,
+                         drivers or _BuildDrivers(state["label"], who, role))
+
+
+def tenant_recipe_rollback(run_id, who, role, drivers=None, purge=False):
+    """Undo what THIS run made, in reverse; an item a human changed since
+    stays by the app's own rule (RFC-0104 section 3.1)."""
+    state, profile, _digest = _recipe_load(run_id, role)
+    if state["state"] == "rolled-back" and not state.get("rolling_back"):
+        raise tenant_build.Refusal(f"run {run_id} is already rolled back")
+    drivers = drivers or _BuildDrivers(state["label"], who, role, purge=purge)
+    with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
+        return tenant_build.rollback(state, profile, drivers, RECIPE_RUN_DIR)
+
+
+def _print_recipe_preview(p, as_json=False):
+    if as_json:
+        print(json.dumps(p, indent=1, ensure_ascii=False))
+        return
+    print(f"Vorschau: Rezept {p['recipe']} {p['version'] or ''} im Mandanten "
+          f"'{p['tenant']}' -- {p['title']}")
+    for n, c in p["needs"].items():
+        print(f"  {n:<10} {c['app']:<14} {c['name']}"
+              + ("  (wird installiert)" if c["install"] else ""))
+    for r in p["rows"]:
+        print(f"  {tenant_recipe.SAY.get(r['verdict'], r['verdict']):<16} "
+              f"{r['id']:<16} {r['type']:<18} {r['note']}")
+    if tenant_recipe.preview_blockers(p["rows"]):
+        print("Ein Lauf würde hier anhalten, bevor er etwas tut.")
+    elif all(r["verdict"] in ("present", "skipped") for r in p["rows"]):
+        print("Alles ist vorhanden; ein Lauf hätte nichts zu tun.")
+    print("Nichts wurde geändert.")
+
+
+def _print_recipe_run(state, as_json=False):
+    if as_json:
+        print(json.dumps(state, indent=1, sort_keys=True))
+        return
+    print(f"Lauf {state['id']}  Rezept {state.get('recipe', '')}  "
+          f"Mandant '{state['label']}'  -> {state['state'].upper()}")
+    for r in state["steps"]:
+        print(f"  {r['state']:<8} {r['id']:<16} {r['type']:<18} {r['note']}")
+    if state["state"] == "waiting":
+        print(f"Wartet auf einen Menschen. Danach: sudo oaap tenant recipe "
+              f"continue {state['id']}")
+    elif state["state"] == "failed":
+        print(f"Ursache beheben, dann: sudo oaap tenant recipe continue "
+              f"{state['id']}  (oder `rollback {state['id']}`)")
+
+
+def _tenant_recipe_cli(args):
+    sub = (args.name or "").strip().lower()
+    arg = args.target
+    who = _build_actor()
+    as_json = bool(getattr(args, "as_json", False))
+    label = getattr(args, "recipe_tenant", None) or ""
+    given = {}
+    for item in getattr(args, "param", None) or []:
+        k, eq, v = item.partition("=")
+        if not eq:
+            die(f"--param wants key=value, not '{item}'")
+        given[k.strip()] = v
+    try:
+        if sub == "list":
+            rows = tenant_recipes()
+            if not rows:
+                print(f"No recipes in {RECIPE_DIR}.")
+            for rid, title, ver, problem in rows:
+                print(f"  {rid:<24} {ver:<8} {title}"
+                      + (f"  REFUSED: {problem}" if problem else ""))
+            return
+        if sub in ("preview", "run"):
+            if not arg or not label:
+                die(f"oaap tenant recipe {sub} <recipe> --tenant <label> "
+                    "[--param need=<instance>] [--param key=value]")
+            if sub == "preview":
+                _print_recipe_preview(
+                    tenant_recipe_preview(arg, label, given, who, "root"), as_json)
+                return
+            got = tenant_recipe_run(arg, label, given, who, "root")
+            _print_recipe_run(got, as_json)
+            if got["state"] == "failed":
+                sys.exit(1)
+            return
+        if sub in ("show", "runs"):
+            if arg:
+                _print_recipe_run(tenant_build.load_state(RECIPE_RUN_DIR, arg),
+                                  as_json)
+                return
+            rows = tenant_build.list_states(RECIPE_RUN_DIR)
+            if as_json:
+                print(json.dumps(rows, indent=1))
+                return
+            for st in rows:
+                print(f"  {st['id']:<44} {st['state']:<11} {st.get('recipe', '')}")
+            if not rows:
+                print("No recipe runs yet.")
+            return
+        if sub in ("continue", "confirm", "rollback"):
+            if not arg:
+                die(f"which run? oaap tenant recipe {sub} <run id>")
+            if sub == "continue":
+                got = tenant_recipe_continue(arg, who, "root",
+                                             purge=bool(args.purge_instances))
+            elif sub == "confirm":
+                if not args.step:
+                    die("which step? oaap tenant recipe confirm <id> --step <id>")
+                got = tenant_recipe_confirm(arg, args.step, who, "root")
+            else:
+                if not args.yes:
+                    state = tenant_build.load_state(RECIPE_RUN_DIR, arg)
+                    made = [(r["id"], m) for r in state["steps"]
+                            for m in r.get("made") or []]
+                    print(f"Rolling back {arg} would undo, in this order:")
+                    for sid, m in reversed(made):
+                        print(f"  {sid}: {m}")
+                    if not made:
+                        print("  (this run made nothing)")
+                    print("What a human changed since stays. Nothing was "
+                          "changed. Add --yes to do it.")
+                    return
+                got = tenant_recipe_rollback(arg, who, "root",
+                                             purge=bool(args.purge_instances))
+            _print_recipe_run(got, as_json)
+            if got["state"] == "failed":
+                sys.exit(1)
+            return
+    except tenant_build.Refusal as exc:
+        die(str(exc))
+    die("oaap tenant recipe list | preview <recipe> --tenant <label> | "
+        "run <recipe> --tenant <label> | runs | show <run> | continue <run> | "
+        "confirm <run> --step <id> | rollback <run> [--yes]")
+
+
 TENANT_DRY_RUN_ACTIONS = frozenset({"adopt", "build"})
 
 
@@ -11533,6 +11840,9 @@ def cmd_tenant(args):
 
     if args.action == "build":
         return _tenant_build_cli(args)
+
+    if args.action == "recipe":
+        return _tenant_recipe_cli(args)
 
     if args.action == "remove":
         return _tenant_remove(args, tenants)
@@ -38671,7 +38981,7 @@ def build_parser():
     pten.add_argument("action",
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
-                               "build", "egress", "allow", "disallow"])
+                               "build", "recipe", "egress", "allow", "disallow"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "
@@ -38728,6 +39038,10 @@ def build_parser():
                       help="for 'adopt': say what would happen, write "
                            "nothing")
     # The build profile (RFC-0055): `tenant build start|show|continue|...`
+    # and the setup recipes (RFC-0109): `tenant recipe preview|run|...`
+    pten.add_argument("--tenant", dest="recipe_tenant", default=None,
+                      help="for 'recipe preview|run': the existing tenant "
+                           "the recipe works in")
     pten.add_argument("--param", action="append", default=[],
                       metavar="KEY=VALUE",
                       help="for 'build start': a parameter of the profile "
