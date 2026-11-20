@@ -199,8 +199,9 @@ def open_requests(view):
 
 
 def _request_row(r):
-    tone = ("err" if r.get("delivery") == "failed" else
-            "ok" if r.get("released") or r.get("case_status") in ("answered", "closed") else
+    tone = ("err" if r.get("delivery") == "failed" or r.get("verdict") == "rejected" else
+            "ok" if r.get("released") or r.get("verdict") == "done"
+            or r.get("case_status") in ("answered", "closed") else
             "todo")
     return {"id": r.get("id", ""), "label": r.get("label", ""),
             "what": r.get("title") or r.get("recipe") or (r.get("text") or "")[:80],
@@ -209,6 +210,11 @@ def _request_row(r):
             "created": build_view._when(r.get("created")), "state": r.get("state", ""),
             "tone": tone, "case": r.get("case", ""), "note": r.get("note", ""),
             "replies": r.get("replies") or [], "open": bool(r.get("open"))}
+
+
+def find_open_request(view, rid):
+    return next((r for r in (view or {}).get("requests") or []
+                 if r.get("id") == rid and r.get("open")), None)
 
 
 def requestable(view):

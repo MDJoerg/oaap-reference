@@ -270,6 +270,40 @@ okj, msg, _e = a.tenant_recipe_job({"op": "inbox", "args": {"inbox": "off"}},
 ok("…als Betreiber: aus", okj and a.recipe_inbox() == ("", None), msg)
 
 print("")
+print("=== der Betreiber antwortet (auch ohne Posteingang) ===")
+msg_req = rq.load(a.RECIPE_REQUEST_DIR, req3["id"])          # went as a message
+ok("eine Anfrage als Nachricht ist offen", msg_req["delivery"] == "message" and rq.is_open(msg_req))
+why = refusal(a.tenant_recipe_request_close, req3["id"], "rejected", "", "max", "server_admin")
+ok("Ablehnen ohne Satz: abgelehnt, nichts geändert", "says why" in why
+   and rq.is_open(rq.load(a.RECIPE_REQUEST_DIR, req3["id"])), why)
+why = refusal(a.tenant_recipe_request_close, req3["id"], "done", "x", "kv", "tenant_admin")
+ok("ein tenant_admin antwortet nicht", "server_admin" in why, why)
+r = a.tenant_recipe_request_close(req3["id"], "done", "Ist eingerichtet.", "max", "server_admin")
+ok("Erledigt mit Antwort: nicht mehr offen, Stand „erledigt“, die Antwort unter den Antworten",
+   not rq.is_open(r) and rq.state_text(r) == "erledigt"
+   and r["replies"][-1]["text"] == "Ist eingerichtet."
+   and r["replies"][-1]["status_label"] == "erledigt", r)
+ok("…im Protokoll des Mandanten", any(x[0] == "tenant.recipe.request.close" and x[1] == "t-kunde"
+                                      for x in AUDIT))
+why = refusal(a.tenant_recipe_request_close, req3["id"], "rejected", "doch nicht", "max",
+              "server_admin")
+ok("ein zweites Mal: abgelehnt", "already answered" in why, why)
+n_posts = len(POSTS)
+r2 = a.tenant_recipe_request_close(req2["id"], "rejected", "Dafür gibt es kein Rezept.",
+                                   "max", "server_admin")
+op = POSTS[-1]
+ok("eine Anfrage, die ein Vorgang wurde: der Vorgang wird mit dem Satz geschlossen",
+   len(POSTS) == n_posts + 1 and op[1]["op"] == "close" and op[1]["number"] == req2["case"]
+   and "Dafür gibt es kein Rezept." in op[1]["text"] and rq.state_text(r2) == "abgelehnt", op)
+okj, msg, _e = a.tenant_recipe_job({"op": "close", "args": {
+    "request": req4["id"], "verdict": "done", "text": ""}}, "t-kunde", "tenant_admin", "kv")
+ok("Auftrag close als tenant_admin: abgelehnt", not okj, msg)
+a.tenant_recipe_view_write()
+view2 = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
+v3 = next(x for x in view2["requests"] if x["id"] == req3["id"])
+ok("die Sicht: erledigt, nicht offen", v3["state"] == "erledigt" and not v3["open"], v3)
+
+print("")
 print("=== die Seiten ===")
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))
 import recipe_view as rv                                      # noqa: E402
@@ -337,6 +371,21 @@ t = c.get("/aufbau", headers=H).get_data(as_text=True)
 ok("Aufbau: der Posteingang zur Wahl, die offenen Anfragen aller Mandanten",
    "Anfragen der Mandanten" in t and 'value="posteingang" selected' in t
    and "Fremde Anfrage von pxx" in t, t[-2500:])
+ok("je offene Anfrage: Antwort, „Erledigt“, „Ablehnen“",
+   'action="/aufbau/rezepte/anfrage"' in t and 'value="q-20261120t130000-pxx"' in t
+   and "Ablehnen" in t)
+n = len(QUEUED)
+r = c.post("/aufbau/rezepte/anfrage", headers=H,
+           data={"request": "q-20261120t130000-pxx", "verdict": "rejected", "text": ""})
+ok("Ablehnen ohne Satz: nichts im Spool", len(QUEUED) == n and "err=" in r.headers["Location"])
+r = c.post("/aufbau/rezepte/anfrage", headers=H,
+           data={"request": "q-gibts-nicht", "verdict": "done", "text": "x"})
+ok("eine Anfrage, die nicht offen ist: nichts im Spool", len(QUEUED) == n)
+r = c.post("/aufbau/rezepte/anfrage", headers=H,
+           data={"request": "q-20261120t130000-pxx", "verdict": "done", "text": "Erledigt."})
+ok("Erledigt: ein Auftrag close", QUEUED[-1]["op"] == "close" and QUEUED[-1]["args"] == {
+    "request": "q-20261120t130000-pxx", "verdict": "done", "text": "Erledigt."}, QUEUED[-1])
+n = len(QUEUED)
 r = c.post("/aufbau/rezepte/posteingang", headers=H, data={"inbox": "kunde-vorgaenge"})
 ok("ein Posteingang, der nicht zur Wahl steht: nichts im Spool", len(QUEUED) == n
    and "err=" in r.headers["Location"])
@@ -348,6 +397,9 @@ n = len(QUEUED)
 r = c.post("/aufbau/rezepte/posteingang", headers=H, data={"inbox": "off"})
 ok("ein tenant_admin ändert den Posteingang nicht: 403", r.status_code == 403
    and len(QUEUED) == n)
+r = c.post("/aufbau/rezepte/anfrage", headers=H,
+           data={"request": "q-20261120t130000-pxx", "verdict": "done", "text": "x"})
+ok("…und beantwortet keine Anfrage: 403", r.status_code == 403 and len(QUEUED) == n)
 
 print("")
 print("PASS: alles" if not fails else f"FAIL: {fails}")

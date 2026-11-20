@@ -13214,11 +13214,17 @@ Verteiler des Knotens. Antworten im Vorgang sieht der Mandant auf seiner Seite.<
 </form>
 {% if recipe_requests %}
 <table>
-  <tr><th>Mandant</th><th>Anfrage</th><th>Stand</th><th>Gestellt</th></tr>
+  <tr><th>Mandant</th><th>Anfrage</th><th>Stand</th><th>Gestellt</th><th>Antwort</th></tr>
   {% for q in recipe_requests %}
   <tr><td>{{ q.label }}</td><td><strong>{{ q.what }}</strong>{% if q.text and q.text != q.what %}<br><span class="muted">{{ q.text[:200] }}</span>{% endif %}</td>
     <td><span class="badge {{ '' if q.tone == 'ok' else 'off' if q.tone == 'off' else 'todo' }}">{{ q.state }}</span>{% if q.case %}<br><span class="muted">{{ q.case }}</span>{% endif %}</td>
-    <td>{{ q.created }}<br><span class="muted">{{ q.by }}</span></td></tr>
+    <td>{{ q.created }}<br><span class="muted">{{ q.by }}</span></td>
+    <td><form method="post" action="/aufbau/rezepte/anfrage">
+      <input type="hidden" name="request" value="{{ q.id }}">
+      <input name="text" maxlength="1000" placeholder="Antwort an den Mandanten" aria-label="Antwort">
+      <button class="btn" name="verdict" value="done">Erledigt</button>
+      <button class="rowaction" name="verdict" value="rejected">Ablehnen</button>
+    </form></td></tr>
   {% endfor %}
 </table>
 {% else %}<p class="muted">Keine offene Anfrage.</p>{% endif %}
@@ -13447,6 +13453,31 @@ def recipe_release_page():
     jid = management_api.enqueue(sc[0], sc[1], op, {"recipe": rid, "tenant": label},
                                  action="tenant-recipe")
     return redirect(f"/aufbau?job={jid}")
+
+
+@app.post("/aufbau/rezepte/anfrage")
+def recipe_request_close_page():
+    """The operator answers a request: done or rejected, with a sentence
+    the tenant reads on Einrichten -- a request the host judges again."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    rid = request.form.get("request", "")
+    verdict = request.form.get("verdict", "")
+    text = str(request.form.get("text") or "").strip()[:1000]
+    if recipe_view.find_open_request(_recipe_view(), rid) is None or \
+            verdict not in ("done", "rejected"):
+        return redirect("/aufbau?err=" + quote("Diese Anfrage ist nicht (mehr) offen; "
+                                               "nichts geändert.") + "#anfragen")
+    if verdict == "rejected" and not text:
+        return redirect("/aufbau?err=" + quote("Eine Ablehnung braucht einen Satz, warum; "
+                                               "nichts geändert.") + "#anfragen")
+    jid = management_api.enqueue(sc[0], sc[1], "close",
+                                 {"request": rid, "verdict": verdict, "text": text},
+                                 action="tenant-recipe")
+    return redirect(f"/aufbau?job={jid}#anfragen")
 
 
 @app.post("/aufbau/rezepte/posteingang")

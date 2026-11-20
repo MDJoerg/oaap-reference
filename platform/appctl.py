@@ -12145,7 +12145,7 @@ def tenant_recipe_view_write():
         requests_ = [dict({k: r.get(k) for k in (
             "id", "label", "by", "by_name", "recipe", "version", "title", "text",
             "created", "delivery", "case", "note", "case_status", "case_label",
-            "replies", "read", "released")},
+            "replies", "read", "released", "closed", "verdict")},
             state=recipe_request.state_text(r), open=recipe_request.is_open(r))
             for r in recipe_request.all_requests(RECIPE_REQUEST_DIR)][:RECIPE_VIEW_KEEP]
         inbox_key, _inbox = recipe_inbox()
@@ -12456,6 +12456,37 @@ def recipe_requests_released(label, rid, words, who):
         recipe_request.save(RECIPE_REQUEST_DIR, req)
 
 
+def tenant_recipe_request_close(rid, verdict, text, who, role="root"):
+    """The operator answers a request (Aufbau, CLI): done or rejected, with
+    a sentence the tenant reads on Einrichten -- also without an inbox. A
+    request that became a case gets the sentence as a note and is closed
+    there too. -> the record."""
+    if role not in ("root", "server_admin"):
+        raise tenant_build.Refusal("only the server_admin answers a request")
+    try:
+        req = recipe_request.load(RECIPE_REQUEST_DIR, rid)
+        recipe_request.close(req, verdict, text, _identity_display_name(who) or who)
+    except recipe_request.Refusal as exc:
+        raise tenant_build.Refusal(str(exc))
+    inst = (load_registry().get("instances") or {}).get(req.get("inbox") or "")
+    if req.get("delivery") == "sent" and inst:
+        word = recipe_request.VERDICT_DE[verdict]
+        try:
+            _node_case_post(req["inbox"], inst, {
+                "op": "close", "number": req["case"], "node": socket.gethostname(),
+                "text": f"Vom Betreiber auf Aufbau {word} ({who})"
+                        + (f": {text.strip()}" if (text or "").strip() else ".")})
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            req["note"] = "der Vorgang konnte nicht geschlossen werden; bitte dort schließen"
+    recipe_request.save(RECIPE_REQUEST_DIR, req)
+    tid, _t = tenant_by_label(req.get("label", ""), include_former=True)
+    audit_tenant("tenant.recipe.request.close", tid or default_tenant_id(), subject=rid,
+                 who=who, role=role, detail=recipe_request.VERDICT_DE[verdict]
+                 + (f": {text.strip()[:200]}" if (text or "").strip() else ""))
+    tenant_recipe_view_write()
+    return req
+
+
 def recipe_requests_minute():
     """The minute job's part: read open cases back, every READ_EVERY."""
     try:
@@ -12519,6 +12550,15 @@ def tenant_recipe_job(req, act_tenant, role, actor):
             n = recipe_requests_refresh(label.strip().lower() or None, force=True)
             return True, (f"{n} Anfrage(n) mit neuem Stand." if n else
                           "Der Stand ist aktuell."), {}
+        elif op == "close":
+            if role not in ("server_admin", "root"):
+                return False, "only the server_admin answers a request", {}
+            r = tenant_recipe_request_close(str(a.get("request") or ""),
+                                            str(a.get("verdict") or ""),
+                                            str(a.get("text") or "")[:recipe_request.ANSWER_MAX + 1],
+                                            actor, role)
+            return True, (f"Anfrage {r['id']} aus {r['label']}: "
+                          f"{recipe_request.VERDICT_DE[r['verdict']]}."), {}
         elif op == "inbox":
             if role not in ("server_admin", "root"):
                 return False, "only the server_admin names the request inbox", {}
@@ -12662,6 +12702,14 @@ def _tenant_recipe_cli(args):
             if r["delivery"] == "failed":
                 sys.exit(1)
             return
+        if sub == "close":
+            if not arg:
+                die("oaap tenant recipe close <request id> [--reject] --text \"answer\"")
+            r = tenant_recipe_request_close(
+                arg, "rejected" if getattr(args, "recipe_reject", False) else "done",
+                getattr(args, "recipe_text", "") or "", who, "root")
+            print(f"Request {r['id']}: {recipe_request.VERDICT_DE[r['verdict']]}.")
+            return
         if sub == "requests":
             if getattr(args, "recipe_refresh", False):
                 print(f"{recipe_requests_refresh(label or None, force=True)} changed.")
@@ -12715,6 +12763,7 @@ def _tenant_recipe_cli(args):
         "run <recipe> --tenant <label> | runs | show <run> | continue <run> | "
         "confirm <run> --step <id> | rollback <run> [--yes] | "
         "request [<recipe>] --tenant <label> --text ... | requests [--refresh] | "
+        "close <request> [--reject] --text ... | "
         "inbox [<instance>|off]")
 
 
@@ -39974,6 +40023,8 @@ def build_parser():
                            "(a step with done_when server.compared, RFC-0109)")
     pten.add_argument("--text", dest="recipe_text", default="",
                       help="for 'recipe request': what the tenant needs, in words")
+    pten.add_argument("--reject", dest="recipe_reject", action="store_true",
+                      help="for 'recipe close': the request is rejected (--text says why)")
     pten.add_argument("--refresh", dest="recipe_refresh", action="store_true",
                       help="for 'recipe requests': read the cases back now")
     pten.add_argument("--param", action="append", default=[],

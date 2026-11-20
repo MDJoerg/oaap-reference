@@ -48,6 +48,10 @@ DELIVERY_DE = {"sent": "als Vorgang beim Betreiber",
                "failed": "nicht zugestellt"}
 # a case in one of these is over (vorgaenge: closed, rejected)
 CASE_ENDED = ("closed", "rejected")
+# the operator's own answer on Aufbau (works without an inbox too)
+VERDICTS = ("done", "rejected")
+VERDICT_DE = {"done": "erledigt", "rejected": "abgelehnt"}
+ANSWER_MAX = 1000
 
 
 class Refusal(Exception):
@@ -180,7 +184,31 @@ def apply_reading(req, reading, now=None):
     return changed
 
 
+def close(req, verdict, text, by_name, now=None):
+    """The operator answers a request on Aufbau: done or rejected, with a
+    sentence the tenant reads on Einrichten. A rejection needs the
+    sentence. Raises Refusal."""
+    if verdict not in VERDICTS:
+        raise Refusal("the answer is done or rejected")
+    if req.get("closed"):
+        raise Refusal(f"request {req['id']} is already answered "
+                      f"({VERDICT_DE.get(req.get('verdict'), req.get('verdict'))})")
+    text = str(text or "").strip()
+    if len(text) > ANSWER_MAX:
+        raise Refusal(f"the answer has at most {ANSWER_MAX} characters")
+    if verdict == "rejected" and not text:
+        raise Refusal("a rejection says why, in one sentence")
+    at = iso_now(now)
+    req.update(closed=at, verdict=verdict)
+    req["replies"] = (list(req.get("replies") or []) + [{
+        "at": at, "by": _clip(by_name, NAME_MAX), "status_label": VERDICT_DE[verdict],
+        "text": _clip(text, REPLY_MAX)}])[-REPLIES_KEEP:]
+    return req
+
+
 def is_open(req):
+    if req.get("closed"):
+        return False
     if req.get("delivery") == "failed":
         return False
     if req.get("delivery") == "message":
@@ -190,6 +218,8 @@ def is_open(req):
 
 def state_text(req):
     """One phrase for the list on Einrichten."""
+    if req.get("closed"):
+        return VERDICT_DE.get(req.get("verdict"), "beantwortet")
     if req.get("delivery") == "failed":
         return "nicht zugestellt"
     if req.get("released"):
