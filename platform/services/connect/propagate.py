@@ -270,6 +270,13 @@ def client_context(cert_pem, key_pem, server_pem, tmp_dir=None):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # 0.1.330 (abap2025 in bec, 2026-11-20): a server certificate ISSUED by a
+    # CA (SAPNetCA_G2) is pinned as the only anchor too. OpenSSL accepts a
+    # certificate that is not self-signed as a trust anchor only with
+    # PARTIAL_CHAIN -- without it every handshake with such a server failed
+    # with CERTIFICATE_VERIFY_FAILED. The anchor is still exactly the pinned
+    # certificate: its issuer is never trusted.
+    ctx.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0x80000)
     if weak_key(server_pem):
         ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
     ctx.load_verify_locations(cadata=server_pem if isinstance(server_pem, str)
@@ -363,6 +370,12 @@ def chain_check(ca_dir, tenant_id, tenant_label, target, server_pem, pin,
     try:
         try:
             conn.connect()
+        except ssl.SSLCertVerificationError as e:
+            # OUR side refused the server's certificate in the handshake --
+            # not the target refusing ours (0.1.330: was reported as "CA")
+            mark("ca", "broke", "die Plattform konnte das gepinnte Serverzertifikat im "
+                                f"Handshake nicht prüfen: {getattr(e, 'verify_message', '') or e}")
+            return rest("ca")
         except ssl.SSLError as e:
             mark("ca", "broke", f"TLS: {getattr(e, 'reason', None) or e}")
             return rest("ca")

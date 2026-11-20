@@ -199,6 +199,80 @@ res = check(PORT, path="")
 ok("ohne Prüfpfad (D8): bis zur Zuordnung, der Benutzer „nicht geprüft“",
    states(res) == ["held"] * 4 + ["not checked"], res)
 
+# 0.1.330 (abap2025 in bec): das Serverzertifikat ist von einer CA AUSGESTELLT
+# (SAPNetCA_G2), nicht selbstsigniert. Gepinnt wird das Blatt; es muss als
+# einziger Anker reichen -- der Aussteller wird nie vertraut.
+ikey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+iname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "SAPNetCA_G2 (Test)")])
+icert = (x509.CertificateBuilder().subject_name(iname).issuer_name(iname)
+         .public_key(ikey.public_key()).serial_number(x509.random_serial_number())
+         .not_valid_before(now - datetime.timedelta(days=1))
+         .not_valid_after(now + datetime.timedelta(days=60))
+         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+         .sign(ikey, hashes.SHA256()))
+lkey = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+lname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "A4H.wdf.sap.corp")])
+lcert = (x509.CertificateBuilder().subject_name(lname).issuer_name(iname)
+         .public_key(lkey.public_key()).serial_number(x509.random_serial_number())
+         .not_valid_before(now - datetime.timedelta(days=1))
+         .not_valid_after(now + datetime.timedelta(days=30))
+         .sign(ikey, hashes.SHA256()))
+LEAF_PEM = lcert.public_bytes(serialization.Encoding.PEM).decode()
+LEAF_FP = hashlib.sha256(lcert.public_bytes(serialization.Encoding.DER)).hexdigest()
+issued_file = os.path.join(WORK, "issued.pem")
+with open(issued_file, "w", encoding="utf-8") as f:
+    f.write(LEAF_PEM + icert.public_bytes(serialization.Encoding.PEM).decode()
+            + lkey.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                 serialization.NoEncryption()).decode())
+
+
+def serve_issued():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(issued_file)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(cafile=propagate.ca_paths(CA_DIR, KUNDE)[1])
+    s_ = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    s_.socket = ctx.wrap_socket(s_.socket, server_side=True)
+    threading.Thread(target=s_.serve_forever, daemon=True).start()
+    return s_, s_.server_address[1]
+
+
+srv_issued, PORT_ISSUED = serve_issued()
+res = propagate.chain_check(CA_DIR, KUNDE, "kunde", f"https://127.0.0.1:{PORT_ISSUED}",
+                            LEAF_PEM, LEAF_FP, "/sap/bc/ui2/start_up", timeout=5)
+ok("0.1.330: ein von einer CA ausgestelltes Serverzertifikat, gepinnt: alle fünf Glieder halten "
+   "(vorher brach „CA“ mit CERTIFICATE_VERIFY_FAILED)", states(res) == ["held"] * 5, res)
+# Köder: ein ANDERES Serverzertifikat derselben CA. Angepinnt ist das Blatt, nicht
+# sein Aussteller -- der Handshake mit dem gepinnten Blatt als Anker muss scheitern.
+l2key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+l2cert = (x509.CertificateBuilder().subject_name(lname).issuer_name(iname)
+          .public_key(l2key.public_key()).serial_number(x509.random_serial_number())
+          .not_valid_before(now - datetime.timedelta(days=1))
+          .not_valid_after(now + datetime.timedelta(days=30))
+          .sign(ikey, hashes.SHA256()))
+other_file = os.path.join(WORK, "other.pem")
+with open(other_file, "w", encoding="utf-8") as f:
+    f.write(l2cert.public_bytes(serialization.Encoding.PEM).decode()
+            + icert.public_bytes(serialization.Encoding.PEM).decode()
+            + l2key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()).decode())
+octx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+octx.load_cert_chain(other_file)
+osrv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+osrv.socket = octx.wrap_socket(osrv.socket, server_side=True)
+threading.Thread(target=osrv.serve_forever, daemon=True).start()
+ca_c, ca_k, _m = propagate.ensure_ca(CA_DIR, KUNDE, "kunde")
+cpem, kpem, _s, _n = propagate.issue(ca_c, ca_k, "kunde", "PROBE", "", 1)
+cctx = propagate.client_context(cpem, kpem, LEAF_PEM)
+try:
+    with socket.create_connection(("127.0.0.1", osrv.server_address[1]), timeout=5) as raw:
+        with cctx.wrap_socket(raw, server_hostname="127.0.0.1"):
+            refused = False
+except ssl.SSLCertVerificationError:
+    refused = True
+ok("...ein ANDERES Serverzertifikat derselben CA wird abgelehnt: angepinnt ist das Blatt, "
+   "nie sein Aussteller", refused)
+
 print("")
 print("=== der Befehl und der Auftrag des Portals ===")
 _real_run = subprocess.run
