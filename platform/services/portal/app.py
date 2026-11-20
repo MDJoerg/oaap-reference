@@ -2252,6 +2252,8 @@ STORE_APP_BODY = """
       <td>v{{ r.version }}</td>
       <td>
       {% if r.version == a.version %}<span class="ok">aktuell</span>
+      {% elif r.ahead %}<span class="muted">neuer als der Store (dort v{{ a.version }}) –
+        kommt über den Deploy-Hook; nichts zu tun</span>
       {% elif r.via_test %}
         <span class="muted">Erst die Test-Instanz
         <a href="/instances/{{ r.via_test.key }}">{{ r.via_test.name }}</a>
@@ -8920,7 +8922,22 @@ def _install_target():
     return {"choose": False, "label": tenant_label(mine) if mine else ""}
 
 
-def _app_instances(app_id):
+def _version_older(new, old):
+    """Is `new` older than `old`? Numeric, 1.2.10 after 1.2.9, a release
+    after its -pre (the host's rule, tenant_build.version_key)."""
+    def key(v):
+        core, _, pre = str(v).partition("-")
+        nums = tuple(int(x) for x in core.split("."))
+        parts = [(0, int(p), "") if p.isdigit() else (1, 0, p)
+                 for p in (pre.split(".") if pre else [])]
+        return nums + ((1,) if not pre else (0, tuple(parts)),)
+    try:
+        return key(new) < key(old)
+    except (ValueError, TypeError):
+        return False
+
+
+def _app_instances(app_id, store_version=""):
     """The caller's own instances of one app, for the store's object page.
 
     Through the boundary like every other list (visible_instances), so a
@@ -8946,7 +8963,10 @@ def _app_instances(app_id):
         rows.append({"key": key, "name": local_name(key, inst),
                      "channel": inst.get("channel", ""),
                      "version": inst.get("version", "?"),
-                     "tenant": label, "via_test": via})
+                     "tenant": label, "via_test": via,
+                     # 0.1.328: newer than the store -- no "update" back
+                     "ahead": bool(store_version) and _version_older(
+                         store_version, inst.get("version", ""))})
     return rows
 
 
@@ -8981,7 +9001,8 @@ def store_app(source_id, app_id, envelope=None):
                 "administer_too": request.args.get("ca") == "1",
                 "tun_too": request.args.get("ct") == "1"}
     return page(STORE_APP_BODY, a["name"], "store", a=a, need=need, envelope=envelope,
-                instances=_app_instances(a["id"]), target=_install_target(),
+                instances=_app_instances(a["id"], a.get("version", "")),
+                target=_install_target(),
                 profiles=node_profiles(),
                 msg=request.args.get("msg"),
                 msg_ok=request.args.get("err") is None)

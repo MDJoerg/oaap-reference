@@ -225,6 +225,21 @@ ok("... auf den Schluessel der Instanz, die im Mandanten bleibt",
    BUILT[-1:])
 ok("... ohne neue Instanz", len(keys()) == n_before, keys())
 
+print("\n=== 0.1.328: ein Store-Update geht nie zurück (bdt auf oaapx01) ===")
+put("kunde-a-portal-verein-neu", KA, channel="test", version="0.9.0-2",
+    name="portal-verein-neu")
+built_before = len(BUILT)
+r = ask({"app_id": "vereinsportal", "update": "kunde-a-portal-verein-neu"}, by="chef-a")
+ok("eine Test-Instanz neuer als der Store (0.9.0-2 > 0.2.0): abgelehnt, nichts gebaut",
+   not r.get("ok") and len(BUILT) == built_before
+   and "never goes back" in r.get("message", ""), r)
+ok("...sie läuft unverändert",
+   a.load_registry()["instances"]["kunde-a-portal-verein-neu"]["version"] == "0.9.0-2")
+drop("kunde-a-portal-verein-neu")
+ok("version_older: 0.774.0 < 0.831.0-2, 1.0.0-rc1 < 1.0.0, 1.2.10 nicht < 1.2.9, Unlesbares nie",
+   a.version_older("0.774.0", "0.831.0-2") and a.version_older("1.0.0-rc1", "1.0.0")
+   and not a.version_older("1.2.10", "1.2.9") and not a.version_older("x", "1.0.0"))
+
 print("\n=== was nicht geht ===")
 built_before = len(BUILT)
 r = ask({"app_id": "vereinsportal", "update": "kunde-a-portal-verein"}, by="chef-b")
@@ -415,6 +430,11 @@ t = page()
 ok("auf dem aktuellen Stand: 'aktuell', kein Knopf",
    'name="update" value="kunde-a-portal-verein"' not in t and "aktuell" in t)
 INST["kunde-a-portal-verein"]["version"] = "0.1.0"
+INST["kunde-a-neu-test"] = rec("neu-test", channel="test", version="0.831.0-2")
+t = page()
+ok("0.1.328: eine Instanz neuer als der Store: kein Knopf zurück, der Satz 'neuer als der Store'",
+   'name="update" value="kunde-a-neu-test"' not in t and "neuer als der Store" in t, t[-1500:])
+INST.pop("kunde-a-neu-test")
 
 r = c.post("/store/install", headers=H, data={
     "app_id": "vereinsportal", "source_id": "catalog-katalog",

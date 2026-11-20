@@ -24764,6 +24764,27 @@ def resolve_channel(inst, requested, name):
     return requested
 
 
+def version_older(new, old):
+    """Is `new` an OLDER version than `old`? 1.2.10 after 1.2.9, 1.0.0
+    after 1.0.0-rc1 (tenant_build.version_key). Unreadable versions are
+    never called older -- the caller then behaves as before."""
+    try:
+        return tenant_build.version_key(new) < tenant_build.version_key(old)
+    except (ValueError, TypeError):
+        return False
+
+
+def store_update_refusal(name, inst, new_version, args):
+    """Why an update from the store must not happen, or "": it would go
+    BACK (0.1.328). Only the store's update path asks (args.store_update)."""
+    if (inst and getattr(args, "store_update", False)
+            and version_older(new_version, inst.get("version", ""))):
+        return (f"'{name}' runs {inst.get('version')}, newer than the store's "
+                f"{new_version} -- an update from the store never goes back; "
+                "nothing was changed")
+    return ""
+
+
 def cmd_install(args):
     # Store integration: the package may be a Git URL (+ --path inside
     # the repo) instead of a local directory.
@@ -24871,6 +24892,13 @@ def cmd_install(args):
             finally:
                 shutil.rmtree(probe, ignore_errors=True)
             hard, confirm = envelope_review(inst, probed)
+            # 0.1.328: an update FROM THE STORE never goes back -- also on
+            # the test channel, where the deploy hook may be ahead of the
+            # store (bdt on oaapx01: test 0.831, store 0.774)
+            why = store_update_refusal(name, inst, str((probed.get("app") or {})
+                                                       .get("version") or ""), args)
+            if why:
+                die(why)
             if channel == "production":
                 # "Production takes a higher version only" is a rule
                 # about what PRODUCTION runs. A test instance being
@@ -25018,6 +25046,13 @@ def _install_from_dir(pkg, args, source):
     if (inst and inst["channel"] == "production" and channel == "production"
             and inst["version"] == app["version"]):
         die(f"production instance '{name}' already runs version {app['version']} — bump the version (spec: redeploy semantics)")
+    # An update from the store does not go back (runtime 2.6, 0.1.328): a
+    # test instance the deploy hook took to 0.831 must not be "updated" to
+    # the store's 0.774. Only the store's update path asks this; a person
+    # who means to go back installs that version deliberately elsewhere.
+    why = store_update_refusal(name, inst, app["version"], args)
+    if why:
+        die(why)
 
     # A rehearsal is NOT redeployable (spec 2.15.1, RFC-0030 D2). Wrong
     # package means delete it and build another: it takes as long as the
@@ -34480,6 +34515,10 @@ def cmd_process_deploys(_args):
                 # sides cannot drift (RFC-0025 8.1).
                 name=local_name, channel=channel,
                 store_source=src.get("store_source", ""),
+                # 0.1.328: an update from the store never goes BACK -- a
+                # test instance the deploy hook took past the store's
+                # version is not "out of date" (Jörg, bdt on oaapx01)
+                store_update=bool(update_key),
                 # oaap.core.authorization 2.10: the operator's yes to an app
                 # that administers its tenant's grants. From the portal it
                 # counts only if the actor IS a server_admin by their own
