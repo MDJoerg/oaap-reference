@@ -13874,7 +13874,14 @@ RECIPE_RUN_BODY = """
 {% if b.waiting %}
 <div class="card warn">
   <h2>Hier ist ein Mensch gefragt</h2>
-  <p>{{ b.waiting.text }}</p>
+  <p style="white-space:pre-line">{{ b.waiting.text }}</p>
+  {% if b.waiting.offer %}<p>
+  {% if 'ca' in b.waiting.offer %}<form method="post" action="/destinationen/ca" style="display:inline">
+    <button class="btn secondary">Zertifizierungsstelle des Mandanten herunterladen (.crt)</button></form>{% endif %}
+  {% if 'sample' in b.waiting.offer %}<form method="post" action="/destinationen/sample" style="display:inline;margin-left:.6rem">
+    <input type="hidden" name="sample" value="MUSTER">
+    <button class="btn secondary">Musterzertifikat für CERTRULE herunterladen (.crt)</button></form>{% endif %}
+  </p>{% endif %}
   <form method="post" action="/einrichten/lauf/{{ b.id }}/continue" style="display:inline">
     <button class="btn">Weiter prüfen</button></form>
   {% if b.waiting.confirmable and b.waiting.compare %}
@@ -13904,7 +13911,7 @@ RECIPE_RUN_BODY = """
 <table>
   <tr><th>Schritt</th><th>Was</th><th>Zustand</th><th>Hinweis</th></tr>
   {% for s in b.steps %}
-  <tr><td>{{ s.id }}</td><td>{{ s.type }}</td><td>{{ s.state }}</td><td>{{ s.note }}</td></tr>
+  <tr><td>{{ s.id }}</td><td>{{ s.type }}</td><td>{{ s.state }}</td><td style="white-space:pre-line">{{ s.note }}</td></tr>
   {% endfor %}
 </table>
 </div>

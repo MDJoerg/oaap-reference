@@ -113,7 +113,10 @@ STEP_TYPES = {
     "app.setup":      (("name", "items"), ()),
     # the arguments of the two reads that need them (MANUAL_READ_KEYS)
     "manual":         (("text", "done_when"), ("destination", "instance",
-                                               "kind", "item", "target")),
+                                               "kind", "item", "target",
+                                               # 0.1.329: what the page offers
+                                               # to download next to the step
+                                               "offer")),
     "backup.check":   ((), ()),
     # RFC-0109 D9 (stage 3): a recipe's steps inside a profile. Expanded when
     # the profile is read (RECIPE_EXPANDER), never driven as itself: `needs`
@@ -140,6 +143,10 @@ MANUAL_READ_KEYS = {"destination.secret": ("destination", "instance"),
 # a waiting step of these says what the node read beside its text (the
 # fingerprint to compare, the link of the chain that broke)
 MANUAL_SHOWS_READING = ("server.compared", "destination.check")
+# 0.1.329 (Jörg on oaapx01): files a person needs for a manual step, offered
+# on the run page right at the step -- the tenant's CA (SAP: STRUST) and a
+# sample certificate of it (SAP: CERTRULE). Public halves, never a key.
+MANUAL_OFFERS = ("ca", "sample")
 PROPAGATION_KEYS = ("pin_step", "claim", "name_check", "check_path")
 SETUP_ITEMS_MAX = 40
 SECRET_WORDS = ("key", "token", "secret", "password", "credentials")
@@ -502,6 +509,11 @@ def profile_problems(doc):
                 if not st.get(k):
                     out.append(f"{where} ('{sid}'): done_when {st.get('done_when')} "
                                f"needs '{k}'")
+            offers = [x.strip() for x in str(st.get("offer") or "").split(",") if x.strip()]
+            bad = [x for x in offers if x not in MANUAL_OFFERS]
+            if bad:
+                out.append(f"{where} ('{sid}'): offer is a list of "
+                           + ", ".join(MANUAL_OFFERS))
             for k in ("destination", "instance", "kind", "item", "target"):
                 if k in st and k not in need:
                     out.append(f"{where} ('{sid}'): '{k}' is no argument of "
@@ -902,10 +914,13 @@ def _new_step(s, values):
         # step: a page shows it without the profile file (which may have
         # changed since), and a waiting step is then a complete question.
         try:
-            rec["text"] = _sentence(render_step(s, values).get("text", ""), TEXT_LIMIT)
+            rec["text"] = _lines(render_step(s, values).get("text", ""), TEXT_LIMIT)
         except Refusal:
-            rec["text"] = _sentence(s.get("text", ""), TEXT_LIMIT)
+            rec["text"] = _lines(s.get("text", ""), TEXT_LIMIT)
         rec["done_when"] = s.get("done_when", "")
+        if s.get("offer"):
+            rec["offer"] = [x.strip() for x in str(s["offer"]).split(",")
+                            if x.strip() in MANUAL_OFFERS]
     return rec
 
 
@@ -1071,6 +1086,22 @@ def _sentence(text, limit=240):
     return text[:limit]
 
 
+def _lines(text, limit=2000):
+    """A person's text with its line breaks kept (0.1.329): spaces inside a
+    line collapse, empty lines stay one empty line."""
+    out, blank = [], False
+    for ln in str(text or "").replace("\r", "").split("\n"):
+        ln = " ".join(ln.split())
+        if not ln:
+            if out and not blank:
+                out.append("")
+            blank = True
+            continue
+        out.append(ln)
+        blank = False
+    return "\n".join(out).strip()[:limit]
+
+
 # What a person is asked to do is the profile author's text, written for a
 # person: it is not cut like a machine's note (I-45 -- "...danach neu
 # anmelde" was the 240th character).
@@ -1149,7 +1180,7 @@ def run(state, profile, drivers, root, now=iso_now):
                     drivers, now)
             continue
         if typ == "manual":
-            said = _sentence(args["text"], TEXT_LIMIT)
+            said = _lines(args["text"], TEXT_LIMIT)
             if args.get("done_when") in MANUAL_SHOWS_READING and note:
                 said += " -- " + _sentence(note, 600)
             return _stop(state, rec, "waiting", said, root, drivers, now)

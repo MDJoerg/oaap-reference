@@ -297,6 +297,20 @@ ok("mit Haken: confirm mit dem angebotenen Fingerabdruck, nie einem eingetippten
    len(QUEUED) == n + 1 and q["op"] == "confirm" and q["args"]["value"] == FPX
    and q["args"]["step"] == "zertifikat", q)
 
+print("=== 0.1.329: Zeilen und Downloads am Schritt ===")
+RUN_O = dict(RUN_K, id="r-20261120t120000-kunde", state="waiting", recipe="sap-sso",
+             title="SAP SSO einrichten",
+             steps=[{"id": "sap-ca", "type": "manual", "state": "waiting",
+                     "done_when": "confirmed", "offer": ["ca"],
+                     "text": "Teil 1\n\n1. Herunterladen.\n2. In STRUST importieren.",
+                     "note": "Teil 1"}])
+json.dump({"schema": "0.2", **dict(VIEW, runs=[RUN_O, RUN_P, RUN_K])}, open(VF, "w"))
+as_("tenant_admin", "t-kunde", "t-kunde")
+t = c.get(f"/einrichten/lauf/{RUN_O['id']}", headers=H).get_data(as_text=True)
+ok("der Text behält seine Zeilen, daneben der Download der CA (nicht das Muster)",
+   "white-space:pre-line" in t and "1. Herunterladen.\n2. In STRUST" in t
+   and 'action="/destinationen/ca"' in t and 'action="/destinationen/sample"' not in t, t[-1800:])
+
 print("=== Stufe 3: Einrichten… von der Seite einer Instanz ===")
 ok("die Rezepte, die eine App brauchen -- nur, was diese Person hier ausführen darf",
    rv.recipes_needing(VIEW, "kunde", "tenant_admin", "help")

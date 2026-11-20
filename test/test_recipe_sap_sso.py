@@ -193,8 +193,8 @@ print("")
 print("=== Vorschau ===")
 pv = a.tenant_recipe_preview("sap-sso", "kunde", P, "root", "root")
 rows = {r["id"]: r for r in pv["rows"]}
-ok("zehn Schritte; das Attribut, die Destination, der Server werden angelegt",
-   len(pv["rows"]) == 10 and rows["attribut"]["verdict"] == "absent"
+ok("vierzehn Schritte (SAP-Basis in fünf Teilen); das Attribut, die Destination, der Server werden angelegt",
+   len(pv["rows"]) == 14 and rows["attribut"]["verdict"] == "absent"
    and rows["ziel"]["verdict"] == "absent" and rows["server"]["verdict"] == "absent", pv["rows"])
 rows_first_note = rows["zertifikat"]["note"]
 ok("der Fingerabdruck steht schon in der Vorschau zum Vergleichen",
@@ -216,7 +216,7 @@ ok("ohne Freigabe: abgelehnt", "not released" in why, why)
 TENANTS["t-kunde"]["tenant_admin_may"] = ["recipe:sap-sso@1"]
 pv = a.tenant_recipe_preview("sap-sso", "kunde", P, "kv", "tenant_admin", actor_tid="t-kunde")
 ok("freigegeben: der tenant_admin sieht die Vorschau (die Schritte liegen in seinem Bereich)",
-   len(pv["rows"]) == 10, pv.get("problems"))
+   len(pv["rows"]) == 14, pv.get("problems"))
 
 print("")
 print("=== der Lauf ===")
@@ -256,8 +256,19 @@ ok("…mit Claim sap_user, SAP-Namensregel und Prüfpfad mit sap-client",
 inst = REG["instances"]["kunde-werkzeuge"]
 ok("die Destination ist dem MCP-Gateway zugeordnet, trägt aber noch KEINE Person",
    inst.get("destinations", {}).get("sap") == "sap" and not inst.get("propagate"), inst)
-ok("der Lauf wartet bei der SAP-Basis", steps["sap-basis"]["state"] == "waiting", steps["sap-basis"])
-st = a.tenant_recipe_confirm(rid, "sap-basis", "kv", "tenant_admin", actor_tid="t-kunde")
+ok("der Lauf wartet bei der SAP-Basis, Teil 1 (CA in STRUST)",
+   steps["sap-ca"]["state"] == "waiting", steps["sap-ca"])
+ok("…mit Zeilen statt eines Blocks und dem Download der CA am Schritt (0.1.329)",
+   "\n1. " in steps["sap-ca"]["text"] and "\n2. " in steps["sap-ca"]["text"]
+   and steps["sap-ca"].get("offer") == ["ca"], steps["sap-ca"])
+for part in ("sap-ca", "sap-regel", "sap-parameter", "sap-dienst", "sap-pruefer"):
+    st = a.tenant_recipe_confirm(rid, part, "kv", "tenant_admin", actor_tid="t-kunde")
+    steps = {r["id"]: r for r in st["steps"]}
+    if part == "sap-regel":
+        pass
+ok("CERTRULE bietet das Musterzertifikat an, SICF nennt den Dienst",
+   steps["sap-regel"].get("offer") == ["sample"]
+   and "/zmcp2/bc/access-support" in steps["sap-dienst"]["text"], steps["sap-dienst"]["text"])
 steps = {r["id"]: r for r in st["steps"]}
 ok("die Kette hält noch nicht: der Lauf wartet und sagt, welches Glied bricht",
    steps["kette"]["state"] == "waiting" and "mapping" in steps["kette"]["note"].lower()

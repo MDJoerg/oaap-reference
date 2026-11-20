@@ -304,6 +304,8 @@ def detail(build):
                        "confirmable": r.get("done_when") == "confirmed"
                        or (r.get("done_when") == "server.compared" and len(fp) == 64),
                        "compare": r.get("done_when") == "server.compared",
+                       # 0.1.329: downloads right at the step (ca, sample)
+                       "offer": [x for x in (r.get("offer") or []) if x in ("ca", "sample")],
                        "fingerprint": fp,
                        "shown": ":".join(fp[i:i + 2] for i in range(0, len(fp), 2)).upper()}
         if st == "failed" and failed is None:
