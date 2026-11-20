@@ -179,6 +179,40 @@ ok("D6: Sandbox-Namen bleiben unter dem Knoten", sb and all(DOM not in h for h i
 ok("der Connector trägt die Rücksprungadresse der Domain mit ein",
    idp_admin.redirect_uris_for("bec", HOST, domain=place.tenant_domain(t))
    == [f"https://bec.{HOST}/auth/oidc/callback", f"https://{DOM}/auth/oidc/callback"])
+# oaapx01, 2026-11-20: chat.bec.brandeis.de war schon ein eigener Name der Instanz,
+# bevor bec die Domain bekam -- zwei Seiten für einen Namen lehnt Caddy ab
+reg = m.load_registry()
+reg["instances"]["bec-chat"]["address"] = f"chat.{DOM}"
+m.save_registry(reg)
+m.write_external_caddy()
+m.write_instance_address_caddy()
+c = caddy()
+with open(os.path.join(m.CADDY_APPS_DIR, "instance-addresses.caddy"), encoding="utf-8") as f:
+    own = f.read()
+sites = (c + own).count(f"https://chat.{DOM} {{")
+ok("KÖDER: ein Name, den eine Instanz schon als eigenen trägt, steht genau einmal im Gateway",
+   sites == 1 and f"https://chat.{DOM} {{" in own and f"https://{DOM} {{" in c, sites)
+reg["instances"]["bec-chat"].pop("address")
+m.save_registry(reg)
+m.write_instance_address_caddy()
+calls = []
+
+
+def refused_reload():
+    calls.append(1)
+    if len(calls) == 1:
+        m.die("caddy: ambiguous site definition")
+
+
+m.reload_gateway = refused_reload
+tenant("domain", "bec", "off")
+calls.clear()
+rc, out = tenant("domain", "bec", DOM)
+ok("lehnt das Gateway die Seiten ab, wartet die Domain wieder, und die Dateien stehen ohne sie",
+   rc != 0 and m.load_tenants()[bec_id]["domain"]["state"] == "pending" and DOM not in caddy()
+   and len(calls) == 2, (rc, out[-300:]))
+m.reload_gateway = lambda: None
+tenant("domain", "bec", DOM)
 rc, out = tenant("domain", "cls", DOM)
 ok("KÖDER: dieselbe Domain für einen zweiten Mandanten wird abgelehnt", rc != 0, out)
 rc, out = tenant("domain", "default", "x.anders.example")

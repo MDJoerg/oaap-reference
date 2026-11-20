@@ -13378,10 +13378,26 @@ def _tenant_domain_cli(args, tenants):
         if was == "off":
             print("The domain is switched off; set it again to switch it on.")
         return
+    try:
+        refresh_generated_sites()
+        reload_gateway()
+    except SystemExit:
+        # The gateway keeps its running config when a reload is refused, but
+        # the files on disk would make the NEXT reload of anything fail. Take
+        # the domain back to pending and write the files without it.
+        dom["state"] = "pending"
+        t["domain"] = dom
+        save_tenants(tenants)
+        refresh_generated_sites()
+        reload_gateway()
+        die(f"the gateway refused the sites for {dom['name']} (above); the domain is pending "
+            f"again and nothing changed for anybody")
     audit_tenant("tenant.domain", tid, label, detail=f"active {dom['name']}")
-    refresh_generated_sites()
-    reload_gateway()
+    taken = sorted(h for i in load_registry()["instances"].values() for h in instance_names(i)
+                   if h == dom["name"] or h.endswith("." + dom["name"]))
     _host, edge = load_external_conf()
+    if taken:
+        print(f"Already an instance's own name, and served as such: {', '.join(taken)}")
     print("")
     print(f"Active. {dom['name']} shows the place and login of '{label}', "
           f"<instance>.{dom['name']} each of its instances;")
@@ -20326,7 +20342,15 @@ def write_external_caddy():
     # no certificate and so never reaches a page at all.
     domains = [(tid, place.tenant_domain(t)) for tid, t in sorted(load_tenants().items())
                if place.tenant_domain(t)]
+    # A name an instance already holds as its OWN name (RFC-0009/0018) keeps
+    # that site: Caddy refuses two sites for one name, and the operator's
+    # explicit choice wins over the automatic one (measured on oaapx01,
+    # 2026-11-20: chat.bec.brandeis.de was an alias before bec got the domain).
+    own_names = {h for i in reg["instances"].values() for h in instance_names(i)}
     for _tid, dom in domains:
+        if dom in own_names:
+            lines.append(f"# {dom} -> held as an instance's own name; no place site")
+            continue
         lines.append(f"# {dom} -> the own domain of tenant {_tid} (RFC-0115)")
         lines.append(f"{scheme}://{dom} {{")
         if edge:
@@ -20371,6 +20395,8 @@ def write_external_caddy():
         # operator's own name.
         groups = (inst.get("visibility") or {}).get("groups")
         for fqdn in instance_auto_hosts(name, inst, ext_host=host):
+            if fqdn in own_names:
+                continue        # RFC-0115: the instance-address site serves it
             lines.append(f"{scheme}://{fqdn} {{")
             if edge:
                 lines += _edge_guard(edge)
