@@ -104,6 +104,7 @@ import disks  # noqa: E402
 # acting is cmd_metrics.
 import metrics  # noqa: E402
 import traffic  # noqa: E402
+import instance_metrics  # noqa: E402  (RFC-0108)
 import idle  # noqa: E402
 # Host care (oaap.core.updates 2.6): the operating system under the
 # platform -- kernel, automatic updates, the gateway's listeners. Pure
@@ -3898,6 +3899,11 @@ def ledger_lines_for_day(day, measured_now):
             if measured_now:
                 parts["bytes"] = ({"tenant": (bytes_t or {}).get(tid)}
                                   if bytes_t is not None and tid in (bytes_t or {}) else None)
+                # RFC-0108 D3: the size per instance, from the history's last
+                # du -- no second walk of the tenant tree.
+                per = instance_metrics.disk_bytes(METRICS_DIR, tid)
+                if per and parts["bytes"] is not None:
+                    parts["bytes"]["instances"] = per
         out[tid] = report.ledger_line(day, tid, **parts)
     return out
 
@@ -9641,6 +9647,27 @@ def _metrics_sender(args):
     print(f"  waiting: {metrics.queue_status(METRICS_DIR)['pending']}")
 
 
+def instance_metrics_targets():
+    """What the per-instance history needs of each instance (RFC-0108):
+    its tenant, its containers, the hosts it answers under and its data
+    directory. One read of the registry per minute."""
+    out = {}
+    for key, inst in (load_registry().get("instances") or {}).items():
+        tid = resolve_tenant(inst.get("tenant"))
+        if not tid:
+            continue
+        try:
+            containers = [x["container"] for x in instance_services(inst) if x.get("container")]
+        except (KeyError, TypeError, ValueError):
+            containers = []
+        hosts = [h for h in ([inst.get("address")] + list(inst.get("aliases") or [])
+                             + instance_auto_hosts(key, inst)) if h]
+        out[key] = {"tenant": tid, "containers": containers, "hosts": hosts,
+                    "dir": instance_dir(key, inst),
+                    "asleep": inst.get("state") in ("standby", "waking")}
+    return out
+
+
 def cmd_metrics(args):
     """`oaap metrics sample|show [--window 4h|24h|1w|1m]|queue|queue-purge
     [--yes]|sender set|show|test|remove` (RFC-0051, RFC-0052).
@@ -9661,7 +9688,8 @@ def cmd_metrics(args):
             metrics.take_sample(
                 METRICS_DIR, DATA_DIR,
                 log_path=os.path.join(GATEWAY_LOG_DIR, "external-access.log"),
-                containers=traffic.docker_stats)
+                containers=traffic.docker_stats,
+                instances=instance_metrics_targets)
         except Exception as exc:  # noqa: BLE001 -- see the docstring
             print(f"metrics: sample skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)

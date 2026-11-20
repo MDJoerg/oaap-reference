@@ -163,5 +163,49 @@ with portal.app.test_request_context("/health", base_url="https://node.example.o
     ok("server_admin an der Knotenadresse: weiter die Seite des Knotens",
        portal._health_scope() == (None, None), portal._health_scope())
 
+
+print("\n=== Verlauf je Instanz (RFC-0108) ===")
+import time as _t  # noqa: E402
+import instance_metrics as im  # noqa: E402
+MD = tempfile.mkdtemp(prefix="oaap-nav-metrics-")
+portal.METRICS_DIR = MD
+now = int(_t.time())
+tg = {"bec-tools": {"tenant": "t-bec", "containers": ["oaap-app-bec-tools"], "hosts": [],
+                    "dir": "/x", "asleep": False},
+      "pxx-geheim": {"tenant": "t-pxx", "containers": ["oaap-app-pxx-geheim"], "hosts": [],
+                     "dir": "/y", "asleep": False}}
+for k in range(30, 0, -1):
+    im.sample(MD, now - k * 60, {"containers": [("oaap-app-bec-tools", 5.0 + k % 3, 200.0, 0, 0),
+                                                ("oaap-app-pxx-geheim", 50.0, 999.0, 0, 0)]},
+              tg, du=lambda p: 42.0)
+st, body = get("/health?i=bec-tools", host="bec.node.example.org")
+ok("CPU und Speicher jetzt aus dem Verlauf, nicht aus den Top 6",
+   ">200 MB" in body and "120 MB" not in body, body[-5000:])
+ok("Minikurven je Instanz", 'class="spark"' in body)
+ok("ein Klick auf „Verlauf“ öffnet die Diagramme der Instanz",
+   'id="verlauf-instanz"' in body and "Verlauf: tools" in body and "vl-svg" in body, body[:3000])
+ok("die Fensterknöpfe behalten die Instanz",
+   'href="/health?i=bec-tools&amp;w=1w#verlauf-instanz"' in body, body[:4000])
+ok("der Verlauf des Mandanten (Summe) steht oben", "Verlauf des Mandanten" in body)
+ok("kein Wert der fremden Instanz (999 MB, 50 %) auf der Seite",
+   "999 MB" not in body and "999,0" not in body and "geheim" not in body)
+st, body = get("/health?i=pxx-geheim", host="bec.node.example.org")
+ok("eine fremde Instanz im Parameter öffnet nichts",
+   'id="verlauf-instanz"' not in body and "geheim" not in body)
+
+import tenant_health_view as thv  # noqa: E402
+r = thv.ranking([("a", "a", "bec", {"series": {"cpu": [[1, 10, 10, 10], [2, 30, 30, 30]],
+                                                "mem": [[1, 100, 100, 100]],
+                                                "disk": [[1, 5, 5, 5], [2, 25, 25, 25]]}}),
+                 ("b", "b", "pxx", {"series": {"cpu": [[1, 50, 50, 50]]}}),
+                 ("c", "c", "pxx", {"series": {}})], "24h")
+ok("Rangliste: mittlere CPU absteigend, Wachstum der Daten, ohne Werte nicht dabei",
+   [x["key"] for x in r["cpu"]] == ["b", "a"] and r["cpu"][1]["cpu"] == 20
+   and r["growth"][0]["growth"] == 20 and len(r["mem"]) == 1, r)
+ok("die Knotenseite trägt die Karte „Was kostet am meisten“",
+   'id="kosten"' in src and "ranked=ranked" in src)
+ok("die Instanzseite zeigt den Verlauf im Reiter Diagnose",
+   "{% if i.history %}{{ i.mx_style }}{{ i.history }}{% endif %}" in src)
+
 print(f"\n{'ALL PASS' if not fails else str(fails) + ' FAILURES'}")
 sys.exit(1 if fails else 0)

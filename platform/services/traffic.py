@@ -111,7 +111,8 @@ def read_tcp_inuse(proc="/proc"):
 
 
 def docker_stats():
-    """[(name, cpu percent of one core, memory MB)] from `docker stats`,
+    """[(name, cpu percent of one core, memory MB, received bytes, sent bytes)]
+    from `docker stats` (the bytes since the container started -- RFC-0108),
     or None when it cannot be asked. This is the one slow reading (about
     two seconds): it is bounded and a failure only costs the minute."""
     exe = shutil.which("docker")
@@ -120,7 +121,7 @@ def docker_stats():
     try:
         r = subprocess.run(
             [exe, "stats", "--no-stream", "--format",
-             "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"],
+             "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"],
             capture_output=True, text=True, timeout=DOCKER_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -141,8 +142,25 @@ def parse_docker_stats(text):
             continue
         if not math.isfinite(cpu):          # float("nan") parses happily
             continue
-        out.append((p[0].strip()[:80], cpu, _mem_mb(p[2])))
+        row = (p[0].strip()[:80], cpu, _mem_mb(p[2]))
+        if len(p) >= 4 and "/" in p[3]:
+            rx, _, tx = p[3].partition("/")
+            row += (_bytes(rx), _bytes(tx))
+        out.append(row)
     return out
+
+
+def _bytes(text):
+    """'36.4kB' -> 36400 (docker prints NetIO in decimal units), None if odd."""
+    t = text.strip()
+    for unit, factor in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3), ("B", 1.0)):
+        if t.endswith(unit):
+            try:
+                v = float(t[:-len(unit)]) * factor
+            except ValueError:
+                return None
+            return int(v) if math.isfinite(v) and v >= 0 else None
+    return None
 
 
 def _mem_mb(text):
@@ -255,10 +273,15 @@ def merge(into, hosts):
 
 # --- the run ------------------------------------------------------------
 
-def measure(directory, now, proc="/proc", log_path=None, containers=None):
+def measure(directory, now, proc="/proc", log_path=None, containers=None,
+            keep=None):
     """Read the traffic sources once. Returns {series: value} for what was
     measurable and writes the state and the snapshot. `containers` is a
-    function returning docker_stats()'s list (None leaves it out)."""
+    function returning docker_stats()'s list (None leaves it out).
+
+    `keep`, a dict, receives what this run read for the per-instance
+    history (RFC-0108): the full container list, this run's tally per host
+    and the seconds it covers -- read once, used twice."""
     out = {}
     if not (log_path or containers or os.path.isdir(os.path.join(proc, "net"))):
         return out                  # nothing to read: write nothing either
@@ -286,6 +309,8 @@ def measure(directory, now, proc="/proc", log_path=None, containers=None):
         lines, new_pos = _read_new(log_path, new_pos)
         if lines is not None and fresh:
             hosts = tally(lines)
+            if keep is not None:
+                keep["hosts"], keep["elapsed"] = hosts, elapsed
             n = sum(r[0] for r in hosts.values())
             out["req"] = round(n * 60.0 / elapsed, 1)
             timed = sum(r[0] - r[1] for r in hosts.values())
@@ -303,6 +328,8 @@ def measure(directory, now, proc="/proc", log_path=None, containers=None):
             stats = containers()
         except Exception:                                  # noqa: BLE001
             stats = None
+        if stats and keep is not None:
+            keep["containers"] = stats
         if stats:
             top = sorted(stats, key=lambda c: -c[1])
             out["ctop"] = round(top[0][1], 1)

@@ -139,7 +139,7 @@ def _aggregate(entries, series):
             round(max(c[3] for c in cells), 2)]
 
 
-def rollup(directory, now):
+def rollup(directory, now, series=SERIES):
     """Close every interval that has ended, tier by tier.
 
     Idempotent and catching up: it looks at what each tier already holds
@@ -160,7 +160,7 @@ def rollup(directory, now):
         out = []
         for b in sorted(buckets):
             entry = {"t": b}
-            for s in SERIES:
+            for s in series:
                 agg = _aggregate(buckets[b], s)
                 if agg:
                     entry[s] = agg
@@ -260,7 +260,8 @@ def _save_last(directory, d):
 
 
 def take_sample(directory, data_path, now=None, proc="/proc",
-                sleep=time.sleep, log_path=None, containers=None):
+                sleep=time.sleep, log_path=None, containers=None,
+                instances=None):
     """Read the host once and file the sample. Returns the entry, or None
     when this minute already has one (the job may fire twice).
 
@@ -292,9 +293,10 @@ def take_sample(directory, data_path, now=None, proc="/proc",
             entry[s] = round(v, 2)
     # Traffic (RFC-0051 stage 3). A reading that fails leaves its series
     # out of this minute; it never costs the CPU line above.
+    keep = {}
     try:
         entry.update(traffic.measure(directory, now, proc, log_path,
-                                     containers))
+                                     containers, keep))
     except Exception:                                      # noqa: BLE001
         pass
     if len(entry) > 1:
@@ -305,13 +307,25 @@ def take_sample(directory, data_path, now=None, proc="/proc",
     # the first rolled tier has actually closed; trimming rewrites, so it
     # runs about once an hour. Both are idempotent catch-ups, so a gate
     # that skips a run only delays it.
-    if now // ROLLUP_EVERY != last.get("rolled", -1):
+    roll = now // ROLLUP_EVERY != last.get("rolled", -1)
+    cut = now // TRIM_EVERY != last.get("trimmed", -1)
+    if roll:
         rollup(directory, now)
         last["rolled"] = now // ROLLUP_EVERY
-    if now // TRIM_EVERY != last.get("trimmed", -1):
+    if cut:
         trim(directory, now)
         queue_trim(directory, now)
         last["trimmed"] = now // TRIM_EVERY
+    # RFC-0108: the same minute per instance, from what was read above.
+    # `instances` is a function (the registry is the caller's); a failure
+    # costs the instance lines, never the node's.
+    if instances is not None:
+        try:
+            import instance_metrics
+            instance_metrics.sample(directory, now, keep, instances(),
+                                    roll=roll, trim=cut)
+        except Exception:                                  # noqa: BLE001
+            pass
     last.update({"cpu": list(cur) if cur else None, "at": now, "t": t})
     _save_last(directory, last)
     return entry
@@ -319,7 +333,7 @@ def take_sample(directory, data_path, now=None, proc="/proc",
 
 # --- reading the store --------------------------------------------------
 
-def _entries(directory, idx, now):
+def _entries(directory, idx, now, series=SERIES):
     """A tier's entries INCLUDING what has not been rolled up into it yet.
 
     The files only hold closed intervals, so a node updated an hour ago
@@ -334,14 +348,14 @@ def _entries(directory, idx, now):
         return stored
     last = stored[-1]["t"] if stored else -1
     buckets = {}
-    for e in _entries(directory, idx - 1, now):
+    for e in _entries(directory, idx - 1, now, series):
         b = e["t"] - e["t"] % step
         if b > last:
             buckets.setdefault(b, []).append(e)
     derived = []
     for b in sorted(buckets):
         entry = {"t": b}
-        for s in SERIES:
+        for s in series:
             agg = _aggregate(buckets[b], s)
             if agg:
                 entry[s] = agg
@@ -350,7 +364,7 @@ def _entries(directory, idx, now):
     return stored + derived
 
 
-def window(directory, key, now=None):
+def window(directory, key, now=None, series=SERIES):
     """One window as the charts need it:
 
         {"window", "tier", "step", "since", "series": {name: [[t, mean,
@@ -363,10 +377,11 @@ def window(directory, key, now=None):
     step = _tier(tier)[1]
     now = int(time.time() if now is None else now)
     idx = [t[0] for t in TIERS].index(tier)
-    entries = [e for e in _entries(directory, idx, now)
+    names = series
+    entries = [e for e in _entries(directory, idx, now, names)
                if e["t"] >= now - span]
     series = {}
-    for s in SERIES:
+    for s in names:
         pts = []
         for e in entries:
             c = _cell(e, s)

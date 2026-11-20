@@ -48,6 +48,7 @@ import metrics_view
 import nav_view
 import tenant_health_view as thv
 import traffic  # noqa: E402  (the hour per host, for the tenant health page)
+import instance_metrics  # noqa: E402  (RFC-0108: the history per instance)
 # The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
@@ -325,6 +326,8 @@ STYLE = """
        padding:0;margin:0 0 .4rem;color:var(--oaap-blue-600);font-size:.8rem;cursor:pointer;
        min-height:0;box-shadow:none}
   .apptile .meta{margin-top:auto}
+  table.thv tr.active td{background:var(--oaap-bg)}
+  svg.spark{display:block;margin-top:.15rem}
   .apptile:has(.tilecover:hover){border-color:var(--oaap-blue-600);box-shadow:0 2px 8px rgba(37,99,235,.18)}
   .hexdot{flex:none}
   .badge{font-size:.72rem;padding:.15rem .55rem;border-radius:1rem;
@@ -1269,6 +1272,8 @@ TENANT_HEALTH_BODY = """
     Knoten zuletzt {{ bk.node_last.when }}{% endif %}</span></div>
 </div>
 
+{{ mx_style }}
+{{ total }}
 <div class="card">
   <h2 style="margin-top:0">Datengröße im Verlauf</h2>
   {{ chart }}
@@ -1276,25 +1281,27 @@ TENANT_HEALTH_BODY = """
      (dieselbe Zahl wie im Wochenbericht), die letzten 90 Messtage.</p>
 </div>
 
+{{ detail }}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <h2>Instanzen</h2>
 {% if rows %}
-<table>
+<table class="thv">
   <tr><th>Instanz</th><th>Status</th><th>App</th><th>Daten</th><th>Anfragen/h</th>
-      <th>Ø Dauer</th><th>Raus/h</th><th>CPU jetzt</th><th>Speicher jetzt</th><th>Neustarts</th></tr>
+      <th>Ø Dauer</th><th>Raus/h</th><th>CPU</th><th>Speicher</th><th>Neustarts</th></tr>
   {% for r in rows %}
-  <tr class="rowlink">
-    <td><a class="rowaction" href="/instances/{{ r.key }}">{{ r.name }}</a></td>
+  <tr class="rowlink{{ ' active' if r.key == chosen }}">
+    <td><a class="rowaction" href="/instances/{{ r.key }}">{{ r.name }}</a><br>
+        <a class="muted" href="/health?i={{ r.key|urlencode }}#verlauf-instanz">Verlauf</a></td>
     <td title="{{ r.detail }}"><span class="dot {{ r.state }}"></span>{{ r.label }}</td>
     <td>{{ r.app_name }} <span class="muted">v{{ r.version }}</span>
         {% if r.channel == 'test' %}<span class="badge test">Test</span>{% endif %}</td>
-    <td>{{ r.data }}</td>
+    <td>{{ r.data }}<br>{{ r.spark_disk|safe }}</td>
     <td>{% if r.req is none %}<span class="muted">—</span>{% else %}{{ r.req }}{% if r.err %}
-        <span class="badge todo" title="Antworten 5xx">{{ r.err }}</span>{% endif %}{% endif %}</td>
+        <span class="badge todo" title="Antworten 5xx">{{ r.err }}</span>{% endif %}{% endif %}<br>{{ r.spark_req|safe }}</td>
     <td>{% if r.ms is none %}<span class="muted">—</span>{% else %}{{ r.ms }} ms{% endif %}</td>
     <td>{{ r.out }}</td>
-    <td>{% if r.cpu is none %}<span class="muted">—</span>{% else %}{{ r.cpu }} %{% endif %}</td>
-    <td>{% if r.mem is none %}<span class="muted">—</span>{% else %}{{ r.mem }} MB{% endif %}</td>
+    <td>{% if r.cpu is none %}<span class="muted">—</span>{% else %}{{ r.cpu }} %{% endif %}<br>{{ r.spark_cpu|safe }}</td>
+    <td>{% if r.mem is none %}<span class="muted">—</span>{% else %}{{ r.mem }} MB{% endif %}<br>{{ r.spark_mem|safe }}</td>
     <td>{{ r.restarts }}{% if r.oom %} <span class="badge todo">Speicher voll</span>{% endif %}</td>
   </tr>
   {% endfor %}
@@ -1302,10 +1309,10 @@ TENANT_HEALTH_BODY = """
 {% else %}<p class="muted">Dieser Mandant hat keine Instanzen.</p>{% endif %}
 <p class="muted">Anfragen, Dauer und „Raus“: die letzte Stunde über die öffentlichen
    Adressen{% if traffic_at %}, Stand {{ traffic_at }} UTC{% endif %} — Aufrufe über das LAN zählt der
-   Knoten nicht. Daten: Verzeichnis der Produktiv-Instanz, aufgefrischt nach jeder
-   Aktion an ihr. CPU und Speicher: nur, wenn die Instanz gerade zu den sechs
-   stärksten Containern des Knotens gehört; einen Verlauf je Instanz misst der
-   Knoten noch nicht.</p>
+   Knoten nicht. CPU (in % eines Kerns), Speicher und Daten: die letzte Messung
+   des Verlaufs je Instanz (jede Minute, die Daten alle 15 Minuten, RFC-0108);
+   die kleinen Kurven zeigen die letzten 24 Stunden. „Verlauf“ öffnet die
+   Diagramme einer Instanz.</p>
 </div>
 """
 
@@ -1314,6 +1321,27 @@ HEALTH_BODY = """
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
 {{ mx_style }}{{ mx }}
+{% if ranked and (ranked.cpu or ranked.mem or ranked.growth) %}
+<div class="card" id="kosten">
+  <h2>Was kostet am meisten</h2>
+  <p class="muted">Je Instanz über das Fenster „{{ window_label }}“ (die Knöpfe oben):
+     mittlere CPU in % eines Kerns, mittlerer Speicher, Wachstum der Daten (RFC-0108).</p>
+  <div class="vl-row">
+  {% for field, head in (("cpu", "CPU"), ("mem", "Speicher"), ("growth", "Daten-Wachstum")) %}
+  <div class="vl-cell">
+    <div class="vl-head"><span>{{ head }}</span></div>
+    {% if ranked[field] %}
+    <table class="vl-tab">
+      {% for r in ranked[field] %}<tr><td><a href="/instances/{{ r.key }}?tab=diagnose#verlauf">{{ r.name }}</a>
+        <span class="muted">{{ r.tenant }}</span></td>
+        <td>{{ fmt_i("disk" if field == "growth" else field, r[field]) }}</td></tr>{% endfor %}
+    </table>
+    {% else %}<p class="muted">noch keine Werte</p>{% endif %}
+  </div>
+  {% endfor %}
+  </div>
+</div>
+{% endif %}
 <div class="card">
   <h2>Knoten</h2>
   <table>
@@ -4143,6 +4171,7 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'diagnose' }}">
+{% if i.history %}{{ i.mx_style }}{{ i.history }}{% endif %}
 {% if i.diag %}
 <div class="card">
   <h2>Zustand</h2>
@@ -7271,7 +7300,26 @@ def tenant_health(tid):
     state = (_read_json(STATE_VIEW) or {}).get("instances") or {}
     sizes = _rehearsal_options().get("instances") or {}
     snap = traffic.snapshot(METRICS_DIR)
-    rows = thv.instance_rows(insts, probed, state, sizes, snap, _tenant_hosts)
+    # RFC-0108: the history per instance -- the last minute for "now", a
+    # day for the sparklines, the chosen window for the charts.
+    wkey = metrics_view.clean_window(request.args.get("w", ""))
+    now = int(_time.time())
+    day = {k: instance_metrics.window(METRICS_DIR, tid, k, "24h", now=now) for k in insts}
+    latest = {k: instance_metrics.latest(METRICS_DIR, tid, k) for k in insts}
+    rows = thv.instance_rows(insts, probed, state, sizes, snap, _tenant_hosts,
+                             latest=latest, windows=day)
+    chosen = request.args.get("i", "")
+    detail = ""
+    if chosen in insts:
+        detail = thv.history_block(
+            instance_metrics.window(METRICS_DIR, tid, chosen, wkey, now=now), wkey, now,
+            f"/health?i={quote(chosen)}&", "Verlauf: " + (insts[chosen].get("name") or chosen),
+            "verlauf-instanz")
+    wins = day if wkey == "24h" else {
+        k: instance_metrics.window(METRICS_DIR, tid, k, wkey, now=now) for k in insts}
+    total = thv.history_block(thv.sum_window(wins.values()), wkey, now, "/health?",
+                              "Verlauf des Mandanten (Summe seiner Instanzen)", "verlauf",
+                              names=("cpu", "mem", "req"))
     series = thv.tenant_bytes_series(
         report.read_ledger(os.path.join(TENANT_LEDGER_DIR, tid + ".jsonl")))
     at = snap.get("at")
@@ -7279,6 +7327,8 @@ def tenant_health(tid):
                 tenant=tenant_name(tid) or tenant_label(tid), rows=rows,
                 sum=thv.summary(rows), trend=thv.trend(series),
                 size_h=thv.size, chart=Markup(thv.chart(series)),
+                detail=Markup(detail), total=Markup(total), chosen=chosen,
+                mx_style=Markup(metrics_view.STYLE),
                 bk=_tenant_backup_facts(tid),
                 traffic_at=(datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%d %H:%M")
                             if isinstance(at, (int, float)) else ""),
@@ -7326,7 +7376,15 @@ def health():
             "state": state, "label": label, "detail": detail,
         })
     care, care_when = care_state()
+    # RFC-0108 §5: the instances that cost the most, over the chosen window.
+    wkey = metrics_view.clean_window(request.args.get("w", ""))
+    now = int(_time.time())
+    ranked = thv.ranking(
+        [(n, local_name(n, i), tenant_label(resolve_tenant(i.get("tenant"))),
+          instance_metrics.window(METRICS_DIR, resolve_tenant(i.get("tenant")) or "", n, wkey, now=now))
+         for n, i in insts if resolve_tenant(i.get("tenant"))], wkey)
     return page(HEALTH_BODY, "Gesundheit", "health", node=node_values(),
+                ranked=ranked, fmt_i=thv.fmt_i, window_label=metrics_view.LABELS[wkey],
                 ident=node_identity_view(),
                 is_server_admin="server_admin" in caller_roles(),
                 care=care, care_when=care_when,
@@ -10070,6 +10128,15 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "backup_out": (_backup_class()["skip_test"]
                         and (inst.get("channel") == "test" or bool(inst.get("rehearsal")))),
          **_throttle_view(inst)}
+    # RFC-0108: the history of this instance on the tab Diagnose.
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    if tid:
+        wkey = metrics_view.clean_window(request.args.get("w", ""))
+        now = int(_time.time())
+        i["history"] = Markup(thv.history_block(
+            instance_metrics.window(METRICS_DIR, tid, name, wkey, now=now), wkey, now,
+            f"/instances/{quote(name)}?tab=diagnose&", "Verlauf", "verlauf"))
+        i["mx_style"] = Markup(metrics_view.STYLE)
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
                 # Carried back by _inst_back after a refused removal, so

@@ -121,7 +121,8 @@ def chart(series, days=90):
             f'style="max-width:{W}px">{grid}{lines}{labels}</svg>')
 
 
-def instance_rows(instances, probed, state_view, sizes, traffic, host_of):
+def instance_rows(instances, probed, state_view, sizes, traffic, host_of,
+                  latest=None, windows=None):
     """Eine Zeile je Instanz des Mandanten.
 
     instances: {key: record} -- schon auf den Mandanten gefiltert
@@ -131,7 +132,13 @@ def instance_rows(instances, probed, state_view, sizes, traffic, host_of):
     traffic:   traffic.snapshot(): {"hosts": {host: [n, n101, bytes, durSum, durMax, 5xx]},
                                      "containers": [[name, cpu, memMB]]}
     host_of:   key, record -> [hosts, unter denen die Instanz antwortet]
+    latest:    {key: last raw line of its history} (RFC-0108) -- wins over
+               the top-6 snapshot for CPU and memory, the data size over the
+               view refreshed after actions
+    windows:   {key: 24-hour window of its history}, for the sparklines
     """
+    latest = latest or {}
+    windows = windows or {}
     cont_now = {}
     for c in (traffic or {}).get("containers") or []:
         if isinstance(c, (list, tuple)) and len(c) >= 3:
@@ -160,6 +167,14 @@ def instance_rows(instances, probed, state_view, sizes, traffic, host_of):
                 cpu = (cpu or 0) + float(c or 0)
                 mem = (mem or 0) + float(m or 0)
         kb = ((sizes or {}).get(key) or {}).get("kbytes")
+        lt = latest.get(key) or {}
+        if isinstance(lt.get("cpu"), (int, float)):
+            cpu = float(lt["cpu"])
+        if isinstance(lt.get("mem"), (int, float)):
+            mem = float(lt["mem"])
+        if isinstance(lt.get("disk"), (int, float)):
+            kb = lt["disk"] * 1024
+        ser = (windows.get(key) or {}).get("series") or {}
         st = probed.get(key) or ("unknown", "Unbekannt", "")
         rows.append({
             "key": key, "name": inst.get("name") or key,
@@ -175,6 +190,10 @@ def instance_rows(instances, probed, state_view, sizes, traffic, host_of):
             "out": size(b) if seen else "—",
             "cpu": None if cpu is None else round(cpu, 1),
             "mem": None if mem is None else round(mem),
+            "spark_cpu": sparkline(ser.get("cpu")),
+            "spark_mem": sparkline(ser.get("mem")),
+            "spark_req": sparkline(ser.get("req")),
+            "spark_disk": sparkline(ser.get("disk")),
         })
     return rows
 
@@ -187,3 +206,117 @@ def summary(rows):
             "err": sum(r["err"] for r in measured) if measured else None,
             "restarts": sum(r["restarts"] for r in rows),
             "oom": sum(1 for r in rows if r["oom"])}
+
+
+# --- RFC-0108 stage 2: the history per instance ------------------------
+
+import metrics_view as _mv  # noqa: E402
+
+TITLES_I = (("cpu", "CPU (% eines Kerns)"), ("mem", "Speicher"), ("req", "Anfragen je Minute"),
+            ("err", "Fehler (5xx) je Minute"), ("lat", "Dauer je Anfrage"),
+            ("rx", "Netz rein"), ("tx", "Netz raus"), ("disk", "Daten"))
+
+
+def fmt_i(series, v):
+    """A value of an instance series with its unit."""
+    if v is None:
+        return "—"
+    if series in ("mem", "disk"):
+        return (f"{v / 1024:.1f} GB" if v >= 1024 else f"{v:.0f} MB").replace(".", ",")
+    if series == "cpu":
+        return f"{v:.1f} %".replace(".", ",") if v < 10 else f"{v:.0f} %"
+    if series in ("req", "err"):
+        return f"{v:.1f}/Min.".replace(".", ",") if v < 10 else f"{v:.0f}/Min."
+    return _mv.fmt(series, v)
+
+
+def sparkline(points, w=90, h=22):
+    """A tiny line of the means, no axis -- the shape, not the numbers."""
+    pts = [p for p in points or [] if p]
+    if len(pts) < 2:
+        return ""
+    t0, t1 = pts[0][0], pts[-1][0]
+    top = max(p[1] for p in pts) or 1.0
+    span = max(t1 - t0, 1)
+    line = " ".join(f"{(p[0] - t0) / span * (w - 2) + 1:.1f},{h - 1 - p[1] / top * (h - 2):.1f}"
+                    for p in pts)
+    return (f'<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="spark" aria-hidden="true">'
+            f'<polyline points="{line}" fill="none" stroke="#2563eb" stroke-width="1.4"/></svg>')
+
+
+def sum_window(windows, names=("cpu", "mem", "req")):
+    """The tenant's total: the means of its instances added per point in
+    time. A point where one instance has no value adds what is there."""
+    out = {"series": {}, "since": None, "step": None}
+    for w in windows:
+        if not w or not w.get("since"):
+            continue
+        out["step"] = w["step"]
+        out["since"] = w["since"] if out["since"] is None else min(out["since"], w["since"])
+        for s in names:
+            acc = out["series"].setdefault(s, {})
+            for t, mean, _lo, _hi in w["series"].get(s) or []:
+                acc[t] = acc.get(t, 0.0) + mean
+    out["series"] = {s: [[t, round(v, 2), round(v, 2), round(v, 2)] for t, v in sorted(acc.items())]
+                     for s, acc in out["series"].items()}
+    return out
+
+
+def history_block(win, wkey, now, href, title, anchor, names=None):
+    """Charts of one window (an instance's, or the tenant total) with the
+    window buttons -- drawn like RFC-0051's, server-side SVG. `href` is the
+    link for a window button without the `w=` part."""
+    names = names or [s for s, _ in TITLES_I]
+    span = _mv.metrics.WINDOWS[_mv.clean_window(wkey)][1]
+    out = [f'<div class="card" id="{html.escape(anchor)}">', f"<h2>{html.escape(title)}</h2>",
+           '<p class="vl-tabs">']
+    for k, label in _mv.LABELS.items():
+        cls = "vl-btn active" if k == wkey else "vl-btn"
+        out.append(f'<a class="{cls}" href="{html.escape(href)}w={k}#{html.escape(anchor)}">'
+                   f"{html.escape(label)}</a>")
+    out.append("</p>")
+    if not win or not win.get("since"):
+        out.append('<p class="muted">Noch keine Messwerte. Der Knoten misst jede Minute; '
+                   "nach ein paar Minuten erscheint hier der Verlauf.</p></div>")
+        return "".join(out)
+    out.append('<div class="vl-row">')
+    for s, label in TITLES_I:
+        pts = (win.get("series") or {}).get(s) or []
+        if s not in names or not pts:
+            continue
+        top = _mv.nice_top(max(p[3] for p in pts))
+        out.append('<div class="vl-cell"><div class="vl-head">'
+                   f"<span>{html.escape(label)}</span>"
+                   f"<strong>{html.escape(fmt_i(s, pts[-1][1]))}</strong></div>"
+                   + _mv.chart(label, pts, now, span, win["step"], top, s) + "</div>")
+    out.append("</div>")
+    if win.get("since") and now - win["since"] < span * 0.9:
+        out.append(f'<p class="muted">Gemessen seit {html.escape(_mv._ago(now - win["since"]))} '
+                   "— vorher gab es keinen Verlauf je Instanz (RFC-0108).</p>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def ranking(entries, wkey, limit=10):
+    """„Was kostet am meisten“ (RFC-0108 §5): per instance the window's mean
+    CPU and memory and the data growth, three top lists.
+
+    entries: [(key, name, tenant_label, window)]"""
+    rows = []
+    for key, name, tenant, w in entries:
+        ser = (w or {}).get("series") or {}
+
+        def mean(s):
+            pts = ser.get(s) or []
+            n = len(pts)
+            return sum(p[1] for p in pts) / n if n else None
+        disk = ser.get("disk") or []
+        growth = (disk[-1][1] - disk[0][1]) if len(disk) >= 2 else None
+        rows.append({"key": key, "name": name, "tenant": tenant,
+                     "cpu": mean("cpu"), "mem": mean("mem"), "growth": growth,
+                     "disk": disk[-1][1] if disk else None})
+
+    def top(field):
+        return sorted([r for r in rows if r[field] is not None],
+                      key=lambda r: -r[field])[:limit]
+    return {"cpu": top("cpu"), "mem": top("mem"), "growth": top("growth"), "window": wkey}
