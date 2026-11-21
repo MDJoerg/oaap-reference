@@ -125,7 +125,7 @@ ok("die Liste der Quellen nennt die Adresse der Erkundungs-Tuer",
 ok("die Site mit Erkundungs-Tuer gilt nicht als veraltet (die Kopfzeile ist keine Identitaets-Kopfzeile)",
    not a._site_identity_stale(body))
 ok("Format 8: eine Site von vorher ist hinter",
-   a.CASES_BLOCK_FORMAT == 8 and f"{a.CASES_MARKER}8 " in body)
+   a.CASES_BLOCK_FORMAT >= 8 and f"{a.CASES_MARKER}{a.CASES_BLOCK_FORMAT} " in body)
 reg = a.load_registry()
 reg["instances"]["gw"]["maintenance"] = {"since": "2026-11-18T00:00:00Z", "by": "root"}
 a.save_registry(reg)

@@ -237,8 +237,8 @@ ok("KOEDER: ein normaler Benutzer, der das Formular abschickt, aendert nichts",
    s == 403 and "Kein Zugriff" in b and state() == before)
 
 print("Der volle Weg")
-s, _h, b = req("GET", "/roles")
-ok("die Rollen-Seite bietet die Vorlage mit den Werten der App an",
+s, _h, b = req("GET", "/roles/new")
+ok("die Seite Neue Rolle bietet die Vorlage mit den Werten der App an",
    s == 200 and "Bereich" in b and "value='sponsoring'" in b, b[:400])
 s, h, b = req("POST", "/do/role-add", form={
     "app": "vereinsportal", "template": "bereich", "name": "<b>Redaktion</b>",
@@ -279,8 +279,7 @@ ok("Bens Seite danach: nichts mehr, die Zeile bleibt als 'beendet'",
 s, h, b = req("POST", "/do/collection-retire", form={"id": cid})
 ok("jetzt geht das Ausblenden", s == 303, (s, b[:200]))
 s, _h, b = req("GET", "/collections")
-ok("die Sammlung ist aus der Liste", "Redaktion" not in b.split("Neues Berechtigungspaket")[0]
-   .split("<table>")[1], b[:600])
+ok("die Sammlung ist aus der Liste", "Redaktion" not in b, b[:600])
 s, _h, b = req("GET", "/collections?alle=1")
 ok("mit 'alle' ist sie wieder da, als ausgeblendet", "ausgeblendet" in b)
 s, _h, b = req("GET", "/mappings")
@@ -324,8 +323,8 @@ for pfad in ("/agents", "/delegated"):
        s == 403 and "agent-vp" not in b and "Gegeben von" not in b, b[:300])
 s, _h, b = req("GET", "/delegated")
 ok("noch keine Weitergabe: die Seite sagt es", s == 200
-   and "Keine gueltige Weitergabe" in b, b[:400])
-ok("und sie nennt die Grenze der Tuer", "fuenf Minuten" in " ".join(b.split()), b[:800])
+   and "Keine gültige Weitergabe" in b, b[:400])
+ok("und sie nennt die Grenze der Tuer", "fünf Minuten" in " ".join(b.split()), b[:800])
 for key, name in (("teamchef", "Chef"), ("teamhilfe", "Hilfe")):
     req("POST", "/do/role-add", form={"app": "vereinsportal", "template": key,
                                       "name": name})
@@ -386,7 +385,7 @@ print("Wenn etwas fehlt")
 os.environ["OAAP_AUTHZ_ADMIN_KEY"] = ""
 s, _h, b = req("GET", "/")
 ok("ohne Schluessel: eine Seite, die es sagt (kein Absturz, keine Namen)",
-   s == 200 and "Verwaltungsschluessel" in b and "carla" not in b, b[:300])
+   s == 200 and "Verwaltungsschlüssel" in b and "carla" not in b, b[:300])
 os.environ["OAAP_AUTHZ_ADMIN_KEY"] = KEY
 os.environ["OAAP_AUTHZ_URL"] = "http://127.0.0.1:9/authz"
 s, _h, b = req("GET", "/")

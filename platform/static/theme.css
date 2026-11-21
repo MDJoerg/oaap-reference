@@ -1,27 +1,53 @@
-/* OAAP platform theme (RFC-0035 §1.1, App Design Contract Teil A).
+/* OAAP platform theme and app kit (RFC-0035 §1.1, RFC-0118 P1).
  *
- * Served by the gateway at /platform/theme.css -- the same URL for
- * every tenant today (RFC-0035 D3: a fixed platform default now, a
- * per-tenant override is a later phase that changes what is served
- * here, never how an app links to it or reads these variables).
+ * Served by the gateway at /platform/theme.css on the portal AND on
+ * every instance's own name -- the same file for every tenant today
+ * (RFC-0035 D3: a per-tenant override is a later phase that changes
+ * what is served here, never how an app links to it).
  *
- * An app links to this file and reads these variables in its own
- * CSS (var(--oaap-color-primary, #2f6fed)) with the same values kept
- * as local fallbacks, so a missing stylesheet degrades a page rather
- * than breaking it.
+ * 1. Variables (RFC-0035). The names of 0.1 stay; since RFC-0118 D9
+ *    their values are the brand of the design guidelines (blue-600
+ *    #2563eb), no longer the lighter blue of 0.1. An app reads them with local
+ *    fallbacks, so a missing stylesheet degrades a page rather than
+ *    breaking it.
+ * 2. The kit (RFC-0118 §4-§7): the frame (header, tab bar, footer),
+ *    cards, the object header, the filter bar, tables with sorting and
+ *    paging, badges, buttons, the empty state. An app keeps only what
+ *    is its own. Class names all start with "oaap-".
+ * 3. Dark mode follows the system, unless the page says
+ *    <html data-theme="light"> or "dark".
  */
 :root {
-  --oaap-color-bg: #ffffff;
-  --oaap-color-surface: #f4f5f7;
-  --oaap-color-text: #1a1d21;
-  --oaap-color-text-muted: #5b616b;
-  --oaap-color-primary: #2f6fed;
-  --oaap-color-primary-text: #ffffff;
-  --oaap-color-border: #d8dbe0;
-  --oaap-color-danger: #c4342f;
-  --oaap-color-success: #1f8a4c;
+  --oaap-blue-950: #172554;
+  --oaap-blue-900: #1e3a8a;
+  --oaap-blue-700: #1d4ed8;
+  --oaap-blue-600: #2563eb;
+  --oaap-blue-100: #dbeafe;
 
-  --oaap-font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --oaap-color-bg: #f4f6fa;
+  --oaap-color-surface: #ffffff;
+  --oaap-color-text: #1f2937;
+  --oaap-color-text-muted: #6b7280;
+  --oaap-color-primary: #2563eb;
+  --oaap-color-primary-hover: #1d4ed8;
+  --oaap-color-primary-text: #ffffff;
+  --oaap-color-accent-soft: #dbeafe;
+  --oaap-color-border: #e5e7eb;
+  --oaap-color-danger: #b91c1c;
+  --oaap-color-success: #15803d;
+  --oaap-color-warning: #b45309;
+  --oaap-color-header: #1e3a8a;
+  --oaap-color-header-2: #172554;
+  --oaap-color-header-text: #ffffff;
+
+  --oaap-badge-ok-bg: #dcfce7;    --oaap-badge-ok: #166534;
+  --oaap-badge-warn-bg: #fef3c7;  --oaap-badge-warn: #92400e;
+  --oaap-badge-err-bg: #fee2e2;   --oaap-badge-err: #991b1b;
+  --oaap-badge-info-bg: #dbeafe;  --oaap-badge-info: #1e40af;
+  --oaap-badge-test-bg: #fef3c7;  --oaap-badge-test: #92400e;
+  --oaap-badge-neutral-bg: #f3f4f6; --oaap-badge-neutral: #374151;
+
+  --oaap-font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --oaap-font-size-base: 15px;
 
   --oaap-space-1: 4px;
@@ -31,31 +57,239 @@
 
   --oaap-radius: 6px;
   --oaap-header-height: 48px;
+  --oaap-main-width: 72rem;
+  color-scheme: light;
 }
 
-/* RFC-0035 D4: the one navigation decision made so far -- a thin
- * header bar every app carries until Part B (RFC-0036) settles the
- * rest. An app opts in with class="oaap-header" on its header
- * element and "oaap-header-title"/"oaap-header-back" inside it. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --oaap-color-bg: #0f172a;
+    --oaap-color-surface: #1e293b;
+    --oaap-color-text: #e5e7eb;
+    --oaap-color-text-muted: #9ca3af;
+    --oaap-color-primary: #60a5fa;
+    --oaap-color-primary-hover: #93c5fd;
+    --oaap-color-primary-text: #0f172a;
+    --oaap-color-accent-soft: #1e3a8a;
+    --oaap-color-border: #334155;
+    --oaap-color-danger: #f87171;
+    --oaap-color-success: #4ade80;
+    --oaap-color-warning: #fbbf24;
+    --oaap-color-header: #172554;
+    --oaap-color-header-2: #0b1437;
+    --oaap-badge-ok-bg: #14532d;    --oaap-badge-ok: #bbf7d0;
+    --oaap-badge-warn-bg: #78350f;  --oaap-badge-warn: #fde68a;
+    --oaap-badge-err-bg: #7f1d1d;   --oaap-badge-err: #fecaca;
+    --oaap-badge-info-bg: #1e3a8a;  --oaap-badge-info: #bfdbfe;
+    --oaap-badge-test-bg: #78350f;  --oaap-badge-test: #fde68a;
+    --oaap-badge-neutral-bg: #334155; --oaap-badge-neutral: #e5e7eb;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --oaap-color-bg: #0f172a;
+  --oaap-color-surface: #1e293b;
+  --oaap-color-text: #e5e7eb;
+  --oaap-color-text-muted: #9ca3af;
+  --oaap-color-primary: #60a5fa;
+  --oaap-color-primary-hover: #93c5fd;
+  --oaap-color-primary-text: #0f172a;
+  --oaap-color-accent-soft: #1e3a8a;
+  --oaap-color-border: #334155;
+  --oaap-color-danger: #f87171;
+  --oaap-color-success: #4ade80;
+  --oaap-color-warning: #fbbf24;
+  --oaap-color-header: #172554;
+  --oaap-color-header-2: #0b1437;
+  --oaap-badge-ok-bg: #14532d;    --oaap-badge-ok: #bbf7d0;
+  --oaap-badge-warn-bg: #78350f;  --oaap-badge-warn: #fde68a;
+  --oaap-badge-err-bg: #7f1d1d;   --oaap-badge-err: #fecaca;
+  --oaap-badge-info-bg: #1e3a8a;  --oaap-badge-info: #bfdbfe;
+  --oaap-badge-test-bg: #78350f;  --oaap-badge-test: #fde68a;
+  --oaap-badge-neutral-bg: #334155; --oaap-badge-neutral: #e5e7eb;
+  color-scheme: dark;
+}
+
+/* ---------------------------------------------------------- page --- */
+body.oaap-app {
+  margin: 0;
+  background: var(--oaap-color-bg);
+  color: var(--oaap-color-text);
+  font-family: var(--oaap-font-family);
+  font-size: var(--oaap-font-size-base);
+  line-height: 1.5;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+.oaap-app a { color: var(--oaap-color-primary); }
+.oaap-main {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--oaap-main-width);
+  margin: 0 auto;
+  padding: var(--oaap-space-4) var(--oaap-space-3);
+  flex: 1;
+}
+.oaap-main p, .oaap-main li { max-width: 75ch; }
+.oaap-pagehead {
+  display: flex; flex-wrap: wrap; align-items: baseline;
+  justify-content: space-between; gap: var(--oaap-space-2);
+  margin-bottom: var(--oaap-space-3);
+}
+.oaap-pagehead h1 { margin: 0; font-size: 1.45rem; }
+.oaap-back { display: inline-block; margin-bottom: var(--oaap-space-2); font-size: .9em; text-decoration: none; }
+.oaap-muted { color: var(--oaap-color-text-muted); }
+
+/* -------------------------------------------- header (RFC-0118 §4) --- */
 .oaap-header {
-  height: var(--oaap-header-height);
+  min-height: var(--oaap-header-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--oaap-space-3);
   padding: 0 var(--oaap-space-3);
-  background: var(--oaap-color-surface, #f4f5f7);
-  border-bottom: 1px solid var(--oaap-color-border, #d8dbe0);
-  font-family: var(--oaap-font-family, system-ui, sans-serif);
+  background: linear-gradient(90deg, var(--oaap-color-header), var(--oaap-color-header-2));
+  color: var(--oaap-color-header-text);
+  font-family: var(--oaap-font-family);
 }
-.oaap-header-title {
-  font-weight: 600;
-  color: var(--oaap-color-text, #1a1d21);
+.oaap-header a { color: inherit; text-decoration: none; }
+.oaap-brand { display: flex; align-items: center; gap: var(--oaap-space-2); min-width: 0; }
+.oaap-logo { display: inline-flex; width: 26px; height: 26px; flex: none; }
+.oaap-logo svg, .oaap-logo img { width: 26px; height: 26px; object-fit: contain; }
+.oaap-tenant { font-size: .85em; opacity: .8; white-space: nowrap; }
+.oaap-tenant:not(:empty)::after { content: " ·"; }
+.oaap-header-title, .oaap-appname { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.oaap-header-back { color: inherit; font-size: .9em; text-decoration: none; opacity: .85; }
+.oaap-header-back:hover { text-decoration: underline; }
+.oaap-actions { display: flex; align-items: center; gap: var(--oaap-space-3); font-size: .92em; }
+.oaap-actions a:hover, .oaap-user summary:hover { text-decoration: underline; }
+.oaap-user { position: relative; }
+.oaap-user summary { cursor: pointer; list-style: none; white-space: nowrap; }
+.oaap-user summary::-webkit-details-marker { display: none; }
+.oaap-user summary::after { content: " ▾"; font-size: .8em; }
+.oaap-user .oaap-menu {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 50;
+  min-width: 13rem; padding: var(--oaap-space-2) 0;
+  background: var(--oaap-color-surface); color: var(--oaap-color-text);
+  border: 1px solid var(--oaap-color-border); border-radius: var(--oaap-radius);
+  box-shadow: 0 8px 24px rgba(0,0,0,.18);
 }
-.oaap-header-back {
-  color: var(--oaap-color-primary, #2f6fed);
-  text-decoration: none;
-  font-size: 0.9em;
+.oaap-menu a, .oaap-menu button {
+  display: block; width: 100%; box-sizing: border-box; text-align: left;
+  padding: 6px 14px; color: var(--oaap-color-text); background: none; border: 0;
+  font: inherit; cursor: pointer;
 }
-.oaap-header-back:hover {
-  text-decoration: underline;
+.oaap-menu a:hover, .oaap-menu button:hover { background: var(--oaap-color-accent-soft); text-decoration: none; }
+.oaap-menu .oaap-menu-who { padding: 4px 14px 8px; color: var(--oaap-color-text-muted); font-size: .88em; border-bottom: 1px solid var(--oaap-color-border); margin-bottom: 4px; }
+.oaap-menu form { margin: 0; }
+
+/* ------------------------------------------ tab bar (RFC-0118 §6) --- */
+.oaap-tabs {
+  display: flex; gap: 2px; overflow-x: auto;
+  padding: 0 var(--oaap-space-3);
+  background: var(--oaap-color-surface);
+  border-bottom: 1px solid var(--oaap-color-border);
+  position: sticky; top: 0; z-index: 20;
+}
+.oaap-tabs a {
+  padding: 10px 14px; white-space: nowrap; text-decoration: none;
+  color: var(--oaap-color-text-muted); border-bottom: 3px solid transparent;
+}
+.oaap-tabs a:hover { color: var(--oaap-color-text); }
+.oaap-tabs a[aria-current="page"], .oaap-tabs a.active {
+  color: var(--oaap-color-primary); border-bottom-color: var(--oaap-color-primary); font-weight: 600;
+}
+.oaap-tabs .oaap-count { font-size: .78em; margin-left: 4px; padding: 0 6px; border-radius: 9px; background: var(--oaap-badge-neutral-bg); color: var(--oaap-badge-neutral); }
+
+/* ------------------------------------------------- footer (§4) --- */
+.oaap-footer {
+  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+  gap: var(--oaap-space-2);
+  padding: var(--oaap-space-2) var(--oaap-space-3);
+  border-top: 1px solid var(--oaap-color-border);
+  color: var(--oaap-color-text-muted); font-size: .82em;
+}
+
+/* --------------------------------------------- cards, object head --- */
+.oaap-card {
+  background: var(--oaap-color-surface);
+  border: 1px solid var(--oaap-color-border);
+  border-radius: var(--oaap-radius);
+  padding: var(--oaap-space-3);
+  margin: 0 0 var(--oaap-space-4);
+}
+.oaap-card > h2:first-child, .oaap-card > h3:first-child {
+  margin: calc(-1 * var(--oaap-space-3)) calc(-1 * var(--oaap-space-3)) var(--oaap-space-3);
+  padding: 10px var(--oaap-space-3);
+  font-size: 1.02rem; color: var(--oaap-color-primary);
+  border-bottom: 1px solid var(--oaap-color-border);
+}
+.oaap-card.oaap-warn { border-left: 4px solid var(--oaap-color-warning); }
+.oaap-card.oaap-danger { border-left: 4px solid var(--oaap-color-danger); }
+.oaap-grid { display: grid; gap: var(--oaap-space-3); grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); }
+.oaap-objhead { margin-bottom: var(--oaap-space-3); }
+.oaap-objhead h1 { margin: 0 0 4px; font-size: 1.45rem; }
+.oaap-facts { display: grid; gap: var(--oaap-space-2) var(--oaap-space-4); grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr)); margin: var(--oaap-space-2) 0 0; }
+.oaap-facts dt { font-size: .8em; color: var(--oaap-color-text-muted); }
+.oaap-facts dd { margin: 0; overflow-wrap: anywhere; }
+.oaap-kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px var(--oaap-space-3); margin: 0; }
+.oaap-kv dt { color: var(--oaap-color-text-muted); }
+.oaap-kv dd { margin: 0; overflow-wrap: anywhere; }
+
+/* ------------------------------------------ filter bar (RFC-0118 §7) --- */
+.oaap-filter {
+  display: flex; flex-wrap: wrap; align-items: end; gap: var(--oaap-space-2);
+  margin: 0 0 var(--oaap-space-2);
+}
+.oaap-filter label { display: flex; flex-direction: column; font-size: .8em; color: var(--oaap-color-text-muted); gap: 2px; }
+.oaap-filter input[type=search] { min-width: 14rem; }
+.oaap-countline { font-size: .85em; color: var(--oaap-color-text-muted); margin: 0 0 var(--oaap-space-2); }
+
+/* ------------------------------------------------------- tables --- */
+.oaap-tablewrap { overflow-x: auto; background: var(--oaap-color-surface); border: 1px solid var(--oaap-color-border); border-radius: var(--oaap-radius); }
+table.oaap-table { width: 100%; border-collapse: collapse; font-size: .94em; }
+.oaap-table th, .oaap-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--oaap-color-border); vertical-align: top; }
+.oaap-table th { font-weight: 600; font-size: .85em; color: var(--oaap-color-text-muted); white-space: nowrap; background: var(--oaap-color-bg); }
+.oaap-table th a { color: inherit; text-decoration: none; }
+.oaap-table th[aria-sort="ascending"] a::after { content: " ▲"; }
+.oaap-table th[aria-sort="descending"] a::after { content: " ▼"; }
+.oaap-table tbody tr:hover { background: var(--oaap-color-accent-soft); }
+.oaap-table tbody tr:last-child td { border-bottom: 0; }
+.oaap-table td.oaap-num, .oaap-table th.oaap-num { text-align: right; font-variant-numeric: tabular-nums; }
+@media (max-width: 640px) { .oaap-table .oaap-minor { display: none; } }
+.oaap-paging { display: flex; gap: var(--oaap-space-2); align-items: center; justify-content: center; margin: var(--oaap-space-3) 0; font-size: .9em; }
+.oaap-empty { padding: var(--oaap-space-4) var(--oaap-space-3); text-align: center; color: var(--oaap-color-text-muted); }
+
+/* ------------------------------------------------------- badges --- */
+.oaap-badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: .78em; font-weight: 600; white-space: nowrap; background: var(--oaap-badge-neutral-bg); color: var(--oaap-badge-neutral); }
+.oaap-badge.ok { background: var(--oaap-badge-ok-bg); color: var(--oaap-badge-ok); }
+.oaap-badge.warn { background: var(--oaap-badge-warn-bg); color: var(--oaap-badge-warn); }
+.oaap-badge.err { background: var(--oaap-badge-err-bg); color: var(--oaap-badge-err); }
+.oaap-badge.info { background: var(--oaap-badge-info-bg); color: var(--oaap-badge-info); }
+.oaap-badge.test { background: var(--oaap-badge-test-bg); color: var(--oaap-badge-test); }
+
+/* ------------------------------------------------ buttons, forms --- */
+.oaap-app input, .oaap-app select, .oaap-app textarea {
+  font: inherit; color: var(--oaap-color-text); background: var(--oaap-color-surface);
+  border: 1px solid var(--oaap-color-border); border-radius: var(--oaap-radius); padding: 6px 8px;
+}
+.oaap-btn, .oaap-app button:not(.oaap-plain) {
+  font: inherit; cursor: pointer; min-height: 36px; padding: 6px 14px;
+  border-radius: var(--oaap-radius); border: 1px solid var(--oaap-color-border);
+  background: var(--oaap-color-surface); color: var(--oaap-color-text);
+}
+.oaap-btn.primary, .oaap-app button.primary { background: var(--oaap-color-primary); border-color: var(--oaap-color-primary); color: var(--oaap-color-primary-text); }
+.oaap-btn.primary:hover, .oaap-app button.primary:hover { background: var(--oaap-color-primary-hover); }
+.oaap-btn.danger, .oaap-app button.danger { color: var(--oaap-color-danger); border-color: var(--oaap-color-danger); }
+a.oaap-btn { display: inline-block; text-decoration: none; }
+.oaap-form { display: grid; gap: var(--oaap-space-2); max-width: 32rem; }
+.oaap-form label { display: grid; gap: 2px; font-size: .9em; }
+.oaap-msg { padding: 8px 12px; border-radius: var(--oaap-radius); margin: 0 0 var(--oaap-space-3); background: var(--oaap-badge-ok-bg); color: var(--oaap-badge-ok); }
+.oaap-msg.err { background: var(--oaap-badge-err-bg); color: var(--oaap-badge-err); }
+
+@media (max-width: 640px) {
+  .oaap-tenant { display: none; }
+  .oaap-actions { gap: var(--oaap-space-2); }
+  .oaap-main { padding: var(--oaap-space-3) 12px; }
 }

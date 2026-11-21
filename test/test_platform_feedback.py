@@ -359,8 +359,8 @@ ok("der Block steht vor /platform/* und vor der App-Route",
 ok("eine App-Site traegt die Tuer NICHT",
    block(site("hbvp-portal"), "handle /platform/cases/node {") is None
    and block(site("fremd"), "handle /platform/cases/node {") is None)
-ok("der Marker zaehlt das Format 8, damit Sites auf der Platte nachgezogen werden",
-   m.CASES_BLOCK_FORMAT == 8 and f"{m.CASES_MARKER}8 " in body)
+ok("der Marker zaehlt das Format 9 (RFC-0118: context.json), damit Sites auf der Platte nachgezogen werden",
+   m.CASES_BLOCK_FORMAT == 9 and f"{m.CASES_MARKER}9 " in body)
 ok("die Migration (Abschnitt 5) findet nichts mehr zu tun", m._cases_sites_behind() == [])
 
 print("")

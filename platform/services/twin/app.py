@@ -541,6 +541,14 @@ def list_objects():
     if not type_key:
         return "query needs '?type='", 400
     at = _parse_at(request.args.get("at"))
+    # RFC-0118 P6 (oaap.data.twin 0.8 §2.6a): an app's list report searches
+    # and pages here instead of reading all and cutting at LIST_MAX --
+    # `q` matches words in the title, `offset` skips that many rows
+    words = [w for w in (request.args.get("q") or "").strip()[:200].split() if w][:8]
+    try:
+        offset = max(0, int(request.args.get("offset") or 0))
+    except ValueError:
+        return "'offset' is a number", 400
     conn = get_conn(tenant_id)
     if conn is None:
         return "this tenant has no twin schema yet", 409
@@ -552,10 +560,14 @@ def list_objects():
                         f"'{type_key}' -- see 'oaap data model "
                         "bindings' (RFC-0031 D7)"), 403
             with conn.cursor() as cur:
+                like = "".join(" AND title ILIKE %s" for _ in words)
+                pats = ["%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                        for w in words]
                 cur.execute(
                     "SELECT id FROM objects WHERE type_key = %s AND id NOT IN "
-                    "(SELECT alias_id FROM aliases WHERE unmerged_at IS NULL) "
-                    "ORDER BY title, id LIMIT %s", (type_key, LIST_MAX + 1))
+                    "(SELECT alias_id FROM aliases WHERE unmerged_at IS NULL)" + like +
+                    " ORDER BY title, id LIMIT %s OFFSET %s",
+                    (type_key, *pats, LIST_MAX + 1, offset))
                 ids = [str(r["id"]) for r in cur.fetchall()]
             out = []
             for oid in ids[:LIST_MAX]:
@@ -566,7 +578,7 @@ def list_objects():
                                 "owner": loaded["owner"], "groups": loaded["groups"]})
     finally:
         conn.close()
-    return jsonify({"objects": out, "truncated": len(ids) > LIST_MAX})
+    return jsonify({"objects": out, "truncated": len(ids) > LIST_MAX, "offset": offset})
 
 
 @app.get("/twin/objects/<obj_id>")

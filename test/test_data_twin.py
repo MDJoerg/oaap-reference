@@ -282,6 +282,12 @@ ok("0.7 §2.6a: GET /twin/objects?type= is app-facing (require_caller), "
    and "LIMIT %s" in list_fn and '"truncated"' in list_fn
    and '@app.get("/twin/objects")' in twin_src)
 
+ok("0.8 §2.6a (RFC-0118 P6): the list searches the title word by word with "
+   "bound parameters, LIKE wildcards taken literally, and pages by offset",
+   list_fn is not None and "title ILIKE %s" in list_fn and "OFFSET %s" in list_fn
+   and 'replace("%", "\\\\%")' in list_fn and '"offset": offset' in list_fn
+   and "f\"" not in list_fn.split("cur.execute(")[1].split(")")[0])
+
 candidates_fn = _twin_fn_body("twin_candidates")
 ok("candidate buckets are keyed by TITLE ALONE, not (type, title) -- a "
    "same-type restriction would hide the very duplicate this step exists "

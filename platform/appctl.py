@@ -7742,6 +7742,13 @@ def tenant_set_theme(tid, title=None, primary=None, accent=None,
     t["theme"] = {k: v for k, v in theme.items() if v}
     save_tenants(tenants)
     refresh_place_assets()
+    # RFC-0118 P3: every site of the tenant names its title and logo in
+    # /platform/context.json; the marker sees the change and rewrites them
+    try:
+        if refresh_cases_sites():
+            reload_gateway()
+    except Exception:
+        pass
     label = t.get("label", "?")
     audit_tenant("tenant.face", tid, label, who=who, role=role,
                  detail=", ".join(done))
@@ -19936,7 +19943,8 @@ CASES_MARKER = "# platform-feedback "
 #    chat's site carries /platform/mcp/gateways and its via doors (RFC-0074).
 # 8: a consuming gateway's site carries a discovery door per source
 #    (RFC-0073 §16).
-CASES_BLOCK_FORMAT = 8
+# 9: every site carries /platform/context.json (RFC-0118 P3).
+CASES_BLOCK_FORMAT = 9
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -20004,12 +20012,97 @@ def cases_target(insts, scope):
     return f"{pick['container']}:{pick['svc_port']}" if pick else ""
 
 
+# RFC-0118 P3: what an app's frame shows besides its own name -- the
+# tenant's title and logo, the portal, and the help and chat of the same
+# tenant. For DISPLAY only: no tenant id, no groups (design guidelines
+# §5.1 rule 3 stands; the gateway draws the boundary, not the app).
+HELP_APP_ID = "help"
+CHAT_APP_ID = "chat"
+
+
+def _tenant_peer(insts, scope, app_id):
+    """(name, inst) of the `app_id` instance of scope's tenant a person
+    should be sent to, or (None, None). The rule of cases_target: same
+    tenant, never a rehearsal, the source's own channel first, a test
+    instance may fall back to production, production never to test."""
+    me = insts.get(scope)
+    if not me:
+        return None, None
+    tenant = instance_tenant_ref(me)
+    cands = sorted((k, i) for k, i in insts.items()
+                   if i.get("app_id") == app_id and not is_rehearsal(i)
+                   and instance_tenant_ref(i) == tenant)
+    if me.get("app_id") == app_id and not is_rehearsal(me):
+        return scope, me
+    same = [c for c in cands if c[1].get("channel") == me.get("channel")]
+    prod = [c for c in cands if c[1].get("channel") == "production"]
+    pick = (same or (prod if me.get("channel") != "production" else []) or [(None, None)])[0]
+    return pick
+
+
+def _browser_origin(name, inst):
+    """The first origin a browser reaches an instance at, '' without one.
+    Always https: behind an edge the edge terminates TLS."""
+    try:
+        host, _edge = load_external_conf()
+        names = instance_names(inst or {}) + instance_auto_hosts(name, inst, ext_host=host)
+    except Exception:
+        return ""
+    return f"https://{names[0]}" if names else ""
+
+
+def app_context_of(insts, scope):
+    """The document /platform/context.json answers on scope's site."""
+    me = insts.get(scope) or {}
+    tid = instance_tenant_ref(me)
+    try:
+        t = load_tenants().get(tid) or {}
+    except Exception:
+        t = {}
+    out = {"v": 1, "app": {"id": me.get("app_id") or "",
+                           "version": me.get("version") or "",
+                           "channel": me.get("channel") or ""}}
+    ver = _platform_env().get("OAAP_VERSION", "")
+    if ver:
+        out["platform"] = ver
+    theme = t.get("theme") or {}
+    face = {}
+    if theme.get("title"):
+        face["title"] = str(theme["title"])[:80]
+    labels = place_labels(t)
+    if theme.get("logo") and theme.get("logo_type") and labels:
+        face["logo"] = f"/platform/place/{labels[0]}.{theme['logo_type']}"
+    if face:
+        out["tenant"] = face
+    portal = portal_instance_url(scope, tid) if scope else ""
+    if portal:
+        out["portal"] = portal.rsplit("/instances/", 1)[0] + "/"
+        out["instance_page"] = portal
+    for key, app_id in (("help", HELP_APP_ID), ("chat", CHAT_APP_ID)):
+        name, inst = _tenant_peer(insts, scope, app_id)
+        origin = _browser_origin(name, inst) if name else ""
+        if origin:
+            out[key] = origin
+    return out
+
+
+def _app_context_body(insts, scope):
+    # ensure_ascii: a title is the only free text, and \u escapes keep it
+    # (and any backtick) out of Caddy's quoting
+    body = json.dumps(app_context_of(insts, scope), sort_keys=True,
+                      separators=(",", ":"), ensure_ascii=True)
+    return body.replace("`", "\\u0060")
+
+
 def cases_marker(insts, scope):
     """The marker line a site for `scope` carries (see CASES_MARKER)."""
     me = insts.get(scope) or {}
     return (f"{CASES_MARKER}{CASES_BLOCK_FORMAT} "
             f"{cases_target(insts, scope) or '-'} "
             f"{me.get('app_id') or '-'}@{me.get('version') or '-'}"
+            # RFC-0118 P3: the context names the tenant's face and its help
+            # and chat, so it goes stale when either changes
+            + f" ctx:{hashlib.sha256(_app_context_body(insts, scope).encode()).hexdigest()[:12]}"
             # RFC-0073: a consuming gateway's site carries its sources list,
             # so it goes stale when another instance comes, goes or moves
             + (f" mcp:{mcp_sources_digest(insts, scope)}"
@@ -20165,6 +20258,17 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
     # gateways and one door per gateway.
     if me.get("ai_client") and not login_only:
         lines += ai_via_lines(insts, scope)
+    # RFC-0118 P3: the frame's context. A logged-in person who may use
+    # this instance reads it; the answer is written here like the MCP
+    # sources list, so no service has to know the registry.
+    body = _app_context_body(insts, scope)
+    assert "`" not in body
+    lines.append("\thandle /platform/context.json {")
+    lines += login_lines()
+    lines.append("\t\theader Content-Type application/json")
+    lines.append("\t\theader Cache-Control no-store")
+    lines.append(f"\t\trespond `{body}` 200")
+    lines.append("\t}")
     lines.append("\thandle /platform/* {")
     lines += login_lines() if login_only else strip_identity()
     lines.append("\t\turi strip_prefix /platform")
