@@ -33,6 +33,9 @@ sys.path.insert(0, os.path.join(HERE, "..", "platform"))
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))
 
 import appctl as a                                            # noqa: E402
+# RFC-0109 semantics: without the templates the platform ships (RFC-0117 D4
+# makes a shipped template free; test_assistant_templates.py measures that)
+a.SHIPPED_RECIPE_DIR = tempfile.mkdtemp(prefix="oaap-no-shipped-")
 import recipe_request as rq                                   # noqa: E402
 import notify                                                 # noqa: E402
 

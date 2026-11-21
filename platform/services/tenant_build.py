@@ -842,7 +842,10 @@ def _kind_problem(spec, val, label_check):
             return "is empty"
         if len(val) > mx:
             return f"is longer than {mx} characters"
-        if any(ord(c) < 32 for c in val):
+        # RFC-0117: a recipe's `prose` (instructions of an assistant) may
+        # break lines; every other control character stays refused
+        keep = "\n\t" if spec.get("multiline") is True else ""
+        if any(ord(c) < 32 and c not in keep for c in val):
             return "contains control characters"
         return ""
     if kind == "color":

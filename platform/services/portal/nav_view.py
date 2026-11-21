@@ -25,6 +25,8 @@ GROUPS = (
         ("apps", "/", "Apps", None),
         ("instances", "/instances", "Instanzen", "is_user_admin"),
         ("setup", "/einrichten", "Einrichten", "can_setup"),
+        # RFC-0117: new assistants from templates, same people as Einrichten
+        ("assistants", "/assistenten", "Assistenten", "can_setup"),
         ("health", "/health", "Gesundheit", "can_health"),
         ("fleet", "/flotte", "Flotte", "can_fleet"),
         ("build", "/aufbau", "Aufbau", "can_build"),

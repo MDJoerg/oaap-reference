@@ -1,0 +1,42 @@
+{
+  "recipe": "oaap.tenant-recipe/1",
+  "id": "assistent-leer",
+  "version": "1.0.0",
+  "offers": "assistant",
+  "card": {"title": "Leer – ohne Werkzeuge",
+           "summary": "Ein Assistent nur mit Anweisungen und Modell, ohne Werkzeuge: zum Schreiben, Erklären, Übersetzen. Die Ampel ist die des Modells.",
+           "light": "green", "icon": "chat"},
+  "title": "Assistent ohne Werkzeuge",
+  "description": "RFC-0117. Ein Assistent für den ganzen Mandanten, ohne Sicht (RFC-0116 D9): Name, Begrüßung, Anweisungen und ein Modellname des KI-Gateways. Gibt dem Chat den Modellnamen frei, wenn er noch keine Freigabe hat. Überschreibt nichts, was ein Mensch angelegt hat. Voraussetzung: mcp-gateway ab 0.35.0, chat ab 0.18.0, ai-gateway ab 0.10.0.",
+  "needs": {
+    "tools":  {"app": "mcp-gateway", "label": "Werkzeuge (MCP-Gateway, hält die Assistenten)"},
+    "models": {"app": "ai-gateway",  "label": "Modelle (KI-Gateway)"},
+    "chat":   {"app": "chat",        "label": "Chat"}
+  },
+  "params": {
+    "title": {"kind": "text", "max": 60, "default": "Schreibhilfe", "shape": true,
+              "label": "Name des Assistenten"},
+    "aid": {"kind": "word", "default": "schreibhilfe", "shape": true,
+            "label": "Kennung (kurz, klein, ohne Leerzeichen; gibt es sie schon, eine andere wählen)"},
+    "greeting": {"kind": "prose", "max": 600, "shape": true,
+                 "default": "Ich helfe beim Schreiben, Kürzen und Umformulieren. Ich habe keine Werkzeuge und sehe nur, was Du mir hier gibst.",
+                 "label": "Begrüßung"},
+    "system": {"kind": "prose", "max": 8000, "shape": true,
+               "default": "Du hilfst beim Schreiben von Texten für den Arbeitsalltag.\n- Antworte knapp und in der Sprache der Person.\n- Frag nach, wenn Zweck oder Leser des Textes unklar sind.\n- Du hast keine Werkzeuge; sag, wenn Du etwas nicht weißt, statt zu raten.",
+               "label": "Anweisungen (wie der Assistent arbeitet und antwortet)"},
+    "model": {"kind": "setup_item", "need": "models", "item_kind": "alias", "default": "standard",
+              "shape": true, "label": "Modellname des KI-Gateways für den Assistenten"},
+    "ceiling": {"kind": "light", "from": "model", "default": "yellow",
+                "label": "Höchste Ampel für den Chat (vorgeschlagen: die Ampel des Modells)"}
+  },
+  "steps": [
+    {"id": "freigabe", "type": "app.setup", "name": "{models}",
+     "items": [{"kind": "client", "id": "{chat_key}", "aliases": ["{model}"],
+                "ceiling": "{ceiling}", "personal_data": false,
+                "tenant": "{tenant}"}]},
+    {"id": "assistent", "type": "app.setup", "name": "{tools}",
+     "items": [{"kind": "assistant", "id": "{aid}", "title": "{title}", "model": "{model}",
+                "greeting": "{greeting}", "system": "{system}",
+                "visibility": "tenant"}]}
+  ]
+}

@@ -13960,6 +13960,8 @@ RECIPE_FORM_BODY = """
     </select>
   {% elif f.kind == 'bool' %}
     <input type="checkbox" id="f-{{ f.name }}" name="{{ f.name }}" value="1" {% if f.checked %}checked{% endif %}>
+  {% elif f.kind == 'prose' %}
+    <textarea id="f-{{ f.name }}" name="{{ f.name }}" rows="6" maxlength="{{ f.max }}" style="width:100%">{{ f.value }}</textarea>
   {% else %}
     <input id="f-{{ f.name }}" name="{{ f.name }}" value="{{ f.value }}">
     {% if f.kind == 'setup_item' %}<span class="muted">{{ f.note or 'Die Liste kommt mit der Vorschau.' }}</span>{% endif %}
@@ -14218,6 +14220,200 @@ def recipe_run_act_page(run_id, verb):
             "Bitte bestätigen; nichts wurde zurückgenommen."))
     jid = management_api.enqueue(tid, role, verb, args, action="tenant-recipe")
     return redirect(f"/einrichten/lauf/{run_id}?job={jid}")
+
+
+# ---------------------------------------------------------------------------
+# RFC-0117 stage 1: the page "Assistenten" -- a wizard over recipes that
+# offer an assistant (templates). Same scope, same jobs (`tenant-recipe`),
+# same preview and run as Einrichten; the host judges everything again.
+
+ASSISTANT_FIELD = """
+{% macro widget(f) %}
+  <p><label for="f-{{ f.name }}"><strong>{{ f.label }}</strong></label><br>
+  {% if f.kind == 'setup_item' and f.entries %}
+    <select id="f-{{ f.name }}" name="{{ f.name }}">
+      {% if not f.value %}<option value="">– bitte wählen –</option>{% endif %}
+      {% for i in f.entries %}<option value="{{ i.id }}" {% if i.id == f.value %}selected{% endif %}>{{ i.id }}{% if i.title and i.title != i.id %} – {{ i.title }}{% endif %}{% if i.light %} ({{ i.light }}){% endif %}</option>{% endfor %}
+    </select> <span class="muted">aus {{ f.source }}</span>
+  {% elif f.kind == 'prose' %}
+    <textarea id="f-{{ f.name }}" name="{{ f.name }}" rows="{{ 10 if f.max > 1000 else 3 }}" maxlength="{{ f.max }}" style="width:100%">{{ f.value }}</textarea>
+    {% if f.default and f.value != f.default %}<button type="button" class="rowaction" onclick="document.getElementById('f-{{ f.name }}').value=this.dataset.text" data-text="{{ f.default }}">Zurück zur Vorlage</button>{% endif %}
+  {% elif f.kind == 'bool' %}
+    <input type="checkbox" id="f-{{ f.name }}" name="{{ f.name }}" value="1" {% if f.checked %}checked{% endif %}>
+  {% else %}
+    <input id="f-{{ f.name }}" name="{{ f.name }}" value="{{ f.value }}" style="min-width:18rem">
+    {% if f.kind == 'setup_item' %}<span class="muted">{{ f.note or 'Die Liste kommt mit der Vorschau.' }}</span>{% endif %}
+  {% endif %}</p>
+{% endmacro %}
+"""
+
+ASSISTANT_LIST_BODY = """
+<div class="pagehead"><h1>Assistenten</h1></div>
+<p class="muted">Neue Assistenten für alle in <strong>{{ label }}</strong>, aus einer Vorlage:
+Vorlage wählen → sehen, was fehlt → Name, Begrüßung, Anweisungen und Modell anpassen →
+Vorschau → anlegen. Die Vorlage bringt mit, was der Assistent braucht (Sicht, Zugang des Chats,
+Freigabe des Modells); nichts, was ein Mensch angelegt hat, wird überschrieben. Bestehende
+Assistenten pflegst Du im Chat oder im MCP-Gateway.</p>
+""" + RECIPE_BANNER + """
+<div class="card">
+<h2>Vorlage wählen</h2>
+{% if cards %}
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:1rem">
+{% for c in cards %}
+  <div class="card" style="margin:0">
+    <h3 style="margin-top:0">{{ c.title }}</h3>
+    <p>{{ c.summary }}</p>
+    <p class="muted">Ampel der Werkzeuge: <span class="badge {{ '' if c.light == 'green' else 'todo' if c.light == 'yellow' else 'off' }}">{{ c.light_text or '–' }}</span>
+      {% if c.installs %}· installiert: {{ c.installs|join(', ') }}{% endif %}
+      · Vorlage <code>{{ c.id }}</code> {{ c.version }}</p>
+    {% if c.usable %}<a class="btn" href="/assistenten/neu/{{ c.id }}">Weiter</a>
+    {% else %}
+    <p class="muted">Braucht die Freigabe des Betreibers{% if c.light == 'red' %} (Suchwörter oder Inhalte verlassen den Mandanten){% endif %}.</p>
+    <form method="post" action="/einrichten/anfrage">
+      <input type="hidden" name="recipe" value="{{ c.id }}">
+      <input type="hidden" name="text" value="Bitte die Vorlage „{{ c.title }}“ für unseren Mandanten freigeben.">
+      <button class="btn">Freigabe anfragen</button>
+    </form>{% endif %}
+  </div>
+{% endfor %}
+</div>
+{% else %}<p class="muted">Auf diesem Knoten gibt es keine Vorlage für Assistenten.</p>{% endif %}
+</div>
+{% if runs %}
+<div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
+<h2>Angelegt aus Vorlagen</h2>
+<table>
+  <tr><th>Vorlage</th><th>Zustand</th><th>Gestartet</th><th></th></tr>
+  {% for r in runs %}
+  <tr class="rowlink">
+    <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">{{ r.title or r.recipe }}</a>{% if r.version %} <span class="muted">{{ r.version }}</span>{% endif %}</td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span></td>
+    <td>{{ r.created }}<br><span class="muted">{{ r.by }}</span></td>
+    <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">Ansehen</a></td>
+  </tr>
+  {% endfor %}
+</table>
+</div>
+{% endif %}
+"""
+
+ASSISTANT_WIZARD_BODY = ASSISTANT_FIELD + """
+<a class="back" href="/assistenten">← Andere Vorlage</a>
+<div class="pagehead"><h1>Neuer Assistent: {{ card.title }}</h1></div>
+<p class="muted">{{ card.summary }} Vorlage <code>{{ recipe.id }}</code> {{ recipe.version }} im
+Mandanten <strong>{{ label }}</strong>.</p>
+""" + RECIPE_BANNER + """
+<form method="post" action="/assistenten/neu/{{ recipe.id }}/vorschau">
+<div class="card">
+<h2>Was gebraucht wird</h2>
+{% if recipe.description %}<p class="muted">{{ recipe.description }}</p>{% endif %}
+<table>
+  <tr><th>App</th><th>Instanz</th><th></th></tr>
+  {% for f in needs %}
+  <tr><td>{{ f.label }}</td>
+    <td><input name="{{ f.name }}" value="{{ f.value }}" placeholder="leer = die einzige im Mandanten"></td>
+    <td class="muted">{% if f.install %}fehlt sie, wird sie installiert{% else %}muss es im Mandanten geben{% endif %}</td></tr>
+  {% endfor %}
+</table>
+{% for f in asked %}{{ widget(f) }}{% endfor %}
+</div>
+<div class="card">
+<h2>Anpassen</h2>
+{% for f in shaped %}{{ widget(f) }}{% endfor %}
+<p class="muted">Sicht, Werkzeuge und Ampel bringt die Vorlage mit; Rechte hat ein Assistent nie.</p>
+</div>
+<p><button class="btn">Vorschau</button> <span class="muted">Fragt die Apps und ändert nichts.</span></p>
+</form>
+{% if preview %}
+<div class="card {{ 'warn' if state in ('choose', 'blocked') else '' }}">
+<h2>Vorschau</h2>
+{% if preview.problems %}<ul>{% for p in preview.problems %}<li class="err">{{ p }}</li>{% endfor %}</ul>{% endif %}
+{% if rows %}
+<table>
+  <tr><th>Schritt</th><th>Was</th><th>Ergebnis</th><th>Hinweis</th></tr>
+  {% for r in rows %}
+  <tr><td>{{ r.id }}</td><td>{{ r.type }}</td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.verdict }}</span></td>
+    <td>{{ r.note }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if state == 'complete' %}<p class="ok">Diesen Assistenten gibt es schon genau so; anlegen hätte nichts zu tun.</p>
+{% elif state == 'blocked' %}<p class="err">So ginge es nicht. Steht beim Assistenten ein Konflikt, gibt es die
+Kennung schon anders – eine andere Kennung wählen. Sonst den Konflikt in der App klären oder den Betreiber fragen.</p>
+{% elif state == 'ready' %}
+<form method="post" action="/assistenten/neu/{{ recipe.id }}/anlegen">
+  {% for k, v in run_values.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <button class="btn">Anlegen</button>
+  <span class="muted">Mit genau diesen Werten; der Knoten prüft vorher noch einmal. Rückgängig geht auf der Seite des Laufs.</span>
+</form>{% endif %}
+</div>
+{% endif %}
+"""
+
+
+@app.get("/assistenten")
+def assistant_templates_page():
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    tid, label, role = sc
+    rv = _recipe_view()
+    return page(ASSISTANT_LIST_BODY, "Assistenten", "assistants", label=label, role=role,
+                cards=recipe_view.templates_for(rv, label, role),
+                runs=recipe_view.template_runs(rv, label),
+                job=_recipe_job(tid, role, request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.get("/assistenten/neu/<rid>")
+def assistant_wizard_page(rid):
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    tid, label, role = sc
+    recipe = recipe_view.find_template(_recipe_view(), rid, label, role)
+    if recipe is None:
+        return redirect("/assistenten?err=" + quote(
+            "Diese Vorlage gibt es hier nicht (oder sie ist nicht freigegeben)."))
+    job = _recipe_job(tid, role, request.args.get("job", ""))
+    preview = (job or {}).get("preview")
+    if preview and (preview.get("recipe") != rid or preview.get("tenant") != label):
+        preview = None
+    run_values = {}
+    if preview and recipe_view.preview_state(preview) == "ready":
+        run_values = dict(preview.get("params") or {})
+        run_values.update({n: c.get("name", "") for n, c in (preview.get("needs") or {}).items()
+                           if not c.get("install")})
+    needs, asked, shaped = recipe_view.wizard_parts(recipe, preview, prefill=request.args)
+    return page(ASSISTANT_WIZARD_BODY, "Neuer Assistent", "assistants", recipe=recipe,
+                card=recipe.get("card") or {"title": recipe.get("title") or rid, "summary": ""},
+                label=label, needs=needs, asked=asked, shaped=shaped, job=job, preview=preview,
+                rows=recipe_view.preview_rows(preview),
+                state=recipe_view.preview_state(preview), run_values=run_values,
+                error=request.args.get("err"))
+
+
+@app.post("/assistenten/neu/<rid>/<verb>")
+def assistant_wizard_act(rid, verb):
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    recipe = recipe_view.find_template(_recipe_view(), rid, label, role)
+    if recipe is None or verb not in ("vorschau", "anlegen"):
+        return redirect("/assistenten?err=" + quote(
+            "Diese Vorlage gibt es hier nicht (oder sie ist nicht freigegeben)."))
+    params = recipe_view.start_params(recipe, request.form)
+    op = "preview" if verb == "vorschau" else "run"
+    jid = management_api.enqueue(tid, role, op, {"recipe": rid, "tenant": label,
+                                                 "params": params},
+                                 action="tenant-recipe")
+    if op == "preview":
+        return redirect(f"/assistenten/neu/{rid}?job={jid}")
+    return redirect(f"/assistenten?job={jid}")
 
 
 # ---------------------------------------------------------------------------

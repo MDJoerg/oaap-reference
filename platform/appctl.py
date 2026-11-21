@@ -11798,10 +11798,54 @@ RECIPE_DIR = os.path.join(DATA_DIR, "recipes")
 RECIPE_RUN_DIR = os.path.join(DATA_DIR, "data", "tenant-recipe-runs")
 
 
+# RFC-0117 D7: the platform ships its templates beside appctl (copied with
+# every update into the app folder); the operator's folder above stays his.
+SHIPPED_RECIPE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recipes")
+
+
+def _recipe_version_of(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return tenant_build.profile_version(json.load(f))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+
+
+def _version_key(v):
+    m = re.match(r"^([0-9]+)\.([0-9]+)\.([0-9]+)", str(v or ""))
+    return tuple(int(x) for x in m.groups()) if m else (-1, -1, -1)
+
+
 def tenant_recipe_path(rid):
+    """The file of a recipe: the operator's in RECIPE_DIR, or the one the
+    platform ships. Both there -> the higher version; the same version ->
+    the operator's (RFC-0117 D7). So a recipe copied by hand before the
+    platform shipped it does not hide a newer shipped template."""
     if not tenant_build.ID_RE.match(str(rid or "")):
         raise tenant_build.Refusal(f"'{rid}' is not a recipe name")
-    return os.path.join(RECIPE_DIR, rid + ".json")
+    own = os.path.join(RECIPE_DIR, rid + ".json")
+    shipped = os.path.join(SHIPPED_RECIPE_DIR, rid + ".json")
+    if not os.path.isfile(shipped):
+        return own
+    if not os.path.isfile(own):
+        return shipped
+    return (shipped if _version_key(_recipe_version_of(shipped))
+            > _version_key(_recipe_version_of(own)) else own)
+
+
+def shipped_recipe_doc(rid):
+    """The doc of the template the platform ships under this id, or None."""
+    try:
+        doc, _d, _r = tenant_recipe.read_recipe_file(
+            os.path.join(SHIPPED_RECIPE_DIR, rid + ".json"))
+        return doc
+    except tenant_build.Refusal:
+        return None
+
+
+def recipe_is_free(doc):
+    """RFC-0117 D4: a template every tenant_admin may use without a release."""
+    return not tenant_recipe.free_problems(doc, shipped_recipe_doc(str(doc.get("id") or "")))
 
 
 def _profile_recipe_expander(doc, pins=None):
@@ -11837,15 +11881,17 @@ tenant_build.RECIPE_EXPANDER = _profile_recipe_expander
 def tenant_recipes():
     """[(id, title, version, problem or '')] for every file in the folder."""
     out = []
-    try:
-        names = sorted(os.listdir(RECIPE_DIR))
-    except OSError:
-        return out
-    for n in names:
-        if not n.endswith(".json"):
+    names = set()
+    for d in (RECIPE_DIR, SHIPPED_RECIPE_DIR):
+        try:
+            names.update(os.listdir(d))
+        except OSError:
+            pass
+    for n in sorted(names):
+        if not n.endswith(".json") or not tenant_build.ID_RE.match(n[:-5]):
             continue
         try:
-            doc, _d, _r = tenant_recipe.read_recipe_file(os.path.join(RECIPE_DIR, n))
+            doc, _d, _r = tenant_recipe.read_recipe_file(tenant_recipe_path(n[:-5]))
             out.append((n[:-5], doc.get("title", ""),
                         tenant_build.profile_version(doc), ""))
         except tenant_build.Refusal as exc:
@@ -11876,7 +11922,7 @@ def _recipe_tenant_gate(role, actor_tid, tid, t, doc):
     if tid == default_tenant_id():
         raise tenant_build.Refusal("the node's own tenant is the operator's")
     if not tenant_recipe.released(t.get("tenant_admin_may"), doc.get("id"),
-                                  doc.get("version")):
+                                  doc.get("version")) and not recipe_is_free(doc):
         raise tenant_build.Refusal(
             f"the recipe '{doc.get('id')}' (version "
             f"{tenant_build.profile_version(doc) or '?'}) is not released for "
@@ -12171,6 +12217,11 @@ def tenant_recipe_view_write():
                                "install": sp.get("install") is True}
                            for n, sp in (doc.get("needs") or {}).items()},
                     params=doc.get("params") or {},
+                    # RFC-0117: a template for the page Assistenten
+                    offers=str(doc.get("offers") or ""),
+                    card=doc.get("card") if doc.get("offers") else None,
+                    free=bool(doc.get("offers")) and recipe_is_free(doc),
+                    shipped=tenant_recipe_path(rid).startswith(SHIPPED_RECIPE_DIR),
                     steps=[{"id": x["id"], "type": x["type"]} for x in doc["steps"]],
                     released_for=sorted(
                         t.get("label", "") for tid, t in tenants.items()

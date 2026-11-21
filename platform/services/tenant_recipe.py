@@ -35,12 +35,22 @@ import tenant_build as tb
 
 RECIPE_FORMAT = "oaap.tenant-recipe/1"
 TOP_KEYS = ("recipe", "id", "version", "title", "description", "needs",
-            "params", "steps")
+            "params", "steps", "offers", "card")
 # what a recipe may do -- the profile's vocabulary minus everything that
 # makes or shapes the tenant; app.install comes only from `needs`
 STEP_TYPES = ("app.config", "destination.ensure", "app.setup", "manual",
               "backup.check", "idp.claim", "destination.bind")
-PARAM_KINDS = ("text", "word", "bool", "color", "setup_item", "light")
+PARAM_KINDS = ("text", "word", "bool", "color", "setup_item", "light", "prose")
+# RFC-0117: a recipe can OFFER an assistant -- then it is a template on the
+# portal page "Assistenten", with a card and the params a person may shape
+OFFERS = ("assistant",)
+CARD_KEYS = ("title", "summary", "light", "icon")
+CARD_TITLE_MAX = 60
+CARD_SUMMARY_MAX = 240
+PROSE_MAX = 8000
+# where a prose value may go: the text of the assistant, nowhere else (§6.3)
+PROSE_FIELDS = ("greeting", "system")
+LIGHT_KEYS = ("ceiling", "light")
 LIGHTS = ("green", "yellow", "red")
 LIGHT_RANK = {"green": 0, "yellow": 1, "red": 2}
 LIGHT_DE = {"green": "grün", "yellow": "gelb", "red": "rot"}
@@ -140,6 +150,12 @@ def recipe_problems(doc):
         elif "need" in spec or "item_kind" in spec or "from" in spec:
             out.append(f"parameter '{name}': 'need', 'item_kind' and 'from' belong "
                        "to the kinds setup_item and light")
+        if spec["kind"] == "prose":
+            mx = spec.get("max", PROSE_MAX)
+            if not (isinstance(mx, int) and not isinstance(mx, bool) and 1 <= mx <= PROSE_MAX):
+                out.append(f"parameter '{name}': max is 1 to {PROSE_MAX}")
+        if "shape" in spec and not isinstance(spec["shape"], bool):
+            out.append(f"parameter '{name}': 'shape' is true or false")
 
     steps = doc.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -155,10 +171,157 @@ def recipe_problems(doc):
             out.append(f"step {i + 1} ('{st.get('id', '')}'): a recipe works "
                        f"in a tenant that exists; '{typ}' is not one of its "
                        "steps")
+    out += offer_problems(doc)
     if out:
         return out
     # The rest is the profile's own judgement, on the shape the engine runs.
     return out + tb.profile_problems(as_profile(doc))
+
+
+# ------------------------------------------- templates (RFC-0117, stage 1)
+
+def _refs(value):
+    """The parameter names a step value refers to, anywhere inside it."""
+    if isinstance(value, str):
+        return set(tb.TEMPLATE_RE.findall(value))
+    if isinstance(value, list):
+        return set().union(*(_refs(v) for v in value)) if value else set()
+    if isinstance(value, dict):
+        return set().union(*(_refs(v) for v in value.values())) if value else set()
+    return set()
+
+
+def assistant_items(doc):
+    """[(step id, item)] of the `assistant` items in the recipe's app.setup steps."""
+    out = []
+    for st in (doc or {}).get("steps") or []:
+        if not isinstance(st, dict) or st.get("type") != "app.setup":
+            continue
+        for it in st.get("items") or []:
+            if isinstance(it, dict) and it.get("kind") == "assistant":
+                out.append((st.get("id", ""), it))
+    return out
+
+
+def literal_light(doc):
+    """The highest light the steps set as a LITERAL (a `ceiling` or `light`
+    of an item or step); a placeholder follows a choice and is judged in
+    the run. '' when the steps set none."""
+    best = ""
+    for st in (doc or {}).get("steps") or []:
+        if not isinstance(st, dict):
+            continue
+        rows = [st] + [i for i in (st.get("items") or []) if isinstance(i, dict)]
+        for row in rows:
+            for k in LIGHT_KEYS:
+                v = row.get(k)
+                if v in LIGHTS and (not best or LIGHT_RANK[v] > LIGHT_RANK[best]):
+                    best = v
+    return best
+
+
+def _prose_misuse(where, key, value, prose, item=None):
+    bad = _refs(value) & prose
+    if not bad or (item is not None and item.get("kind") == "assistant"
+                   and key in PROSE_FIELDS):
+        return []
+    return [f"step '{where}': the text parameter '{sorted(bad)[0]}' may only fill an "
+            f"assistant's {' or '.join(PROSE_FIELDS)}, not '{key}'"]
+
+
+def offer_problems(doc):
+    """Why a recipe that offers an assistant is not a usable template.
+
+    * exactly one `assistant` item;
+    * a card with a title, a sentence and the light the assistant needs --
+      at least the highest light the steps set (section 6.4: computed, not
+      trusted);
+    * a `prose` value only in the assistant's greeting or instructions
+      (section 6.3), never in an address, a name or an id -- for every
+      recipe, template or not."""
+    params = doc.get("params") if isinstance(doc.get("params"), dict) else {}
+    prose = {n for n, sp in params.items() if isinstance(sp, dict) and sp.get("kind") == "prose"}
+    out = []
+    for st in doc.get("steps") or []:
+        if not isinstance(st, dict):
+            continue
+        sid = st.get("id", "")
+        for k, v in st.items():
+            if k == "items" and st.get("type") == "app.setup" and isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        for ik, iv in it.items():
+                            out += _prose_misuse(sid, ik, iv, prose, it)
+                continue
+            out += _prose_misuse(sid, k, v, prose)
+    if "offers" not in doc:
+        if "card" in doc:
+            out.append("'card' belongs to a recipe that offers an assistant")
+        return out
+    if doc.get("offers") not in OFFERS:
+        return out + ["'offers' is " + " or ".join(OFFERS)]
+    items = assistant_items(doc)
+    if len(items) != 1:
+        out.append(f"a template offers exactly one assistant (it has {len(items)})")
+    card = doc.get("card")
+    if not isinstance(card, dict):
+        return out + ["a template needs a 'card' (title, summary, light)"]
+    for k in card:
+        if k not in CARD_KEYS:
+            out.append(f"card: '{k}' is not a field of a card")
+    t = card.get("title")
+    if not isinstance(t, str) or not t.strip() or len(t) > CARD_TITLE_MAX:
+        out.append(f"card: 'title' is a text of 1 to {CARD_TITLE_MAX} characters")
+    sm = card.get("summary")
+    if not isinstance(sm, str) or not sm.strip() or len(sm) > CARD_SUMMARY_MAX:
+        out.append(f"card: 'summary' is one sentence of 1 to {CARD_SUMMARY_MAX} characters")
+    if "icon" in card and not tb.WORD_RE.match(str(card.get("icon") or "")):
+        out.append("card: 'icon' is a short lowercase word")
+    lt = card.get("light")
+    if lt not in LIGHTS:
+        out.append("card: 'light' is green, yellow or red")
+    else:
+        need = literal_light(doc)
+        if need and LIGHT_RANK[need] > LIGHT_RANK[lt]:
+            out.append(f"card: says {lt}, but the steps set {need} -- the card must "
+                       "say the light the assistant needs")
+    return out
+
+
+def shape_params(doc):
+    """[(name, spec)] the wizard offers in the step "Anpassen" (`shape: true`)."""
+    return [(n, sp) for n, sp in ((doc or {}).get("params") or {}).items()
+            if isinstance(sp, dict) and sp.get("shape") is True]
+
+
+def free_problems(doc, shipped):
+    """RFC-0117 D4: why this template is NOT free for every tenant_admin
+    without the operator's release -> sentences, [] = free.
+
+    Free is a template the platform ships, exactly as shipped (`shipped`
+    is the shipped file's doc, or None), that installs no app, sets no
+    light red and has only app.setup and destination.ensure steps. A
+    destination it sets is the platform's own fixed one (a placeholder in
+    its address would make it the person's). The tenant_admin scope
+    (section 5) still judges every filled step."""
+    if not isinstance(doc, dict) or doc.get("offers") not in OFFERS:
+        return ["not a template"]
+    out = []
+    if shipped is None or shipped != doc:
+        out.append("not shipped by the platform as it is")
+    for _n, spec in (doc.get("needs") or {}).items():
+        if isinstance(spec, dict) and spec.get("install") is True:
+            out.append(f"installs the app {spec.get('app')}")
+    if (doc.get("card") or {}).get("light") == "red" or literal_light(doc) == "red":
+        out.append("needs the light red")
+    for st in doc.get("steps") or []:
+        if not isinstance(st, dict):
+            continue
+        if st.get("type") == "destination.ensure" and _refs(st.get("target")):
+            out.append(f"step '{st.get('id', '')}': the destination's address is a parameter")
+        if st.get("type") not in ("app.setup", "destination.ensure"):
+            out.append(f"step '{st.get('id', '')}': {st.get('type')}")
+    return out
 
 
 def _install_step_id(need):
@@ -190,10 +353,13 @@ def _engine_param(spec):
     """A recipe parameter as the engine judges it. A chosen item is a text
     (an id of the app, judged against the app's own list before the run);
     a light is a word, judged against the three lights there too."""
-    if not isinstance(spec, dict) or spec.get("kind") not in ("setup_item", "light"):
+    if not isinstance(spec, dict) or spec.get("kind") not in ("setup_item", "light", "prose"):
         return spec
     out = {k: v for k, v in spec.items() if k in ("label", "default", "required")}
-    if spec["kind"] == "setup_item":
+    if spec["kind"] == "prose":
+        # RFC-0117: a text that may break lines (greeting, instructions)
+        out.update(kind="text", max=spec.get("max", PROSE_MAX), multiline=True)
+    elif spec["kind"] == "setup_item":
         out.update(kind="text", max=SETUP_ITEM_MAX)
     else:
         out["kind"] = "word"

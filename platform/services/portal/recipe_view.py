@@ -19,6 +19,7 @@ RECIPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 RUN_RE = re.compile(r"^r-[0-9]{8}t[0-9]{6}-[a-z0-9-]{1,63}$")
 PARAM_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 VALUE_MAX = 200
+PROSE_MAX = 8000          # RFC-0117: tenant_recipe.PROSE_MAX
 LIGHT_WORDS = (("green", "grün"), ("yellow", "gelb"), ("red", "rot"))
 VERDICT = {"present": ("vorhanden", "ok"), "absent": ("wird angelegt", "todo"),
            "conflict": ("Konflikt", "err"), "skipped": ("nicht gewünscht", "off"),
@@ -35,7 +36,8 @@ def recipes_for(view, label, role):
             if role == "server_admin":
                 out.append(dict(r, runnable=False))
             continue
-        mine = label in (r.get("released_for") or [])
+        # RFC-0117 D4: a free template needs no release
+        mine = label in (r.get("released_for") or []) or bool(r.get("free"))
         if role == "server_admin" or (role == "tenant_admin" and mine):
             out.append(dict(r, runnable=True, released_here=mine))
     return out
@@ -114,8 +116,18 @@ def fields(recipe, preview=None, prefill=None):
             f["options"] = light_options(f["value"], ch.get("suggested", ""))
         elif kind == "bool":
             f["checked"] = f["value"] in ("true", "yes", "ja", "1", "True")
+        elif kind == "prose":
+            f["max"] = _prose_max(spec)
+            f["default"] = str(spec.get("default") or "")
+        f["shape"] = spec.get("shape") is True
+        f["asked"] = not f["shape"] and "default" not in spec and kind not in ("light", "bool")
         out.append(f)
     return out
+
+
+def _prose_max(spec):
+    mx = spec.get("max", PROSE_MAX)
+    return mx if isinstance(mx, int) and 1 <= mx <= PROSE_MAX else PROSE_MAX
 
 
 def start_params(recipe, form):
@@ -130,6 +142,13 @@ def start_params(recipe, form):
         spec = (recipe.get("params") or {}).get(n) or {}
         if spec.get("kind") == "bool":
             out[n] = "true" if form.get(n) in ("1", "true", "on") else "false"
+            continue
+        if spec.get("kind") == "prose":
+            # RFC-0117: lines stay lines (a browser sends CRLF); the host
+            # judges the length again -- cut one past it, so it says why
+            v = str(form.get(n) or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+            if v:
+                out[n] = v[:_prose_max(spec) + 1]
             continue
         v = str(form.get(n) or "").strip()[:VALUE_MAX]
         if v:
@@ -174,6 +193,58 @@ def recipes_needing(view, label, role, app_id):
                 out.append({"id": r["id"], "title": r.get("title") or r["id"], "need": n})
                 break
     return out
+
+
+# --- Vorlagen für Assistenten (RFC-0117 Stufe 1) ---------------------------
+
+LIGHT_DE = dict(LIGHT_WORDS)
+
+
+def templates_for(view, label, role):
+    """Die Karten der Seite „Assistenten“: jedes Rezept des Knotens, das
+    einen Assistenten anbietet. `usable`: diese Person darf es hier
+    starten (frei, freigegeben, oder der Betreiber); sonst steht dort
+    „braucht Freigabe“ und der Weg ist die Anfrage."""
+    runnable = {r["id"] for r in recipes_for(view, label, role) if r.get("runnable")}
+    out = []
+    for r in (view or {}).get("recipes") or []:
+        if r.get("problem") or r.get("offers") != "assistant":
+            continue
+        card = r.get("card") or {}
+        light = card.get("light") if card.get("light") in LIGHT_DE else ""
+        out.append({"id": r["id"], "title": card.get("title") or r.get("title") or r["id"],
+                    "summary": card.get("summary") or "", "light": light,
+                    "light_text": LIGHT_DE.get(light, ""), "icon": card.get("icon") or "",
+                    "version": r.get("version", ""), "usable": r["id"] in runnable,
+                    "free": bool(r.get("free")),
+                    "installs": [nd.get("label") or n for n, nd in (r.get("needs") or {}).items()
+                                 if nd.get("install")]})
+    # erst was man starten kann, dann nach Titel
+    return sorted(out, key=lambda c: (not c["usable"], c["title"].lower()))
+
+
+def find_template(view, rid, label, role):
+    r = find_recipe(view, rid, label, role)
+    return r if r and r.get("offers") == "assistant" else None
+
+
+def wizard_parts(recipe, preview=None, prefill=None):
+    """Die Schritte 2 und 3 des Assistenten: (needs, asked, shaped).
+
+    needs: die Apps (vorhanden / wird installiert); asked: Werte ohne
+    Vorgabe, die nicht zum Anpassen gehören (z. B. die Adresse des
+    Suchdienstes); shaped: was die Person formen darf (`shape: true`).
+    Alles andere setzt die Vorlage selbst."""
+    fs = fields(recipe, preview, prefill)
+    return ([f for f in fs if f["kind"] == "need"],
+            [f for f in fs if f["kind"] != "need" and f.get("asked")],
+            [f for f in fs if f["kind"] != "need" and f.get("shape")])
+
+
+def template_runs(view, label):
+    """Die Läufe dieses Mandanten, die von einer Vorlage kamen."""
+    ids = {r["id"] for r in (view or {}).get("recipes") or [] if r.get("offers") == "assistant"}
+    return [r for r in runs_for(view, label) if r["recipe"] in ids]
 
 
 def released_text(recipe):
