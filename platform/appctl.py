@@ -10035,6 +10035,8 @@ data = None if q["body"] is None else json.dumps(q["body"]).encode()
 req = urllib.request.Request(q["url"], data=data, method=q["method"], headers={
     "Authorization": "Bearer " + q["key"], "X-OAAP-Setup-Actor": q["actor"],
     "Content-Type": "application/json", "Accept": "application/json"})
+if q.get("recipe"):
+    req.add_header("X-OAAP-Setup-Recipe", q["recipe"])
 op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 try:
     with op.open(req, timeout=60) as r:
@@ -10052,7 +10054,20 @@ SETUP_RETRY_SECONDS = 3
 SETUP_STARTING = (0, 502, 503, 504)   # no answer yet, not a refusal
 
 
-def setup_call(key, inst, method, body=None, query="", actor="root"):
+# RFC-0117 stage 2: a recipe run names itself to the setup door as
+# `<id>@<major>` -- an app remembers which template made an assistant, and
+# its export says so (`from`). A header, not a field of the item: a door
+# that does not know it skips it, a field it would refuse.
+SETUP_RECIPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}@[0-9]{1,4}$")
+
+
+def setup_recipe_ref(rid, version):
+    """'<id>@<major>' for the setup door, or '' when it would not be one."""
+    ref = f"{rid}@{tenant_recipe.major_of(version)}"
+    return ref if SETUP_RECIPE_RE.match(ref) and tenant_recipe.major_of(version) else ""
+
+
+def setup_call(key, inst, method, body=None, query="", actor="root", recipe=""):
     """(doc, refusal) for one call to instance `key`'s setup door."""
     if not setup_door(inst):
         return None, f"'{key}' erklärt keine Einrichtungstür (setup)"
@@ -10063,7 +10078,8 @@ def setup_call(key, inst, method, body=None, query="", actor="root"):
     url = f"http://{GATEWAY_CONTAINER}:{HEALTH_PROBE_PORT}/s/{key}" + (
         f"?{query}" if query else "")
     q = json.dumps({"url": url, "method": method, "body": body, "key": skey,
-                    "actor": str(actor or "root")[:120]})
+                    "actor": str(actor or "root")[:120],
+                    "recipe": recipe if SETUP_RECIPE_RE.match(recipe or "") else ""})
     # Measured on oaapx01 (kit1, 2026-11-19): app.config and
     # destination.ensure recreate the container, and the next step met it
     # still starting -- the gateway answered 502. A starting container is
@@ -10106,6 +10122,8 @@ class _BuildDrivers:
         self.accounts = accounts
         self.probe = probe or _https_status
         self.sleep = sleep or time.sleep
+        # RFC-0117 stage 2: '<id>@<major>' of the recipe this run follows
+        self.recipe = ""
 
     # the engine's three calls ------------------------------------------
     def check(self, typ, a, ctx):
@@ -11027,7 +11045,8 @@ class _BuildDrivers:
 
     def _setup(self, key, inst, method, body=None, query=""):
         """(doc, refusal) -- one call through gateway:8099/s/<key>."""
-        return setup_call(key, inst, method, body, query, actor=self.who)
+        return setup_call(key, inst, method, body, query, actor=self.who,
+                          recipe=self.recipe)
 
     @staticmethod
     def _setup_verdict(results):
@@ -12075,6 +12094,7 @@ def tenant_recipe_preview(rid, label, given, who, role, drivers=None,
             k: v for k, v in (given or {}).items()
             if k not in tenant_recipe.need_names(doc)})
     drivers = drivers or _BuildDrivers(values["label"], who, role)
+    drivers.recipe = setup_recipe_ref(doc["id"], doc.get("version"))
     rows = tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values, doc["id"]))
     return dict(base, rows=rows, params={k: v for k, v in values.items()
                                          if k not in ("label", "tenant")
@@ -12094,6 +12114,7 @@ def tenant_recipe_run(rid, label, given, who, role, drivers=None,
             f"run {held['id']} in '{held['label']}' is not finished "
             f"({held['state']}); continue it or roll it back first")
     drivers = drivers or _BuildDrivers(values["label"], who, role)
+    drivers.recipe = setup_recipe_ref(doc["id"], doc.get("version"))
     blockers = tenant_recipe.preview_blockers(
         tenant_recipe.preview(profile, values, drivers, _recipe_ctx(values, doc["id"])))
     if blockers:
@@ -12121,6 +12142,7 @@ def tenant_recipe_run(rid, label, given, who, role, drivers=None,
 
 
 def _recipe_drive(state, profile, drivers):
+    drivers.recipe = setup_recipe_ref(state.get("recipe", ""), state.get("version"))
     try:
         with tenant_build.RunLock(RECIPE_RUN_DIR, state["id"]):
             return tenant_build.run(state, profile, drivers, RECIPE_RUN_DIR)
@@ -12199,6 +12221,26 @@ RECIPE_VIEW = os.path.join(APPS_DIR, "recipe-view.json")
 RECIPE_VIEW_KEEP = 100
 
 
+ASSISTANT_MAP_FIELDS = ("id", "title", "greeting", "system", "model")
+_PLACEHOLDER_RE = re.compile(r"^\{([a-z_][a-z0-9_]{0,39})\}$")
+
+
+def recipe_assistant_map(doc):
+    """{field: param} of a template's one assistant item, for the fields a
+    file may pre-fill and only where the item takes the field from exactly
+    one param that the person may shape (RFC-0117 stage 2)."""
+    items = tenant_recipe.assistant_items(doc)
+    if len(items) != 1:
+        return {}
+    params = doc.get("params") or {}
+    out = {}
+    for f in ASSISTANT_MAP_FIELDS:
+        m = _PLACEHOLDER_RE.match(str(items[0][1].get(f) or ""))
+        if m and (params.get(m.group(1)) or {}).get("shape") is True:
+            out[f] = m.group(1)
+    return out
+
+
 def tenant_recipe_view_write():
     """Recipes, their releases and the latest runs, where the portal reads
     (RFC-0109 stage 2, page Einrichten). Like the build view: no secret by
@@ -12227,6 +12269,9 @@ def tenant_recipe_view_write():
                     offers=str(doc.get("offers") or ""),
                     card=doc.get("card") if doc.get("offers") else None,
                     free=bool(doc.get("offers")) and recipe_is_free(doc),
+                    # RFC-0117 stage 2: which param fills which field of the
+                    # assistant -- the portal pre-fills a template from a file
+                    assistant_map=recipe_assistant_map(doc) if doc.get("offers") else {},
                     shipped=tenant_recipe_path(rid).startswith(SHIPPED_RECIPE_DIR),
                     steps=[{"id": x["id"], "type": x["type"]} for x in doc["steps"]],
                     released_for=sorted(

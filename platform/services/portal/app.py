@@ -14279,6 +14279,18 @@ Assistenten pflegst Du im Chat oder im MCP-Gateway.</p>
 </div>
 {% else %}<p class="muted">Auf diesem Knoten gibt es keine Vorlage für Assistenten.</p>{% endif %}
 </div>
+<div class="card">
+<h2>Aus Datei</h2>
+<p class="muted">Eine exportierte Datei (aus dem Chat oder dem MCP-Gateway): Nennt sie ihre Vorlage, öffnet
+sich diese Vorlage mit Name, Kennung, Begrüßung, Anweisungen und Modell aus der Datei – Sicht, Zugang des
+Chats und Freigabe des Modells kommen dann mit. Hier wird nichts gespeichert, bevor Du anlegst.</p>
+<form method="post" action="/assistenten/aus-datei" enctype="multipart/form-data">
+  <input type="file" name="datei" accept="application/json,.json">
+  <button class="btn">Datei lesen</button>
+</form>
+<p class="muted">Assistenten, die noch in einem Chat liegen (aus der Zeit vor dem MCP-Gateway), übernimmst Du
+im Chat unter „Assistenten“ mit „Ins MCP-Gateway übernehmen“.</p>
+</div>
 {% if runs %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <h2>Angelegt aus Vorlagen</h2>
@@ -14366,11 +14378,71 @@ def assistant_templates_page():
                 error=request.args.get("err"))
 
 
-@app.get("/assistenten/neu/<rid>")
+ASSISTANT_IMPORT_BODY = """
+<a class="back" href="/assistenten">← Assistenten</a>
+<div class="pagehead"><h1>Aus Datei</h1></div>
+""" + RECIPE_BANNER + """
+<div class="card">
+<h2>Was aus der Datei wird</h2>
+{% if problem %}<p class="err">{{ problem }}</p>{% endif %}
+{% if rows %}
+<table>
+  <tr><th>Assistent</th><th>Weg</th><th></th></tr>
+  {% for r in rows %}
+  <tr><td><strong>{{ r.title }}</strong><br><span class="muted">{{ r.id }}{% if r.view %} · Sicht {{ r.view }}{% endif %}</span></td>
+    {% if r.rid %}
+    <td>Vorlage <strong>{{ r.template }}</strong>, vorausgefüllt</td>
+    <td><form method="post" action="/assistenten/neu/{{ r.rid }}">
+      {% for k, v in r.prefill.items() %}<textarea name="{{ k }}" hidden>{{ v }}</textarea>{% endfor %}
+      <button class="btn">Vorlage öffnen</button></form></td>
+    {% else %}
+    <td colspan="2" class="muted">{{ r.sentence }}</td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+</div>
+"""
+
+IMPORT_FILE_MAX = 512 * 1024
+
+
+@app.post("/assistenten/aus-datei")
+def assistant_import_page():
+    """RFC-0117 §4 (Stufe 2): eine Austauschdatei lesen und je Assistent zeigen, was
+    daraus wird -- mit `from` die Vorlage vorausgefüllt. Gespeichert wird nichts."""
+    sc = _recipe_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    up = request.files.get("datei")
+    raw = up.read(IMPORT_FILE_MAX + 1) if up else b""
+    rows, problem = [], ""
+    if not raw:
+        problem = "Keine Datei gewählt."
+    elif len(raw) > IMPORT_FILE_MAX:
+        problem = "Die Datei ist größer als 512 KB."
+    else:
+        try:
+            doc = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            doc, problem = None, "Die Datei ist kein JSON in UTF-8."
+        if not problem:
+            rows, problem = recipe_view.import_plan(_recipe_view(), doc, label, role)
+    return page(ASSISTANT_IMPORT_BODY, "Aus Datei", "assistants", label=label, role=role,
+                rows=rows, problem=problem, job=None, error=None)
+
+
+@app.route("/assistenten/neu/<rid>", methods=["GET", "POST"])
 def assistant_wizard_page(rid):
     sc = _recipe_scope()
     if sc is None:
         return _recipe_denied()
+    if request.method == "POST" and not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
     tid, label, role = sc
     recipe = recipe_view.find_template(_recipe_view(), rid, label, role)
     if recipe is None:
@@ -14385,7 +14457,10 @@ def assistant_wizard_page(rid):
         run_values = dict(preview.get("params") or {})
         run_values.update({n: c.get("name", "") for n, c in (preview.get("needs") or {}).items()
                            if not c.get("install")})
-    needs, asked, shaped = recipe_view.wizard_parts(recipe, preview, prefill=request.args)
+    # RFC-0117 Stufe 2: aus „Aus Datei“ kommen die Werte als Formular (lange Anweisungen
+    # gehören in keine Adresse), sonst wie bisher die Instanz von ihrer Seite (?<bedarf>=)
+    prefill = request.form if request.method == "POST" else request.args
+    needs, asked, shaped = recipe_view.wizard_parts(recipe, preview, prefill=prefill)
     return page(ASSISTANT_WIZARD_BODY, "Neuer Assistent", "assistants", recipe=recipe,
                 card=recipe.get("card") or {"title": recipe.get("title") or rid, "summary": ""},
                 label=label, needs=needs, asked=asked, shaped=shaped, job=job, preview=preview,

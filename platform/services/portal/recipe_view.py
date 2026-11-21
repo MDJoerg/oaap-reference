@@ -97,6 +97,12 @@ def fields(recipe, preview=None, prefill=None):
     if not preview:
         needs_used.update({n: str(v)[:VALUE_MAX] for n, v in (prefill or {}).items()
                            if n in (recipe.get("needs") or {}) and PARAM_RE.match(n)})
+        # RFC-0117 Stufe 2: Werte aus einer Datei (Import) füllen, was die Person formen darf
+        for n, spec in (recipe.get("params") or {}).items():
+            v = (prefill or {}).get(n)
+            if spec.get("shape") is True and isinstance(v, str) and v.strip() and PARAM_RE.match(n):
+                cap = _prose_max(spec) if spec.get("kind") == "prose" else VALUE_MAX
+                used[n] = v.replace(chr(13) + chr(10), chr(10)).strip()[:cap]
     out = []
     for n, spec in (recipe.get("needs") or {}).items():
         out.append({"name": n, "kind": "need", "label": spec.get("label") or n,
@@ -239,6 +245,62 @@ def wizard_parts(recipe, preview=None, prefill=None):
     return ([f for f in fs if f["kind"] == "need"],
             [f for f in fs if f["kind"] != "need" and f.get("asked")],
             [f for f in fs if f["kind"] != "need" and f.get("shape")])
+
+
+IMPORT_MAX = 20                 # Assistenten je Datei
+FROM_RE = re.compile(r"^recipe:([a-z0-9][a-z0-9-]{0,62})@([0-9]{1,4})$")
+
+
+def import_plan(view, doc, label, role):
+    """RFC-0117 §4 (Stufe 2): was aus einer Austauschdatei wird, je Assistent.
+
+    Mit `from` und einer Vorlage, die diese Person hier starten darf (gleiche
+    Hauptversion): die Vorlage, vorausgefüllt mit Titel, Kennung, Begrüßung,
+    Anweisungen und Modell der Datei -- Sicht, Zugang und Modellfreigabe kommen
+    dann mit. Sonst ein Satz; ohne `from` der bisherige Weg (Chat oder MCP-Gateway,
+    das ihn nur nimmt, wenn seine Sicht dort steht). Gespeichert wird hier nichts.
+    -> (rows, problem)"""
+    if not isinstance(doc, dict) or doc.get("v") != 1 or not isinstance(doc.get("assistants"), list):
+        return [], 'Das ist keine Austauschdatei für Assistenten ({"v": 1, "assistants": [...]}).'
+    items = [a for a in doc["assistants"] if isinstance(a, dict)]
+    if not items:
+        return [], "Die Datei enthält keinen Assistenten."
+    if len(items) > IMPORT_MAX:
+        return [], f"Höchstens {IMPORT_MAX} Assistenten je Datei."
+    rows = []
+    for a in items:
+        title = str(a.get("title") or a.get("id") or "?")[:80]
+        row = {"id": str(a.get("id") or "")[:48], "title": title, "view": str(a.get("view") or "")[:48],
+               "rid": "", "prefill": {}, "sentence": ""}
+        m = FROM_RE.match(str(a.get("from") or ""))
+        if not m:
+            row["sentence"] = ("Ohne Vorlage exportiert. Im Chat oder im MCP-Gateway importieren; "
+                               + (f"das Gateway nimmt ihn nur, wenn es dort die Sicht „{row['view']}“ gibt."
+                                  if row["view"] else "er spricht ohne Werkzeuge."))
+            rows.append(row)
+            continue
+        rid, major = m.group(1), int(m.group(2))
+        known = next((r for r in (view or {}).get("recipes") or []
+                      if r.get("id") == rid and not r.get("problem")), None)
+        recipe = find_template(view, rid, label, role)
+        if known is None or known.get("offers") != "assistant":
+            row["sentence"] = f"Die Vorlage „{rid}“ gibt es auf diesem Knoten nicht."
+        elif int(known.get("major") or 0) != major:
+            row["sentence"] = (f"Die Datei kommt aus „{rid}“ Hauptversion {major}; hier liegt "
+                               f"{known.get('version')} -- die Werte passen vielleicht nicht, darum "
+                               "nicht vorausgefüllt.")
+        elif recipe is None or not any(c["id"] == rid and c["usable"]
+                                       for c in templates_for(view, label, role)):
+            row["sentence"] = (f"Die Vorlage „{rid}“ braucht hier die Freigabe des Betreibers -- "
+                               "auf der Seite Assistenten anfragen.")
+        else:
+            amap = known.get("assistant_map") or {}
+            row["rid"] = rid
+            row["template"] = (known.get("card") or {}).get("title") or rid
+            row["prefill"] = {p: str(a[f]) for f, p in amap.items()
+                              if isinstance(a.get(f), str) and a[f].strip()}
+        rows.append(row)
+    return rows, ""
 
 
 def template_runs(view, label):
