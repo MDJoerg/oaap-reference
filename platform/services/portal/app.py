@@ -14279,6 +14279,12 @@ ASSISTANT_FIELD = """
       {% if not f.value %}<option value="">– bitte wählen –</option>{% endif %}
       {% for i in f.entries %}<option value="{{ i.id }}" {% if i.id == f.value %}selected{% endif %}>{{ i.id }}{% if i.title and i.title != i.id %} – {{ i.title }}{% endif %}{% if i.light %} ({{ i.light }}){% endif %}</option>{% endfor %}
     </select> <span class="muted">aus {{ f.source }}</span>
+  {% elif f.kind == 'light' and f.options %}
+    <select id="f-{{ f.name }}" name="{{ f.name }}">
+      {% if not f.value %}<option value="">– bitte wählen –</option>{% endif %}
+      {% for o in f.options %}<option value="{{ o.value }}" {% if o.selected %}selected{% endif %}>{{ o.text }}</option>{% endfor %}
+    </select>
+    {% if f.proposal == 'app' %}<br><span class="muted">{% if f.current and f.current != 'red' %}Steht im MCP-Gateway schon auf {{ f.current_text }} – das gilt.{% else %}Die Quelle steht im MCP-Gateway auf Rot. Welche Ampel sie bekommt, entscheidest Du{% if f.suggested_text %}; die App schlägt {{ f.suggested_text }} vor{% endif %}.{% endif %}</span>{% endif %}
   {% elif f.kind == 'prose' %}
     <textarea id="f-{{ f.name }}" name="{{ f.name }}" rows="{{ 10 if f.max > 1000 else 3 }}" maxlength="{{ f.max }}" style="width:100%">{{ f.value }}</textarea>
     {% if f.default and f.value != f.default %}<button type="button" class="rowaction" onclick="document.getElementById('f-{{ f.name }}').value=this.dataset.text" data-text="{{ f.default }}">Zurück zur Vorlage</button>{% endif %}
@@ -14306,6 +14312,7 @@ Assistenten pflegst Du im Chat oder im MCP-Gateway.</p>
 {% for c in cards %}
   <div class="card" style="margin:0">
     <h3 style="margin-top:0">{{ c.title }}</h3>
+    {% if c.app %}<p class="muted" style="margin-top:-.5rem">von der App {{ c.app }}{% if c.app_instance %} ({{ c.app_instance }}){% endif %}</p>{% endif %}
     <p>{{ c.summary }}</p>
     <p class="muted">Ampel der Werkzeuge: <span class="badge {{ '' if c.light == 'green' else 'todo' if c.light == 'yellow' else 'off' }}">{{ c.light_text or '–' }}</span>
       {% if c.installs %}· installiert: {{ c.installs|join(', ') }}{% endif %}

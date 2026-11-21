@@ -21,6 +21,7 @@ PARAM_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
 VALUE_MAX = 200
 PROSE_MAX = 8000          # RFC-0117: tenant_recipe.PROSE_MAX
 LIGHT_WORDS = (("green", "grün"), ("yellow", "gelb"), ("red", "rot"))
+LIGHT_DE_ALL = {"green": "grün", "yellow": "gelb", "red": "rot"}
 VERDICT = {"present": ("vorhanden", "ok"), "absent": ("wird angelegt", "todo"),
            "conflict": ("Konflikt", "err"), "skipped": ("nicht gewünscht", "off"),
            "refused": ("abgelehnt", "err"),
@@ -32,6 +33,9 @@ def recipes_for(view, label, role):
     """Die Rezepte, die diese Person in diesem Mandanten sieht."""
     out = []
     for r in (view or {}).get("recipes") or []:
+        # RFC-0119 D2: a template an app brought is seen only at its tenant
+        if r.get("tenant") and r.get("tenant") != label:
+            continue
         if r.get("problem"):
             if role == "server_admin":
                 out.append(dict(r, runnable=False))
@@ -81,8 +85,11 @@ def run_detail(st):
     return d
 
 
-def light_options(chosen, suggested=""):
-    return [{"value": v, "text": t + (" (vom Modell vorgeschlagen)" if v == suggested else ""),
+def light_options(chosen, suggested="", proposal=""):
+    """Die drei Ampeln; `proposal` "app" (RFC-0119 §4.4): der Vorschlag kommt
+    von der App, die die Vorlage mitbrachte, und ist nie vorausgewählt."""
+    who = " (Vorschlag der App)" if proposal == "app" else " (vom Modell vorgeschlagen)"
+    return [{"value": v, "text": t + (who if v == suggested else ""),
              "selected": v == chosen} for v, t in LIGHT_WORDS]
 
 
@@ -119,14 +126,23 @@ def fields(recipe, preview=None, prefill=None):
             f["note"] = ch.get("note", "")
             f["source"] = f"{spec.get('need')}/{spec.get('item_kind')}"
         elif kind == "light":
-            f["options"] = light_options(f["value"], ch.get("suggested", ""))
+            f["options"] = light_options(f["value"], ch.get("suggested", ""),
+                                         ch.get("proposal", ""))
+            f["proposal"] = ch.get("proposal", "")
+            f["suggested"] = ch.get("suggested", "")
+            f["current"] = ch.get("current", "")
+            f["current_text"] = LIGHT_DE_ALL.get(ch.get("current", ""), "")
+            f["suggested_text"] = LIGHT_DE_ALL.get(ch.get("suggested", ""), "")
         elif kind == "bool":
             f["checked"] = f["value"] in ("true", "yes", "ja", "1", "True")
         elif kind == "prose":
             f["max"] = _prose_max(spec)
             f["default"] = str(spec.get("default") or "")
         f["shape"] = spec.get("shape") is True
-        f["asked"] = not f["shape"] and "default" not in spec and kind not in ("light", "bool")
+        # RFC-0119 §4.4: eine Ampel ohne Vorgabe und ohne `from` (die der
+        # eigenen Quelle einer App) fragt der Assistent die Person
+        f["asked"] = not f["shape"] and "default" not in spec and kind != "bool" and (
+            kind != "light" or not spec.get("from"))
         out.append(f)
     return out
 
@@ -216,6 +232,8 @@ def templates_for(view, label, role):
     for r in (view or {}).get("recipes") or []:
         if r.get("problem") or r.get("offers") != "assistant":
             continue
+        if r.get("tenant") and r.get("tenant") != label:
+            continue
         card = r.get("card") or {}
         light = card.get("light") if card.get("light") in LIGHT_DE else ""
         out.append({"id": r["id"], "title": card.get("title") or r.get("title") or r["id"],
@@ -223,10 +241,15 @@ def templates_for(view, label, role):
                     "light_text": LIGHT_DE.get(light, ""), "icon": card.get("icon") or "",
                     "version": r.get("version", ""), "usable": r["id"] in runnable,
                     "free": bool(r.get("free")),
+                    # RFC-0119: die App, die die Vorlage mitbrachte
+                    "app": (r.get("app") or {}).get("name") or "",
+                    "app_instance": (r.get("app") or {}).get("instance") or "",
                     "installs": [nd.get("label") or n for n, nd in (r.get("needs") or {}).items()
                                  if nd.get("install")]})
-    # erst was man starten kann, dann nach Titel
-    return sorted(out, key=lambda c: (not c["usable"], c["title"].lower()))
+    # erst die Vorlagen der Plattform, dann die aus Apps; je erst was man
+    # starten kann, dann nach Titel
+    return sorted(out, key=lambda c: (bool(c["app"]), not c["usable"], c["app"].lower(),
+                                      c["title"].lower()))
 
 
 def find_template(view, rid, label, role):
@@ -305,7 +328,8 @@ def import_plan(view, doc, label, role):
 
 def template_runs(view, label):
     """Die Läufe dieses Mandanten, die von einer Vorlage kamen."""
-    ids = {r["id"] for r in (view or {}).get("recipes") or [] if r.get("offers") == "assistant"}
+    ids = {r["id"] for r in (view or {}).get("recipes") or [] if r.get("offers") == "assistant"
+           and (not r.get("tenant") or r.get("tenant") == label)}
     return [r for r in runs_for(view, label) if r["recipe"] in ids]
 
 
