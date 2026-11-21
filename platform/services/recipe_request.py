@@ -156,9 +156,16 @@ def case_body(req, node=""):
         lines += ["", "Vorschau, wie der Mandant sie sah:"]
         lines += [f"- {x}" for x in seen.get("problems") or []]
         lines += [f"- {r['id']}: {r['verdict']} {r['note']}".rstrip() for r in seen.get("rows") or []]
-    lines += ["", f"Anfrage {req['id']}. Freigeben: Aufbau, Karte „Rezepte“, oder "
-                  f"oaap tenant allow {req['label']} recipe:<id>. Antworten hier im Vorgang "
-                  "sieht der Mandant auf seiner Seite Einrichten."]
+    dom = (req.get("values") or {}).get("domain") if not req.get("recipe") else ""
+    if dom:
+        # RFC-0115 stage 3: eine Domain -- binden statt freigeben
+        lines += ["", f"Anfrage {req['id']}. Binden: Portal, Mandanten → Domain, oder "
+                      f"sudo oaap tenant domain {req['label']} {dom}. Ist sie aktiv, beantwortet die "
+                      "Plattform diese Anfrage selbst; ablehnen hier im Vorgang oder auf Aufbau."]
+    else:
+        lines += ["", f"Anfrage {req['id']}. Freigeben: Aufbau, Karte „Rezepte“, oder "
+                      f"oaap tenant allow {req['label']} recipe:<id>. Antworten hier im Vorgang "
+                      "sieht der Mandant auf seiner Seite Einrichten."]
     return "\n".join(lines)[:9000]
 
 

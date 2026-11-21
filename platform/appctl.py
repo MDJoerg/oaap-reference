@@ -12290,7 +12290,9 @@ def tenant_recipe_view_write():
             "id", "label", "by", "by_name", "recipe", "version", "title", "text",
             "created", "delivery", "case", "note", "case_status", "case_label",
             "replies", "read", "released", "closed", "verdict")},
-            state=recipe_request.state_text(r), open=recipe_request.is_open(r))
+            state=recipe_request.state_text(r), open=recipe_request.is_open(r),
+            # RFC-0115 stage 3: eine Anfrage nach einer Domain nennt sie
+            domain=("" if r.get("recipe") else (r.get("values") or {}).get("domain", "")))
             for r in recipe_request.all_requests(RECIPE_REQUEST_DIR)][:RECIPE_VIEW_KEEP]
         inbox_key, _inbox = recipe_inbox()
         os.makedirs(APPS_DIR, exist_ok=True)
@@ -12537,6 +12539,57 @@ def tenant_recipe_request(label, who, role, actor_tid=None, recipe="", values=No
     return req
 
 
+def tenant_domain_request(label, who, role, actor_tid=None, domain="", text=""):
+    """RFC-0115 stage 3 (D1): a tenant_admin asks the operator for a domain of
+    their own -- the operator binds it (`oaap tenant domain`, portal Mandanten ->
+    Domain). The same way as any request (RFC-0109 §13): into the operator's
+    inbox, the state on Einrichten. The name is judged by the rules of `domain
+    set` and DNS is checked right away, so the operator reads whether it fits.
+    Closed by the platform itself once the domain is active (_domain_requests_done)."""
+    _recipe_role(role)
+    label = str(label or "").strip().lower()
+    tid, t = tenant_by_label(label, include_former=False)
+    if not t:
+        raise tenant_build.Refusal(f"there is no tenant '{label}'")
+    if tid == default_tenant_id():
+        raise tenant_build.Refusal("the node's own tenant has no domain of its own")
+    if role == "tenant_admin" and (not actor_tid or tid != actor_tid):
+        raise tenant_build.Refusal("a tenant_admin asks for their own tenant only")
+    have = t.get("domain") or {}
+    if have.get("name"):
+        raise tenant_build.Refusal(f"'{label}' already has the domain {have['name']} "
+                                   f"({have.get('state', '?')}) -- the operator changes it")
+    ext = load_external()
+    if not ext:
+        raise tenant_build.Refusal("this node has no external name yet -- nothing to check a domain against")
+    name = str(domain or "").strip().lower().rstrip(".")
+    bad = place.domain_refusal(name, ext, load_tenants(), tid)
+    if bad:
+        raise tenant_build.Refusal(bad)
+    if any((r.get("values") or {}).get("domain") for r in recipe_request.open_of(RECIPE_REQUEST_DIR, label)):
+        raise tenant_build.Refusal(f"'{label}' has asked for a domain already -- wait for the operator's answer")
+    fits, said = domain_dns_check(name, ext)
+    body = (f"Bitte die eigene Domain {name} an den Mandanten {label} binden (RFC-0115).\n"
+            f"DNS beim Anfragen: {'passt' if fits else 'passt noch nicht'} -- {said}")
+    own = str(text or "").strip()
+    if own:
+        body += "\n\n" + own[:recipe_request.TEXT_MAX - len(body) - 4]
+    return tenant_recipe_request(label, who, role, actor_tid=actor_tid, recipe="",
+                                 values={"domain": name}, text=body[:recipe_request.TEXT_MAX])
+
+
+def _domain_requests_done(label, name):
+    """Once a domain is active, its open requests are answered: done, with the
+    sentence the tenant reads on Einrichten (and in the case). Never raises."""
+    try:
+        for r in recipe_request.open_of(RECIPE_REQUEST_DIR, label):
+            if (r.get("values") or {}).get("domain") == name:
+                tenant_recipe_request_close(r["id"], "done", f"Die Domain {name} ist gebunden und aktiv.",
+                                            "root", "root")
+    except Exception as e:                          # noqa: BLE001
+        print(f"domain requests: {type(e).__name__}: {e}", file=sys.stderr)
+
+
 def recipe_requests_refresh(label=None, force=False):
     """Read the cases of open requests back (state and the operator's
     replies) -> how many changed. At most every READ_EVERY seconds unless
@@ -12680,6 +12733,16 @@ def tenant_recipe_job(req, act_tenant, role, actor):
             r = tenant_recipe_request(label, actor, role, actor_tid=act_tenant,
                                       recipe=rid, values=params,
                                       text=str(a.get("text") or "")[:recipe_request.TEXT_MAX + 1])
+            return (r["delivery"] != "failed",
+                    f"Anfrage {r['id']}: {recipe_request.DELIVERY_DE[r['delivery']]}"
+                    + (f" ({r['case']})" if r.get("case") else "")
+                    + (f" -- {r['note']}" if r.get("note") and r["delivery"] != "sent" else ""),
+                    {"request": r["id"]})
+        elif op == "domain-request":
+            # RFC-0115 stage 3: eine Domain beim Betreiber anfragen
+            r = tenant_domain_request(label, actor, role, actor_tid=act_tenant,
+                                      domain=str(a.get("domain") or "")[:256],
+                                      text=str(a.get("text") or "")[:recipe_request.TEXT_MAX])
             return (r["delivery"] != "failed",
                     f"Anfrage {r['id']}: {recipe_request.DELIVERY_DE[r['delivery']]}"
                     + (f" ({r['case']})" if r.get("case") else "")
@@ -13521,6 +13584,7 @@ def _tenant_domain_cli(args, tenants):
         die(f"the gateway refused the sites for {dom['name']} (above); the domain is pending "
             f"again and nothing changed for anybody")
     audit_tenant("tenant.domain", tid, label, detail=f"active {dom['name']}")
+    _domain_requests_done(label, dom["name"])
     taken = sorted(h for i in load_registry()["instances"].values() for h in instance_names(i)
                    if h == dom["name"] or h.endswith("." + dom["name"]))
     _host, edge = load_external_conf()
@@ -13624,6 +13688,7 @@ def _tenant_domains_sweep(tenants):
             dom["state"] = "active"
             activated.append(tid)
             audit_tenant("tenant.domain", tid, t.get("label", ""), detail=f"active {dom['name']} (daily check)")
+            _domain_requests_done(t.get("label", ""), dom["name"])
             print(f"{dom['name']}: DNS fits now -- active for '{t.get('label')}'.")
         elif dom["state"] == "active" and not ok_:
             audit_tenant("tenant.domain", tid, t.get("label", ""), result="warn",

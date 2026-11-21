@@ -1272,6 +1272,15 @@ TENANT_HEALTH_BODY = """
   {% if dom %}<div><span class="k">Eigene Domain</span><span class="v">
     <span class="dot {{ 'ok' if dom.state == 'active' else 'warn' }}"></span>{{ dom.name }} · {{ dom.word }}
     {% if dom.checked %}<span class="muted">(geprüft {{ dom.checked }} UTC{% if dom.state != 'active' and dom.said %}: {{ dom.said }}{% endif %})</span>{% endif %}</span></div>{% endif %}
+  {% if dom_ask %}<div><span class="k">Eigene Domain</span><span class="v">
+    {% if dom_ask.open %}angefragt: {{ dom_ask.open }} <span class="muted">(Stand auf <a href="/einrichten#anfragen">Einrichten</a>)</span>
+    {% else %}<form method="post" action="/domain/anfrage" class="inline">
+      <input name="domain" placeholder="z. B. firma.example" required maxlength="200" style="max-width:16rem">
+      <input name="text" placeholder="Hinweis an den Betreiber (optional)" maxlength="500" style="max-width:18rem">
+      <button class="quiet">Beim Betreiber anfragen</button></form>
+    <span class="muted">Vorher im DNS der Domain: <code>A</code>/<code>AAAA</code> für die Domain und
+      <code>*.</code>Domain auf dieselben Adressen wie {{ dom_ask.ext }}. Der Betreiber bindet sie dann.</span>{% endif %}
+  </span></div>{% endif %}
   <div><span class="k">Sicherung</span><span class="v">{{ bk.word }}{% if bk.last %} ·
     zuletzt {{ bk.last.when }}{% if bk.last.size %}, {{ bk.last.size }}{% endif %}{% elif bk.node_last %} ·
     Knoten zuletzt {{ bk.node_last.when }}{% endif %}</span></div>
@@ -7438,6 +7447,40 @@ def _tenant_domain_facts(tid):
             "checked": str(d.get("checked") or "")[:16].replace("T", " "), "said": d.get("said") or ""}
 
 
+def _tenant_domain_ask(tid):
+    """RFC-0115 stage 3: for a tenant_admin without a domain, the way to ask the
+    operator for one -- or the open request. None for everybody else."""
+    if (load_tenants().get(tid) or {}).get("domain", {}).get("name"):
+        return None
+    role, mine = caller_scope()
+    if role != "tenant_admin" or mine != tid or tid == default_tenant_id():
+        return None
+    reqs = (_recipe_view() or {}).get("requests") or []
+    label = tenant_label(tid)
+    open_ = next((r["domain"] for r in reqs
+                  if r.get("label") == label and r.get("open") and r.get("domain")), "")
+    return {"open": open_, "ext": external_host() or "der Knoten"}
+
+
+@app.post("/domain/anfrage")
+def tenant_domain_request_page():
+    """RFC-0115 stage 3: a tenant_admin asks the operator for a domain (the host
+    writes the request; the tenant is the actor's own)."""
+    sc = _recipe_scope()
+    if sc is None or sc[2] != "tenant_admin":
+        return "Eine Domain fragt der tenant_admin an; der server_admin bindet sie unter Mandanten → Domain.", 403
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    domain = (request.form.get("domain") or "").strip()[:200]
+    text = (request.form.get("text") or "").strip()[:500]
+    if not domain:
+        return redirect("/health")
+    jid = management_api.enqueue(tid, role, "domain-request",
+                                 {"tenant": label, "domain": domain, "text": text}, action="tenant-recipe")
+    return redirect(f"/einrichten?job={jid}#anfragen")
+
+
 def _tenant_hosts(key, inst):
     return [h for h in (inst.get("address"), instance_auto_host(key, inst),
                         *(inst.get("aliases") or [])) if h]
@@ -7483,6 +7526,7 @@ def tenant_health(tid):
                 detail=Markup(detail), total=Markup(total), chosen=chosen,
                 mx_style=Markup(metrics_view.STYLE),
                 bk=_tenant_backup_facts(tid), dom=_tenant_domain_facts(tid),
+                dom_ask=_tenant_domain_ask(tid),
                 place_url=_place_url(tenant_label(tid)),
                 traffic_at=(datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%d %H:%M")
                             if isinstance(at, (int, float)) else ""),

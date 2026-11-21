@@ -391,6 +391,91 @@ r = pc.get("/tenant/domain?tenant=default", headers={"Host": HOST, "X-OAAP-Roles
 ok("KÖDER: der Standard-Mandant hat keine Domain-Seite", r.status_code == 303, r.status_code)
 
 # ---------------------------------------------------------------------------
+print("\nStufe 3: ein tenant_admin fragt eine Domain beim Betreiber an")
+
+import recipe_request as rq                                    # noqa: E402
+
+tenant("create", "efg", title="Efg")
+efg_id = m.tenant_by_label("efg")[0]
+SENT = []
+m.notify_event = lambda *a, **k: SENT.append(k.get("text", "")) or True
+EFG = "efg.anders.example"
+DNS[EFG] = set()
+
+
+def ask(label="efg", who="erik", role="tenant_admin", tid=None, domain=EFG, text=""):
+    try:
+        return m.tenant_domain_request(label, who, role, actor_tid=efg_id if tid is None else tid,
+                                       domain=domain, text=text), ""
+    except m.tenant_build.Refusal as exc:
+        return None, str(exc)
+
+
+for kw, why in (({"label": "bec"}, "für einen fremden Mandanten"),
+                ({"label": "default", "tid": default_id}, "für den Mandanten des Knotens"),
+                ({"label": "bec", "tid": bec_id}, "ein Mandant mit Domain"),
+                ({"domain": f"x.{HOST}"}, "unter dem Knotennamen"),
+                ({"domain": f"a.{DOM}"}, "unter der Domain eines anderen")):
+    r_, err = ask(**kw)
+    ok(f"KÖDER: abgelehnt -- {why}", r_ is None and err, err)
+r_, err = ask(text="Für unsere Marke.")
+ok("angefragt: eine Anfrage mit der Domain als Wert, DNS gleich mitgeprüft",
+   r_ and r_["values"] == {"domain": EFG} and "DNS beim Anfragen: passt noch nicht" in r_["text"]
+   and "Für unsere Marke." in r_["text"] and r_["delivery"] == "message", (err, r_))
+body = rq.case_body(r_, "knoten") if r_ else ""
+ok("der Text für den Betreiber sagt, wie er bindet (nicht: freigeben)",
+   f"sudo oaap tenant domain efg {EFG}" in body and "Mandanten → Domain" in body and "recipe:<id>" not in body, body)
+r2, err2 = ask()
+ok("KÖDER: eine zweite offene Anfrage nach einer Domain wird abgelehnt", r2 is None and "already" in err2, err2)
+view = json.load(open(m.RECIPE_VIEW, encoding="utf-8"))
+ok("die Sicht des Portals nennt die Domain der Anfrage",
+   any(x.get("domain") == EFG and x.get("open") for x in view["requests"]), view["requests"][:1])
+ok_j, msg_j, _x = m.tenant_recipe_job({"op": "domain-request", "args": {"tenant": "efg", "domain": "zweite.example"}},
+                                       efg_id, "tenant_admin", "erik")
+ok("über den Auftrag des Portals: dieselbe Regel (schon angefragt)", not ok_j and "already" in msg_j, msg_j)
+DNS[EFG] = {"203.0.113.7"}
+DNS["x." + EFG] = {"203.0.113.7"}
+rc, out = tenant("domain", "efg", EFG)
+done = rq.load(m.RECIPE_REQUEST_DIR, r_["id"]) if r_ else {}
+ok("der Betreiber bindet, die Domain wird aktiv -- die Anfrage ist von selbst erledigt",
+   m.load_tenants()[efg_id]["domain"]["state"] == "active" and done.get("verdict") == "done"
+   and not rq.is_open(done), (rc, out[-300:], done.get("verdict")))
+r3, err3 = ask()
+ok("danach: der Mandant hat eine Domain, keine neue Anfrage", r3 is None and "already has the domain" in err3, err3)
+
+# das Portal: die Karte auf der Gesundheitsseite und der Weg der Anfrage
+TT2 = m.load_tenants()
+p.load_tenants = lambda: TT2
+p.caller_scope = lambda: ("tenant_admin", cls_id)
+p._recipe_view = lambda: {"requests": []}
+a1 = p._tenant_domain_ask(cls_id)
+ok("Portal: ein tenant_admin ohne Domain bekommt den Weg zur Anfrage", a1 == {"open": "", "ext": HOST}, a1)
+p._recipe_view = lambda: {"requests": [{"label": "cls", "open": True, "domain": "cls.marke.example"}]}
+ok("…mit offener Anfrage steht dort, was angefragt ist",
+   (p._tenant_domain_ask(cls_id) or {}).get("open") == "cls.marke.example")
+p.caller_scope = lambda: ("server_admin", default_id)
+ok("KÖDER: der server_admin bekommt keine Anfrage (er bindet selbst)", p._tenant_domain_ask(cls_id) is None)
+p.caller_scope = lambda: ("tenant_admin", efg_id)
+ok("KÖDER: ein Mandant mit Domain bekommt keine", p._tenant_domain_ask(efg_id) is None)
+ok("die Gesundheitsseite trägt das Formular", 'action="/domain/anfrage"' in p.TENANT_HEALTH_BODY
+   and "Beim Betreiber anfragen" in p.TENANT_HEALTH_BODY)
+QUEUED = []
+p.management_api.enqueue = lambda tid, role, op, args, action="": QUEUED.append((tid, role, op, args, action)) or "j1"
+p._recipe_scope = lambda: (cls_id, "cls", "tenant_admin")
+p._same_origin = lambda: True
+r = pc.post("/domain/anfrage", data={"domain": "cls.marke.example", "text": "bitte"},
+            headers={"Host": f"cls.{HOST}", "X-OAAP-Roles": "tenant_admin", "X-OAAP-User": "clara"})
+ok("Portal: die Anfrage geht als Auftrag domain-request an den Host, für den eigenen Mandanten",
+   r.status_code in (302, 303) and QUEUED == [(cls_id, "tenant_admin", "domain-request",
+                                               {"tenant": "cls", "domain": "cls.marke.example", "text": "bitte"},
+                                               "tenant-recipe")], (r.status_code, QUEUED))
+p._recipe_scope = lambda: (cls_id, "cls", "server_admin")
+r = pc.post("/domain/anfrage", data={"domain": "x.example"}, headers={"Host": f"cls.{HOST}"})
+ok("KÖDER: als server_admin keine Anfrage (403)", r.status_code == 403 and len(QUEUED) == 1, r.status_code)
+p.load_tenants = lambda: TT
+p.caller_scope = lambda: ("server_admin", default_id)
+
+# ---------------------------------------------------------------------------
 print("\nDer Anmeldedienst auf der Domain")
 
 
