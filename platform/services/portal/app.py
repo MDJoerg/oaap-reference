@@ -2528,7 +2528,8 @@ TENANT_BODY = """
           href="/tenant/face?tenant={{ t.label }}">Gesicht</a>{% endif %}
           <a class="rowaction" href="/tenant/egress?tenant={{ t.label }}">Abfluss</a>
           {% if not t.is_default %}<a class="rowaction"
-          href="/tenant/backup?tenant={{ t.label }}">Sicherung</a>{% endif %}</td></tr>
+          href="/tenant/backup?tenant={{ t.label }}">Sicherung</a>
+          <a class="rowaction" href="/tenant/domain?tenant={{ t.label }}">Domain</a>{% endif %}</td></tr>
   {% endfor %}
 </table>
 </div>
@@ -6359,6 +6360,117 @@ def tenant_backup_post():
             "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
     return redirect(back + ("" if res.get("ok") else "err=1&") + "msg="
                     + quote(str(res.get("message") or "")[:600]), code=303)
+TENANT_DOMAIN_BODY = """
+<div class="pagehead"><h1>Domain: {{ label }}</h1></div>
+{% if msg %}<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0;white-space:pre-line">{{ msg }}</p></div>{% endif %}
+<div class="card">
+  <h2>Eigene Domain des Mandanten</h2>
+  {% if dom %}
+  <p><span class="dot {{ 'ok' if dom.state == 'active' else 'warn' }}"></span><strong>{{ dom.name }}</strong> · {{ dom.word }}
+     {% if dom.checked %}<span class="muted">(geprüft {{ dom.checked }} UTC)</span>{% endif %}</p>
+  {% if dom.said %}<p class="muted">{{ dom.said }}</p>{% endif %}
+  <form method="post" action="/tenant/domain?tenant={{ label }}" style="display:inline">
+    <input type="hidden" name="op" value="domain">
+    <button class="btn" name="what" value="check">DNS prüfen</button>
+    {% if dom.state != 'off' %}<button class="btn" name="what" value="off">Abschalten</button>{% endif %}
+    <button class="btn" name="what" value="remove" onclick="return confirm('Domain entfernen? Die Namen darunter antworten danach nicht mehr.')">Entfernen</button>
+  </form>
+  {% else %}<p class="muted">Dieser Mandant hat keine eigene Domain. Er antwortet unter
+     <code>{{ label }}.{{ host }}</code> und seine Apps unter <code>&lt;app&gt;.{{ label }}.{{ host }}</code>.</p>{% endif %}
+  <form method="post" action="/tenant/domain?tenant={{ label }}">
+    <input type="hidden" name="op" value="domain">
+    <p><label>{{ 'Andere Domain zuordnen' if dom else 'Domain zuordnen' }}
+       <input name="what" placeholder="z. B. bec.beispiel.de" maxlength="200" required
+              pattern="[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"></label></p>
+    <p class="muted">Vorher im DNS: <code>&lt;domain&gt;</code> und <code>*.&lt;domain&gt;</code> auf dieselbe Adresse
+       wie <code>{{ host }}</code>. Die Domain gilt erst, wenn das stimmt; bis dahin wartet sie und der Knoten
+       prüft sie jeden Morgen. Die Namen unter <code>{{ host }}</code> antworten weiter.</p>
+    <button class="btn">Zuordnen und prüfen</button>
+  </form>
+</div>
+{% if dom %}
+<div class="card">
+  <h2>Apps unter der Domain</h2>
+  <p class="muted">Eine verborgene App antwortet nur unter dem Namen des Knotens, unter der Domain gar nicht.</p>
+  <table>
+    <tr><th>App</th><th>unter der Domain</th><th>unter dem Knoten</th><th></th></tr>
+    {% for r in insts %}<tr>
+      <td>{{ r.name }}</td>
+      <td>{% if r.hidden %}<span class="muted">verborgen</span>{% else %}<code>{{ r.local }}.{{ dom.name }}</code>{% endif %}</td>
+      <td><code>{{ r.local }}.{{ label }}.{{ host }}</code></td>
+      <td><form method="post" action="/tenant/domain?tenant={{ label }}" style="display:inline">
+        <input type="hidden" name="op" value="instance"><input type="hidden" name="key" value="{{ r.key }}">
+        <input type="hidden" name="hidden" value="{{ '0' if r.hidden else '1' }}">
+        <button class="rowaction">{{ 'Unter der Domain zeigen' if r.hidden else 'Unter der Domain verbergen' }}</button></form></td>
+    </tr>{% endfor %}
+  </table>
+</div>
+{% endif %}
+<p><a href="/tenant">Zurück zu den Mandanten</a></p>
+"""
+TENANT_DOMAIN_WAIT = 30    # DNS lookups plus a gateway reload
+
+
+def _tenant_domain_target():
+    """(tid, label) for a server_admin naming a tenant other than the default, else (None, "")."""
+    role, _mine = caller_scope()
+    want = (request.values.get("tenant") or "").strip().lower()
+    tid = tenant_id_by_label(want) if want else None
+    if role != "server_admin" or not tid or tid == default_tenant_id() or tid not in load_tenants():
+        return None, ""
+    return tid, want
+
+
+@app.get("/tenant/domain")
+def tenant_domain_page():
+    """RFC-0115 §15 (Jörg 2026-11-21): bind a tenant's own domain and hide single
+    instances under it -- the server_admin's, in the tenant settings. The host
+    judges every request again (the spool is data, not trust)."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label = _tenant_domain_target()
+    if not tid:
+        return redirect("/tenant?err=1&msg=" + quote(
+            "Eine eigene Domain ordnet der Server-Admin einem Mandanten zu (Mandanten → Domain)."), code=303)
+    insts = [{"key": k, "name": i.get("app_name") or i.get("name") or k, "local": i.get("name") or k,
+              "hidden": bool(i.get("domain_hidden"))}
+             for k, i in sorted(load_instances().items())
+             if (resolve_tenant(i.get("tenant")) or "") == tid]
+    return page(TENANT_DOMAIN_BODY, "Domain", "tenant", label=label, host=external_host(),
+                dom=_tenant_domain_facts(tid), insts=insts,
+                msg=request.args.get("msg"), msg_ok=request.args.get("err") is None)
+
+
+@app.post("/tenant/domain")
+def tenant_domain_post():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label = _tenant_domain_target()
+    if not tid:
+        return redirect("/tenant", code=303)
+    back = f"/tenant/domain?tenant={quote(label)}&"
+    if request.form.get("op") == "instance":
+        key = (request.form.get("key") or "").strip()
+        inst = load_instances().get(key)
+        if not inst or (resolve_tenant(inst.get("tenant")) or "") != tid:
+            return redirect(back + "err=1&msg=" + quote("Diese App gehört nicht zu diesem Mandanten."), code=303)
+        payload = {"action": "instance-domain", "hidden": request.form.get("hidden") == "1"}
+        res = _queue_with_id(_uuid.uuid4().hex, key, payload, TENANT_DOMAIN_WAIT)
+    else:
+        what = (request.form.get("what") or "").strip().lower()[:200]
+        payload = {"action": "tenant-domain", "tenant": tid, "what": what}
+        res = _queue_with_id(_uuid.uuid4().hex, "", payload, TENANT_DOMAIN_WAIT)
+    if res is None:
+        return redirect(back + "err=1&msg=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    return redirect(back + ("" if res.get("ok") else "err=1&") + "msg="
+                    + quote(str(res.get("message") or "")[:1500]), code=303)
+
+
 FACE_WAIT_SECONDS = 20     # a small JSON file, one small picture, no docker
 
 

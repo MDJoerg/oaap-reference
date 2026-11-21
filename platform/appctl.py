@@ -6515,7 +6515,9 @@ def instance_auto_hosts(name, inst, ext_host=None):
     # Only for a tenant that resolves: fail closed exactly as above.
     t = load_tenants().get(tid or "") if prefixes else None
     dom = place.tenant_domain(t)
-    if dom:
+    # Jörg 2026-11-21: an instance may be HIDDEN under the domain -- then it
+    # answers only under the node's names (RFC-0115 §15)
+    if dom and not (inst or {}).get("domain_hidden"):
         mine = [f"{local}.{dom}" for local in names]
         out = mine + out if place.domain_canonical(t) else out + mine
     return out
@@ -13423,6 +13425,61 @@ def _tenant_domain_cli(args, tenants):
         print("builds itself name the domain only after that. When it suits:")
         for n in insts:
             print(f"  sudo oaap app restart {n}")
+
+
+def instance_set_domain_hidden(key, hidden, who="root", role="root"):
+    """(ok, sentence): hide an instance under its tenant's own domain, or show
+    it there again (RFC-0115 §15, Jörg 2026-11-21). A hidden instance answers
+    under the node's names only; under the domain its name answers nothing
+    (404 behind an edge, no certificate directly). Shared by the CLI and the
+    portal's request, so both doors judge alike."""
+    reg = load_registry()
+    inst = reg["instances"].get(key)
+    if not inst:
+        return False, f"no instance named '{key}'"
+    tid = resolve_tenant(inst.get("tenant"))
+    t = load_tenants().get(tid or "") or {}
+    dom = str((t.get("domain") or {}).get("name") or "")
+    if not dom:
+        return False, (f"tenant '{t.get('label', '?')}' has no own domain -- there is nothing "
+                       f"to hide '{instance_name(key, inst)}' from")
+    local = instance_name(key, inst)
+    if bool(inst.get("domain_hidden")) == bool(hidden):
+        return True, (f"{local} is already {'hidden under' if hidden else 'shown under'} {dom}; "
+                      "nothing changed")
+    if hidden:
+        inst["domain_hidden"] = True
+    else:
+        inst.pop("domain_hidden", None)
+    save_registry(reg)
+    audit_tenant("instance.domain", tid, local, who=who, role=role,
+                 detail=f"{'hidden under' if hidden else 'shown under'} {dom}")
+    refresh_generated_sites()
+    reload_gateway()
+    ext = load_external()
+    own = [h for h in instance_names(inst) if h == dom or h.endswith("." + dom)]
+    msg = (f"{local} is hidden under {dom}: it answers at {local}.{t.get('label')}.{ext} only"
+           if hidden else f"{local} answers under {dom} again: https://{local}.{dom}/")
+    if hidden and own:
+        msg += (f". Its own name {', '.join(own)} stays -- an operator's explicit name; "
+                f"`oaap app address remove {key}` takes it away")
+    msg += ". The app learns its names at its next start (oaap app restart)."
+    return True, msg
+
+
+def _run_captured(fn, *a):
+    """(ok, text): run a CLI function and keep what it printed -- the portal's
+    request then answers with the very sentences the CLI says (one rule, two
+    doors). A die() is a refusal; its sentence is the answer."""
+    out, err = io.StringIO(), io.StringIO()
+    ok_ = True
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            fn(*a)
+        except SystemExit as e:
+            ok_ = not e.code
+    text = (out.getvalue() + err.getvalue()).replace("ERROR: ", "").strip()
+    return ok_, text
 
 
 def _tenant_domains_sweep(tenants):
@@ -24647,9 +24704,18 @@ def cmd_address(args):
         if refusal:
             die(refusal)
 
+    if args.action in ("domain-hide", "domain-show"):
+        ok_, said = instance_set_domain_hidden(name, args.action == "domain-hide")
+        if not ok_:
+            die(said)
+        print(said)
+        return
+
     if args.action == "show":
         addr = inst.get("address")
         print(f"{name}: {addr}" if addr else f"{name}: no own hostname registered")
+        if inst.get("domain_hidden"):
+            print("Hidden under the tenant's own domain: answers under the node's names only")
         for a in aliases:
             print(f"  alias: {a}")
         autos = instance_auto_hosts(name, inst, ext_host=ext_host)
@@ -35110,6 +35176,35 @@ def cmd_process_deploys(_args):
                     ok = True
                 except (ValueError, OSError) as e:
                     msg = str(e)
+        elif action == "tenant-domain":
+            # RFC-0115 §15 (Jörg 2026-11-21): the domain from the portal's
+            # tenant settings -- the server_admin's alone (D1), judged again
+            # here from the actor's record, and run through the CLI's own
+            # function so that both doors say and do the same.
+            tid_d = str(req.get("tenant") or "")
+            t_d = load_tenants().get(tid_d)
+            what = str(req.get("what") or "").strip().lower()[:200]
+            audit_tenant_id = tid_d if t_d else None
+            name = (t_d or {}).get("label", "")
+            if not actor or act_role != "server_admin":
+                msg = "a tenant's own domain is bound by server_admin (RFC-0115 D1)"
+            elif not t_d:
+                msg = "no such tenant on this node"
+            elif not what:
+                msg = "which domain -- or check, off, remove?"
+            else:
+                ok, msg = _run_captured(_tenant_domain_cli,
+                                        argparse.Namespace(name=name, target=what), load_tenants())
+        elif action == "instance-domain":
+            # RFC-0115 §15: hide an instance under its tenant's domain (or show it)
+            if not actor or act_role != "server_admin":
+                msg = "hiding an instance under a tenant's domain requires server_admin"
+            elif inst is None:
+                msg = "no such instance on this node"
+            else:
+                audit_tenant_id = resolve_tenant(inst.get("tenant"))
+                ok, msg = instance_set_domain_hidden(name, bool(req.get("hidden")),
+                                                     who=actor, role=act_role)
         elif action == "node-identity":
             # RFC-0082 D6: alias, place, tags from the health page. The
             # server_admin's alone, judged again from the actor's record.
@@ -40458,7 +40553,8 @@ def build_parser():
     pa = sub.add_parser("address",
                         help="an instance's own public hostname and its aliases (RFC-0009, RFC-0018)")
     pa.add_argument("action", choices=["show", "set", "remove",
-                                       "alias-add", "alias-remove"])
+                                       "alias-add", "alias-remove",
+                                       "domain-hide", "domain-show"])
     pa.add_argument("name")
     pa.add_argument("hostname", nargs="?",
                     help="public hostname of its own, e.g. hub.example.org; "

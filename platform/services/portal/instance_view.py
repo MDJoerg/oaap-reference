@@ -81,7 +81,7 @@ def auto_host(name, inst, tenants, node_host):
     # RFC-0115 §5: the tenant's own domain, while it is canonical -- the
     # same judgement appctl's instance_auto_hosts makes (place.py).
     d = (tenant.get("domain") or {})
-    if (d.get("state") == "active" and d.get("name")
+    if (d.get("state") == "active" and d.get("name") and not (inst or {}).get("domain_hidden")
             and (d.get("canonical") or "domain") == "domain"):
         return f"{local}.{str(d['name']).lower()}"
     label = tenant.get("label", "")

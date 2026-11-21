@@ -308,6 +308,88 @@ body = r.get_data(as_text=True)
 ok("Portal am Ort der Domain: die Kachel verlinkt <app>.<domain>", r.status_code == 200 and f"https://chat.{DOM}/" in body,
    (r.status_code, body[-300:]))
 
+
+# ---------------------------------------------------------------------------
+print("\n§15: eine App unter der Domain verbergen, Domain aus dem Portal")
+
+ok_h, said = m.instance_set_domain_hidden("bec-chat", True, who="root")
+c = caddy()
+names = m.instance_auto_hosts("bec-chat", m.load_registry()["instances"]["bec-chat"], ext_host=HOST)
+ok("verborgen: kein Name unter der Domain, der Name unter dem Knoten bleibt",
+   ok_h and f"chat.{DOM}" not in names and f"chat.bec.{HOST}" in names
+   and f"https://chat.{DOM} {{" not in c and f"https://chat.bec.{HOST} {{" in c, (said, names))
+ok("verborgen: das Portal verlinkt die App unter dem Knoten",
+   iv.auto_host("chat", m.load_registry()["instances"]["bec-chat"], m.load_tenants(), HOST) == f"chat.bec.{HOST}")
+ok("verborgen: der Ort der Domain bleibt", f"https://{DOM} {{" in c)
+log = [e for e in m.read_tenant_log(bec_id) if e["action"] == "instance.domain"]
+ok("das Verbergen steht im Protokoll des Mandanten", log and "hidden under" in log[-1].get("detail", ""), log[-1:])
+ok_h2, said2 = m.instance_set_domain_hidden("bec-chat", True)
+ok("noch einmal verbergen: nichts geändert, kein Fehler", ok_h2 and "nothing changed" in said2, said2)
+ok_n, said_n = m.instance_set_domain_hidden("cls-wiki", True)
+ok("KÖDER: ohne eigene Domain gibt es nichts zu verbergen", not ok_n and "no own domain" in said_n, said_n)
+rc, out = quiet(m.cmd_address, argparse.Namespace(action="domain-show", name="bec-chat", hostname=None))
+ok("CLI: oaap app address bec-chat domain-show zeigt sie wieder", rc == 0 and f"https://chat.{DOM} {{" in caddy(), out)
+rc, out = quiet(m.cmd_address, argparse.Namespace(action="domain-hide", name="bec-chat", hostname=None))
+ok("CLI: domain-hide verbirgt", rc == 0 and f"https://chat.{DOM} {{" not in caddy(), out)
+
+# die Warteschlange (der Weg des Portals) -- durch den echten Worker
+users_dir = os.path.join(DATA, "data", "identity")
+os.makedirs(users_dir, exist_ok=True)
+with open(os.path.join(users_dir, "users.json"), "w", encoding="utf-8") as f:
+    json.dump([{"username": "root", "roles": ["server_admin"], "tenant": "", "groups": [], "active": True},
+               {"username": "karin", "roles": ["tenant_admin"], "tenant": bec_id, "groups": [], "active": True}], f)
+QUEUE = os.path.join(m.SPOOL_DIR, "queue")
+_rid = [0]
+
+
+def spool(by, instance, **req):
+    _rid[0] += 1
+    rid = f"d{_rid[0]}"
+    os.makedirs(QUEUE, exist_ok=True)
+    with open(os.path.join(QUEUE, f"{rid}.json"), "w", encoding="utf-8") as f:
+        json.dump({"id": rid, "instance": instance, "by": by, **req}, f)
+    with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
+        m.cmd_process_deploys(None)
+    with open(os.path.join(m.SPOOL_DIR, "results", f"{rid}.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+r = spool("karin", "", action="tenant-domain", tenant=bec_id, what="off")
+ok("KÖDER: eine tenant_admin ordnet keine Domain zu (auch nicht die eigene)",
+   not r.get("ok") and m.load_tenants()[bec_id]["domain"]["state"] == "active", r)
+r = spool("karin", "bec-chat", action="instance-domain", hidden=False)
+ok("KÖDER: eine tenant_admin verbirgt und zeigt keine App",
+   not r.get("ok") and m.load_registry()["instances"]["bec-chat"].get("domain_hidden"), r)
+r = spool("root", "bec-chat", action="instance-domain", hidden=False)
+ok("server_admin über die Warteschlange: die App wieder unter der Domain",
+   r.get("ok") and not m.load_registry()["instances"]["bec-chat"].get("domain_hidden")
+   and f"https://chat.{DOM} {{" in caddy(), r)
+r = spool("root", "", action="tenant-domain", tenant=bec_id, what="off")
+ok("server_admin über die Warteschlange: Domain abschalten, die Antwort ist der Satz der CLI",
+   r.get("ok") and m.load_tenants()[bec_id]["domain"]["state"] == "off" and "switched off" in r.get("message", ""), r)
+r = spool("root", "", action="tenant-domain", tenant=bec_id, what=f"x.{HOST}")
+ok("eine Ablehnung kommt mit dem Satz der CLI zurück", not r.get("ok") and "node's own name" in r.get("message", ""), r)
+r = spool("root", "", action="tenant-domain", tenant=bec_id, what=DOM)
+ok("server_admin über die Warteschlange: Domain zuordnen und prüfen", r.get("ok")
+   and m.load_tenants()[bec_id]["domain"]["state"] == "active" and "Active." in r.get("message", ""), r)
+
+# die Seite im Portal
+TT = m.load_tenants()
+p.load_tenants = lambda: TT
+p.load_instances = lambda: m.load_registry()["instances"]
+p.caller_scope = lambda: ("server_admin", default_id)
+p.require_user_admin = lambda: None
+body = pc.get("/tenant/domain?tenant=bec", headers={"Host": HOST, "X-OAAP-Roles": "server_admin",
+                                                     "X-OAAP-User": "root"}).get_data(as_text=True)
+ok("Portal: die Seite Domain zeigt Domain, Zustand und die Apps mit Verbergen",
+   DOM in body and "aktiv" in body and "Unter der Domain verbergen" in body and f"chat.bec.{HOST}" in body, body[-400:])
+p.caller_scope = lambda: ("tenant_admin", bec_id)
+r = pc.get("/tenant/domain?tenant=bec", headers={"Host": HOST, "X-OAAP-Roles": "tenant_admin", "X-OAAP-User": "karin"})
+ok("KÖDER: eine tenant_admin kommt nicht auf die Seite", r.status_code == 303, r.status_code)
+p.caller_scope = lambda: ("server_admin", default_id)
+r = pc.get("/tenant/domain?tenant=default", headers={"Host": HOST, "X-OAAP-Roles": "server_admin", "X-OAAP-User": "root"})
+ok("KÖDER: der Standard-Mandant hat keine Domain-Seite", r.status_code == 303, r.status_code)
+
 # ---------------------------------------------------------------------------
 print("\nDer Anmeldedienst auf der Domain")
 
