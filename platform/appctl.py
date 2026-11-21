@@ -6186,7 +6186,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 18     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 19     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -6221,7 +6221,13 @@ MANIFEST_MINOR = 18     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.18 adds setup.path, ai_client.use and
                         # ai_gateway.serve (RFC-0104 -- a tenant build sets
                         # an app up through its door; a chat reaches its
-                        # tenant's model gateway without a key)
+                        # tenant's model gateway without a key);
+                        # 0.19 adds mcp_content.untrusted (RFC-0116 stage 2
+                        # -- an MCP source says it delivers foreign content
+                        # such as web pages; the gateway proposes the mark
+                        # that keeps it in reading-only views). Its own
+                        # block, not a key under `mcp:`: nodes before 0.19
+                        # refuse unknown keys there, and skip unknown blocks.
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -16191,6 +16197,11 @@ def validate_manifest(m):
             err = mcp_door_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.19 (RFC-0116 stage 2): the source delivers foreign content.
+        if "mcp_content" in m:
+            err = mcp_content_error(m)
+            if err:
+                errs.append(err)
         # Manifest 0.13 (RFC-0075 D6): the app serves a sandbox page for the
         # views of MCP Apps; the platform gives it a second origin.
         if "ui_sandbox" in m:
@@ -18276,6 +18287,26 @@ def mcp_door(m_or_inst):
     return str(d.get("path") or "") if isinstance(d, dict) else ""
 
 
+def mcp_untrusted_wanted(m):
+    """Only a literal `mcp_content: {untrusted: true}` next to an MCP door (RFC-0116 §4.3)."""
+    d = m.get("mcp_content")
+    return isinstance(d, dict) and d.get("untrusted") is True and bool(mcp_door(m))
+
+
+def mcp_content_error(m):
+    """'' when `mcp_content:` is valid, else the sentence for the operator (manifest 0.19)."""
+    d = m.get("mcp_content")
+    if not isinstance(d, dict):
+        return "mcp_content: object expected"
+    if set(d) - {"untrusted"}:
+        return "mcp_content: only 'untrusted' is known (RFC-0116 stage 2)"
+    if not isinstance(d.get("untrusted"), bool):
+        return "mcp_content.untrusted: true or false"
+    if not mcp_door(m):
+        return "mcp_content: only for an app that declares an MCP door (mcp.path)"
+    return ""
+
+
 def mcp_sources_wanted(m):
     """Only a literal `mcp_sources: {read: true}`."""
     d = m.get("mcp_sources")
@@ -18334,6 +18365,9 @@ def mcp_sources_of(insts, scope):
                              f"{MCP_DOOR_PREFIX}{k}") if me.get("port") else "",
                     "discover": (f"http://{GATEWAY_CONTAINER}:{me['port']}"
                                  f"{MCP_DISCOVER_PREFIX}{k}") if me.get("port") else ""})
+        if i.get("mcp_untrusted") is True:
+            # RFC-0116 §4.3: only named when true; a gateway before 0.36 ignores it.
+            out[-1]["untrusted_content"] = True
     return out
 
 
@@ -25949,6 +25983,9 @@ def _install_from_dir(pkg, args, source):
         # describe the app, neither is an operator's decision.
         "mcp": ({"path": mcp_door(m)} if mcp_door(m) else {}),
         "mcp_sources": mcp_sources_wanted(m),
+        # Manifest 0.19 (RFC-0116 stage 2): the app says its door delivers
+        # foreign content. A proposal to the gateway, never its decision.
+        "mcp_untrusted": mcp_untrusted_wanted(m),
         # Manifest 0.17 (RFC-0094): the help products this app brings, and
         # whether it is a help that reads those of its tenant. Re-read on
         # every install, like `mcp`: both describe the app.
