@@ -467,6 +467,26 @@ def instance_egress_closed(inst):
     return is_rehearsal(inst) or not egress_exception(inst)
 
 
+EGRESS_ENV = "OAAP_EGRESS"
+
+
+def egress_tell(name, inst, closed):
+    """RFC-0116 (runtime 2.40): every container learns whether it is closed,
+    `OAAP_EGRESS=closed|open` in instance.env, written where every container
+    is (re)created -- an install, a restart, the move of `oaap tenant egress`.
+    A fact, not a door: the network is what closes; an app only stops
+    offering what cannot work there (recherche's web_fetch). Written only
+    into an instance.env that exists, and only when it says something else."""
+    path = env_path(name, inst)
+    if not os.path.exists(path):
+        return
+    env = load_env(name, inst)
+    want = "closed" if closed else "open"
+    if env.get(EGRESS_ENV) != want:
+        env[EGRESS_ENV] = want
+        save_env(name, env, inst)
+
+
 def _create_closed_network(net):
     create_network(net, ["--internal", "-o",
                          f"{EGRESS_BRIDGE_OPTION}={egress_bridge_name(net)}"])
@@ -21546,6 +21566,7 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
         why = egress_start_refusal(name, egress_record, services, endpoints)
         if why:
             raise EgressRefused(why)
+    egress_tell(name, inst, closed)
     # RFC-0016: the instance's own network, gateway bridged in. Set up
     # before the containers so they land on the right network at
     # `docker run` time; the migration step restores the gateway link
@@ -25740,6 +25761,10 @@ def _install_from_dir(pkg, args, source):
     # 0.1.308 (runtime 2.38, L5): where the administration finds this instance
     # in the portal -- an address, like OAAP_CARE_URL; empty without one.
     env["OAAP_PORTAL_URL"] = portal_instance_url(name, ident["tenant"])
+    # RFC-0116 (runtime 2.40): closed or open, before the first start too.
+    env[EGRESS_ENV] = ("closed" if instance_egress_closed(
+        dict(inst or {}, tenant=ident["tenant"], **({"rehearsal": True} if rehearsal else {})))
+        else "open")
     for c in m.get("config") or []:
         env.setdefault(c["key"], c.get("default", ""))
     # RFC-0043: the instance's own names, canonical first, so the app

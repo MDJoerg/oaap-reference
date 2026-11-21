@@ -256,6 +256,7 @@ ok("`oaap status` sagt auf einem offenen Knoten nichts", a.egress_faults_line() 
 # ------------------------------------------------------------- schliessen
 print("=== schliessen: fragt, dann intern plus Regel ===")
 instance("kp", T)
+a.save_env("kp", {"FOO": "bar"}, rec("kp"))     # RFC-0116: eine instance.env, die es gibt
 before = dict(net_of("kp"))
 code, out = cli("zu", "--close")
 ok("ohne --yes nennt es die Instanz und aendert nichts",
@@ -270,6 +271,13 @@ ok("der Container laeuft wieder, auf diesem Netz",
 ok("die eine Regel steht, v4 und v6",
    ("iptables", "oaapc+") in RULES and ("ip6tables", "oaapc+") in RULES, RULES)
 ok("im Mandanten-Log", "egress.close" in log_actions(T), log_actions(T))
+ok("RFC-0116 (runtime 2.40): die Instanz erfährt OAAP_EGRESS=closed, alles andere bleibt",
+   a.load_env("kp", rec("kp")) == {"FOO": "bar", "OAAP_EGRESS": "closed"}, a.load_env("kp", rec("kp")))
+a.save_env("offen1", {"FOO": "x"}, rec("offen1"))
+a.recreate_instance_containers("offen1", a.instance_services(rec("offen1")), [], inst=rec("offen1"))
+ok("RFC-0116: eine offene Instanz erfährt OAAP_EGRESS=open beim nächsten Start",
+   a.load_env("offen1", rec("offen1")).get("OAAP_EGRESS") == "open", a.load_env("offen1", rec("offen1")))
+ok("RFC-0116: ohne instance.env wird keine angelegt", not os.path.exists(a.env_path("neu-gibt-es-nicht")))
 ok("das Gateway ist wieder im Netz", a.GATEWAY_CONTAINER in net_of("kp")["members"], net_of("kp"))
 ok("der andere Mandant bleibt offen", not net_of("offen1")["internal"])
 LOG.clear()
@@ -541,6 +549,8 @@ code, out = cli("zu", "--open", "--reason", "Probe beendet", "--yes")
 ok("mit Begruendung: normale Netze", code == 0 and net_of("kp")["internal"] is False, out)
 ok("Generalprobe bleibt im offenen Mandanten normal", net_of("probe")["internal"] is False)
 ok("im Log", "egress.open" in log_actions(T))
+ok("RFC-0116: nach dem Öffnen sagt instance.env wieder OAAP_EGRESS=open",
+   a.load_env("kp", rec("kp")).get("OAAP_EGRESS") == "open", a.load_env("kp", rec("kp")))
 ok("und die Seite nennt den Grund", "Probe beendet" in cli("zu")[1])
 
 # ---------------------------------------------- Stufe 2: die Destination
