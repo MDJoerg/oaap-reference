@@ -819,6 +819,26 @@ Type=oneshot
 Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
 ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py cohort sweep
 EOF
+  cat > /etc/systemd/system/oaap-domain-check.service <<EOF
+[Unit]
+Description=OAAP tenant domains (RFC-0115: activates a pending domain once DNS points here)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py tenant domains
+EOF
+  cat > /etc/systemd/system/oaap-domain-check.timer <<'EOF'
+[Unit]
+Description=OAAP tenant domains, daily
+
+[Timer]
+OnCalendar=*-*-* 04:50:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   cat > /etc/systemd/system/oaap-cohort-sweep.timer <<'EOF'
 [Unit]
 Description=OAAP cohort sweep, daily
@@ -937,6 +957,7 @@ EOF
   systemctl enable --now oaap-deployd.path >/dev/null 2>&1 || true
   systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-cohort-sweep.timer >/dev/null 2>&1 || true
+  systemctl enable --now oaap-domain-check.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-keys.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
   systemctl enable oaap-disks.service >/dev/null 2>&1 || true

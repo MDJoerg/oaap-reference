@@ -1268,6 +1268,10 @@ TENANT_HEALTH_BODY = """
     <span class="badge todo">{{ sum.err }} Fehler (5xx)</span>{% endif %}{% endif %}</span></div>
   <div><span class="k">Neustarts</span><span class="v">{{ sum.restarts }}{% if sum.oom %}
     <span class="badge todo">{{ sum.oom }} × Speicher voll</span>{% endif %}</span></div>
+  {% if place_url %}<div><span class="k">Adresse</span><span class="v"><a href="{{ place_url }}/">{{ place_url[8:] }}</a></span></div>{% endif %}
+  {% if dom %}<div><span class="k">Eigene Domain</span><span class="v">
+    <span class="dot {{ 'ok' if dom.state == 'active' else 'warn' }}"></span>{{ dom.name }} · {{ dom.word }}
+    {% if dom.checked %}<span class="muted">(geprüft {{ dom.checked }} UTC{% if dom.state != 'active' and dom.said %}: {{ dom.said }}{% endif %})</span>{% endif %}</span></div>{% endif %}
   <div><span class="k">Sicherung</span><span class="v">{{ bk.word }}{% if bk.last %} ·
     zuletzt {{ bk.last.when }}{% if bk.last.size %}, {{ bk.last.size }}{% endif %}{% elif bk.node_last %} ·
     Knoten zuletzt {{ bk.node_last.when }}{% endif %}</span></div>
@@ -7300,6 +7304,28 @@ def _health_scope():
 TENANT_LEDGER_DIR = "/apps-registry/report-ledger"
 
 
+def _place_url(label, path=""):
+    """The printed address of a tenant's place (RFC-0115 §5, place.canonical_place_host):
+    its own domain while canonical, else `<label>.<node>`; "" without one."""
+    ext = external_host()
+    tid = tenant_id_by_label(label) if label else None
+    if not ext or not tid:
+        return ""
+    at = place.canonical_place_host(tid, load_tenants(), ext, default_tenant_id())
+    return f"https://{at}{path}" if at else ""
+
+
+def _tenant_domain_facts(tid):
+    """The tenant's own domain for the health page: name, state in words, when
+    checked and what DNS said -- or None (RFC-0115 stage 2)."""
+    d = (load_tenants().get(tid) or {}).get("domain") or {}
+    if not d.get("name"):
+        return None
+    word = {"active": "aktiv", "pending": "wartet auf DNS", "off": "abgeschaltet"}.get(d.get("state"), d.get("state", ""))
+    return {"name": d["name"], "state": d.get("state", ""), "word": word,
+            "checked": str(d.get("checked") or "")[:16].replace("T", " "), "said": d.get("said") or ""}
+
+
 def _tenant_hosts(key, inst):
     return [h for h in (inst.get("address"), instance_auto_host(key, inst),
                         *(inst.get("aliases") or [])) if h]
@@ -7344,7 +7370,8 @@ def tenant_health(tid):
                 size_h=thv.size, chart=Markup(thv.chart(series)),
                 detail=Markup(detail), total=Markup(total), chosen=chosen,
                 mx_style=Markup(metrics_view.STYLE),
-                bk=_tenant_backup_facts(tid),
+                bk=_tenant_backup_facts(tid), dom=_tenant_domain_facts(tid),
+                place_url=_place_url(tenant_label(tid)),
                 traffic_at=(datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%d %H:%M")
                             if isinstance(at, (int, float)) else ""),
                 node_url=_node_health_url())
@@ -13593,8 +13620,7 @@ def build_detail_page(bid):
                     job=None, error="Diesen Aufbau gibt es nicht.")
     ext = external_host()
     return page(BUILD_DETAIL_BODY, b.get("label", "Aufbau"), "build",
-                setup_url=(f"https://{b.get('label')}.{ext}/einrichten"
-                           if ext and b.get("label") else ""),
+                setup_url=_place_url(b.get("label"), "/einrichten"),
                 b=build_view.detail(b), job=_build_job_note(
                     sc[0], sc[1], request.args.get("job", "")),
                 error=request.args.get("err"))

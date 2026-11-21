@@ -527,6 +527,36 @@ EOF
     || say "  WARNING: the cohort sweep timer could not be enabled."
 fi
 
+# --- the tenant domain check (RFC-0115 stage 2) ---
+# A domain entered before its DNS points here waits as `pending`; once a day
+# it is checked again and served as soon as it fits. Idempotent.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  PYTHON3="$(command -v python3 || echo /usr/bin/python3)"
+  cat > /etc/systemd/system/oaap-domain-check.service <<EOF
+[Unit]
+Description=OAAP tenant domains (RFC-0115: activates a pending domain once DNS points here)
+
+[Service]
+Type=oneshot
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $APP_DIR/appctl.py tenant domains
+EOF
+  cat > /etc/systemd/system/oaap-domain-check.timer <<'EOF'
+[Unit]
+Description=OAAP tenant domains, daily
+
+[Timer]
+OnCalendar=*-*-* 04:50:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now oaap-domain-check.timer >/dev/null 2>&1 \
+    || say "  WARNING: the tenant domain check timer could not be enabled."
+fi
+
 # --- disks and archives (RFC-0063) ---
 # The boot unit that opens adopted disks, and the template unit an archive
 # source runs in. A node that was updated rather than installed has

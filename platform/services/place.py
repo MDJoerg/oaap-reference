@@ -182,6 +182,17 @@ def place_host_of(tid, tenants, ext_host, default_tid, host=""):
     return f"{label}.{ext}" if label else ""
 
 
+def canonical_place_host(tid, tenants, ext_host, default_tid):
+    """The place of tenant `tid` as the platform PRINTS it (RFC-0115 §5):
+    its own domain while that is canonical, else `<label>.<node>` (the
+    node's own name for the default tenant), "" when there is none. Mails,
+    the face's address and links on pages read it from here."""
+    t = (tenants or {}).get(tid) or {}
+    if domain_canonical(t):
+        return tenant_domain(t)
+    return place_host_of(tid, tenants, ext_host, default_tid)
+
+
 def tenant_id_by_label(label, tenants, now_iso):
     """The tenant answering to this label, current or former, or None."""
     label = (label or "").strip().lower()
@@ -400,7 +411,9 @@ def theme_of(tenant, label="", ext_host=""):
         "themed": themed,
         "label": label,
         "title": (theme.get("title") or "").strip() or label,
-        "address": f"{label}.{ext_host}" if (label and ext_host) else label,
+        # RFC-0115 §5: the own domain while it is canonical
+        "address": (tenant_domain(tenant) if domain_canonical(tenant)
+                    else f"{label}.{ext_host}" if (label and ext_host) else label),
         "color_primary": primary,
         "color_accent": accent,
         "logo": logo,

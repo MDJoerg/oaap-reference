@@ -2929,9 +2929,10 @@ def notify_link(tid, path):
     if not ext:
         return ""
     if tid and tid != default_tenant_id():
-        prefix = next(iter(tenant_host_prefixes(tid)), "")
-        if prefix:
-            return f"https://{prefix}.{ext}{path}"
+        # RFC-0115 §5: a mail names the tenant's own domain while it is canonical
+        at = place.canonical_place_host(tid, load_tenants(), ext, default_tenant_id())
+        if at:
+            return f"https://{at}{path}"
     return f"https://{ext}{path}"
 
 
@@ -12827,6 +12828,9 @@ def cmd_tenant(args):
     if args.action == "domain":
         return _tenant_domain_cli(args, tenants)
 
+    if args.action == "domains":
+        return _tenant_domains_sweep(tenants)
+
     if args.action == "create":
         label = (args.name or "").strip().lower()
         _tenant_write_common(label, "create")
@@ -13412,7 +13416,54 @@ def _tenant_domain_cli(args, tenants):
     print(f"  https://{dom['name']}/auth/oidc/callback")
     print(f"A Keycloak realm made by `oaap idp provision` gets it when you run that again for '{label}';")
     print("any other provider: add it there. Until then a provider login on the domain is refused by the provider.")
-    print("Apps learn the new names (OAAP_INSTANCE_NAMES) at their next start.")
+    insts = sorted(k for k, i in load_registry()["instances"].items()
+                   if resolve_tenant(i.get("tenant")) == tid)
+    if insts:
+        print("Apps learn the new names (OAAP_INSTANCE_NAMES) at their next start -- links an app")
+        print("builds itself name the domain only after that. When it suits:")
+        for n in insts:
+            print(f"  sudo oaap app restart {n}")
+
+
+def _tenant_domains_sweep(tenants):
+    """`oaap tenant domains` (the daily timer, RFC-0115 stage 2): a pending
+    domain whose DNS now fits is activated; an active one is checked and what
+    DNS said is written down -- never switched off by a timer (a DNS hiccup
+    at 04:50 must not take a tenant's address away). Quiet when there is
+    nothing to do."""
+    ext = load_external()
+    if not ext:
+        return
+    activated = []
+    for tid, t in sorted(tenants.items()):
+        dom = dict(t.get("domain") or {})
+        if not dom.get("name") or dom.get("state") not in ("pending", "active"):
+            continue
+        ok_, said = domain_dns_check(dom["name"], ext)
+        dom.update(checked=_iso_now(), said=said)
+        if dom["state"] == "pending" and ok_:
+            dom["state"] = "active"
+            activated.append(tid)
+            audit_tenant("tenant.domain", tid, t.get("label", ""), detail=f"active {dom['name']} (daily check)")
+            print(f"{dom['name']}: DNS fits now -- active for '{t.get('label')}'.")
+        elif dom["state"] == "active" and not ok_:
+            audit_tenant("tenant.domain", tid, t.get("label", ""), result="warn",
+                         detail=f"{dom['name']} stays active, but: {said}")
+            print(f"{dom['name']}: stays active, but DNS does not fit: {said}")
+        t["domain"] = dom
+    save_tenants(tenants)
+    if activated:
+        try:
+            refresh_generated_sites()
+            reload_gateway()
+        except SystemExit:
+            # as in `domain check`: back to pending, files without them
+            for tid in activated:
+                tenants[tid]["domain"]["state"] = "pending"
+            save_tenants(tenants)
+            refresh_generated_sites()
+            reload_gateway()
+            die("the gateway refused the sites of the domain(s) above; they are pending again")
 
 
 # ------------------------------------------------ node profiles (RFC-0011)
@@ -40193,7 +40244,7 @@ def build_parser():
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
                                "build", "recipe", "egress", "allow", "disallow",
-                               "domain"])
+                               "domain", "domains"])
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "

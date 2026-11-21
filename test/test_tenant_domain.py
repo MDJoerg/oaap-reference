@@ -241,6 +241,73 @@ ok("KÖDER: eine abgeschaltete Domain schaltet sich durch check nicht wieder ein
 tenant("domain", "bec", DOM)
 ok("neu gesetzt und passend: wieder aktiv", m.load_tenants()[bec_id]["domain"]["state"] == "active")
 
+
+# ---------------------------------------------------------------------------
+print("\nStufe 2: wo die Plattform den Ort druckt")
+
+TT = m.load_tenants()
+ok("der gedruckte Ort ist die Domain, solange sie gilt",
+   place.canonical_place_host(bec_id, TT, HOST, default_id) == DOM
+   and place.canonical_place_host(cls_id, TT, HOST, default_id) == f"cls.{HOST}")
+ok("das Gesicht (Anmeldeseite, Portal) nennt die Domain als Adresse",
+   place.theme_of(TT[bec_id], "bec", HOST)["address"] == DOM
+   and place.theme_of(TT[cls_id], "cls", HOST)["address"] == f"cls.{HOST}")
+ok("eine Mail an den Mandanten verlinkt die Domain", m.notify_link(bec_id, "/x") == f"https://{DOM}/x"
+   and m.notify_link(cls_id, "/x") == f"https://cls.{HOST}/x", m.notify_link(bec_id, "/x"))
+rc, out = tenant("domain", "bec", "check")
+ok("beim Aktivieren nennt der Befehl die Apps, die die Namen erst nach einem Neustart kennen",
+   "sudo oaap app restart bec-chat" in out, out[-400:])
+
+# die tägliche Nachprüfung
+tenant("domain", "bec", "off")
+TT = m.load_tenants()
+TT[bec_id]["domain"]["state"] = "pending"
+m.save_tenants(TT)
+saved = dict(DNS)
+DNS.pop(f"x.{DOM}")
+rc, out = tenant("domains")
+ok("täglich: passt DNS noch nicht, bleibt die Domain wartend und still",
+   m.load_tenants()[bec_id]["domain"]["state"] == "pending" and DOM not in caddy(), out)
+DNS.update(saved)
+rc, out = tenant("domains")
+ok("täglich: sobald DNS passt, wird sie aktiv und bekommt ihre Seiten",
+   m.load_tenants()[bec_id]["domain"]["state"] == "active" and f"https://{DOM} {{" in caddy(), out)
+DNS.pop(DOM)
+rc, out = tenant("domains")
+ok("KÖDER: täglich schaltet ein DNS-Aussetzer eine aktive Domain nie ab",
+   m.load_tenants()[bec_id]["domain"]["state"] == "active" and "stays active" in out, out)
+DNS.update(saved)
+for f in ("platform/migrate.sh", "install.sh"):
+    src = open(os.path.join(HERE, "..", f), encoding="utf-8").read()
+    ok(f"{f} richtet den täglichen Zeitgeber ein",
+       "oaap-domain-check.timer" in src and "appctl.py tenant domains" in src)
+
+# das Portal
+import app as p                                                # noqa: E402
+
+TT = m.load_tenants()
+p.load_tenants = lambda: TT
+p.load_instances = lambda: m.load_registry()["instances"]
+p.external_host = lambda: HOST
+p.default_tenant_id = lambda: default_id
+p.resolve_tenant = lambda ref: (ref or default_id) if (ref or default_id) in TT else None
+p.multi_tenant = lambda: True
+p.caller_record = lambda: {"tenant": bec_id}
+p.setup_done = lambda: True
+p.identity_users = lambda: []
+p.caller_groups = lambda: set()
+p.app.config["TESTING"] = True
+pc = p.app.test_client()
+ok("Portal: der Link „Einrichten“ zeigt auf die Domain", p._place_url("bec", "/einrichten") == f"https://{DOM}/einrichten"
+   and p._place_url("cls", "/einrichten") == f"https://cls.{HOST}/einrichten")
+facts = p._tenant_domain_facts(bec_id)
+ok("Portal: die Gesundheitsseite kennt Domain und Zustand", facts and facts["name"] == DOM and facts["word"] == "aktiv", facts)
+ok("Portal: ohne Domain steht dort nichts", p._tenant_domain_facts(cls_id) is None)
+r = pc.get("/", headers={"Host": DOM, "X-OAAP-Roles": "user", "X-OAAP-User": "anna"})
+body = r.get_data(as_text=True)
+ok("Portal am Ort der Domain: die Kachel verlinkt <app>.<domain>", r.status_code == 200 and f"https://chat.{DOM}/" in body,
+   (r.status_code, body[-300:]))
+
 # ---------------------------------------------------------------------------
 print("\nDer Anmeldedienst auf der Domain")
 
