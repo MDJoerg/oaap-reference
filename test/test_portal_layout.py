@@ -40,6 +40,7 @@ ROLES = {"r": set()}
 portal.caller_roles = lambda: ROLES["r"]
 portal._can_build = lambda: "server_admin" in ROLES["r"]
 portal._has_cohorts = lambda: False
+portal._recipe_scope = lambda: None   # the Einrichten link (RFC-0109) asks identity
 portal.multi_tenant = lambda: False
 
 
