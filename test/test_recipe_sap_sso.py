@@ -153,7 +153,7 @@ DOOR = {}          # (key, kind, id) -> wish
 READY = {"catalog": False}
 
 
-def fake_setup_call(key, inst, method, body=None, query="", actor="root"):
+def fake_setup_call(key, inst, method, body=None, query="", actor="root", recipe=""):
     if method == "GET":
         q = dict(x.split("=", 1) for x in query.split("&") if "=" in x)
         if q.get("kind") == "alias" and "id" not in q:
@@ -287,7 +287,13 @@ ok("die Kette hält: weiter; jetzt reicht das MCP-Gateway die Person durch (eige
 ok("der Server ist im MCP-Gateway angelegt, hinter der Destination",
    DOOR.get(("kunde-werkzeuge", "server", "sap")) == {
        "address": "destination:sap/zmcp2/bc/access-support", "auth": "propagate",
-       "light": "yellow"}, DOOR)
+       "light": "yellow"}, (steps["server"], DOOR))
+# RFC-0114 Stufe 2 (sap-sso 1.2.0): derselbe Schritt trägt das Zielsystem in die
+# Systemlandschaft ein -- mit dem Server, SAP-Mandant, ohne SID (nicht angegeben)
+ok("…und das Zielsystem steht in der Systemlandschaft, mit dem Server",
+   DOOR.get(("kunde-werkzeuge", "system", "sap")) == {
+       "title": "SAP-System", "role": "other", "type": "sap", "facts": {"client": "001"},
+       "servers": ["sap"]}, DOOR.get(("kunde-werkzeuge", "system", "sap")))
 ok("der Lauf wartet, bis die Personen ihren SAP-Benutzer haben",
    steps["personen"]["state"] == "waiting", steps["personen"])
 st = a.tenant_recipe_confirm(rid, "personen", "kv", "tenant_admin", actor_tid="t-kunde")
