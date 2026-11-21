@@ -99,6 +99,7 @@ from flask import Flask, jsonify, request
 import assets_model
 import assets_twin
 import fleet_affected
+import mcp_door
 import semantic
 import timeseries as ts
 import twin_write as tw
@@ -525,6 +526,16 @@ _write_group_content = tw.write_group_content
 LIST_MAX = 500
 
 
+def _title_like(words):
+    """(' AND title ILIKE %s ...', patterns) -- every word in the title,
+    `%`, `_` and backslash taken literally. One rule for the app list
+    (§2.6a) and the MCP search (§2.16)."""
+    like = "".join(" AND title ILIKE %s" for _ in words)
+    pats = ["%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            for w in words]
+    return like, pats
+
+
 @app.get("/twin/objects")
 def list_objects():
     """oaap.data.twin 0.7 §2.6a (RFC-0085 §10): every object of one type,
@@ -560,9 +571,7 @@ def list_objects():
                         f"'{type_key}' -- see 'oaap data model "
                         "bindings' (RFC-0031 D7)"), 403
             with conn.cursor() as cur:
-                like = "".join(" AND title ILIKE %s" for _ in words)
-                pats = ["%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-                        for w in words]
+                like, pats = _title_like(words)
                 cur.execute(
                     "SELECT id FROM objects WHERE type_key = %s AND id NOT IN "
                     "(SELECT alias_id FROM aliases WHERE unmerged_at IS NULL)" + like +
@@ -658,6 +667,135 @@ def write_group(obj_id, group_key):
     finally:
         conn.close()
     return "", 204
+
+
+# ============================================== the MCP source (0.9 §2.16)
+# Reached ONLY through the door blocks appctl writes on a consuming MCP
+# gateway's own site (RFC-0073 §4/§16): forward_auth at identity carries
+# the person (or, at the discovery door, the gateway for the catalog),
+# then the block SETS X-OAAP-Twin-Tenant to the gateway's tenant. '/mcp'
+# is not under '/twin/*', so the public route never reaches it. The
+# JSON-RPC rules live in mcp_door.py; this only binds them to a tenant.
+TWIN_TENANT_HEADER = "X-OAAP-Twin-Tenant"
+TENANT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class _McpStore:
+    """What the three tools read, for ONE tenant (the door's)."""
+
+    def __init__(self, tenant_id):
+        self.tenant_id = tenant_id
+
+    def _conn(self):
+        conn = get_conn(self.tenant_id)
+        if conn is None:
+            raise mcp_door.Refused("Dieser Mandant hat noch keinen Zwilling.")
+        return conn
+
+    def types(self):
+        conn = self._conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT d.key, d.kind, d.definition FROM "
+                        "oaap_model.type_definitions d JOIN oaap_model.activations a "
+                        "ON a.type_key = d.key WHERE a.tenant_id = %s "
+                        "ORDER BY d.kind, d.key", (self.tenant_id,))
+                    rows = cur.fetchall()
+        finally:
+            conn.close()
+        out = []
+        for r in rows:
+            definition = r["definition"]
+            if isinstance(definition, str):
+                definition = json.loads(definition)
+            row = {"key": r["key"], "kind": r["kind"],
+                   "title": definition.get("title") or r["key"]}
+            if definition.get("semantic_id"):
+                row["semantic_iri"] = semantic.expand(definition["semantic_id"])
+            out.append(row)
+        return out
+
+    def search(self, type_key, words, offset, limit):
+        like, pats = _title_like(words)
+        where = " AND type_key = %s" if type_key else ""
+        conn = self._conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, type_key, title, owner_origin FROM objects WHERE "
+                        "id NOT IN (SELECT alias_id FROM aliases WHERE unmerged_at IS NULL)"
+                        + where + like + " ORDER BY title, id LIMIT %s OFFSET %s",
+                        ((type_key,) if type_key else ()) + (*pats, limit, offset))
+                    rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [{"id": f"urn:oaap:obj:{r['id']}", "type": r["type_key"],
+                 "title": r["title"], "owner": r["owner_origin"]} for r in rows]
+
+    def object(self, obj_id, at):
+        conn = self._conn()
+        try:
+            with conn:
+                loaded = _load_object(conn, obj_id, _parse_at(at))
+                if loaded is None:
+                    return None
+                aliases = _aliases_of(conn, loaded["canonical_id"])
+                # each relation's target with its title -- an assistant
+                # should not have to read every target to name it
+                targets = {rel["target"][len("urn:oaap:obj:"):]
+                           for g in loaded["groups"].values() for rel in g["relations"]}
+                titles = {}
+                if targets:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id, title FROM objects WHERE id = ANY(%s::uuid[])",
+                                    (sorted(targets),))
+                        titles = {str(r["id"]): r["title"] for r in cur.fetchall()}
+        finally:
+            conn.close()
+        for g in loaded["groups"].values():
+            for rel in g["relations"]:
+                t = titles.get(rel["target"][len("urn:oaap:obj:"):])
+                if t is not None:
+                    rel["target_title"] = t
+        result = {"id": f"urn:oaap:obj:{loaded['canonical_id']}", "type": loaded["type_key"],
+                  "title": loaded["title"], "owner": loaded["owner"],
+                  "groups": loaded["groups"],
+                  "merged_aliases": [f"urn:oaap:obj:{a}" for a in aliases]}
+        if loaded["canonical_id"] != obj_id:
+            result["requested_as_alias_of"] = f"urn:oaap:obj:{obj_id}"
+        return result
+
+
+@app.post("/mcp")
+def mcp_source():
+    tenant_id = (request.headers.get(TWIN_TENANT_HEADER) or "").strip()
+    if not TENANT_ID_RE.match(tenant_id):
+        return jsonify(error="the twin's MCP door is reached only through an MCP "
+                             "gateway's door (oaap.data.twin §2.16)"), 403
+    if not (request.content_type or "").startswith("application/json"):
+        return jsonify(error="MCP spricht JSON."), 415
+    if (request.content_length or 0) > 1024 * 1024:
+        return jsonify(error="Rumpf zu groß"), 413
+    try:
+        msg = json.loads(request.get_data(cache=False) or b"{}")
+    except ValueError:
+        return jsonify({"jsonrpc": "2.0", "id": None,
+                        "error": {"code": -32700, "message": "Parse error"}})
+    out = mcp_door.answer(msg, mcp_door.who_from(request.headers), _McpStore(tenant_id))
+    if out is None:
+        return "", 202
+    resp = app.response_class(json.dumps(out, ensure_ascii=False, default=str),
+                              mimetype="application/json")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.get("/mcp")
+def mcp_source_get():
+    return "", 405, {"Allow": "POST"}
 
 
 # ========================================================= person-facing API

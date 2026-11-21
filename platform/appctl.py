@@ -18485,7 +18485,38 @@ def mcp_sources_of(insts, scope):
         if i.get("mcp_untrusted") is True:
             # RFC-0116 §4.3: only named when true; a gateway before 0.36 ignores it.
             out[-1]["untrusted_content"] = True
+    twin = twin_mcp_source(me, out)
+    if twin:
+        out.append(twin)
     return out
+
+
+# oaap.data.twin 0.9 §2.16 (RFC-0118 P6): the twin as an MCP source. Not an
+# instance, so it declares no `mcp:` -- the platform names it on a node with
+# the profile `store`. Its address is the door too: no agent key opens it.
+TWIN_MCP_SOURCE = "twin"
+TWIN_MCP_PATH = "/mcp"
+TWIN_MCP_TARGET = "twin:8000"
+TWIN_MCP_VERSION = "0.9"
+TWIN_MCP_ROLES = ["admin", "keyuser", "tenant_admin", "user"]
+TWIN_TENANT_HEADER = "X-OAAP-Twin-Tenant"
+TWIN_TENANT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def twin_mcp_source(me, taken):
+    """The list entry of the twin for gateway `me`, or None: only with the
+    profile `store`, a port of its own and a plain tenant id; an instance
+    of the tenant called `twin` with a door keeps the name (one name, one
+    source)."""
+    if not me.get("port") or not has_profile("store") \
+            or any(s["name"] == TWIN_MCP_SOURCE for s in taken) \
+            or not TWIN_TENANT_ID_RE.match(_instance_tenant_id(me)):
+        return None
+    door = f"http://{GATEWAY_CONTAINER}:{me['port']}{MCP_DOOR_PREFIX}{TWIN_MCP_SOURCE}"
+    return {"name": TWIN_MCP_SOURCE, "app": "oaap.data.twin", "version": TWIN_MCP_VERSION,
+            "channel": "platform", "path": TWIN_MCP_PATH, "address": door, "door": door,
+            "discover": (f"http://{GATEWAY_CONTAINER}:{me['port']}"
+                         f"{MCP_DISCOVER_PREFIX}{TWIN_MCP_SOURCE}")}
 
 
 MCP_DOOR_PREFIX = "/platform/mcp/to/"
@@ -18507,6 +18538,16 @@ def mcp_door_specs(insts, scope):
     exactly the rules a browser session meets on the source's own site."""
     out = []
     for s in mcp_sources_of(insts, scope):
+        if s.get("app") == "oaap.data.twin" and s["name"] == TWIN_MCP_SOURCE \
+                and s["name"] not in insts:
+            # §2.16: the twin's readers (§2.12), the gateway's tenant, and the
+            # header that tells the twin which tenant -- SET, never passed on
+            me = insts.get(scope) or {}
+            out.append({"name": s["name"], "path": TWIN_MCP_PATH, "roles": TWIN_MCP_ROLES,
+                        "groups": [], "tenant": instance_tenant_ref(me),
+                        "target": TWIN_MCP_TARGET,
+                        "set": {TWIN_TENANT_HEADER: _instance_tenant_id(me)}})
+            continue
         i = insts.get(s["name"]) or {}
         path = s["path"]
         routes = sorted(i.get("routes") or [], key=lambda r: len(r["path"]),
@@ -18549,9 +18590,20 @@ def mcp_door_lines(insts, scope):
             lines.append("\t\trequest_header -Authorization")
             lines.append("\t\trequest_header -X-OAAP-Act-Token")
             lines.append("\t\trequest_header -X-OAAP-Act-Assertion")
+            lines += _door_set_lines(d)
             lines += _proxy(d["target"], "\t\t")
             lines.append("\t}")
     return lines
+
+
+def _door_set_lines(d):
+    """The headers a door SETS after forward_auth (the twin's tenant, §2.16)
+    -- overwriting whatever the client sent under the same name."""
+    out = []
+    for k, v in sorted((d.get("set") or {}).items()):
+        assert TWIN_TENANT_ID_RE.match(v), v
+        out.append(f"\t\trequest_header {k} {v}")
+    return out
 
 
 def mcp_discover_lines(insts, scope):
@@ -18588,6 +18640,7 @@ def mcp_discover_lines(insts, scope):
             lines.append("\t\trequest_header -X-OAAP-Act-Token")
             lines.append("\t\trequest_header -X-OAAP-Act-Assertion")
             lines.append(f"\t\trequest_header -{MCP_DISCOVER_HEADER}")
+            lines += _door_set_lines(d)
             lines += _proxy(d["target"], "\t\t")
             lines.append("\t}")
     return lines

@@ -19,6 +19,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # app.py's /internal/twin/assets reads what it wrote.
 COPY app.py relay.py timeseries.py ts_admin.py fleet.py \
      twin_write.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py \
-     fleet_affected.py assets_model.py assets_twin.py assets_run.py ./
+     fleet_affected.py assets_model.py assets_twin.py assets_run.py mcp_door.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
