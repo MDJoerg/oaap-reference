@@ -1,13 +1,13 @@
 {
   "recipe": "oaap.tenant-recipe/1",
   "id": "zwilling",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "offers": "assistant",
   "card": {"title": "Zwilling",
            "summary": "Liest den digitalen Zwilling des Mandanten im Chat und pflegt ihn, wenn du es erlaubst: Werte, Zeiträume und Status, jeder Aufruf bestätigt.",
            "light": "yellow", "icon": "graph"},
   "title": "Zwilling-Assistent im Chat",
-  "description": "RFC-0119 3c (D16) und RFC-0120 Stufe 5. Der Chat bekommt einen Assistenten auf der MCP-Quelle twin des Zwillings: Objekttypen, Suche, ein Objekt lesen. Schreibende Werkzeuge (Werte in Mandantengruppen, Werte mit Zeitraum, Status wechseln) kommen nur, wenn du sie einzeln anhakst; im Chat bestätigt die Person jeden Aufruf, und sie schreibt mit ihren eigenen Rechten aus dem Portal. Die Vorlage setzt keine eigene Ampel für den Zwilling (er hält die Daten des Mandanten). Die Freigabe der Modelle für den Chat bleibt, wie der Mandant sie gesetzt hat. Voraussetzung: mcp-gateway ab 0.44.0 (liest den Katalog des Zwillings neu ein, wenn er gewachsen ist), ai-gateway, Chat.",
+  "description": "RFC-0119 3c (D16) und RFC-0120 Stufe 5. Der Chat bekommt einen Assistenten auf der MCP-Quelle twin des Zwillings: Objekttypen, Suche, ein Objekt lesen. Schreibende Werkzeuge (Werte in Mandantengruppen, Werte mit Zeitraum, Status wechseln) kommen nur, wenn du sie einzeln anhakst; im Chat bestätigt die Person jeden Aufruf, und sie schreibt mit ihren eigenen Rechten aus dem Portal. Die Ampel der Quelle twin wählst du selbst (gelb, wenn der Zwilling interne Daten des Mandanten hält; die Vorlage schlägt keine vor). Hat sie schon jemand von Hand gesetzt, bleibt sie. Die Freigabe der Modelle für den Chat bleibt, wie der Mandant sie gesetzt hat. Voraussetzung: mcp-gateway ab 0.44.0 (liest den Katalog des Zwillings neu ein, wenn er gewachsen ist), ai-gateway, Chat.",
   "needs": {
     "tools":  {"app": "mcp-gateway", "label": "Werkzeuge (MCP-Gateway)"},
     "models": {"app": "ai-gateway",  "label": "Modelle (KI-Gateway)"},
@@ -26,6 +26,8 @@
                "label": "Anweisungen (wie der Assistent arbeitet und antwortet)"},
     "model": {"kind": "setup_item", "need": "models", "item_kind": "alias", "default": "standard",
               "shape": true, "label": "Modellname des KI-Gateways für den Assistenten"},
+    "quelle_ampel": {"kind": "light",
+                     "label": "Ampel der Quelle Zwilling im MCP-Gateway (gelb: der Zwilling hält interne Daten des Mandanten; neue Quellen beginnen rot)"},
     "ceiling": {"kind": "light", "from": "model", "default": "yellow",
                 "label": "Höchste Ampel für den Chat (vorgeschlagen: die Ampel des Modells)"},
     "w_group": {"kind": "bool",
@@ -38,6 +40,7 @@
   "steps": [
     {"id": "werkzeuge", "type": "app.setup", "name": "{tools}",
      "items": [{"kind": "refresh", "id": "twin"},
+               {"kind": "server_light", "id": "twin", "light": "{quelle_ampel}"},
                {"kind": "view", "id": "zwilling", "accesses": ["platform"],
                 "tools": {"server": "twin", "effect": "read"},
                 "writes": {"twin_set_group": "{w_group}",

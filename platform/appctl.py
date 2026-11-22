@@ -12101,8 +12101,10 @@ def _recipe_list_reader():
 def _app_server_lights(doc, chosen, read_list):
     """RFC-0119 section 4.4: {light param: the app's server's light at the
     MCP gateway now, or ''} for each `server_light` item of an app's
-    template -- read from the gateway's setup door (`GET ?kind=server_light`)."""
-    own = (chosen.get(app_templates.APP_NEED) or {}).get("key", "")
+    template -- read from the gateway's setup door (`GET ?kind=server_light`).
+    A platform template names its server literally (`twin`, D16 amended
+    2026-11-22); an app's template names it by the app's key."""
+    app_key = (chosen.get(app_templates.APP_NEED) or {}).get("key", "")
     out = {}
     for st in doc.get("steps") or []:
         if not isinstance(st, dict) or st.get("type") != "app.setup":
@@ -12112,6 +12114,8 @@ def _app_server_lights(doc, chosen, read_list):
             if not isinstance(it, dict) or it.get("kind") != "server_light":
                 continue
             pname = str(it.get("light") or "").strip("{}")
+            sid = str(it.get("id") or "")
+            own = app_key if sid.startswith("{") else sid
             cur = ""
             if gw.get("key") and not gw.get("install") and own:
                 got = read_list(gw["key"], "server_light")
@@ -12179,13 +12183,19 @@ def _recipe_prepare(rid, label, given, role, doc=None, digest=None,
                             "die App wird erst installiert -- der Wert wird "
                             "genommen, wie er ist")
     own_lights = {}
-    if app_template_meta(doc, tid) is not None:
+    is_app_tpl = app_template_meta(doc, tid) is not None
+    if is_app_tpl or (
+            doc == shipped_recipe_doc(rid) and any(
+                isinstance(it, dict) and it.get("kind") == "server_light"
+                for st in doc.get("steps") or [] if isinstance(st, dict)
+                for it in st.get("items") or [])):
         own_lights = _app_server_lights(doc, chosen, read_list or _recipe_list_reader())
         for pname, cur in own_lights.items():
             if cur in tenant_recipe.LIGHTS and cur != "red" and not str(rest.get(pname) or "").strip():
                 rest[pname] = cur       # a human set it: the template meets it
     rest, problems, choices = tenant_recipe.judge_choices(doc, rest, lists)
-    proposal = str((doc.get("card") or {}).get("light") or "")
+    # D16 amended: a platform template proposes no light for its source
+    proposal = str((doc.get("card") or {}).get("light") or "") if is_app_tpl else ""
     for pname, cur in own_lights.items():
         if pname in choices:
             choices[pname].update(suggested=proposal, proposal="app",
