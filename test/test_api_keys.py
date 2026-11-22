@@ -355,5 +355,39 @@ ok("ein zweites Geraet am selben Prinzipal laeuft eigenstaendig",
    "Entziehen des ersten Geraets dieses hier nicht beruehrt")
 
 print("")
+print("RFC-0120 §1.6: die Tür für Schlüssel von Personen gibt keine Plattform-Schlüssel aus")
+_u = m.load_users()
+_u += [user("instance:cls-viewer", ["user"], kind="machine", tenant="t-cls"),
+       user("remote:hub", ["user"], kind="machine", tenant="t-cls"),
+       user("cls_admin2", ["tenant_admin", "admin", "keyuser", "user"], tenant="t-cls")]
+put_users(m, _u)
+kc = m.app.test_client()
+
+
+def door(actor, principal, instance=""):
+    rv = kc.post("/internal/keys", headers={m.INTERNAL_HEADER: "test-internal-key"},
+                 json={"actor": actor, "principal": principal, "roles": ["user"],
+                       "instance": instance, "label": "t", "days": 1})
+    return rv.status_code, (rv.get_json() or {})
+
+
+before = len(m.load_keys())
+for who in ("cls_admin2", "joerg"):
+    for scope in ("oaap.twin", "oaap.authz.admin", "oaap.cases.submit:cls-viewer", "cls-viewer", ""):
+        st, b = door(who, "instance:cls-viewer", scope)
+        ok(f"KÖDER {who}: Schlüssel für instance:cls-viewer, Begrenzung '{scope}' -> 403",
+           st == 403 and "nur die Plattform" in b.get("error", ""), (st, b))
+    st, b = door(who, "remote:hub")
+    ok(f"KÖDER {who}: Schlüssel für remote:hub -> 403", st == 403, (st, b))
+    st, b = door(who, "terminal-3", "oaap.twin")
+    ok(f"KÖDER {who}: eine Person/Maschine mit Begrenzung oaap.twin -> 403 mit Satz",
+       st == 403 and "Fähigkeit der Plattform" in b.get("error", ""), (st, b))
+ok("kein Schlüssel ist dabei entstanden", len(m.load_keys()) == before)
+st, b = door("cls_admin2", "terminal-3", "cls-viewer")
+ok("eine gewöhnliche Begrenzung auf eine Instanz geht weiter", st == 201 and b.get("secret"), (st, b))
+ok("die Plattform selbst (issue_key) stellt den Zwillingsschlüssel weiter aus",
+   m.issue_key(m.load_users(), "instance:cls-viewer", ["user"], "oaap.twin", "twin", 365, "root")[1])
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

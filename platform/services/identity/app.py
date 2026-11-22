@@ -3565,6 +3565,29 @@ def keys_list():
             "scope": role or "self"}
 
 
+# RFC-0120 §1.6 (measured on oaap-test 2026-11-22): the door below is the one
+# the portal and the CLI use for PEOPLE's keys. Until 0.1.346 a tenant_admin
+# could ask it for a key of the platform's own machine principals
+# (`instance:<app>`, `remote:<label>`) and with a scope that names a platform
+# capability (`oaap.twin`, `oaap.authz.admin`, `oaap.cases.submit:<x>`) --
+# and act as that app on the twin, the authorization door or the cases door.
+# Those keys are minted by the platform itself (appctl through issue_key),
+# never here. A scope with a dot is a capability (an app id has none), and
+# the platform's principal kinds are named by their prefix.
+PLATFORM_PRINCIPAL_PREFIXES = ("instance:", "remote:", "client:")
+
+
+def door_refusal(principal, instance):
+    """Why the people's key door refuses this principal or scope -> '' or a sentence."""
+    if str(principal or "").startswith(PLATFORM_PRINCIPAL_PREFIXES):
+        return (f"Schlüssel für '{principal}' stellt nur die Plattform aus "
+                "(Prinzipale von Instanzen, Lesern und Integrations-Clients).")
+    if "." in str(instance or ""):
+        return (f"Die Begrenzung '{instance}' ist eine Fähigkeit der Plattform und wird "
+                "hier nicht ausgestellt; begrenzt wird auf eine Instanz.")
+    return ""
+
+
 @app.post("/internal/keys")
 def keys_create():
     """Issue one key. The secret is in this response and nowhere else,
@@ -3585,6 +3608,11 @@ def keys_create():
     if not may_see(role, actor_tenant, target):
         return {"error": "Dieser Prinzipal gehoert zu einem anderen "
                          "Mandanten."}, 403
+    why = door_refusal(principal, body.get("instance"))
+    if why:
+        audit("key.refused", target.get("tenant", ""), principal, who=actor_name, role=role,
+              detail=why[:200])
+        return {"error": why}, 403
     actor = find_user(users, actor_name)
     wanted = {r for r in (body.get("roles") or []) if r in ASSIGNABLE_ROLES}
     # The second ceiling (RFC-0027 3.3): nobody hands out authority they

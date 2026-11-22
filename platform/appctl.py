@@ -19409,6 +19409,26 @@ def _authz_close_admin_door(name):
 # to know does not run here.
 TWIN_READERS_FILE = os.path.join(APPS_DIR, "twin-readers.json")
 TWIN_REMOTE_PREFIX = "remote:"
+# RFC-0120 stage 0: integration clients (programs outside the platform)
+TWIN_CLIENTS_FILE = os.path.join(APPS_DIR, "twin-clients.json")
+TWIN_CLIENT_PREFIX = "client:"
+
+
+def load_twin_clients():
+    try:
+        with open(TWIN_CLIENTS_FILE, encoding="utf-8") as f:
+            return json.load(f).get("clients") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_twin_clients(clients):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = TWIN_CLIENTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"schema": "0.1", "clients": clients}, f, indent=2)
+    os.replace(tmp, TWIN_CLIENTS_FILE)
+    os.chmod(TWIN_CLIENTS_FILE, 0o644)       # labels, tenants, type keys -- no secret
 
 
 def load_twin_readers():
@@ -19487,6 +19507,92 @@ def twin_reader_add(label, tid, reads, days=None, who="root", active_types=None)
     audit_tenant("twin.reader.add", tid, subject=principal, who=who,
                  detail="reads " + ",".join(types) + f", key {res['id']}")
     return res["secret"], res["expires"]
+
+
+def twin_client_add(label, tid, reads, days=None, who="root", active_types=None):
+    """RFC-0120 stage 0: `client:<label>` in tenant `tid`, reading exactly
+    `reads`, with a key scoped to the twin. -> (secret, expires). The key is
+    for the program, shown once."""
+    if not re.fullmatch(DEST_NAME_RE, label or ""):
+        die("a client label is [a-z0-9-], 2-40 characters, starting and "
+            "ending with a letter or digit")
+    types = sorted({t.strip() for t in (reads or "").split(",") if t.strip()})
+    if not types:
+        die("--reads names the types this client may read -- there is no default (RFC-0120)")
+    if label in load_twin_clients():
+        die(f"an integration client '{label}' exists -- remove it first")
+    if active_types is None:
+        active_types = {t["key"] for t in model_types(tid)}
+    missing = [t for t in types if t not in active_types]
+    if missing:
+        die("not active for this tenant: " + ", ".join(missing)
+            + " (oaap data model types --tenant ...)")
+    principal = TWIN_CLIENT_PREFIX + label
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_R_NAME']\n"
+        "    u = m.find_user(users, name)\n"
+        "    if u is None:\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_R_TITLE'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_R_TENANT'],\n"
+        "                      'active': True})\n"
+        "    elif u.get('kind') != 'machine' or u.get('tenant') != os.environ['OAAP_R_TENANT']:\n"
+        "        print(json.dumps({'error': 'a principal of that name exists elsewhere'})); raise SystemExit\n"
+        "    else:\n"
+        "        u['active'] = True\n"
+        "    m.save_users(users)\n"
+        "try:\n"
+        "    rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_R_SCOPE'],\n"
+        "        os.environ['OAAP_R_LABEL'], os.environ.get('OAAP_R_DAYS') or None, 'root')\n"
+        "except ValueError as e:\n"
+        "    print(json.dumps({'error': str(e)})); raise SystemExit\n"
+        "print(json.dumps({'secret': secret, 'id': rec['id'], 'expires': rec['expires']}))\n",
+        {"OAAP_R_NAME": principal, "OAAP_R_TENANT": tid,
+         "OAAP_R_TITLE": f"integration client {label}",
+         "OAAP_R_SCOPE": TWIN_KEY_SCOPE,
+         "OAAP_R_LABEL": f"oaap.data.twin integration client ({','.join(types)})",
+         "OAAP_R_DAYS": str(days or "")})
+    res = json.loads(out.strip().splitlines()[-1])
+    if res.get("error"):
+        die(res["error"])
+    clients = load_twin_clients()
+    clients[label] = {"tenant": tid, "reads": types, "created": _iso_now(),
+                      "created_by": who, "key": res["id"], "expires": res["expires"]}
+    save_twin_clients(clients)
+    audit_tenant("twin.client.add", tid, subject=principal, who=who,
+                 detail="reads " + ",".join(types) + f", key {res['id']}")
+    return res["secret"], res["expires"]
+
+
+def twin_client_remove(label, who="root"):
+    clients = load_twin_clients()
+    c = clients.pop(label, None)
+    if c is None:
+        die(f"no integration client '{label}' on this node")
+    principal = TWIN_CLIENT_PREFIX + label
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "name = os.environ['OAAP_R_NAME']\n"
+        "n = 0\n"
+        "for k in m.load_keys():\n"
+        "    if k['principal'] == name and not k.get('revoked'):\n"
+        "        m.revoke_key(k['id']); n += 1\n"
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, name)\n"
+        "    if u is not None:\n"
+        "        u['active'] = False\n"
+        "        m.save_users(users)\n"
+        "print(json.dumps({'revoked': n}))\n",
+        {"OAAP_R_NAME": principal})
+    n = json.loads(out.strip().splitlines()[-1]).get("revoked", 0)
+    save_twin_clients(clients)
+    audit_tenant("twin.client.remove", c.get("tenant", ""), subject=principal,
+                 who=who, detail=f"{n} key(s) revoked, principal deactivated")
+    return n
 
 
 def twin_reader_remove(label, who="root"):
@@ -19627,6 +19733,37 @@ def cmd_data_timeseries(args):
 def cmd_data_twin(args):
     """`oaap data twin readers|add-reader|remove-reader` (oaap.data.twin 2.14)."""
     who = os.environ.get("SUDO_USER") or "root"
+    if args.action == "clients":
+        clients = load_twin_clients()
+        if not clients:
+            print("No integration clients. No program outside the platform reads the twin.")
+            return
+        for label, c in sorted(clients.items()):
+            print(f"  {TWIN_CLIENT_PREFIX}{label:<20} tenant {tenant_label(c['tenant']) or 'default'}"
+                  f"  reads {','.join(c.get('reads') or [])}  key {c.get('key', '?')} "
+                  f"until {c.get('expires', '?')}")
+        return
+    if args.action in ("add-client", "remove-client"):
+        label = args.arg1 or die(f"'data twin {args.action}' needs a client label")
+        if args.action == "remove-client":
+            n = twin_client_remove(label, who=who)
+            print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' removed: {n} key(s) "
+                  "revoked, the principal deactivated. Its next call is refused.")
+            return
+        if not has_profile("store") or not _store_running():
+            die("this node's twin is not running (profile 'store') -- nothing to read")
+        tid = resolve_tenant_arg(args.tenant) or die(
+            "add-client needs --tenant (the tenant whose twin it reads)")
+        key, expires = twin_client_add(label, tid, args.reads, args.days, who=who)
+        print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' reads {args.reads} of "
+              f"tenant '{tenant_label(tid) or tid}' (RFC-0120; reading only until stage 3).")
+        print(f"Its key, shown ONCE (valid until {expires}) -- for the program, never for an app:")
+        print("")
+        print(f"  {key}")
+        print("")
+        print("The program calls  GET <node>/twin/v1/types  and  GET <node>/twin/v1/openapi.json")
+        print("with  Authorization: Bearer <key>.")
+        return
     if args.action == "readers":
         readers = load_twin_readers()
         if not readers:
@@ -19663,7 +19800,8 @@ def cmd_data_twin(args):
         print(f"Remote reader '{TWIN_REMOTE_PREFIX}{label}' removed: {n} key(s) revoked, "
               "the principal deactivated. Its next call is refused.")
     else:
-        die(f"'data twin' knows readers, add-reader, remove-reader")
+        die(f"'data twin' knows readers, add-reader, remove-reader, clients, add-client, "
+            "remove-client")
 
 
 def image_uid(image):
@@ -41607,7 +41745,8 @@ def build_parser():
                                         "types", "show", "register",
                                         "alias", "bindings",
                                         "readers", "add-reader",
-                                        "remove-reader", "enable", "job"])
+                                        "remove-reader", "clients", "add-client",
+                                        "remove-client", "enable", "job"])
     pdt.add_argument("arg1", nargs="?",
                      help="create: purpose; copy/drop: schema; restore: "
                           "dump file; model show/register/alias: type key "

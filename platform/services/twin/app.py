@@ -114,6 +114,12 @@ SECRETS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-secrets.json")
 # no secret in it.
 READERS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-readers.json")
 REMOTE_PREFIX = "remote:"
+# RFC-0120 stage 0: integration clients -- programs outside the platform, one
+# tenant each, reading exactly the types the operator (later the tenant
+# admin) bound them to. Written by appctl only; no secret in it.
+CLIENTS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-clients.json")
+CLIENT_PREFIX = "client:"
+API_VERSION = "v1"
 STORE_HOST = os.environ.get("STORE_HOST", "store")
 STORE_PORT = int(os.environ.get("STORE_PORT", "5432"))
 
@@ -183,6 +189,26 @@ def is_remote(name):
     return name.startswith(REMOTE_PREFIX)
 
 
+def resolve_client(label):
+    """{'tenant', 'origin', 'reads'} of an integration client (RFC-0120), or None --
+    the same shape of trust as resolve_remote: the NAME from identity's
+    verification, the rest from a file only the operator's CLI writes."""
+    c = (_load_json(CLIENTS_FILE, {}).get("clients") or {}).get(label)
+    if not c or not c.get("tenant"):
+        return None
+    return {"tenant": c["tenant"], "origin": CLIENT_PREFIX + label,
+            "reads": [t for t in c.get("reads") or [] if isinstance(t, str)]}
+
+
+def is_client(name):
+    return name.startswith(CLIENT_PREFIX)
+
+
+def reads_only(name):
+    """RFC-0120 stage 0: a client reads; writing comes with stage 3 (sync)."""
+    return is_remote(name) or is_client(name)
+
+
 def require_caller():
     """(instance_name, tenant, origin) or None -- writes the 401/403
     onto Flask's request-local error path via abort-by-return.
@@ -193,6 +219,11 @@ def require_caller():
     route, per the deployment contract every other protected route
     already relies on)."""
     user = request.headers.get("X-OAAP-User", "")
+    if is_client(user):
+        resolved = resolve_client(user[len(CLIENT_PREFIX):])
+        if resolved is None:
+            return None, f"'{user}' is not an integration client of this node", 403
+        return (user, resolved["tenant"], resolved["origin"]), None, None
     if is_remote(user):
         # oaap.data.twin 0.4 §2.14 -- the caller's NAME is the full
         # principal ('remote:<label>'), so no binding row of a local
@@ -274,6 +305,11 @@ def _bindings(conn, instance):
         return [{"type_key": t, "direction": "consumes", "role": None,
                  "group_key": None, "declared_as": "remote reader"}
                 for t in r.get("reads") or []]
+    if is_client(instance):
+        c = resolve_client(instance[len(CLIENT_PREFIX):]) or {}
+        return [{"type_key": t, "direction": "consumes", "role": None,
+                 "group_key": None, "declared_as": "integration client"}
+                for t in c.get("reads") or []]
     with conn.cursor() as cur:
         cur.execute(
             "SELECT type_key, direction, role, group_key, declared_as "
@@ -463,15 +499,125 @@ def twin_types():
     return jsonify({"active": active, "bindings": bindings})
 
 
+# ------------------------------------------------ RFC-0120: the door /twin/v1
+# One versioned path for programs outside the platform (D1, D3), behind the
+# same gateway block '/twin/*' and the same key check as the app routes; the
+# app routes above stay as they are. Stage 0: what the caller may read, and a
+# description of the door (OpenAPI 3.1) generated from it.
+
+def _v1_types(conn, tenant_id, name):
+    bound = {}
+    for b in _bindings(conn, name):
+        bound.setdefault(b["type_key"], set()).add(
+            "read" if b["direction"] == "consumes" else "write")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT d.key, d.kind, d.definition FROM oaap_model.type_definitions d "
+            "JOIN oaap_model.activations a ON a.type_key = d.key "
+            "WHERE a.tenant_id = %s ORDER BY d.key", (tenant_id,))
+        rows = cur.fetchall()
+    out = []
+    for r in rows:
+        if r["key"] not in bound:
+            continue
+        d = r["definition"] or {}
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except ValueError:
+                d = {}
+        t = {"key": r["key"], "kind": r["kind"], "access": sorted(bound[r["key"]]),
+             "title": d.get("title") or d.get("label") or r["key"]}
+        if d.get("semantic_id"):
+            t["semantic_iri"] = semantic.expand(d["semantic_id"])
+        for k in ("groups", "attributes", "relations"):
+            if d.get(k):
+                t[k] = d[k]
+        out.append(t)
+    return out
+
+
+def _v1_caller():
+    caller, err, code = require_caller()
+    if err:
+        return None, None, (jsonify({"error": err}), code)
+    name, tenant_id, _origin = caller
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return None, None, (jsonify({"error": "this tenant has no twin yet"}), 409)
+    return name, (tenant_id, conn), None
+
+
+@app.get("/twin/v1/types")
+def v1_types():
+    name, tc, fail = _v1_caller()
+    if fail:
+        return fail
+    tenant_id, conn = tc
+    try:
+        with conn:
+            types = _v1_types(conn, tenant_id, name)
+    finally:
+        conn.close()
+    return jsonify({"v": 1, "api": API_VERSION, "caller": name, "types": types})
+
+
+def openapi_doc(types):
+    """OpenAPI 3.1 for the door as THIS caller sees it -- the types it is
+    bound to, nothing it may not reach (RFC-0120 §4.1)."""
+    obj = {"type": "object", "properties": {
+        "id": {"type": "string", "description": "urn:oaap:obj:<uuid>"},
+        "type": {"type": "string"}, "title": {"type": "string"},
+        "groups": {"type": "object"}}}
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "OAAP twin", "version": API_VERSION,
+                 "description": "The tenant's digital twin (oaap.data.twin, RFC-0120). "
+                                "Every call carries a bearer key; the tenant comes from "
+                                "the key, never from the request."},
+        "servers": [{"url": "/twin/v1"}],
+        "components": {
+            "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer",
+                                           "description": "oaapk_<id>_<secret>"}},
+            "schemas": {"Object": obj, "Type": {"type": "object", "properties": {
+                "key": {"type": "string"}, "kind": {"type": "string"},
+                "access": {"type": "array", "items": {"enum": ["read", "write"]}},
+                "semantic_iri": {"type": "string"}}}}},
+        "security": [{"bearer": []}],
+        "paths": {
+            "/types": {"get": {"summary": "The types this key may read or write",
+                               "responses": {"200": {"description": "types"}}}},
+            "/openapi.json": {"get": {"summary": "This document",
+                                      "responses": {"200": {"description": "OpenAPI 3.1"}}}}},
+        "x-oaap-types": [{"key": t["key"], "access": t["access"]} for t in types],
+        "x-oaap-stage": "RFC-0120 stage 0 -- reads, graph and export follow in stage 1",
+    }
+
+
+@app.get("/twin/v1/openapi.json")
+def v1_openapi():
+    name, tc, fail = _v1_caller()
+    if fail:
+        return fail
+    tenant_id, conn = tc
+    try:
+        with conn:
+            types = _v1_types(conn, tenant_id, name)
+    finally:
+        conn.close()
+    return jsonify(openapi_doc(types))
+
+
 @app.post("/twin/objects")
 def create_object():
     caller, err, code = require_caller()
     if err:
         return err, code
     name, tenant_id, origin = caller
-    if is_remote(name):
-        return ("a remote reader reads only (oaap.data.twin 0.4 §2.14) -- "
-                "writing belongs to an app on the node that holds the data"), 403
+    if reads_only(name):
+        return ("a remote reader or integration client reads only (oaap.data.twin 0.4 "
+                "§2.14, RFC-0120 stage 0) -- writing belongs to an app on the node that "
+                "holds the data"), 403
     body = request.get_json(silent=True) or {}
     type_key = (body.get("type") or "").strip()
     title = (body.get("title") or "").strip()
@@ -633,9 +779,10 @@ def write_group(obj_id, group_key):
     if err:
         return err, code
     name, tenant_id, origin = caller
-    if is_remote(name):
-        return ("a remote reader reads only (oaap.data.twin 0.4 §2.14) -- "
-                "writing belongs to an app on the node that holds the data"), 403
+    if reads_only(name):
+        return ("a remote reader or integration client reads only (oaap.data.twin 0.4 "
+                "§2.14, RFC-0120 stage 0) -- writing belongs to an app on the node that "
+                "holds the data"), 403
     m = OBJ_ID_RE.match(obj_id)
     if not m or not KEY_RE.match(group_key.replace(".", "")):
         return "malformed object id or group key", 400
@@ -1583,7 +1730,7 @@ def ts_route(write):
             caller, err, code = require_caller()
             if err:
                 return err, code
-            if write and is_remote(caller[0]):
+            if write and reads_only(caller[0]):
                 return TS_READ_ONLY, 403
             try:
                 drv = get_ts(caller[1])
