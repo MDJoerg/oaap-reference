@@ -16924,6 +16924,11 @@ def type_change_kind(old, new):
     """
     if old == new:
         return "unchanged"
+    # RFC-0120 stage 2: an attribute's values live in another table once it is
+    # periodic (oaap.data.twin 0.12 §2.20) -- turning it on or off is never a
+    # mere addition, even where the field was absent before
+    if bool(old.get("periodic")) != bool(new.get("periodic")):
+        return "destructive"
     list_fields = ("attributes", "relations", "activities")
     scalar_old = {k: v for k, v in old.items() if k not in list_fields}
     scalar_new = {k: v for k, v in new.items() if k not in list_fields}
@@ -17492,6 +17497,34 @@ def _twin_ensure_tables(schema):
         );
         INSERT INTO "{schema}".relay_watermark (id) VALUES (1)
             ON CONFLICT (id) DO NOTHING;
+        -- Periods of a periodic attribute (RFC-0120 stage 2, oaap.data.twin
+        -- 0.12 §2.20): several values of ONE attribute coexist, each valid
+        -- from..to (date-times, 'to' exclusive), with unit, source and
+        -- quality -- a KPI per year or quarter. Append-only: a correction of
+        -- the same bounds supersedes; value JSON null withdraws a period.
+        -- The no-overlap rule lives in twin_write.write_period.
+        CREATE TABLE IF NOT EXISTS "{schema}".periods (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL,
+            group_key text NOT NULL,
+            attr_key text NOT NULL,
+            value jsonb NOT NULL,
+            valid_from timestamptz NOT NULL,
+            valid_to timestamptz NOT NULL,
+            unit text,
+            source text,
+            quality text,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL,
+            superseded_by bigint,
+            CHECK (valid_to > valid_from),
+            FOREIGN KEY (object_id, group_key)
+                REFERENCES "{schema}".groups(object_id, group_key)
+        );
+        CREATE INDEX IF NOT EXISTS periods_slot
+            ON "{schema}".periods (object_id, group_key, attr_key, valid_from);
+        CREATE OR REPLACE VIEW "{schema}".current_periods AS
+            SELECT * FROM "{schema}".periods WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS

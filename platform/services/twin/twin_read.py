@@ -140,6 +140,81 @@ def registry(conn, tenant_id):
     return reg
 
 
+# ----------------------------------------------------------------- periods
+def _period_rows(conn, ids, moment, as_of):
+    """Period rows of these member ids as recorded at `moment` (`as_of`
+    False: the current rows), withdrawn ones left out."""
+    p = {"ids": list(ids), "t": moment}
+    cols = ("r.object_id, r.group_key, r.attr_key, r.value, r.valid_from, r.valid_to, "
+            "r.unit, r.source, r.quality, r.recorded_at, r.recorded_by")
+    if not as_of:
+        sql = (f"SELECT {cols} FROM current_periods r WHERE r.object_id = ANY(%(ids)s::uuid[]) "
+               "AND r.value <> 'null'::jsonb")
+    else:
+        sql = (f"SELECT {cols} FROM periods r LEFT JOIN periods s ON s.id = r.superseded_by "
+               "WHERE r.object_id = ANY(%(ids)s::uuid[]) AND r.recorded_at <= %(t)s "
+               "AND (s.id IS NULL OR s.recorded_at > %(t)s) AND r.value <> 'null'::jsonb")
+    with conn.cursor() as cur:
+        cur.execute(sql, p)
+        return cur.fetchall()
+
+
+def periods_at(conn, ids, moment, as_of):
+    """{(member id, group, attr): row} -- the value of each periodic
+    attribute at `moment` (oaap.data.twin 0.12 §2.20): the period that
+    contains it; if none does, the latest period that ended before it (the
+    last known value -- its bounds go with it, so nobody mistakes 2025 for
+    now). A period that begins later does not count."""
+    best = {}
+    for r in _period_rows(conn, ids, moment, as_of):
+        if r["valid_from"] > moment:
+            continue
+        k = (str(r["object_id"]), r["group_key"], r["attr_key"])
+        inside = r["valid_to"] > moment
+        cur = best.get(k)
+        if cur is None:
+            best[k] = (inside, r)
+        elif inside and not cur[0]:
+            best[k] = (inside, r)
+        elif inside == cur[0] and r["valid_to"] > cur[1]["valid_to"]:
+            best[k] = (inside, r)
+    return {k: v[1] for k, v in best.items()}
+
+
+def period_meta(r):
+    out = {"valid_from": _iso(r["valid_from"]), "valid_to": _iso(r["valid_to"])}
+    for k in ("unit", "source", "quality"):
+        if r.get(k):
+            out[k] = r[k]
+    return out
+
+
+def _iso(t):
+    return t.astimezone(UTC).isoformat().replace("+00:00", "Z") if t else None
+
+
+def list_periods(conn, mem, moment, as_of, group=None, attr=None, frm=None, to=None):
+    """Every period of these objects ({member id: canonical id}), oldest
+    first, as recorded at `moment`; `group`/`attr` narrow it, `frm`/`to`
+    keep the periods that overlap that window."""
+    out = []
+    for r in _period_rows(conn, mem, moment, as_of):
+        if group and r["group_key"] != group:
+            continue
+        if attr and r["attr_key"] != attr:
+            continue
+        if frm and r["valid_to"] <= frm:
+            continue
+        if to and r["valid_from"] >= to:
+            continue
+        row = {"object": urn(mem[str(r["object_id"])]), "group": r["group_key"],
+               "attribute": r["attr_key"], "value": r["value"], **period_meta(r),
+               "recorded_at": _iso(r["recorded_at"]), "recorded_by": r["recorded_by"]}
+        out.append(row)
+    out.sort(key=lambda x: (x["group"], x["attribute"], x["valid_from"], x["valid_to"]))
+    return out
+
+
 # ---------------------------------------------------------------- snapshot
 class Snapshot:
     """The visible part of one tenant's twin at one moment: objects of the
@@ -236,6 +311,12 @@ class Snapshot:
             s = slot.get((str(r["object_id"]), r["group_key"]))
             if s and r["attr_key"] not in leave_out:
                 out[s[0]][s[1]]["attributes"][r["attr_key"]] = r["value"]
+        for (m, k, a), r in periods_at(self.conn, mem, self.moment, self.at is not None).items():
+            s = slot.get((m, k))
+            if s and a not in leave_out:
+                g = out[s[0]][s[1]]
+                g["attributes"][a] = r["value"]
+                g.setdefault("periods", {})[a] = period_meta(r)
         for r in self._rows("relations", "r.object_id, r.group_key, r.rel_key, r.target_id",
                             mem):
             s = slot.get((str(r["object_id"]), r["group_key"]))
@@ -492,7 +573,8 @@ def export(snap, types, relations, with_attributes, reg):
         for n in range(0, len(ids), 2000):
             gs.update(snap.groups(ids[n:n + 2000], leave_out=personal))
         for i in ids:
-            node = snap.obj(i, {k: {"origin": g["origin"], "attributes": g["attributes"]}
+            node = snap.obj(i, {k: dict({"origin": g["origin"], "attributes": g["attributes"]},
+                                        **({"periods": g["periods"]} if g.get("periods") else {}))
                                 for k, g in gs[i].items()})
             nodes.append(node)
     else:

@@ -12496,7 +12496,9 @@ TWIN_OBJECT_BODY = """
   {% if g.attributes %}
   <table>
   {% for ak, av in g.attributes.items() %}
-    <tr><td class="muted">{{ attr_titles.get(ak, ak) }}</td><td>{{ av.value }}</td></tr>
+    <tr><td class="muted">{{ attr_titles.get(ak, ak) }}</td><td>{{ av.value }}
+      {%- if av.periodic %} {{ av.unit or '' }}
+        <span class="muted">({{ plabel(av.valid_from, av.valid_to) }})</span>{% endif %}</td></tr>
   {% endfor %}
   </table>
   {% endif %}
@@ -12510,16 +12512,93 @@ TWIN_OBJECT_BODY = """
   <p class="muted">Keine Inhalte.</p>
   {% endif %}
   {% if can_twin_write and g.origin == 'tenant' %}
+  {% set plain = g.attributes.items()|rejectattr('1.periodic')|list %}
+  {% if plain %}
   <form method="post" action="/zwilling/object/{{ bare_id }}/save/{{ base_group_key(gk) }}">
-    {% for ak, av in g.attributes.items() %}
+    {% for ak, av in plain %}
     <label>{{ attr_titles.get(ak, ak) }}
       <input type="text" name="attr_{{ ak }}" value="{{ av.value }}"></label>
     {% endfor %}
     <button>Speichern</button>
   </form>
   {% endif %}
+  {% endif %}
 </div>
 {% endfor %}
+{% if slots %}
+<style>
+  .tchart{width:100%;max-width:560px;height:auto;display:block;margin:.4rem 0}
+  .tchart .bar{fill:var(--oaap-blue-600)}
+  .tchart .line{stroke:var(--oaap-blue-700);stroke-width:2}
+  .tchart .band{fill:var(--oaap-blue-100)}
+  .tchart .axis{font-size:10px;fill:var(--oaap-muted)}
+  .pform{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.5rem;
+         align-items:end}
+</style>
+{% for sl in slots %}
+<div class="card" id="periods-{{ sl.key }}">
+  <h2>Werte mit Zeitraum: {{ sl.title }} <span class="badge">Mandant</span></h2>
+  {% for a in sl.attributes %}
+  <h3>{{ a.title }}{% if a.unit %} <span class="muted">({{ a.unit }})</span>{% endif %}</h3>
+  {% set ps = periods.get((sl.key, a.key), []) %}
+  {% if ps %}
+  {{ bars(ps)|safe }}
+  <table>
+  <tr><th>Zeitraum</th><th>Wert</th><th>Quelle</th><th>Güte</th><th>Erfasst</th><th></th></tr>
+  {% for pr in ps %}
+  <tr><td>{{ pr.label }}</td><td>{{ pr.value }} {{ pr.unit or '' }}</td>
+      <td class="muted">{{ pr.source or '–' }}</td><td class="muted">{{ pr.quality_label or '–' }}</td>
+      <td class="muted">{{ pr.recorded_by }}, {{ (pr.recorded_at or '')[:10] }}</td>
+      <td>{% if can_twin_write %}
+        <form method="post" action="/zwilling/object/{{ bare_id }}/period/{{ sl.key }}" style="display:inline">
+          <input type="hidden" name="attribute" value="{{ a.key }}">
+          <input type="hidden" name="from" value="{{ pr.first_day }}">
+          <input type="hidden" name="to" value="{{ pr.last_day }}">
+          <input type="hidden" name="withdraw" value="1">
+          <button class="btn-secondary">Zurückziehen</button></form>{% endif %}</td></tr>
+  {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Noch kein Wert eingetragen.</p>
+  {% endif %}
+  {% endfor %}
+  {% if can_twin_write %}
+  <h3>Wert eintragen</h3>
+  <form method="post" action="/zwilling/object/{{ bare_id }}/period/{{ sl.key }}" class="pform">
+    <label>Attribut
+      <select name="attribute">{% for a in sl.attributes %}<option value="{{ a.key }}">{{ a.title }}</option>{% endfor %}</select></label>
+    <label>Jahr <input type="number" name="year" min="1900" max="2999" value="{{ this_year }}"></label>
+    <label>Teil
+      <select name="part">{% for v, l in parts %}<option value="{{ v }}">{{ l }}</option>{% endfor %}</select></label>
+    <label>oder Von <input type="date" name="from"></label>
+    <label>Bis (einschließlich) <input type="date" name="to"></label>
+    <label>Wert <input type="text" name="value" required></label>
+    <label>Einheit <input type="text" name="unit" placeholder="{{ sl.attributes[0].unit }}"></label>
+    <label>Quelle <input type="text" name="source" placeholder="z. B. Energieabrechnung 2025"></label>
+    <label>Güte
+      <select name="quality">{% for v, l in qualities %}<option value="{{ v }}">{{ l }}</option>{% endfor %}</select></label>
+    <button>Eintragen</button>
+  </form>
+  <p class="muted">Ein Zeitraum desselben Attributs darf sich mit keinem anderen überschneiden;
+     dieselben Grenzen noch einmal korrigieren den Wert. Ohne Einheit gilt die des Attributs.</p>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+{% if series %}
+<div class="card" id="series">
+  <h2>Messreihen</h2>
+  <p>{% for k, l, _sec in ranges %}<a class="btn{{ '' if k == range_key else ' btn-secondary' }}"
+       href="/zwilling/object/{{ bare_id }}?range={{ k }}#series">{{ l }}</a> {% endfor %}</p>
+  {% for sr in series %}
+  <h3>{{ sr.measure }}{% if sr.unit %} <span class="muted">({{ sr.unit }})</span>{% endif %}
+      {% if sr.labels %}<span class="muted">{{ sr.labels }}</span>{% endif %}</h3>
+  {% if sr.chart %}{{ sr.chart|safe }}{% elif sr.kind == 'text' %}<p class="muted">Textreihe — Verlauf als Zustände, hier nicht gezeichnet.</p>{% else %}<p class="muted">Keine Punkte in diesem Zeitraum.</p>{% endif %}
+  {% endfor %}
+  {% if series_more %}<p class="muted">{{ series_more }} weitere Reihen nicht gezeichnet.</p>{% endif %}
+</div>
+{% endif %}
+{% if series_error %}<p class="muted">Messreihen: {{ series_error }}</p>{% endif %}
 {% if activities %}
 <div class="card">
   <h2>Zeitleiste der Aktivitäten</h2>
@@ -12536,13 +12615,18 @@ TWIN_OBJECT_BODY = """
   <h2>Gruppe hinzufügen</h2>
   {% for gt in addable %}
   <h3>{{ gt.title }}</h3>
+  {% set plain = gt.definition.attributes|reject('in', periodic_keys)|list %}
+  {% if plain %}
   <form method="post" action="/zwilling/object/{{ bare_id }}/save/{{ gt.key }}">
-    {% for ak in gt.definition.attributes %}
+    {% for ak in plain %}
     <label>{{ attr_titles.get(ak, ak) }}
       <input type="text" name="attr_{{ ak }}"></label>
     {% endfor %}
     <button>Anlegen</button>
   </form>
+  {% else %}
+  <p class="muted">Nur Werte mit Zeitraum — unten unter „Werte mit Zeitraum“ eintragen.</p>
+  {% endif %}
   {% endfor %}
 </div>
 {% endif %}
@@ -12635,9 +12719,18 @@ Datenmodell-Paket.</p>
       <select name="attr_value_type">
         {% for v in value_types %}<option value="{{ v }}">{{ v }}</option>{% endfor %}
       </select>
+      <select name="attr_periodic" title="Werte mit Zeitraum (z. B. eine Kennzahl je Jahr)">
+        <option value="nein">ein Wert</option>
+        <option value="ja">Werte mit Zeitraum</option>
+      </select>
+      <input type="text" name="attr_unit" placeholder="Einheit, z. B. t CO2e" maxlength="40">
     </p>
     {% endfor %}
-    <p class="muted">Leere Zeilen werden übersprungen.</p>
+    <p class="muted">Leere Zeilen werden übersprungen. „Werte mit Zeitraum“: das
+    Attribut hält mehrere Werte nebeneinander, jeden für einen Zeitraum (eine
+    Kennzahl 2024, 2025, ein Quartal) mit Einheit, Quelle und Güte — eingetragen
+    auf der Seite des Objekts. Gemessene Werte (jede Minute) gehören in eine
+    Messreihe, nicht hierher.</p>
     <button>Anlegen</button>
   </div>
 </form>
@@ -12735,14 +12828,105 @@ def twin_object_page(obj_id):
                    twin_view.attribute_defs(types).items()}
     addable = twin_view.addable_group_types(types, obj["type"], obj["groups"].keys())
     activities = twin_view.timeline(obj["groups"])
+    adefs = twin_view.attribute_defs(types)
+    slots = twin_view.period_slots(types, obj["type"], obj["groups"])
+    periods = {}
+    if slots:
+        try:
+            rp = _twin_call("GET", f"/internal/twin/objects/{obj_id}/periods")
+            periods = twin_view.periods_by_attribute(
+                rp.json().get("periods", []) if rp.status_code == 200 else [], slots)
+        except (requests.RequestException, ValueError):
+            periods = {}
+    range_key = request.args.get("range", "24h")
+    series, series_more, series_error = _twin_series(obj_id, range_key)
     return page(TWIN_OBJECT_BODY, obj["title"], "twin", **_twin_flags(),
                obj=obj, type_title=(type_row or {}).get("title", obj["type"]),
                bare_id=_bare(obj["id"]), at=at, attr_titles=attr_titles,
                addable=addable, activities=activities,
+               periodic_keys=[k for k in adefs if twin_view.is_periodic(adefs, k)],
+               slots=slots, periods=periods, bars=twin_view.svg_bars,
+               plabel=twin_view.period_label, parts=twin_view.PARTS,
+               qualities=twin_view.QUALITIES, this_year=datetime.now(timezone.utc).year - 1,
+               series=series, series_more=series_more, series_error=series_error,
+               ranges=twin_view.RANGES, range_key=range_key,
                origin_label=twin_view.origin_label, bare=_bare,
                base_group_key=twin_view.base_group_key,
                msg=request.args.get("msg"), msg_ok=request.args.get("err") is None,
                error=None)
+
+
+SERIES_DRAWN = 8
+
+
+def _twin_series(obj_id, range_key):
+    """(series with an inline chart each, how many more, error) for the
+    object page -- RFC-0120 stage 2: series for persons. At most
+    SERIES_DRAWN charts; a tenant without time series shows none, quietly."""
+    try:
+        r = _twin_call("GET", "/internal/twin/series", params={"object": obj_id})
+    except requests.RequestException as e:
+        return [], 0, f"Der Zwilling antwortet nicht ({type(e).__name__})."
+    if r.status_code == 409:
+        return [], 0, None
+    if r.status_code != 200:
+        return [], 0, None if r.status_code == 404 else (r.text or f"HTTP {r.status_code}")
+    try:
+        rows = r.json().get("series", [])
+    except ValueError:
+        return [], 0, "Antwort des Zwillings unlesbar."
+    to = datetime.now(timezone.utc).timestamp()
+    frm = to - twin_view.range_seconds(range_key)
+    out = []
+    for sr in rows[:SERIES_DRAWN]:
+        sr = dict(sr, chart="")
+        if sr.get("kind") != "text":
+            try:
+                rr = _twin_call("GET", f"/internal/twin/series/{sr['id']}/range",
+                                params={"from": int(frm), "to": int(to)})
+                if rr.status_code == 200:
+                    sr["chart"] = twin_view.svg_line(rr.json().get("buckets"), frm, to)
+            except (requests.RequestException, ValueError):
+                pass
+        out.append(sr)
+    return out, max(0, len(rows) - SERIES_DRAWN), None
+
+
+@app.post("/zwilling/object/<obj_id>/period/<group_key>")
+def twin_object_period(obj_id, group_key):
+    """The form "Werte mit Zeitraum" (RFC-0120 stage 2): one period entered,
+    corrected or withdrawn."""
+    denied = require_twin_write()
+    if denied:
+        return denied
+    back = f"/zwilling/object/{obj_id}"
+    if request.form.get("withdraw"):
+        body, error = twin_view.parse_period_form(dict(request.form.to_dict(), value="-"))
+        if body:
+            body["value"] = None
+    else:
+        body, error = twin_view.parse_period_form(request.form)
+    if error:
+        return redirect(f"{back}?err=1&msg=" + quote(error) + f"#periods-{group_key}", code=303)
+    try:
+        r = _twin_call("POST", f"/internal/twin/objects/{obj_id}/groups/{group_key}/periods",
+                       json=body)
+    except requests.RequestException as e:
+        return redirect(f"{back}?err=1&msg="
+                        + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
+                        code=303)
+    if r.status_code not in (200, 201):
+        return redirect(f"{back}?err=1&msg=" + quote(r.text or f"HTTP {r.status_code}")
+                        + f"#periods-{group_key}", code=303)
+    label = twin_view.period_label(body["valid_from"] + "T00:00:00Z",
+                                   _next_day(body["valid_to"]) + "T00:00:00Z")
+    msg = ("Zurückgezogen" if body["value"] is None else
+           "Unverändert" if r.status_code == 200 else "Eingetragen") + f": {label}."
+    return redirect(f"{back}?msg=" + quote(msg) + f"#periods-{group_key}", code=303)
+
+
+def _next_day(iso_day):
+    return (date.fromisoformat(iso_day) + timedelta(days=1)).isoformat()
 
 
 @app.get("/zwilling/object/<obj_id>/tree")

@@ -135,11 +135,13 @@ ok("KÖDER eine Person (kein Maschinen-Prinzipal): 403", r.status_code == 403)
 print("=== OpenAPI ===")
 r = get("/twin/v1/openapi.json", "client:graph")
 d = r.get_json() or {}
-ok("OpenAPI 3.1, Bearer, Pfade /types, /openapi.json und die Lesewege der Stufe 1, nur seine Typen",
+ok("OpenAPI 3.1, Bearer, Pfade /types, /openapi.json und die Lesewege der Stufen 1 und 2, nur seine Typen",
    r.status_code == 200 and d.get("openapi") == "3.1.0"
    and d["components"]["securitySchemes"]["bearer"]["scheme"] == "bearer"
    and set(d["paths"]) == {"/types", "/openapi.json", "/objects", "/objects/{id}",
-                           "/objects/{id}/graph", "/paths", "/export", "/changes"}
+                           "/objects/{id}/graph", "/paths", "/export", "/changes",
+                           "/objects/{id}/periods", "/series", "/series/{id}/range",
+                           "/series/{id}/latest"}
    and d["x-oaap-types"] == [{"key": "FleetNode", "access": ["read"]}], d)
 
 print("=== ein Client schreibt nicht (Stufe 0) ===")

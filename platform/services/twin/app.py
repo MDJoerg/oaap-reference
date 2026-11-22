@@ -103,6 +103,7 @@ import mcp_door
 import semantic
 import timeseries as ts
 import twin_read as tr
+import twin_values as tv
 import twin_write as tw
 
 app = Flask(__name__)
@@ -330,6 +331,13 @@ def _type_active(conn, tenant_id, type_key):
 _record_event = tw.record_event
 
 
+@app.errorhandler(tw.Refused)
+def _refused(e):
+    """A write the rules refuse, raised anywhere inside a route's `with conn:`
+    (which rolls the transaction back): its sentence and its code."""
+    return str(e), e.code
+
+
 # ---------------------------------------------------------------- validity
 def _parse_at(raw):
     """A date the caller asked to see the twin as of, or None for 'now'
@@ -428,6 +436,15 @@ def _load_object(conn, requested_id, at=None):
                 groups[disp]["attributes"][r["attr_key"]] = {
                     "value": r["value"], "valid_from": r["valid_from"],
                     "valid_to": r["valid_to"]}
+    # periodic attributes (oaap.data.twin 0.12 §2.20): the period of the day
+    # asked for (its end, UTC), or of now -- with its bounds, unit, source
+    moment = (datetime.datetime.combine(at, datetime.time(23, 59, 59, 999999),
+                                        datetime.timezone.utc) if at else tr.now())
+    for (m, k, a), r in tr.periods_at(conn, member_ids, moment, False).items():
+        disp = slot_of.get((m, k))
+        if disp:
+            groups[disp]["attributes"][a] = {"value": r["value"], "periodic": True,
+                                             **tr.period_meta(r)}
     with conn.cursor() as cur:
         cur.execute("SELECT object_id, group_key, rel_key, target_id, valid_from, "
                    "valid_to FROM current_relations "
@@ -594,8 +611,8 @@ def openapi_doc(types):
             "/openapi.json": {"get": {"summary": "This document",
                                       "responses": {"200": {"description": "OpenAPI 3.1"}}}}},
         "x-oaap-types": [{"key": t["key"], "access": t["access"]} for t in types],
-        "x-oaap-stage": "RFC-0120 stage 1 -- reads, graph, export, change feed; "
-                        "values in time follow in stage 2, writing in stage 3",
+        "x-oaap-stage": "RFC-0120 stage 2 -- reads, graph, export, change feed, "
+                        "periods and series; writing follows in stage 3",
     }
     doc["paths"].update(_V1_READ_PATHS)
     return doc
@@ -656,6 +673,33 @@ _V1_READ_PATHS = {
                        _q("types", "object types, comma-separated"),
                        _q("limit", "at most 1000, default 200", schema={"type": "integer"})],
         "responses": {"200": {"description": "{v, changes, next, more}"}}}},
+    "/objects/{id}/periods": {"get": {
+        "summary": "The periods of an object's periodic attributes (a KPI per year, ...)",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "string"}},
+                       _q("attribute", "<group>.<attr>; default every periodic attribute"),
+                       _q("from", "keep periods that end after this (date or date-time)"),
+                       _q("to", "keep periods that begin before this"), _AT],
+        "responses": {"200": {"description": "{v, at, object, periods: [{group, attribute, "
+                                             "value, valid_from, valid_to, unit, source, "
+                                             "quality, recorded_at, recorded_by}]}"}}}},
+    "/series": {"get": {
+        "summary": "The time series of an object (measured values)",
+        "parameters": [_q("object", "object id", True)],
+        "responses": {"200": {"description": "{object, series}"}}}},
+    "/series/{id}/range": {"get": {
+        "summary": "Points of one series between two times (the tier is chosen for you)",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "integer"}},
+                       _q("from", "seconds or ISO-8601 with zone", True),
+                       _q("to", "seconds or ISO-8601 with zone", True),
+                       _q("step", "seconds per point, optional", schema={"type": "integer"})],
+        "responses": {"200": {"description": "{series, tier, points}"}}}},
+    "/series/{id}/latest": {"get": {
+        "summary": "The latest point of one series",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "integer"}}],
+        "responses": {"200": {"description": "{series, latest}"}}}},
 }
 
 
@@ -675,7 +719,7 @@ def v1_read(fn):
                 types = _v1_types(conn, tenant_id, name)
                 readable = {t["key"] for t in types if t["kind"] == "object_types"}
                 return fn(conn, tenant_id, name, readable, *a, **k)
-        except tr.Bad as e:
+        except (tr.Bad, tv.Wrong) as e:
             return jsonify({"error": str(e)}), 400
         finally:
             conn.close()
@@ -729,6 +773,126 @@ def v1_object(conn, tenant_id, name, readable, oid):
     if i != raw:
         out["merged_from"] = tr.urn(raw)
     return jsonify(out)
+
+
+def _window():
+    frm = tv.moment(request.args["from"], "from") if request.args.get("from") else None
+    to = tv.moment(request.args["to"], "to", end=True) if request.args.get("to") else None
+    return frm, to
+
+
+def _attribute_arg():
+    raw = (request.args.get("attribute") or "").strip()
+    if not raw:
+        return None, None
+    group, _, attr = raw.rpartition(".")
+    if not tr.GROUP_RE.match(group or "") or not tr.KEY_RE.match(attr or ""):
+        raise tr.Bad(f"'{raw}' is not <group>.<attribute> (e.g. esg.kpi.co2e)")
+    return group, attr
+
+
+@app.get("/twin/v1/objects/<oid>/periods")
+@v1_read
+def v1_periods(conn, tenant_id, name, readable, oid):
+    at = tr.parse_at(request.args.get("at"))
+    snap = tr.Snapshot(conn, readable, at)
+    i = _visible(snap, oid)
+    if i is None:
+        return jsonify({"error": "no such object, or not of a type this key may read"}), 404
+    group, attr = _attribute_arg()
+    frm, to = _window()
+    rows = tr.list_periods(conn, snap.members([i]), snap.moment, at is not None,
+                           group, attr, frm, to)
+    return jsonify({"v": 1, "at": snap.stamp(), "object": tr.urn(i), "periods": rows})
+
+
+def _ts_read(tenant_id, fn):
+    """A read of the tenant's time series for a person or a client: the
+    driver opened and closed, its refusals as answers."""
+    try:
+        drv = get_ts(tenant_id)
+    except psycopg2.Error:
+        return jsonify({"error": "the store does not answer"}), 503
+    if drv is None:
+        return jsonify({"error": TS_OFF}), 409
+    try:
+        return fn(drv)
+    except ts.NotFound as e:
+        return jsonify({"error": str(e)}), 404
+    except ts.TimeseriesError as e:
+        return jsonify({"error": str(e)}), 400
+    finally:
+        drv.conn.close()
+
+
+def _object_type(conn, raw):
+    """(canonical id, type key) of an object of this twin, or (None, None)."""
+    m = OBJ_ID_RE.match(raw or "")
+    if not m:
+        raise tr.Bad(f"'{raw}' is not an object id (urn:oaap:obj:<uuid>)")
+    oid = _canonical_of(conn, m.group(1).lower())
+    with conn.cursor() as cur:
+        cur.execute("SELECT type_key FROM objects WHERE id = %s", (oid,))
+        r = cur.fetchone()
+    return (oid, r["type_key"]) if r else (None, None)
+
+
+def _series_list(conn, drv, oid):
+    ids = [oid] + _aliases_of(conn, oid)
+    return jsonify({"object": _urn(oid),
+                    "series": [_ts_public(x) for i in ids for x in drv.list(i)]})
+
+
+def _series_range(drv, sid):
+    frm, to = _qtime(request.args.get("from")), _qtime(request.args.get("to"))
+    if not frm or not to:
+        raise tr.Bad("'from' and 'to' are needed (seconds or ISO-8601 with zone)")
+    step = request.args.get("step")
+    try:
+        step = int(step) if step else None
+    except ValueError:
+        raise tr.Bad("step: whole seconds")
+    return jsonify(drv.range(sid, frm, to, step, time.time()))
+
+
+NO_OBJECT = "no such object, or not of a type this key may read"
+
+
+@app.get("/twin/v1/series")
+@v1_read
+def v1_series(conn, tenant_id, name, readable):
+    if not request.args.get("object"):
+        raise tr.Bad("query needs '?object='")
+    oid, type_key = _object_type(conn, request.args["object"])
+    if oid is None or type_key not in readable:
+        return jsonify({"error": NO_OBJECT}), 404
+    return _ts_read(tenant_id, lambda drv: _series_list(conn, drv, oid))
+
+
+def _v1_series_of(conn, readable, drv, sid):
+    s = drv.get_series(sid)
+    oid, type_key = _object_type(conn, s["object"])
+    if oid is None or type_key not in readable:
+        raise ts.NotFound(f"no series {sid}")
+    return s
+
+
+@app.get("/twin/v1/series/<int:sid>/range")
+@v1_read
+def v1_series_range(conn, tenant_id, name, readable, sid):
+    def go(drv):
+        _v1_series_of(conn, readable, drv, sid)
+        return _series_range(drv, sid)
+    return _ts_read(tenant_id, go)
+
+
+@app.get("/twin/v1/series/<int:sid>/latest")
+@v1_read
+def v1_series_latest(conn, tenant_id, name, readable, sid):
+    def go(drv):
+        _v1_series_of(conn, readable, drv, sid)
+        return jsonify({"series": sid, "latest": drv.latest(sid)})
+    return _ts_read(tenant_id, go)
 
 
 def _direction():
@@ -1027,6 +1191,85 @@ def write_group(obj_id, group_key):
     finally:
         conn.close()
     return "", 204
+
+
+@app.post("/twin/objects/<obj_id>/groups/<group_key>/periods")
+def write_period(obj_id, group_key):
+    """An app writes one period of a periodic attribute into its own group
+    (oaap.data.twin 0.12 §2.20) -- the binding and the write rule of a group
+    PUT."""
+    caller, err, code = require_caller()
+    if err:
+        return err, code
+    name, tenant_id, origin = caller
+    if reads_only(name):
+        return ("a remote reader or integration client reads only (RFC-0120: writing "
+                "comes with stage 3)"), 403
+    m = OBJ_ID_RE.match(obj_id)
+    if not m or not tr.GROUP_RE.match(group_key):
+        return "malformed object id or group key", 400
+    body = request.get_json(silent=True) or {}
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return "this tenant has no twin schema yet", 409
+    try:
+        with conn:
+            oid = _canonical_of(conn, m.group(1))
+            with conn.cursor() as cur:
+                cur.execute("SELECT type_key FROM objects WHERE id = %s", (oid,))
+                obj = cur.fetchone()
+            if obj is None:
+                return "no such object", 404
+            if not any(b["type_key"] == obj["type_key"] and b["direction"] == "contributes"
+                       for b in _bindings(conn, name)):
+                return (f"'{name}' does not contribute to '{obj['type_key']}' "
+                        "-- see 'oaap data model bindings' (RFC-0031 D4)"), 403
+            res = tw.write_period(conn, oid, group_key, origin, name, body)
+    finally:
+        conn.close()
+    return jsonify(res), (201 if res["written"] else 200)
+
+
+def _periods_answer(conn, raw_id, at=None):
+    """{object, periods} of one object of this twin (every periodic attribute,
+    or `?attribute=<group>.<attr>`), or None if there is no such object."""
+    m = OBJ_ID_RE.match(raw_id)
+    if not m:
+        raise tr.Bad("malformed object id")
+    oid = _canonical_of(conn, m.group(1).lower())
+    with conn.cursor() as cur:
+        cur.execute("SELECT type_key FROM objects WHERE id = %s", (oid,))
+        obj = cur.fetchone()
+    if obj is None:
+        return None, None
+    group, attr = _attribute_arg()
+    frm, to = _window()
+    mem = {i: oid for i in [oid] + _aliases_of(conn, oid)}
+    rows = tr.list_periods(conn, mem, at or tr.now(), at is not None, group, attr, frm, to)
+    return obj["type_key"], {"object": tr.urn(oid), "periods": rows}
+
+
+@app.get("/twin/objects/<obj_id>/periods")
+def read_periods(obj_id):
+    caller, err, code = require_caller()
+    if err:
+        return err, code
+    name, tenant_id, _origin = caller
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return "this tenant has no twin schema yet", 409
+    try:
+        with conn:
+            type_key, out = _periods_answer(conn, obj_id)
+            if out is None:
+                return "no such object", 404
+            if not any(b["type_key"] == type_key for b in _bindings(conn, name)):
+                return f"'{name}' neither contributes nor consumes '{type_key}'", 403
+    except (tr.Bad, tv.Wrong) as e:
+        return str(e), 400
+    finally:
+        conn.close()
+    return jsonify(out)
 
 
 # ============================================== the MCP source (0.9 §2.16)
@@ -1622,6 +1865,120 @@ def twin_unmerge():
     return "", 204
 
 
+def _tenant_group_type(conn, tenant_id, group_key, type_key):
+    """A person has no bindings (only an instance does) -- this replaces that
+    check: the group type must exist, be active for this tenant, and attach to
+    THIS object's own type. None if it does, else (sentence, code)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT d.definition FROM oaap_model.type_definitions d "
+            "JOIN oaap_model.activations a ON a.type_key = d.key "
+            "WHERE a.tenant_id = %s AND d.key = %s AND d.kind = 'group_types'",
+            (tenant_id, group_key))
+        gt = cur.fetchone()
+    if gt is None:
+        return f"group type '{group_key}' is not active for this tenant", 404
+    gdef = tv.defn(gt["definition"])
+    if gdef.get("on") != type_key:
+        return (f"group type '{group_key}' attaches to "
+                f"'{gdef.get('on')}', not '{type_key}'"), 400
+    return None
+
+
+TWIN_WRITERS = {"admin", "keyuser", "tenant_admin"}
+
+
+@app.post("/internal/twin/objects/<obj_id>/groups/<group_key>/periods")
+def twin_write_period_person(obj_id, group_key):
+    """A person enters one period into a TENANT group (the portal's form
+    "Werte mit Zeitraum", RFC-0120 stage 2) -- the roles and the rule of the
+    group write below; the group is created if the tenant has none yet."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    username, tenant_id, roles = person
+    if not (roles & TWIN_WRITERS):
+        return "writing into a tenant group needs role admin, keyuser or tenant_admin", 403
+    m = OBJ_ID_RE.match(obj_id)
+    if not m or not tr.GROUP_RE.match(group_key):
+        return "malformed object id or group key", 400
+    body = request.get_json(silent=True) or {}
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return "this tenant has no twin schema yet", 409
+    try:
+        with conn:
+            oid = _canonical_of(conn, m.group(1))
+            with conn.cursor() as cur:
+                cur.execute("SELECT type_key FROM objects WHERE id = %s", (oid,))
+                obj = cur.fetchone()
+            if obj is None:
+                return "no such object", 404
+            refused = _tenant_group_type(conn, tenant_id, group_key, obj["type_key"])
+            if refused:
+                return refused
+            res = tw.write_period(conn, oid, group_key, "tenant", username, body,
+                                  event_origin=f"tenant:{username}")
+    finally:
+        conn.close()
+    return jsonify(res), (201 if res["written"] else 200)
+
+
+@app.get("/internal/twin/objects/<obj_id>/periods")
+def twin_periods_person(obj_id):
+    person, err, code = require_person()
+    if err:
+        return err, code
+    _username, tenant_id, _roles = person
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return jsonify({"periods": []})
+    try:
+        with conn:
+            _type, out = _periods_answer(conn, obj_id)
+    except (tr.Bad, tv.Wrong) as e:
+        return str(e), 400
+    finally:
+        conn.close()
+    if out is None:
+        return "no such object", 404
+    return jsonify(out)
+
+
+@app.get("/internal/twin/series")
+def twin_series_person():
+    """The series of one object, for the portal's object page (RFC-0120 stage
+    2: series for persons) -- a person reads the tenant's whole twin."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    tenant_id = person[1]
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return jsonify({"series": []})
+    try:
+        with conn:
+            oid, _type = _object_type(conn, request.args.get("object") or "")
+            if oid is None:
+                return "no such object", 404
+            return _ts_read(tenant_id, lambda drv: _series_list(conn, drv, oid))
+    except tr.Bad as e:
+        return str(e), 400
+    finally:
+        conn.close()
+
+
+@app.get("/internal/twin/series/<int:sid>/range")
+def twin_series_range_person(sid):
+    person, err, code = require_person()
+    if err:
+        return err, code
+    try:
+        return _ts_read(person[1], lambda drv: (drv.get_series(sid), _series_range(drv, sid))[1])
+    except tr.Bad as e:
+        return str(e), 400
+
+
 @app.put("/internal/twin/objects/<obj_id>/groups/<group_key>")
 def twin_write_group_person(obj_id, group_key):
     """A person writes into a TENANT-origin group -- Bauplan Schritt 5:
@@ -1655,24 +2012,9 @@ def twin_write_group_person(obj_id, group_key):
                 obj = cur.fetchone()
             if obj is None:
                 return "no such object", 404
-            # A person has no bindings (only an instance does) -- this
-            # replaces that check: the group type must exist, be active
-            # for this tenant, and attach to THIS object's own type.
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT d.definition FROM oaap_model.type_definitions d "
-                    "JOIN oaap_model.activations a ON a.type_key = d.key "
-                    "WHERE a.tenant_id = %s AND d.key = %s AND d.kind = 'group_types'",
-                    (tenant_id, group_key))
-                gt = cur.fetchone()
-            if gt is None:
-                return f"group type '{group_key}' is not active for this tenant", 404
-            gdef = gt["definition"]
-            if isinstance(gdef, str):
-                gdef = json.loads(gdef)
-            if gdef.get("on") != obj["type_key"]:
-                return (f"group type '{group_key}' attaches to "
-                        f"'{gdef.get('on')}', not '{obj['type_key']}'"), 400
+            refused = _tenant_group_type(conn, tenant_id, group_key, obj["type_key"])
+            if refused:
+                return refused
             with conn.cursor() as cur:
                 cur.execute("SELECT origin FROM groups WHERE object_id = %s "
                            "AND group_key = %s", (obj_id, group_key))
@@ -1740,6 +2082,9 @@ def twin_create_type():
         if a.get("value_type", "text") not in MODEL_VALUE_TYPES:
             return (f"attribute '{a['key']}': value_type must be one of "
                     f"{' | '.join(MODEL_VALUE_TYPES)}"), 400
+        if a.get("unit") is not None and (not isinstance(a["unit"], str)
+                                          or len(a["unit"]) > 40):
+            return f"attribute '{a['key']}': 'unit' is a short text", 400
     conn = get_conn(tenant_id)
     if conn is None:
         return "this tenant has no twin schema yet", 409
@@ -1771,7 +2116,11 @@ def twin_create_type():
                         "(%s, 'attribute_types', %s, %s, '1.0.0', %s)",
                         (a["key"], origin, tenant_id, json.dumps(
                             {"key": a["key"], "title": a.get("title") or a["key"],
-                             "value_type": a.get("value_type", "text")})))
+                             "value_type": a.get("value_type", "text"),
+                             # RFC-0120 stage 2: values with a period (D4)
+                             **({"periodic": True} if a.get("periodic") else {}),
+                             **({"unit": a["unit"].strip()} if (a.get("unit") or "").strip()
+                                else {})})))
                     cur.execute(
                         "INSERT INTO oaap_model.activations (tenant_id, type_key) "
                         "VALUES (%s, %s) ON CONFLICT DO NOTHING", (tenant_id, a["key"]))

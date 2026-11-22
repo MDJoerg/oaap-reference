@@ -31,6 +31,7 @@ Aufruf: py -3 test/test_fleet_twin.py            (Teil 1)
         TS_DSN=... python3 test/test_fleet_twin.py   (Teil 1 + 2, oaap-test)
 """
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -282,9 +283,13 @@ admin.autocommit = True
 DDL = []
 real_psql = a._store_psql
 a._store_psql = lambda sql, *x, **k: DDL.append(sql) or type("R", (), {"stdout": "", "returncode": 0})()
+# the type registry first, as fleet_hub_twin does (checked above) -- since
+# RFC-0120 stage 2 every write checks its values against it
+a._model_ensure_schema()
 a._twin_ensure_tables(f"twin_{TID}")
 a._store_psql = real_psql
 with admin.cursor() as cur:
+    cur.execute('DROP SCHEMA IF EXISTS oaap_model CASCADE')
     for sch in (f"twin_{TID}", f"ts_{TID}"):
         cur.execute(f'DROP SCHEMA IF EXISTS "{sch}" CASCADE')
         cur.execute(f'CREATE SCHEMA "{sch}"')
@@ -294,6 +299,23 @@ with admin.cursor() as cur:
     for sql in DDL:
         cur.execute(sql)
 ok("die Tabellen des Zwillings kommen aus appctl._twin_ensure_tables", len(DDL) >= 1)
+# the fleet's own attribute types, as the hub registers them: the fleet's real
+# values must pass the value check (RFC-0120 stage 2) -- a value left out is
+# logged by twin_write and counted here
+with admin.cursor() as cur:
+    for at in fm.data_model()["attribute_types"]:
+        cur.execute("INSERT INTO oaap_model.type_definitions (key, kind, origin, package, "
+                    "version, definition) VALUES (%s, 'attribute_types', 'platform:fleet', "
+                    "'fleet', '1.0.0', %s)", (at["key"], json.dumps(at)))
+LEFT_OUT = []
+
+
+class _Count(logging.Handler):
+    def emit(self, record):
+        LEFT_OUT.append(record.getMessage())
+
+
+logging.getLogger("twin.write").addHandler(_Count())
 
 
 def conns(_tid):
@@ -669,6 +691,8 @@ hsink.flush({**hsnap, "status": {"ni": ("ni", "", with_app(INN3, None))}}, NOW +
 ok("App ohne Tuer (keine app-Zeile mehr): alle Assets removed",
    all(asset_state(t) == "removed" for t in ass), {t: asset_state(t) for t in ass})
 
+ok("die Werte der Flotte bestehen die Pruefung gegen ihre Typen: keiner ausgelassen "
+   "(RFC-0120 Stufe 2)", not LEFT_OUT, LEFT_OUT[:5])
 with admin.cursor() as cur:
     for sch in (f"twin_{TID}", f"ts_{TID}"):
         cur.execute(f'DROP SCHEMA IF EXISTS "{sch}" CASCADE')
