@@ -46,6 +46,8 @@ GATEWAY_KINDS = ("refresh", "server_light", "view", "profile", "assistant")
 MODELS_KINDS = ("client",)
 # RFC-0119 3a: the first MCP gateway that takes `prompts` in a view
 PROMPTS_GATEWAY = "0.42.0"
+# RFC-0119 3b: the first MCP gateway that takes `writes` in a view
+WRITES_GATEWAY = "0.43.0"
 _PH = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
 
 
@@ -116,6 +118,8 @@ def template_problems(doc, app_id):
     own_key = APP_NEED + tenant_recipe.KEY_SUFFIX
     params = doc.get("params") if isinstance(doc.get("params"), dict) else {}
     views = set()
+    prompt_views = set()
+    writes_view = False
     for st in doc.get("steps") or []:
         if not isinstance(st, dict):
             continue
@@ -161,7 +165,36 @@ def template_problems(doc, app_id):
                                f"({{\"server\": \"{{{own_key}}}\", \"effect\": \"read\"}})")
                 if "max_effect" in it and it.get("max_effect") != "read":
                     out.append(f"step '{sid}': the view reads only (RFC-0119 D4)")
+                if "writes" in it:
+                    # RFC-0119 3b (D13): writing tools of the app's own server, each one a
+                    # yes/no a human answers -- never ticked beforehand
+                    wr = it.get("writes")
+                    seen = set()
+                    if not isinstance(wr, dict) or not wr:
+                        out.append(f"step '{sid}': writes names the app's writing tools, "
+                                   "each with a parameter of kind bool")
+                        wr = {}
+                    for tool, v in wr.items():
+                        p = _placeholder(v)
+                        spec = params.get(p) if p else None
+                        if not (isinstance(spec, dict) and spec.get("kind") == "bool"
+                                and str(spec.get("default", "false")).lower() == "false"
+                                and spec.get("shape") is not True):
+                            out.append(f"step '{sid}': writes '{tool}' is a parameter of kind "
+                                       "bool that is not ticked beforehand -- the tenant admin "
+                                       "ticks each writing tool (RFC-0119 D13)")
+                        elif p in seen:
+                            out.append(f"step '{sid}': each writing tool has its own parameter")
+                        seen.add(p)
+                    mv = str((needs.get(target) or {}).get("min_version") or "")
+                    if not (tb.VERSION_RE.match(mv)
+                            and tb.version_key(mv) >= tb.version_key(WRITES_GATEWAY)):
+                        out.append(f"step '{sid}': writing tools in a view need the MCP gateway "
+                                   f"{WRITES_GATEWAY} or newer -- the need '{target}' says "
+                                   f"min_version: {WRITES_GATEWAY}")
+                    writes_view = True
                 if "prompts" in it:
+                    prompt_views.add(str(it.get("id") or ""))
                     # RFC-0119 3a (D11): the prompts of the app's own server, in
                     # addition to its reading tools, from a gateway that knows them
                     if it.get("prompts") != {"server": "{" + own_key + "}"}:
@@ -176,12 +209,16 @@ def template_problems(doc, app_id):
                                    f"min_version: {PROMPTS_GATEWAY}")
                 views.add(str(it.get("id") or ""))
             if k == "profile":
-                if "max_effect" in it and it.get("max_effect") != "read":
-                    out.append(f"step '{sid}': the profile reads only (RFC-0119 D4)")
+                if "max_effect" in it and it.get("max_effect") not in ("read", "write"):
+                    out.append(f"step '{sid}': the profile reads, or writes with writes "
+                               "in the view (RFC-0119 D13)")
     for _sid, st in [(s.get("id", ""), s) for s in doc.get("steps") or [] if isinstance(s, dict)]:
         for it in st.get("items") or []:
             if not isinstance(it, dict):
                 continue
+            if it.get("kind") == "profile" and it.get("max_effect") == "write" and not writes_view:
+                out.append(f"step '{_sid}': the profile writes only when the view names "
+                           "writing tools (writes) (RFC-0119 D4/D13)")
             if it.get("kind") == "profile":
                 bad = [v for v in it.get("views") or [] if v not in views]
                 if bad or not it.get("views"):
@@ -189,9 +226,15 @@ def template_problems(doc, app_id):
             if it.get("kind") == "assistant":
                 if it.get("view") not in views:
                     out.append(f"step '{_sid}': the assistant uses the template's own view")
-                if it.get("views") or it.get("commands") or it.get("support_queue"):
+                if it.get("views") or it.get("support_queue"):
                     out.append(f"step '{_sid}': the assistant of an app's template has one "
-                               "view and nothing else (views, commands, support_queue)")
+                               "view and nothing else (views, support_queue)")
+                # RFC-0119 3a: the chat offers a view's prompts as /name only to an
+                # assistant with commands: true -- allowed exactly when its view has them
+                if "commands" in it and not (it.get("commands") is True
+                                             and it.get("view") in prompt_views):
+                    out.append(f"step '{_sid}': commands: true only when the assistant's view "
+                               "names the app's prompts")
     return out
 
 

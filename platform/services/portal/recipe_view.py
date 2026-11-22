@@ -114,6 +114,7 @@ def fields(recipe, preview=None, prefill=None):
                 cap = _prose_max(spec) if spec.get("kind") == "prose" else VALUE_MAX
                 used[n] = v.replace(chr(13) + chr(10), chr(10)).strip()[:cap]
     out = []
+    writes = _write_params(recipe)
     for n, spec in (recipe.get("needs") or {}).items():
         out.append({"name": n, "kind": "need", "label": spec.get("label") or n,
                     "app": spec.get("app", ""), "value": needs_used.get(n, ""),
@@ -146,7 +147,25 @@ def fields(recipe, preview=None, prefill=None):
         # eigenen Quelle einer App) fragt der Assistent die Person
         f["asked"] = not f["shape"] and "default" not in spec and kind != "bool" and (
             kind != "light" or not spec.get("from"))
+        # RFC-0119 3b (D13): ein schreibendes Werkzeug -- ein eigenes Haekchen im
+        # Kasten "Darf schreiben", nie vorab gesetzt
+        if kind == "bool" and n in writes:
+            f["write_tool"] = writes[n]
+            f["asked"] = True
         out.append(f)
+    return out
+
+
+def _write_params(recipe):
+    """{param: tool} der Haekchen fuer schreibende Werkzeuge (RFC-0119 D13)."""
+    out = {}
+    for st in (recipe or {}).get("steps") or []:
+        for it in (st.get("items") or []) if isinstance(st, dict) else []:
+            if isinstance(it, dict) and it.get("kind") == "view" and isinstance(it.get("writes"), dict):
+                for tool, v in it["writes"].items():
+                    m = re.fullmatch(r"\{([a-z][a-z0-9_]*)\}", str(v))
+                    if m:
+                        out[m.group(1)] = tool
     return out
 
 

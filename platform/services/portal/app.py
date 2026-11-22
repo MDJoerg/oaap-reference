@@ -14381,7 +14381,18 @@ Mandanten <strong>{{ label }}</strong>.</p>
     <td class="muted">{% if f.install %}fehlt sie, wird sie installiert{% else %}muss es im Mandanten geben{% endif %}</td></tr>
   {% endfor %}
 </table>
-{% for f in asked %}{{ widget(f) }}{% endfor %}
+{% for f in asked if not f.write_tool %}{{ widget(f) }}{% endfor %}
+{% set wtools = asked|selectattr('write_tool')|list %}
+{% if wtools %}
+<div class="card warn">
+<h3>Darf schreiben</h3>
+<p class="muted">Diese Werkzeuge ändern Daten in der App. Hake nur an, was der Assistent
+können soll – jedes einzeln, vorab ist keines gesetzt. Im Chat bestätigt die Person jeden
+schreibenden Aufruf, bevor er ausgeführt wird.</p>
+{% for f in wtools %}<p><label><input type="checkbox" id="f-{{ f.name }}" name="{{ f.name }}" value="1" {% if f.checked %}checked{% endif %}>
+<strong>{{ f.label }}</strong> <code>{{ f.write_tool }}</code></label></p>{% endfor %}
+</div>
+{% endif %}
 </div>
 <div class="card">
 <h2>Anpassen</h2>

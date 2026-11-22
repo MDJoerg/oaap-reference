@@ -130,7 +130,8 @@ bait(lambda d: items(d)[2]["tools"].update(server="{chat_key}"), "own server",
 bait(lambda d: items(d)[2].update(tools=[{"server": "{source_key}", "tool": "create_case",
                                           "effect": "write"}]), "reading tools",
      "schreibende Werkzeuge")
-bait(lambda d: items(d)[3].update(max_effect="write"), "reads only", "Profil schreibt")
+bait(lambda d: items(d)[2].pop("writes"), "only when the view names writing tools",
+     "Profil schreibt ohne schreibende Werkzeuge in der Sicht")
 bait(lambda d: d["params"]["quelle_ampel"].update(default="green"), "never chooses",
      "die App wählt die Ampel ihrer Quelle")
 bait(lambda d: items(d)[1].update(light="green"), "never chooses", "Ampel als feste Angabe")
@@ -145,7 +146,7 @@ print("=== Stufe 3a: Prompts der eigenen App, Mindestversion des Gateways ===")
 gw_need = next(n for n, sp in TPL["needs"].items() if sp.get("app") == "mcp-gateway")
 P3 = copy.deepcopy(TPL)
 items(P3)[2]["prompts"] = {"server": "{source_key}"}
-P3["needs"][gw_need]["min_version"] = "0.42.0"
+P3["needs"][gw_need]["min_version"] = "0.43.0"
 ok("Prompts der eigenen Quelle mit min_version 0.42.0: gültiges Rezept und App-Vorlage",
    tr.recipe_problems(P3) == [] and at.template_problems(P3, "vorgaenge") == [],
    (tr.recipe_problems(P3), at.template_problems(P3, "vorgaenge")))
@@ -163,9 +164,52 @@ bait3(lambda d: items(d)[2].update(prompts={"server": "{chat_key}"}), "prompts o
 bait3(lambda d: items(d)[2].update(prompts={"server": "{source_key}", "name": "x"}),
       "prompts of the app's own", "Prompts in anderer Form")
 bait3(lambda d: d["needs"][gw_need].pop("min_version"), "0.42.0", "Prompts ohne Mindestversion")
+bait3(lambda d: d["needs"][gw_need].update(min_version="0.42.0"), "0.43.0",
+      "schreibende Werkzeuge mit Gateway 0.42.0")
+P3c = copy.deepcopy(P3)
+items(P3c)[4]["commands"] = True
+ok("commands: true am Assistenten, wenn seine Sicht die Prompts nennt: gültig (sonst bietet der Chat kein /name an)",
+   at.template_problems(P3c, "vorgaenge") == [], at.template_problems(P3c, "vorgaenge"))
+bait(lambda d: items(d)[4].update(commands=True), "commands: true only when",
+     "commands ohne Prompts in der Sicht")
+bait3(lambda d: items(d)[4].update(commands="ja"), "commands: true only when", "commands kein true")
 bait3(lambda d: d["needs"][gw_need].update(min_version="0.41.9"), "0.42.0",
       "Prompts mit zu alter Mindestversion")
 bait3(lambda d: d["needs"][gw_need].update(min_version="neu"), "x.y.z", "Mindestversion kein x.y.z")
+print("=== Stufe 3b: schreibende Werkzeuge der eigenen App, einzeln angehakt (D13) ===")
+ok("die Vorlage von Vorgänge nennt create_case und comment_case, je ein Häkchen ohne Vorgabe",
+   items(TPL)[2].get("writes") == {"create_case": "{darf_melden}", "comment_case": "{darf_kommentieren}"}
+   and all(TPL["params"][p]["kind"] == "bool" and "default" not in TPL["params"][p]
+           for p in ("darf_melden", "darf_kommentieren"))
+   and items(TPL)[3].get("max_effect") == "write", items(TPL)[2])
+bait(lambda d: d["params"]["darf_melden"].update(default=True), "not ticked beforehand",
+     "ein Häkchen vorab gesetzt")
+bait(lambda d: d["params"]["darf_melden"].update(default="true"), "not ticked beforehand",
+     "ein Häkchen vorab gesetzt (Text)")
+bait(lambda d: items(d)[2]["writes"].update(create_case="true"), "not ticked beforehand",
+     "schreiben fest eingetragen statt angehakt")
+bait(lambda d: d["params"]["darf_melden"].update(shape=True), "not ticked beforehand",
+     "Häkchen unter Anpassen versteckt")
+bait(lambda d: items(d)[2]["writes"].update(comment_case="{darf_melden}"), "own parameter",
+     "zwei Werkzeuge an einem Häkchen")
+bait(lambda d: items(d)[2].update(writes=["create_case"]), "writes names", "writes als Liste")
+bait(lambda d: d["needs"]["tools"].update(min_version="0.42.0"), "0.43.0",
+     "schreibende Werkzeuge ohne Gateway 0.43.0")
+bait(lambda d: items(d)[3].update(max_effect="execute"), "the profile reads, or writes",
+     "Profil bis execute")
+_n, asked, shaped = rv.wizard_parts(TPL)
+wf = {f["name"]: f for f in asked if f.get("write_tool")}
+ok("der Assistent fragt beide als eigenes Häkchen im Schritt „Was fehlt“, keines gesetzt",
+   set(wf) == {"darf_melden", "darf_kommentieren"} and not any(f["checked"] for f in wf.values())
+   and wf["darf_melden"]["write_tool"] == "create_case"
+   and not any(f.get("write_tool") for f in shaped), (asked, shaped))
+ok("ein leeres Formular schickt beide als false", {k: v for k, v in rv.start_params(TPL, {}).items()
+                                                   if k.startswith("darf_")}
+   == {"darf_melden": "false", "darf_kommentieren": "false"})
+vals = {"darf_melden": "true", "darf_kommentieren": "false", "source_key": "rzt-vorgaenge"}
+row = tb.render_items([items(TPL)[2]], vals, "werkzeuge")[0]
+ok("eingesetzt: create_case true, comment_case false -- so geht es an die Einrichtungstür",
+   row["writes"] == {"create_case": "true", "comment_case": "false"}, row)
 INSTS = [("t-k-gw", "werkzeuge", "mcp-gateway"), ("t-k-src", "vorgaenge", "vorgaenge"),
          ("t-k-chat", "chat", "chat"), ("t-k-ai", "ki", "ai-gateway")]
 NEED_DOC = {"needs": {gw_need: {"app": "mcp-gateway", "min_version": "0.42.0"}}}
@@ -283,6 +327,7 @@ a._recipe_instances = lambda tid: [("kunde-vorgaenge", "vorgaenge", "vorgaenge")
                                    ("kunde-werkzeuge", "werkzeuge", "mcp-gateway"),
                                    ("kunde-modelle", "modelle", "ai-gateway"),
                                    ("kunde-chat", "chat", "chat")] if tid == "t-kunde" else []
+a._recipe_versions = lambda tid: {"kunde-werkzeuge": "0.43.0"} if tid == "t-kunde" else {}
 
 
 def reader(light):
@@ -392,16 +437,16 @@ ok("die Seite listet ihn, „von der App Vorgänge“, ohne Hinweis", r0.get("ap
 ok("in pxx nicht", not any(r["id"] == st["id"] for r in rv.template_runs(view, "pxx")))
 pkg2 = tempfile.mkdtemp(prefix="oaap-pkg2-")
 os.makedirs(os.path.join(pkg2, "assistants"))
-json.dump(dict(copy.deepcopy(TPL), version="1.1.0"),
+json.dump(dict(copy.deepcopy(TPL), version="2.1.0"),
           open(os.path.join(pkg2, "assistants", "vorgaenge-ueberblick.json"), "w", encoding="utf-8"),
           ensure_ascii=False)
 a.app_templates_publish_instance("kunde-vorgaenge", dict(INST, version="0.19.0"), pkg2)
 view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
 r0 = next((r for r in rv.template_runs(view, "kunde") if r["id"] == st["id"]), {})
-ok("nach dem Update der App: „Vorlage neuer (1.1.0)“, der Assistent bleibt",
-   "Vorlage neuer (1.1.0)" in r0.get("mark", ""), r0)
-ok("die Karte zeigt 1.1.0",
-   any(c["id"] == "vorgaenge-ueberblick" and c["version"] == "1.1.0"
+ok("nach dem Update der App: „Vorlage neuer (2.1.0)“, der Assistent bleibt",
+   "Vorlage neuer (2.1.0)" in r0.get("mark", ""), r0)
+ok("die Karte zeigt 2.1.0",
+   any(c["id"] == "vorgaenge-ueberblick" and c["version"] == "2.1.0"
        for c in rv.templates_for(view, "kunde", "tenant_admin")))
 a.app_templates_retire_instance("kunde-vorgaenge", INST)
 view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
