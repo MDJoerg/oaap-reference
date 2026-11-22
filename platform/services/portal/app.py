@@ -5667,17 +5667,20 @@ CLIENT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
 INTEGRATION_BODY = """
 <div class="pagehead"><h1>Integration</h1></div>
 <p class="muted">Programme außerhalb der Plattform -- ein Graph-Viewer, ein Modellierungswerkzeug,
-ein Dashboard -- lesen den Zwilling von <strong>{{ label }}</strong> über die Tür
-<code>/twin/v1</code>. Jeder Client liest genau die Typen, die du ihm gibst; schreiben kann er noch
-nicht (RFC-0120). Die Beschreibung der Tür liefert <code>/twin/v1/openapi.json</code>.</p>
+ein Dashboard -- lesen und pflegen den Zwilling von <strong>{{ label }}</strong> über die Tür
+<code>/twin/v1</code>. Jeder Client liest genau die Typen, die du ihm gibst. Schreiben darf er nur
+in Typen, die du ihm zum Schreiben gibst, und nur in seine eigenen Gruppen -- was eine Person, eine
+App oder die Plattform pflegt, überschreibt er nie. „Modelliert“ heißt: er darf eigene Typen dieses
+Mandanten anlegen (RFC-0120). Die Beschreibung der Tür liefert <code>/twin/v1/openapi.json</code>.</p>
 {% if job %}<div class="card {{ 'warn' if job.state == 'failed' else '' }}"><p>
 {% if job.state == 'done' %}{{ job.message }}{% elif job.state == 'failed' %}Nicht ausgeführt: {{ job.message }}
 {% else %}Der Auftrag läuft … <a href="?job={{ job.id }}">neu laden</a>{% endif %}</p></div>{% endif %}
 <div class="card">
 <h2>Clients</h2>
 {% if clients %}
-<table><tr><th>Client</th><th>liest</th><th>Schlüssel</th><th></th></tr>
-{% for c in clients %}<tr><td><code>client:{{ c.label }}</code></td><td>{{ c.reads|join(', ') }}</td>
+<table><tr><th>Client</th><th>liest</th><th>schreibt</th><th>Schlüssel</th><th></th></tr>
+{% for c in clients %}<tr><td><code>client:{{ c.label }}</code></td><td>{{ c.reads|join(', ') or '–' }}</td>
+<td>{{ c.writes|join(', ') or '–' }}{% if c.models %}<br><span class="muted">modelliert</span>{% endif %}</td>
 <td>{% if c.client_keys %}{% for k in c.client_keys %}{{ k.id }} bis {{ k.expires[:10] }}<br>{% endfor %}{% else %}<span class="muted">keiner</span>{% endif %}</td>
 <td><form method="post" action="/zugaenge/integration/{{ c.label }}/schluessel" style="display:inline">
 <input name="days" value="90" size="3"> Tage <button class="btn">Schlüssel ausstellen</button></form>
@@ -5686,13 +5689,31 @@ onsubmit="return confirm('Client und alle seine Schlüssel entfernen?')"><button
 {% endfor %}</table>
 {% else %}<p class="muted">Noch kein Client.</p>{% endif %}
 </div>
+{% if hooks %}<div class="card">
+<h2>Webhooks</h2>
+<p class="muted">Ein Client meldet hier eine Adresse an; jede Änderung, die er lesen darf, geht
+signiert dorthin. Nach zehn Fehlversuchen in Folge hält die Zustellung an, bis der Client sie
+wieder aufnimmt.</p>
+<table><tr><th>Client</th><th>Adresse</th><th>Zustand</th><th>zugestellt</th><th>zuletzt</th></tr>
+{% for h in hooks %}<tr><td><code>{{ h.client }}</code></td><td><code>{{ h.url }}</code>
+{% if h.types %}<br><span class="muted">{{ h.types|join(', ') }}</span>{% endif %}</td>
+<td>{% if h.state == 'stopped' %}<strong>angehalten</strong> seit {{ h.stopped[:16]|replace('T', ' ') }}
+{% elif h.state == 'retrying' %}<strong>Fehler</strong>, {{ h.failures }}. Versuch{% else %}läuft{% endif %}
+{% if h.last_error %}<br><span class="muted">{{ h.last_error }}</span>{% endif %}</td>
+<td>{{ h.delivered }}</td><td>{{ (h.last_ok or '–')[:16]|replace('T', ' ') }}</td></tr>
+{% endfor %}</table></div>{% endif %}
 <div class="card">
 <h2>Neuer Client</h2>
 <form method="post" action="/zugaenge/integration/neu">
 <p><label>Name <input name="label" placeholder="graph-viewer" pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" required></label>
 <span class="muted">klein, Ziffern und Bindestriche</span></p>
-<p><label>Liest die Typen <input name="reads" placeholder="FleetNode, FleetInstance" style="min-width:24rem" required></label>
+<p><label>Liest die Typen <input name="reads" placeholder="FleetNode, FleetInstance" style="min-width:24rem"></label>
 <br><span class="muted">Schlüssel der Typen, mit Komma getrennt; nur Typen, die in diesem Mandanten aktiv sind.</span></p>
+<p><label>Schreibt die Typen <input name="writes" placeholder="leer = liest nur" style="min-width:24rem"></label>
+<br><span class="muted">legt Objekte dieser Typen an und schreibt seine eigenen Gruppen darauf.</span></p>
+<p><label><input type="checkbox" name="models" value="ja"> Modelliert</label>
+<span class="muted">darf eigene Typen dieses Mandanten anlegen (Objekttypen heißen dann
+<code>t.{{ label }}.&lt;Name&gt;</code>) und schreibt Objekte dieser Typen.</span></p>
 <p><button class="btn">Anlegen</button> <span class="muted">Danach stellst du hier den Schlüssel aus.</span></p>
 </form></div>
 """
@@ -5713,6 +5734,7 @@ def _integration_clients(tid):
         if c.get("tenant") != tid:
             continue
         out.append({"label": label, "reads": c.get("reads") or [],
+                    "writes": c.get("writes") or [], "models": c.get("models") is True,
                     "client_keys": [k for k in keys if k["principal"] == "client:" + label
                              and str(k.get("expires") or "") > now]})
     return out
@@ -5730,6 +5752,18 @@ def _integration_job(rid):
             "message": res.get("message", "")}
 
 
+def _integration_hooks(tid):
+    """The webhooks of this tenant's clients (twin '/internal/twin/webhooks',
+    RFC-0120 stage 3), or [] when the twin does not answer."""
+    try:
+        r = TWIN_INTERNAL.get(f"{TWIN}/internal/twin/webhooks", timeout=4, headers={
+            "X-OAAP-Person-User": caller_name(), "X-OAAP-Person-Tenant": tid,
+            "X-OAAP-Person-Roles": ",".join(caller_roles())})
+        return (r.json() or {}).get("webhooks") or [] if r.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return []
+
+
 @app.get("/zugaenge/integration")
 def integration_page():
     sc = _integration_scope()
@@ -5737,7 +5771,7 @@ def integration_page():
         return _recipe_denied()
     tid, label, _role = sc
     return page(INTEGRATION_BODY, "Integration", "keys", label=label,
-                clients=_integration_clients(tid),
+                clients=_integration_clients(tid), hooks=_integration_hooks(tid),
                 job=_integration_job(request.args.get("job", "")))
 
 
@@ -5751,8 +5785,11 @@ def integration_new():
     tid, label, role = sc
     name = (request.form.get("label") or "").strip().lower()[:40]
     reads = (request.form.get("reads") or "").replace(" ", "")[:600]
+    writes = (request.form.get("writes") or "").replace(" ", "")[:600]
     jid = management_api.enqueue(tid, role, "twin-client-add",
-                                 {"tenant": label, "label": name, "reads": reads},
+                                 {"tenant": label, "label": name, "reads": reads,
+                                  "writes": writes,
+                                  "models": request.form.get("models") == "ja"},
                                  action="tenant-recipe")
     return redirect(f"/zugaenge/integration?job={jid}")
 

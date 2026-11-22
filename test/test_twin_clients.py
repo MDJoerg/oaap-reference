@@ -135,24 +135,29 @@ ok("KÖDER eine Person (kein Maschinen-Prinzipal): 403", r.status_code == 403)
 print("=== OpenAPI ===")
 r = get("/twin/v1/openapi.json", "client:graph")
 d = r.get_json() or {}
-ok("OpenAPI 3.1, Bearer, Pfade /types, /openapi.json und die Lesewege der Stufen 1 und 2, nur seine Typen",
+ok("OpenAPI 3.1, Bearer, Pfade /types, /openapi.json die Lesewege der Stufen 1 und 2 und die Schreibwege der Stufe 3, nur seine Typen",
    r.status_code == 200 and d.get("openapi") == "3.1.0"
    and d["components"]["securitySchemes"]["bearer"]["scheme"] == "bearer"
    and set(d["paths"]) == {"/types", "/openapi.json", "/objects", "/objects/{id}",
                            "/objects/{id}/graph", "/paths", "/export", "/changes",
                            "/objects/{id}/periods", "/series", "/series/{id}/range",
-                           "/series/{id}/latest"}
+                           "/series/{id}/latest",
+                           # Stufe 3: die Schreibwege
+                           "/types", "/objects/by-key/{key}", "/objects/{id}/groups/{group}",
+                           "/objects/{id}/groups/{group}/periods", "/objects/{id}/retire",
+                           "/batch", "/webhooks", "/webhooks/{id}", "/webhooks/{id}/resume"}
    and d["x-oaap-types"] == [{"key": "FleetNode", "access": ["read"]}], d)
 
-print("=== ein Client schreibt nicht (Stufe 0) ===")
+print("=== ein Client schreibt nie über die Wege einer App (Stufe 3: nur über /twin/v1) ===")
 r = c.post("/twin/objects", headers={"X-OAAP-User": "client:graph"},
            json={"type": "FleetNode", "title": "x", "group": {"key": "oaap.software"}})
-ok("KÖDER Objekt anlegen: 403 mit Satz", r.status_code == 403
-   and "integration client reads only" in r.get_data(as_text=True), r.get_data(as_text=True))
+ok("KÖDER Objekt anlegen: 403 mit Satz, der auf /twin/v1 zeigt", r.status_code == 403
+   and "integration client writes through its own door /twin/v1" in r.get_data(as_text=True),
+   r.get_data(as_text=True))
 r = c.put("/twin/objects/urn:oaap:obj:00000000-0000-0000-0000-000000000000/groups/oaap.software",
           headers={"X-OAAP-User": "client:graph"}, json={"attributes": {}})
 ok("KÖDER Gruppe schreiben: 403 mit Satz", r.status_code == 403
-   and "reads only" in r.get_data(as_text=True), r.get_data(as_text=True))
+   and "/twin/v1" in r.get_data(as_text=True), r.get_data(as_text=True))
 r = c.post("/twin/points", headers={"X-OAAP-User": "client:graph"}, json={"points": []})
 ok("KÖDER Zeitreihenpunkte schreiben: 403", r.status_code == 403, r.get_data(as_text=True))
 

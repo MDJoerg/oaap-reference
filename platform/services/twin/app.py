@@ -103,6 +103,7 @@ import mcp_door
 import semantic
 import timeseries as ts
 import twin_read as tr
+import twin_sync as tsy
 import twin_values as tv
 import twin_write as tw
 
@@ -121,6 +122,13 @@ REMOTE_PREFIX = "remote:"
 # admin) bound them to. Written by appctl only; no secret in it.
 CLIENTS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-clients.json")
 CLIENT_PREFIX = "client:"
+# the tenants' labels (the namespace of a tenant's object types, RFC-0120 D9)
+# and whether a tenant's outbound traffic is closed (RFC-0068: no webhooks)
+TENANTS_FILE = os.path.join(PLATFORM_APPS_DIR, "tenants.json")
+# hosts a webhook may reach although they are not on the internet (a test
+# receiver in the LAN) -- the operator's setting, the same one hooks.py reads
+HOOK_ALLOW = tuple(h.strip().lower() for h in os.environ.get("OAAP_TWIN_HOOK_ALLOW", "")
+                   .split(",") if h.strip())
 API_VERSION = "v1"
 STORE_HOST = os.environ.get("STORE_HOST", "store")
 STORE_PORT = int(os.environ.get("STORE_PORT", "5432"))
@@ -192,14 +200,25 @@ def is_remote(name):
 
 
 def resolve_client(label):
-    """{'tenant', 'origin', 'reads'} of an integration client (RFC-0120), or None --
-    the same shape of trust as resolve_remote: the NAME from identity's
-    verification, the rest from a file only the operator's CLI writes."""
+    """{'tenant', 'origin', 'reads', 'writes', 'models'} of an integration
+    client (RFC-0120), or None -- the same shape of trust as resolve_remote:
+    the NAME from identity's verification, the rest from a file only the
+    host writes (the operator's CLI, the tenant admin's job). Stage 3:
+    `writes` (types it creates objects of and writes its own groups on) and
+    `models` (it may create types of its tenant, D8)."""
     c = (_load_json(CLIENTS_FILE, {}).get("clients") or {}).get(label)
     if not c or not c.get("tenant"):
         return None
     return {"tenant": c["tenant"], "origin": CLIENT_PREFIX + label,
-            "reads": [t for t in c.get("reads") or [] if isinstance(t, str)]}
+            "reads": [t for t in c.get("reads") or [] if isinstance(t, str)],
+            "writes": [t for t in c.get("writes") or [] if isinstance(t, str)],
+            "models": c.get("models") is True}
+
+
+def tenant_record(tenant_id):
+    """The tenant's record in tenants.json ({"tenants": {id: record}}, the
+    host's file) -- its label, whether its outbound traffic is closed."""
+    return tsy.tenant_of(_load_json(TENANTS_FILE, {}), tenant_id)
 
 
 def is_client(name):
@@ -207,7 +226,9 @@ def is_client(name):
 
 
 def reads_only(name):
-    """RFC-0120 stage 0: a client reads; writing comes with stage 3 (sync)."""
+    """Not for the app routes: a remote reader reads only (§2.14); an
+    integration client writes through its own door, /twin/v1 (RFC-0120
+    stage 3), never through an app's routes."""
     return is_remote(name) or is_client(name)
 
 
@@ -308,10 +329,10 @@ def _bindings(conn, instance):
                  "group_key": None, "declared_as": "remote reader"}
                 for t in r.get("reads") or []]
     if is_client(instance):
-        c = resolve_client(instance[len(CLIENT_PREFIX):]) or {}
-        return [{"type_key": t, "direction": "consumes", "role": None,
-                 "group_key": None, "declared_as": "integration client"}
-                for t in c.get("reads") or []]
+        c = resolve_client(instance[len(CLIENT_PREFIX):])
+        if c is None:
+            return []
+        return tsy.client_bindings(conn, c["tenant"], instance, c)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT type_key, direction, role, group_key, declared_as "
@@ -329,6 +350,9 @@ def _type_active(conn, tenant_id, type_key):
 
 
 _record_event = tw.record_event
+_NOT_HERE = ("a remote reader reads only (oaap.data.twin 0.4 §2.14); an integration client "
+             "writes through its own door /twin/v1 (RFC-0120 stage 3) -- these routes are "
+             "an app's")
 
 
 @app.errorhandler(tw.Refused)
@@ -372,6 +396,8 @@ def _row_open(row, at):
 # -------------------------------------------------------------- merge (D3)
 # The rules live in twin_write.py (one rule for the API and the fleet).
 _canonical_of = tw.canonical_of
+# the objects not retired (RFC-0120 stage 3) -- for the lists of now
+NOT_RETIRED = "id NOT IN (SELECT object_id FROM retirements)"
 
 
 def _aliases_of(conn, canonical_id):
@@ -408,6 +434,11 @@ def _load_object(conn, requested_id, at=None):
         cur.execute("SELECT * FROM objects WHERE id = %s", (canonical_id,))
         obj = cur.fetchone()
     if obj is None:
+        return None
+    # RFC-0120 stage 3: a retired object is gone from every current read; a
+    # read for a day before it was retired still sees it
+    when = tsy.retired_at(conn, canonical_id)
+    if when is not None and (at is None or when.date() <= at):
         return None
     with conn.cursor() as cur:
         cur.execute("SELECT object_id, group_key, origin FROM groups "
@@ -611,10 +642,13 @@ def openapi_doc(types):
             "/openapi.json": {"get": {"summary": "This document",
                                       "responses": {"200": {"description": "OpenAPI 3.1"}}}}},
         "x-oaap-types": [{"key": t["key"], "access": t["access"]} for t in types],
-        "x-oaap-stage": "RFC-0120 stage 2 -- reads, graph, export, change feed, "
-                        "periods and series; writing follows in stage 3",
+        "x-oaap-stage": "RFC-0120 stage 3 -- reads, graph, export, change feed, "
+                        "periods and series; types of the tenant, upsert by key, batch, "
+                        "retire, webhooks",
     }
     doc["paths"].update(_V1_READ_PATHS)
+    for path, ops in _V1_WRITE_PATHS.items():
+        doc["paths"].setdefault(path, {}).update(ops)
     return doc
 
 
@@ -700,6 +734,65 @@ _V1_READ_PATHS = {
         "parameters": [{"name": "id", "in": "path", "required": True,
                         "schema": {"type": "integer"}}],
         "responses": {"200": {"description": "{series, latest}"}}}},
+}
+
+
+def _p(name, kind="string"):
+    return {"name": name, "in": "path", "required": True, "schema": {"type": kind}}
+
+
+def _w(summary, desc, params=(), codes=None):
+    return {"summary": summary, "description": desc, "parameters": list(params),
+            "requestBody": {"content": {"application/json": {"schema": {"type": "object"}}}},
+            "responses": codes or {"200": {"description": "done"},
+                                   "400": {"description": "a request to fix, with a sentence"},
+                                   "403": {"description": "not this client's to write"},
+                                   "409": {"description": "in the way: retired, overlapping, "
+                                                          "registered otherwise"}}}
+
+
+_V1_WRITE_PATHS = {
+    "/types": {"post": _w(
+        "Register types of the tenant (needs 'models')",
+        "{object_type?: {key, title, semantic_id?}, on?: <type>, groups: [{key, title, "
+        "attributes: [{key, title, value_type, values?, unit?, periodic?, personal?}], "
+        "relations: [{key, title, to}]}]} -- the object type becomes t.<tenant>.<key>; "
+        "attribute, relation and group keys are reused when registered with the same "
+        "meaning; additive only; 201 when something was registered, else 200")},
+    "/objects/by-key/{key}": {
+        "put": _w("Create or find the object this client knows as {key}, write its groups",
+                  "{type, title, groups: {<group>: {attributes: {...}, relations: [{key, "
+                  "target | target_key}]}}} -- the first group of a new object is its "
+                  "owner's core group; a new title renames (owner only); 201 created, "
+                  "200 found", [_p("key")]),
+        "get": {"summary": "The object this client knows as {key}", "parameters": [_p("key")],
+                "responses": {"200": {"description": "the object"},
+                              "404": {"description": "none"}}}},
+    "/objects/{id}/groups/{group}": {"put": _w(
+        "Write this client's own group", "{attributes, relations} -- a group another origin "
+        "owns is refused with its owner's name", [_p("id"), _p("group")])},
+    "/objects/{id}/groups/{group}/periods": {"post": _w(
+        "Write one period of a periodic attribute into this client's own group",
+        "{attribute, value, valid_from, valid_to, unit?, source?, quality?}",
+        [_p("id"), _p("group")])},
+    "/objects/{id}/retire": {"post": _w(
+        "Retire an object this client owns", "{reason?} -- it stays in the history and "
+        "leaves every current read", [_p("id")])},
+    "/batch": {"post": _w(
+        "Several writes in one transaction, all or nothing",
+        "{id, operations: [{op: upsert|group|period|retire, ...}]} -- the same id again "
+        "answers the first run and writes nothing ('replayed': true)")},
+    "/webhooks": {
+        "post": _w("Register a webhook", "{url (https), types?, kinds?, own?} -- the answer "
+                   "carries the secret once; every POST is signed X-OAAP-Signature: "
+                   "t=<unix>,v1=hex(HMAC-SHA256(secret, '<t>.<body>'))",
+                   codes={"201": {"description": "{id, secret, ...}"}}),
+        "get": {"summary": "This client's webhooks and their state",
+                "responses": {"200": {"description": "{webhooks}"}}}},
+    "/webhooks/{id}": {"delete": {"summary": "Remove a webhook", "parameters": [
+        _p("id", "integer")], "responses": {"204": {"description": "removed"}}}},
+    "/webhooks/{id}/resume": {"post": _w(
+        "Resume a stopped webhook from where it stopped", "", [_p("id", "integer")])},
 }
 
 
@@ -985,6 +1078,139 @@ def v1_openapi():
     return jsonify(openapi_doc(types))
 
 
+# ------------------------------------------------ RFC-0120 stage 3: sync writes
+def v1_write(fn):
+    """The frame of every write of the door: an integration client only (an
+    app writes through its own routes, a remote reader reads), its tenant's
+    connection, one transaction -- a refusal anywhere rolls all of it back
+    and answers its sentence as JSON."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        caller, err, code = require_caller()
+        if err:
+            return jsonify({"error": err}), code
+        name, tenant_id, origin = caller
+        if not is_client(name):
+            return jsonify({"error": "the writes of /twin/v1 are an integration client's; an "
+                                     "app writes through /twin/objects, a remote reader "
+                                     "reads only"}), 403
+        conn = get_conn(tenant_id)
+        if conn is None:
+            return jsonify({"error": "this tenant has no twin yet"}), 409
+        try:
+            with conn:
+                door = tsy.Door(conn, tenant_id, name, origin, _bindings(conn, name))
+                return fn(door, *a, **k)
+        except tw.Refused as e:
+            return jsonify({"error": str(e)}), e.code
+        except (tr.Bad, tv.Wrong) as e:
+            return jsonify({"error": str(e)}), 400
+        finally:
+            conn.close()
+    return wrapper
+
+
+def _body():
+    b = request.get_json(silent=True)
+    if not isinstance(b, dict):
+        raise tw.Refused("the body is a JSON object", 400)
+    return b
+
+
+@app.post("/twin/v1/types")
+@v1_write
+def v1_create_types(door):
+    """Types of the tenant (D8, D9): a client with `models` registers an object
+    type `t.<tenant>.<Key>` with its groups, or adds groups to a type it
+    writes. Additive only; the same body again changes nothing."""
+    c = resolve_client(door.principal[len(CLIENT_PREFIX):]) or {}
+    if not c.get("models"):
+        raise tw.Refused(f"'{door.principal}' may not create types -- the tenant admin gives "
+                         "a client 'models' (RFC-0120 D8)", 403)
+    label = tenant_record(door.tenant_id).get("label") or door.tenant_id
+    res = tsy.create_types(door.conn, door.tenant_id, label, door.principal, _body(),
+                           lambda t: t in door.writable)
+    return jsonify(res), (201 if res["created"] else 200)
+
+
+@app.put("/twin/v1/objects/by-key/<path:key>")
+@v1_write
+def v1_upsert(door, key):
+    res = door.upsert(key, _body())
+    return jsonify(res), (201 if res["created"] else 200)
+
+
+@app.get("/twin/v1/objects/by-key/<path:key>")
+@v1_write
+def v1_by_key(door, key):
+    oid, _o = door.resolve(None, key=key)
+    snap = tr.Snapshot(door.conn, door.readable, None)
+    if oid not in snap.objects:
+        return jsonify({"error": "no such object, or not of a type this key may read"}), 404
+    return jsonify(dict(snap.obj(oid, snap.groups([oid])[oid]), at=snap.stamp(), key=key))
+
+
+@app.put("/twin/v1/objects/<oid>/groups/<group_key>")
+@v1_write
+def v1_write_group(door, oid, group_key):
+    i, o = door.resolve(oid)
+    if not tr.GROUP_RE.match(group_key):
+        raise tw.Refused("malformed group key", 400)
+    return jsonify({"id": tr.urn(i), "written": door.write_group(i, o, group_key, _body())})
+
+
+@app.post("/twin/v1/objects/<oid>/groups/<group_key>/periods")
+@v1_write
+def v1_write_period(door, oid, group_key):
+    i, o = door.resolve(oid)
+    if not tr.GROUP_RE.match(group_key):
+        raise tw.Refused("malformed group key", 400)
+    res = door.write_period(i, o, group_key, _body())
+    return jsonify(res), (201 if res["written"] else 200)
+
+
+@app.post("/twin/v1/objects/<oid>/retire")
+@v1_write
+def v1_retire(door, oid):
+    i, o = door.resolve(oid)
+    b = request.get_json(silent=True) or {}
+    return jsonify(door.retire(i, o, b.get("reason") if isinstance(b, dict) else ""))
+
+
+@app.post("/twin/v1/batch")
+@v1_write
+def v1_batch(door):
+    b = _body()
+    return jsonify(door.batch(b.get("id"), b.get("operations")))
+
+
+@app.post("/twin/v1/webhooks")
+@v1_write
+def v1_add_hook(door):
+    closed = tsy.egress_closed(tenant_record(door.tenant_id))
+    res = tsy.add_hook(door.conn, door.principal, door.readable, _body(), HOOK_ALLOW, closed)
+    return jsonify(res), 201
+
+
+@app.get("/twin/v1/webhooks")
+@v1_write
+def v1_hooks(door):
+    return jsonify({"webhooks": tsy.hooks_of(door.conn, door.principal)})
+
+
+@app.delete("/twin/v1/webhooks/<int:hid>")
+@v1_write
+def v1_remove_hook(door, hid):
+    tsy.remove_hook(door.conn, door.principal, hid)
+    return "", 204
+
+
+@app.post("/twin/v1/webhooks/<int:hid>/resume")
+@v1_write
+def v1_resume_hook(door, hid):
+    return jsonify(tsy.resume_hook(door.conn, door.principal, hid))
+
+
 @app.post("/twin/objects")
 def create_object():
     caller, err, code = require_caller()
@@ -992,9 +1218,7 @@ def create_object():
         return err, code
     name, tenant_id, origin = caller
     if reads_only(name):
-        return ("a remote reader or integration client reads only (oaap.data.twin 0.4 "
-                "§2.14, RFC-0120 stage 0) -- writing belongs to an app on the node that "
-                "holds the data"), 403
+        return _NOT_HERE, 403
     body = request.get_json(silent=True) or {}
     type_key = (body.get("type") or "").strip()
     title = (body.get("title") or "").strip()
@@ -1157,9 +1381,7 @@ def write_group(obj_id, group_key):
         return err, code
     name, tenant_id, origin = caller
     if reads_only(name):
-        return ("a remote reader or integration client reads only (oaap.data.twin 0.4 "
-                "§2.14, RFC-0120 stage 0) -- writing belongs to an app on the node that "
-                "holds the data"), 403
+        return _NOT_HERE, 403
     m = OBJ_ID_RE.match(obj_id)
     if not m or not KEY_RE.match(group_key.replace(".", "")):
         return "malformed object id or group key", 400
@@ -1203,8 +1425,7 @@ def write_period(obj_id, group_key):
         return err, code
     name, tenant_id, origin = caller
     if reads_only(name):
-        return ("a remote reader or integration client reads only (RFC-0120: writing "
-                "comes with stage 3)"), 403
+        return _NOT_HERE, 403
     m = OBJ_ID_RE.match(obj_id)
     if not m or not tr.GROUP_RE.match(group_key):
         return "malformed object id or group key", 400
@@ -1330,7 +1551,7 @@ class _McpStore:
                     cur.execute(
                         "SELECT id, type_key, title, owner_origin FROM objects WHERE "
                         "id NOT IN (SELECT alias_id FROM aliases WHERE unmerged_at IS NULL)"
-                        + where + like + " ORDER BY title, id LIMIT %s OFFSET %s",
+                        " AND " + NOT_RETIRED + where + like + " ORDER BY title, id LIMIT %s OFFSET %s",
                         ((type_key,) if type_key else ()) + (*pats, limit, offset))
                     rows = cur.fetchall()
         finally:
@@ -1474,7 +1695,8 @@ def twin_objects_by_type():
                 cur.execute(
                     "SELECT id, title, owner_origin FROM objects WHERE "
                     "type_key = %s AND id NOT IN (SELECT alias_id FROM "
-                    "aliases WHERE unmerged_at IS NULL) ORDER BY title",
+                    "aliases WHERE unmerged_at IS NULL) AND " + NOT_RETIRED +
+                    " ORDER BY title",
                     (type_key,))
                 rows = cur.fetchall()
     finally:
@@ -1702,7 +1924,7 @@ def twin_candidates():
                 cur.execute(
                     "SELECT id, type_key, title, owner_origin FROM objects "
                     "WHERE id NOT IN (SELECT alias_id FROM aliases WHERE "
-                    "unmerged_at IS NULL) ORDER BY title")
+                    "unmerged_at IS NULL) AND " + NOT_RETIRED + " ORDER BY title")
                 rows = cur.fetchall()
     finally:
         conn.close()
@@ -2139,6 +2361,29 @@ def twin_create_type():
     finally:
         conn.close()
     return jsonify({"key": group_key}), 201
+
+
+@app.get("/internal/twin/webhooks")
+def twin_webhooks_person():
+    """The webhooks of the tenant's clients with their state -- the portal's
+    page *Integration* (RFC-0120 stage 3: "stops after a limit, which the
+    portal shows"). Never a secret."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    _u, tenant_id, roles = person
+    if not (roles & {"admin", "tenant_admin", "server_admin"}):
+        return "the webhooks of the clients are the tenant admin's page", 403
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return jsonify({"webhooks": []})
+    try:
+        with conn:
+            return jsonify({"webhooks": tsy.hooks_of(conn)})
+    except psycopg2.errors.UndefinedTable:
+        return jsonify({"webhooks": []})
+    finally:
+        conn.close()
 
 
 # ============================================================ outbox (0.3)

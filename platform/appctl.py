@@ -12982,11 +12982,13 @@ def tenant_recipe_job(req, act_tenant, role, actor):
                 active = {t["key"] for t in model_types(tid)}
             except SystemExit:
                 return False, "the tenant's types could not be read: " + (LAST_DIE or "?"), {}
-            why = twin_client_problem(name, tid, str(a.get("reads") or ""), active)
+            writes, models = str(a.get("writes") or ""), a.get("models") is True
+            why = twin_client_problem(name, tid, str(a.get("reads") or ""), active, writes,
+                                      models)
             if why:
                 return False, why, {}
             twin_client_add(name, tid, str(a.get("reads") or ""), who=actor,
-                            active_types=active, issue=False)
+                            active_types=active, issue=False, writes=writes, models=models)
             return True, (f"Client „{name}“ angelegt. Den Schlüssel stellst du jetzt auf "
                           "dieser Seite aus -- er wird genau einmal gezeigt."), {"client": name}
         elif op in ("release", "unrelease"):
@@ -17525,6 +17527,60 @@ def _twin_ensure_tables(schema):
             ON "{schema}".periods (object_id, group_key, attr_key, valid_from);
         CREATE OR REPLACE VIEW "{schema}".current_periods AS
             SELECT * FROM "{schema}".periods WHERE superseded_by IS NULL;
+        -- Modelling and sync (RFC-0120 stage 3, oaap.data.twin 0.13 §2.22-2.25).
+        -- 'retirements': the owner ends an object -- it stays in the history,
+        -- leaves every current read and is never written again (one row per
+        -- object; append-only, nothing is deleted). 'renames': the old title
+        -- of every rename by the owner, so a read with an earlier 'at' answers
+        -- the title of then (objects.title holds the current one).
+        CREATE TABLE IF NOT EXISTS "{schema}".retirements (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL UNIQUE REFERENCES "{schema}".objects(id),
+            origin text NOT NULL,
+            reason text,
+            retired_at timestamptz NOT NULL DEFAULT now(),
+            retired_by text NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS "{schema}".renames (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL REFERENCES "{schema}".objects(id),
+            old_title text NOT NULL,
+            new_title text NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            recorded_by text NOT NULL
+        );
+        -- 'batches': the answer of every batch a client ran, under the id it
+        -- chose -- the same id again answers this and writes nothing.
+        CREATE TABLE IF NOT EXISTS "{schema}".batches (
+            principal text NOT NULL,
+            batch_id text NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            result jsonb NOT NULL,
+            PRIMARY KEY (principal, batch_id)
+        );
+        -- 'webhooks': a client's URL for the changes it may read (delivered by
+        -- services/twin/hooks.py). Bookkeeping, not twin data, and therefore
+        -- UPDATEd like relay_watermark: the cursor (the last event id
+        -- delivered), failures, the last answer; removal sets removed_at.
+        -- The secret signs every POST; it was shown to the client once.
+        CREATE TABLE IF NOT EXISTS "{schema}".webhooks (
+            id bigserial PRIMARY KEY,
+            principal text NOT NULL,
+            url text NOT NULL,
+            types text[] NOT NULL DEFAULT '{{}}',
+            kinds text[] NOT NULL DEFAULT '{{}}',
+            own boolean NOT NULL DEFAULT false,
+            secret text NOT NULL,
+            cursor bigint NOT NULL DEFAULT 0,
+            delivered bigint NOT NULL DEFAULT 0,
+            failures integer NOT NULL DEFAULT 0,
+            last_ok_at timestamptz,
+            last_error text,
+            next_try_at timestamptz,
+            stopped_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            removed_at timestamptz
+        );
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS
@@ -19574,35 +19630,45 @@ def twin_reader_add(label, tid, reads, days=None, who="root", active_types=None)
     return res["secret"], res["expires"]
 
 
-def twin_client_problem(label, tid, reads, active_types):
-    """'' or the sentence why this client cannot be made (RFC-0120 stage 0)."""
+def _type_list(raw):
+    return sorted({t.strip() for t in (raw or "").split(",") if t.strip()})
+
+
+def twin_client_problem(label, tid, reads, active_types, writes="", models=False):
+    """'' or the sentence why this client cannot be made (RFC-0120 stage 0;
+    stage 3: `writes` -- the types it creates objects of and writes its own
+    groups on, `models` -- it may create types of its tenant, D8)."""
     if not re.fullmatch(DEST_NAME_RE, label or ""):
         return ("a client label is [a-z0-9-], 2-40 characters, starting and "
                 "ending with a letter or digit")
-    types = sorted({t.strip() for t in (reads or "").split(",") if t.strip()})
-    if not types:
-        return "name the types this client may read -- there is no default (RFC-0120)"
+    types = _type_list(reads)
+    wtypes = _type_list(writes)
+    if not types and not wtypes and not models:
+        return ("name the types this client may read or write, or let it model -- "
+                "there is no default (RFC-0120)")
     if label in load_twin_clients():
         return f"an integration client '{label}' exists -- remove it first"
-    missing = [t for t in types if t not in active_types]
+    missing = [t for t in types + wtypes if t not in active_types]
     if missing:
-        return ("not active for this tenant: " + ", ".join(missing) + " (active: "
+        return ("not active for this tenant: " + ", ".join(sorted(set(missing))) + " (active: "
                 + (", ".join(sorted(active_types)) or "none") + ")")
     return ""
 
 
-def twin_client_add(label, tid, reads, days=None, who="root", active_types=None, issue=True):
+def twin_client_add(label, tid, reads, days=None, who="root", active_types=None, issue=True,
+                    writes="", models=False):
     """RFC-0120 stage 0: `client:<label>` in tenant `tid`, reading exactly
-    `reads`. With `issue`, also a key scoped to the twin -> (secret, expires);
-    without (the portal's way), ('', '') -- the tenant admin then issues the
-    key in the portal straight from identity, shown once, never through a
-    job's files."""
+    `reads` (stage 3: writing `writes`, modelling with `models`). With
+    `issue`, also a key scoped to the twin -> (secret, expires); without (the
+    portal's way), ('', '') -- the tenant admin then issues the key in the
+    portal straight from identity, shown once, never through a job's files."""
     if active_types is None:
         active_types = {t["key"] for t in model_types(tid)}
-    why = twin_client_problem(label, tid, reads, active_types)
+    why = twin_client_problem(label, tid, reads, active_types, writes, models)
     if why:
         die(why)
-    types = sorted({t.strip() for t in (reads or "").split(",") if t.strip()})
+    wtypes = _type_list(writes)
+    types = sorted(set(_type_list(reads)) | set(wtypes))
     principal = TWIN_CLIENT_PREFIX + label
     out = _identity_exec(
         "import json, os, app as m\n"
@@ -19632,7 +19698,7 @@ def twin_client_add(label, tid, reads, days=None, who="root", active_types=None,
         {"OAAP_R_NAME": principal, "OAAP_R_TENANT": tid, "OAAP_R_ISSUE": "1" if issue else "0",
          "OAAP_R_TITLE": f"integration client {label}",
          "OAAP_R_SCOPE": TWIN_KEY_SCOPE,
-         "OAAP_R_LABEL": f"oaap.data.twin integration client ({','.join(types)})",
+         "OAAP_R_LABEL": f"oaap.data.twin integration client ({','.join(types) or 'models'})",
          "OAAP_R_DAYS": str(days or "")})
     res = json.loads(out.strip().splitlines()[-1])
     if res.get("error"):
@@ -19640,9 +19706,15 @@ def twin_client_add(label, tid, reads, days=None, who="root", active_types=None,
     clients = load_twin_clients()
     clients[label] = {"tenant": tid, "reads": types, "created": _iso_now(),
                       "created_by": who, "key": res["id"], "expires": res["expires"]}
+    if wtypes:
+        clients[label]["writes"] = wtypes
+    if models:
+        clients[label]["models"] = True
     save_twin_clients(clients)
     audit_tenant("twin.client.add", tid, subject=principal, who=who,
-                 detail="reads " + ",".join(types) + f", key {res['id']}")
+                 detail="reads " + (",".join(types) or "-")
+                 + (f", writes {','.join(wtypes)}" if wtypes else "")
+                 + (", models" if models else "") + f", key {res['id']}")
     return res["secret"], res["expires"]
 
 
@@ -19818,8 +19890,10 @@ def cmd_data_twin(args):
             return
         for label, c in sorted(clients.items()):
             print(f"  {TWIN_CLIENT_PREFIX}{label:<20} tenant {tenant_label(c['tenant']) or 'default'}"
-                  f"  reads {','.join(c.get('reads') or [])}  key {c.get('key', '?')} "
-                  f"until {c.get('expires', '?')}")
+                  f"  reads {','.join(c.get('reads') or []) or '-'}"
+                  + (f"  writes {','.join(c['writes'])}" if c.get("writes") else "")
+                  + ("  models" if c.get("models") else "")
+                  + f"  key {c.get('key', '?')} until {c.get('expires', '?')}")
         return
     if args.action in ("add-client", "remove-client"):
         label = args.arg1 or die(f"'data twin {args.action}' needs a client label")
@@ -19832,9 +19906,12 @@ def cmd_data_twin(args):
             die("this node's twin is not running (profile 'store') -- nothing to read")
         tid = resolve_tenant_arg(args.tenant) or die(
             "add-client needs --tenant (the tenant whose twin it reads)")
-        key, expires = twin_client_add(label, tid, args.reads, args.days, who=who)
-        print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' reads {args.reads} of "
-              f"tenant '{tenant_label(tid) or tid}' (RFC-0120; reading only until stage 3).")
+        key, expires = twin_client_add(label, tid, args.reads, args.days, who=who,
+                                       writes=args.writes, models=args.models)
+        print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' reads {args.reads or '-'}"
+              + (f", writes {args.writes}" if args.writes else "")
+              + (", models types of its tenant" if args.models else "")
+              + f" of tenant '{tenant_label(tid) or tid}' (RFC-0120).")
         print(f"Its key, shown ONCE (valid until {expires}) -- for the program, never for an app:")
         print("")
         print(f"  {key}")
@@ -41846,6 +41923,11 @@ def build_parser():
                           "comma-separated (oaap.data.twin 2.14)")
     pdt.add_argument("--days", type=int, default=None,
                      help="twin add-reader: key validity in days (default 90, max 365)")
+    pdt.add_argument("--writes", default="",
+                     help="twin add-client: the type keys it creates objects of and writes "
+                          "its own groups on, comma-separated (RFC-0120 stage 3)")
+    pdt.add_argument("--models", action="store_true",
+                     help="twin add-client: it may create types of its tenant (RFC-0120 D8)")
     pdt.set_defaults(fn=cmd_data)
     pe = sub.add_parser("external",
                         help="the node's public hostname and TLS, also behind an edge (RFC-0006)")

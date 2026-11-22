@@ -281,11 +281,41 @@ services:
       # stored as 'oaap-aas:...', expanded with this on the way out; empty =
       # https://objid.info/oaap/aas (semantic.py). Changing it moves no row.
       OAAP_SEMANTIC_BASE: "${OAAP_SEMANTIC_BASE:-}"
+      # RFC-0120 stage 3: hosts a webhook may name although they are not on
+      # the internet (the same setting the 'hooks' service reads)
+      OAAP_TWIN_HOOK_ALLOW: "${OAAP_TWIN_HOOK_ALLOW:-}"
     volumes:
       # registry.json (whose tenant/app owns which instance) and
       # twin-secrets.json (the per-tenant schema role/password, written
       # by appctl, read by nobody else) -- both read-only, same posture
       # as identity's own '/platform-apps' mount.
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+
+  # Webhook delivery (RFC-0120 stage 3, oaap.data.twin 0.13 §2.25) -- the
+  # 'twin' image with a different command (services/twin/hooks.py), the same
+  # profile as the twin: it posts the changes an integration client may read
+  # to the URL the client registered, signed, in order, with retries. Only to
+  # hosts on the internet; OAAP_TWIN_HOOK_ALLOW names the exceptions (a test
+  # receiver in the LAN, comma-separated host names or addresses). No port,
+  # no gateway route -- it only ever calls out.
+  hooks:
+    build: ./services/twin
+    profiles: ["store"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["python", "-u", "hooks.py"]
+    depends_on:
+      - store
+    environment:
+      OAAP_TWIN_HOOK_ALLOW: "${OAAP_TWIN_HOOK_ALLOW:-}"
+    volumes:
+      # twin-secrets.json (the tenants' schema roles), twin-clients.json (what
+      # a client may read now) and tenants.json (a closed tenant posts
+      # nothing) -- read-only, the twin's own mount
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
 
   # The MQTT broker (oaap.events.broker 0.1, RFC-0032 D2) -- gated by the

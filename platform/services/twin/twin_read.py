@@ -234,9 +234,13 @@ class Snapshot:
                 cur.execute("SELECT alias_id, canonical_id FROM aliases WHERE merged_at <= %s "
                             "AND (unmerged_at IS NULL OR unmerged_at > %s)", (at, at))
             self.alias = {str(r["alias_id"]): str(r["canonical_id"]) for r in cur.fetchall()}
-            cur.execute("SELECT id, type_key, title, owner_origin FROM objects "
-                        "WHERE type_key = ANY(%s) AND recorded_at <= %s",
-                        (self.types, self.moment))
+            # RFC-0120 stage 3: an object retired by then is gone; a title
+            # renamed after the moment answers as it was then
+            cur.execute("SELECT id, type_key, title, owner_origin FROM objects o "
+                        "WHERE type_key = ANY(%s) AND recorded_at <= %s AND NOT EXISTS "
+                        "(SELECT 1 FROM retirements x WHERE x.object_id = o.id "
+                        "AND x.retired_at <= %s)",
+                        (self.types, self.moment, self.moment))
             self.objects = {}
             for r in cur.fetchall():
                 i = str(r["id"])
@@ -244,6 +248,13 @@ class Snapshot:
                     continue
                 self.objects[i] = {"type": r["type_key"], "title": r["title"],
                                    "owner": r["owner_origin"]}
+            if at is not None:
+                cur.execute("SELECT DISTINCT ON (object_id) object_id, old_title FROM renames "
+                            "WHERE recorded_at > %s ORDER BY object_id, id", (at,))
+                for r in cur.fetchall():
+                    o = self.objects.get(str(r["object_id"]))
+                    if o is not None:
+                        o["title"] = r["old_title"]
 
     def canonical(self, i):
         seen = set()
