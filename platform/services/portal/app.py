@@ -5702,6 +5702,19 @@ wieder aufnimmt.</p>
 {% if h.last_error %}<br><span class="muted">{{ h.last_error }}</span>{% endif %}</td>
 <td>{{ h.delivered }}</td><td>{{ (h.last_ok or '–')[:16]|replace('T', ' ') }}</td></tr>
 {% endfor %}</table></div>{% endif %}
+{% if receivers %}<div class="card">
+<h2>Eingehende Webhooks</h2>
+<p class="muted">Ein System, das nur Webhooks kann, schickt seine Änderungen an einen Empfänger
+eines Clients. Die Zuordnung macht daraus Schreibschritte mit den Rechten des Clients -- dieselbe
+Schreibregel, alles oder nichts. Der Client legt Empfänger über <code>/twin/v1/receivers</code> an.</p>
+<table><tr><th>Client</th><th>Empfänger</th><th>Zustand</th><th>empfangen</th><th>abgewiesen</th><th>zuletzt</th></tr>
+{% for r in receivers %}<tr><td><code>{{ r.client }}</code></td><td><code>{{ r.url }}</code>
+<br><span class="muted">Signatur {{ r.signature.scheme }}{% if r.signature.header %} ({{ r.signature.header }}){% endif %}</span></td>
+<td>{% if r.state == 'failing' %}<strong>Fehler</strong>{% else %}bereit{% endif %}
+{% if r.state == 'failing' and r.last_error %}<br><span class="muted">{{ r.last_error }}</span>{% endif %}</td>
+<td>{{ r.received }} ({{ r.written }} Schritte)</td><td>{{ r.refused }}</td>
+<td>{{ (r.last_ok_at or '–')[:16]|replace('T', ' ') }}</td></tr>
+{% endfor %}</table></div>{% endif %}
 <div class="card">
 <h2>Neuer Client</h2>
 <form method="post" action="/zugaenge/integration/neu">
@@ -5752,16 +5765,21 @@ def _integration_job(rid):
             "message": res.get("message", "")}
 
 
-def _integration_hooks(tid):
-    """The webhooks of this tenant's clients (twin '/internal/twin/webhooks',
-    RFC-0120 stage 3), or [] when the twin does not answer."""
+def _integration_twin(tid, what):
+    """The webhooks (RFC-0120 stage 3) or receivers (D13) of this tenant's
+    clients (twin '/internal/twin/<what>'), or [] when the twin does not
+    answer."""
     try:
-        r = TWIN_INTERNAL.get(f"{TWIN}/internal/twin/webhooks", timeout=4, headers={
+        r = TWIN_INTERNAL.get(f"{TWIN}/internal/twin/{what}", timeout=4, headers={
             "X-OAAP-Person-User": caller_name(), "X-OAAP-Person-Tenant": tid,
             "X-OAAP-Person-Roles": ",".join(caller_roles())})
-        return (r.json() or {}).get("webhooks") or [] if r.status_code == 200 else []
+        return (r.json() or {}).get(what) or [] if r.status_code == 200 else []
     except (requests.RequestException, ValueError):
         return []
+
+
+def _integration_hooks(tid):
+    return _integration_twin(tid, "webhooks")
 
 
 @app.get("/zugaenge/integration")
@@ -5770,8 +5788,12 @@ def integration_page():
     if sc is None:
         return _recipe_denied()
     tid, label, _role = sc
+    clients = _integration_clients(tid)
+    known = {c["label"] for c in clients}
     return page(INTEGRATION_BODY, "Integration", "keys", label=label,
-                clients=_integration_clients(tid), hooks=_integration_hooks(tid),
+                clients=clients, hooks=_integration_hooks(tid),
+                receivers=[r for r in _integration_twin(tid, "receivers")
+                           if r.get("client") in known],
                 job=_integration_job(request.args.get("job", "")))
 
 

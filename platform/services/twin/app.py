@@ -102,6 +102,7 @@ import fleet_affected
 import mcp_door
 import semantic
 import timeseries as ts
+import twin_inbound as tsi
 import twin_read as tr
 import twin_sync as tsy
 import twin_values as tv
@@ -644,7 +645,7 @@ def openapi_doc(types):
         "x-oaap-types": [{"key": t["key"], "access": t["access"]} for t in types],
         "x-oaap-stage": "RFC-0120 stage 3 -- reads, graph, export, change feed, "
                         "periods and series; types of the tenant, upsert by key, batch, "
-                        "retire, webhooks",
+                        "retire, webhooks; receivers for inbound webhooks (D13)",
     }
     doc["paths"].update(_V1_READ_PATHS)
     for path, ops in _V1_WRITE_PATHS.items():
@@ -793,6 +794,27 @@ _V1_WRITE_PATHS = {
         _p("id", "integer")], "responses": {"204": {"description": "removed"}}}},
     "/webhooks/{id}/resume": {"post": _w(
         "Resume a stopped webhook from where it stopped", "", [_p("id", "integer")])},
+    "/receivers": {
+        "post": _w("Register a receiver for inbound webhooks (D13)",
+                   "{name, signature?: {scheme: oaap|hmac-sha256|token, header?, prefix?}, "
+                   "mapping: {id?, items?, rules: [{when?, upsert | retire}]}} -- the answer "
+                   "carries the receiver's URL and its secret once",
+                   codes={"201": {"description": "{name, url, secret, ...}"}}),
+        "get": {"summary": "This client's receivers and their state",
+                "responses": {"200": {"description": "{receivers}"}}}},
+    "/receivers/{name}": {
+        "put": _w("Replace a receiver's mapping (the secret stays)",
+                  "{signature?, mapping}", [_p("name")]),
+        "delete": {"summary": "Remove a receiver", "parameters": [_p("name")],
+                   "responses": {"204": {"description": "removed"}}}},
+    "/inbound/{client}/{name}": {"post": {
+        "summary": "Where the sending system posts -- no key, the receiver's signature",
+        "security": [], "parameters": [_p("client"), _p("name")],
+        "responses": {"200": {"description": "{batch, replayed, operations, skipped}"},
+                      "401": {"description": "signature"},
+                      "404": {"description": "no such receiver"},
+                      "422": {"description": "the mapping or the write rule refused it; "
+                                             "nothing written"}}}},
 }
 
 
@@ -1209,6 +1231,107 @@ def v1_remove_hook(door, hid):
 @v1_write
 def v1_resume_hook(door, hid):
     return jsonify(tsy.resume_hook(door.conn, door.principal, hid))
+
+
+# ------------------------------------- RFC-0120 D13: inbound webhooks (0.14 §2.26)
+def _may_receive(door):
+    c = resolve_client(door.principal[len(CLIENT_PREFIX):]) or {}
+    if not (c.get("writes") or c.get("models")):
+        raise tw.Refused(f"'{door.principal}' writes nothing -- a receiver writes as its "
+                         "client, so the tenant admin gives it 'writes' first", 403)
+
+
+@app.post("/twin/v1/receivers")
+@v1_write
+def v1_add_receiver(door):
+    _may_receive(door)
+    return jsonify(tsi.add(door.conn, door.principal, door.writable, _body())), 201
+
+
+@app.get("/twin/v1/receivers")
+@v1_write
+def v1_receivers(door):
+    return jsonify({"receivers": tsi.receivers_of(door.conn, door.principal)})
+
+
+@app.put("/twin/v1/receivers/<name>")
+@v1_write
+def v1_replace_receiver(door, name):
+    _may_receive(door)
+    return jsonify(tsi.replace(door.conn, door.principal, door.writable, name, _body()))
+
+
+@app.delete("/twin/v1/receivers/<name>")
+@v1_write
+def v1_remove_receiver(door, name):
+    tsi.remove(door.conn, door.principal, name)
+    return "", 204
+
+
+@app.post("/twin/v1/inbound/<label>/<name>")
+def v1_inbound(label, name):
+    """Where a system that only speaks webhooks posts. No key: the gateway
+    passes this path unverified with every identity header stripped
+    (Caddyfile), and only the receiver's signature counts. The body becomes
+    a batch under the client's rights and origin; the delivery id names it."""
+    nothing = jsonify({"error": "no such receiver"}), 404
+    if not tsi.NAME_RE.match(name) or not re.match(r"^[a-z0-9][a-z0-9-]{0,62}$", label):
+        return nothing
+    if (request.content_length or 0) > tsi.BODY_MAX:
+        return jsonify({"error": f"a delivery is at most {tsi.BODY_MAX // 1024} KB"}), 413
+    raw = request.get_data(cache=False)
+    if len(raw) > tsi.BODY_MAX:
+        return jsonify({"error": f"a delivery is at most {tsi.BODY_MAX // 1024} KB"}), 413
+    client = resolve_client(label)
+    if client is None:
+        return nothing
+    principal = CLIENT_PREFIX + label
+    conn = get_conn(client["tenant"])
+    if conn is None:
+        return nothing
+    try:
+        with conn:
+            rec = tsi.find(conn, principal, name)
+        if rec is None:
+            return nothing
+        if not tsi.check_signature(rec, request.headers, raw):
+            with conn:
+                tsi.note(conn, rec["id"], refused=True)
+            return jsonify({"error": "the signature does not fit"}), 401
+        try:
+            root = json.loads(raw)
+        except ValueError:
+            with conn:
+                tsi.note(conn, rec["id"], error="the body is not JSON")
+            return jsonify({"error": "the body is not JSON"}), 400
+        bid = f"in:{name}:{tsi.delivery_id(rec['mapping'], raw, root, request.headers)}"
+        try:
+            with conn:
+                ops, skipped = tsi.operations(rec["mapping"], root)
+                if ops:
+                    door = tsy.Door(conn, client["tenant"], principal, client["origin"],
+                                    _bindings(conn, principal))
+                    res = door.batch(bid, ops)
+                else:
+                    res = {"replayed": False}
+        except tw.Refused as e:
+            msg = str(e)
+        except (tr.Bad, tv.Wrong) as e:
+            msg = str(e)
+        else:
+            msg = None
+        if msg is not None:
+            with conn:
+                tsi.note(conn, rec["id"], error=msg)
+            return jsonify({"error": msg}), 422
+        with conn:
+            tsi.note(conn, rec["id"], written=0 if res.get("replayed") else len(ops))
+        return jsonify({"batch": bid if ops else None, "replayed": bool(res.get("replayed")),
+                        "operations": len(ops), "skipped": skipped})
+    except psycopg2.errors.UndefinedTable:
+        return nothing
+    finally:
+        conn.close()
 
 
 @app.post("/twin/objects")
@@ -2382,6 +2505,28 @@ def twin_webhooks_person():
             return jsonify({"webhooks": tsy.hooks_of(conn)})
     except psycopg2.errors.UndefinedTable:
         return jsonify({"webhooks": []})
+    finally:
+        conn.close()
+
+
+@app.get("/internal/twin/receivers")
+def twin_receivers_person():
+    """The receivers of the tenant's clients with their state -- the portal's
+    page *Integration* (RFC-0120 D13). Never a secret."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    _u, tenant_id, roles = person
+    if not (roles & {"admin", "tenant_admin", "server_admin"}):
+        return "the receivers of the clients are the tenant admin's page", 403
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return jsonify({"receivers": []})
+    try:
+        with conn:
+            return jsonify({"receivers": tsi.receivers_of(conn)})
+    except psycopg2.errors.UndefinedTable:
+        return jsonify({"receivers": []})
     finally:
         conn.close()
 

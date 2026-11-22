@@ -17581,6 +17581,32 @@ def _twin_ensure_tables(schema):
             created_at timestamptz NOT NULL DEFAULT now(),
             removed_at timestamptz
         );
+        -- 'receivers': inbound webhooks (oaap.data.twin 0.14 §2.26, RFC-0120
+        -- D13) -- a client's named door for a system that only speaks
+        -- webhooks, with the signature it checks and the mapping that turns
+        -- a body into a batch. Bookkeeping like 'webhooks': counters and the
+        -- last answer are UPDATEd; removal sets removed_at. The secret was
+        -- shown to the client once.
+        CREATE TABLE IF NOT EXISTS "{schema}".receivers (
+            id bigserial PRIMARY KEY,
+            principal text NOT NULL,
+            name text NOT NULL,
+            scheme text NOT NULL,
+            header text,
+            prefix text,
+            secret text NOT NULL,
+            mapping jsonb NOT NULL,
+            received bigint NOT NULL DEFAULT 0,
+            written bigint NOT NULL DEFAULT 0,
+            refused bigint NOT NULL DEFAULT 0,
+            last_ok_at timestamptz,
+            last_error text,
+            last_error_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            removed_at timestamptz
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS receivers_live
+            ON "{schema}".receivers (principal, name) WHERE removed_at IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS

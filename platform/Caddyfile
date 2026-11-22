@@ -195,6 +195,26 @@
 	# (CURRENT_STATE 125), by testing the very thing the comment here
 	# used to claim was safe. 'oaap.twin' can never collide with a real
 	# app name (app.id is '[a-z0-9][a-z0-9-]{1,38}[a-z0-9]', never a dot).
+	# Inbound webhooks (oaap.data.twin 0.14 §2.26, RFC-0120 D13): a system
+	# that only speaks webhooks holds no OAAP key, so this one path under
+	# '/twin/*' is passed WITHOUT forward_auth. Every identity header is
+	# stripped, so nothing a sender writes can pose as the gateway; the twin
+	# trusts only the receiver's signature and writes as the receiver's
+	# client. More specific than '/twin/*', so Caddy tries it first.
+	handle /twin/v1/inbound/* {
+		request_header -X-OAAP-User
+		request_header -X-OAAP-Roles
+		request_header -X-OAAP-User-Id
+		request_header -X-OAAP-Display-Name
+		request_header -X-OAAP-Email
+		request_header -X-OAAP-User-Assertion
+		request_header -X-OAAP-User-Idp
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy twin:8000
+	}
+
 	handle /twin/* {
 		forward_auth identity:8000 {
 			uri /verify?roles=user&instance=oaap.twin

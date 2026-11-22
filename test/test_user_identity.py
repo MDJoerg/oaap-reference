@@ -137,10 +137,13 @@ stripped = [l.strip().removeprefix("request_header -")
 # RFC-0045): /authz/*, ueber die eine App-Instanz fragt, was eine Person in
 # IHREN Objekten darf. Kein forward_auth: Identity prueft den Schluessel
 # selbst (nur Bereich oaap.authz) und vertraut keiner Kopfzeile -- deshalb
-# werden alle fuenf gestrippt. Die Zahl steht
+# werden alle fuenf gestrippt. Elf seit 0.1.350: /twin/v1/inbound/*, die
+# eingehenden Webhooks des Zwillings (oaap.data.twin 0.14 SS2.26, RFC-0120
+# D13) -- ein fremdes System hat keinen Schluessel, nur die Signatur des
+# Empfaengers zaehlt. Die Zahl steht
 # hier, damit eine weitere Route diesen Test anfassen muss -- und dabei
 # jede Stelle mit allen fuenf Kopfzeilen.
-PUBLIC_ROUTES = 10
+PUBLIC_ROUTES = 11
 ok(f"der feste Caddyfile strippt an {PUBLIC_ROUTES} Stellen",
    len(stripped) == PUBLIC_ROUTES * len(appctl.IDENTITY_HEADERS),
    f"{len(stripped)} Zeilen: {sorted(set(stripped))}")

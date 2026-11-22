@@ -145,7 +145,9 @@ ok("OpenAPI 3.1, Bearer, Pfade /types, /openapi.json die Lesewege der Stufen 1 u
                            # Stufe 3: die Schreibwege
                            "/types", "/objects/by-key/{key}", "/objects/{id}/groups/{group}",
                            "/objects/{id}/groups/{group}/periods", "/objects/{id}/retire",
-                           "/batch", "/webhooks", "/webhooks/{id}", "/webhooks/{id}/resume"}
+                           "/batch", "/webhooks", "/webhooks/{id}", "/webhooks/{id}/resume",
+                           # D13: Empfänger für eingehende Webhooks
+                           "/receivers", "/receivers/{name}", "/inbound/{client}/{name}"}
    and d["x-oaap-types"] == [{"key": "FleetNode", "access": ["read"]}], d)
 
 print("=== ein Client schreibt nie über die Wege einer App (Stufe 3: nur über /twin/v1) ===")
