@@ -18954,7 +18954,7 @@ def mcp_sources_of(insts, scope):
 TWIN_MCP_SOURCE = "twin"
 TWIN_MCP_PATH = "/mcp"
 TWIN_MCP_TARGET = "twin:8000"
-TWIN_MCP_VERSION = "0.9"
+TWIN_MCP_VERSION = "0.16"
 TWIN_MCP_ROLES = ["admin", "keyuser", "tenant_admin", "user"]
 TWIN_TENANT_HEADER = "X-OAAP-Twin-Tenant"
 TWIN_TENANT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")

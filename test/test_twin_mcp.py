@@ -196,10 +196,14 @@ ok("initialize antwortet auch dem Gateway (Erkundung)",
    init["result"]["protocolVersion"] == "2025-06-18"
    and init["result"]["serverInfo"]["name"] == "oaap-twin", init)
 tl = mcp_door.answer(rq("tools/list"), MACHINE, st)["result"]["tools"]
-ok("tools/list: genau twin_types, twin_search, twin_object",
-   [t["name"] for t in tl] == ["twin_types", "twin_search", "twin_object"], tl)
-ok("… alle lesend, nicht zerstörend, keine offene Welt",
-   all(t["annotations"]["readOnlyHint"] is True and t["annotations"]["destructiveHint"] is False
+ok("tools/list: die drei lesenden und (0.16, §2.28) die drei schreibenden Werkzeuge",
+   [t["name"] for t in tl] == ["twin_types", "twin_search", "twin_object", "twin_set_group",
+                               "twin_add_period", "twin_set_status"], tl)
+ok("… die lesenden lesend, die schreibenden readOnlyHint false; keins zerstörend, keine "
+   "offene Welt",
+   all(t["annotations"]["readOnlyHint"] is (t["name"] in ("twin_types", "twin_search",
+                                                          "twin_object"))
+       and t["annotations"]["destructiveHint"] is False
        and t["annotations"]["openWorldHint"] is False for t in tl))
 ok("… Beschreibungen fest (zweimal gelesen gleich)",
    tl == mcp_door.answer(rq("tools/list"), PERSON, st)["result"]["tools"])
@@ -240,6 +244,60 @@ r = mcp_door.answer(rq("tools/call", name="twin_object",
 ok("twin_object: unbekanntes Objekt → Satz", r["isError"] is True and "nicht" in r["content"][0]["text"])
 
 
+# -- the writing tools (0.16, §2.28): roles, arguments; the rules are the twin's (DB test)
+class WStore(Store):
+    def set_group(self, user, oid, group, attrs):
+        self.calls.append(("set_group", user, oid, group, attrs))
+        return {"written": sorted(attrs)}
+
+    def add_period(self, user, oid, group, body):
+        self.calls.append(("add_period", user, oid, group, body))
+        return {"written": True}
+
+    def set_status(self, user, oid, to, reason):
+        self.calls.append(("set_status", user, oid, to, reason))
+        if to == "x":
+            raise mcp_door.Refused("'active' -> 'x' is not a declared transition")
+        return {"to": to, "written": True}
+
+
+ws = WStore()
+OID = "0abcdef0-0000-4000-8000-000000000000"
+W_ARGS = {"twin_set_group": {"id": OID, "group": "werk.notiz", "attributes": {"notiz": "a"}},
+          "twin_add_period": {"id": OID, "group": "werk.kpi", "attribute": "co2e", "value": 5,
+                              "valid_from": "2025-01-01", "valid_to": "2025-12-31"},
+          "twin_set_status": {"id": OID, "to": "active", "reason": "abgenommen"}}
+for name, args in W_ARGS.items():
+    r = mcp_door.answer(rq("tools/call", name=name, arguments=args), PERSON, ws)["result"]
+    ok(f"KÖDER {name}: eine Person mit Leserolle (user), aber ohne Schreibrolle -> Satz, "
+       "nichts gefragt", r["isError"] is True and "schreiben" in r["content"][0]["text"]
+       and ws.calls == [], r)
+    r = mcp_door.answer(rq("tools/call", name=name, arguments=args), MACHINE, ws)["result"]
+    ok(f"KÖDER {name}: kein Gateway, keine Maschine", r["isError"] is True and ws.calls == [])
+KEY = {"user": "kim", "roles": {"keyuser"}}
+r = mcp_door.answer(rq("tools/call", name="twin_set_group", arguments=W_ARGS["twin_set_group"]),
+                    KEY, ws)["result"]
+ok("twin_set_group: keyuser schreibt als er selbst, die id kleingeschrieben",
+   r["isError"] is False and ws.calls[-1] == ("set_group", "kim", OID, "werk.notiz",
+                                              {"notiz": "a"}), ws.calls[-1:])
+r = mcp_door.answer(rq("tools/call", name="twin_add_period", arguments=W_ARGS["twin_add_period"]),
+                    KEY, ws)["result"]
+ok("twin_add_period: nur die bekannten Felder gehen weiter",
+   r["isError"] is False and ws.calls[-1][4] == {"attribute": "co2e", "value": 5,
+                                                 "valid_from": "2025-01-01",
+                                                 "valid_to": "2025-12-31"}, ws.calls[-1:])
+r = mcp_door.answer(rq("tools/call", name="twin_set_status", arguments=dict(
+    W_ARGS["twin_set_status"], to="x")), KEY, ws)["result"]
+ok("twin_set_status: die Ablehnung des Zwillings kommt als Satz zurück",
+   r["isError"] is True and "declared transition" in r["content"][0]["text"], r)
+r = mcp_door.answer(rq("tools/call", name="twin_set_group", arguments={"id": OID,
+                    "group": "werk.notiz", "attributes": {}}), KEY, ws)["result"]
+ok("KÖDER twin_set_group ohne Werte: Satz", r["isError"] is True, r)
+init = mcp_door.answer(rq("initialize"), PERSON, ws)["result"]["instructions"]
+ok("die Anweisungen der Quelle nennen die schreibenden Werkzeuge und die Bestätigung",
+   "twin_set_status" in init and "bestätigt" in init, init)
+
+
 class Broken(Store):
     def types(self):
         raise RuntimeError("db weg: geheim")
@@ -274,6 +332,10 @@ ok("die Suche nutzt dieselbe Titelregel wie die App-Liste",
    "_title_like(words)" in store_src and "aliases WHERE unmerged_at IS NULL" in store_src)
 ok("der Speicher öffnet nur die Verbindung seines Mandanten",
    store_src.count("get_conn(") == 1 and "get_conn(self.tenant_id)" in store_src)
+ok("die schreibenden Werkzeuge rufen dieselben Funktionen wie die Portal-Routen (§2.28)",
+   all(f in src.split("def _mcp_set_group", 1)[1].split("\n@app.", 1)[0]
+       for f in ("person_group_write(", "person_period_write(", "person_status_change("))
+   and "person_group_write(conn, tenant_id, username, obj_id, group_key, body)" in src)
 docker = open(os.path.join(TWIN_DIR, "Dockerfile"), encoding="utf-8").read()
 ok("mcp_door.py steht im Dockerfile", "mcp_door.py" in docker)
 

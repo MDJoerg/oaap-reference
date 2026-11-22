@@ -1678,7 +1678,9 @@ TENANT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class _McpStore:
-    """What the three tools read, for ONE tenant (the door's)."""
+    """What the tools read and write, for ONE tenant (the door's). The writes
+    (oaap.data.twin 0.16 §2.28) go through the portal's own functions, as the
+    person; a refusal becomes the tool's sentence."""
 
     def __init__(self, tenant_id):
         self.tenant_id = tenant_id
@@ -1764,6 +1766,41 @@ class _McpStore:
         if loaded["canonical_id"] != obj_id:
             result["requested_as_alias_of"] = f"urn:oaap:obj:{obj_id}"
         return result
+
+
+def _mcp_write(store, fn):
+    conn = store._conn()
+    try:
+        with conn:
+            return fn(conn)
+    except (tw.Refused, tr.Bad, tv.Wrong) as e:
+        raise mcp_door.Refused(str(e)) from None
+    finally:
+        conn.close()
+
+
+def _mcp_set_group(self, username, obj_id, group_key, attrs):
+    if not tr.GROUP_RE.match(group_key or ""):
+        raise mcp_door.Refused("group ist der Schlüssel einer Gruppe (namespace.name).")
+    oid = _mcp_write(self, lambda c: person_group_write(c, self.tenant_id, username, obj_id,
+                                                       group_key, {"attributes": attrs}))
+    return {"id": f"urn:oaap:obj:{oid}", "group": group_key, "written": sorted(attrs)}
+
+
+def _mcp_add_period(self, username, obj_id, group_key, body):
+    if not tr.GROUP_RE.match(group_key or ""):
+        raise mcp_door.Refused("group ist der Schlüssel einer Gruppe (namespace.name).")
+    return _mcp_write(self, lambda c: person_period_write(c, self.tenant_id, username, obj_id,
+                                                         group_key, body))
+
+
+def _mcp_set_status(self, username, obj_id, to, reason):
+    return _mcp_write(self, lambda c: person_status_change(c, username, obj_id, to, reason))
+
+
+_McpStore.set_group = _mcp_set_group
+_McpStore.add_period = _mcp_add_period
+_McpStore.set_status = _mcp_set_status
 
 
 @app.post("/mcp")
@@ -1966,16 +2003,8 @@ def twin_set_status_person(obj_id):
         return "this tenant has no twin schema yet", 409
     try:
         with conn:
-            oid = _canonical_of(conn, m.group(1))
-            with conn.cursor() as cur:
-                cur.execute("SELECT type_key, owner_origin FROM objects WHERE id = %s", (oid,))
-                obj = cur.fetchone()
-            if obj is None:
-                return "no such object", 404
-            to, reason = body.get("to"), body.get("reason")
-            origin = f"tenant:{username}"      # the sign-in name, never the body's
-            res = tst.change(conn, oid, obj["type_key"], obj["owner_origin"], to, reason,
-                             origin, username, ["persons"])
+            res = person_status_change(conn, username, m.group(1), body.get("to"),
+                                       body.get("reason"))
     except tw.Refused as e:
         return str(e), e.code
     finally:
@@ -2372,20 +2401,35 @@ def twin_write_period_person(obj_id, group_key):
         return "this tenant has no twin schema yet", 409
     try:
         with conn:
-            oid = _canonical_of(conn, m.group(1))
-            with conn.cursor() as cur:
-                cur.execute("SELECT type_key FROM objects WHERE id = %s", (oid,))
-                obj = cur.fetchone()
-            if obj is None:
-                return "no such object", 404
-            refused = _tenant_group_type(conn, tenant_id, group_key, obj["type_key"])
-            if refused:
-                return refused
-            res = tw.write_period(conn, oid, group_key, "tenant", username, body,
-                                  event_origin=f"tenant:{username}")
+            res = person_period_write(conn, tenant_id, username, m.group(1), group_key, body)
     finally:
         conn.close()
     return jsonify(res), (201 if res["written"] else 200)
+
+
+def person_period_write(conn, tenant_id, username, obj_id, group_key, body):
+    """One period into a TENANT group -- the portal's form and the MCP tool
+    twin_add_period (§2.28) both call this."""
+    oid, type_key, _owner = _person_object(conn, obj_id)
+    refused = _tenant_group_type(conn, tenant_id, group_key, type_key)
+    if refused:
+        raise tw.Refused(refused[0], refused[1])
+    return tw.write_period(conn, oid, group_key, "tenant", username, body,
+                           event_origin=f"tenant:{username}")
+
+
+def person_status_change(conn, username, obj_id, to, reason):
+    """A status change as `persons` -- the portal's card and the MCP tool
+    twin_set_status (§2.28) both call this."""
+    oid = _canonical_of(conn, obj_id)
+    with conn.cursor() as cur:
+        cur.execute("SELECT type_key, owner_origin FROM objects WHERE id = %s", (oid,))
+        obj = cur.fetchone()
+    if obj is None:
+        raise tw.Refused("no such object", 404)
+    origin = f"tenant:{username}"      # the sign-in name, never the body's
+    return tst.change(conn, oid, obj["type_key"], obj["owner_origin"], to, reason,
+                      origin, username, ["persons"])
 
 
 @app.get("/internal/twin/objects/<obj_id>/periods")
@@ -2470,34 +2514,52 @@ def twin_write_group_person(obj_id, group_key):
         return "this tenant has no twin schema yet", 409
     try:
         with conn:
-            obj_id = _canonical_of(conn, obj_id)
-            with conn.cursor() as cur:
-                cur.execute("SELECT type_key FROM objects WHERE id = %s", (obj_id,))
-                obj = cur.fetchone()
-            if obj is None:
-                return "no such object", 404
-            refused = _tenant_group_type(conn, tenant_id, group_key, obj["type_key"])
-            if refused:
-                return refused
-            with conn.cursor() as cur:
-                cur.execute("SELECT origin FROM groups WHERE object_id = %s "
-                           "AND group_key = %s", (obj_id, group_key))
-                existing = cur.fetchone()
-            if existing is None:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO groups (object_id, group_key, origin, "
-                        "created_by) VALUES (%s, %s, %s, %s)",
-                        (obj_id, group_key, "tenant", username))
-            elif existing["origin"] != "tenant":
-                return (f"group '{group_key}' belongs to '{existing['origin']}' "
-                        "-- the tenant may not overwrite another origin's "
-                        "group (RFC-0031 §3.3)"), 403
-            _write_group_content(conn, obj_id, group_key, "tenant", username, body)
-            _record_event(conn, "group.written", obj_id, group_key, f"tenant:{username}")
+            person_group_write(conn, tenant_id, username, obj_id, group_key, body)
     finally:
         conn.close()
     return "", 204
+
+
+def _person_object(conn, obj_id):
+    """(canonical id, type key, owner) of an object a person writes -- 404
+    when there is none, 409 when it is retired (§2.24)."""
+    oid = _canonical_of(conn, obj_id)
+    with conn.cursor() as cur:
+        cur.execute("SELECT type_key, owner_origin FROM objects WHERE id = %s", (oid,))
+        obj = cur.fetchone()
+        if obj is None:
+            raise tw.Refused("no such object", 404)
+        cur.execute("SELECT 1 FROM retirements WHERE object_id = %s LIMIT 1", (oid,))
+        if cur.fetchone():
+            raise tw.Refused("the object is retired -- it is not written again", 409)
+    return oid, obj["type_key"], obj["owner_origin"]
+
+
+def person_group_write(conn, tenant_id, username, obj_id, group_key, body):
+    """A person's write into a TENANT group -- the portal's route and the MCP
+    tool twin_set_group (oaap.data.twin 0.16 §2.28) both call this; inside
+    the caller's transaction, refusals raise tw.Refused."""
+    oid, type_key, _owner = _person_object(conn, obj_id)
+    refused = _tenant_group_type(conn, tenant_id, group_key, type_key)
+    if refused:
+        raise tw.Refused(refused[0], refused[1])
+    with conn.cursor() as cur:
+        cur.execute("SELECT origin FROM groups WHERE object_id = %s "
+                    "AND group_key = %s", (oid, group_key))
+        existing = cur.fetchone()
+    if existing is None:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO groups (object_id, group_key, origin, "
+                "created_by) VALUES (%s, %s, %s, %s)",
+                (oid, group_key, "tenant", username))
+    elif existing["origin"] != "tenant":
+        raise tw.Refused(f"group '{group_key}' belongs to '{existing['origin']}' "
+                         "-- the tenant may not overwrite another origin's "
+                         "group (RFC-0031 §3.3)", 403)
+    _write_group_content(conn, oid, group_key, "tenant", username, body)
+    _record_event(conn, "group.written", oid, group_key, f"tenant:{username}")
+    return oid
 
 
 @app.post("/internal/twin/types")
