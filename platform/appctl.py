@@ -12130,6 +12130,13 @@ def _recipe_instances(tid):
             if not is_rehearsal(i)]
 
 
+def _recipe_versions(tid):
+    """{key: version} of this tenant's instances -- for a need's
+    `min_version` (RFC-0119 3a)."""
+    return {k: str(i.get("version") or "")
+            for k, i in tenant_instances(load_registry(), tid).items()}
+
+
 def _recipe_prepare(rid, label, given, role, doc=None, digest=None,
                     actor_tid=None, read_list=None, soft=False):
     """-> (doc, digest, profile, values, chosen, choices, problems) with
@@ -12157,7 +12164,8 @@ def _recipe_prepare(rid, label, given, role, doc=None, digest=None,
         if k in rest:
             raise tenant_build.Refusal(f"'{k}' is set by the node, not given")
     vals, problems, chosen = tenant_recipe.resolve_needs(
-        doc, _recipe_instances(tid), picks, lambda loc: instance_key(tid, loc))
+        doc, _recipe_instances(tid), picks, lambda loc: instance_key(tid, loc),
+        _recipe_versions(tid))
     if problems:
         raise tenant_build.Refusal("; ".join(problems))
     lists = {}

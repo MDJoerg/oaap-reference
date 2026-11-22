@@ -44,6 +44,8 @@ MODELS_APP = "ai-gateway"
 CHAT_APP = "chat"
 GATEWAY_KINDS = ("refresh", "server_light", "view", "profile", "assistant")
 MODELS_KINDS = ("client",)
+# RFC-0119 3a: the first MCP gateway that takes `prompts` in a view
+PROMPTS_GATEWAY = "0.42.0"
 _PH = re.compile(r"^\{([a-z][a-z0-9_]*)\}$")
 
 
@@ -159,6 +161,19 @@ def template_problems(doc, app_id):
                                f"({{\"server\": \"{{{own_key}}}\", \"effect\": \"read\"}})")
                 if "max_effect" in it and it.get("max_effect") != "read":
                     out.append(f"step '{sid}': the view reads only (RFC-0119 D4)")
+                if "prompts" in it:
+                    # RFC-0119 3a (D11): the prompts of the app's own server, in
+                    # addition to its reading tools, from a gateway that knows them
+                    if it.get("prompts") != {"server": "{" + own_key + "}"}:
+                        out.append(f"step '{sid}': a view of an app's template holds the "
+                                   f"prompts of the app's own server only "
+                                   f"({{\"server\": \"{{{own_key}}}\"}})")
+                    mv = str((needs.get(target) or {}).get("min_version") or "")
+                    if not (tb.VERSION_RE.match(mv)
+                            and tb.version_key(mv) >= tb.version_key(PROMPTS_GATEWAY)):
+                        out.append(f"step '{sid}': prompts in a view need the MCP gateway "
+                                   f"{PROMPTS_GATEWAY} or newer -- the need '{target}' says "
+                                   f"min_version: {PROMPTS_GATEWAY}")
                 views.add(str(it.get("id") or ""))
             if k == "profile":
                 if "max_effect" in it and it.get("max_effect") != "read":

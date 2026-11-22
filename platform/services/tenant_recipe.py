@@ -60,7 +60,7 @@ SETUP_ITEM_MAX = 128
 RELEASE_RE = re.compile(r"^recipe:([a-z0-9][a-z0-9-]{0,62})@([0-9]{1,4})$")
 RESERVED = ("label", "tenant", tb.SELECTION_REF)
 KEY_SUFFIX = "_key"
-NEED_KEYS = ("app", "label", "install", "name")
+NEED_KEYS = ("app", "label", "install", "name", "min_version")
 NEEDS_MAX = 12
 TITLE_MAX = 120
 
@@ -120,6 +120,10 @@ def recipe_problems(doc):
             out.append(f"need '{n}': 'label' is a text")
         if "install" in spec and not isinstance(spec["install"], bool):
             out.append(f"need '{n}': 'install' is true or false")
+        # RFC-0119 3a: the app must run at least this version (a field an
+        # older version of the app refuses, such as prompts in a view)
+        if "min_version" in spec and not tb.VERSION_RE.match(str(spec["min_version"] or "")):
+            out.append(f"need '{n}': 'min_version' is x.y.z (e.g. 0.42.0)")
         if "name" in spec and (spec.get("install") is not True
                                or not tb.WORD_RE.match(str(spec["name"]))):
             out.append(f"need '{n}': 'name' is the proposed instance name of an "
@@ -390,7 +394,7 @@ def read_recipe_file(path):
 
 # ------------------------------------------------- the instances (D2, D3)
 
-def resolve_needs(doc, instances, given, planned_key):
+def resolve_needs(doc, instances, given, planned_key, versions=None):
     """-> (values, problems, chosen).
 
     `instances`: [(key, local name, app id)] of THIS tenant only -- the
@@ -400,6 +404,11 @@ def resolve_needs(doc, instances, given, planned_key):
 
     values: {need: local name, need_key: key}; chosen: {need: {"app",
     "name", "key", "install": bool}} for the preview.
+
+    `versions` ({key: version}, RFC-0119 3a): a need with `min_version` is
+    not met by an instance that runs an older version -- one sentence, the
+    instance stays as it is. An instance the recipe would install gets the
+    current version and is not judged.
     """
     values, problems, chosen = {}, [], {}
     for n, spec in (doc.get("needs") or {}).items():
@@ -436,6 +445,15 @@ def resolve_needs(doc, instances, given, planned_key):
             problems.append(f"dieser Mandant hat keine App {app} "
                             f"({spec.get('label') or n}); das Rezept installiert "
                             "sie nicht")
+            continue
+        need_v = str(spec.get("min_version") or "")
+        have_v = str((versions or {}).get(hit[0]) or "")
+        if need_v and versions is not None and (
+                not tb.VERSION_RE.match(have_v)
+                or tb.version_key(have_v) < tb.version_key(need_v)):
+            problems.append(f"die App {app} ('{hit[1]}') läuft in Version "
+                            f"{have_v or 'unbekannt'}; diese Vorlage braucht "
+                            f"mindestens {need_v} -- erst die App aktualisieren")
             continue
         values[n], values[n + KEY_SUFFIX] = hit[1], hit[0]
         chosen[n] = {"app": app, "name": hit[1], "key": hit[0], "install": False}

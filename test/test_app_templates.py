@@ -141,6 +141,44 @@ bait(lambda d: d["steps"].append({"id": "frei", "type": "app.setup", "name": "{c
                                   "items": [{"kind": "x", "id": "y"}]}),
      "only the MCP gateway", "eine andere App einrichten")
 
+print("=== Stufe 3a: Prompts der eigenen App, Mindestversion des Gateways ===")
+gw_need = next(n for n, sp in TPL["needs"].items() if sp.get("app") == "mcp-gateway")
+P3 = copy.deepcopy(TPL)
+items(P3)[2]["prompts"] = {"server": "{source_key}"}
+P3["needs"][gw_need]["min_version"] = "0.42.0"
+ok("Prompts der eigenen Quelle mit min_version 0.42.0: gültiges Rezept und App-Vorlage",
+   tr.recipe_problems(P3) == [] and at.template_problems(P3, "vorgaenge") == [],
+   (tr.recipe_problems(P3), at.template_problems(P3, "vorgaenge")))
+
+
+def bait3(change, word, label):
+    d = copy.deepcopy(P3)
+    change(d)
+    p = at.template_problems(d, "vorgaenge") + tr.recipe_problems(d)
+    ok(f"KÖDER {label}: abgelehnt", any(word in x for x in p), p)
+
+
+bait3(lambda d: items(d)[2].update(prompts={"server": "{chat_key}"}), "prompts of the app's own",
+      "Prompts eines fremden Servers")
+bait3(lambda d: items(d)[2].update(prompts={"server": "{source_key}", "name": "x"}),
+      "prompts of the app's own", "Prompts in anderer Form")
+bait3(lambda d: d["needs"][gw_need].pop("min_version"), "0.42.0", "Prompts ohne Mindestversion")
+bait3(lambda d: d["needs"][gw_need].update(min_version="0.41.9"), "0.42.0",
+      "Prompts mit zu alter Mindestversion")
+bait3(lambda d: d["needs"][gw_need].update(min_version="neu"), "x.y.z", "Mindestversion kein x.y.z")
+INSTS = [("t-k-gw", "werkzeuge", "mcp-gateway"), ("t-k-src", "vorgaenge", "vorgaenge"),
+         ("t-k-chat", "chat", "chat"), ("t-k-ai", "ki", "ai-gateway")]
+NEED_DOC = {"needs": {gw_need: {"app": "mcp-gateway", "min_version": "0.42.0"}}}
+_v, probs, _c = tr.resolve_needs(NEED_DOC, INSTS, {}, lambda x: x, {"t-k-gw": "0.41.0"})
+ok("ein Gateway 0.41.0: der Bedarf ist nicht erfüllt, mit Satz",
+   len(probs) == 1 and "0.41.0" in probs[0] and "mindestens 0.42.0" in probs[0], probs)
+_v, probs, _c = tr.resolve_needs(NEED_DOC, INSTS, {}, lambda x: x, {"t-k-gw": "0.42.0"})
+ok("ein Gateway 0.42.0: erfüllt", probs == [], probs)
+_v, probs, _c = tr.resolve_needs(NEED_DOC, INSTS, {}, lambda x: x, {"t-k-gw": "0.100.0"})
+ok("0.100.0 ist neuer als 0.42.0 (nach Zahlen, nicht nach Buchstaben)", probs == [], probs)
+_v, probs, _c = tr.resolve_needs(NEED_DOC, INSTS, {}, lambda x: x, {})
+ok("KÖDER eine Instanz ohne bekannte Version: nicht erfüllt", len(probs) == 1, probs)
+
 print("=== §4.1: der Knoten kopiert je Mandant ===")
 tenants = a.load_tenants()
 tenants.update({"t-kunde": {"label": "kunde", "name": "Kunde"},
