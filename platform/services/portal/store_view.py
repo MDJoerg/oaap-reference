@@ -9,6 +9,7 @@ those rules can be read and tested without Flask, a request, or a node.
 `app.py` supplies the I/O — reading the sources file, fetching the
 lists, knowing what is installed — and renders the result.
 """
+import re
 from datetime import date
 
 # Trust classes (RFC-0012 §3). appctl.py is the authority; the portal
@@ -232,7 +233,14 @@ CARE_FILTER_LABEL = {"update": "Update verfügbar",
 
 
 def _numeric(v):
-    parts = str(v or "").split(".")
+    """Numbers between dots, dashes and pluses -> a tuple, else None.
+
+    The same split as the node's `_version_gt` (appctl), so the portal's
+    "Update" badge and `oaap update` agree: a package revision such as
+    0.878.0-2 is a number too. Before 0.1.354 only dots split, and a test
+    instance on 0.878.0-2 was offered the catalogue's 0.832.0-2 as an update.
+    """
+    parts = [p for p in re.split(r"[.\-+]", str(v or "")) if p != ""]
     if not parts or not all(p.isdigit() for p in parts):
         return None
     return tuple(int(p) for p in parts)

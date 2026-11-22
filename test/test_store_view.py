@@ -241,6 +241,12 @@ ok("an older catalogue entry is no update", sv.update_to("0.4.4", "0.4.3") == ""
 ok("the same version is no update", sv.update_to("1.0.0", "1.0.0") == "")
 ok("a pre-release falls back to 'differs'", sv.update_to("1.0.0", "1.1.0-rc1") == "1.1.0-rc1")
 ok("nothing in the catalogue, nothing offered", sv.update_to("1.0.0", "") == "")
+# 0.1.354: a test instance on 0.878.0-2, the catalogue on 0.832.0-2 (team-test, bdt, oaapx01)
+ok("a package revision compares as numbers: an older catalogue entry is no update",
+   sv.update_to("0.878.0-2", "0.832.0-2") == "")
+ok("…and a newer one is", sv.update_to("0.832.0-2", "0.878.0-2") == "0.878.0-2")
+ok("…a newer revision of the same version is", sv.update_to("0.832.0-2", "0.832.0-3") == "0.832.0-3")
+ok("…and an older revision is not", sv.update_to("0.832.0-3", "0.832.0-2") == "")
 
 IMAGES = {"instances": {
     "ai-gateway": {"state": "open", "services": [{"state": "open", "open": 4},
