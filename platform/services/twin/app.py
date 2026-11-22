@@ -102,6 +102,7 @@ import fleet_affected
 import mcp_door
 import semantic
 import timeseries as ts
+import twin_read as tr
 import twin_write as tw
 
 app = Flask(__name__)
@@ -569,12 +570,15 @@ def openapi_doc(types):
         "id": {"type": "string", "description": "urn:oaap:obj:<uuid>"},
         "type": {"type": "string"}, "title": {"type": "string"},
         "groups": {"type": "object"}}}
-    return {
+    doc = {
         "openapi": "3.1.0",
         "info": {"title": "OAAP twin", "version": API_VERSION,
                  "description": "The tenant's digital twin (oaap.data.twin, RFC-0120). "
                                 "Every call carries a bearer key; the tenant comes from "
-                                "the key, never from the request."},
+                                "the key, never from the request. Reads answer as the "
+                                "twin looked at one moment ('at'), only objects of the "
+                                "types this key may read, an edge only when both ends "
+                                "are visible."},
         "servers": [{"url": "/twin/v1"}],
         "components": {
             "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer",
@@ -590,8 +594,217 @@ def openapi_doc(types):
             "/openapi.json": {"get": {"summary": "This document",
                                       "responses": {"200": {"description": "OpenAPI 3.1"}}}}},
         "x-oaap-types": [{"key": t["key"], "access": t["access"]} for t in types],
-        "x-oaap-stage": "RFC-0120 stage 0 -- reads, graph and export follow in stage 1",
+        "x-oaap-stage": "RFC-0120 stage 1 -- reads, graph, export, change feed; "
+                        "values in time follow in stage 2, writing in stage 3",
     }
+    doc["paths"].update(_V1_READ_PATHS)
+    return doc
+
+
+def _q(name, desc, required=False, schema=None):
+    return {"name": name, "in": "query", "required": required, "description": desc,
+            "schema": schema or {"type": "string"}}
+
+
+_AT = _q("at", "the moment to answer for: a date-time, or a date (= end of that day, UTC); "
+               "default now")
+_REL = _q("relations", "relation keys to follow, comma-separated; default all")
+_DIR = _q("direction", "out, in or both", schema={"enum": ["out", "in", "both"]})
+_V1_READ_PATHS = {
+    "/objects": {"get": {
+        "summary": "Objects of one type, filtered, one page at a time (ordered by title)",
+        "parameters": [
+            _q("type", "the object type", True), _AT,
+            _q("where", "repeatable: <group>.<attr><op><value> (op = != < <= > >=), "
+                        "'<group>.<attr> in a,b' or '<group>.<attr> has'; checked against "
+                        "the attribute's value type"),
+            _q("fields", "groups to answer, comma-separated; default all"),
+            _q("limit", "at most 500, default 100", schema={"type": "integer"}),
+            _q("cursor", "the 'next' of the previous page")],
+        "responses": {"200": {"description": "{v, at, objects, next}"}}}},
+    "/objects/{id}": {"get": {
+        "summary": "One object with its groups",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "string"}}, _AT],
+        "responses": {"200": {"description": "the object"}, "404": {"description": "none"}}}},
+    "/objects/{id}/graph": {"get": {
+        "summary": "The neighbourhood of an object: nodes and edges within depth hops",
+        "parameters": [{"name": "id", "in": "path", "required": True,
+                        "schema": {"type": "string"}},
+                       _q("depth", "1..5, default 2", schema={"type": "integer"}),
+                       _REL, _DIR, _q("types", "node types the walk enters"), _AT],
+        "responses": {"200": {"description": "{v, at, nodes, edges, truncated}"}}}},
+    "/paths": {"get": {
+        "summary": "The shortest paths between two objects",
+        "parameters": [_q("from", "object id", True), _q("to", "object id", True), _REL, _DIR,
+                       _q("max", "how many paths, 1..10, default 3",
+                          schema={"type": "integer"}),
+                       _q("length", "most hops, 1..6, default 6", schema={"type": "integer"}),
+                       _AT],
+        "responses": {"200": {"description": "{v, at, paths}"}}}},
+    "/export": {"get": {
+        "summary": "Nodes and edges in one document -- what a graph viewer loads",
+        "parameters": [_q("types", "object types, comma-separated; default all it may read"),
+                       _REL, _AT,
+                       _q("format", "json or graphml", schema={"enum": ["json", "graphml"]}),
+                       _q("attributes", "1 (default) or 0", schema={"enum": ["0", "1"]})],
+        "responses": {"200": {"description": "JSON {v, at, types, nodes, edges, truncated} "
+                                             "or GraphML"}}}},
+    "/changes": {"get": {
+        "summary": "Every change after a cursor, in order -- for a sync that missed nothing",
+        "parameters": [_q("since", "the 'next' of the last answer, 0, or 'now'"),
+                       _q("types", "object types, comma-separated"),
+                       _q("limit", "at most 1000, default 200", schema={"type": "integer"})],
+        "responses": {"200": {"description": "{v, changes, next, more}"}}}},
+}
+
+
+# ------------------------------------------------------- RFC-0120 stage 1: reads
+def v1_read(fn):
+    """The frame of every read of the door: the caller, its tenant's
+    connection, the types it may read (any binding, active for the tenant),
+    the moment; a request it can fix answers 400 with the sentence."""
+    @functools.wraps(fn)
+    def wrapper(*a, **k):
+        name, tc, fail = _v1_caller()
+        if fail:
+            return fail
+        tenant_id, conn = tc
+        try:
+            with conn:
+                types = _v1_types(conn, tenant_id, name)
+                readable = {t["key"] for t in types if t["kind"] == "object_types"}
+                return fn(conn, tenant_id, name, readable, *a, **k)
+        except tr.Bad as e:
+            return jsonify({"error": str(e)}), 400
+        finally:
+            conn.close()
+    return wrapper
+
+
+def _need_type(readable, key, name):
+    if key not in readable:
+        raise tr.Bad(f"'{name}' may not read type '{key}' -- it may read: "
+                     + (", ".join(sorted(readable)) or "nothing"))
+
+
+def _types_arg(readable, name):
+    want = tr.csv_arg(request.args.get("types"))
+    for t in want:
+        _need_type(readable, t, name)
+    return set(want)
+
+
+def _visible(snap, raw):
+    i = snap.canonical(tr.obj_id(raw))
+    return i if i in snap.objects else None
+
+
+@app.get("/twin/v1/objects")
+@v1_read
+def v1_objects(conn, tenant_id, name, readable):
+    type_key = (request.args.get("type") or "").strip()
+    if not type_key:
+        raise tr.Bad("query needs '?type='")
+    _need_type(readable, type_key, name)
+    reg = tr.registry(conn, tenant_id)
+    where = [tr.parse_where(w, reg) for w in request.args.getlist("where")][:8]
+    limit = tr.int_arg(request.args.get("limit"), tr.LIST_DEFAULT, 1, tr.LIST_MAX, "limit")
+    cursor = tr.decode_cursor(request.args["cursor"]) if request.args.get("cursor") else None
+    fields = tr.csv_arg(request.args.get("fields")) if "fields" in request.args else None
+    snap = tr.Snapshot(conn, readable, tr.parse_at(request.args.get("at")))
+    objs, nxt = tr.list_objects(snap, type_key, where, limit, cursor, fields)
+    return jsonify({"v": 1, "at": snap.stamp(), "objects": objs, "next": nxt})
+
+
+@app.get("/twin/v1/objects/<oid>")
+@v1_read
+def v1_object(conn, tenant_id, name, readable, oid):
+    snap = tr.Snapshot(conn, readable, tr.parse_at(request.args.get("at")))
+    raw = tr.obj_id(oid)
+    i = _visible(snap, oid)
+    if i is None:
+        return jsonify({"error": "no such object, or not of a type this key may read"}), 404
+    out = dict(snap.obj(i, snap.groups([i])[i]), at=snap.stamp())
+    if i != raw:
+        out["merged_from"] = tr.urn(raw)
+    return jsonify(out)
+
+
+def _direction():
+    d = (request.args.get("direction") or "").strip() or None
+    if d not in (None, "out", "in", "both"):
+        raise tr.Bad("'direction' is out, in or both")
+    return d
+
+
+@app.get("/twin/v1/objects/<oid>/graph")
+@v1_read
+def v1_graph(conn, tenant_id, name, readable, oid):
+    depth = tr.int_arg(request.args.get("depth"), 2, 1, tr.GRAPH_DEPTH_MAX, "depth")
+    types = _types_arg(readable, name)
+    rels = set(tr.csv_arg(request.args.get("relations")))
+    snap = tr.Snapshot(conn, readable, tr.parse_at(request.args.get("at")))
+    i = _visible(snap, oid)
+    if i is None:
+        return jsonify({"error": "no such object, or not of a type this key may read"}), 404
+    nodes, edges, cut = tr.neighbourhood(snap, i, depth, rels, _direction() or "both", types)
+    return jsonify({"v": 1, "at": snap.stamp(), "start": tr.urn(i), "depth": depth,
+                    "nodes": nodes, "edges": edges, "truncated": cut})
+
+
+@app.get("/twin/v1/paths")
+@v1_read
+def v1_paths(conn, tenant_id, name, readable):
+    if not request.args.get("from") or not request.args.get("to"):
+        raise tr.Bad("query needs '?from=' and '?to='")
+    rels = set(tr.csv_arg(request.args.get("relations")))
+    limit = tr.int_arg(request.args.get("max"), 3, 1, tr.PATHS_MAX, "max")
+    length = tr.int_arg(request.args.get("length"), tr.PATH_LEN_MAX, 1, tr.PATH_LEN_MAX, "length")
+    snap = tr.Snapshot(conn, readable, tr.parse_at(request.args.get("at")))
+    a, b = _visible(snap, request.args["from"]), _visible(snap, request.args["to"])
+    if a is None or b is None:
+        return jsonify({"error": "no such object, or not of a type this key may read"}), 404
+    found = tr.paths(snap, a, b, rels, _direction() or "both", limit, length)
+    nodes = sorted({n for p in found for n in p["nodes"]})
+    return jsonify({"v": 1, "at": snap.stamp(), "from": tr.urn(a), "to": tr.urn(b),
+                    "paths": found,
+                    "nodes": [snap.node(tr.obj_id(n)) for n in nodes]})
+
+
+@app.get("/twin/v1/export")
+@v1_read
+def v1_export(conn, tenant_id, name, readable):
+    types = _types_arg(readable, name) or set(readable)
+    rels = set(tr.csv_arg(request.args.get("relations")))
+    fmt = (request.args.get("format") or "json").strip()
+    if fmt not in ("json", "graphml"):
+        raise tr.Bad("'format' is json or graphml")
+    attrs = (request.args.get("attributes") or "1") != "0"
+    reg = tr.registry(conn, tenant_id)
+    snap = tr.Snapshot(conn, readable, tr.parse_at(request.args.get("at")))
+    nodes, edges, cut = tr.export(snap, types, rels, attrs, reg)
+    if fmt == "graphml":
+        return app.response_class(tr.graphml(snap, nodes, edges, reg),
+                                  mimetype="application/graphml+xml")
+    tdocs = []
+    for t in sorted(types):
+        d = {"key": t}
+        sid = (reg["object"].get(t) or {}).get("semantic_id")
+        if sid:
+            d["semantic_iri"] = semantic.expand(sid)
+        tdocs.append(d)
+    return jsonify({"v": 1, "at": snap.stamp(), "types": tdocs, "nodes": nodes,
+                    "edges": edges, "truncated": cut})
+
+
+@app.get("/twin/v1/changes")
+@v1_read
+def v1_changes(conn, tenant_id, name, readable):
+    types = _types_arg(readable, name) or set(readable)
+    limit = tr.int_arg(request.args.get("limit"), tr.CHANGES_DEFAULT, 1, tr.CHANGES_MAX, "limit")
+    out, nxt, more = tr.changes(conn, types, (request.args.get("since") or "0").strip(), limit)
+    return jsonify({"v": 1, "changes": out, "next": nxt, "more": more})
 
 
 @app.get("/twin/v1/openapi.json")
