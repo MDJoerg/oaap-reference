@@ -676,5 +676,12 @@ def changes(conn, types, since, limit):
         if oid != str(r["object_id"]):
             c["merged_from"] = urn(str(r["object_id"]))
         out.append(c)
+    st_ids = [c["id"] for c in out if c["kind"] == "status.changed"]
+    if st_ids:
+        import twin_status as tst
+        found = tst.by_event(conn, st_ids)
+        for c in out:
+            if c["id"] in found:
+                c["status"] = {"from": found[c["id"]]["from"], "to": found[c["id"]]["to"]}
     nxt = out[-1]["id"] if more else max(since, settled)
     return out, nxt, more

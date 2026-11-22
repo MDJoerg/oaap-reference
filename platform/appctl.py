@@ -17605,6 +17605,24 @@ def _twin_ensure_tables(schema):
             created_at timestamptz NOT NULL DEFAULT now(),
             removed_at timestamptz
         );
+        -- 'statuses': status changes along a declared transition
+        -- (oaap.data.twin 0.15 §2.27, RFC-0120 D7) -- append-only like every
+        -- twin table; the current status is the newest row, or the type's
+        -- 'initial' while there is none. 'event_id' ties a row to its
+        -- 'status.changed' event (the relay publishes from, to with it).
+        CREATE TABLE IF NOT EXISTS "{schema}".statuses (
+            id bigserial PRIMARY KEY,
+            object_id uuid NOT NULL REFERENCES "{schema}".objects(id),
+            from_status text,
+            to_status text NOT NULL,
+            reason text,
+            origin text NOT NULL,
+            recorded_by text NOT NULL,
+            recorded_at timestamptz NOT NULL DEFAULT now(),
+            event_id bigint
+        );
+        CREATE INDEX IF NOT EXISTS statuses_object ON "{schema}".statuses (object_id, id);
+        CREATE INDEX IF NOT EXISTS statuses_event ON "{schema}".statuses (event_id);
         CREATE UNIQUE INDEX IF NOT EXISTS receivers_live
             ON "{schema}".receivers (principal, name) WHERE removed_at IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS

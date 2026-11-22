@@ -104,6 +104,7 @@ import semantic
 import timeseries as ts
 import twin_inbound as tsi
 import twin_read as tr
+import twin_status as tst
 import twin_sync as tsy
 import twin_values as tv
 import twin_write as tw
@@ -779,9 +780,17 @@ _V1_WRITE_PATHS = {
     "/objects/{id}/retire": {"post": _w(
         "Retire an object this client owns", "{reason?} -- it stays in the history and "
         "leaves every current read", [_p("id")])},
+    "/objects/{id}/status": {
+        "post": _w("Change the object's status along a declared transition",
+                   "{to, reason?} -- a transition its type does not declare is refused (409) "
+                   "naming the values allowed from here", [_p("id")]),
+        "get": {"summary": "The object's status and its history, newest first",
+                "parameters": [_p("id")],
+                "responses": {"200": {"description": "{status, history, declaration}"},
+                              "404": {"description": "none, or its type declares no status"}}}},
     "/batch": {"post": _w(
         "Several writes in one transaction, all or nothing",
-        "{id, operations: [{op: upsert|group|period|retire, ...}]} -- the same id again "
+        "{id, operations: [{op: upsert|group|period|retire|status, ...}]} -- the same id again "
         "answers the first run and writes nothing ('replayed': true)")},
     "/webhooks": {
         "post": _w("Register a webhook", "{url (https), types?, kinds?, own?} -- the answer "
@@ -797,7 +806,7 @@ _V1_WRITE_PATHS = {
     "/receivers": {
         "post": _w("Register a receiver for inbound webhooks (D13)",
                    "{name, signature?: {scheme: oaap|hmac-sha256|token, header?, prefix?}, "
-                   "mapping: {id?, items?, rules: [{when?, upsert | retire}]}} -- the answer "
+                   "mapping: {id?, items?, rules: [{when?, upsert | retire | status}]}} -- the answer "
                    "carries the receiver's URL and its secret once",
                    codes={"201": {"description": "{name, url, secret, ...}"}}),
         "get": {"summary": "This client's receivers and their state",
@@ -887,7 +896,39 @@ def v1_object(conn, tenant_id, name, readable, oid):
     out = dict(snap.obj(i, snap.groups([i])[i]), at=snap.stamp())
     if i != raw:
         out["merged_from"] = tr.urn(raw)
+    st = _status_or_none(conn, i, snap.objects[i]["type"], snap.at)
+    if st is not None:
+        out["status"] = st
     return jsonify(out)
+
+
+def _status_or_none(conn, oid, type_key, at=None):
+    """The status for a read -- None without a declaration; a malformed
+    declaration is not the reader's fault and reads as none."""
+    try:
+        return tst.status_of(conn, oid, type_key, at)
+    except tw.Refused:
+        return None
+
+
+@app.get("/twin/v1/objects/<oid>/status")
+@v1_read
+def v1_object_status(conn, tenant_id, name, readable, oid):
+    """The status and its history, newest first (oaap.data.twin 0.15 §2.27)."""
+    snap = tr.Snapshot(conn, readable, tr.parse_at(request.args.get("at")))
+    i = _visible(snap, oid)
+    if i is None:
+        return jsonify({"error": "no such object, or not of a type this key may read"}), 404
+    type_key = snap.objects[i]["type"]
+    try:
+        decl = tst.declaration(conn, type_key)
+    except tw.Refused as e:
+        return jsonify({"error": str(e)}), 409
+    if decl is None:
+        return jsonify({"error": f"type '{type_key}' declares no status"}), 404
+    return jsonify({"id": tr.urn(i), "at": snap.stamp(), "declaration": decl,
+                    "status": tst.current(conn, i, decl, snap.at),
+                    "history": [tst.entry(r) for r in tst.history(conn, i, snap.at)]})
 
 
 def _window():
@@ -1197,6 +1238,15 @@ def v1_retire(door, oid):
     i, o = door.resolve(oid)
     b = request.get_json(silent=True) or {}
     return jsonify(door.retire(i, o, b.get("reason") if isinstance(b, dict) else ""))
+
+
+@app.post("/twin/v1/objects/<oid>/status")
+@v1_write
+def v1_set_status(door, oid):
+    """A status change along a declared transition (§2.27)."""
+    i, o = door.resolve(oid)
+    b = _body()
+    return jsonify(door.status(i, o, b.get("to"), b.get("reason")))
 
 
 @app.post("/twin/v1/batch")
@@ -1853,15 +1903,84 @@ def twin_object_detail(obj_id):
             if loaded is None:
                 return "no such object", 404
             aliases = _aliases_of(conn, loaded["canonical_id"])
+            status = _person_status(conn, loaded["canonical_id"], loaded["type_key"], at,
+                                    _roles)
     finally:
         conn.close()
     result = {"id": f"urn:oaap:obj:{loaded['canonical_id']}", "type": loaded["type_key"],
               "title": loaded["title"], "owner": loaded["owner"],
               "groups": loaded["groups"],
               "merged_aliases": [f"urn:oaap:obj:{a}" for a in aliases]}
+    if status is not None:
+        result["status"] = status
     if loaded["canonical_id"] != obj_id:
         result["requested_as_alias_of"] = f"urn:oaap:obj:{obj_id}"
     return jsonify(result)
+
+
+PERSON_WRITERS = {"admin", "keyuser", "tenant_admin"}
+
+
+def _person_status(conn, oid, type_key, at, roles):
+    """The object page's status: current, the values this person may go to
+    from here, the history (oaap.data.twin 0.15 §2.27). None without a
+    declaration."""
+    try:
+        decl = tst.declaration(conn, type_key)
+    except tw.Refused:
+        return None
+    if decl is None:
+        return None
+    moment = None
+    if at is not None:
+        moment = datetime.datetime.combine(at, datetime.time(23, 59, 59, 999999),
+                                           datetime.timezone.utc)
+    cur = tst.current(conn, oid, decl, moment)
+    may = bool(roles & PERSON_WRITERS)
+    with conn.cursor() as c:
+        c.execute("SELECT 1 FROM retirements WHERE object_id = %s LIMIT 1", (oid,))
+        retired = c.fetchone() is not None
+    return dict(cur, values=decl["values"],
+                allowed=[] if (retired or at is not None or not may)
+                else tst.allowed_from(decl, cur["value"], ["persons"]),
+                history=[tst.entry(r) for r in tst.history(conn, oid, moment, 50)])
+
+
+@app.post("/internal/twin/objects/<obj_id>/status")
+def twin_set_status_person(obj_id):
+    """A person changes the status on the object page -- the same rule as a
+    client (§2.27), as `persons`; the origin is tenant:<sign-in name>."""
+    person, err, code = require_person()
+    if err:
+        return err, code
+    username, tenant_id, roles = person
+    if not (roles & PERSON_WRITERS):
+        return ("changing a status needs role admin, keyuser or tenant_admin "
+                "(oaap.data.twin 0.15 §2.27)"), 403
+    m = OBJ_ID_RE.match(obj_id)
+    if not m:
+        return "malformed object id", 400
+    body = request.get_json(silent=True) or {}
+    conn = get_conn(tenant_id)
+    if conn is None:
+        return "this tenant has no twin schema yet", 409
+    try:
+        with conn:
+            oid = _canonical_of(conn, m.group(1))
+            with conn.cursor() as cur:
+                cur.execute("SELECT type_key, owner_origin FROM objects WHERE id = %s", (oid,))
+                obj = cur.fetchone()
+            if obj is None:
+                return "no such object", 404
+            to, reason = body.get("to"), body.get("reason")
+            origin = f"tenant:{username}"      # the sign-in name, never the body's
+            res = tst.change(conn, oid, obj["type_key"], obj["owner_origin"], to, reason,
+                             origin, username, ["persons"])
+    except tw.Refused as e:
+        return str(e), e.code
+    finally:
+        conn.close()
+    return jsonify(res)
 
 
 @app.get("/internal/twin/objects/<obj_id>/tree")

@@ -136,6 +136,21 @@ def message_for(row):
     }, separators=(",", ":")).encode("utf-8")
 
 
+def status_message(conn, row):
+    """A status change (oaap.data.twin 0.15 §2.27) goes out on
+    `.../<object>/status` WITH from, to and reason -- a subscriber needs
+    them, and a status is not personal data (RFC-0120 D10)."""
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT from_status, to_status, reason FROM statuses "
+                        "WHERE event_id = %s", (row["id"],))
+            st = cur.fetchone() or {}
+    msg = json.loads(message_for(row))
+    msg["status"] = {"from": st.get("from_status"), "to": st.get("to_status"),
+                     "reason": st.get("reason")}
+    return json.dumps(msg, separators=(",", ":")).encode("utf-8")
+
+
 def wants_state(row, topic):
     """Only a published row that names an object AND a group gets a
     `states` row -- the grain is the group (RFC-0032 D3)."""
@@ -262,9 +277,12 @@ def relay_tenant(conn, tenant_id, client, acks, problem):
                         "AND group_key = %s ORDER BY attr_key",
                         (row["object_id"], row["group_key"]))
                     payload = snapshot_payload(cur.fetchall())
+        message = None
+        if topic and row["kind"] == "status.changed":
+            topic, message = topic + "/status", status_message(conn, row)
         if topic:
             try:
-                publish(client, acks, topic, message_for(row))
+                publish(client, acks, topic, message or message_for(row))
             except PublishFailed as e:
                 return str(e)
         with conn:

@@ -38,6 +38,7 @@ import re
 import secrets as _secrets
 
 import twin_read as tr
+import twin_status as tst
 import twin_values as tv
 import twin_write as tw
 
@@ -51,7 +52,7 @@ BATCH_MAX = 500
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 HOOKS_PER_CLIENT = 5
 HOOK_KINDS = ("object.created", "group.written", "period.written", "object.retired",
-              "object.renamed", "object.merged", "object.unmerged")
+              "object.renamed", "object.merged", "object.unmerged", "status.changed")
 # what an attribute type means -- the same key with the same meaning is reused
 _ATTR_MEANING = ("value_type", "values", "unit", "periodic")
 
@@ -199,6 +200,8 @@ def create_types(conn, tenant_id, label, principal, body, may_write):
                 d["title_plural"] = _title(ot["title_plural"], d["title"])
             if isinstance(ot.get("semantic_id"), str) and ot["semantic_id"].strip():
                 d["semantic_id"] = ot["semantic_id"].strip()[:300]
+            if ot.get("status") is not None:
+                d["status"] = tst.check_declaration(ot["status"])
             _register(conn, tenant_id, "object_types", type_key, d)
             created.append(type_key)
         elif row["kind"] != "object_types" or row["origin"] != f"tenant:{tenant_id}":
@@ -221,6 +224,15 @@ def create_types(conn, tenant_id, label, principal, body, may_write):
         _refuse(f"'{type_key}' was made by "
                 f"{(_type_row(conn, type_key)[1] or {}).get('created_by') or 'someone else'}"
                 f" -- '{principal}' may not change it", 403)
+    if ot is not None and type_key not in created and ot.get("status") is not None:
+        # status on a type this client made: additive (oaap.data.model 0.5 §2.11)
+        _row, d = _type_row(conn, type_key)
+        merged, changed = tst.merge_declaration(d.get("status"),
+                                                tst.check_declaration(ot["status"]))
+        if changed:
+            _replace(conn, type_key, dict(d, status=merged))
+            created.append(f"{type_key} (status)")
+            unchanged.remove(type_key)
     for g in groups:
         if not isinstance(g, dict) or not GROUP_KEY_RE.match(str(g.get("key") or "")):
             _refuse(f"group key '{(g or {}).get('key') if isinstance(g, dict) else g}' "
@@ -469,6 +481,16 @@ class Door:
             n += self.write_group(oid, o, gkey, content)
         return {"id": tr.urn(oid), "created": created, "written": n, "renamed": renamed}
 
+    def status(self, oid, o, to, reason=None):
+        """A status change by this client (oaap.data.twin 0.15 §2.27): owner
+        when it owns the object, writer when it may write the type."""
+        kinds = [k for k, yes in (("owner", o["owner_origin"] == self.origin),
+                                  ("writers", o["type_key"] in self.writable)) if yes]
+        if not kinds:
+            _refuse(f"'{self.principal}' may not write type '{o['type_key']}'", 403)
+        return tst.change(self.conn, oid, o["type_key"], o["owner_origin"], to, reason,
+                          self.origin, self.principal, kinds)
+
     def retire(self, oid, o, reason=""):
         if o["type_key"] not in self.writable:
             _refuse(f"'{self.principal}' may not write type '{o['type_key']}'", 403)
@@ -524,13 +546,15 @@ class Door:
         kind = op.get("op")
         if kind == "upsert":
             return dict(self.upsert(op.get("key"), op), op="upsert")
-        if kind not in ("group", "period", "retire"):
-            _refuse(f"op is one of upsert, group, period, retire -- not '{kind}'")
+        if kind not in ("group", "period", "retire", "status"):
+            _refuse(f"op is one of upsert, group, period, retire, status -- not '{kind}'")
         if not op.get("object") and op.get("key") is None:
             _refuse(f"op '{kind}' names its object: 'object' (id) or 'key' (this client's key)")
         oid, o = self.resolve(op.get("object"), key=op.get("key"))
         if kind == "retire":
             return dict(self.retire(oid, o, op.get("reason") or ""), op="retire")
+        if kind == "status":
+            return dict(self.status(oid, o, op.get("to"), op.get("reason")), op="status")
         gkey = str(op.get("group") or "")
         if not GROUP_KEY_RE.match(gkey):
             _refuse(f"op '{kind}' names its 'group'")

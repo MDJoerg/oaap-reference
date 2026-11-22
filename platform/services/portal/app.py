@@ -12549,6 +12549,29 @@ TWIN_OBJECT_BODY = """
   </form>
   <a class="btn" href="/zwilling/object/{{ bare_id }}/tree{{ '?at=' + at if at else '' }}">Baum ansehen</a>
 </div>
+{% if obj.status %}
+<div class="card" id="status">
+  <h2>Status: {{ obj.status.value }}</h2>
+  <p class="muted">{% if obj.status.since %}seit {{ obj.status.since[:16]|replace('T', ' ') }},
+    {{ origin_label(obj.status.by) }}{% else %}Anfangsstatus, noch nie gewechselt{% endif %}
+    {% if at %} (Stand {{ at }}){% endif %}</p>
+  {% if obj.status.allowed and can_twin_write %}
+  <form method="post" action="/zwilling/object/{{ bare_id }}/status">
+    <label>Wechseln nach
+      <select name="to">{% for v in obj.status.allowed %}<option>{{ v }}</option>{% endfor %}</select></label>
+    <label>Grund <input type="text" name="reason" maxlength="500" style="min-width:18rem"></label>
+    <button>Status wechseln</button>
+  </form>
+  {% elif not at %}<p class="muted">Von hier aus gibt es keinen Übergang, den du machen darfst.</p>{% endif %}
+  {% if obj.status.history %}
+  <table><tr><th>Wann</th><th>von</th><th>nach</th><th>wer</th><th>Grund</th></tr>
+  {% for h in obj.status.history %}<tr><td class="muted">{{ h.at[:16]|replace('T', ' ') }}</td>
+    <td>{{ h.from }}</td><td>{{ h.to }}</td><td class="muted">{{ h.recorded_by if h.by.startswith('tenant:') else origin_label(h.by) }}</td>
+    <td>{{ h.reason or '–' }}</td></tr>{% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% endif %}
 {% for gk, g in obj.groups.items() %}
 <div class="card">
   <h2>{{ gk }} <span class="badge">{{ origin_label(g.origin) }}</span></h2>
@@ -13009,6 +13032,29 @@ def twin_object_tree(obj_id):
                    tree=None, bare=_bare, error=r.text or f"HTTP {r.status_code}")
     return page(TWIN_TREE_BODY, "Baum", "twin", tree=r.json(), bare=_bare,
                at=at, depth=depth, error=None)
+
+
+@app.post("/zwilling/object/<obj_id>/status")
+def twin_object_status(obj_id):
+    """A person changes the object's status along a declared transition
+    (oaap.data.twin 0.15 §2.27); the twin checks the declaration."""
+    denied = require_twin_write()
+    if denied:
+        return denied
+    to = (request.form.get("to") or "").strip()
+    reason = (request.form.get("reason") or "").strip()[:500]
+    try:
+        r = _twin_call("POST", f"/internal/twin/objects/{obj_id}/status",
+                       json={"to": to, "reason": reason or None})
+    except requests.RequestException as e:
+        return redirect(f"/zwilling/object/{obj_id}?err=1&msg="
+                        + quote(f"Der Zwilling antwortet nicht ({type(e).__name__})."),
+                        code=303)
+    if r.status_code != 200:
+        return redirect(f"/zwilling/object/{obj_id}?err=1&msg="
+                        + quote(r.text or f"HTTP {r.status_code}"), code=303)
+    return redirect(f"/zwilling/object/{obj_id}?msg=" + quote(f"Status: {to}.") + "#status",
+                    code=303)
 
 
 @app.post("/zwilling/object/<obj_id>/save/<group_key>")

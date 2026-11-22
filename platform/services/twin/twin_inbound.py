@@ -82,9 +82,9 @@ def check_mapping(m, writable):
         w = f"rule {i}"
         if not isinstance(r, dict):
             _refuse(f"{w}: an object {{when?, upsert | retire}}")
-        acts = [k for k in ("upsert", "retire") if k in r]
-        if len(acts) != 1 or set(r) - {"when", "upsert", "retire"}:
-            _refuse(f"{w}: exactly one of upsert, retire, and an optional when")
+        acts = [k for k in ("upsert", "retire", "status") if k in r]
+        if len(acts) != 1 or set(r) - {"when", "upsert", "retire", "status"}:
+            _refuse(f"{w}: exactly one of upsert, retire, status, and an optional when")
         when = r.get("when", {})
         if not isinstance(when, dict):
             _refuse(f"{w}: 'when' maps paths to a value or a list of values")
@@ -93,6 +93,14 @@ def check_mapping(m, writable):
             if isinstance(v, dict) or (isinstance(v, list)
                                        and any(isinstance(x, (dict, list)) for x in v)):
                 _refuse(f"{w} when '{p}': a value or a list of values")
+        if "status" in r:
+            a = r["status"]
+            if not isinstance(a, dict) or "key" not in a or "to" not in a                     or set(a) - {"key", "to", "reason"}:
+                _refuse(f"{w} status: {{key, to, reason?}}")
+            for f in ("key", "to", "reason"):
+                if f in a:
+                    _value_spec(a[f], f"{w} status {f}")
+            continue
         if "retire" in r:
             a = r["retire"]
             if not isinstance(a, dict) or "key" not in a or set(a) - {"key", "reason"}:
@@ -204,6 +212,18 @@ def operations(mapping, root):
             skipped += 1
             continue
         where = f"item {n}"
+        if "status" in rule:
+            a = rule["status"]
+            to = _get(a["to"], item, root)
+            if to is _MISSING or to is None or isinstance(to, (dict, list)):
+                _refuse(f"{where}: no status at '{a['to']}'", 422)
+            op = {"op": "status", "key": _key(a["key"], item, root, where), "to": str(to)}
+            if "reason" in a:
+                r = _get(a["reason"], item, root)
+                if r is not _MISSING and r is not None:
+                    op["reason"] = str(r)
+            ops.append(op)
+            continue
         if "retire" in rule:
             a = rule["retire"]
             op = {"op": "retire", "key": _key(a["key"], item, root, where)}
