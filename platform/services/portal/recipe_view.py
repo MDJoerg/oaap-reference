@@ -42,6 +42,9 @@ def recipes_for(view, label, role):
             continue
         # RFC-0117 D4: a free template needs no release
         mine = label in (r.get("released_for") or []) or bool(r.get("free"))
+        # RFC-0119 section 4.5: the operator's block beats a release
+        if r.get("blocked"):
+            mine = False
         if role == "server_admin" or (role == "tenant_admin" and mine):
             out.append(dict(r, runnable=True, released_here=mine))
     return out
@@ -241,6 +244,8 @@ def templates_for(view, label, role):
                     "light_text": LIGHT_DE.get(light, ""), "icon": card.get("icon") or "",
                     "version": r.get("version", ""), "usable": r["id"] in runnable,
                     "free": bool(r.get("free")),
+                    # RFC-0119 §4.5: vom Betreiber gesperrt
+                    "blocked": bool(r.get("blocked")),
                     # RFC-0119: die App, die die Vorlage mitbrachte
                     "app": (r.get("app") or {}).get("name") or "",
                     "app_instance": (r.get("app") or {}).get("instance") or "",
@@ -326,11 +331,36 @@ def import_plan(view, doc, label, role):
     return rows, ""
 
 
+def _vkey(v):
+    m = re.match(r"^([0-9]+)\.([0-9]+)\.([0-9]+)", str(v or ""))
+    return tuple(int(x) for x in m.groups()) if m else (-1, -1, -1)
+
+
 def template_runs(view, label):
-    """Die Läufe dieses Mandanten, die von einer Vorlage kamen."""
-    ids = {r["id"] for r in (view or {}).get("recipes") or [] if r.get("offers") == "assistant"
-           and (not r.get("tenant") or r.get("tenant") == label)}
-    return [r for r in runs_for(view, label) if r["recipe"] in ids]
+    """Die Läufe dieses Mandanten, die von einer Vorlage kamen -- auch die
+    einer App, die es nicht mehr gibt (RFC-0119 Stufe 2). `mark`: was die
+    Seite zum Assistenten sagt (RFC-0119 §5/§6); nichts ändert sich von selbst."""
+    here = {r["id"]: r for r in (view or {}).get("recipes") or []
+            if r.get("offers") == "assistant" and not r.get("problem")
+            and (not r.get("tenant") or r.get("tenant") == label)}
+    raw = {st.get("id"): st for st in (view or {}).get("runs") or []}
+    out = []
+    for row in runs_for(view, label):
+        st = raw.get(row["id"]) or {}
+        app = st.get("app") or {}
+        if row["recipe"] not in here and not app:
+            continue
+        row = dict(row, app=app.get("name", ""), mark="", mark_tone="")
+        cur = here.get(row["recipe"])
+        if st.get("state") == "done":
+            if cur is None:
+                row.update(mark="Vorlage nicht mehr da – die App wurde entfernt; "
+                                "ihre Werkzeuge gibt es nicht mehr", mark_tone="err")
+            elif _vkey(cur.get("version")) > _vkey(st.get("version")):
+                row.update(mark=f"Vorlage neuer ({cur.get('version')}) – der Assistent "
+                                "bleibt, wie er ist", mark_tone="todo")
+        out.append(row)
+    return out
 
 
 def released_text(recipe):

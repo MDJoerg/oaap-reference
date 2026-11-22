@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apps bringen ihre Vorlagen für Assistenten mit (RFC-0119 Stufe 1).
+"""Apps bringen ihre Vorlagen für Assistenten mit (RFC-0119 Stufen 1 und 2).
 
 Gemessen wird, was das RFC verspricht:
 
@@ -18,6 +18,16 @@ Gemessen wird, was das RFC verspricht:
   * §4.4: steht die Quelle auf Rot, fragt der Assistent die Ampel -- der
     Vorschlag der App ist zu sehen, nicht gewählt; hat ein Mensch sie
     gesetzt, gilt seine.
+
+Stufe 2:
+
+  * jede Vorlage der Apps in oaap-apps hält die Regeln, ihr Manifest ist gültig;
+  * §4.5: der Betreiber sperrt die Vorlagen einer App je Mandant -- die Karte
+    sagt „vom Betreiber gesperrt“, der Riegel hält auch gegen eine Freigabe,
+    nur der server_admin sperrt, und er gibt sie zurück;
+  * ein Lauf merkt sich die App seiner Vorlage; die Seite sagt „Vorlage
+    neuer“ nach einem Update und „Vorlage nicht mehr da“ nach dem Entfernen,
+    nichts bei einem zurückgebauten Lauf (§5, §6, D9).
 
 Aufruf: python3 test/test_app_templates.py
 """
@@ -271,6 +281,104 @@ ok("der gefüllte Plan richtet nur die Quelle der App ein",
    all(t == "app.setup" for _i, t, _a in plan)
    and any(i.get("kind") == "server_light" and i.get("id") == "kunde-vorgaenge"
            for _i, _t, ar in plan for i in ar.get("items") or []), plan)
+
+print("=== Stufe 2: die Vorlagen aller Apps ===")
+import glob                                                   # noqa: E402
+APPS = os.path.join(HERE, "..", "..", "oaap-apps", "apps")
+found = 0
+for path in sorted(glob.glob(os.path.join(APPS, "*", "assistants", "*.json"))):
+    app_id = os.path.basename(os.path.dirname(os.path.dirname(path)))
+    with open(path, "rb") as f:
+        doc, why = at._check(f.read(), app_id)
+    with open(os.path.join(APPS, app_id, "oaap-app.yaml"), encoding="utf-8") as f:
+        man = yaml.safe_load(f)
+    ok(f"{app_id}: {os.path.basename(path)} hält die Regeln, Manifest gültig",
+       doc is not None and at.declaration_error(man) == "" and at.folder_of(man) == "assistants",
+       why or at.declaration_error(man))
+    found += 1
+ok("mindestens elf Apps bringen eine Vorlage mit", found >= 11, found)
+
+print("=== Stufe 2, §4.5: die Sperre des Betreibers ===")
+okb, msg = a.tenant_templates_block("t-kunde", "vorgaenge", True, "probe", "tenant_admin")
+ok("KÖDER: ein tenant_admin sperrt nicht", not okb and "server_admin" in msg, msg)
+okb, msg = a.tenant_templates_block("t-kunde", "vorgaenge", True, "root", "root")
+ok("der Betreiber sperrt die Vorlagen von vorgaenge in kunde", okb and "blocked" in msg, msg)
+view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
+row = next((r for r in view["recipes"] if r["id"] == "vorgaenge-ueberblick"), {})
+ok("die Zeile fürs Portal: gesperrt, nicht frei", row.get("blocked") is True and row.get("free") is False,
+   row)
+card = next((c for c in rv.templates_for(view, "kunde", "tenant_admin")
+             if c["id"] == "vorgaenge-ueberblick"), {})
+ok("die Karte: „vom Betreiber gesperrt“ (blocked), nicht startbar",
+   card.get("blocked") is True and card.get("usable") is False, card)
+ok("der Betreiber selbst kann sie im Mandanten noch starten",
+   rv.find_template(view, "vorgaenge-ueberblick", "kunde", "server_admin") is not None)
+ok("der Riegel: gesperrt", "blocked" in gate("t-kunde", "kunde", TPL), gate("t-kunde", "kunde", TPL))
+try:
+    a._recipe_tenant_gate("tenant_admin", "t-kunde", "t-kunde",
+                          dict(a.load_tenants()["t-kunde"],
+                               tenant_admin_may=[tr.release_word("vorgaenge-ueberblick", "1.0.0")]),
+                          TPL)
+    why = ""
+except tb.Refusal as exc:
+    why = str(exc)
+ok("KÖDER: auch eine Freigabe schlägt die Sperre nicht", "blocked" in why, why)
+view2 = dict(view, recipes=[dict(r, released_for=["kunde"]) if r["id"] == "vorgaenge-ueberblick" else r
+                            for r in view["recipes"]])
+ok("…und im Portal nicht", rv.find_template(view2, "vorgaenge-ueberblick", "kunde", "tenant_admin") is None)
+ok("der Mandant pxx bleibt unberührt", a.app_templates_blocked("t-pxx") == set())
+okb, msg = a.tenant_templates_block("t-kunde", "vorgaenge", False, "root", "root")
+ok("zurückgegeben: wieder frei", okb and gate("t-kunde", "kunde", TPL) == "", (msg, gate("t-kunde", "kunde", TPL)))
+
+print("=== Stufe 2: der Lauf merkt sich die App; Vorlage neuer / nicht mehr da ===")
+import types                                                  # noqa: E402
+saved = (a.tenant_recipe.preview, a._recipe_drive)
+a.tenant_recipe.preview = lambda *x, **k: []
+a._recipe_drive = lambda state, profile, drivers: state
+try:
+    st = a.tenant_recipe_run("vorgaenge-ueberblick", "kunde", {"quelle_ampel": "yellow"}, "probe",
+                             "tenant_admin", drivers=types.SimpleNamespace(), actor_tid="t-kunde",
+                             read_list=reader("red"))
+finally:
+    a.tenant_recipe.preview, a._recipe_drive = saved
+ok("der Lauf nennt die App seiner Vorlage",
+   (st.get("app") or {}).get("id") == "vorgaenge" and st["app"].get("name") == "Vorgänge", st.get("app"))
+st["state"] = "done"
+tb.save_state(a.RECIPE_RUN_DIR, st)
+a.tenant_recipe_view_write()
+view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
+runs = rv.template_runs(view, "kunde")
+r0 = next((r for r in runs if r["id"] == st["id"]), {})
+ok("die Seite listet ihn, „von der App Vorgänge“, ohne Hinweis", r0.get("app") == "Vorgänge"
+   and r0.get("mark") == "", r0)
+ok("in pxx nicht", not any(r["id"] == st["id"] for r in rv.template_runs(view, "pxx")))
+pkg2 = tempfile.mkdtemp(prefix="oaap-pkg2-")
+os.makedirs(os.path.join(pkg2, "assistants"))
+json.dump(dict(copy.deepcopy(TPL), version="1.1.0"),
+          open(os.path.join(pkg2, "assistants", "vorgaenge-ueberblick.json"), "w", encoding="utf-8"),
+          ensure_ascii=False)
+a.app_templates_publish_instance("kunde-vorgaenge", dict(INST, version="0.19.0"), pkg2)
+view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
+r0 = next((r for r in rv.template_runs(view, "kunde") if r["id"] == st["id"]), {})
+ok("nach dem Update der App: „Vorlage neuer (1.1.0)“, der Assistent bleibt",
+   "Vorlage neuer (1.1.0)" in r0.get("mark", ""), r0)
+ok("die Karte zeigt 1.1.0",
+   any(c["id"] == "vorgaenge-ueberblick" and c["version"] == "1.1.0"
+       for c in rv.templates_for(view, "kunde", "tenant_admin")))
+a.app_templates_retire_instance("kunde-vorgaenge", INST)
+view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
+r0 = next((r for r in rv.template_runs(view, "kunde") if r["id"] == st["id"]), {})
+ok("nach dem Entfernen: der Lauf steht noch da, „Vorlage nicht mehr da“",
+   "Vorlage nicht mehr da" in r0.get("mark", "") and r0.get("mark_tone") == "err", r0)
+st["state"] = "rolled-back"
+tb.save_state(a.RECIPE_RUN_DIR, st)
+a.tenant_recipe_view_write()
+view = json.load(open(a.RECIPE_VIEW, encoding="utf-8"))
+r0 = next((r for r in rv.template_runs(view, "kunde") if r["id"] == st["id"]), {})
+ok("ein zurückgebauter Lauf: kein Hinweis", r0 and r0.get("mark") == "", r0)
+os.remove(tb.state_path(a.RECIPE_RUN_DIR, st["id"]))
+shutil.rmtree(pkg2, ignore_errors=True)
+a.app_templates_publish_instance("kunde-vorgaenge", INST, pkg)
 
 print("=== Entfernen ===")
 a.app_templates_retire_instance("kunde-vorgaenge", INST)

@@ -11894,7 +11894,46 @@ def recipe_is_free(doc, tid=None):
     it brought it -- the rules of section 4.3 judged again here."""
     if not tenant_recipe.free_problems(doc, shipped_recipe_doc(str(doc.get("id") or ""))):
         return True
-    return bool(tid) and app_template_meta(doc, tid) is not None
+    meta = app_template_meta(doc, tid) if tid else None
+    return meta is not None and not app_templates_blocked(tid, meta.get("app_id"))
+
+
+def app_templates_blocked(tid, app_id=None):
+    """RFC-0119 section 4.5 (stage 2): the apps whose templates the operator
+    withdrew in this tenant -> set; with `app_id`, whether that one is."""
+    have = set((load_tenants().get(tid) or {}).get("app_templates_blocked") or [])
+    return have if app_id is None else (app_id in have)
+
+
+def tenant_templates_block(tid, app_id, on, who="root", role="root"):
+    """Withdraw the templates an app brings in one tenant, or give them back
+    (RFC-0119 section 4.5) -> (ok, sentence). What earlier runs made stays."""
+    if role not in ("root", "server_admin"):
+        return False, "only the server_admin blocks an app's templates (RFC-0119 section 4.5)"
+    if not re.match(r"^[a-z0-9][a-z0-9-]{0,62}$", str(app_id or "")):
+        return False, f"'{app_id}' is not an app id"
+    tenants = load_tenants()
+    t = tenants.get(tid)
+    if not t:
+        return False, "no such tenant"
+    label = t.get("label", "?")
+    have = set(t.get("app_templates_blocked") or [])
+    new = (have | {app_id}) if on else (have - {app_id})
+    if new == have:
+        return True, (f"unchanged: the templates of '{app_id}' are "
+                      f"{'' if on else 'not '}blocked in '{label}'")
+    t["app_templates_blocked"] = sorted(new)
+    tenants[tid] = t
+    save_tenants(tenants)
+    audit_tenant("tenant.app_templates.block" if on else "tenant.app_templates.unblock",
+                 tid, subject=app_id, who=who, role=role,
+                 detail=("the tenant_admin no longer sees this app's templates as free; "
+                         "what earlier runs made stays" if on else
+                         "this app's templates are free again for the tenant_admin"))
+    tenant_recipe_view_write()
+    return True, (f"The templates of '{app_id}' are blocked in '{label}': the cards say "
+                  "\"vom Betreiber gesperrt\"; what earlier runs made stays." if on else
+                  f"The templates of '{app_id}' are free again in '{label}'.")
 
 
 def app_template_meta(doc, tid):
@@ -11992,6 +12031,12 @@ def _recipe_tenant_gate(role, actor_tid, tid, t, doc):
                                    "tenant only")
     if tid == default_tenant_id():
         raise tenant_build.Refusal("the node's own tenant is the operator's")
+    meta = app_template_meta(doc, tid)
+    if meta is not None and (meta.get("app_id") in set(t.get("app_templates_blocked") or [])
+                             or app_templates_blocked(tid, meta.get("app_id"))):
+        raise tenant_build.Refusal(
+            f"the operator blocked the templates of the app '{meta.get('app_id')}' in "
+            f"'{t.get('label')}' (RFC-0119 section 4.5)")
     if not tenant_recipe.released(t.get("tenant_admin_may"), doc.get("id"),
                                   doc.get("version")) and not recipe_is_free(doc, tid):
         raise tenant_build.Refusal(
@@ -12203,6 +12248,12 @@ def tenant_recipe_run(rid, label, given, who, role, drivers=None,
             "the preview found what stops this recipe, nothing was done: "
             + "; ".join(f"{r['id']}: {r['note']}" for r in blockers[:5]))
     state = tenant_recipe.new_run_state(doc, digest, values, chosen, who)
+    # RFC-0119 stage 2: the run keeps the app its template came from, so the
+    # page Assistenten can still say "Vorlage nicht mehr da" after a removal
+    meta = app_template_meta(doc, tenant_by_label(values["label"], include_former=False)[0])
+    if meta is not None:
+        state["app"] = {"id": meta.get("app_id", ""), "name": meta.get("app_name", ""),
+                        "instance": meta.get("name", "")}
     # An id names a second; a second run in the same second (found by the
     # test: a run right after one that found everything present) must not
     # overwrite the first run's state, or its rollback is lost.
@@ -12339,7 +12390,9 @@ def _app_template_rows(tenants, dflt):
                 continue
             app = {"id": meta.get("app_id", ""), "name": meta.get("app_name", ""),
                    "instance": meta.get("name", ""), "version": meta.get("app_version", "")}
-            row = {"id": rid, "tenant": label, "app": app}
+            # section 4.5: the operator withdrew this app's templates here
+            blocked = app["id"] in set(t.get("app_templates_blocked") or [])
+            row = {"id": rid, "tenant": label, "app": app, "blocked": blocked}
             try:
                 doc, dg, _raw = tenant_recipe.read_recipe_file(path)
                 bad = app_templates.template_problems(doc, app["id"])
@@ -12357,7 +12410,7 @@ def _app_template_rows(tenants, dflt):
                            "install": False}
                        for n, sp in (doc.get("needs") or {}).items()},
                 params=doc.get("params") or {}, offers="assistant", card=doc.get("card"),
-                free=True, assistant_map=recipe_assistant_map(doc), shipped=False,
+                free=not blocked, assistant_map=recipe_assistant_map(doc), shipped=False,
                 steps=[{"id": x["id"], "type": x["type"]} for x in doc["steps"]],
                 released_for=[], releases={})
             out.append(row)
@@ -12961,6 +13014,46 @@ def _print_recipe_run(state, as_json=False):
               f"{state['id']}  (oder `rollback {state['id']}`)")
 
 
+def _tenant_templates_cli(args):
+    """oaap tenant templates <tenant> [--block <app> | --unblock <app>]
+    (RFC-0119 section 4.5): the templates the tenant's apps brought, what
+    the node dropped and why, and which apps the operator blocked."""
+    label = (args.name or "").strip().lower()
+    tid, _t = tenant_by_label(label, include_former=False)
+    if not tid:
+        die(f"no tenant with the label '{label}'")
+    block, unblock = getattr(args, "block_app", None), getattr(args, "unblock_app", None)
+    if block and unblock:
+        die("--block and --unblock ask for opposite things")
+    if block or unblock:
+        ok, msg = tenant_templates_block(tid, block or unblock, bool(block), _build_actor(), "root")
+        print(msg)
+        if not ok:
+            sys.exit(1)
+        return
+    blocked = app_templates_blocked(tid)
+    root = app_templates_root(tid)
+    seen = False
+    for iid in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        try:
+            with open(os.path.join(root, iid, app_templates.META), encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        seen = True
+        aid = meta.get("app_id", "")
+        print(f"{meta.get('name') or meta.get('instance')}  ({aid} {meta.get('version', '')})"
+              + ("  BLOCKED by the operator" if aid in blocked else ""))
+        for t in meta.get("templates") or []:
+            print(f"  {t['id']:<32} {t.get('version', ''):<8} {t.get('title', '')}")
+        for x in meta.get("dropped") or []:
+            print(f"  dropped {x.get('file')}: {x.get('reason')}")
+    if not seen:
+        print(f"No app of '{label}' brought an assistant template.")
+    for aid in sorted(blocked):
+        print(f"Blocked: {aid}")
+
+
 def _tenant_recipe_cli(args):
     sub = (args.name or "").strip().lower()
     arg = args.target
@@ -13126,6 +13219,9 @@ def cmd_tenant(args):
 
     if args.action == "recipe":
         return _tenant_recipe_cli(args)
+
+    if args.action == "templates":
+        return _tenant_templates_cli(args)
 
     if args.action == "remove":
         return _tenant_remove(args, tenants)
@@ -40920,7 +41016,13 @@ def build_parser():
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
                                "build", "recipe", "egress", "allow", "disallow",
-                               "domain", "domains"])
+                               "domain", "domains", "templates"])
+    # RFC-0119 section 4.5: the operator withdraws an app's templates per tenant
+    pten.add_argument("--block", dest="block_app", default=None,
+                      help="for 'templates': the app id whose assistant templates "
+                           "this tenant no longer gets free")
+    pten.add_argument("--unblock", dest="unblock_app", default=None,
+                      help="for 'templates': give an app's templates back")
     pten.add_argument("--archive", default=None,
                       help="for 'adopt': the tenant archive to take on. "
                            "Only onto a node that is EMPTY for this tenant "

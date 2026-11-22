@@ -14318,6 +14318,7 @@ Assistenten pflegst Du im Chat oder im MCP-Gateway.</p>
       {% if c.installs %}· installiert: {{ c.installs|join(', ') }}{% endif %}
       · Vorlage <code>{{ c.id }}</code> {{ c.version }}</p>
     {% if c.usable %}<a class="btn" href="/assistenten/neu/{{ c.id }}">Weiter</a>
+    {% elif c.blocked %}<p class="muted"><span class="badge off">vom Betreiber gesperrt</span></p>
     {% else %}
     <p class="muted">Braucht die Freigabe des Betreibers{% if c.light == 'red' %} (Suchwörter oder Inhalte verlassen den Mandanten){% endif %}.</p>
     <form method="post" action="/einrichten/anfrage">
@@ -14349,8 +14350,10 @@ im Chat unter „Assistenten“ mit „Ins MCP-Gateway übernehmen“.</p>
   <tr><th>Vorlage</th><th>Zustand</th><th>Gestartet</th><th></th></tr>
   {% for r in runs %}
   <tr class="rowlink">
-    <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">{{ r.title or r.recipe }}</a>{% if r.version %} <span class="muted">{{ r.version }}</span>{% endif %}</td>
-    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span></td>
+    <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">{{ r.title or r.recipe }}</a>{% if r.version %} <span class="muted">{{ r.version }}</span>{% endif %}
+      {% if r.app %}<br><span class="muted">von der App {{ r.app }}</span>{% endif %}</td>
+    <td><span class="badge {{ '' if r.tone == 'ok' else 'off' if r.tone == 'off' else 'todo' }}">{{ r.state }}</span>
+      {% if r.mark %}<br><span class="badge {{ 'todo' if r.mark_tone == 'err' else 'off' }}">{{ r.mark }}</span>{% endif %}</td>
     <td>{{ r.created }}<br><span class="muted">{{ r.by }}</span></td>
     <td><a class="rowaction" href="/einrichten/lauf/{{ r.id }}">Ansehen</a></td>
   </tr>
