@@ -350,5 +350,28 @@ ok("das Portal prueft die Regeln nicht selbst, es zeigt identitys Antwort",
    "parse_grants" not in src and '.get("error"' in src)
 
 print("")
+print("RFC-0120: Zugänge -> Integration")
+integ = ENV.from_string(template("INTEGRATION_BODY"))
+html = integ.render(label="bec", clients=[{"label": "graph", "reads": ["FleetNode", "FleetInstance"],
+                                         "client_keys": [dict(KEY, id="c1c1c1c1", principal="client:graph")]}],
+                    job={"id": "a" * 32, "state": "failed", "message": "not active for this tenant: X"})
+ok("die Seite nennt Client, Typen, Schlüssel und die Tür /twin/v1",
+   "client:graph" in html and "FleetNode, FleetInstance" in html and "c1c1c1c1" in html
+   and "/twin/v1" in html, html[:400])
+ok("eine Ablehnung des Host-Auftrags steht mit ihrem Satz da", "not active for this tenant" in html)
+ok("Entfernen fragt nach", "confirm(" in html and "/entfernen" in html)
+ok("kein Geheimnis auf der Seite", "oaapk_" not in html and "secret" not in html.lower())
+src = SRC[SRC.index("def integration_key"):SRC.index("@app.get(\"/keys/new\")")]
+ok("der Schlüssel kommt direkt von identity und wird einmal gezeigt, nie über eine Adresse",
+   'INTERNAL.post(f"{IDENTITY}/internal/keys"' in src and "KEY_SHOWN_BODY" in src
+   and "redirect(" not in src)
+ok("… begrenzt auf den Zwilling, Rolle user, nur für einen Client dieses Mandanten",
+   '"instance": "oaap.twin"' in src and '"roles": ["user"]' in src and "_integration_clients(tid)" in src)
+jobsrc = SRC[SRC.index("def integration_new"):SRC.index("def integration_key")]
+ok("Anlegen und Entfernen laufen als Host-Auftrag ohne Schlüssel, mit Herkunftsprüfung",
+   "twin-client-add" in jobsrc and "twin-client-remove" in jobsrc
+   and jobsrc.count("_same_origin()") == 2 and "secret" not in jobsrc)
+
+print("")
 print(f"{'FEHLER' if fails else 'Alles gruen'} - {fails} Fehlschlag(e)")
 sys.exit(1 if fails else 0)

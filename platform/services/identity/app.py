@@ -3577,8 +3577,18 @@ def keys_list():
 PLATFORM_PRINCIPAL_PREFIXES = ("instance:", "remote:", "client:")
 
 
+TWIN_SCOPE = "oaap.twin"                 # must agree with appctl.TWIN_KEY_SCOPE
+
+
 def door_refusal(principal, instance):
-    """Why the people's key door refuses this principal or scope -> '' or a sentence."""
+    """Why the people's key door refuses this principal or scope -> '' or a sentence.
+
+    One case is the point of RFC-0120 D2: the tenant admin issues the key of
+    an integration client of their OWN tenant (may_see judged before this),
+    scoped to the twin and nothing else. An integration client is nobody's
+    app: its rights come from the record the host keeps for it."""
+    if str(principal or "").startswith("client:") and str(instance or "") == TWIN_SCOPE:
+        return ""
     if str(principal or "").startswith(PLATFORM_PRINCIPAL_PREFIXES):
         return (f"Schlüssel für '{principal}' stellt nur die Plattform aus "
                 "(Prinzipale von Instanzen, Lesern und Integrations-Clients).")
@@ -3609,6 +3619,8 @@ def keys_create():
         return {"error": "Dieser Prinzipal gehoert zu einem anderen "
                          "Mandanten."}, 403
     why = door_refusal(principal, body.get("instance"))
+    if not why and principal.startswith("client:") and sorted(body.get("roles") or []) != ["user"]:
+        why = "Ein Integrations-Client trägt genau die Rolle user."
     if why:
         audit("key.refused", target.get("tenant", ""), principal, who=actor_name, role=role,
               detail=why[:200])

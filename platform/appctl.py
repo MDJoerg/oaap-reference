@@ -12957,6 +12957,38 @@ def tenant_recipe_job(req, act_tenant, role, actor):
             key = recipe_inbox_set(str(a.get("inbox") or ""), who=actor, role=role)
             return True, (f"Anfragen der Mandanten werden Vorgänge in {key}." if key else
                           "Kein Posteingang: Anfragen gehen als Nachricht an den Betreiber."), {}
+        elif op in ("twin-client-add", "twin-client-remove"):
+            # RFC-0120 stage 0 (D2): the tenant admin makes and removes the
+            # integration clients of their own tenant; the key comes from the
+            # portal straight from identity, never through this job.
+            tid, _t = tenant_by_label(label.strip().lower(), include_former=False)
+            if not tid:
+                return False, f"there is no tenant '{label}'", {}
+            if role == "tenant_admin" and tid != act_tenant:
+                return False, "a tenant_admin manages their own tenant's clients only", {}
+            if role not in ("tenant_admin", "server_admin", "root"):
+                return False, "integration clients need tenant_admin or server_admin", {}
+            name = str(a.get("label") or "").strip().lower()
+            if op == "twin-client-remove":
+                c = load_twin_clients().get(name)
+                if not c or c.get("tenant") != tid:
+                    return False, f"this tenant has no integration client '{name}'", {}
+                n = twin_client_remove(name, who=actor)
+                return True, (f"Client „{name}“ entfernt: {n} Schlüssel widerrufen, "
+                              "sein nächster Aufruf wird abgewiesen."), {"client": name}
+            if not has_profile("store") or not _store_running():
+                return False, "this node's twin is not running (profile 'store')", {}
+            try:
+                active = {t["key"] for t in model_types(tid)}
+            except SystemExit:
+                return False, "the tenant's types could not be read: " + (LAST_DIE or "?"), {}
+            why = twin_client_problem(name, tid, str(a.get("reads") or ""), active)
+            if why:
+                return False, why, {}
+            twin_client_add(name, tid, str(a.get("reads") or ""), who=actor,
+                            active_types=active, issue=False)
+            return True, (f"Client „{name}“ angelegt. Den Schlüssel stellst du jetzt auf "
+                          "dieser Seite aus -- er wird genau einmal gezeigt."), {"client": name}
         elif op in ("release", "unrelease"):
             tid, _t = tenant_by_label(label.strip().lower(), include_former=False)
             if not tid:
@@ -19509,24 +19541,35 @@ def twin_reader_add(label, tid, reads, days=None, who="root", active_types=None)
     return res["secret"], res["expires"]
 
 
-def twin_client_add(label, tid, reads, days=None, who="root", active_types=None):
-    """RFC-0120 stage 0: `client:<label>` in tenant `tid`, reading exactly
-    `reads`, with a key scoped to the twin. -> (secret, expires). The key is
-    for the program, shown once."""
+def twin_client_problem(label, tid, reads, active_types):
+    """'' or the sentence why this client cannot be made (RFC-0120 stage 0)."""
     if not re.fullmatch(DEST_NAME_RE, label or ""):
-        die("a client label is [a-z0-9-], 2-40 characters, starting and "
-            "ending with a letter or digit")
+        return ("a client label is [a-z0-9-], 2-40 characters, starting and "
+                "ending with a letter or digit")
     types = sorted({t.strip() for t in (reads or "").split(",") if t.strip()})
     if not types:
-        die("--reads names the types this client may read -- there is no default (RFC-0120)")
+        return "name the types this client may read -- there is no default (RFC-0120)"
     if label in load_twin_clients():
-        die(f"an integration client '{label}' exists -- remove it first")
-    if active_types is None:
-        active_types = {t["key"] for t in model_types(tid)}
+        return f"an integration client '{label}' exists -- remove it first"
     missing = [t for t in types if t not in active_types]
     if missing:
-        die("not active for this tenant: " + ", ".join(missing)
-            + " (oaap data model types --tenant ...)")
+        return ("not active for this tenant: " + ", ".join(missing) + " (active: "
+                + (", ".join(sorted(active_types)) or "none") + ")")
+    return ""
+
+
+def twin_client_add(label, tid, reads, days=None, who="root", active_types=None, issue=True):
+    """RFC-0120 stage 0: `client:<label>` in tenant `tid`, reading exactly
+    `reads`. With `issue`, also a key scoped to the twin -> (secret, expires);
+    without (the portal's way), ('', '') -- the tenant admin then issues the
+    key in the portal straight from identity, shown once, never through a
+    job's files."""
+    if active_types is None:
+        active_types = {t["key"] for t in model_types(tid)}
+    why = twin_client_problem(label, tid, reads, active_types)
+    if why:
+        die(why)
+    types = sorted({t.strip() for t in (reads or "").split(",") if t.strip()})
     principal = TWIN_CLIENT_PREFIX + label
     out = _identity_exec(
         "import json, os, app as m\n"
@@ -19545,13 +19588,15 @@ def twin_client_add(label, tid, reads, days=None, who="root", active_types=None)
         "    else:\n"
         "        u['active'] = True\n"
         "    m.save_users(users)\n"
+        "if os.environ.get('OAAP_R_ISSUE') != '1':\n"
+        "    print(json.dumps({'secret': '', 'id': '', 'expires': ''})); raise SystemExit\n"
         "try:\n"
         "    rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_R_SCOPE'],\n"
         "        os.environ['OAAP_R_LABEL'], os.environ.get('OAAP_R_DAYS') or None, 'root')\n"
         "except ValueError as e:\n"
         "    print(json.dumps({'error': str(e)})); raise SystemExit\n"
         "print(json.dumps({'secret': secret, 'id': rec['id'], 'expires': rec['expires']}))\n",
-        {"OAAP_R_NAME": principal, "OAAP_R_TENANT": tid,
+        {"OAAP_R_NAME": principal, "OAAP_R_TENANT": tid, "OAAP_R_ISSUE": "1" if issue else "0",
          "OAAP_R_TITLE": f"integration client {label}",
          "OAAP_R_SCOPE": TWIN_KEY_SCOPE,
          "OAAP_R_LABEL": f"oaap.data.twin integration client ({','.join(types)})",

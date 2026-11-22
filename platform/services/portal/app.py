@@ -868,6 +868,7 @@ KEYS_LIST_BODY = """
 <div class="pagehead">
   <h1>Zugänge</h1>
   <span><a class="btn" href="/keys/new">Schlüssel ausstellen</a>
+  <a class="btn" href="/zugaenge/integration">Integration (Zwilling)</a>
         <a class="btn" href="/terminal/new">Dieses Gerät zum Terminal machen</a></span>
 </div>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
@@ -5654,6 +5655,146 @@ def keys_list():
                 scope_note=(tenant_name(mine) if role == "tenant_admin"
                             and multi_tenant() else ""),
                 msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+# RFC-0120 stage 0 (D2): Zugaenge -> Integration. A tenant admin makes the
+# integration clients of their own tenant (a job: the host keeps the record
+# the twin trusts) and issues each one's key here, straight from identity --
+# shown once, never written into a job's files.
+TWIN_CLIENTS = "/apps-registry/twin-clients.json"
+CLIENT_LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
+
+INTEGRATION_BODY = """
+<div class="pagehead"><h1>Integration</h1></div>
+<p class="muted">Programme außerhalb der Plattform -- ein Graph-Viewer, ein Modellierungswerkzeug,
+ein Dashboard -- lesen den Zwilling von <strong>{{ label }}</strong> über die Tür
+<code>/twin/v1</code>. Jeder Client liest genau die Typen, die du ihm gibst; schreiben kann er noch
+nicht (RFC-0120). Die Beschreibung der Tür liefert <code>/twin/v1/openapi.json</code>.</p>
+{% if job %}<div class="card {{ 'warn' if job.state == 'failed' else '' }}"><p>
+{% if job.state == 'done' %}{{ job.message }}{% elif job.state == 'failed' %}Nicht ausgeführt: {{ job.message }}
+{% else %}Der Auftrag läuft … <a href="?job={{ job.id }}">neu laden</a>{% endif %}</p></div>{% endif %}
+<div class="card">
+<h2>Clients</h2>
+{% if clients %}
+<table><tr><th>Client</th><th>liest</th><th>Schlüssel</th><th></th></tr>
+{% for c in clients %}<tr><td><code>client:{{ c.label }}</code></td><td>{{ c.reads|join(', ') }}</td>
+<td>{% if c.client_keys %}{% for k in c.client_keys %}{{ k.id }} bis {{ k.expires[:10] }}<br>{% endfor %}{% else %}<span class="muted">keiner</span>{% endif %}</td>
+<td><form method="post" action="/zugaenge/integration/{{ c.label }}/schluessel" style="display:inline">
+<input name="days" value="90" size="3"> Tage <button class="btn">Schlüssel ausstellen</button></form>
+<form method="post" action="/zugaenge/integration/{{ c.label }}/entfernen" style="display:inline"
+onsubmit="return confirm('Client und alle seine Schlüssel entfernen?')"><button class="rowaction">Entfernen</button></form></td></tr>
+{% endfor %}</table>
+{% else %}<p class="muted">Noch kein Client.</p>{% endif %}
+</div>
+<div class="card">
+<h2>Neuer Client</h2>
+<form method="post" action="/zugaenge/integration/neu">
+<p><label>Name <input name="label" placeholder="graph-viewer" pattern="[a-z0-9][a-z0-9-]{0,38}[a-z0-9]" required></label>
+<span class="muted">klein, Ziffern und Bindestriche</span></p>
+<p><label>Liest die Typen <input name="reads" placeholder="FleetNode, FleetInstance" style="min-width:24rem" required></label>
+<br><span class="muted">Schlüssel der Typen, mit Komma getrennt; nur Typen, die in diesem Mandanten aktiv sind.</span></p>
+<p><button class="btn">Anlegen</button> <span class="muted">Danach stellst du hier den Schlüssel aus.</span></p>
+</form></div>
+"""
+
+
+def _integration_scope():
+    sc = _recipe_scope()
+    return sc if sc else None
+
+
+def _integration_clients(tid):
+    doc = _read_json(TWIN_CLIENTS) or {}
+    keys = [k for k in identity_keys() if str(k.get("principal", "")).startswith("client:")
+            and not k.get("revoked")]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = []
+    for label, c in sorted((doc.get("clients") or {}).items()):
+        if c.get("tenant") != tid:
+            continue
+        out.append({"label": label, "reads": c.get("reads") or [],
+                    "client_keys": [k for k in keys if k["principal"] == "client:" + label
+                             and str(k.get("expires") or "") > now]})
+    return out
+
+
+def _integration_job(rid):
+    if not rid or not re.fullmatch(r"[0-9a-f]{32}", rid):
+        return None
+    st = management_api.job_status(management_api.SPOOL_DIR, rid)
+    if st != "done":
+        return {"id": rid, "state": st or "queued", "message": ""}
+    res = management_api.read_json(os.path.join(management_api.SPOOL_DIR, "jobs", rid,
+                                                "result.json")) or {}
+    return {"id": rid, "state": "done" if res.get("ok") else "failed",
+            "message": res.get("message", "")}
+
+
+@app.get("/zugaenge/integration")
+def integration_page():
+    sc = _integration_scope()
+    if sc is None:
+        return _recipe_denied()
+    tid, label, _role = sc
+    return page(INTEGRATION_BODY, "Integration", "keys", label=label,
+                clients=_integration_clients(tid),
+                job=_integration_job(request.args.get("job", "")))
+
+
+@app.post("/zugaenge/integration/neu")
+def integration_new():
+    sc = _integration_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    name = (request.form.get("label") or "").strip().lower()[:40]
+    reads = (request.form.get("reads") or "").replace(" ", "")[:600]
+    jid = management_api.enqueue(tid, role, "twin-client-add",
+                                 {"tenant": label, "label": name, "reads": reads},
+                                 action="tenant-recipe")
+    return redirect(f"/zugaenge/integration?job={jid}")
+
+
+@app.post("/zugaenge/integration/<name>/entfernen")
+def integration_remove(name):
+    sc = _integration_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = sc
+    if not CLIENT_LABEL_RE.match(name or ""):
+        return "Unbekannter Client.", 404
+    jid = management_api.enqueue(tid, role, "twin-client-remove",
+                                 {"tenant": label, "label": name}, action="tenant-recipe")
+    return redirect(f"/zugaenge/integration?job={jid}")
+
+
+@app.post("/zugaenge/integration/<name>/schluessel")
+def integration_key(name):
+    sc = _integration_scope()
+    if sc is None:
+        return _recipe_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, _role = sc
+    if not any(c["label"] == name for c in _integration_clients(tid)):
+        return "Diesen Client gibt es in diesem Mandanten nicht.", 404
+    resp = INTERNAL.post(f"{IDENTITY}/internal/keys", json={
+        "actor": caller_name(), "principal": "client:" + name, "roles": ["user"],
+        "instance": "oaap.twin", "label": f"Integration {name} (RFC-0120)",
+        "days": (request.form.get("days") or "90").strip()[:3]}, timeout=5)
+    if resp.status_code == 201:
+        body = resp.json()
+        # The secret is rendered ONCE, straight from identity's response.
+        return page(KEY_SHOWN_BODY, "Schlüssel ausgestellt", "keys",
+                    k=body["key"], secret=body["secret"])
+    return page(INTEGRATION_BODY, "Integration", "keys", label=label,
+                clients=_integration_clients(tid),
+                job={"id": "", "state": "failed",
+                     "message": (resp.json() or {}).get("error", "Ausstellen fehlgeschlagen.")})
 
 
 @app.get("/keys/new")

@@ -383,6 +383,21 @@ for who in ("cls_admin2", "joerg"):
     ok(f"KÖDER {who}: eine Person/Maschine mit Begrenzung oaap.twin -> 403 mit Satz",
        st == 403 and "Fähigkeit der Plattform" in b.get("error", ""), (st, b))
 ok("kein Schlüssel ist dabei entstanden", len(m.load_keys()) == before)
+_u = m.load_users()
+_u.append(user("client:graph", ["user"], kind="machine", tenant="t-cls"))
+_u.append(user("client:fremd", ["user"], kind="machine", tenant="t-default"))
+put_users(m, _u)
+st, b = door("cls_admin2", "client:graph", "oaap.twin")
+ok("RFC-0120 D2: tenant_admin stellt den Zwillingsschlüssel SEINES Clients aus", st == 201 and b.get("secret"), (st, b))
+st, b = door("cls_admin2", "client:fremd", "oaap.twin")
+ok("KÖDER der Client eines anderen Mandanten: 403", st == 403, (st, b))
+for scope in ("", "oaap.authz.admin", "cls-viewer"):
+    st, b = door("cls_admin2", "client:graph", scope)
+    ok(f"KÖDER Client mit Begrenzung '{scope}' (nicht oaap.twin): 403", st == 403, (st, b))
+rv = kc.post("/internal/keys", headers={m.INTERNAL_HEADER: "test-internal-key"},
+             json={"actor": "cls_admin2", "principal": "client:graph", "roles": ["user", "keyuser"],
+                   "instance": "oaap.twin", "label": "t", "days": 1})
+ok("KÖDER Client mit mehr als der Rolle user: 403", rv.status_code == 403, rv.get_json())
 st, b = door("cls_admin2", "terminal-3", "cls-viewer")
 ok("eine gewöhnliche Begrenzung auf eine Instanz geht weiter", st == 201 and b.get("secret"), (st, b))
 ok("die Plattform selbst (issue_key) stellt den Zwillingsschlüssel weiter aus",
