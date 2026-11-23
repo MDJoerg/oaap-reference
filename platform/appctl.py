@@ -24241,7 +24241,7 @@ def _answers(inst, seconds):
     return False
 
 
-# 0.1.357 (F2, measured 2026-11-23 on oaap-test): `oaap app install` put
+# 0.1.358 (F2, measured 2026-11-23 on oaap-test): `oaap app install` put
 # Forgejo 11 on a database migrated by Forgejo 15; the container exited at
 # once and restarted in a loop (gateway 502), and the install said
 # "Installed". So after every install the node watches the containers for
@@ -27289,7 +27289,7 @@ def _install_from_dir(pkg, args, source):
         app_templates_publish_instance(name, reg["instances"][name], pkg)
     except Exception as e:                      # noqa: BLE001
         print(f"WARNING: the assistant templates of '{name}' were not handed over: {e}")
-    # F2 (0.1.357): does it run at all? Never a reason to fail the install
+    # F2 (0.1.358): does it run at all? Never a reason to fail the install
     # by an exception -- a check that cannot be made says nothing.
     try:
         # a sleeping instance is stopped on purpose -- nothing to watch

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install watches whether the instance runs (0.1.357, runtime 2.11 / 0.2.80).
+"""Install watches whether the instance runs (0.1.358, runtime 2.11 / 0.2.81).
 
 Found 2026-11-23 on oaap-test (Forgejo upgrade measurement, F2): Forgejo 11
 installed over a database migrated by Forgejo 15 exited at once and
