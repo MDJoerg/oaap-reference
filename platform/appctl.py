@@ -22822,6 +22822,29 @@ def config_entries(name, inst):
     return entries
 
 
+def empty_generatable(name, inst):
+    """Keys the app lets the node generate (runtime 2.8) that are still
+    empty -- (key, kind) in declaration order. The command line names them
+    after an install, because nothing there fills them on its own."""
+    try:
+        return [(e["key"], gen_values.kind_of(e.get("generate")))
+                for e in config_entries(name, inst)
+                if gen_values.kind_of(e.get("generate")) and not e["value"]]
+    except Exception:  # noqa: BLE001 -- a hint, never a reason to fail
+        return []
+
+
+def generate_hint_lines(name, keys):
+    """What `app install` says about empty generatable keys."""
+    if not keys:
+        return []
+    lines = [f"NOTE: {len(keys)} key(s) the app lets the node generate are empty: "
+             + ", ".join(f"{k} ({kind})" for k, kind in keys) + ".",
+             "      The command line generates only when asked (runtime 2.8):"]
+    lines += [f"        sudo oaap app config set {name} {k} --generate" for k, _ in keys]
+    return lines
+
+
 def apply_config(name, inst, values):
     """Write config values and recreate the container. Returns a message.
 
@@ -25661,11 +25684,31 @@ def cmd_config(args):
             print("manifest's real labels and secret flags.")
         return
     key = args.key or die(f"'app config {args.action}' needs a key name")
+    if getattr(args, "generate", False) and args.action != "set":
+        die("--generate belongs to 'set'")
     if args.action == "unset":
         entry = next((e for e in entries if e["key"] == key), None)
         if not entry:
             die(f"'{name}' does not declare config key '{key}'")
         value = entry["default"]
+    elif getattr(args, "generate", False):
+        # runtime 2.8 / RFC-0079 D7, the same rule as a recipe's
+        # `app.config generate: true`: only the kind the manifest declares,
+        # only into an EMPTY key, never replacing -- a replaced push key
+        # voids every subscription. The value is never printed or logged.
+        if args.value is not None or getattr(args, "append", False):
+            die("--generate takes no value and no --append")
+        entry = next((e for e in entries if e["key"] == key), None)
+        if not entry:
+            die(f"'{name}' does not declare config key '{key}'")
+        kind = gen_values.kind_of(entry.get("generate"))
+        if not kind:
+            die(f"'{name}' does not let the node generate {key} "
+                "(its manifest declares no `generate:` for it)")
+        if entry["value"]:
+            print(f"{key} is already set -- a generated key is never replaced.")
+            return
+        value = gen_values.generate(kind)
     else:
         value = args.value
         if value is None:
@@ -25688,6 +25731,8 @@ def cmd_config(args):
     if msg == "no change":
         print(f"{key} already had this value — nothing changed.")
         return
+    if getattr(args, "generate", False):
+        msg += f" (generated: {gen_values.kind_of(entry.get('generate'))})"
     audit_deploy({"instance": name, "ok": True, "message": f"config {msg}",
                   "revision": "", "version": inst.get("version", ""), "via": "cli"})
     print(f"Config updated for '{name}' ({msg}).")
@@ -27316,6 +27361,8 @@ def _install_from_dir(pkg, args, source):
             pass
     else:
         print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
+    for ln in generate_hint_lines(name, empty_generatable(name, reg["instances"][name])):
+        print(ln)
     print(f"Entry point: port {port} (through the gateway, login required)")
     try:
         _note = None if _bad else check_health_path(reg["instances"][name])
@@ -41824,6 +41871,10 @@ def build_parser():
     pcf.add_argument("--append", action="store_true",
                      help="with 'set': append to the current value with ';' "
                           "instead of replacing it (list-valued keys)")
+    pcf.add_argument("--generate", action="store_true",
+                     help="with 'set': let the node produce the value, for a key "
+                          "whose manifest declares `generate:` -- only into an "
+                          "empty key, never replacing (runtime 2.8)")
     pcf.set_defaults(fn=cmd_config)
     pa = sub.add_parser("address",
                         help="an instance's own public hostname and its aliases (RFC-0009, RFC-0018)")
