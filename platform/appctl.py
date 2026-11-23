@@ -24241,6 +24241,99 @@ def _answers(inst, seconds):
     return False
 
 
+# 0.1.357 (F2, measured 2026-11-23 on oaap-test): `oaap app install` put
+# Forgejo 11 on a database migrated by Forgejo 15; the container exited at
+# once and restarted in a loop (gateway 502), and the install said
+# "Installed". So after every install the node watches the containers for
+# a moment: a container that restarts, exits or is missing is said at once
+# -- a WARNING with the last log lines, a NOTE for the portal's message --
+# and the CLI exits with INSTALL_NOT_RUNNING_EXIT. The install itself is
+# not undone: what to do with a broken version is the operator's decision.
+INSTALL_SETTLE_SECONDS = 20
+INSTALL_NOT_RUNNING_EXIT = 3
+# set by _install_from_dir, read by the CLI door only (cmd_install_cli):
+# the other doors call cmd_install inside their own SystemExit handling,
+# and a non-zero exit there would read as "nothing installed".
+LAST_INSTALL_NOT_RUNNING = []
+
+
+def install_settle_problems(states, containers):
+    """Pure: what is wrong with the instance's containers right after an
+    install, as one phrase per container; [] when all run. A restart
+    counts even when the container runs again just now -- that is the
+    loop, seen between two of its turns."""
+    out = []
+    for c in containers:
+        st = states.get(c)
+        if st is None:
+            out.append(f"{c} does not exist")
+            continue
+        state, restarts = st.get("state") or "?", int(st.get("restarts") or 0)
+        if state in ("restarting", "exited", "dead", "created") or restarts > 0:
+            bits = [state]
+            if st.get("exit_code"):
+                bits.append(f"exit code {st['exit_code']}")
+            if restarts:
+                bits.append(f"{restarts} restart{'s' if restarts != 1 else ''}")
+            if st.get("oom"):
+                bits.append("out of memory")
+            out.append(f"{c} {', '.join(bits)}")
+    return out
+
+
+def check_install_settled(inst, seconds=INSTALL_SETTLE_SECONDS):
+    """After an install: watch the containers until the primary service
+    answers HTTP (any status) with all of them running, or `seconds` pass.
+    Returns the problems ([] = fine). A runtime that cannot be asked, or
+    an app that is merely slow, is not a problem -- only a container that
+    restarts, exits or is missing is."""
+    containers = _containers_of(inst)
+    if not containers:
+        return []
+    svcs = instance_services(inst)
+    http = bool(svcs and (svcs[0].get("port") or inst.get("svc_port")))
+    end = time.monotonic() + seconds
+    while True:
+        states, runtime_ok = container_states(containers)
+        if not runtime_ok:
+            return []
+        bad = install_settle_problems(states, containers)
+        if bad:
+            return bad
+        if time.monotonic() >= end:
+            return []
+        if http and _answers(inst, 1):
+            # it answers; one more look catches a crash right after
+            states, runtime_ok = container_states(containers)
+            return install_settle_problems(states, containers) if runtime_ok else []
+        time.sleep(2)
+
+
+def install_settle_report(name, bad, logs_of=None):
+    """Pure apart from `logs_of`: the lines install prints when the
+    instance does not run. The NOTE line travels into the portal's
+    message (envelope_notes_suffix)."""
+    lines = [f"WARNING: '{name}' is installed but does NOT run: " + "; ".join(bad)]
+    for c in (logs_of or {}):
+        tail = [ln for ln in (logs_of[c] or "").splitlines() if ln.strip()][-5:]
+        if tail:
+            lines.append(f"      last lines of {c}:")
+            lines += [f"      | {ln[:240]}" for ln in tail]
+    lines.append(f"      See 'oaap app logs {name}'. The install is NOT undone -- "
+                 "an older version, a backup or a fix is the operator's call.")
+    lines.append(f"NOTE: the instance does not run after the install ({'; '.join(bad)})")
+    return lines
+
+
+def _container_log_tail(c, n=20):
+    try:
+        r = subprocess.run(["docker", "logs", "--tail", str(n), c],
+                           capture_output=True, text=True, timeout=15)
+        return (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def standby_instance(name, inst, who="root", role="root"):
     """Put an instance to sleep. The fact and the waking page come FIRST,
     the containers stop after, so a visitor never meets a dead upstream."""
@@ -26361,6 +26454,15 @@ def cmd_install(args):
             shutil.rmtree(tmp_clone, ignore_errors=True)
 
 
+def cmd_install_cli(args):
+    """`oaap app install` on the command line: like every other door, plus
+    an exit code a script can read when the instance does not run (F2)."""
+    LAST_INSTALL_NOT_RUNNING.clear()
+    cmd_install(args)
+    if LAST_INSTALL_NOT_RUNNING:
+        sys.exit(INSTALL_NOT_RUNNING_EXIT)
+
+
 def _install_from_dir(pkg, args, source):
     mf_path = os.path.join(pkg, "oaap-app.yaml")
     if not os.path.isfile(mf_path):
@@ -27187,10 +27289,36 @@ def _install_from_dir(pkg, args, source):
         app_templates_publish_instance(name, reg["instances"][name], pkg)
     except Exception as e:                      # noqa: BLE001
         print(f"WARNING: the assistant templates of '{name}' were not handed over: {e}")
-    print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
+    # F2 (0.1.357): does it run at all? Never a reason to fail the install
+    # by an exception -- a check that cannot be made says nothing.
+    try:
+        # a sleeping instance is stopped on purpose -- nothing to watch
+        _bad = ([] if is_standby(reg["instances"][name])
+                else check_install_settled(reg["instances"][name]))
+    except Exception:  # noqa: BLE001
+        _bad = []
+    if _bad:
+        print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel}) "
+              "-- but it does NOT run")
+        _logs = {c.split(" ", 1)[0]: _container_log_tail(c.split(" ", 1)[0])
+                 for c in _bad if not c.endswith("does not exist")}
+        for ln in install_settle_report(name, _bad, _logs):
+            print(ln)
+        LAST_INSTALL_NOT_RUNNING.append(name)
+        try:
+            audit_tenant("instance.not-running",
+                         resolve_tenant(reg["instances"][name].get("tenant"))
+                         or ensure_default_tenant(), name, "failed",
+                         who=os.environ.get("SUDO_USER") or getpass.getuser(),
+                         role="root", detail=f"after install of {app['version']}: "
+                         + "; ".join(_bad))
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        print(f"Installed '{name}' ({app['name']} {app['version']}, channel {channel})")
     print(f"Entry point: port {port} (through the gateway, login required)")
     try:
-        _note = check_health_path(reg["instances"][name])
+        _note = None if _bad else check_health_path(reg["instances"][name])
         if _note:
             print(_note)
     except Exception:  # noqa: BLE001 -- a hint, never a reason to fail an install
@@ -40903,7 +41031,7 @@ def build_parser():
                     help="accept a version that REMOVES something it had "
                          "declared for business authorization "
                          "(oaap.core.authorization 2.2)")
-    pi.set_defaults(fn=cmd_install)
+    pi.set_defaults(fn=cmd_install_cli)
     pl = sub.add_parser("list",
                         help="list the app instances of this node")
     pl.set_defaults(fn=cmd_list)

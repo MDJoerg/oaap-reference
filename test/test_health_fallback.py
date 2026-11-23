@@ -108,9 +108,10 @@ ok("check_health_path fragt Pfad, dann Startseite",
    calls == ["http://oaap-sgl-web:3000/healthz", "http://oaap-sgl-web:3000/"]
    and note and note.startswith("NOTE:"), (calls, note))
 src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+# 0.1.357: not asked when the instance does not run (F2 already said why)
 ok("install ruft check_health_path nach 'Entry point' und scheitert nie daran",
-   "_note = check_health_path(reg[\"instances\"][name])" in src
-   and src.index('print(f"Entry point: port') < src.index("_note = check_health_path("))
+   "_note = None if _bad else check_health_path(reg[\"instances\"][name])" in src
+   and src.index('print(f"Entry point: port') < src.index("else check_health_path("))
 hs = src.split("def _http_status(", 1)[1].split("\ndef ", 1)[0]
 ok("_http_status nutzt nur Optionen, die busybox-wget kennt (gefunden auf oaap-test)",
    '"--max-redirect' not in hs and '"-S"' in hs, hs)
