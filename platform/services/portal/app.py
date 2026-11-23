@@ -2981,7 +2981,7 @@ Routen und Rollen der Instanz bleiben davon unberührt.</p>
 # exactly once, and deliberately NOT after a redirect — a redirect would
 # put it in a URL, and the gateway logs full URIs including their query.
 GRANT_SHOW_BODY = """
-<a class="back" href="/instances">← Zurück zur Liste</a>
+<a class="back" href="/instances?back=1">← Zurück zur Liste</a>
 <h1>Anlege-Erlaubnis für {{ name }}</h1>
 <div class="card">
   <p class="ok">Erlaubnis ausgestellt. <strong>Sie wird nur dieses eine Mal
@@ -2996,7 +2996,7 @@ GRANT_SHOW_BODY = """
      hoch — dieselben drei Schritte wie bei jedem Deployment.</p>
   <p class="muted">Danach ist die Erlaubnis verbraucht. Für spätere
      Aktualisierungen erzeugst Du auf der Instanzseite ein Deploy-Token.</p>
-  <p><a href="/instances">Fertig — zurück zur Liste</a></p>
+  <p><a href="/instances?back=1">Fertig — zurück zur Liste</a></p>
 </div>
 """
 
@@ -3004,7 +3004,7 @@ GRANT_SHOW_BODY = """
 # node with profile `dev` (RFC-0011); the store's one-click install
 # remains the way to production instances on every node.
 INSTANCE_NEW_BODY = """
-<a class="back" href="/instances">← Zurück zur Liste</a>
+<a class="back" href="/instances?back=1">← Zurück zur Liste</a>
 <h1>Test-Instanz anlegen</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 <div class="card">
@@ -3273,7 +3273,7 @@ MCP_CARD = """
 
 
 INSTANCE_EDIT_BODY = """
-<a class="back" href="/instances">← Zurück zur Liste</a>
+<a class="back" href="/instances?back=1">← Zurück zur Liste</a>
 <div class="objhead">
   <div class="titleline">
     <h1>{{ i.name }}</h1>
@@ -9960,11 +9960,37 @@ def _instance_config(name, inst, fresh=None, typed=None):
     return rows
 
 
+INSTANCES_FILTER_COOKIE = "oaap_instances_filter"
+INSTANCES_FILTER_KEYS = ("q", "state", "channel", "tenant", "care")
+
+
 @app.get("/instances")
 def instances_list():
+    """The instance list. Like the store it remembers its filter (Jörg,
+    23.11.: "Filter wählen, Instanz bearbeiten, zurück -- Filter weg") in a
+    cookie of this browser; every way back from an instance page and every
+    redirect after an action goes to /instances?back=1, which restores it.
+    A plain /instances (menu, "Zurücksetzen") clears it."""
     denied = require_user_admin()
     if denied:
         return denied
+    if request.args.get("back") == "1":
+        saved = request.cookies.get(INSTANCES_FILTER_COOKIE, "")
+        keep = [(k, v) for k, v in _parse_qsl(saved) if k in INSTANCES_FILTER_KEYS]
+        extra = [(k, v) for k, v in request.args.items(multi=True)
+                 if k in ("msg", "err")]
+        q = _urlencode(keep + extra)
+        return redirect("/instances" + ("?" + q if q else ""), code=303)
+    resp = make_response(instances_page())
+    cur = _urlencode([(k, v) for k, v in request.args.items(multi=True)
+                      if k in INSTANCES_FILTER_KEYS and v])
+    resp.set_cookie(INSTANCES_FILTER_COOKIE, cur, max_age=7 * 86400, path="/instances",
+                    httponly=True, samesite="Lax",
+                    secure=request.headers.get("X-Forwarded-Proto", "https") == "https")
+    return resp
+
+
+def instances_page():
     role, mine = caller_scope()
     rows = []
     shown = sorted(visible_instances().items())
@@ -10074,17 +10100,17 @@ def instance_grant():
         return denied
     name = (request.form.get("name") or "").strip().lower()
     if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
-        return redirect("/instances?err="
+        return redirect("/instances?back=1&err="
                         + quote("Instanzname: Kleinbuchstaben, Ziffern, Bindestriche."),
                         code=303)
     if request.form.get("op") == "revoke":
         res = _queue_and_wait(name, {"action": "grant", "op": "revoke"},
                               TOKEN_WAIT_SECONDS)
         if res is None:
-            return redirect("/instances?err="
+            return redirect("/instances?back=1&err="
                             + quote("Der Widerruf läuft noch — bitte gleich erneut prüfen."),
                             code=303)
-        return redirect(f"/instances?{'msg' if res.get('ok') else 'err'}="
+        return redirect(f"/instances?back=1&{'msg' if res.get('ok') else 'err'}="
                         + quote(res.get("message", "")), code=303)
     if name in load_instances():
         # Instance names are unique per NODE, not per tenant — a name
@@ -10098,7 +10124,7 @@ def instance_grant():
         else:
             err = (f"Der Name „{name}“ ist auf diesem Knoten schon vergeben — "
                    "bitte einen anderen wählen.")
-        return redirect("/instances?err=" + quote(err), code=303)
+        return redirect("/instances?back=1&err=" + quote(err), code=303)
     # Same shape as the deploy token: the portal mints the secret and
     # hands the host only its digest, so the readable value never
     # touches the spool or the filesystem.
@@ -10112,11 +10138,11 @@ def instance_grant():
         "tenant": request.form.get("tenant", ""),
     }, TOKEN_WAIT_SECONDS)
     if res is None:
-        return redirect("/instances?err="
+        return redirect("/instances?back=1&err="
                         + quote("Die Ausstellung läuft noch — bitte gleich erneut prüfen."),
                         code=303)
     if not res.get("ok"):
-        return redirect("/instances?err="
+        return redirect("/instances?back=1&err="
                         + quote(res.get("message", "Erlaubnis konnte nicht ausgestellt werden.")),
                         code=303)
     # Rendered directly, NOT via Post/Redirect/Get — see TOKEN_SHOW_BODY.
@@ -10261,7 +10287,7 @@ def instance_new():
         "ref": request.form.get("ref", "").strip(),
     }, CREATE_WAIT_SECONDS)
     if res is None:
-        return redirect(f"/instances?msg={quote(f'Die Installation von {name} läuft noch — das Ergebnis steht im Deploy-Protokoll auf der Gesundheitsseite.')}", code=303)
+        return redirect(f"/instances?back=1&msg={quote(f'Die Installation von {name} läuft noch — das Ergebnis steht im Deploy-Protokoll auf der Gesundheitsseite.')}", code=303)
     if res.get("ok"):
         # The key the host settled on, not the name that was typed: in a
         # tenant they differ, and a link to the name would 404.
@@ -10493,7 +10519,7 @@ def sideload_install_page():
     }, SIDELOAD_INSTALL_WAIT)
     if res is None:
         return redirect(
-            "/instances?msg=" + quote(
+            "/instances?back=1&msg=" + quote(
                 f"Die Installation von {name} läuft noch — das Ergebnis "
                 "steht im Deploy-Protokoll auf der Gesundheitsseite."),
             code=303)
@@ -10548,7 +10574,7 @@ def instance_detail(name):
         return denied
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     return _instance_page(name, inst)
 
 
@@ -10733,7 +10759,7 @@ def instance_endpoint(name):
                 "Entscheidung über den Knoten und erfordert die Rolle "
                 "server_admin."), 403
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     op = request.form.get("op", "allow")
     ep = (request.form.get("endpoint") or "").strip()
     if not ep:
@@ -10750,7 +10776,7 @@ def instance_link(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     op = request.form.get("op", "add")
     target = (request.form.get("target") or "").strip()
     if not target:
@@ -10774,7 +10800,7 @@ def instance_destination(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     op = request.form.get("op", "bind")
     need = (request.form.get("need") or "").strip()
     dest = (request.form.get("destination") or "").strip()
@@ -10821,7 +10847,7 @@ def instance_mcp_idp(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     op = request.form.get("op", "")
     if op not in ("on", "off"):
         return _inst_back(name, err="Unbekannte Aktion.")
@@ -10840,7 +10866,7 @@ def instance_visibility(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     mode = request.form.get("mode", "all")
     groups = _parse_groups(request.form.get("groups", "")) if mode == "groups" else []
     if mode == "groups" and not groups:
@@ -10862,7 +10888,7 @@ def instance_tile(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     mode = request.form.get("mode", "auto")
     if mode not in iv.TILE_MODES:
         return _inst_back(name, err="Unbekannte Einstellung für die Kachel.")
@@ -10989,7 +11015,7 @@ def instance_address(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     op = (request.form.get("op") or "").strip()
     hostname = (request.form.get("hostname") or "").strip()
     # Canonical name: an explicit remove, or an empty field, clears it.
@@ -11012,7 +11038,7 @@ def instance_throttle(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     return _queue_and_redirect(name, {
         "action": "throttle",
         "mode": request.form.get("mode", "default"),
@@ -11033,7 +11059,7 @@ def instance_resources(name):
     if "server_admin" not in caller_roles():
         return ("Zugriff verweigert: erfordert die Rolle server_admin."), 403
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     if _deploy_now(name):
         return _inst_back(name, err="Für diese Instanz läuft gerade ein "
@@ -11066,7 +11092,7 @@ def instance_rename(name):
         return denied
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     new = (request.form.get("new") or "").strip().lower()
     shown = local_name(name, inst)
@@ -11079,7 +11105,7 @@ def instance_rename(name):
     res = _queue_and_wait(name, {"action": "rename", "new": new},
                           RENAME_WAIT_SECONDS)
     if res is None:
-        return redirect(f"/instances?msg={quote('Das Umbenennen laeuft noch — die Liste zeigt gleich den tatsaechlichen Stand.')}",
+        return redirect(f"/instances?back=1&msg={quote('Das Umbenennen laeuft noch — die Liste zeigt gleich den tatsaechlichen Stand.')}",
                         code=303)
     if not res.get("ok"):
         return _inst_back(name, keep=("new",),
@@ -11095,7 +11121,7 @@ def instance_remove(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     # Typing the name is the guard against a misclick on the one
     # destructive control in this UI; the host checks it a second time.
     # Typed against the name the page SHOWS -- the key is an
@@ -11112,12 +11138,12 @@ def instance_remove(name):
                           REMOVE_WAIT_SECONDS)
     if res is None:
         return redirect(
-            f"/instances?err={quote('Das Entfernen läuft noch — bitte die Liste gleich erneut prüfen.')}",
+            f"/instances?back=1&err={quote('Das Entfernen läuft noch — bitte die Liste gleich erneut prüfen.')}",
             code=303)
     if not res.get("ok"):
         return _inst_back(name, err=res.get("message", "Entfernen fehlgeschlagen."))
     # back to the list: the object page this came from no longer exists
-    return redirect(f"/instances?msg={quote(res.get('message', 'Entfernt.'))}", code=303)
+    return redirect(f"/instances?back=1&msg={quote(res.get('message', 'Entfernt.'))}", code=303)
 
 
 def _hook_url(name):
@@ -11143,7 +11169,7 @@ def instance_envelope(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     op = "reject" if request.form.get("op") == "reject" else "confirm"
     return _queue_and_redirect(
         name, {"action": "envelope", "op": op,
@@ -11261,7 +11287,7 @@ def instance_promote(name):
         return denied
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     target = (request.form.get("target") or "").strip()
     new_target = (request.form.get("new_target") or "").strip().lower()
     if target and new_target and target != new_target:
@@ -11304,7 +11330,7 @@ def instance_catalog_put(name):
                 "Betreibers (server_admin)."), 403
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     catalog = (request.form.get("catalog") or "").strip()
     if catalog and not _re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,63}", catalog):
         return _inst_back(name, err="Unbekannter Katalog.")
@@ -11326,7 +11352,7 @@ def instance_rollback(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     artifact = request.form.get("artifact", "").strip()
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
         return _inst_back(name, err="Unbekanntes Paket.")
@@ -11360,7 +11386,7 @@ def instance_artifact_download(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     artifact = request.args.get("artifact", "").strip()
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
         return _inst_back(name, err="Unbekanntes Paket.")
@@ -11397,7 +11423,7 @@ def instance_artifact_delete(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     artifact = request.form.get("artifact", "").strip()
     if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.zip", artifact):
         return _inst_back(name, err="Unbekanntes Paket.")
@@ -11439,7 +11465,7 @@ def instance_token(name):
         return denied
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     if inst.get("channel") != "test":
         return _inst_back(name, err="Deploy-Token gibt es nur für Test-Instanzen.")
     if request.form.get("op") == "revoke":
@@ -11621,7 +11647,7 @@ def instance_config(name):
         return denied
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     rows = _instance_config(name, inst)
     # "Wert erzeugen" (spec oaap.apps.runtime 2.8). A plain submit
     # button, deliberately: this page carries no JavaScript, and the
@@ -11719,7 +11745,7 @@ def instance_rehearse(name):
         return denied
     inst = load_instances().get(name)
     if not inst:
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     to = (request.form.get("to") or "").strip().lower()
     if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", to):
@@ -11879,7 +11905,7 @@ def instance_diagnose(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     op = (request.form.get("op") or "").strip()
     if op == "close":
@@ -11987,7 +12013,7 @@ def instance_access(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     op = (request.form.get("op") or "").strip()
     if op == "close":
@@ -12265,7 +12291,7 @@ def instance_rebuild_act(name, op):
     if not _same_origin():
         return "Zugriff verweigert: fremde Herkunft.", 403
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     if op not in ("start", "back"):
         return _inst_back(name)
     res = _queue_and_wait(name, {"action": "rebuild", "op": op}, REBUILD_WAIT_SECONDS)
@@ -12288,7 +12314,7 @@ def instance_care_act(name, op):
     if not _same_origin():
         return "Zugriff verweigert: fremde Herkunft.", 403
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}", code=303)
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
     if op not in ("protect", "release"):
         return _inst_back(name)
     args = {}
@@ -12344,7 +12370,7 @@ def _mode_action(name, payload, wait, ok_text, fail_text, pending_text):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     if _deploy_now(name):
         return _inst_back(name, err="Für diese Instanz läuft gerade ein "
@@ -12417,7 +12443,7 @@ def instance_restart(name):
     if denied:
         return denied
     if not load_instances().get(name):
-        return redirect(f"/instances?err={quote('Instanz nicht gefunden.')}",
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}",
                         code=303)
     if _deploy_now(name):
         return _inst_back(name, err="Für diese Instanz läuft gerade ein "
