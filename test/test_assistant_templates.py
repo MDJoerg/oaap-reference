@@ -190,7 +190,7 @@ ok("höhere Version des Betreibers: seine",
    a.tenant_recipe_path("hilfe-assistent") == os.path.join(own_dir, "hilfe-assistent.json"))
 ok("die Liste nennt die gelieferten und die eigenen",
    [(r[0], r[2]) for r in a.tenant_recipes()]
-   == [("assistent-leer", "1.0.0"), ("hilfe-assistent", "2.0.0"), ("recherche", "1.1.0")],
+   == [("assistent-leer", "1.0.0"), ("hilfe-assistent", "2.0.0"), ("recherche", "1.2.0")],
    a.tenant_recipes())
 
 print("=== der Riegel des tenant_admin ===")

@@ -1,21 +1,23 @@
 {
   "recipe": "oaap.tenant-recipe/1",
   "id": "recherche",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "offers": "assistant",
   "card": {"title": "Recherche",
            "summary": "Sucht im öffentlichen Internet, liest Seiten und nennt zu jeder Aussage die Quelle. Suchwörter verlassen den Mandanten.",
            "light": "red", "icon": "search"},
   "title": "Web-Recherche im Chat",
-  "description": "RFC-0116, Vorlage nach RFC-0117. Der Chat bekommt einen Assistenten, der im öffentlichen Internet sucht und Seiten liest. Installiert bei Bedarf die App recherche, bindet ihr den Suchdienst (eine SearXNG-Instanz mit format json) als Destination search, legt im MCP-Gateway die Sicht 'recherche', ein eigenes Zugangsprofil des Chats für diese Sicht (Ampel bis rot) und den Assistenten an. Die Quelle bleibt rot (Suchwörter verlassen den Mandanten): ein Gespräch mit dem Assistenten muss bewusst auf rot gestellt werden. Überschreibt nichts, was ein Mensch angelegt hat. Voraussetzung: mcp-gateway ab 0.27.0, chat mit Zugang zu einem Modell.",
+  "description": "RFC-0116, Vorlage nach RFC-0117. Der Chat bekommt einen Assistenten, der im öffentlichen Internet sucht und Seiten liest. Installiert bei Bedarf die App recherche (ab 0.3.0 mit eigenem Suchdienst SearXNG im Netz der Instanz; nur wer einen anderen Suchdienst will, gibt seine Adresse an, dann wird sie als Destination search gebunden), legt im MCP-Gateway die Sicht 'recherche', ein eigenes Zugangsprofil des Chats für diese Sicht (Ampel bis rot) und den Assistenten an. Die Quelle bleibt rot (Suchwörter verlassen den Mandanten): ein Gespräch mit dem Assistenten muss bewusst auf rot gestellt werden. Überschreibt nichts, was ein Mensch angelegt hat. Voraussetzung: mcp-gateway ab 0.27.0, chat mit Zugang zu einem Modell.",
   "needs": {
     "recherche": {"app": "recherche", "label": "Recherche", "install": true, "name": "recherche"},
     "tools":     {"app": "mcp-gateway", "label": "Werkzeuge (MCP-Gateway)"},
     "chat":      {"app": "chat", "label": "Chat"}
   },
   "params": {
-    "search_url": {"kind": "text", "max": 200,
-                   "label": "Adresse des Suchdienstes (SearXNG mit format json), z. B. http://10.0.0.5:8080"},
+    "fremde_suche": {"kind": "bool", "default": "false",
+                     "label": "Einen anderen Suchdienst statt des eigenen nehmen (z. B. im geschlossenen Mandanten)"},
+    "search_url": {"kind": "text", "max": 200, "default": "",
+                   "label": "Nur mit anderem Suchdienst: seine Adresse (SearXNG mit format json), z. B. http://10.0.0.5:8080"},
     "title": {"kind": "text", "max": 60, "default": "Recherche", "shape": true,
               "label": "Name des Assistenten"},
     "aid": {"kind": "word", "default": "recherche", "shape": true,
@@ -30,7 +32,7 @@
               "label": "Modellname des KI-Gateways für den Assistenten"}
   },
   "steps": [
-    {"id": "suchdienst", "type": "destination.ensure", "name": "search",
+    {"id": "suchdienst", "type": "destination.ensure", "name": "search", "when": "fremde_suche",
      "instance": "{recherche}", "target": "{search_url}", "auth": "none"},
     {"id": "werkzeuge", "type": "app.setup", "name": "{tools}",
      "items": [{"kind": "refresh", "id": "{recherche_key}"},

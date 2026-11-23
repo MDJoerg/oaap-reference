@@ -78,8 +78,8 @@ ok("ein Rezept ohne offers ist keine Vorlage",
    rv.find_template(VIEW, "sap-sso", "kunde", "tenant_admin") is None
    and rv.find_recipe(VIEW, "sap-sso", "kunde", "tenant_admin") is not None)
 needs, asked, shaped = rv.wizard_parts(RECH)
-ok("Recherche: gefragt wird nur die Adresse des Suchdienstes, geformt die fünf Werte",
-   [f["name"] for f in asked] == ["search_url"]
+ok("Recherche (1.2.0): nichts gefragt -- der eigene Suchdienst; geformt die fünf Werte",
+   [f["name"] for f in asked] == []
    and [f["name"] for f in shaped] == ["title", "aid", "greeting", "system", "model"]
    and [f["name"] for f in needs] == ["recherche", "tools", "chat"], (asked, shaped))
 _n, asked, shaped = rv.wizard_parts(HILFE)
