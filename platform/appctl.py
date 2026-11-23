@@ -21902,6 +21902,30 @@ def write_internal_care_caddy():
     return True
 
 
+def door_target(inst, door_path):
+    """(container, port) that serves an app's own door path (setup, links,
+    assets): the service of the LONGEST route that covers the path -- the
+    same service the gateway would send a person to. Measured on oaap-test
+    2026-11-23 (bookstack, RFC-0110 stage 1): with three services the setup
+    door /oaap/setup lies under the route /oaap of the service `oaap`, but
+    /s/<name> went to the primary service, BookStack, which answered 404.
+    A single-service instance, or a path no route covers, keeps the primary."""
+    primary = (inst["container"], inst["svc_port"])
+    services = route_targets(inst)
+    if not services or not door_path:
+        return primary
+    path = door_path.split("?", 1)[0]
+    best = None
+    for r in inst.get("routes") or []:
+        p = r.get("path") or "/"
+        covers = p == "/" or path == p or path.startswith(p.rstrip("/") + "/")
+        if covers and (best is None or len(p) > len(best.get("path") or "/")):
+            best = r
+    if best and best.get("service") in services:
+        return services[best["service"]]
+    return primary
+
+
 def write_internal_health_caddy():
     reg = load_registry()
     path = os.path.join(CADDY_APPS_DIR, "_internal-health.caddy")
@@ -21944,7 +21968,7 @@ def write_internal_health_caddy():
         if lp:
             lines.append(f"\t\thandle /l/{name} {{")
             lines.append(f"\t\t\trewrite * {lp}")
-            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t\treverse_proxy %s:%s" % door_target(inst, lp))
             lines.append("\t\t}")
         # RFC-0104 §3.1: an app's setup door, for a tenant build. The
         # query stays (setup.ready asks ?kind=&id=); the app checks its
@@ -21953,14 +21977,14 @@ def write_internal_health_caddy():
         if sp:
             lines.append(f"\t\thandle /s/{name} {{")
             lines.append(f"\t\t\trewrite * {sp}?{{query}}")
-            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t\treverse_proxy %s:%s" % door_target(inst, sp))
             lines.append("\t\t}")
         # RFC-0087 §8.2: an app's assets door, for the status document
         ap = assets_door(inst)
         if ap:
             lines.append(f"\t\thandle /a/{name} {{")
             lines.append(f"\t\t\trewrite * {ap}")
-            lines.append(f"\t\t\treverse_proxy {inst['container']}:{inst['svc_port']}")
+            lines.append("\t\t\treverse_proxy %s:%s" % door_target(inst, ap))
             lines.append("\t\t}")
     lines += ["\t\thandle {", "\t\t\trespond 404", "\t\t}", "\t}",
               "\thandle {", "\t\trespond 403", "\t}", "}"]
