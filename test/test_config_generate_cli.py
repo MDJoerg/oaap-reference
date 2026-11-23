@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Erzeugte Werte auf der Kommandozeile: `oaap app config set <i> <KEY> --generate`.
+"""Erzeugte Werte auf der Kommandozeile (0.1.359, runtime 2.8 / 0.2.82): `oaap app config set <i> <KEY> --generate`.
 
 Der Befund (BookStack Stufe 1, oaap-test, 23.11.): `oaap app install` auf der
 Kommandozeile liess die Schluessel mit `generate: token` leer, und die

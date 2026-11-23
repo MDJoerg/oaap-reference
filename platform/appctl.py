@@ -22823,7 +22823,7 @@ def config_entries(name, inst):
 
 
 def empty_generatable(name, inst):
-    """Keys the app lets the node generate (runtime 2.8) that are still
+    """Keys the app lets the node generate (runtime 2.8, 0.2.82; 0.1.359) that are still
     empty -- (key, kind) in declaration order. The command line names them
     after an install, because nothing there fills them on its own."""
     try:
@@ -25692,7 +25692,7 @@ def cmd_config(args):
             die(f"'{name}' does not declare config key '{key}'")
         value = entry["default"]
     elif getattr(args, "generate", False):
-        # runtime 2.8 / RFC-0079 D7, the same rule as a recipe's
+        # 0.1.359 (runtime 2.8 / 0.2.82, RFC-0079 D7): the same rule as a recipe's
         # `app.config generate: true`: only the kind the manifest declares,
         # only into an EMPTY key, never replacing -- a replaced push key
         # voids every subscription. The value is never printed or logged.
