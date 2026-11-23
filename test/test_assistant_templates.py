@@ -190,7 +190,7 @@ ok("höhere Version des Betreibers: seine",
    a.tenant_recipe_path("hilfe-assistent") == os.path.join(own_dir, "hilfe-assistent.json"))
 ok("die Liste nennt die gelieferten und die eigenen",
    [(r[0], r[2]) for r in a.tenant_recipes()]
-   == [("assistent-leer", "1.0.0"), ("hilfe-assistent", "2.0.0"), ("recherche", "1.2.0")],
+   == [("assistent-leer", "1.0.0"), ("hilfe-assistent", "2.0.0"), ("recherche", "1.2.1")],
    a.tenant_recipes())
 
 print("=== der Riegel des tenant_admin ===")
@@ -230,6 +230,17 @@ ok("die Sicht fürs Portal: offers, Karte, frei",
    {k: (v.get("offers"), v.get("free"), v.get("shipped")) for k, v in rows.items()})
 ok("…und die Vorgabe der Anweisungen steht mehrzeilig darin",
    "\n- " in rows["recherche"]["params"]["system"]["default"])
+
+print("=== Recherche 1.2.1: ohne Angaben startbar (gefunden auf oaapx01, 23.11.) ===")
+import tenant_recipe as tr                                    # noqa: E402
+_keys = {"label": "pxx", "tenant": "pxx", "model": "chat-default"}
+for _n in ("recherche", "tools", "chat"):
+    _keys[_n], _keys[_n + "_key"] = _n, "pxx-" + _n
+_vals, _probs = tb.param_values(tr.as_profile(RECH), _keys)
+ok("keine Adresse, kein fremder Suchdienst: keine Beanstandung (Text darf nie leer sein)",
+   _probs == [] and _vals["fremde_suche"] == "false", _probs)
+ok("der Schritt Destination hängt an fremde_suche",
+   next(x for x in RECH["steps"] if x["id"] == "suchdienst").get("when") == "fremde_suche")
 
 shutil.rmtree(ship, ignore_errors=True)
 print(f"\nFAIL: {fails}" if fails else "\nalle grün")

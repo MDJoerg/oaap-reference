@@ -1,7 +1,7 @@
 {
   "recipe": "oaap.tenant-recipe/1",
   "id": "recherche",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "offers": "assistant",
   "card": {"title": "Recherche",
            "summary": "Sucht im öffentlichen Internet, liest Seiten und nennt zu jeder Aussage die Quelle. Suchwörter verlassen den Mandanten.",
@@ -16,7 +16,7 @@
   "params": {
     "fremde_suche": {"kind": "bool", "default": "false",
                      "label": "Einen anderen Suchdienst statt des eigenen nehmen (z. B. im geschlossenen Mandanten)"},
-    "search_url": {"kind": "text", "max": 200, "default": "",
+    "search_url": {"kind": "text", "max": 200, "default": "keine",
                    "label": "Nur mit anderem Suchdienst: seine Adresse (SearXNG mit format json), z. B. http://10.0.0.5:8080"},
     "title": {"kind": "text", "max": 60, "default": "Recherche", "shape": true,
               "label": "Name des Assistenten"},
