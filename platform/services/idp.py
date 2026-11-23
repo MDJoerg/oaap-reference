@@ -769,6 +769,57 @@ def policy_target(role, own_tenant, wanted=""):
     return tid, ""
 
 
+# oaap.core.tenant 2.8 (Jörg 2026-11-23): the portal is a second door
+# for the operator, and a narrower one. It knows the two plain answers
+# -- nobody gets anything, or everybody gets one role -- and nothing
+# that needs a mapping or a reason. Those stay on the command line,
+# where the reason is typed.
+PORTAL_FIRST_LOGIN = ("eingang", "role")
+
+
+def portal_policy_refusal(first_login, default_role, policy):
+    """The sentence that refuses a first-login change from the portal, or ''.
+
+    `policy` is the tenant's record AFTER a fresh read of its realm --
+    the caller reads first. Closing (`eingang`) is always allowed: it
+    takes rights away and opens nothing. Granting is allowed only when
+    the realm was read, answered about its brokers, and has no open
+    door at all: no self-registration, no open broker. The command line
+    can still set the dangerous pair deliberately, with a reason; the
+    portal has no field for one on purpose (Jörg 2026-11-23: "natürlich
+    nur, wenn keine Selbstregistrierung offen ist").
+    """
+    first = (first_login or "").strip().lower()
+    role = (default_role or "").strip().lower()
+    if first not in PORTAL_FIRST_LOGIN:
+        return (f"the portal sets '{PORTAL_FIRST_LOGIN[0]}' or "
+                f"'{PORTAL_FIRST_LOGIN[1]}'; '{first_login}' stays on the "
+                "command line (oaap tenant policy)")
+    if first == "eingang":
+        return ""
+    if role not in GRANTABLE_AT_FIRST_LOGIN:
+        return (f"'{default_role}' cannot be granted at a first login -- one "
+                f"of {', '.join(GRANTABLE_AT_FIRST_LOGIN)} (RFC-0041 K4)")
+    p = policy or {}
+    realm = p.get("realm") or {}
+    if not realm.get("read"):
+        return ("the provider's space has never been read, so nobody knows "
+                "whether it lets people register themselves -- the portal "
+                "grants nothing on a guess")
+    if brokers_judged(p) is None:
+        return ("the last read of the provider's space could not list its "
+                "brokers, so an open door cannot be ruled out -- the portal "
+                "grants nothing on a guess")
+    doors = open_doors(p)
+    if doors:
+        return ("a door into the provider's space is open ("
+                + "; ".join(why for _d, why in doors)
+                + "), so a role at first login would go to anybody who comes "
+                "through it. Close the door first, or set it deliberately "
+                "with a reason: oaap tenant policy ... --reason (RFC-0041 K7)")
+    return ""
+
+
 def policy_refusal(first_login, default_role, self_registration,
                    group_map=None, reason="", second_factor=None,
                    realm=None, broker_closed=None, role_map=None):

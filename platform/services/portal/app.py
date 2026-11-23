@@ -2539,7 +2539,9 @@ TENANT_BODY = """
           <a class="rowaction" href="/tenant/egress?tenant={{ t.label }}">Abfluss</a>
           {% if not t.is_default %}<a class="rowaction"
           href="/tenant/backup?tenant={{ t.label }}">Sicherung</a>
-          <a class="rowaction" href="/tenant/domain?tenant={{ t.label }}">Domain</a>{% endif %}</td></tr>
+          <a class="rowaction" href="/tenant/domain?tenant={{ t.label }}">Domain</a>
+          {% if t.idp.issuer %}<a class="rowaction"
+          href="/tenant/first-login?tenant={{ t.label }}">Erster Login</a>{% endif %}{% endif %}</td></tr>
   {% endfor %}
 </table>
 </div>
@@ -6678,6 +6680,130 @@ def tenant_domain_post():
             "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
     return redirect(back + ("" if res.get("ok") else "err=1&") + "msg="
                     + quote(str(res.get("message") or "")[:1500]), code=303)
+
+
+TENANT_POLICY_BODY = """
+<div class="pagehead"><h1>Erster Login: {{ label }}</h1></div>
+{% if msg %}<div class="card"><p class="{{ 'ok' if msg_ok else 'err' }}" style="margin:0;white-space:pre-line">{{ msg }}</p></div>{% endif %}
+{% if confirm %}
+<div class="card">
+  <h2>Bestätigen</h2>
+  <p>Wer sich ab jetzt zum ersten Mal über den Anmeldedienst anmeldet, bekommt
+     <strong>{{ confirm.text }}</strong>.</p>
+  <form method="post" action="/tenant/first-login?tenant={{ label }}" style="display:inline">
+    <input type="hidden" name="first_login" value="{{ confirm.first }}">
+    <input type="hidden" name="default_role" value="{{ confirm.role }}">
+    <button class="btn">Jetzt umstellen</button>
+  </form>
+  <a class="btn" href="/tenant/first-login?tenant={{ label }}">Abbrechen</a>
+  <p class="muted">Wer schon im Eingang wartet, bleibt dort: die Einstellung gilt
+     für die nächste erste Anmeldung, nicht rückwirkend.</p>
+</div>
+{% endif %}
+<div class="card">
+  <h2>Was eine erste Anmeldung bekommt</h2>
+  {% if not idp.issuer %}
+  <p class="muted">Dieser Mandant hat keinen eigenen Anmeldedienst. Eine erste
+     Anmeldung über einen solchen kann es hier nicht geben.</p>
+  {% else %}
+  <p>Heute: <strong>{{ idp.first_login_text }}</strong></p>
+  <p class="muted">Anmeldedienst: {{ idp.label }} (<code>{{ idp.issuer }}</code>).
+     {% if idp.realm_read %}Zuletzt am Ort <code>{{ idp.realm_space }}</code>
+     nachgelesen: {{ idp.realm_read }}.{% endif %}
+     Selbstregistrierung: <strong>{{ 'offen' if idp.self_registration else 'aus' }}</strong>.</p>
+  {% if idp.custom %}
+  <p class="err">Hier gilt eine Einstellung, die das Portal nicht abbildet
+     ({{ idp.first_login }}{% if idp.role_map %}, Rollen je Gruppe{% endif %}).
+     Sie bleibt der Kommandozeile vorbehalten: <code>sudo oaap tenant policy {{ label }}</code>.</p>
+  {% endif %}
+  <form method="post" action="/tenant/first-login?tenant={{ label }}">
+    <input type="hidden" name="check" value="1">
+    <p><label><input type="radio" name="first_login" value="eingang"
+       {% if idp.first_login == 'eingang' %}checked{% endif %}>
+       Eingang — eine Identität und keine Rechte, bis jemand freischaltet</label></p>
+    <p><label><input type="radio" name="first_login" value="role"
+       {% if idp.first_login == 'role' %}checked{% endif %}>
+       Sofort die Rolle</label>
+       <select name="default_role">
+       {% for r in roles %}<option value="{{ r }}" {% if r == (idp.default_role or 'user') %}selected{% endif %}>{{ r }}</option>{% endfor %}
+       </select></p>
+    <button class="btn">Prüfen</button>
+  </form>
+  <p class="muted">Prüfen liest den Anmeldedienst sofort neu und ändert noch
+     nichts. Eine Rolle vergibt das Portal nur, wenn dort keine Tür offen ist:
+     keine Selbstregistrierung und kein offener fremder Anmeldedienst (Broker).
+     Mit offener Tür geht das nur bewusst mit Begründung auf der Kommandozeile.
+     Jede Änderung steht im Protokoll des Mandanten.</p>
+  {% endif %}
+</div>
+<p><a href="/tenant">Zurück zu den Mandanten</a></p>
+"""
+TENANT_POLICY_WAIT = 30    # one read at the provider, one small JSON file
+
+
+def _tenant_policy_text(first, role):
+    return f"die Rolle {role}" if first == "role" else "eine Identität und keine Rechte (Eingang)"
+
+
+@app.get("/tenant/first-login")
+def tenant_policy_page():
+    """oaap.core.tenant 2.8 (Jörg 2026-11-23): what a first login becomes --
+    the operator's switch, in the portal. Check first, then confirm; the host
+    reads the realm fresh and judges every request again."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label = _tenant_domain_target()
+    if not tid:
+        return redirect("/tenant?err=1&msg=" + quote(
+            "Was eine erste Anmeldung bekommt, stellt der Server-Admin ein "
+            "(Mandanten → Erster Login)."), code=303)
+    t = load_tenants().get(tid) or {}
+    view = _idp_view(t)
+    pol = idp.policy_of(t)
+    view["default_role"] = pol["default_role"]
+    view["custom"] = (pol["first_login"] not in idp.PORTAL_FIRST_LOGIN
+                      or bool(pol["role_map"]))
+    confirm = None
+    want = (request.args.get("confirm") or "")
+    if want:
+        first, _sep, role = want.partition(":")
+        if first in idp.PORTAL_FIRST_LOGIN and (
+                first == "eingang" or role in idp.GRANTABLE_AT_FIRST_LOGIN):
+            confirm = {"first": first, "role": role if first == "role" else "",
+                       "text": _tenant_policy_text(first, role)}
+    return page(TENANT_POLICY_BODY, "Erster Login", "tenant", label=label,
+                idp=view, roles=idp.GRANTABLE_AT_FIRST_LOGIN, confirm=confirm,
+                msg=request.args.get("msg"), msg_ok=request.args.get("err") is None)
+
+
+@app.post("/tenant/first-login")
+def tenant_policy_post():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label = _tenant_domain_target()
+    if not tid:
+        return redirect("/tenant", code=303)
+    first = (request.form.get("first_login") or "").strip().lower()[:20]
+    role = (request.form.get("default_role") or "").strip().lower()[:40]
+    check = request.form.get("check") == "1"
+    payload = {"action": "tenant-policy", "tenant": tid, "first_login": first,
+               "default_role": role if first == "role" else "", "check": check}
+    res = _queue_with_id(_uuid.uuid4().hex, "", payload, TENANT_POLICY_WAIT)
+    back = f"/tenant/first-login?tenant={quote(label)}&"
+    if res is None:
+        return redirect(back + "err=1&msg=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    said = str(res.get("message") or "")[:1500]
+    if not res.get("ok"):
+        return redirect(back + "err=1&msg=" + quote(said), code=303)
+    if check and "nothing to change" not in said:
+        return redirect(back + "confirm=" + quote(f"{first}:{role if first == 'role' else ''}")
+                        + "&msg=" + quote(said), code=303)
+    return redirect(back + "msg=" + quote(said), code=303)
 
 
 FACE_WAIT_SECONDS = 20     # a small JSON file, one small picture, no docker

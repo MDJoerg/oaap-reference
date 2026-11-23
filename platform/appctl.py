@@ -3969,6 +3969,90 @@ IDP_WATCH_STATE = os.path.join(APPS_DIR, "idp-watch.json")
 IDP_WATCH_AFTER = "05:10"
 
 
+def tenant_read_realm_now(tid, t=None, held=None, who="oaap", role="root"):
+    """Read ONE tenant's realm now and record it: (ok, sentence).
+
+    ok is None when there is nothing to read with (no connector of this
+    node, or one whose product cannot read settings) -- not a failure,
+    just no answer. A pure read at the provider, recorded exactly like
+    the daily one and like `oaap idp settings` without flags; used by
+    the daily watch and by the portal's first-login door, which must
+    not open anything on yesterday's answer.
+    """
+    t = t if t is not None else load_tenants().get(tid)
+    if not t:
+        return False, "no such tenant"
+    held = held if held is not None else load_idp_connectors()
+    provider = idp.provider_of(t) or {}
+    name = provider.get("connector") or ""
+    c = held.get(name)
+    if not c or idp_admin.verb_refusal(c["kind"], "settings"):
+        return None, "no connector of this node can read this tenant's realm"
+    pol = idp.policy_of(t)
+    space = (provider.get("space") or (pol["realm"] or {}).get("space")
+             or idp_admin.space_for(t.get("label") or "")).strip().lower()
+    admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
+                            c["admin_id"], c["admin_secret"],
+                            auth_realm=c.get("auth_realm", ""))
+    good, msg = admin.login()
+    if not good:
+        return False, "credential refused: " + msg
+    said, err = admin.read_settings(space)
+    if err:
+        return False, err
+    return tenant_record_realm_settings(tid, name, space, said, who=who,
+                                        role=role, quiet_if_same=True)
+
+
+def tenant_policy_from_portal(tid, first_login, default_role, check=False,
+                              who="portal", role="-", act_tenant=""):
+    """The operator's first-login switch from the portal: (ok, sentence).
+
+    oaap.core.tenant 2.8 (Jörg 2026-11-23). The same authority as the
+    command line (idp.policy_target: server_admin only), the same writer
+    (tenant_set_policy, which also logs), and one rule more: before
+    anything is GRANTED the realm is read fresh, and any open door
+    refuses (idp.portal_policy_refusal). `check` answers what would
+    happen and writes nothing but the read.
+    """
+    target, refusal = idp.policy_target(role, act_tenant, tid)
+    if refusal:
+        return False, refusal
+    t = load_tenants().get(target)
+    if not t:
+        return False, "no such tenant on this node"
+    if not idp.provider_of(t):
+        return False, ("this tenant has no provider of its own -- a first "
+                       "login through one cannot happen")
+    first = (first_login or "").strip().lower()
+    want_role = (default_role or "").strip().lower() if first != "eingang" \
+        else ""
+    if first != "eingang":
+        good, said = tenant_read_realm_now(target)
+        if not good:
+            return False, ("the provider's space could not be read just now ("
+                           + said + ") -- the portal grants nothing on "
+                           "yesterday's answer")
+        t = load_tenants().get(target) or t
+    bad = idp.portal_policy_refusal(first, want_role, idp.policy_of(t))
+    if bad:
+        return False, bad
+    now = idp.policy_of(t)
+    if now["first_login"] == first and now["default_role"] == want_role:
+        return True, (f"a first login in '{t['label']}' already means "
+                      f"'{first}'" + (f" with the role {want_role}"
+                                      if want_role else "") + " -- nothing to change")
+    if check:
+        return True, (f"a first login in '{t['label']}' would mean '{first}'"
+                      + (f" with the role {want_role}" if want_role else "")
+                      + "; the space was just read and no door is open"
+                      if want_role else
+                      f"a first login in '{t['label']}' would mean 'eingang': "
+                      "an identity and no rights")
+    return tenant_set_policy(target, first_login=first, default_role=want_role,
+                             who=who, role=role)
+
+
 def idp_watch_minute(now=None, force=False):
     """Once a day after IDP_WATCH_AFTER: a pure read of every tenant realm
     that came through a connector of this node, recorded like `oaap idp
@@ -3984,28 +4068,9 @@ def idp_watch_minute(now=None, force=False):
     held = load_idp_connectors()
     done = []
     for tid, t in load_tenants().items():
-        provider = idp.provider_of(t) or {}
-        name = provider.get("connector") or ""
-        c = held.get(name)
-        if not c or idp_admin.verb_refusal(c["kind"], "settings"):
+        good, msg = tenant_read_realm_now(tid, t, held)
+        if good is None:
             continue
-        pol = idp.policy_of(t)
-        space = (provider.get("space") or (pol["realm"] or {}).get("space")
-                 or idp_admin.space_for(t.get("label") or "")).strip().lower()
-        admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"],
-                                c["admin_id"], c["admin_secret"],
-                                auth_realm=c.get("auth_realm", ""))
-        good, msg = admin.login()
-        if not good:
-            done.append((t.get("label"), "credential refused: " + msg))
-            continue
-        said, err = admin.read_settings(space)
-        if err:
-            done.append((t.get("label"), err))
-            continue
-        good, msg = tenant_record_realm_settings(tid, name, space, said,
-                                                 who="oaap", role="root",
-                                                 quiet_if_same=True)
         done.append((t.get("label"), msg))
     os.makedirs(os.path.dirname(IDP_WATCH_STATE), exist_ok=True)
     with open(IDP_WATCH_STATE, "w", encoding="utf-8") as f:
@@ -36227,6 +36292,26 @@ def cmd_process_deploys(_args):
             else:
                 ok, msg = _run_captured(_tenant_domain_cli,
                                         argparse.Namespace(name=name, target=what), load_tenants())
+        elif action == "tenant-policy":
+            # oaap.core.tenant 2.8 (Jörg 2026-11-23): what a first login
+            # becomes, from the portal -- server_admin's alone, judged
+            # again here (policy_target) because the spool is data and
+            # not trust. Successes are logged by tenant_set_policy(), as
+            # for the CLI; the refusal is written here.
+            tid_p = str(req.get("tenant") or "")
+            t_p = load_tenants().get(tid_p)
+            audit_tenant_id = tid_p if t_p else (act_tenant or None)
+            name = (t_p or {}).get("label", tid_p or "?")
+            ok, msg = tenant_policy_from_portal(
+                tid_p, str(req.get("first_login") or ""),
+                str(req.get("default_role") or ""),
+                check=bool(req.get("check")), who=actor or "portal",
+                role=act_role or "-", act_tenant=act_tenant or "")
+            if not ok:
+                audit_tenant("tenant.idp-policy", audit_tenant_id
+                             or ensure_default_tenant(),
+                             name, "denied", who=actor or "portal",
+                             role=act_role or "-", detail=msg)
         elif action == "instance-domain":
             # RFC-0115 §15: hide an instance under its tenant's domain (or show it)
             if not actor or act_role != "server_admin":
