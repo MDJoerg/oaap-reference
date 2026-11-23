@@ -2181,7 +2181,7 @@ def login_form():
     if away:
         return redirect(away, code=303)
     return render_template_string(
-        LOGIN_PAGE, error=None, has_users=bool(load_users()),
+        LOGIN_PAGE, error=None, has_users=_has_people(load_users()),
         provider=login_provider_label(),
         next=_return_target(request.args.get("next", "")))
 
@@ -2199,7 +2199,7 @@ def login():
     if _login_blocked(throttle_key):
         return render_template_string(
             LOGIN_PAGE, error="Zu viele Fehlversuche — bitte eine Minute warten.",
-            has_users=bool(users), provider=login_provider_label(),
+            has_users=_has_people(users), provider=login_provider_label(),
             next=target), 429
     u = find_user(users, username)
     # Generic error either way — no username enumeration (spec 4.4).
@@ -2237,7 +2237,7 @@ def login():
     print(f"login failed: '{username}' from {_client_ip()}", flush=True)
     return render_template_string(
         LOGIN_PAGE, error="Benutzername oder Passwort ist falsch.",
-        has_users=bool(users), provider=login_provider_label(), next=target
+        has_users=_has_people(users), provider=login_provider_label(), next=target
     ), 401
 
 
@@ -3381,11 +3381,24 @@ def internal_setup():
         return _first_admin()
 
 
+def _has_people(users):
+    """Is there a person on this node -- not just machine principals?
+
+    I-68 (3), 2026-11-23: an app installed before the first administrator
+    (a profile run on a fresh node) brings its machine principal along
+    (RFC-0027), and "any record at all" then refused the first-run wizard
+    with 409 -- a node nobody could ever sign in to. Machines never sign
+    in with a password, so they never count as "somebody is here".
+    """
+    return any((u.get("kind") or "human") == "human" for u in users)
+
+
 def _first_admin():
     state = _load(STATE_FILE, {})
     if state.get("setup_done"):
         return {"error": "Die Einrichtung ist bereits abgeschlossen; das Token ist nicht mehr gültig."}, 410
-    if load_users():
+    existing = load_users()
+    if _has_people(existing):
         return {"error": "Es existieren bereits Benutzer."}, 409
 
     body = request.get_json(force=True)
@@ -3397,7 +3410,12 @@ def _first_admin():
         return {"error": "Benutzername: Kleinbuchstaben/Ziffern/._- (2–40 Zeichen); "
                          "das Passwort braucht mindestens 8 Zeichen."}, 400
 
-    _save(USERS_FILE, [{
+    if find_user(existing, username):
+        return {"error": f"Der Name '{username}' gehört schon einem Maschinenkonto."}, 409
+
+    # Appended, never written over: the machine principals already in the
+    # file belong to installed apps, and losing them cuts those apps off.
+    _save(USERS_FILE, existing + [{
         "username": username,
         # RFC-0040 §3.1: the first user gets an identity like every
         # other one. Written here rather than left to the backfill so

@@ -200,6 +200,14 @@ if [[ " ${PROFILE_ARGS[*]-} " == *" broker "* ]] \
     && COMPOSE_FILES+=(-f "$APP_DIR/docker-compose.broker-plain.yml")
 fi
 
+# I-68 (1): same rule as install.sh. Removed again where the kernel has
+# MPTCP, so a node never keeps the no-op after its kernel gains it.
+if [ -e /proc/sys/net/mptcp/enabled ]; then
+  sed -i '/^OAAP_GATEWAY_SYSCTL=/d' "$ENVF"
+else
+  set_env OAAP_GATEWAY_SYSCTL "net.ipv4.ip_unprivileged_port_start=0"
+fi
+
 say "Building core service images (the running services stay up) ..."
 if ! docker compose --project-directory "$APP_DIR" --project-name oaap \
        "${COMPOSE_FILES[@]}" "${PROFILE_ARGS[@]}" build --quiet; then

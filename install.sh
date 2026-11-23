@@ -667,6 +667,13 @@ INTERNAL_API_KEY=$INTERNAL_API_KEY
 STORE_SUPERUSER_PASSWORD=$STORE_SUPERUSER_PASSWORD
 BROKER_RELAY_KEY=$BROKER_RELAY_KEY
 EOF
+# I-68 (1): a kernel without MPTCP has no net.mptcp.enabled, and Docker
+# will not start a container that asks for it -- the gateway would never
+# come up. Nothing to switch off there; see docker-compose.yml.
+if [ ! -e /proc/sys/net/mptcp/enabled ]; then
+  echo "OAAP_GATEWAY_SYSCTL=net.ipv4.ip_unprivileged_port_start=0" >> "$APP_DIR/.env"
+  say "Kernel without MPTCP: the gateway starts without the MPTCP switch."
+fi
 # Baseline for `oaap update`: which revision is installed right now.
 git -c safe.directory="$SCRIPT_DIR" -C "$SCRIPT_DIR" rev-parse --short HEAD > "$APP_DIR/REVISION" 2>/dev/null \
   || rm -f "$APP_DIR/REVISION"
@@ -989,7 +996,9 @@ cat > /etc/update-motd.d/50-oaap <<EOF
 # OAAP login greeting (SSH + console via pam_motd) — state per login.
 ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
 v="\$(cat "$OAAP_DATA_DIR/app/VERSION" 2>/dev/null)"
-if [ -s "$OAAP_DATA_DIR/data/identity/users.json" ]; then
+# setup_done, not "users.json is not empty": apps installed before the
+# first admin bring machine principals along (I-68 (3)).
+if grep -qs '"setup_done": true' "$OAAP_DATA_DIR/data/identity/state.json"; then
   echo ""
   echo "OAAP \${v:-?}  —  Portal:  http://\${ip:-<adresse>}/   (Status: oaap status)"
 else
@@ -1007,6 +1016,18 @@ if [ "$MODE" = "restore" ]; then
   OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" restore-instances \
     || say "WARNING: some app instances could not be restored automatically — see the messages above."
 fi
+
+# The node-level steps of migrate.sh (I-68 (2), 2026-11-23). Until now
+# only `oaap update` ran them, so a freshly installed node lacked
+# whatever had been added there since the installer was written -- the
+# default tenant first of all (`oaap tenant create` answered "no tenant
+# store yet"), the tenant domain timer, ... Found on a laptop demo node
+# that was used without ever being updated. Every step is idempotent by
+# contract, and on a restored node it heals what an older backup lacks,
+# exactly as the first `oaap update` would.
+say "Bringing the node in line with this version ..."
+OAAP_DATA_DIR="$OAAP_DATA_DIR" bash "$APP_DIR/migrate.sh" \
+  || say "WARNING: a migration step did not complete — run 'sudo oaap update'."
 
 # ---------------------------------------------------------------- handover
 if [ -z "${OAAP_HOST:-}" ]; then
