@@ -88,6 +88,9 @@ ok("nach dem Start der Kerndienste und nach restore-instances",
 ok("vor der Übergabe an den Betreiber", i_mig < install.index("# ---------------------------------------------------------------- handover"))
 ok("ein Fehler darin bricht die Installation nicht ab",
    re.search(r'bash "\$APP_DIR/migrate\.sh" \\\s*\n\s*\|\| say', install) is not None)
+ok("die Sicherheitsupdates werden erst nach dem Start der Kerndienste eingeschaltet "
+   "(die Messung am Ende lädt das Gateway neu)",
+   install.index("up -d") < install.index("node care auto-updates on"))
 ok("migrate.sh legt den Standardmandanten an (migrate-tenants)",
    "appctl.py\" migrate-tenants" in read(PLATFORM_DIR, "migrate.sh"))
 
