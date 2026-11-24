@@ -25,6 +25,18 @@ feed from the last id it got.
 - **The client's current rights decide:** the types are read from the client
   record and the registry at every delivery; a removed client's webhooks
   stop.
+
+**The CloudEvents format** (RFC-0127 D7, stage 3; oaap.events.bus 0.8): a
+webhook registered with `format: cloudevents` gets, in one POST of
+`application/cloudevents-batch+json` (a JSON array, at most BATCH of each),
+its twin changes as `oaap.twin.object.*.v1` events and every event type the
+tenant admin granted the client (`bus_grants`, instance `client:<label>`),
+with the same signature. Before its first POST the target is asked once, as
+the CloudEvents webhook spec's abuse protection says: `OPTIONS` with
+`WebHook-Request-Origin`; only an answer 2xx whose `WebHook-Allowed-Origin`
+is that origin or `*` lets delivery start -- otherwise it counts as a failure
+and is asked again after the backoff. The old body (`oaap-v1`) stays for the
+existing webhooks.
 """
 import hashlib
 import hmac
@@ -40,6 +52,7 @@ from urllib.parse import urlsplit
 import psycopg2
 import psycopg2.extras
 
+import bus_model as bm
 import twin_read as tr
 import twin_sync as tsy
 
@@ -127,8 +140,9 @@ class _PinnedPlain(http.client.HTTPConnection):
         self.sock = socket.create_connection((self._addr, self.port), self.timeout)
 
 
-def post(url, body, headers):
-    """(status, short text) -- never follows a redirect."""
+def post(url, body, headers, method="POST"):
+    """(status, short text, response headers) for OPTIONS, (status, short
+    text) for POST -- never follows a redirect."""
     u = urlsplit(url)
     host = u.hostname or ""
     if u.scheme == "http" and host.lower() not in ALLOW:
@@ -138,16 +152,121 @@ def post(url, body, headers):
     cls = _Pinned if u.scheme == "https" else _PinnedPlain
     conn = cls(host, addr, port, TIMEOUT_S)
     try:
-        conn.request("POST", (u.path or "/") + (f"?{u.query}" if u.query else ""), body=body,
+        conn.request(method, (u.path or "/") + (f"?{u.query}" if u.query else ""), body=body,
                      headers=headers)
         r = conn.getresponse()
         text = r.read(300).decode("utf-8", "replace")
+        if method == "OPTIONS":
+            return r.status, text, {k.lower(): v for k, v in r.getheaders()}
         return r.status, text
     finally:
         conn.close()
 
 
-def deliver_one(conn, hook, client, tenant_id, closed, now=None, send=post):
+def hook_origin(tenant_id, tenants):
+    """WebHook-Request-Origin: OAAP_HOOK_ORIGIN, else `<tenant label>.oaap`."""
+    if os.environ.get("OAAP_HOOK_ORIGIN"):
+        return os.environ["OAAP_HOOK_ORIGIN"]
+    label = (tsy.tenant_of(tenants, tenant_id) or {}).get("label") or tenant_id
+    return f"{label}.oaap"
+
+
+def handshake_problem(url, origin, send=post):
+    """None when the target allows us (CloudEvents webhook spec, abuse
+    protection), else the sentence."""
+    try:
+        status, text, headers = send(url, None, {"WebHook-Request-Origin": origin,
+                                                 "User-Agent": USER_AGENT}, method="OPTIONS")
+    except (Refused, OSError, http.client.HTTPException, ssl.SSLError) as e:
+        return "handshake: " + (str(e)[:180] or e.__class__.__name__)
+    allowed = (headers.get("webhook-allowed-origin") or "").strip()
+    if not 200 <= status < 300:
+        return f"handshake: OPTIONS answered HTTP {status}"
+    if allowed not in (origin, "*"):
+        return (f"handshake: WebHook-Allowed-Origin is {allowed or 'missing'!r}, "
+                f"not {origin!r} or '*'")
+    return None
+
+
+def bus_batch(conn, principal, cursor, limit):
+    """([row], last seq) of the store's events granted to this client after
+    `cursor` -- nothing in a schema without the bus tables."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('bus_grants') IS NOT NULL AS ok")
+        r = cur.fetchone()
+        if not r or not r.get("ok"):
+            return [], cursor
+        cur.execute("SELECT type, subject_prefix, granted_at FROM bus_grants WHERE instance = %s "
+                    "AND revoked_at IS NULL", (principal,))
+        where = bm.client_conditions(cur.fetchall(), principal)
+        if where is None:
+            return [], cursor
+        cur.execute("SELECT seq, id, type, source_instance, source_app, subject, time, data, "
+                    f"semantic, oaapto FROM bus_events WHERE seq > %s AND {where[0]} "
+                    "ORDER BY seq LIMIT %s", [cursor] + where[1] + [limit])
+        rows = cur.fetchall()
+    return rows, (rows[-1]["seq"] if rows else cursor)
+
+
+def _record(conn, hook, err, n=0, cursor=None, bus_cursor=None, handshake=False):
+    with conn.cursor() as cur:
+        if handshake:
+            cur.execute("UPDATE webhooks SET handshake_at = now() WHERE id = %s", (hook["id"],))
+        if err is None:
+            cur.execute("UPDATE webhooks SET cursor = %s, bus_cursor = %s, "
+                        "delivered = delivered + %s, failures = 0, last_ok_at = now(), "
+                        "last_error = NULL, next_try_at = NULL WHERE id = %s",
+                        (cursor, bus_cursor, n, hook["id"]))
+            return f"sent {n}"
+        f = int(hook["failures"] or 0) + 1
+        wait = min(2 ** f, BACKOFF_MAX_S)
+        cur.execute("UPDATE webhooks SET failures = %s, last_error = %s, next_try_at = now() + "
+                    "%s * interval '1 second', stopped_at = CASE WHEN %s THEN now() END "
+                    "WHERE id = %s", (f, err, wait, f >= FAILURES_MAX, hook["id"]))
+        return "stopped" if f >= FAILURES_MAX else "failed"
+
+
+def deliver_ce(conn, hook, tenant_id, types, origin, now=None, send=post):
+    """One step of a webhook in the CloudEvents format (0.8)."""
+    now = now or time.time()
+    handshook = False
+    if not hook.get("handshake_at"):
+        err = handshake_problem(hook["url"], origin, send)
+        if err:
+            return _record(conn, hook, err)
+        handshook = True
+    changes, nxt, _more = tr.changes(conn, types, hook["cursor"], BATCH) if types else (
+        [], hook["cursor"], False)
+    kinds = set(hook["kinds"] or [])
+    own = "client:" + hook["principal"].split(":", 1)[1]
+    evs = [bm.twin_change_event(c, tenant_id) for c in changes
+           if (not kinds or c["kind"] in kinds) and (hook["own"] or c["origin"] != own)]
+    evs = [e for e in evs if e]
+    rows, bnext = bus_batch(conn, hook["principal"], int(hook.get("bus_cursor") or 0), BATCH)
+    evs += [bm.envelope(r, tenant_id, r["source_app"]) for r in rows]
+    if not evs:
+        with conn.cursor() as cur:
+            if handshook:
+                # the target said yes: the earlier refusals are over
+                cur.execute("UPDATE webhooks SET handshake_at = now(), failures = 0, "
+                            "last_error = NULL, next_try_at = NULL WHERE id = %s", (hook["id"],))
+            if nxt != hook["cursor"]:
+                cur.execute("UPDATE webhooks SET cursor = %s WHERE id = %s", (nxt, hook["id"]))
+        return "nothing"
+    body = json.dumps(evs, separators=(",", ":"), default=str).encode()
+    ts = int(now)
+    headers = {"Content-Type": "application/cloudevents-batch+json", "User-Agent": USER_AGENT,
+               "X-OAAP-Signature": sign(hook["secret"], ts, body),
+               "X-OAAP-Hook": str(hook["id"])}
+    try:
+        status, text = send(hook["url"], body, headers)
+        err = None if 200 <= status < 300 else f"HTTP {status}: {text[:120]}"
+    except (Refused, OSError, http.client.HTTPException, ssl.SSLError) as e:
+        err = str(e)[:200] or e.__class__.__name__
+    return _record(conn, hook, err, len(evs), nxt, bnext, handshook)
+
+
+def deliver_one(conn, hook, client, tenant_id, closed, now=None, send=post, origin="oaap"):
     """One step of one webhook: post its next events, or nothing. Returns a
     word for the log ('sent n', 'nothing', 'failed', 'stopped', 'waiting')."""
     now = now or time.time()
@@ -164,6 +283,8 @@ def deliver_one(conn, hook, client, tenant_id, closed, now=None, send=post):
     principal = hook["principal"]
     readable = {b["type_key"] for b in tsy.client_bindings(conn, tenant_id, principal, client)}
     types = set(hook["types"] or []) & readable if hook["types"] else readable
+    if hook.get("format") == "cloudevents":
+        return deliver_ce(conn, hook, tenant_id, types, origin, now, send)
     changes, nxt, _more = tr.changes(conn, types, hook["cursor"], BATCH) if types else (
         [], hook["cursor"], False)
     kinds = set(hook["kinds"] or [])
@@ -208,7 +329,7 @@ def due_hooks(conn):
         return cur.fetchall()
 
 
-def run_tenant(conn, tenant_id, clients, closed):
+def run_tenant(conn, tenant_id, clients, closed, origin="oaap"):
     out = []
     for hook in due_hooks(conn):
         with conn.cursor() as cur:
@@ -220,7 +341,8 @@ def run_tenant(conn, tenant_id, clients, closed):
         client = clients.get(label)
         if client is not None and client.get("tenant") != tenant_id:
             client = None
-        out.append((hook["id"], deliver_one(conn, hook, client, tenant_id, closed)))
+        out.append((hook["id"], deliver_one(conn, hook, client, tenant_id, closed,
+                                            origin=origin)))
     return out
 
 
@@ -253,7 +375,8 @@ def main():
                 continue
             try:
                 with conn:
-                    for hid, what in run_tenant(conn, tid, clients, closed):
+                    for hid, what in run_tenant(conn, tid, clients, closed,
+                                                hook_origin(tid, tenants)):
                         if what not in ("nothing", "waiting"):
                             log(f"{schema} webhook {hid}: {what}")
                 quiet.pop(schema, None)

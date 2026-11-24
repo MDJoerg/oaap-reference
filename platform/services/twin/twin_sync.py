@@ -617,7 +617,10 @@ def add_hook(conn, principal, readable, body, allowed_private=(), closed=False):
         _refuse("this tenant's outbound traffic is closed (RFC-0068) -- it posts no webhooks",
                 409)
     if not isinstance(body, dict):
-        _refuse("the body is an object {url, types?, kinds?, own?}")
+        _refuse("the body is an object {url, types?, kinds?, own?, format?}")
+    fmt = body.get("format") or "oaap-v1"
+    if fmt not in ("oaap-v1", "cloudevents"):
+        _refuse("'format' is oaap-v1 (the default) or cloudevents (RFC-0127 D7)")
     why = hook_problem(body.get("url"), allowed_private)
     if why:
         _refuse(why)
@@ -639,11 +642,16 @@ def add_hook(conn, principal, readable, body, allowed_private=(), closed=False):
             _refuse(f"a client has at most {HOOKS_PER_CLIENT} webhooks -- remove one first", 409)
         cur.execute("SELECT coalesce(max(id), 0) AS m FROM events")
         start = int(cur.fetchone()["m"])
+        bus_start = 0
+        cur.execute("SELECT to_regclass('bus_events') IS NOT NULL AS ok")
+        if cur.fetchone()["ok"]:
+            cur.execute("SELECT coalesce(max(seq), 0) AS m FROM bus_events")
+            bus_start = int(cur.fetchone()["m"])
         secret = "whsec_" + _secrets.token_urlsafe(32)
-        cur.execute("INSERT INTO webhooks (principal, url, types, kinds, own, secret, cursor) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+        cur.execute("INSERT INTO webhooks (principal, url, types, kinds, own, secret, cursor, "
+                    "format, bus_cursor) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
                     (principal, body["url"], types, kinds, body.get("own") is True, secret,
-                     start))
+                     start, fmt, bus_start))
         row = cur.fetchone()
     return dict(hook_json(row), secret=secret)
 
@@ -656,6 +664,8 @@ def hook_json(r):
     return {"id": int(r["id"]), "client": r["principal"], "url": r["url"],
             "types": list(r.get("types") or []), "kinds": list(r.get("kinds") or []),
             "own": bool(r.get("own")), "state": state, "since_event": int(r["cursor"]),
+            "format": r.get("format") or "oaap-v1",
+            "handshake": t(r.get("handshake_at")) if r.get("format") == "cloudevents" else None,
             "delivered": int(r.get("delivered") or 0), "failures": int(r.get("failures") or 0),
             "last_ok": t(r.get("last_ok_at")), "last_error": r.get("last_error"),
             "next_try": t(r.get("next_try_at")), "stopped": t(r.get("stopped_at")),

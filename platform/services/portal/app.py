@@ -13072,6 +13072,36 @@ Ereignisspeicher. Er entsteht mit der ersten App, die Ereignisse erklärt.</p></
 {% else %}
 <div class="card"><p class="muted">Keine App dieses Mandanten erklärt Ereignisse.</p></div>
 {% endfor %}
+{% if clients %}
+<h2>Integrations-Clients — was den Mandanten verlässt</h2>
+<p class="muted">Ein Client bekommt freigegebene Ereignisse in seinem Webhook im
+CloudEvents-Format, neben seinen Zwilling-Änderungen. Die Freigabe ist Ihre
+Erlaubnis für genau dieses Ziel, auch für personenbezogene Typen.</p>
+{% for c in clients %}
+<div class="card">
+  <h2>{{ c.client }}</h2>
+  <table>
+  <tr><th>Typ</th><th>Stand</th><th></th></tr>
+  {% for g in c.grants %}
+  <tr><td><code>{{ g.type }}</code>{% if g.personal %} <span class="badge off">personenbezogen</span>{% endif %}</td>
+    <td><span class="badge">freigegeben</span> <span class="muted">von {{ g.granted_by }}{% if g.subject_prefix %}, nur Betreff {{ g.subject_prefix }}…{% endif %}</span></td>
+    <td><form method="post" action="/ereignisse/revoke" style="display:inline">
+      <input type="hidden" name="instance" value="{{ c.client }}"><input type="hidden" name="type" value="{{ g.type }}">
+      <button>Widerrufen</button></form></td></tr>
+  {% endfor %}
+  {% for g in c.grantable %}
+  <tr><td><code>{{ g.type }}</code>{% if g.personal %} <span class="badge off">personenbezogen</span>{% endif %}</td>
+    <td class="muted">nicht freigegeben</td>
+    <td><form method="post" action="/ereignisse/grant" style="display:inline">
+      <input type="hidden" name="instance" value="{{ c.client }}"><input type="hidden" name="type" value="{{ g.type }}">
+      <input name="subject_prefix" placeholder="nur Betreff beginnend mit … (leer = alle)" size="22">
+      <button>{{ 'Freigeben — verlässt den Mandanten' if g.personal else 'Freigeben' }}</button></form></td></tr>
+  {% endfor %}
+  {% if not c.grants and not c.grantable %}<tr><td colspan="3" class="muted">Keine App dieses Mandanten veröffentlicht einen Typ für alle.</td></tr>{% endif %}
+  </table>
+</div>
+{% endfor %}
+{% endif %}
 <div class="card">
   <h2>Ereignisse der Plattform</h2>
   <table>
@@ -13096,7 +13126,7 @@ def events_page():
     denied = require_events_admin()
     if denied:
         return denied
-    ctx = {"instances": [], "platform_types": [], "store": True, "error": None,
+    ctx = {"instances": [], "platform_types": [], "clients": [], "store": True, "error": None,
            "msg": request.args.get("msg"), "msg_ok": request.args.get("err") is None}
     try:
         r = _twin_call("GET", "/internal/bus/overview")

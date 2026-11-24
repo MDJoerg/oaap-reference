@@ -563,10 +563,108 @@ def grant_error(catalogue, tenant, instance, t):
         return f"{t} is addressed: it reaches only the instance it names, no grant needed"
     return f"{t} is listed for other apps, not for '{me.get('app_id')}'"
 
+# ------------------------------------- integration clients (0.8)
+#
+# RFC-0127 D7, stage 3: the way out. An integration client (`client:<label>`,
+# oaap.data.twin §2.17) may be granted event types like an instance; its
+# webhook in the CloudEvents format carries them, beside its twin changes.
+# A grant to a client is the tenant admin's permission for that target, also
+# for a `personal` type (Jörg, 2026-11-24) -- said when granting.
+
+CLIENT_PREFIX = "client:"
+CLIENT_RE = re.compile(r"^client:([a-z0-9][a-z0-9-]{0,38})$")
+
+
+def client_grant_error(catalogue, tenant, clients, principal, t):
+    """'' when integration client `principal` ('client:<label>') of `tenant`
+    may be granted type `t`, else why. `clients` = twin-clients.json's
+    {label: {tenant, ...}}."""
+    m = CLIENT_RE.match(principal or "")
+    c = (clients or {}).get(m.group(1)) if m else None
+    if not c or c.get("tenant") != tenant:
+        return f"'{principal}' is not an integration client of this tenant"
+    plat = PLATFORM_TYPES.get(t)
+    if plat and plat["publisher"] == "twin":
+        return (f"{t}: a client receives the twin's changes through its read rights "
+                "-- in its webhook (format cloudevents), no grant")
+    if plat:
+        if plat["audience"] == "addressed":
+            return f"{t} is addressed to the inviting app; it does not leave the tenant"
+        return ""
+    pubs = [find_type(e, t) for n, e in ((catalogue or {}).get("instances") or {}).items()
+            if e.get("tenant") == tenant and find_type(e, t)]
+    if not pubs:
+        return f"no instance of this tenant publishes {t}"
+    if any(p["audience"] == "tenant" for p in pubs):
+        return ""
+    if all(p["audience"] == "addressed" for p in pubs):
+        return f"{t} is addressed: it reaches only the instance it names"
+    return f"{t} is listed for named apps only"
+
+
+def client_conditions(grants, me):
+    """(sql, args) of what a client's webhook carries from the store: the
+    events of its live grants **from the moment of each grant on** -- never
+    one stored before the tenant admin said yes (measured 2026-11-24: a grant
+    opened what was already in the store, including events from a time
+    without any grant). `grants` = [{type, subject_prefix, granted_at}].
+    None when it holds none."""
+    conds, args = [], []
+    for g in grants:
+        c = "(oaapto IS NULL AND type = %s AND time >= %s"
+        args += [g["type"], g["granted_at"]]
+        if g.get("subject_prefix"):
+            c += " AND starts_with(subject, %s)"
+            args.append(g["subject_prefix"])
+        conds.append(c + ")")
+    if not conds:
+        return None
+    return f"source_instance <> %s AND ({' OR '.join(conds)})", [me] + args
+
+
+def is_personal(catalogue, tenant, t):
+    for e in ((catalogue or {}).get("instances") or {}).values():
+        p = find_type(e, t) if e.get("tenant") == tenant else None
+        if p and p.get("personal"):
+            return True
+    return bool((PLATFORM_TYPES.get(t) or {}).get("personal"))
+
+
+def client_types(catalogue, tenant):
+    """The types a client of `tenant` could be granted at all (sorted)."""
+    out = set()
+    for e in ((catalogue or {}).get("instances") or {}).values():
+        if e.get("tenant") == tenant:
+            out |= {p["type"] for p in e.get("publishes") or [] if p.get("audience") == "tenant"}
+    out |= {t for t, p in PLATFORM_TYPES.items()
+            if p["audience"] == "tenant" and p["publisher"] != "twin"}
+    return sorted(out)
+
+
+def twin_change_event(change, tenant):
+    """The CloudEvent of one entry of the twin's change feed (twin_read.
+    changes: {id, at, kind, object, type, group, origin, status?}), or None
+    for a kind with no event. `id` is the twin's event id, unique per this
+    source."""
+    row = {"kind": change.get("kind"), "object_id": (change.get("object") or "").rsplit(":", 1)[-1],
+           "group_key": change.get("group"), "origin": change.get("origin")}
+    ev = twin_event(row, change.get("type"), change.get("status"))
+    if ev is None:
+        return None
+    t, subj, data = ev
+    out = {"specversion": SPECVERSION, "id": f"twin-{change['id']}", "type": t,
+           "source": f"urn:oaap:tenant:{tenant}:twin", "subject": subj,
+           "time": change.get("at"), "datacontenttype": "application/json",
+           "dataschema": dataschema("platform", t), "oaaptenant": tenant,
+           "oaaporigin": change.get("origin") or "platform:twin", "data": data}
+    if change.get("merged_from"):
+        out["oaapmergedfrom"] = change["merged_from"]
+    return out
+
 # ------------------------------------------- the portal page (0.6)
 
 
-def overview(catalogue, registry, tenant, grants, deliveries):
+def overview(catalogue, registry, tenant, grants, deliveries, clients=None):
     """What the portal page "Ereignisse" shows for one tenant (pure;
     tested): every instance with an events block, what it publishes, what
     it wants and in which state, its push; and the platform's types.
@@ -614,7 +712,20 @@ def overview(catalogue, registry, tenant, grants, deliveries):
     plat = [{"type": t, "title": p["title"], "publisher": p["publisher"],
              "audience": p["audience"], "semantic_id": p["semantic_id"]}
             for t, p in sorted(PLATFORM_TYPES.items())]
-    return {"instances": insts, "platform_types": plat}
+    # 0.8: the tenant's integration clients -- what leaves the tenant
+    cls, offer = [], client_types(catalogue, tenant)
+    for label, c in sorted((clients or {}).items()):
+        if c.get("tenant") != tenant:
+            continue
+        p = CLIENT_PREFIX + label
+        held = [{"type": g["type"], "subject_prefix": g.get("subject_prefix") or "",
+                 "granted_by": g.get("granted_by") or "", "personal": is_personal(catalogue, tenant, g["type"])}
+                for g in grants if g["instance"] == p]
+        have = {h["type"] for h in held}
+        cls.append({"client": p, "label": label, "grants": held,
+                    "grantable": [{"type": t, "personal": is_personal(catalogue, tenant, t)}
+                                  for t in offer if t not in have]})
+    return {"instances": insts, "platform_types": plat, "clients": cls}
 
 # ------------------------------------------------ AsyncAPI export (0.7)
 #

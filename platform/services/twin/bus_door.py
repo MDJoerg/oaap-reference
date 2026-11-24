@@ -199,8 +199,15 @@ def register(app, get_conn, apps_dir):
             return None, (403, "the page \"Ereignisse\" is for the tenant's administrators")
         return (user, tenant), None
 
+    def _clients():
+        return (_load(os.path.join(apps_dir, "twin-clients.json"), {}) or {}).get("clients") or {}
+
     def _own_instance(tenant, name):
         cat = _load(os.path.join(apps_dir, CATALOG_NAME), {})
+        m = bm.CLIENT_RE.match(name)
+        if m:
+            c = _clients().get(m.group(1))
+            return cat if c and c.get("tenant") == tenant else None
         e = (cat.get("instances") or {}).get(name)
         return cat if e and e.get("tenant") == tenant else None
 
@@ -227,7 +234,7 @@ def register(app, get_conn, apps_dir):
                                   for r in cur.fetchall()}
             finally:
                 conn.close()
-        out = bm.overview(cat, reg, tenant, grants, deliveries)
+        out = bm.overview(cat, reg, tenant, grants, deliveries, _clients())
         out["store"] = store
         return jsonify(out)
 
@@ -262,7 +269,8 @@ def register(app, get_conn, apps_dir):
         if cat is None:
             return jsonify(error=f"'{name}' is not an instance of this tenant with an events block"), 404
         if action == "grant":
-            why = bm.grant_error(cat, tenant, name, t)
+            why = (bm.client_grant_error(cat, tenant, _clients(), name, t)
+                   if name.startswith(bm.CLIENT_PREFIX) else bm.grant_error(cat, tenant, name, t))
             if why:
                 return jsonify(error=why), 409
             if len(pre) > bm.SUBJECT_MAX or any(ord(c) < 32 for c in pre):
@@ -292,8 +300,11 @@ def register(app, get_conn, apps_dir):
             return jsonify(error={"grant": f"'{name}' already holds a grant for {t}",
                                   "revoke": f"'{name}' holds no grant for {t}",
                                   "resume": f"'{name}' has no push yet"}[action]), 409
+        personal = (action == "grant" and name.startswith(bm.CLIENT_PREFIX)
+                    and bm.is_personal(cat, tenant, t))
         audit(f"events.{action}", tenant, name if action == "resume" else f"{name} {t}", user,
-              f"subject_prefix={pre}" if action == "grant" and pre else "")
+              ", ".join(x for x in (f"subject_prefix={pre}" if action == "grant" and pre else "",
+                                    "personal, leaves the tenant" if personal else "") if x))
         return jsonify(ok=True), 200
 
     @app.get("/bus/v1/feed")

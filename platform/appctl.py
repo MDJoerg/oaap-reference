@@ -17699,6 +17699,12 @@ def _twin_ensure_tables(schema):
             created_at timestamptz NOT NULL DEFAULT now(),
             removed_at timestamptz
         );
+        -- oaap.events.bus 0.8 (RFC-0127 D7): the CloudEvents format, the
+        -- target's OPTIONS handshake and the cursor in the event store
+        ALTER TABLE "{schema}".webhooks
+            ADD COLUMN IF NOT EXISTS format text NOT NULL DEFAULT 'oaap-v1',
+            ADD COLUMN IF NOT EXISTS handshake_at timestamptz,
+            ADD COLUMN IF NOT EXISTS bus_cursor bigint NOT NULL DEFAULT 0;
         -- 'receivers': inbound webhooks (oaap.data.twin 0.14 §2.26, RFC-0120
         -- D13) -- a client's named door for a system that only speaks
         -- webhooks, with the signature it checks and the mapping that turns
@@ -18426,17 +18432,36 @@ def cmd_events(args):
         print(f"Resumed: the push to '{key}' continues where it stopped.")
         return
     if not args.instance or not args.type:
-        die(f"usage: oaap events {args.action} <instance> <type>")
-    key, err = resolve_instance_ref(reg, args.instance, args.tenant or "")
-    if err:
-        die(err)
-    inst = reg["instances"][key]
-    tid = _instance_tenant_id(inst)
+        die(f"usage: oaap events {args.action} <instance|client:<label>> <type>")
     who = os.environ.get("SUDO_USER") or "root"
+    if args.instance.startswith(bus_model.CLIENT_PREFIX):
+        # oaap.events.bus 0.8 (RFC-0127 D7): an integration client receives
+        # granted types in its webhook (format cloudevents)
+        key = args.instance
+        m = bus_model.CLIENT_RE.match(key)
+        c = load_twin_clients().get(m.group(1)) if m else None
+        if not c:
+            die(f"no integration client '{key}' on this node")
+        tid = c.get("tenant", "")
+        if args.action == "grant":
+            why = bus_model.client_grant_error(cat, tid, load_twin_clients(), key, args.type)
+            if why:
+                die(why)
+            if bus_model.is_personal(cat, tid, args.type):
+                print(f"NOTE: {args.type} is personal -- this grant lets it leave the tenant "
+                      f"to '{key}' (oaap.events.bus 0.8).")
+    else:
+        key, err = resolve_instance_ref(reg, args.instance, args.tenant or "")
+        if err:
+            die(err)
+        inst = reg["instances"][key]
+        tid = _instance_tenant_id(inst)
     if args.action == "grant":
-        why = bus_model.grant_error(cat, tid, key, args.type)
-        if why:
-            die(why)
+        # a client was checked above (client_grant_error); an instance here
+        if not key.startswith(bus_model.CLIENT_PREFIX):
+            why = bus_model.grant_error(cat, tid, key, args.type)
+            if why:
+                die(why)
         pre = args.subject_prefix or ""
         if len(pre) > bus_model.SUBJECT_MAX:
             die("--subject-prefix: too long")
@@ -18448,9 +18473,14 @@ def cmd_events(args):
             print(f"'{key}' already holds a grant for {args.type} -- revoke it first to change it.")
             return
         audit_tenant("events.grant", tid, f"{key} {args.type}", who=who,
-                     detail=f"subject_prefix={pre}" if pre else "")
+                     detail=", ".join(x for x in (
+                         f"subject_prefix={pre}" if pre else "",
+                         "personal, leaves the tenant" if key.startswith(bus_model.CLIENT_PREFIX)
+                         and bus_model.is_personal(cat, tid, args.type) else "") if x))
         print(f"Granted: '{key}' receives {args.type}" + (f" (subject {pre}*)" if pre else "")
-              + " -- from the feed at once, from the push once it exists.")
+              + (" -- in its webhook (format cloudevents), from now on."
+                 if key.startswith(bus_model.CLIENT_PREFIX)
+                 else " -- from the feed at once, from the push once it exists."))
         return
     out = _events_psql(tid, f"UPDATE {{s}}.bus_grants SET revoked_at = now(), revoked_by = {_sql_lit(who)} "
                        f"WHERE instance = {_sql_lit(key)} AND type = {_sql_lit(args.type)} "
@@ -20349,6 +20379,16 @@ def twin_client_remove(label, who="root"):
         {"OAAP_R_NAME": principal})
     n = json.loads(out.strip().splitlines()[-1]).get("revoked", 0)
     save_twin_clients(clients)
+    # oaap.events.bus 0.8: its event grants go with it (the 0.3.1 lesson)
+    tid = c.get("tenant", "")
+    if re.fullmatch(r"[0-9a-f-]{36}", tid or "") and _store_running() \
+            and _twin_schema_exists(f"twin_{tid}"):
+        try:
+            _events_psql(tid, "UPDATE {s}.bus_grants SET revoked_at = now(), revoked_by = "
+                         f"{_sql_lit(who)} WHERE instance = {_sql_lit(principal)} "
+                         "AND revoked_at IS NULL")
+        except SystemExit:
+            pass
     audit_tenant("twin.client.remove", c.get("tenant", ""), subject=principal,
                  who=who, detail=f"{n} key(s) revoked, principal deactivated")
     return n
