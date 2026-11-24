@@ -960,7 +960,7 @@ def egress_apply_instance(name):
     connect_leave_network(app_network(name))
     remove_app_network(name)
     recreate_instance_containers(name, services, inst.get("storage") or [],
-                                 inst.get("endpoints") or [], inst=inst)
+                                 inst.get("endpoints") or [], inst=inst, cause="setting", detail="Abfluss")
     refresh_destinations()
     return True
 
@@ -1835,7 +1835,7 @@ def sync_destination_env(reg, only=None, recreate=True):
         if recreate:
             recreate_instance_containers(name, instance_services(inst),
                                          inst.get("storage") or [],
-                                         inst.get("endpoints"), inst=inst)
+                                         inst.get("endpoints"), inst=inst, cause="setting", detail="Destination")
             recreated.append(name)
         else:
             stale.append(name)
@@ -6208,7 +6208,7 @@ def cmd_migrate_networks(_args):
             # recreate_instance_containers creates the network, connects
             # the gateway, and recreates all service containers on it.
             recreate_instance_containers(name, instance_services(inst),
-                                         inst.get("storage") or [])
+                                         inst.get("storage") or [], cause="update", detail="eigenes Netz der Instanz")
             isolated += 1
             print(f"  isolated '{name}' onto {net}")
         else:
@@ -7400,7 +7400,7 @@ def cmd_migrate_instance_dirs(_args):
                 recreate_instance_containers(key, instance_services(inst),
                                              inst.get("storage") or [],
                                              inst.get("endpoints") or [],
-                                             inst=inst)
+                                             inst=inst, cause="update", detail="Ablage der Instanz verschoben")
                 recreated += 1
             except Exception as e:        # noqa: BLE001 - reported, not fatal
                 skipped.append(f"{key} (moved, but not recreated: {e})")
@@ -7479,7 +7479,7 @@ def _repair_stale_mounts(reg):
             recreate_instance_containers(key, instance_services(inst),
                                          inst.get("storage") or [],
                                          inst.get("endpoints") or [],
-                                         inst=inst)
+                                         inst=inst, cause="update", detail="Einhängepunkte repariert")
             repaired.append(key)
         except Exception as e:            # noqa: BLE001 - reported, not fatal
             print(f"  WARNING: {key} still reads from the old path and could "
@@ -14796,7 +14796,7 @@ def _rebuild_recreate_and_wait(name):
     inst = load_registry()["instances"][name]
     recreate_instance_containers(name, instance_services(inst),
                                  inst.get("storage") or [], inst.get("endpoints") or [],
-                                 inst=inst)
+                                 inst=inst, cause="rebuild", detail="Abbild neu gebaut")
     return _answers(inst, REBUILD_HEALTH_SECONDS)
 
 
@@ -18097,7 +18097,7 @@ def renew_instance_keys(days=RENEW_DAYS, dry_run=False, only=None, now=None):
         if name not in sleeping and (inst.get("image") or inst.get("services")):
             recreate_instance_containers(name, instance_services(inst),
                                          inst.get("storage") or [],
-                                         inst.get("endpoints") or [], inst=inst)
+                                         inst.get("endpoints") or [], inst=inst, cause="key", detail="Instanzschlüssel erneuert")
         _identity_exec(
             "import os, app as m\n"
             "for kid in os.environ['OAAP_T_IDS'].split(','):\n"
@@ -18656,7 +18656,7 @@ def _mcp_idp_env(name, inst, values):
         return False
     save_env(name, env, inst)
     recreate_instance_containers(name, instance_services(inst),
-                                 inst.get("storage") or [])
+                                 inst.get("storage") or [], cause="setting", detail="Anmeldung am MCP-Gateway")
     return True
 
 
@@ -19011,7 +19011,7 @@ def _app_idp_env(name, inst, values):
         return False
     save_env(name, env, inst)
     recreate_instance_containers(name, instance_services(inst),
-                                 inst.get("storage") or [])
+                                 inst.get("storage") or [], cause="setting", detail="Anmeldung (Identitätsanbieter)")
     return True
 
 
@@ -22487,7 +22487,7 @@ def sync_instance_names(reg, only=None, recreate=True):
         if recreate:
             recreate_instance_containers(name, instance_services(inst),
                                          inst.get("storage") or [],
-                                         inst.get("endpoints"), inst=inst)
+                                         inst.get("endpoints"), inst=inst, cause="setting", detail="Name oder Adresse")
             recreated.append(name)
         else:
             stale.append(name)
@@ -23347,7 +23347,7 @@ def report_grants(name, report):
 
 
 def recreate_instance_containers(name, services, storage, endpoints=None,
-                                 inst=None):
+                                 inst=None, cause=None, detail=""):
     """(Re)create ALL of an instance's service containers on its own
     network (RFC-0016), from their recorded shape. Storage entries go to
     the service named in `service`, defaulting to the primary (services
@@ -23396,6 +23396,11 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
         if gone:
             raise DiskAbsent(disk_absent_sentence(name, gone))
         disks.ensure_base(iid)
+    # Portal 0.3.61 (2.19): every door passes here, so here the restart is
+    # written down -- after the refusals above, before the first `docker rm`.
+    # A sleeping instance is re-made, not started: no line.
+    if stored.get("state") != "standby":
+        restart_record(name, cause or "setting", detail)
     for s in services:
         uid = image_uid(s["image"])
         mounts = []
@@ -23591,7 +23596,7 @@ def apply_config(name, inst, values):
         return "no change"
     save_env(name, env)
     recreate_instance_containers(name, instance_services(inst),
-                                 inst.get("storage") or [])
+                                 inst.get("storage") or [], cause="config", detail=", ".join(sorted(changed)))
     return "changed: " + ", ".join(sorted(changed))
 
 
@@ -23626,6 +23631,217 @@ def apply_config(name, inst, values):
 # apps/config-values.json -- the portal never talks to the container
 # runtime.
 STATE_VIEW = os.path.join(APPS_DIR, "instance-state.json")
+
+# --- Restart journal (portal 0.3.61, 2.19) --------------------------------
+#
+# Asked by Joerg on 2026-11-24: an instance had restarted and nobody could
+# say when or why. Every door that recreates containers passes
+# recreate_instance_containers(), which writes one line here with the
+# cause; the minute timer (state_view_write) adds the starts nobody here
+# caused -- a crash Docker restarted, a node boot, a hand `docker restart`.
+# Names, times and causes only: nothing the app wrote, nothing secret --
+# the same class as instance-state.json, readable by the portal.
+RESTARTS_DIR = os.path.join(APPS_DIR, "restarts")
+RESTARTS_SEEN = os.path.join(APPS_DIR, "restarts-seen.json")
+RESTART_KEEP = 200
+# A platform line explains a container start up to this long after it:
+# the line is written before `docker run`, and an image pull or a slow
+# second service lies in between.
+RESTART_MATCH_SECONDS = 600
+RESTART_CAUSES = ("manual", "config", "deploy", "install", "update",
+                  "rebuild", "wake", "key", "setting", "rename", "restore",
+                  "backup", "crash", "node", "external")
+RESTART_FROM_OUTSIDE = ("crash", "node", "external")
+# Who stands behind the current work: the spool worker sets it per request
+# (the signed-in person, or the deploy hook); empty means the command line
+# or a timer, which restart_actor() tells apart.
+RESTART_BY = ""
+
+
+def restart_actor():
+    if RESTART_BY:
+        return RESTART_BY
+    who = os.environ.get("SUDO_USER", "")
+    if who:
+        return f"{who} (Kommandozeile)"
+    try:
+        tty = sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        tty = False
+    return "root (Kommandozeile)" if tty else "Knoten"
+
+
+def _restart_file(name):
+    return os.path.join(RESTARTS_DIR,
+                        re.sub(r"[^A-Za-z0-9._-]", "_", str(name)) + ".jsonl")
+
+
+def restart_journal(name):
+    """The journal of one instance, oldest first; [] when there is none."""
+    rows = []
+    try:
+        with open(_restart_file(name), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get("at") and r.get("cause"):
+                    rows.append(r)
+    except OSError:
+        pass
+    return rows
+
+
+def _restart_write(name, rows):
+    os.makedirs(RESTARTS_DIR, exist_ok=True)
+    os.chmod(RESTARTS_DIR, 0o755)
+    path = _restart_file(name)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows[-RESTART_KEEP:]:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+    os.chmod(path, 0o644)
+
+
+def restart_record(name, cause, detail="", by=None, service="", at=None):
+    """Append one line to an instance's restart journal.
+
+    Never raises: a journal that cannot be written must not stop the
+    restart it describes."""
+    try:
+        rows = restart_journal(name)
+        line = {"at": at or _iso_now(),
+                "cause": cause if cause in RESTART_CAUSES else "setting",
+                "detail": str(detail or "")[:200],
+                "by": restart_actor() if by is None else by}
+        if service:
+            line["service"] = service
+        # A crash loop must not push every other line out of the journal:
+        # a crash of the same service within the hour counts on the last line.
+        last = rows[-1] if rows else None
+        if (cause == "crash" and last and last.get("cause") == "crash"
+                and last.get("service", "") == service
+                and 0 <= _restart_ts(line["at"]) - _restart_ts(last.get("until") or last["at"]) < 3600):
+            last["count"] = int(last.get("count") or 1) + 1
+            last["until"] = line["at"]
+        else:
+            rows.append(line)
+        _restart_write(name, rows)
+    except (OSError, ValueError, TypeError) as e:
+        print(f"WARNING: restart journal of {name}: {e}", file=sys.stderr)
+
+
+def restart_record_running(names, cause, detail=""):
+    """One line for each of these instances that has a running container --
+    for the doors that stop and start containers without recreating them
+    (the backups)."""
+    try:
+        up = set(subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}", "--filter", "name=^oaap-app-"],
+            capture_output=True, text=True, timeout=30).stdout.split())
+    except (OSError, subprocess.SubprocessError):
+        return
+    insts = (load_registry().get("instances") or {})
+    for n in names:
+        try:
+            cs = [x["container"] for x in instance_services(insts.get(n) or {})
+                  if x.get("container")]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if any(c in up for c in cs):
+            restart_record(n, cause, detail)
+
+
+def _restart_ts(stamp):
+    """Seconds since the epoch for an ISO stamp or Docker's StartedAt
+    (nanoseconds, `Z`); 0 for anything unreadable."""
+    import datetime
+    try:
+        st = str(stamp)
+        base = datetime.datetime.strptime(st[:19], "%Y-%m-%dT%H:%M:%S")
+        rest = st[19:]
+        off = 0
+        m = re.search(r"([+-])(\d\d):(\d\d)$", rest)
+        if m:
+            off = (int(m.group(2)) * 3600 + int(m.group(3)) * 60) * (1 if m.group(1) == "+" else -1)
+        return base.replace(tzinfo=datetime.timezone.utc).timestamp() - off
+    except (ValueError, TypeError):
+        return 0
+
+
+def _boot_time():
+    try:
+        with open("/proc/stat", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def restart_detect(instances, states, services_of, boot=None):
+    """Compare each container's start with the last one seen; a start no
+    journal line explains becomes a line of its own (crash, node,
+    external). The first sight of a container records nothing."""
+    try:
+        with open(RESTARTS_SEEN, encoding="utf-8") as f:
+            seen = json.load(f) or {}
+    except (OSError, ValueError):
+        seen = {}
+    boot = _boot_time() if boot is None else boot
+    now_seen = {}
+    for name, inst in instances.items():
+        journal = None
+        for sv in services_of(inst):
+            c = sv["container"]
+            fact = states.get(c)
+            started = (fact or {}).get("started") or ""
+            if not fact or not started or started.startswith("0001"):
+                if c in seen:
+                    now_seen[c] = seen[c]
+                continue
+            cur = {"started": started, "restarts": int(fact.get("restarts") or 0)}
+            now_seen[c] = cur
+            old = seen.get(c)
+            if not isinstance(old, dict) or old.get("started") == started:
+                continue
+            st = _restart_ts(started)
+            if journal is None:
+                journal = restart_journal(name)
+            # A platform line explains the FIRST start after it, no other:
+            # the start seen before must lie before the line (measured
+            # 2026-11-24: a `docker restart` 70 s after a manual restart was
+            # taken for that restart's own start and never written down).
+            before = _restart_ts(old.get("started"))
+            if any(r.get("cause") not in RESTART_FROM_OUTSIDE
+                   and before < _restart_ts(r.get("at"))
+                   and 0 <= st - _restart_ts(r.get("at")) <= RESTART_MATCH_SECONDS
+                   for r in journal):
+                continue
+            if cur["restarts"] > int(old.get("restarts") or 0):
+                cause = "crash"
+                detail = "Docker hat den Container nach einem Absturz neu gestartet"
+            elif boot and _restart_ts(old.get("started")) < boot <= st + 60:
+                cause = "node"
+                detail = "der Knoten wurde neu gestartet"
+            else:
+                cause = "external"
+                detail = ("außerhalb der Plattform gestartet "
+                          "(docker restart oder der Docker-Dienst)")
+            restart_record(name, cause, detail, by="", service=sv.get("service") or "",
+                           at=started[:19] + "+00:00")
+            journal = None
+    try:
+        os.makedirs(APPS_DIR, exist_ok=True)
+        tmp = RESTARTS_SEEN + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(now_seen, f)
+        os.replace(tmp, RESTARTS_SEEN)
+    except OSError as e:
+        print(f"WARNING: could not write {RESTARTS_SEEN}: {e}", file=sys.stderr)
 
 # Snapshots of an app's log, one file per instance with an open window
 # (D2). Deleted when the window closes.
@@ -24379,6 +24595,8 @@ def state_view_write(reg=None):
         for inst in instances.values():
             wanted += [s["container"] for s in services_of(inst)]
         states, runtime_ok = container_states(wanted)
+        if runtime_ok:
+            restart_detect(instances, states, services_of)
         out = {}
         for name, inst in instances.items():
             rows = []
@@ -24763,7 +24981,7 @@ def restart_instance(name, inst, own_rid="", who="root", role="root"):
             "a deployment of this instance is queued or running — a restart "
             "would collide with it. Wait for it to finish and try again.")
     recreate_instance_containers(name, instance_services(inst),
-                                 inst.get("storage") or [])
+                                 inst.get("storage") or [], cause="manual")
     state_view_write()
     audit_tenant("instance.restarted", resolve_tenant(inst.get("tenant"))
                  or ensure_default_tenant(), subject=name, who=who, role=role)
@@ -25126,13 +25344,14 @@ def wake_instance(name, inst, who="root", role="root", wait=WAKE_WAIT_SECONDS):
     cur = reg["instances"][name]
     cur["state"] = "waking"
     save_registry(reg)
+    restart_record(name, "wake", "aus dem Standby", by=who)
     for c in _containers_of(cur):
         r = subprocess.run(["docker", "start", c], capture_output=True, text=True)
         if r.returncode != 0:
             # the container is gone (a prune, a hand removal): make it again
             # from the record -- the state is "waking", so this one STARTS it
             recreate_instance_containers(name, instance_services(cur),
-                                         cur.get("storage") or [])
+                                         cur.get("storage") or [], cause="wake", detail="Container fehlte, neu erzeugt")
             break
     up = _answers(cur, wait)
     reg = load_registry()
@@ -26324,7 +26543,7 @@ def apply_resources(name, res, who="root", role="root", own_rid=""):
     save_registry(reg)
     recreate_instance_containers(name, instance_services(cur),
                                  cur.get("storage") or [],
-                                 cur.get("endpoints") or [], inst=cur)
+                                 cur.get("endpoints") or [], inst=cur, cause="setting", detail="Ressourcen")
     state_view_write()
     audit_tenant("instance.resources", resolve_tenant(cur.get("tenant"))
                  or ensure_default_tenant(), subject=name, who=who, role=role,
@@ -27811,7 +28030,8 @@ def _install_from_dir(pkg, args, source):
     # (measured 18.11. on oaapx01: help 0.3.1 -> 0.4.0 came up without
     # /oaap/docs until the next restart).
     recreate_instance_containers(name, services, m.get("storage") or [], granted,
-                                 inst=dict(ident, docs_sources=docs_publish.docs_sources_wanted(m)))
+                                 inst=dict(ident, docs_sources=docs_publish.docs_sources_wanted(m)), cause=("deploy" if inst else "install"),
+                                 detail=f"Version {(m.get('app') or {}).get('version') or '?'}")
 
     # visibility (RFC-0007) survives reinstall, same as the port above —
     # a redeploy must not silently reopen a group-restricted instance
@@ -28496,7 +28716,7 @@ def rekey_instance(reg, old_key, new_key, grace):
                                 else f"oaap-app-{new_key}-{svc['service']}")
         recreate_instance_containers(new_key, services,
                                      inst.get("storage") or [],
-                                     inst.get("endpoints") or [], inst=inst)
+                                     inst.get("endpoints") or [], inst=inst, cause="rename", detail=f"{old_key} -> {new_key}")
         inst["services"] = services
         inst["container"] = services[0]["container"]
 
@@ -28798,7 +29018,7 @@ def cmd_endpoint(args):
                              if e["name"] != ep_name] + [entry]
         save_registry(reg)
         recreate_instance_containers(args.name, instance_services(inst),
-                                     inst.get("storage") or [], inst["endpoints"])
+                                     inst.get("storage") or [], inst["endpoints"], cause="setting", detail=f"Endpunkt {ep_name}")
         _print_endpoint_grant(args.name, entry)
     else:  # deny
         if ep_name not in granted:
@@ -28806,7 +29026,7 @@ def cmd_endpoint(args):
         inst["endpoints"] = [e for e in inst["endpoints"] if e["name"] != ep_name]
         save_registry(reg)
         recreate_instance_containers(args.name, instance_services(inst),
-                                     inst.get("storage") or [], inst["endpoints"])
+                                     inst.get("storage") or [], inst["endpoints"], cause="setting", detail=f"Endpunkt {ep_name}")
         print(f"Endpoint '{ep_name}' denied for '{args.name}'. The raw port is "
               f"closed; you may remove its router forward.")
 
@@ -36729,6 +36949,10 @@ def cmd_process_deploys(_args):
         actor = str(req.get("by") or "")
         act_tenant, act_role, _act_err = (acting_tenant(actor) if actor
                                           else (None, "", ""))
+        # Portal 0.3.61: the restart journal names who stands behind it
+        global RESTART_BY
+        RESTART_BY = actor or ("Deploy-Hook" if action in ("redeploy", "deploy")
+                               else "Knoten")
         # ...and "names nobody" is only an answer for the requests that
         # carry their own proof: the deploy hook and the artifact pair
         # (deploy token, checked by the portal; upload grant, spent
@@ -37878,7 +38102,7 @@ def cmd_process_deploys(_args):
                         save_registry(reg)
                         recreate_instance_containers(name, instance_services(inst),
                                                      inst.get("storage") or [],
-                                                     inst["endpoints"])
+                                                     inst["endpoints"], cause="setting", detail=f"Endpunkt {ep_name}")
                         ok = True
                         msg = (f"endpoint '{ep_name}' granted on host port {hp} "
                                f"({'+'.join(_endpoint_protos(decl['protocol']))}) — "
@@ -37888,7 +38112,7 @@ def cmd_process_deploys(_args):
                     save_registry(reg)
                     recreate_instance_containers(name, instance_services(inst),
                                                  inst.get("storage") or [],
-                                                 inst["endpoints"])
+                                                 inst["endpoints"], cause="setting", detail=f"Endpunkt {ep_name}")
                     ok = True
                     msg = f"endpoint '{ep_name}' denied; raw port closed"
                 else:
@@ -39984,6 +40208,8 @@ def _tenant_archive(tid, label, out_dir, out_file):
         ids = run(["docker", "ps", "-q", *sum(
             (["--filter", f"name=^{c}$"] for c in containers), [])]).stdout.split()
         stop = [c for c in ids if c in running] or ids
+    if stop:
+        restart_record_running(list(mine), "backup", "Sicherung des Mandanten")
     downtime = 0.0
     written = False
     try:
@@ -40251,6 +40477,11 @@ def _node_archive(out_dir, out_file, out_path):
         print(f"NOTE: {len(keep_test)} container(s) of test instances keep running "
               f"({', '.join(sorted(keep_test))}) — test instances are left out "
               "(`oaap backup test-instances`).")
+    if running:
+        _by_c = {c: n for n, i in (load_registry().get("instances") or {}).items()
+                 for c in _containers_of(i)}
+        for _n in sorted({_by_c[c] for c in running if c in _by_c}):
+            restart_record(_n, "backup", "Sicherung des Knotens")
     stage = tempfile.mkdtemp(prefix="oaap-backup-")
     # The managed Postgres (oaap.data.store 0.1, spec 2.4): a DUMP, not
     # a copy of its data directory -- a dump survives a Postgres
@@ -40535,7 +40766,7 @@ def _deploy_from_registry(name, inst):
     # forward exists) — bring the instance back with the port CLOSED, drop
     # the stale grant, and report so the operator re-grants deliberately.
     had_endpoints = inst.get("endpoints") or []
-    recreate_instance_containers(name, services, inst.get("storage") or [])
+    recreate_instance_containers(name, services, inst.get("storage") or [], cause="restore", detail="aus der Sicherung")
     if had_endpoints:
         r = load_registry()
         if name in r["instances"]:

@@ -89,7 +89,7 @@ def fake_inspect(cmd, **kw):
 m.subprocess.run = fake_inspect
 
 
-def fake_recreate(key, services, storage, endpoints, inst=None):
+def fake_recreate(key, services, storage, endpoints, inst=None, **kw):
     RECREATED.append(key)
     # Ein echtes Neuerzeugen loest den Mount neu auf -- hier
     # nachgebildet, damit der zweite Lauf sieht, was der erste tat.

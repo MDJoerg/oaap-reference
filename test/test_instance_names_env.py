@@ -61,7 +61,7 @@ def fake_container_env(container):
     return CONTAINERS.get(container)
 
 
-def fake_recreate(name, services, storage, endpoints=None, inst=None):
+def fake_recreate(name, services, storage, endpoints=None, inst=None, **kw):
     RECREATED.append(name)
     # wie `docker run --env-file`: der neue Container traegt die Datei
     CONTAINERS[services[0]["container"]] = dict(m.load_env(name, inst))

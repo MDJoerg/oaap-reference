@@ -380,6 +380,10 @@ STYLE = """
   .cfgfield{border:1px solid var(--oaap-border);border-radius:.5rem;
        padding:.8rem 1rem;margin:0 0 .9rem}
   .cfgfield label{display:block;font-weight:600}
+  .cfgfield:target{outline:3px solid var(--oaap-accent,#2563eb);outline-offset:2px}
+  .cfgfield.cfgchanged{border-left:4px solid var(--oaap-accent,#2563eb)}
+  .cfgtools{display:flex;flex-wrap:wrap;gap:.6rem 1.5rem;align-items:flex-end}
+  .cfgtools form{margin:0}
   .cfgfield .hint{margin:.1rem 0 .45rem;font-size:.82rem}
   .cfgfield input,.cfgfield textarea{margin:0;box-sizing:border-box}
   .cfgfield p.gen{margin:.6rem 0 0}
@@ -3291,6 +3295,9 @@ INSTANCE_EDIT_BODY = """
     <div><span class="k">Sichtbar für</span><span class="v">{{ i.visibility_label }}</span></div>
     <div><span class="k">Kachel</span><span class="v">{{ "im Launchpad" if i.tile_visible else "ausgeblendet" }}</span></div>
     <div><span class="k">Herkunft</span><span class="v">{{ i.source_label }}</span></div>
+    <div><span class="k">Zuletzt gestartet</span><span class="v">
+      {% if i.last_start %}<a href="?tab=diagnose#neustarts">{{ i.last_start }}</a>
+      {% else %}<span class="muted">noch nichts aufgezeichnet</span>{% endif %}</span></div>
     <div><span class="k">Deploy-Token</span><span class="v">
       {% if not i.is_test %}<span class="muted">nur für Test-Instanzen</span>
       {% elif i.token_created %}seit {{ i.token_created }}
@@ -4125,6 +4132,37 @@ INSTANCE_EDIT_BODY = """
      dann die IP-Adresse des Rechners im VPN und der Port des Dienstes (hier Ollama).</p>{% endif %}
 </div>
 {% endif %}
+<div class="card" id="cfgtools">
+  <h2>Parameter suchen, Datei</h2>
+  <div class="cfgtools">
+    <form method="get" action="/instances/{{ i.key }}#cfgtools">
+      <input type="hidden" name="tab" value="konfiguration">
+      <label for="cfg-q">Parameter suchen</label>
+      <input type="search" name="q" id="cfg-q" value="{{ i.cfg_q }}"
+             placeholder="Schlüssel, Bezeichnung oder Wert">
+      <button class="secondary">Suchen</button>
+    </form>
+    <p style="margin:0"><a class="rowaction" href="/instances/{{ i.key }}/config.json">Konfiguration herunterladen (JSON)</a></p>
+    <form method="post" action="/instances/{{ i.key }}/config-upload" enctype="multipart/form-data">
+      <input type="hidden" name="tab" value="konfiguration">
+      <label for="cfg-upload">Datei hochladen</label>
+      <input type="file" name="file" id="cfg-upload" accept=".json,application/json">
+      <button class="secondary">Ins Formular übernehmen</button>
+    </form>
+  </div>
+  {% if i.cfg_q %}
+  {% if i.cfg_hits %}
+  <ul>{% for h in i.cfg_hits %}<li><a href="?tab=konfiguration&q={{ i.cfg_q|urlencode }}#feld-{{ h.key }}">{{ h.label }}</a>
+      <code>{{ h.key }}</code> <span class="muted">— gefunden in {{ h.where }}</span></li>{% endfor %}</ul>
+  {% else %}<p class="muted">Kein Parameter passt zu „{{ i.cfg_q }}“.</p>{% endif %}
+  {% endif %}
+  {% if i.cfg_unknown %}<p class="err">Diese Schlüssel aus der Datei kennt die App nicht; sie wurden
+     übergangen: {% for k in i.cfg_unknown %}<code>{{ k }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</p>{% endif %}
+  <p class="muted">Die Datei enthält alle Werte außer vertraulichen und Dateien —
+     diese stehen nur mit Namen unter <code>omitted</code>. Hochladen setzt die
+     Werte ins Formular, markiert, was sich ändert, und speichert noch nichts.
+     Ein vertraulicher Wert, der in der Datei fehlt, bleibt, wie er ist.</p>
+</div>
 <form method="post" action="/instances/{{ i.key }}/config"{% if i.config|selectattr('file')|list %} enctype="multipart/form-data"{% endif %}>
   <input type="hidden" name="tab" value="konfiguration">
   {# Enter in einem Feld loest den ERSTEN Absendeknopf des Formulars aus.
@@ -4142,8 +4180,9 @@ INSTANCE_EDIT_BODY = """
        frueher UNTER dem Feld und damit direkt ueber dem Namen des
        naechsten — sie las sich wie dessen Ueberschrift (Joergs Befund,
        2026-09-15). #}
-    <div class="cfgfield">
-      <label for="cfg-{{ c.key }}">{{ c.label }}</label>
+    <div class="cfgfield{{ ' cfgchanged' if c.key in i.cfg_changed }}" id="feld-{{ c.key }}">
+      <label for="cfg-{{ c.key }}">{{ c.label }}{% if c.key in i.cfg_changed %}
+        <span class="badge todo">aus Datei, geändert</span>{% endif %}</label>
       <p class="muted hint"><code>{{ c.key }}</code>{% if c.multiline %} — eine Angabe
          je Zeile{% endif %}{% if c.secret %} — vertraulich,
          wird nie angezeigt{% endif %}{% if c.generate %} — diesen Wert
@@ -4157,7 +4196,10 @@ INSTANCE_EDIT_BODY = """
                 style="width:100%;font-family:ui-monospace,monospace;font-size:.9rem"
                 placeholder="{{ ('gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt') if c.secret else 'eine Angabe je Zeile' }}">{{ c.value }}</textarea>
       {% elif c.secret and not c.fresh %}
-      <input type="password" name="cfg-{{ c.key }}" value="" id="cfg-{{ c.key }}"
+      {# Nur ein vertraulicher Wert, den der Anwender gerade selbst aus
+         seiner Datei hochgeladen hat, steht im Feld (0.3.61) -- nie einer
+         vom Knoten. #}
+      <input type="password" name="cfg-{{ c.key }}" value="{{ c.value if c.key in i.cfg_changed else '' }}" id="cfg-{{ c.key }}"
              autocomplete="new-password"
              placeholder="{{ 'gesetzt — leer lassen, um ihn zu behalten' if c.is_set else 'noch nicht gesetzt' }}">
       {% else %}
@@ -4226,6 +4268,31 @@ INSTANCE_EDIT_BODY = """
   <p class="muted">Das sind Tatsachen über den Container, nicht Inhalte der
      App — deshalb brauchen sie keine Freischaltung. Stand:
      {{ i.diag.state_written or "unbekannt" }} UTC.</p>
+  {% endif %}
+</div>
+
+<div class="card" id="neustarts">
+  <h2>Neustarts</h2>
+  {% if i.restarts %}
+  <table class="mini">
+    <tr><th>Zeit (UTC)</th><th>Ursache</th><th>Dienst</th><th>Wer</th><th>Hinweis</th></tr>
+    {% for r in i.restarts %}
+    <tr>
+      <td style="white-space:nowrap">{{ r.when }}</td>
+      <td>{% if r.outside %}<span class="badge todo">{{ r.label }}</span>{% else %}{{ r.label }}{% endif %}</td>
+      <td>{% if r.service %}<code>{{ r.service }}</code>{% else %}<span class="muted">alle</span>{% endif %}</td>
+      <td>{{ r.by or "—" }}</td>
+      <td>{{ r.detail }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">Jeder Neustart durch die Plattform steht hier mit Grund und
+     Person. Starts von außen — ein Absturz, den Docker neu gestartet hat, ein
+     Neustart des Knotens, ein <code>docker restart</code> — findet der
+     Minutentakt und markiert sie. Die letzten {{ i.restarts|length }} Einträge.</p>
+  {% else %}
+  <p class="muted">Noch nichts aufgezeichnet. Der Knoten schreibt jeden Neustart
+     ab Version 0.1.374 auf; frühere kennt diese Seite nicht.</p>
   {% endif %}
 </div>
 
@@ -5312,6 +5379,8 @@ def edge_tls_ask():
 # entries.
 import instance_view as iv  # noqa: E402
 import diagnose_view as dv  # noqa: E402
+import restart_view as rv  # noqa: E402  (portal 0.3.61)
+import config_file as cfgf  # noqa: E402  (portal 0.3.61)
 
 
 def launchpad_tiles(user_roles, user_groups, host, user_tenant=None,
@@ -10586,7 +10655,8 @@ def instance_detail(name):
     return _instance_page(name, inst)
 
 
-def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
+def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
+                   cfg_changed=(), cfg_unknown=()):
     """The instance object page.
 
     `fresh` is (key, value) for a config value the node has just
@@ -10705,6 +10775,14 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None):
          "backup_out": (_backup_class()["skip_test"]
                         and (inst.get("channel") == "test" or bool(inst.get("rehearsal")))),
          **_throttle_view(inst)}
+    # Portal 0.3.61 (2.19): the restart history, the last start in the
+    # head, and on the tab Konfiguration the search and the upload's marks.
+    i["restarts"] = rv.read(RESTARTS_DIR, name)
+    i["last_start"] = rv.last_sentence(i["restarts"])
+    i["cfg_q"] = (request.args.get("q") or "").strip()[:100]
+    i["cfg_hits"] = cfgf.search(i["config"], i["cfg_q"])
+    i["cfg_changed"] = list(cfg_changed)
+    i["cfg_unknown"] = list(cfg_unknown)
     # RFC-0108: the history of this instance on the tab Diagnose.
     tid = resolve_tenant(inst.get("tenant")) or ""
     if tid:
@@ -11701,6 +11779,62 @@ def instance_config(name):
     msg, err = _config_outcome(_queue_and_wait(
         name, {"action": "config", "values": values}, CONFIG_WAIT_SECONDS))
     return _inst_back(name, msg=msg, err=err)
+
+
+# Portal 0.3.61 (2.19): the configuration as a file. The rows carry no
+# secret value -- the host's view has none -- so the download cannot leak
+# one; the upload only fills the form, saving stays the ordinary save.
+RESTARTS_DIR = "/apps-registry/restarts"
+
+
+@app.get("/instances/<name>/config.json")
+def instance_config_download(name):
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
+    if _config_view(name) is None:
+        return _inst_back(name, err="Die aktuellen Werte dieser Instanz liegen "
+                                    "dem Portal gerade nicht vor — es gibt "
+                                    "nichts Verlässliches herunterzuladen.")
+    doc = cfgf.export(name, inst, _instance_config(name, inst),
+                      datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    fname = re.sub(r"[^A-Za-z0-9._-]", "_", name) + "-config.json"
+    return app.response_class(json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+                              mimetype="application/json",
+                              headers={"Content-Disposition": f'attachment; filename="{fname}"',
+                                       "Cache-Control": "no-store"})
+
+
+@app.post("/instances/<name>/config-upload")
+def instance_config_upload(name):
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    inst = load_instances().get(name)
+    if not inst:
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
+    if _config_view(name) is None:
+        return _inst_back(name, err="Die aktuellen Werte dieser Instanz liegen "
+                                    "dem Portal gerade nicht vor — die Datei "
+                                    "wurde nicht übernommen.")
+    f = request.files.get("file")
+    raw = f.read(cfgf.MAX_BYTES + 1) if f else None
+    values, err = cfgf.parse(raw)
+    if err:
+        return _inst_back(name, err=err)
+    rows = _instance_config(name, inst)
+    typed, changed, unknown = cfgf.to_form(rows, values)
+    if changed:
+        msg = (f"{len(changed)} Wert{'e' if len(changed) != 1 else ''} aus der Datei "
+               "eingesetzt und markiert — gespeichert ist noch nichts. "
+               "Prüfen, dann „Speichern und App neu starten“.")
+    else:
+        msg = "Die Datei stimmt mit den gespeicherten Werten überein — nichts zu ändern."
+    return _instance_page(name, inst, typed=typed, msg=msg,
+                          cfg_changed=changed, cfg_unknown=unknown)
 
 
 # --------------------------------------------------------------- Generalprobe

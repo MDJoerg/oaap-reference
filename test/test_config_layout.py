@@ -79,7 +79,9 @@ html = render(ROWS)
 print("")
 print("Ein Block je Wert -- und die Erklaerung gehoert zu ihrem eigenen Feld")
 
-blocks = html.split('<div class="cfgfield">')[1:]
+# 0.3.61: the block carries its jump target (id="feld-<KEY>") and, after an
+# upload, the mark "cfgchanged" -- still one block per value
+blocks = re.split(r'<div class="cfgfield[^"]*"[^>]*>', html)[1:]
 ok("jeder Wert steht in genau einem eigenen Block",
    len(blocks) == len(ROWS), len(blocks))
 
