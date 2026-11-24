@@ -214,6 +214,7 @@ case "$cmd" in
   files)       exec python3 "$APP_DIR/appctl.py" files "$@" ;;
   user)        exec python3 "$APP_DIR/appctl.py" user "$@" ;;
   cohort)      exec python3 "$APP_DIR/appctl.py" cohort "$@" ;;
+  events)      exec python3 "$APP_DIR/appctl.py" events "$@" ;;
   disk)        exec python3 "$APP_DIR/appctl.py" disk "$@" ;;
   machine)     exec python3 "$APP_DIR/appctl.py" machine "$@" ;;
   authz)       exec python3 "$APP_DIR/appctl.py" authz "$@" ;;

@@ -3024,3 +3024,9 @@ def ts_delete(caller, drv, series_id):
                 f"with '?confirm={series_id}'"), 409
     s = drv.drop_series(series_id, by=caller[0])
     return jsonify({"deleted": _ts_public(s)})
+
+
+# The event bus's door (oaap.events.bus 0.1, RFC-0127 stage 1): the gateway
+# passes /platform/events/* of an instance's site here as /bus/v1/*.
+import bus_door  # noqa: E402
+bus_door.register(app, get_conn, PLATFORM_APPS_DIR)

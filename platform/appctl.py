@@ -98,6 +98,23 @@ import idp_admin  # noqa: E402
 import docs_publish  # noqa: E402
 # RFC-0119: the assistant templates an app brings -- pure rules, tested on paper.
 import app_templates  # noqa: E402
+
+
+def _load_bus_model():
+    """oaap.events.bus 0.1 (RFC-0127): the event bus's pure rules live with
+    the twin service, whose image is built from services/twin. Loaded by
+    path, not put on sys.path, so the twin's other module names (app.py
+    among them) can never shadow anything this file imports."""
+    import importlib.util
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "services", "twin", "bus_model.py")
+    spec = importlib.util.spec_from_file_location("bus_model", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bus_model = _load_bus_model()
 import user_filter  # noqa: E402
 import move  # noqa: E402
 # The cohort (RFC-0046): what a template may say and how a seat is
@@ -6253,7 +6270,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 20     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 21     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -6297,7 +6314,11 @@ MANIFEST_MINOR = 20     # 0.2 adds app.class (runtime spec 2.10);
                         # refuse unknown keys there, and skip unknown blocks;
                         # 0.20 adds assistant_templates.path (RFC-0119 -- an
                         # app with an MCP door brings assistant templates,
-                        # copied per tenant like its documentation).
+                        # copied per tenant like its documentation);
+                        # 0.21 adds events.publishes/subscribes
+                        # (oaap.events.bus 0.1, RFC-0127 -- an app publishes
+                        # through /platform/events and receives what the
+                        # tenant admin granted it).
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -6415,6 +6436,7 @@ def save_registry(reg):
     os.replace(tmp, REGISTRY)
     artifact_index_write(reg)
     config_view_write(reg)
+    events_catalog_write(reg)
 
 
 # ------------------------------------------- tenancy (oaap.core.tenant 0.1)
@@ -16644,6 +16666,14 @@ def validate_manifest(m):
             err = mcp_door_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.21 (oaap.events.bus 0.1, RFC-0127): the events the app
+        # publishes and wants. Here without the package (every schema
+        # stands in as an empty object); install checks the files too
+        # (events_declared).
+        if "events" in m:
+            err, _ = bus_model.declaration(m, lambda _p: b'{"type": "object"}')
+            if err:
+                errs.append(err)
         # Manifest 0.20 (RFC-0119): the app's assistant templates.
         if "assistant_templates" in m:
             err = app_templates.declaration_error(m)
@@ -17700,6 +17730,39 @@ def _twin_ensure_tables(schema):
         CREATE INDEX IF NOT EXISTS statuses_event ON "{schema}".statuses (event_id);
         CREATE UNIQUE INDEX IF NOT EXISTS receivers_live
             ON "{schema}".receivers (principal, name) WHERE removed_at IS NULL;
+        -- The tenant's event store (oaap.events.bus 0.1 §2.6, RFC-0127 D6):
+        -- what apps published through /platform/events, in the CloudEvents
+        -- envelope's parts. Append-only; rows older than the retention
+        -- (30 days) are deleted -- the one deletion, the store is not a
+        -- second master (RFC-0127 §8). 'oaapto' is for addressed events.
+        CREATE TABLE IF NOT EXISTS "{schema}".bus_events (
+            seq bigserial PRIMARY KEY,
+            id text NOT NULL UNIQUE,
+            type text NOT NULL,
+            source_instance text NOT NULL,
+            source_app text NOT NULL,
+            subject text NOT NULL,
+            time timestamptz NOT NULL DEFAULT now(),
+            data jsonb NOT NULL,
+            semantic text,
+            oaapto text
+        );
+        CREATE INDEX IF NOT EXISTS bus_events_type ON "{schema}".bus_events (type, seq);
+        CREATE INDEX IF NOT EXISTS bus_events_rate ON "{schema}".bus_events (source_instance, time);
+        -- Grants (§2.7, RFC-0127 D4): the tenant admin's yes, per instance
+        -- and type. Revoking sets revoked_*; a new grant is a new row.
+        CREATE TABLE IF NOT EXISTS "{schema}".bus_grants (
+            id bigserial PRIMARY KEY,
+            instance text NOT NULL,
+            type text NOT NULL,
+            subject_prefix text,
+            granted_by text NOT NULL,
+            granted_at timestamptz NOT NULL DEFAULT now(),
+            revoked_by text,
+            revoked_at timestamptz
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS bus_grants_live
+            ON "{schema}".bus_grants (instance, type) WHERE revoked_at IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS
@@ -17818,7 +17881,7 @@ def _cases_issue_submit_key(name, tenant_id):
 INSTANCE_KEY_VARS = ("OAAP_PLATFORM_KEY", "OAAP_AUTHZ_KEY",
                      "OAAP_AUTHZ_ADMIN_KEY", "OAAP_CASES_KEY",
                      "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_CLIENT_KEY",
-                     "OAAP_AI_CLIENT_KEY")
+                     "OAAP_AI_CLIENT_KEY", "OAAP_EVENTS_KEY")
 RENEW_DAYS = 30
 
 
@@ -17895,6 +17958,10 @@ def instance_keys_issue(name, tenant_id, app_id, which, administer=False, port=N
             out[var] = _ai_issue_client_key(name, tenant_id)
             if port:
                 out["OAAP_AI_CLIENT_URL"] = ai_client_url(port)
+        elif var == "OAAP_EVENTS_KEY":
+            out[var] = _events_issue_key(name, tenant_id)
+            if port:
+                out["OAAP_EVENTS_URL"] = events_url(port)
     return out
 
 
@@ -18048,6 +18115,178 @@ def cmd_migrate_instance_keys(_args):
           f"and {len(found['authz'])} authorization record(s) cleared"
           + (f": {', '.join(found['principals'] + [a for a in found['authz'] if a not in found['principals']])}"
              if found["principals"] or found["authz"] else "") + ".")
+
+
+# ------------------------------------------------ the event bus (RFC-0127)
+#
+# oaap.events.bus 0.1. An instance whose manifest has an `events` block gets
+# a key scoped to EVENTS_SCOPE:<name> and a door on its own site,
+# /platform/events/*, which the gateway passes to the twin service. What it
+# declared is kept in its registry record; events-catalog.json is written
+# from the registry every time the registry is saved, so install, update,
+# rename and removal all reach the twin service without a step of their own.
+EVENTS_SCOPE = "oaap.events"
+EVENTS_CATALOG = os.path.join(APPS_DIR, "events-catalog.json")
+
+
+def events_scope(name):
+    return f"{EVENTS_SCOPE}:{name}"
+
+
+def events_declared(m, pkg):
+    """The validated `events` entry of a manifest (schemas read from the
+    package) or None; dies with the sentence on a bad block."""
+    root = os.path.realpath(pkg)
+
+    def read_file(rel):
+        p = os.path.realpath(os.path.join(root, rel))
+        if not p.startswith(root + os.sep) or not os.path.isfile(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read(bus_model.MAX_SCHEMA_BYTES + 1)
+    err, entry = bus_model.declaration(m, read_file)
+    if err:
+        die(err)
+    return entry
+
+
+def events_url(port):
+    return f"http://{GATEWAY_CONTAINER}:{port}/platform/events"
+
+
+def events_wanted(inst):
+    ev = (inst or {}).get("events") or {}
+    return bool(ev.get("publishes") or ev.get("subscribes"))
+
+
+def events_catalog_write(reg=None):
+    """events-catalog.json: per instance with an events block (never a
+    rehearsal) its tenant id, app, version and declaration."""
+    try:
+        reg = reg if reg is not None else load_registry()
+        out = {}
+        for name, inst in (reg.get("instances") or {}).items():
+            if not events_wanted(inst) or is_rehearsal(inst):
+                continue
+            out[name] = {"tenant": inst.get("tenant"), "app_id": inst.get("app_id"),
+                         "version": inst.get("version"),
+                         "publishes": inst["events"].get("publishes") or [],
+                         "subscribes": inst["events"].get("subscribes") or []}
+        tmp = EVENTS_CATALOG + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"schema": "0.1", "written": _iso_now(), "instances": out}, f, indent=2)
+        os.replace(tmp, EVENTS_CATALOG)
+        # declarations and schemas, no secret: readable like the registry
+        os.chmod(EVENTS_CATALOG, 0o644)
+    except OSError as e:
+        print(f"WARNING: could not write {EVENTS_CATALOG}: {e}", flush=True)
+
+
+def _events_issue_key(name, tenant_id):
+    """Key for 'instance:<name>', limited to events_scope(name) -- the
+    construction of _cases_issue_submit_key, another scope."""
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_T_INST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
+        "    'oaap.events (RFC-0127)', m.KEY_MAX_DAYS, 'root')\n"
+        "print(json.dumps(secret))\n",
+        {"OAAP_T_NAME": f"instance:{name}", "OAAP_T_INST": name,
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": events_scope(name)})
+    return json.loads(out)
+
+
+def _events_catalog():
+    try:
+        with open(EVENTS_CATALOG, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"instances": {}}
+
+
+def _events_psql(tid, sql):
+    schema = f"twin_{tid}"
+    if not re.fullmatch(r"twin_[0-9a-f-]{36}", schema):
+        die(f"not a tenant id: {tid!r}")
+    if not _twin_schema_exists(schema):
+        die("this tenant has no twin yet -- its event store lives there")
+    return _store_psql(sql.replace("{s}", f'"{schema}"')).stdout
+
+
+def cmd_events(args):
+    """oaap events list|grant|revoke (oaap.events.bus 0.1 §2.7)."""
+    reg = load_registry()
+    cat = _events_catalog()
+    if args.action == "list":
+        tid = resolve_tenant_arg(args.tenant)
+        insts = {n: e for n, e in (cat.get("instances") or {}).items()
+                 if not tid or e.get("tenant") == tid}
+        if not insts:
+            print("No instance declares events.")
+            return
+        grants = {}
+        for t in sorted({e["tenant"] for e in insts.values()}):
+            if not _twin_schema_exists(f"twin_{t}"):
+                continue
+            out = _events_psql(t, "SELECT instance || '|' || type || '|' || "
+                               "COALESCE(subject_prefix, '') || '|' || granted_by FROM {s}.bus_grants "
+                               "WHERE revoked_at IS NULL ORDER BY 1")
+            for line in out.splitlines():
+                i, ty, pre, by = (line.split("|") + ["", "", "", ""])[:4]
+                grants[(i, ty)] = (pre, by)
+        for n, e in sorted(insts.items()):
+            print(f"{n}  ({e.get('app_id')} {e.get('version')})")
+            for p in e.get("publishes") or []:
+                print(f"  publishes  {p['type']}  [{p['audience']}]  {p['title']}")
+            for sb in e.get("subscribes") or []:
+                g = grants.get((n, sb["type"]))
+                state = (f"GRANTED by {g[1]}" + (f", subject {g[0]}*" if g[0] else "")) if g                     else ("addressed only" if sb.get("addressed_only") else "waiting for a grant")
+                print(f"  wants      {sb['type']}  -- {state}  ({sb['why']})")
+        return
+    if not args.instance or not args.type:
+        die(f"usage: oaap events {args.action} <instance> <type>")
+    key, err = resolve_instance_ref(reg, args.instance, args.tenant or "")
+    if err:
+        die(err)
+    inst = reg["instances"][key]
+    tid = _instance_tenant_id(inst)
+    who = os.environ.get("SUDO_USER") or "root"
+    if args.action == "grant":
+        why = bus_model.grant_error(cat, tid, key, args.type)
+        if why:
+            die(why)
+        pre = args.subject_prefix or ""
+        if len(pre) > bus_model.SUBJECT_MAX:
+            die("--subject-prefix: too long")
+        out = _events_psql(tid, "INSERT INTO {s}.bus_grants (instance, type, subject_prefix, granted_by) "
+                           f"VALUES ({_sql_lit(key)}, {_sql_lit(args.type)}, "
+                           f"{_sql_lit(pre) if pre else 'NULL'}, {_sql_lit(who)}) "
+                           "ON CONFLICT DO NOTHING RETURNING id")
+        if not out.strip():
+            print(f"'{key}' already holds a grant for {args.type} -- revoke it first to change it.")
+            return
+        audit_tenant("events.grant", tid, f"{key} {args.type}", who=who,
+                     detail=f"subject_prefix={pre}" if pre else "")
+        print(f"Granted: '{key}' receives {args.type}" + (f" (subject {pre}*)" if pre else "")
+              + " -- from the feed at once, from the push once it exists.")
+        return
+    out = _events_psql(tid, f"UPDATE {{s}}.bus_grants SET revoked_at = now(), revoked_by = {_sql_lit(who)} "
+                       f"WHERE instance = {_sql_lit(key)} AND type = {_sql_lit(args.type)} "
+                       "AND revoked_at IS NULL RETURNING id")
+    if not out.strip():
+        print(f"'{key}' holds no grant for {args.type}.")
+        return
+    audit_tenant("events.revoke", tid, f"{key} {args.type}", who=who)
+    print(f"Revoked: '{key}' no longer receives {args.type}.")
 
 
 def cases_submit_wanted(m):
@@ -20701,7 +20940,9 @@ CASES_MARKER = "# platform-feedback "
 # 8: a consuming gateway's site carries a discovery door per source
 #    (RFC-0073 §16).
 # 9: every site carries /platform/context.json (RFC-0118 P3).
-CASES_BLOCK_FORMAT = 9
+# 10: an instance with an events block carries /platform/events
+#     (oaap.events.bus 0.1, RFC-0127 D3).
+CASES_BLOCK_FORMAT = 10
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -20958,6 +21199,31 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
         lines += _proxy(target, "\t\t", extra=[
             f"header_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)])
     lines.append("\t}")
+    # oaap.events.bus 0.1 (RFC-0127 D3): the instance's events door. Only
+    # the key scoped to events_scope(this instance) passes; the path goes
+    # to the twin service as /bus/v1/..., with this site as the source --
+    # the twin believes it only when identity's principal names the same
+    # instance. Never for a rehearsal or an instance in maintenance.
+    if events_wanted(me) and not login_only and not is_rehearsal(me):
+        uri = "/verify?roles="
+        if tenant:
+            uri += f"&tenant={tenant}"
+        uri += f"&instance={events_scope(scope or '-')}"
+        source = (scope or "-", me.get("app_id") or "-",
+                  me.get("version") or "-",
+                  tenant or instance_tenant_ref(me))
+        # `route` keeps the written order: Caddy would otherwise rewrite
+        # before forward_auth asks identity.
+        for matcher in ("/platform/events", "/platform/events/*"):
+            lines += [f"\thandle {matcher} {{", "\t\troute {"]
+            lines += ["\t\t\tforward_auth identity:8000 {", f"\t\t\t\turi {uri}",
+                      "\t\t\t\t" + _COPY_IDENTITY]
+            lines += ["\t" + x for x in _AUTH_NO_UPGRADE] + ["\t\t\t}"]
+            lines += ["\t\t\turi strip_prefix /platform/events",
+                      "\t\t\trewrite * /bus/v1{uri}",
+                      "\t\t\treverse_proxy twin:8000 {"]
+            lines += [f"\t\t\t\theader_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)]
+            lines += ["\t\t\t}", "\t\t}", "\t}"]
     # RFC-0069 stage 2: on a `vorgaenge` site only, the node's door. The
     # gateway asks for the key of platform:<this instance>, no roles, and
     # names this instance as the source; the app refuses anything else.
@@ -22246,6 +22512,8 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_AUTHZ_KEY", "OAAP_AUTHZ_ADMIN_KEY", "OAAP_AUTHZ_URL",
                 "OAAP_INSTANCE_NAMES",
                 "OAAP_CASES_KEY", "OAAP_CASES_URL",
+                # oaap.events.bus 0.1 (RFC-0127)
+                "OAAP_EVENTS_KEY", "OAAP_EVENTS_URL",
                 "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_SOURCES_URL",
                 "OAAP_MCP_CLIENT_KEY", "OAAP_MCP_CLIENT_URL",
                 # RFC-0104: the model way and the setup key
@@ -26515,6 +26783,7 @@ def _install_from_dir(pkg, args, source):
     with open(mf_path, encoding="utf-8") as f:
         m = yaml.safe_load(f)
     validate_manifest(m)
+    events_entry = events_declared(m, pkg)
 
     app = m["app"]
     # What the caller asks for is the name INSIDE a tenant (RFC-0025
@@ -26909,6 +27178,19 @@ def _install_from_dir(pkg, args, source):
         env.pop("OAAP_CASES_URL", None)
         print(f"'{name}' no longer asks to open cases: its key is no longer "
               "handed to the app.")
+    # oaap.events.bus 0.1 (RFC-0127 D3): the key this instance presents at
+    # its own door /platform/events. Minted once; never for a rehearsal.
+    if events_entry and not is_artefact and not rehearsal:
+        if "OAAP_EVENTS_KEY" not in env:
+            env["OAAP_EVENTS_KEY"] = _events_issue_key(name, twin_tenant)
+            print(f"Issued an events key for '{name}' (oaap.events.bus) "
+                  "-- OAAP_EVENTS_KEY/OAAP_EVENTS_URL are in its environment.")
+        env["OAAP_EVENTS_URL"] = events_url(port)
+    elif "OAAP_EVENTS_KEY" in env:
+        env.pop("OAAP_EVENTS_KEY", None)
+        env.pop("OAAP_EVENTS_URL", None)
+        print(f"'{name}' no longer declares events: its key is no longer "
+              "handed to the app.")
     # RFC-0073 D2/D8: a gateway app reads the MCP sources of its tenant
     # through its own site. Minted once; never for a rehearsal.
     if mcp_sources_wanted(m) and not is_artefact and not rehearsal:
@@ -27132,6 +27414,9 @@ def _install_from_dir(pkg, args, source):
         # whether it is a help that reads those of its tenant. Re-read on
         # every install, like `mcp`: both describe the app.
         "docs": docs_publish.products_of(m),
+        # Manifest 0.21 (oaap.events.bus 0.1): what the app publishes (with
+        # its schemas) and wants -- the catalogue is written from this.
+        "events": events_entry,
         "docs_sources": docs_publish.docs_sources_wanted(m),
         # Manifest 0.20 (RFC-0119): the folder of its assistant templates.
         "assistant_templates": app_templates.folder_of(m),
@@ -41290,6 +41575,15 @@ def build_parser():
     pcoh.add_argument("--dry-run", action="store_true",
                       help="create, sweep, extend: say what would happen, change nothing")
     pcoh.set_defaults(fn=cmd_cohort)
+    pev = sub.add_parser("events", help="events between apps (oaap.events.bus, RFC-0127): "
+                                        "list, grant, revoke")
+    pev.add_argument("action", choices=["list", "grant", "revoke"])
+    pev.add_argument("instance", nargs="?", help="grant, revoke: the receiving instance")
+    pev.add_argument("type", nargs="?", help="grant, revoke: the event type")
+    pev.add_argument("--tenant", default="", help="the tenant (label) the instance is in")
+    pev.add_argument("--subject-prefix", default="",
+                     help="grant: only events whose subject starts with this")
+    pev.set_defaults(fn=cmd_events)
     pk = sub.add_parser("link", help="app-to-app links (RFC-0016)")
     pk.add_argument("action", choices=["add", "remove", "list"])
     pk.add_argument("source", nargs="?", help="the instance that may reach the target")

@@ -1,0 +1,262 @@
+"""Der Ereignisbus, Stufe 1.2 (oaap.events.bus 0.1, RFC-0127).
+
+Drei Teile ohne Container:
+  1. die reinen Regeln (services/twin/bus_model.py): Typnamen, Manifestblock,
+     Schema-Teilmenge, Pruefung einer Veroeffentlichung, Umschlag, Freigaben;
+  2. die Tuer (services/twin/bus_door.py) mit Flasks Testclient bis zur
+     Datenbank: wer sprechen darf, was abgelehnt wird, und dass ein vom
+     Absender gesetztes `source`/`id`/`time` nicht durchkommt;
+  3. der Knoten (appctl.py): Katalogdatei aus der Registry, Schluessel- und
+     Tuerzeilen im Gateway.
+
+Was hier NICHT geprueft wird: Postgres (Ablage, Feed, Rate) und der echte
+Weg Gateway -> identity -> Zwilling -- das misst Stufe 1.2 auf oaap-test.
+
+Aufruf: python3 test/test_events_bus.py
+"""
+import json
+import os
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+os.environ["OAAP_DATA_DIR"] = tempfile.mkdtemp(prefix="oaap-events-bus-")
+TWIN = os.path.join(HERE, "..", "platform", "services", "twin")
+sys.path.insert(0, os.path.join(HERE, "..", "platform"))
+sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))
+sys.path.insert(0, TWIN)
+
+import bus_model as bm                                         # noqa: E402
+
+fails = 0
+
+
+def ok(label, cond, detail=""):
+    global fails
+    fails += not cond
+    print(f"{'PASS' if cond else 'FAIL'}  {label}")
+    if not cond and detail:
+        print(f"      {str(detail)[:400]}")
+
+
+SCHEMA = {"type": "object", "required": ["case", "to"], "additionalProperties": False,
+          "properties": {"case": {"type": "string", "maxLength": 40},
+                         "from": {"type": ["string", "null"]},
+                         "to": {"type": "string", "enum": ["open", "in_progress", "done"]},
+                         "n": {"type": "integer", "minimum": 0}}}
+FILES = {"events/s.json": json.dumps(SCHEMA).encode()}
+
+
+def manifest(ev, app_id="probe-pub"):
+    return {"app": {"id": app_id}, "events": ev}
+
+
+def decl(ev, app_id="probe-pub", files=FILES):
+    return bm.declaration(manifest(ev, app_id), files.get)
+
+
+PUB = {"type": "app.probepub.case.statuschanged.v1", "title": "Status", "schema": "events/s.json"}
+
+print("\n=== Typnamen ===")
+ok("ein guter Name", bm.type_error("app.vorgaenge.case.statuschanged.v1") == "")
+ok("zu wenige Ebenen, Grossbuchstaben, ohne Hauptversion -> abgelehnt",
+   bm.type_error("app.x.v1") and bm.type_error("app.X.case.changed.v1")
+   and bm.type_error("app.x.case.changed"))
+ok("eine App veroeffentlicht nur unter app.<id ohne Bindestrich>.",
+   bm.own_type_error("app.probepub.a.b.v1", "probe-pub") == ""
+   and bm.own_type_error("app.other.a.b.v1", "probe-pub")
+   and bm.own_type_error("oaap.twin.object.changed.v1", "probe-pub")
+   and bm.own_type_error("ext.sap.bp.changed.v1", "probe-pub"))
+
+print("\n=== Manifestblock ===")
+err, entry = decl({"publishes": [PUB], "subscribes": [
+    {"type": "app.vorgaenge.case.statuschanged.v1", "why": "Rueckmeldung"}]})
+ok("gueltiger Block -> Eintrag mit Schema, audience tenant als Vorgabe",
+   err == "" and entry["publishes"][0]["schema"] == SCHEMA
+   and entry["publishes"][0]["audience"] == "tenant"
+   and entry["subscribes"][0]["addressed_only"] is False, err)
+ok("kein Block -> ('', None)", bm.declaration({"app": {"id": "x"}}, FILES.get) == ("", None))
+for label, ev, frag in [
+    ("unbekannter Schluessel im Block", {"publish": []}, "only 'publishes'"),
+    ("fremder Namensraum", {"publishes": [dict(PUB, type="app.other.a.b.v1")]}, "own namespace"),
+    ("Typ doppelt", {"publishes": [PUB, PUB]}, "twice"),
+    ("Titel fehlt", {"publishes": [dict(PUB, title="")]}, "title"),
+    ("Schema fehlt im Paket", {"publishes": [dict(PUB, schema="events/x.json")]}, "not in the package"),
+    ("Schema-Pfad nach oben", {"publishes": [dict(PUB, schema="../x.json")]}, "relative path"),
+    ("listed ohne Liste", {"publishes": [dict(PUB, audience="listed")]}, "listed"),
+    ("listed bei tenant", {"publishes": [dict(PUB, listed=["a-b"])]}, "only with audience"),
+    ("Wunsch ohne Begruendung", {"subscribes": [{"type": PUB["type"]}]}, "why"),
+    ("unbekannte audience", {"publishes": [dict(PUB, audience="all")]}, "audience"),
+]:
+    e, _ = decl(ev)
+    ok(f"abgelehnt: {label}", frag in e, e)
+bad = {"events/s.json": json.dumps({"type": "object", "oneOf": []}).encode()}
+e, _ = decl({"publishes": [PUB]}, files=bad)
+ok("Schema mit Schluesselwort ausserhalb der Teilmenge -> abgelehnt, nicht still ungeprueft",
+   "oneOf" in e and "subset" in e, e)
+e, _ = decl({"publishes": [PUB]}, files={"events/s.json": b'{"type": "array"}'})
+ok("data muss oben ein Objekt sein", "object at the top" in e, e)
+e, _ = decl({"publishes": [PUB]}, files={"events/s.json": b"{nicht json"})
+ok("kein JSON -> abgelehnt mit Pfad", "events/s.json" in e and "not JSON" in e, e)
+
+print("\n=== Schema-Pruefung ===")
+ok("passt", bm.validate({"case": "V-1", "to": "open", "from": None}, SCHEMA) is None)
+ok("Pflichtfeld fehlt -> Pfad", bm.validate({"case": "V-1"}, SCHEMA) == ("data.to", "required"))
+ok("enum", bm.validate({"case": "V-1", "to": "weg"}, SCHEMA)[0] == "data.to")
+ok("zusaetzliches Feld bei additionalProperties false",
+   bm.validate({"case": "V-1", "to": "open", "x": 1}, SCHEMA) == ("data.x", "not allowed here"))
+ok("bool ist keine Zahl", bm.validate({"case": "V-1", "to": "open", "n": True}, SCHEMA)[0] == "data.n")
+ok("minimum", bm.validate({"case": "V-1", "to": "open", "n": -1}, SCHEMA)[0] == "data.n")
+
+print("\n=== Veroeffentlichen pruefen ===")
+st, why, acc = bm.check_publish({"type": PUB["type"], "subject": "V-1",
+                                 "data": {"case": "V-1", "to": "open"},
+                                 "source": "urn:fake", "id": "X", "time": "1999",
+                                 "oaaptenant": "fremd"}, entry)
+ok("202, und angenommen wird NUR type/subject/data -- source, id, time, oaaptenant fallen weg",
+   st == 202 and set(acc) == {"type", "subject", "data"}, (st, why, acc))
+for label, body, code in [
+    ("kein Objekt", [], 400),
+    ("oaapto vor 0.2", {"type": PUB["type"], "subject": "a", "oaapto": "instance:x"}, 400),
+    ("nicht erklaerter Typ", {"type": "app.probepub.other.thing.v1", "subject": "a"}, 403),
+    ("subject fehlt", {"type": PUB["type"], "data": {"case": "a", "to": "open"}}, 400),
+    ("subject mit Steuerzeichen", {"type": PUB["type"], "subject": "a\nb"}, 400),
+    ("data kein Objekt", {"type": PUB["type"], "subject": "a", "data": [1]}, 400),
+    ("data gegen das Schema", {"type": PUB["type"], "subject": "a", "data": {"case": "a"}}, 422),
+    ("data zu gross", {"type": PUB["type"], "subject": "a",
+                       "data": {"case": "a", "to": "open", "x": "y" * 70000}}, 413),
+]:
+    ok(f"{code}: {label}", bm.check_publish(body, entry)[0] == code,
+       bm.check_publish(body, entry)[:2])
+err_a, entry_a = decl({"publishes": [dict(PUB, audience="addressed")]})
+ok("409: ein adressierter Typ vor 0.2",
+   bm.check_publish({"type": PUB["type"], "subject": "a", "data": {"case": "a", "to": "open"}},
+                    entry_a)[0] == 409)
+
+print("\n=== Umschlag und Kennung ===")
+u1, u2 = bm.ulid(1700000000000, b"\0" * 10), bm.ulid(1700000000001, b"\0" * 10)
+ok("ULID: 26 Zeichen, nach Zeit sortierbar", len(u1) == 26 and u1 < u2 and
+   len(bm.ulid()) == 26)
+ev = bm.envelope({"id": u1, "type": PUB["type"], "source_instance": "t1-pub",
+                  "subject": "V-1", "time": "2026-11-24T12:00:00.000Z",
+                  "data": {"case": "V-1", "to": "open"}}, "T-ID", "probe-pub", "oaap-aas:X")
+ok("CloudEvents 1.0: Pflichtattribute, Quelle von der Plattform, Erweiterungen",
+   ev["specversion"] == "1.0" and ev["source"] == "urn:oaap:tenant:T-ID:instance:t1-pub"
+   and ev["oaaptenant"] == "T-ID" and ev["oaaporigin"] == "app:probe-pub"
+   and ev["oaapsemantic"] == "oaap-aas:X" and ev["datacontenttype"] == "application/json"
+   and ev["dataschema"] == f"urn:oaap:events:schema:probe-pub:{PUB['type']}", ev)
+ok("Attributnamen nach CloudEvents: a-z0-9, hoechstens 20 Zeichen",
+   all(k.isalnum() and k.islower() and len(k) <= 20 for k in ev))
+
+print("\n=== Freigaben ===")
+_, sub_entry = decl({"subscribes": [{"type": PUB["type"], "why": "w"}]}, app_id="probe-sub")
+cat = {"instances": {
+    "t1-pub": dict(entry, tenant="T1", app_id="probe-pub"),
+    "t1-sub": dict(sub_entry, tenant="T1", app_id="probe-sub"),
+    "t2-sub": dict(sub_entry, tenant="T2", app_id="probe-sub"),
+    "t1-nix": {"tenant": "T1", "app_id": "nix", "publishes": [], "subscribes": []}}}
+ok("Freigabe im selben Mandanten: erlaubt", bm.grant_error(cat, "T1", "t1-sub", PUB["type"]) == "")
+ok("Abonnent in einem anderen Mandanten (kein Veroeffentlicher dort): abgelehnt",
+   "no instance of this tenant publishes" in bm.grant_error(cat, "T2", "t2-sub", PUB["type"]))
+ok("Instanz eines fremden Mandanten unter diesem Mandanten: abgelehnt",
+   "not an instance of this tenant" in bm.grant_error(cat, "T1", "t2-sub", PUB["type"]))
+ok("ohne erklaerten Wunsch: abgelehnt",
+   "does not declare" in bm.grant_error(cat, "T1", "t1-nix", PUB["type"]))
+_, listed = decl({"publishes": [dict(PUB, audience="listed", listed=["andere-app"])]})
+cat2 = {"instances": dict(cat["instances"], **{"t1-pub": dict(listed, tenant="T1", app_id="probe-pub")})}
+ok("listed fuer eine andere App: abgelehnt",
+   "listed for other apps" in bm.grant_error(cat2, "T1", "t1-sub", PUB["type"]))
+
+print("\n=== Die Tuer (bus_door, ohne Datenbank) ===")
+apps = tempfile.mkdtemp(prefix="oaap-events-apps-")
+json.dump({"instances": {"t1-pub": {"tenant": "T1", "app_id": "probe-pub"},
+                         "t1-sub": {"tenant": "T1", "app_id": "probe-sub"}}},
+          open(os.path.join(apps, "registry.json"), "w"))
+json.dump(cat, open(os.path.join(apps, "events-catalog.json"), "w"))
+from flask import Flask                                        # noqa: E402
+import bus_door                                                # noqa: E402
+fapp = Flask("t")
+CONNS = []
+bus_door.register(fapp, lambda t: CONNS.append(t) or None, apps)
+c = fapp.test_client()
+
+
+def post(user, src, body, **kw):
+    h = {"X-OAAP-User": user, "X-OAAP-Source-Instance": src}
+    h.update(kw.pop("headers", {}))
+    return c.post("/bus/v1/", data=json.dumps(body), headers=h, content_type="application/json")
+
+
+good = {"type": PUB["type"], "subject": "V-1", "data": {"case": "V-1", "to": "open"}}
+ok("Person statt Instanz -> 403", post("joerg", "t1-pub", good).status_code == 403)
+ok("Schluessel einer anderen Instanz auf dieser Seite -> 403",
+   post("instance:t1-sub", "t1-pub", good).status_code == 403)
+ok("ohne Quellkopfzeile -> 403", post("instance:t1-pub", "", good).status_code == 403)
+ok("unbekannte Instanz -> 403", post("instance:weg", "weg", good).status_code == 403)
+r = post("instance:t1-pub", "t1-pub", dict(good, type="app.probepub.x.y.v1"))
+ok("nicht erklaerter Typ -> 403 mit Satz", r.status_code == 403 and "declares" in r.get_json()["error"])
+r = post("instance:t1-pub", "t1-pub", dict(good, data={"case": "V-1"}))
+ok("Schema verletzt -> 422 mit Pfad", r.status_code == 422 and "data.to" in r.get_json()["error"])
+ok("bis hierhin keine Datenbank gefragt", CONNS == [])
+r = post("instance:t1-pub", "t1-pub", good)
+ok("gueltig, aber Mandant ohne Zwilling -> 409, erst jetzt die Datenbank gefragt",
+   r.status_code == 409 and CONNS == ["T1"], (r.status_code, CONNS))
+r = c.post("/bus/v1/", data=json.dumps({"case": "V-1", "to": "open"}),
+           headers={"X-OAAP-User": "instance:t1-pub", "X-OAAP-Source-Instance": "t1-pub",
+                    "ce-type": PUB["type"], "ce-subject": "V-1"})
+ok("Binaermodus (ce-* Kopfzeilen) wird gelesen", r.status_code == 409, r.get_json())
+r = c.get("/bus/v1/feed", headers={"X-OAAP-User": "instance:t1-sub",
+                                   "X-OAAP-Source-Instance": "t1-sub"})
+ok("Feed ohne Zwilling: leer, kein Fehler", r.status_code == 200 and r.get_json()["events"] == [])
+r = c.get("/bus/v1/feed?limit=x", headers={"X-OAAP-User": "instance:t1-sub",
+                                           "X-OAAP-Source-Instance": "t1-sub"})
+ok("Feed: limit keine Zahl -> 400", r.status_code == 400)
+
+print("\n=== Der Knoten (appctl) ===")
+import appctl as a                                             # noqa: E402
+ok("appctl liest dieselbe Datei wie der Zwilling", a.bus_model.declaration is not None
+   and a.bus_model.__file__.endswith(os.path.join("twin", "bus_model.py")))
+import inspect                                                 # noqa: E402
+ok("validate_manifest prueft den Block schon ohne Paket (Schemas als leeres Objekt)",
+   "bus_model.declaration(m" in inspect.getsource(a.validate_manifest))
+pkg = tempfile.mkdtemp(prefix="oaap-events-pkg-")
+os.makedirs(os.path.join(pkg, "events"))
+open(os.path.join(pkg, "events", "s.json"), "wb").write(FILES["events/s.json"])
+got = a.events_declared(manifest({"publishes": [PUB]}), pkg)
+ok("events_declared liest das Schema aus dem Paket", got["publishes"][0]["schema"] == SCHEMA)
+try:
+    a.events_declared(manifest({"publishes": [dict(PUB, schema="events/x.json")]}), pkg)
+    ok("events_declared: fehlendes Schema bricht ab", False)
+except SystemExit:
+    ok("events_declared: fehlendes Schema bricht die Installation ab", True)
+a.is_rehearsal = lambda inst: bool((inst or {}).get("rehearsal"))
+reg = {"instances": {
+    "t1-pub": {"tenant": "T1", "app_id": "probe-pub", "version": "0.1.0", "events": got},
+    "t1-old": {"tenant": "T1", "app_id": "old", "version": "1.0.0"},
+    "t1-reh": {"tenant": "T1", "app_id": "probe-pub", "version": "0.1.0", "events": got,
+               "rehearsal": {"of": "t1-pub"}}}}
+os.makedirs(a.APPS_DIR, exist_ok=True)
+a.events_catalog_write(reg)
+catw = json.load(open(a.EVENTS_CATALOG))
+ok("Katalog: nur Instanzen mit Block, nie eine Generalprobe",
+   set(catw["instances"]) == {"t1-pub"} and catw["instances"]["t1-pub"]["tenant"] == "T1")
+ok("Katalog ist lesbar wie die Registry (0644, keine Geheimnisse)",
+   os.name == "nt" or (os.stat(a.EVENTS_CATALOG).st_mode & 0o777) == 0o644)
+ok("OAAP_EVENTS_KEY ist ein Instanzschluessel (folgt der Instanz, RFC-0062)",
+   "OAAP_EVENTS_KEY" in a.INSTANCE_KEY_VARS and "OAAP_EVENTS_KEY" in a.RESERVED_ENV
+   and "OAAP_EVENTS_URL" in a.RESERVED_ENV)
+ok("Scope und Adresse", a.events_scope("t1-pub") == "oaap.events:t1-pub"
+   and a.events_url(8123) == "http://gateway:8123/platform/events"
+   or a.events_url(8123).endswith(":8123/platform/events"))
+ok("Gateway-Zeilen bekommen eine neue Formatnummer (Seiten werden neu geschrieben)",
+   a.CASES_BLOCK_FORMAT >= 10)
+src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+door = src[src.index("if events_wanted(me) and not login_only"):src.index("# RFC-0069 stage 2: on a `vorgaenge` site only")]
+ok("die Tuer fragt identity nach genau diesem Scope, ohne Rollen, und reicht an twin:8000",
+   "events_scope(scope" in door and "/verify?roles=" in door and "reverse_proxy twin:8000" in door
+   and "rewrite * /bus/v1{uri}" in door and "SOURCE_HEADERS" in door)
+ok("... in `route`, damit forward_auth vor dem Umschreiben fragt", '"\\t\\troute {"' in door)
+
+print()
+print("all events-bus checks passed" if not fails else f"{fails} check(s) FAILED")
+sys.exit(1 if fails else 0)
