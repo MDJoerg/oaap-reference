@@ -82,6 +82,64 @@ w = bm.pending_conditions([], [ACT], "s")
 ok("Feed/Push: adressierte Plattformereignisse erreichen die erklaerende Instanz",
    "oaapto = %s AND type = ANY(%s)" in w[0] and w[1][0] == "s")
 
+print("\n=== Zwilling im Umschlag (Stufe 2.2, D10) ===")
+TC, TX, TR, TS = ("oaap.twin.object.created.v1", "oaap.twin.object.changed.v1",
+                  "oaap.twin.object.retired.v1", "oaap.twin.object.statuschanged.v1")
+ok("vier Zwilling-Typen, Herausgeber twin, Publikum tenant, Schemas im Teilumfang",
+   all(bm.PLATFORM_TYPES[t]["publisher"] == "twin" and bm.PLATFORM_TYPES[t]["audience"] == "tenant"
+       and bm.schema_error(bm.PLATFORM_TYPES[t]["schema"]) == "" for t in (TC, TX, TR, TS)))
+O = "6f1c2d3e-0000-4000-8000-000000000001"
+row = {"kind": "object.created", "object_id": O, "group_key": "", "origin": "app:bestand"}
+t, subj, data = bm.twin_event(row, "bundle")
+ok("object.created -> created, subject die Objekt-URN, data type+origin",
+   t == TC and subj == "urn:oaap:obj:" + O and data == {"type": "bundle", "origin": "app:bestand"}, data)
+t, _s, data = bm.twin_event(dict(row, kind="group.written", group_key="stock"), "bundle")
+ok("group.written -> changed mit group und change", t == TX
+   and data == {"type": "bundle", "group": "stock", "origin": "app:bestand", "change": "group.written"}, data)
+for k in ("period.written", "object.renamed", "object.merged", "object.unmerged"):
+    ok(f"{k} -> changed", bm.twin_event(dict(row, kind=k), "bundle")[0] == TX)
+ok("object.retired -> retired", bm.twin_event(dict(row, kind="object.retired"), "bundle")[0] == TR)
+t, _s, data = bm.twin_event(dict(row, kind="status.changed"), "bundle", {"from": "open", "to": "done"})
+ok("status.changed -> statuschanged mit from/to (ohne Begruendung)", t == TS
+   and data["from"] == "open" and data["to"] == "done" and "reason" not in data, data)
+ok("type.created, ohne Objekt, ohne Typ, unbekannte Art -> kein Ereignis",
+   bm.twin_event(dict(row, kind="type.created"), "bundle") is None
+   and bm.twin_event(dict(row, object_id=None), "bundle") is None
+   and bm.twin_event(row, None) is None and bm.twin_event(dict(row, kind="x.y"), "bundle") is None)
+for k in ("object.created", "group.written", "object.retired", "status.changed", "object.merged"):
+    ev = bm.twin_event(dict(row, kind=k, group_key="stock"), "bundle", {"from": None, "to": "x"})
+    bad = bm.validate(ev[2], bm.PLATFORM_TYPES[ev[0]]["schema"])
+    ok(f"{k}: data besteht das eigene Schema", bad is None, bad)
+env = bm.envelope({"id": "01Z", "type": TC, "source_instance": "platform:twin", "subject": "urn:oaap:obj:" + O,
+                   "time": "2026-11-24T10:00:00.000Z", "data": {"type": "bundle", "origin": "app:bestand"},
+                   "semantic": "oaap-aas:Bundle/1/0"}, "T1", "platform")
+ok("Umschlag: source twin, oaaporigin = Herkunft wie der Zwilling sie nennt, Semantik",
+   env["source"] == "urn:oaap:tenant:T1:twin" and env["oaaporigin"] == "app:bestand"
+   and env["oaapsemantic"] == "oaap-aas:Bundle/1/0" and "oaapto" not in env, env)
+cat2 = {"instances": {"s": {"tenant": "T1", "app_id": "probe-sub", "subscribes": [{"type": TC}]}}}
+ok("Freigabe fuer einen Zwilling-Typ moeglich (kein Herausgeber unter den Instanzen noetig)",
+   bm.grant_error(cat2, "T1", "s", TC) == "")
+ok("... aber nur fuer eine Instanz, die ihn erklaert", "does not declare" in bm.grant_error(cat2, "T1", "s", TX))
+ok("eine App darf nicht unter oaap.twin. veroeffentlichen",
+   "platform's namespace" in bm.own_type_error(TC, "probe-sub"))
+import relay                                                    # noqa: E402
+done = [(dict(row, id=1, type_key="bundle"), "t", None, None),
+        (dict(row, id=2, kind="status.changed", type_key="bundle"), "t/status",
+         None, json.dumps({"status": {"from": "a", "to": "b", "reason": "geheim"}}).encode()),
+        (dict(row, id=3, kind="type.created", object_id=None, type_key=None), None, None, None),
+        (dict(row, id=4, kind="object.retired", type_key="bundle"), "t", None, None)]
+br = relay.bus_rows(done, {TC, TS})
+ok("Relais: nur freigegebene Typen kopiert, Status mit from/to aus der Nachricht, ohne reason",
+   [(b[1], b[4]["id"]) for b in br] == [(TC, 1), (TS, 2)] and br[1][3]["to"] == "b"
+   and "reason" not in br[1][3], [(b[1], b[4]["id"]) for b in br])
+ok("Relais: ohne Freigabe nichts", relay.bus_rows(done, set()) == [])
+rs = inspect.getsource(relay.relay_tenant)
+i_ins, i_wm = rs.find("INSERT INTO bus_events"), rs.find("UPDATE relay_watermark SET last_event_id")
+ok("Relais: Kopie und Wasserstand in EINER Transaktion, Kopie vor dem Wasserstand (genau einmal)",
+   0 < i_ins < i_wm and "'platform:twin'" in rs)
+ok("Relais: Freigaben werden nur gelesen, wenn etwas veroeffentlicht wurde",
+   rs.find("granted_twin_types(conn)") > rs.find("done = plan[:stop]"))
+
 print("\n=== Die interne Tuer im Zwilling ===")
 try:
     from flask import Flask

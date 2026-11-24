@@ -398,6 +398,9 @@ def envelope(row, tenant, app_id, semantic=None):
     si = row["source_instance"]
     if si.startswith("platform:"):
         src, origin = f"urn:oaap:tenant:{tenant}:{si[9:]}", si
+        # the twin's events carry the origin as the twin names it (RFC-0127 §3)
+        if si == "platform:twin" and isinstance(row.get("data"), dict)                 and row["data"].get("origin"):
+            origin = row["data"]["origin"]
         schema = dataschema("platform", row["type"])
     else:
         src, origin = source(tenant, si), f"app:{app_id}"
@@ -445,8 +448,63 @@ PLATFORM_TYPES = {
         "schema": {"type": "object", "properties": dict(_PERSON, by=_BY),
                    "required": ["user_id", "by"], "additionalProperties": False}},
 }
+# RFC-0127 D10, step 2.2: the twin in the envelope. Audience `tenant`: an
+# app holds a grant from the tenant admin like for any other type. The relay
+# copies a twin event into the store only while some instance of the tenant
+# holds a live grant for its type (Jörg, 2026-11-24) -- the twin's own
+# journal stays the record, the store is not a second copy of it.
+_OBJ = {"type": {"type": "string", "maxLength": 120},
+        "group": {"type": "string", "maxLength": 120},
+        "origin": {"type": "string", "maxLength": 200}}
+_CHANGES = ["group.written", "period.written", "object.renamed",
+            "object.merged", "object.unmerged"]
+
+
+def _twin_type(what, title, props, required=("type",)):
+    return {"publisher": "twin", "audience": "tenant", "subject": "object",
+            "title": title, "semantic_id": f"urn:oaap:concept:twin:object:{what}",
+            "schema": {"type": "object", "properties": props,
+                       "required": list(required), "additionalProperties": False}}
+
+
+PLATFORM_TYPES.update({
+    "oaap.twin.object.created.v1": _twin_type("created", "Objekt im Zwilling angelegt", dict(_OBJ)),
+    "oaap.twin.object.changed.v1": _twin_type(
+        "changed", "Objekt im Zwilling geändert",
+        dict(_OBJ, change={"type": "string", "enum": _CHANGES}), ("type", "change")),
+    "oaap.twin.object.retired.v1": _twin_type("retired", "Objekt im Zwilling stillgelegt", dict(_OBJ)),
+    "oaap.twin.object.statuschanged.v1": _twin_type(
+        "statuschanged", "Status eines Objekts im Zwilling gewechselt",
+        dict(_OBJ, **{"from": {"type": ["string", "null"], "maxLength": 80},
+                      "to": {"type": "string", "maxLength": 80}}), ("type", "to")),
+})
 for _t, _p in PLATFORM_TYPES.items():
     _p.update(type=_t, listed=[], personal=False)
+
+_TWIN_KIND = {"object.created": "oaap.twin.object.created.v1",
+              "object.retired": "oaap.twin.object.retired.v1",
+              "status.changed": "oaap.twin.object.statuschanged.v1"}
+_TWIN_KIND.update({k: "oaap.twin.object.changed.v1" for k in _CHANGES})
+
+
+def twin_event(row, type_key, status=None):
+    """(type, subject, data) for one row of the twin's `events` table with
+    its object's type key, or None when it has no event: `type.created`,
+    no object, an unknown kind. `status` = {from, to} for status.changed."""
+    t = _TWIN_KIND.get(row.get("kind"))
+    if t is None or not row.get("object_id") or not type_key:
+        return None
+    data = {"type": type_key}
+    if row.get("group_key"):
+        data["group"] = row["group_key"]
+    if row.get("origin"):
+        data["origin"] = row["origin"]
+    if t.endswith(".changed.v1"):
+        data["change"] = row["kind"]
+    if t.endswith(".statuschanged.v1"):
+        st = status or {}
+        data["from"], data["to"] = st.get("from"), st.get("to") or ""
+    return t, f"urn:oaap:obj:{row['object_id']}", data
 
 
 def check_platform_publish(body):
@@ -490,6 +548,8 @@ def grant_error(catalogue, tenant, instance, t):
         return f"'{instance}' does not declare {t} under events.subscribes"
     if (PLATFORM_TYPES.get(t) or {}).get("audience") == "addressed":
         return f"{t} is addressed: it reaches only the instance it names, no grant needed"
+    if (PLATFORM_TYPES.get(t) or {}).get("audience") == "tenant":
+        return ""
     pubs =[(n, e, find_type(e, t)) for n, e in insts.items()
             if e.get("tenant") == tenant and find_type(e, t)]
     if not pubs:

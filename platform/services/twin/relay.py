@@ -54,6 +54,15 @@ Deliberately not done, named rather than hidden:
     its batch is followed at once by the next. Every tenant still gets at
     most BATCH rows per pass, so a quiet tenant's event waits one pass at
     most, never behind another tenant's whole backlog.
+
+The twin in the envelope (RFC-0127 D10, step 2.2, oaap.events.bus 0.5):
+in the same transaction that moves the watermark, each published row
+whose type some instance of the tenant holds a live grant for is written
+into the tenant's event store as `oaap.twin.object.*.v1` (bus_model.
+twin_event). Only while granted (Jörg, 2026-11-24): the twin's journal is
+the record; the store carries what somebody listens to. Exactly once per
+row, since the copy and the watermark commit together. The MQTT payload
+on the twin's topics stays as it is for its readers (the fleet views).
 """
 import json
 import os
@@ -61,6 +70,8 @@ import re
 import signal
 import sys
 import time
+
+import bus_model as bm
 
 PLATFORM_APPS_DIR = "/platform-apps"
 SECRETS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-secrets.json")
@@ -290,6 +301,57 @@ def _record(conn, error):
                         "last_error = %s WHERE id = 1", (error,))
 
 
+def granted_twin_types(conn):
+    """The twin types some instance of this tenant holds a live grant for
+    (empty in a schema from before the bus tables)."""
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('bus_grants') IS NOT NULL AS ok")
+            r = cur.fetchone()
+            if not r or not r.get("ok"):
+                return set()
+            cur.execute("SELECT DISTINCT type FROM bus_grants WHERE revoked_at IS NULL "
+                        "AND type LIKE 'oaap.twin.%'")
+            return {r["type"] for r in cur.fetchall()}
+
+
+def semantic_of(conn, keys, cache):
+    """The semantic ID of the first key (group, then object type) whose
+    definition in the model registry names one; None otherwise. A registry
+    that cannot be read costs the attribute, never the event."""
+    for k in keys:
+        if not k:
+            continue
+        if k not in cache:
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT definition::jsonb ->> 'semantic_id' AS s "
+                                    "FROM oaap_model.type_definitions WHERE key = %s LIMIT 1",
+                                    (k,))
+                        r = cur.fetchone()
+                cache[k] = (r or {}).get("s")
+            except Exception:  # noqa: BLE001
+                cache[k] = None
+        if cache[k]:
+            return cache[k]
+    return None
+
+
+def bus_rows(done, granted):
+    """[(id, type, subject, data, row)] for the published rows to copy
+    into the store (pure; tested)."""
+    out = []
+    for row, _topic, _payload, msg in done:
+        st = None
+        if row.get("kind") == "status.changed" and msg:
+            st = json.loads(msg).get("status")
+        ev = bm.twin_event(row, row.get("type_key"), st)
+        if ev and ev[0] in granted:
+            out.append((bm.ulid(), ev[0], ev[1], ev[2], row))
+    return out
+
+
 def relay_tenant(conn, tenant_id, client, acks, problem):
     """Publish this tenant's rows past its watermark, at most BATCH, in
     order. Returns (problem, full): the problem that stopped it (or the
@@ -339,7 +401,13 @@ def relay_tenant(conn, tenant_id, client, acks, problem):
     # a topic in between included (they publish nothing, §1.1).
     stop = sendable[n_ok] if n_ok < len(sendable) else len(plan)
     done = plan[:stop]
+    copies = []
     if done:
+        granted = granted_twin_types(conn)
+        if granted:
+            cache = {}
+            copies = [(c, semantic_of(conn, (c[4].get("group_key"), c[4].get("type_key")), cache))
+                      for c in bus_rows(done, granted)]
         with conn:
             with conn.cursor() as cur:
                 for row, _topic, payload, _m in done:
@@ -350,6 +418,11 @@ def relay_tenant(conn, tenant_id, client, acks, problem):
                             "ON CONFLICT (event_id) DO NOTHING",
                             (row["id"], row["object_id"], row["group_key"],
                              json.dumps(payload)))
+                for (eid, typ, subj, data, _row), sem in copies:
+                    cur.execute(
+                        "INSERT INTO bus_events (id, type, source_instance, source_app, "
+                        "subject, data, semantic) VALUES (%s, %s, 'platform:twin', "
+                        "'platform', %s, %s, %s)", (eid, typ, subj, json.dumps(data), sem))
                 last = done[-1][0]["id"]
                 cur.execute(
                     "UPDATE relay_watermark SET last_event_id = %s, "
