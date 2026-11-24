@@ -41,7 +41,19 @@ Deliberately not done, named rather than hidden:
   wording -- not the value at the time of the event. The twin's
   append-only tables keep that history; `states` is not a copy of it.
 - It polls every RELAY_POLL_SECONDS instead of LISTEN/NOTIFY -- right at
-  this scale, revisited only if it becomes a cost.
+  this scale, revisited only if it becomes a cost. **It became one**
+  (RFC-0127 §1.6, measured 2026-11-24: about 60 rows a second for one
+  tenant, 41 each for two; a burst arrived minutes late). Since 0.1.365
+  (RFC-0127 step 1.6, oaap.data.twin 0.16.1 §2.13):
+  * a batch is published without waiting for each PUBACK -- all of it
+    goes out, then the relay waits for all confirmations (paho keeps at
+    most the broker's receive maximum in flight); the watermark and the
+    `states` rows move in ONE transaction to the last row confirmed in
+    order, so a refusal still stops the tenant at exactly that row;
+  * no sleep while a backlog remains: a pass in which any tenant filled
+    its batch is followed at once by the next. Every tenant still gets at
+    most BATCH rows per pass, so a quiet tenant's event waits one pass at
+    most, never behind another tenant's whole backlog.
 """
 import json
 import os
@@ -70,6 +82,8 @@ BATCH = 200
 # (relay_view.RELAY_STALE_SECONDS, several heartbeats), never after one.
 HEARTBEAT_SECONDS = 60
 PUBLISH_TIMEOUT = 10
+# 0.1.365: a whole batch waits at most this long for its confirmations.
+BATCH_TIMEOUT = 30
 # A broker that has not answered this long after start counts as a
 # problem; before that it is merely still connecting.
 CONNECT_GRACE_SECONDS = 15
@@ -199,6 +213,40 @@ def make_client(link):
     return c, acks
 
 
+def publish_batch(client, acks, items, timeout=BATCH_TIMEOUT):
+    """Publish [(topic, payload)] retained, QoS 1, without waiting between
+    them; then wait for every confirmation. Returns (n, error): the number
+    of leading items the broker confirmed IN ORDER, and why it stopped
+    there (None when all went through). What follows a failure may have
+    been published too -- harmless, it is published again (§1.5)."""
+    infos = []
+    for topic, payload in items:
+        try:
+            info = client.publish(topic, payload, qos=1, retain=True)
+        except (RuntimeError, ValueError) as e:
+            infos.append((topic, None, f"Broker nicht erreichbar ({e})"))
+            break
+        if info.rc != 0:
+            infos.append((topic, None, f"Broker nicht erreichbar (rc={info.rc})"))
+            break
+        infos.append((topic, info, None))
+    deadline = time.time() + timeout
+    for i, (topic, info, err) in enumerate(infos):
+        if err:
+            return i, err
+        try:
+            info.wait_for_publish(timeout=max(0.1, deadline - time.time()))
+        except (RuntimeError, ValueError) as e:
+            return i, f"Broker nicht erreichbar ({e})"
+        if not info.is_published():
+            return i, (f"der Broker hat die Veröffentlichung nicht binnen "
+                       f"{timeout} s bestätigt")
+        rc = acks.pop(info.mid, None)
+        if rc is not None and rc.is_failure:
+            return i, f"der Broker verweigert '{topic}' ({rc})"
+    return len(infos), None
+
+
 def publish(client, acks, topic, payload):
     try:
         info = client.publish(topic, payload, qos=1, retain=True)
@@ -243,18 +291,22 @@ def _record(conn, error):
 
 
 def relay_tenant(conn, tenant_id, client, acks, problem):
-    """Publish everything past this tenant's watermark, in order, until
-    done, a batch is full, or the broker says no. Returns the problem
-    that stopped it (or the one it was handed), None when all is well."""
+    """Publish this tenant's rows past its watermark, at most BATCH, in
+    order. Returns (problem, full): the problem that stopped it (or the
+    one it was handed), None when all is well; and whether the batch was
+    full -- a backlog remains, the next pass comes at once (0.1.365)."""
     with conn:
         with conn.cursor() as cur:
             cur.execute("SELECT last_event_id FROM relay_watermark WHERE id = 1")
             wm = cur.fetchone()
     if wm is None:
         return ("Relais-Tabellen fehlen in diesem Mandanten -- "
-                "'sudo oaap data store migrate-twin'")
+                "'sudo oaap data store migrate-twin'"), False
     if problem:
-        return problem
+        return problem, False
+    # One read transaction for the rows AND their snapshots: the snapshot
+    # is the group's value when the relay READ it (RFC-0032 §1.4).
+    plan = []
     with conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -264,41 +316,48 @@ def relay_tenant(conn, tenant_id, client, acks, problem):
                 "WHERE e.id > %s ORDER BY e.id LIMIT %s",
                 (wm["last_event_id"], BATCH))
             rows = cur.fetchall()
-    for row in rows:
-        topic = topic_for(tenant_id, row["type_key"], row["object_id"],
-                          row["group_key"])
-        payload = None
-        if wants_state(row, topic):
-            with conn:
-                with conn.cursor() as cur:
+            for row in rows:
+                topic = topic_for(tenant_id, row["type_key"], row["object_id"],
+                                  row["group_key"])
+                payload = None
+                if wants_state(row, topic):
                     cur.execute(
                         "SELECT attr_key, value, valid_from, valid_to "
                         "FROM current_attributes WHERE object_id = %s "
                         "AND group_key = %s ORDER BY attr_key",
                         (row["object_id"], row["group_key"]))
                     payload = snapshot_payload(cur.fetchall())
-        message = None
+                plan.append([row, topic, payload, None])
+    for item in plan:
+        row, topic = item[0], item[1]
         if topic and row["kind"] == "status.changed":
-            topic, message = topic + "/status", status_message(conn, row)
-        if topic:
-            try:
-                publish(client, acks, topic, message or message_for(row))
-            except PublishFailed as e:
-                return str(e)
+            item[1], item[3] = topic + "/status", status_message(conn, row)
+    sendable = [i for i, (row, topic, _p, _m) in enumerate(plan) if topic]
+    n_ok, err = publish_batch(client, acks, [
+        (plan[i][1], plan[i][3] or message_for(plan[i][0])) for i in sendable])
+    # Everything before the first unconfirmed publish is done -- rows without
+    # a topic in between included (they publish nothing, §1.1).
+    stop = sendable[n_ok] if n_ok < len(sendable) else len(plan)
+    done = plan[:stop]
+    if done:
         with conn:
             with conn.cursor() as cur:
-                if payload is not None:
-                    cur.execute(
-                        "INSERT INTO states (event_id, object_id, group_key, "
-                        "payload) VALUES (%s, %s, %s, %s::jsonb) "
-                        "ON CONFLICT (event_id) DO NOTHING",
-                        (row["id"], row["object_id"], row["group_key"],
-                         json.dumps(payload)))
+                for row, _topic, payload, _m in done:
+                    if payload is not None:
+                        cur.execute(
+                            "INSERT INTO states (event_id, object_id, group_key, "
+                            "payload) VALUES (%s, %s, %s, %s::jsonb) "
+                            "ON CONFLICT (event_id) DO NOTHING",
+                            (row["id"], row["object_id"], row["group_key"],
+                             json.dumps(payload)))
+                last = done[-1][0]["id"]
                 cur.execute(
                     "UPDATE relay_watermark SET last_event_id = %s, "
                     "updated_at = now(), checked_at = now(), last_error = NULL "
-                    "WHERE id = 1 AND last_event_id < %s", (row["id"], row["id"]))
-    return None
+                    "WHERE id = 1 AND last_event_id < %s", (last, last))
+    if err:
+        return err, False
+    return None, len(rows) >= BATCH
 
 
 def main():
@@ -326,12 +385,14 @@ def main():
             problem = link["error"] or "Broker nicht erreichbar"
         else:
             problem = None
+        backlog = False
         for tenant_id, schema, creds in tenant_schemas(load_secrets()):
             try:
                 if schema not in conns:
                     conns[schema] = connect(schema, creds)
                 conn = conns[schema]
-                result = relay_tenant(conn, tenant_id, client, acks, problem)
+                result, full = relay_tenant(conn, tenant_id, client, acks, problem)
+                backlog = backlog or full
                 # Write the verdict when it CHANGES, and otherwise once a
                 # heartbeat -- not on every poll, which would be a row
                 # update every few seconds per tenant for nothing.
@@ -353,7 +414,9 @@ def main():
                         old.close()
                     except Exception:
                         pass
-        time.sleep(POLL_SECONDS)
+        # 0.1.365: no sleep while a backlog remains (RFC-0127 §1.6)
+        if not backlog:
+            time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":

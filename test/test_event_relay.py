@@ -136,15 +136,15 @@ ok("publish wartet auf die Bestaetigung UND prueft deren Fehlercode",
    and "qos=1" in pub)
 
 rt = fn_body(relay_src, "relay_tenant")
-i_pub = rt.find("publish(client")
+i_pub = rt.find("publish_batch(client")
 i_ins = rt.find("INSERT INTO states")
 i_upd = rt.find("SET last_event_id")
-ok("Reihenfolge: erst veroeffentlichen, dann Schnappschuss, dann Wasserstand",
+ok("Reihenfolge: erst veroeffentlichen (der ganze Stapel), dann Schnappschuss, dann Wasserstand",
    0 < i_pub < i_ins < i_upd, (i_pub, i_ins, i_upd))
 ok("Schnappschuss und Wasserstand in DERSELBEN Transaktion (kein 'with conn:' dazwischen)",
    "with conn:" not in rt[i_ins:i_upd])
-ok("scheitert die Veroeffentlichung, bleibt der Wasserstand stehen (return vor dem Schreiben)",
-   "except PublishFailed" in rt[i_pub:i_ins] and "return" in rt[i_pub:i_ins])
+ok("geschrieben wird nur bis zur letzten in Reihenfolge bestaetigten Zeile",
+   "done = plan[:stop]" in rt[i_pub:i_ins] and "sendable[n_ok]" in rt[i_pub:i_ins])
 ok("ein zweites Veroeffentlichen derselben Zeile schreibt keinen zweiten Schnappschuss",
    "ON CONFLICT (event_id) DO NOTHING" in rt)
 ok("der Wasserstand geht nur vorwaerts",
@@ -334,6 +334,125 @@ if flask is not None:
        getuser("oaap.relay", "")["Ok"] is False)
     ok("ohne BROKER_RELAY_KEY: auch keine Themen-Freigabe",
        acl("oaap.relay", good, 2)["Ok"] is False)
+
+# ---------------------------------------------- 0.1.365: Stapel, keine Pause
+print("\n=== relay.py 0.1.365: Stapel ohne Einzelwarten, keine Pause bei Rueckstau (RFC-0127 1.6) ===")
+
+
+class _Info:
+    def __init__(self, mid, ok=True):
+        self.mid, self.rc, self._ok = mid, 0, ok
+
+    def wait_for_publish(self, timeout=None):
+        pass
+
+    def is_published(self):
+        return self._ok
+
+
+class _RC:
+    def __init__(self, bad):
+        self.is_failure = bad
+
+    def __str__(self):
+        return "Not authorized" if self.is_failure else "Success"
+
+
+class FakeClient:
+    """Veroeffentlicht alles sofort; `refuse` = Index, den der Broker ablehnt."""
+    def __init__(self, acks, refuse=None):
+        self.acks, self.refuse, self.sent, self.mid = acks, refuse, [], 0
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.mid += 1
+        self.acks[self.mid] = _RC(self.refuse is not None and len(self.sent) == self.refuse)
+        self.sent.append((topic, qos, retain))
+        return _Info(self.mid)
+
+
+class FakeCur:
+    def __init__(self, db):
+        self.db, self._r = db, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args=()):
+        q = " ".join(sql.split())
+        self.db["sql"].append(q)
+        if q.startswith("SELECT last_event_id"):
+            self._r = [{"last_event_id": self.db["wm"]}]
+        elif q.startswith("SELECT e.id"):
+            self._r = [r for r in self.db["events"] if r["id"] > args[0]][:args[1]]
+        elif q.startswith("SELECT attr_key"):
+            self._r = [{"attr_key": "a", "value": "1", "valid_from": None, "valid_to": None}]
+        elif q.startswith("INSERT INTO states"):
+            self.db["states"].append(args[0])
+        elif q.startswith("UPDATE relay_watermark SET last_event_id"):
+            self.db["wm"] = max(self.db["wm"], args[0])
+            self.db["commits"] += 1
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+    def fetchall(self):
+        return self._r
+
+
+class FakeConn:
+    def __init__(self, db):
+        self.db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def cursor(self):
+        return FakeCur(self.db)
+
+
+TEN = "11111111-2222-3333-4444-555555555555"
+
+
+def ev(i, group="crm.core"):
+    return {"id": i, "recorded_at": None, "kind": "group.written",
+            "object_id": f"00000000-0000-0000-0000-{i:012d}", "group_key": group,
+            "origin": "app:x", "type_key": "Firma"}
+
+
+db = {"wm": 0, "events": [ev(i) for i in range(1, 6)] + [dict(ev(6), object_id=None, type_key=None)],
+      "states": [], "sql": [], "commits": 0}
+acks = {}
+cl = FakeClient(acks)
+res, full = relay.relay_tenant(FakeConn(db), TEN, cl, acks, None)
+ok("alle bestaetigt: alle veroeffentlicht (QoS 1, gehalten), Wasserstand am Ende, EIN Commit",
+   res is None and len(cl.sent) == 5 and all(q == 1 and r for _t, q, r in cl.sent)
+   and db["wm"] == 6 and db["commits"] == 1 and db["states"] == [1, 2, 3, 4, 5], (res, db["wm"], db["commits"]))
+ok("kein voller Stapel -> kein Rueckstau gemeldet", full is False)
+
+db = {"wm": 0, "events": [ev(i) for i in range(1, 6)], "states": [], "sql": [], "commits": 0}
+acks = {}
+cl = FakeClient(acks, refuse=2)
+res, full = relay.relay_tenant(FakeConn(db), TEN, cl, acks, None)
+ok("der Broker lehnt die dritte ab: Wasserstand und Schnappschuesse genau bis zur zweiten",
+   res and "verweigert" in res and db["wm"] == 2 and db["states"] == [1, 2], (res, db))
+
+old_batch = relay.BATCH
+relay.BATCH = 3
+db = {"wm": 0, "events": [ev(i) for i in range(1, 8)], "states": [], "sql": [], "commits": 0}
+acks = {}
+res, full = relay.relay_tenant(FakeConn(db), TEN, FakeClient(acks), acks, None)
+ok("voller Stapel -> Rueckstau gemeldet, hoechstens BATCH Zeilen je Durchgang",
+   res is None and full is True and db["wm"] == 3)
+relay.BATCH = old_batch
+main_src = fn_body(relay_src, "main")
+ok("main schlaeft nur, wenn kein Mandant einen vollen Stapel hatte",
+   "if not backlog:" in main_src and "time.sleep(POLL_SECONDS)" in main_src.split("if not backlog:")[1])
 
 # ------------------------------------------------------------------- twin
 print("\n=== twin: /internal/twin/outbox ===")
