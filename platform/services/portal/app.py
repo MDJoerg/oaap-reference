@@ -13013,11 +13013,14 @@ EVENTS_BODY = """
 (oaap.events.bus, RFC-0127). Ein Abonnement liefert erst, wenn Sie es hier
 freigeben; adressierte Ereignisse gehen nur an die genannte App und brauchen
 keine Freigabe. Jede Freigabe, jeder Widerruf steht im Protokoll.</p>
+<p><a class="rowaction" href="/ereignisse/asyncapi.json">AsyncAPI des Mandanten herunterladen</a>
+<span class="muted">(AsyncAPI 3.1.0, für Werkzeuge und Partner)</span></p>
 {% if not store %}<div class="card warn"><p>Dieser Mandant hat noch keinen
 Ereignisspeicher. Er entsteht mit der ersten App, die Ereignisse erklärt.</p></div>{% endif %}
 {% for i in instances %}
 <div class="card">
   <h2>{{ i.instance }} <span class="muted">({{ i.app_id }} {{ i.version }})</span></h2>
+  <p><a class="rowaction" href="/ereignisse/{{ i.instance }}/asyncapi.json">AsyncAPI dieser App</a></p>
   {% if i.push %}
   <p>Zustellung an <code>{{ i.push.endpoint }}</code>:
   {% if not i.push.started %}<span class="badge todo">noch nicht gestartet</span>
@@ -13105,6 +13108,29 @@ def events_page():
     except requests.RequestException as e:
         ctx["error"] = f"Der Zwilling antwortet nicht ({type(e).__name__})."
     return page(EVENTS_BODY, "Ereignisse", "events", **ctx)
+
+
+@app.get("/ereignisse/asyncapi.json")
+@app.get("/ereignisse/<instance>/asyncapi.json")
+def events_asyncapi(instance=None):
+    """AsyncAPI 3.1.0 of the tenant or of one instance (oaap.events.bus 0.7),
+    as a download."""
+    denied = require_events_admin()
+    if denied:
+        return denied
+    params = {"label": tenant_label(caller_scope()[1])}
+    if instance:
+        params["instance"] = instance
+    try:
+        r = _twin_call("GET", "/internal/bus/asyncapi", params=params)
+    except requests.RequestException as e:
+        return f"Der Zwilling antwortet nicht ({type(e).__name__}).", 502
+    if r.status_code != 200:
+        return r.text, r.status_code
+    name = f"asyncapi-{instance or params['label'] or 'mandant'}.json"
+    return app.response_class(json.dumps(r.json(), ensure_ascii=False, indent=2),
+                              mimetype="application/json",
+                              headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.post("/ereignisse/<action>")

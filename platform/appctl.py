@@ -18393,6 +18393,23 @@ def cmd_events(args):
                            else "waiting for a grant")
                 print(f"  wants      {sb['type']}  -- {state}  ({sb['why']})")
         return
+    if args.action == "asyncapi":
+        # oaap.events.bus 0.7: the AsyncAPI 3.1.0 document of a tenant, or of
+        # one instance, on stdout (read-only)
+        if args.instance:
+            key, err = resolve_instance_ref(reg, args.instance, args.tenant or "")
+            if err:
+                die(err)
+            tid = _instance_tenant_id(reg["instances"][key])
+        else:
+            key, tid = None, resolve_tenant_arg(args.tenant)
+            if not tid:
+                die("usage: oaap events asyncapi [<instance>] --tenant <label>")
+        doc =bus_model.asyncapi(cat, reg, tid, key, (load_tenants().get(tid) or {}).get("label", ""))
+        if doc is None:
+            die(f"'{key}' declares no events block")
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
+        return
     if args.action == "resume":
         if not args.instance:
             die("usage: oaap events resume <instance>")
@@ -41906,7 +41923,7 @@ def build_parser():
     pcoh.set_defaults(fn=cmd_cohort)
     pev = sub.add_parser("events", help="events between apps (oaap.events.bus, RFC-0127): "
                                         "list, grant, revoke, resume")
-    pev.add_argument("action", choices=["list", "grant", "revoke", "resume"])
+    pev.add_argument("action", choices=["list", "grant", "revoke", "resume", "asyncapi"])
     pev.add_argument("instance", nargs="?", help="grant, revoke: the receiving instance")
     pev.add_argument("type", nargs="?", help="grant, revoke: the event type")
     pev.add_argument("--tenant", default="", help="the tenant (label) the instance is in")

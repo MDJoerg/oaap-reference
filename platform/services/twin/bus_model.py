@@ -616,6 +616,139 @@ def overview(catalogue, registry, tenant, grants, deliveries):
             for t, p in sorted(PLATFORM_TYPES.items())]
     return {"instances": insts, "platform_types": plat}
 
+# ------------------------------------------------ AsyncAPI export (0.7)
+#
+# RFC-0127 D9: the catalogue outward as AsyncAPI 3.1.0 (released
+# 2026-01-31, asyncapi.com), per app and per tenant. One channel per event
+# type (its address is the type: a logical channel, the platform routes);
+# one message per type, its payload the CloudEvents envelope of §2.1 with
+# the type's schema as `data`; operations from the app's side -- `send` for
+# what it publishes (through its door), `receive` for what it wants (pushed
+# to its endpoint or read from its feed). OAAP's own facts ride as `x-oaap-*`
+# specification extensions.
+
+ASYNCAPI_VERSION = "3.1.0"
+_KEY_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _akey(t):
+    return _KEY_RE.sub("_", t)
+
+
+def _envelope_schema(t, data_schema, addressed):
+    props = {"specversion": {"const": SPECVERSION},
+             "id": {"type": "string", "description": "ULID, set by the platform"},
+             "source": {"type": "string", "description": "urn:oaap:tenant:<id>:<publisher>, set by the platform"},
+             "type": {"const": t},
+             "subject": {"type": "string", "maxLength": SUBJECT_MAX},
+             "time": {"type": "string", "format": "date-time"},
+             "datacontenttype": {"const": "application/json"},
+             "dataschema": {"type": "string"},
+             "oaaptenant": {"type": "string"},
+             "oaaporigin": {"type": "string"},
+             "oaapsemantic": {"type": "string"},
+             "data": data_schema or {"type": "object"}}
+    req = ["specversion", "id", "source", "type", "time", "data"]
+    if addressed:
+        props["oaapto"] = {"type": "string", "pattern": "^instance:[a-z0-9][a-z0-9-]{0,80}$"}
+        req.append("oaapto")
+    return {"type": "object", "properties": props, "required": req}
+
+
+def _type_index(catalogue, tenant):
+    """{type: (declaration, publisher)} of every type published in the
+    tenant: the platform's and every instance's."""
+    idx = {t: (p, "platform:" + p["publisher"]) for t, p in PLATFORM_TYPES.items()}
+    for name, e in sorted(((catalogue or {}).get("instances") or {}).items()):
+        if e.get("tenant") == tenant:
+            for p in e.get("publishes") or []:
+                idx.setdefault(p["type"], (p, "instance:" + name))
+    return idx
+
+
+def _message(t, decl, publisher):
+    decl = decl or {}
+    m = {"name": t, "title": decl.get("title") or t,
+         "contentType": "application/cloudevents+json",
+         "payload": _envelope_schema(t, decl.get("schema"), decl.get("audience") == "addressed"),
+         "x-oaap-publisher": publisher or "unknown in this tenant",
+         "x-oaap-audience": decl.get("audience", "")}
+    if decl.get("semantic_id"):
+        m["x-oaap-semantic-id"] = decl["semantic_id"]
+    if decl.get("personal"):
+        m["x-oaap-personal"] = True
+    return m
+
+
+def asyncapi(catalogue, registry, tenant, instance=None, tenant_label=""):
+    """The AsyncAPI 3.1.0 document of one instance (`instance` given) or of
+    the whole tenant, as a dict (pure; tested). None when the instance is
+    not one of the tenant's with an events block."""
+    insts = {n: e for n, e in ((catalogue or {}).get("instances") or {}).items()
+             if e.get("tenant") == tenant}
+    if instance is not None and instance not in insts:
+        return None
+    idx = _type_index(catalogue, tenant)
+    who = {instance: insts[instance]} if instance else insts
+    channels, operations, messages = {}, {}, {}
+
+    def channel(t):
+        k = _akey(t)
+        if k not in channels:
+            decl, pub = idx.get(t, (None, None))
+            messages[k] = _message(t, decl, pub)
+            channels[k] = {"address": t, "title": (decl or {}).get("title") or t,
+                           "messages": {k: {"$ref": f"#/components/messages/{k}"}}}
+        return k
+
+    for name, e in sorted(who.items()):
+        pre = "" if instance else _akey(name) + "__"
+        for p in e.get("publishes") or []:
+            k = channel(p["type"])
+            operations[f"{pre}send__{k}"] = {
+                "action": "send", "channel": {"$ref": f"#/channels/{k}"},
+                "title": f"{name} veröffentlicht",
+                "description": "POST to the instance's own door /platform/events/ "
+                               "with OAAP_EVENTS_KEY; the platform sets the envelope.",
+                "messages": [{"$ref": f"#/channels/{k}/messages/{k}"}]}
+        for sb in e.get("subscribes") or []:
+            k = channel(sb["type"])
+            op = {"action": "receive", "channel": {"$ref": f"#/channels/{k}"},
+                  "title": f"{name} empfängt", "summary": sb.get("why", ""),
+                  "description": ((f"Pushed to {e['endpoint']}, signed X-OAAP-Signature "
+                                   "(HMAC-SHA256, OAAP_EVENTS_SECRET); ")
+                                  if e.get("endpoint") else "")
+                  + "readable from /platform/events/feed. Delivered only after a grant, "
+                    "unless addressed to this instance.",
+                  "messages": [{"$ref": f"#/channels/{k}/messages/{k}"}]}
+            if sb.get("addressed_only"):
+                op["x-oaap-addressed-only"] = True
+            operations[f"{pre}receive__{k}"] = op
+    e = insts.get(instance) or {}
+    reg = ((registry or {}).get("instances") or {}).get(instance or "") or {}
+    title = (f"OAAP-Ereignisse der Instanz {instance}" if instance
+             else f"OAAP-Ereignisse des Mandanten {tenant_label or tenant}")
+    doc = {"asyncapi": ASYNCAPI_VERSION,
+           "info": {"title": title,
+                    "version": (e.get("version") or reg.get("version") or "0") if instance else "0.7",
+                    "description": "Generated by the platform from the manifests' `events` blocks "
+                                   "and the platform catalogue (oaap.events.bus, RFC-0127). "
+                                   "Every message is a CloudEvent 1.0 in the structured JSON form."},
+           "defaultContentType": "application/cloudevents+json",
+           "servers": {"platform": {
+               "host": "{site}", "protocol": "http", "pathname": "/platform/events",
+               "description": "The instance's own events door (OAAP_EVENTS_URL); "
+                              "a push arrives at the instance's declared endpoint.",
+               "variables": {"site": {"default": "gateway",
+                                      "description": "host:port of OAAP_EVENTS_URL"}}}},
+           "channels": channels, "operations": operations,
+           "components": {"messages": messages},
+           "x-oaap-tenant": tenant}
+    if instance:
+        doc["x-oaap-instance"] = instance
+        doc["x-oaap-app"] = e.get("app_id", "")
+    return doc
+
 # --------------------------------------------------- what reaches whom
 
 

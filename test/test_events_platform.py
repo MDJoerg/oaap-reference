@@ -306,6 +306,82 @@ csrc = open(os.path.join(HERE, "..", "platform", "docker-compose.yml"), encoding
 ok("der Zwilling haengt an das Mandanten-Protokoll an (Mount /audit)",
    '${OAAP_DATA_DIR}/data/audit:/audit"' in csrc.split("  twin:")[1].split("\n  hooks:")[0].split("# Webhook")[0])
 
+print("\n=== AsyncAPI-Export (Stufe 2.4) ===")
+import re as _re                                                # noqa: E402
+VG = {"tenant": "T1", "app_id": "vorgaenge", "version": "0.20.0", "subscribes": [],
+      "publishes": [{"type": "app.vorgaenge.case.statuschanged.v1", "title": "Status gewechselt",
+                     "audience": "addressed", "semantic_id": "oaap-aas:Cases/1/0/StatusChanged",
+                     "personal": False, "schema": {"type": "object", "properties": {"case": {"type": "string"}},
+                                                   "required": ["case"]}}]}
+AC = {"instances": dict(OV_CAT["instances"], vg=VG)}
+
+
+def refs(node, out):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "$ref":
+                out.append(v)
+            else:
+                refs(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            refs(v, out)
+    return out
+
+
+def resolve(doc, ref):
+    cur = doc
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+da = bm.asyncapi(AC, {}, "T1", "inv1-pp-a")
+dt = bm.asyncapi(AC, {}, "T1", None, "inv1")
+ok("App-Dokument: asyncapi 3.1.0, info mit Titel und Version der App",
+   da["asyncapi"] == "3.1.0" and da["info"]["version"] == "0.2.2" and "inv1-pp-a" in da["info"]["title"])
+ok("jeder $ref loest sich auf (App und Mandant)",
+   all(resolve(d, r) is not None for d in (da, dt) for r in refs(d, [])),
+   [r for d in (da, dt) for r in refs(d, []) if resolve(d, r) is None][:3])
+ok("Schluessel der Komponenten nach ^[a-zA-Z0-9.\\-_]+$",
+   all(_re.fullmatch(r"[a-zA-Z0-9.\-_]+", k) for d in (da, dt) for k in d["components"]["messages"]))
+ok("Server: host, protocol, Variable fuer den Host",
+   da["servers"]["platform"]["protocol"] == "http" and "site" in da["servers"]["platform"]["variables"])
+ok("App empfaengt: vier receive-Operationen, kein send (sie veroeffentlicht nichts)",
+   sorted(o["action"] for o in da["operations"].values()) == ["receive"] * 4)
+m = da["components"]["messages"][ACT]
+ok("Nachricht: CloudEvents-Umschlag, data = Schema des Typs, adressiert -> oaapto Pflicht",
+   m["contentType"] == "application/cloudevents+json" and m["payload"]["properties"]["type"] == {"const": ACT}
+   and m["payload"]["properties"]["data"] == bm.PLATFORM_TYPES[ACT]["schema"]
+   and "oaapto" in m["payload"]["required"] and m["x-oaap-publisher"] == "platform:identity")
+ok("Mandant: send von vg, receive von pp-a, Operationen nach Instanz benannt",
+   dt["operations"]["vg__send__app.vorgaenge.case.statuschanged.v1"]["action"] == "send"
+   and "inv1-pp-a__receive__" + TC in dt["operations"])
+mv = dt["components"]["messages"]["app.vorgaenge.case.statuschanged.v1"]
+ok("App-Typ: Semantik-ID und Herausgeber als x-oaap-*",
+   mv["x-oaap-semantic-id"] == "oaap-aas:Cases/1/0/StatusChanged" and mv["x-oaap-publisher"] == "instance:vg")
+ok("Mandant: keine Instanz eines anderen Mandanten", not any("fremd" in k for k in dt["operations"]))
+ok("unbekannte oder fremde Instanz -> None",
+   bm.asyncapi(AC, {}, "T1", "fremd") is None and bm.asyncapi(AC, {}, "T1", "weg") is None)
+ok("nur Plattformfelder und x-oaap-* auf oberster Ebene",
+   set(dt) <= {"asyncapi", "info", "defaultContentType", "servers", "channels", "operations",
+               "components", "x-oaap-tenant", "x-oaap-instance", "x-oaap-app"})
+r = c2.get("/internal/bus/asyncapi?instance=inv1-pp-a", headers=ADM)
+ok("Zwilling: /internal/bus/asyncapi fuer den Admin", r.status_code == 200
+   and r.get_json()["asyncapi"] == "3.1.0")
+r = c2.get("/internal/bus/asyncapi?instance=fremd", headers=ADM)
+ok("... fremde Instanz -> 404", r.status_code == 404)
+r = c2.get("/internal/bus/asyncapi", headers=dict(ADM, **{"X-OAAP-Person-Roles": "user"}))
+ok("... ohne Admin-Rolle -> 403", r.status_code == 403)
+psrc = open(os.path.join(SERVICES, "portal", "app.py"), encoding="utf-8").read()
+ok("Portal: Downloads je Mandant und je App", '@app.get("/ereignisse/asyncapi.json")' in psrc
+   and '@app.get("/ereignisse/<instance>/asyncapi.json")' in psrc and "attachment; filename=" in psrc)
+asrc = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+ok("CLI: oaap events asyncapi", '"resume", "asyncapi"]' in asrc and "bus_model.asyncapi(cat, reg, tid, key" in asrc)
+
 print("\n=== identity: Ausgang zum Bus ===")
 DATA = tempfile.mkdtemp(prefix="oaap-bus-id-")
 os.environ.update(SESSION_SECRET="s", SETUP_TOKEN="t", INTERNAL_API_KEY="k",

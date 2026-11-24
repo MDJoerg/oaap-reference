@@ -231,6 +231,22 @@ def register(app, get_conn, apps_dir):
         out["store"] = store
         return jsonify(out)
 
+    @app.get("/internal/bus/asyncapi")
+    def bus_asyncapi():
+        """The AsyncAPI 3.1.0 export (0.7): ?instance=<name> for one app,
+        none for the tenant."""
+        who, err = _page_person()
+        if who is None:
+            return jsonify(error=err[1]), err[0]
+        _user, tenant = who
+        name = request.args.get("instance") or None
+        doc = bm.asyncapi(_load(os.path.join(apps_dir, CATALOG_NAME), {}),
+                          _load(os.path.join(apps_dir, "registry.json"), {}), tenant, name,
+                          request.args.get("label", ""))
+        if doc is None:
+            return jsonify(error=f"'{name}' is not an instance of this tenant with an events block"), 404
+        return jsonify(doc)
+
     @app.post("/internal/bus/<action>")
     def bus_page_action(action):
         if action not in ("grant", "revoke", "resume"):
