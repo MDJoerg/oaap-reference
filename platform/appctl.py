@@ -18263,6 +18263,36 @@ def _events_psql(tid, sql):
     return _store_psql(sql.replace("{s}", f'"{schema}"')).stdout
 
 
+def events_follow_instance(inst, old, new=None):
+    """What the bus keeps under an instance's name follows the instance
+    (oaap.events.bus 0.3, the RFC-0062 lesson again -- measured on oaap-test
+    2026-11-24: a probe installed again under a removed probe's name found
+    its grant still live). Removal (new=None) revokes its grants and drops
+    its push cursor and its records; a rename carries all three over.
+    Never fails the caller: a tenant without a twin has nothing to follow."""
+    tid = _instance_tenant_id(inst)
+    if not tid or not re.fullmatch(r"[0-9a-f-]{36}", tid) or not _store_running() \
+            or not _twin_schema_exists(f"twin_{tid}"):
+        return
+    o = _sql_lit(old)
+    if new is None:
+        sql = ("UPDATE {s}.bus_grants SET revoked_at = now(), revoked_by = 'oaap (instance removed)' "
+               f"WHERE instance = {o} AND revoked_at IS NULL; "
+               f"DELETE FROM {{s}}.bus_deliveries WHERE instance = {o}; "
+               f"DELETE FROM {{s}}.bus_relations WHERE publisher = {o} OR addressee = {o};")
+    else:
+        n = _sql_lit(new)
+        sql = (f"UPDATE {{s}}.bus_grants SET instance = {n} WHERE instance = {o} AND revoked_at IS NULL; "
+               f"UPDATE {{s}}.bus_deliveries SET instance = {n} WHERE instance = {o}; "
+               f"UPDATE {{s}}.bus_relations SET publisher = {n} WHERE publisher = {o}; "
+               f"UPDATE {{s}}.bus_relations SET addressee = {n} WHERE addressee = {o};")
+    try:
+        _events_psql(tid, sql)
+    except (subprocess.CalledProcessError, OSError, SystemExit) as e:
+        print(f"WARNING: the event grants of '{old}' were not "
+              f"{'revoked' if new is None else 'carried over'}: {e}", file=sys.stderr)
+
+
 def cmd_events(args):
     """oaap events list|grant|revoke (oaap.events.bus 0.1 §2.7)."""
     reg = load_registry()
@@ -27847,6 +27877,8 @@ def remove_instance(reg, name, purge):
             print(f"WARNING: grant base of '{name}' not removed: {e}", file=sys.stderr)
     for other in partners:
         teardown_link_network(name, other)
+    # oaap.events.bus: its grants, push cursor and records go with it
+    events_follow_instance(inst, name)
     # RFC-0094: its documentation leaves the tenant's help with it
     try:
         docs_retire_instance(name, inst, reg)
@@ -28172,6 +28204,7 @@ def rename_instance(reg, key, new, grace, who="root"):
     inst["name"] = new
     new_key = instance_key(tid, new)
     rekey_instance(reg, key, new_key, grace)
+    events_follow_instance(inst, key, new_key)  # oaap.events.bus: grants, cursor, records
     refresh_generated_sites()
     refresh_name_links()
     reload_gateway()

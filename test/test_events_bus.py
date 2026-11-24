@@ -453,6 +453,29 @@ ok("events-secrets.json: das Geheimnis der Instanz mit endpoint, nur dieser",
 ok("... nur fuer root lesbar (0600)", os.name == "nt" or (os.stat(a.EVENTS_SECRETS).st_mode & 0o777) == 0o600)
 ok("Katalog traegt den endpoint", json.load(open(a.EVENTS_CATALOG))["instances"]["t1-push"]["endpoint"] == "/oaap/events")
 
+print("\n=== Was der Bus unter einem Namen haelt, folgt der Instanz ===")
+SQL = []
+a._store_running = lambda: True
+a._twin_schema_exists = lambda schema: True
+a._events_psql = lambda tid, sql: SQL.append((tid, sql)) or ""
+T1 = "9edc585b-2161-4f8b-8a03-8dada10becbf"
+a.events_follow_instance({"tenant": T1}, "evp-b")
+ok("Entfernen: Freigaben widerrufen, Cursor und Eintraege geloescht",
+   SQL and SQL[-1][0] == T1 and "UPDATE {s}.bus_grants SET revoked_at = now()" in SQL[-1][1]
+   and "DELETE FROM {s}.bus_deliveries WHERE instance = 'evp-b'" in SQL[-1][1]
+   and "DELETE FROM {s}.bus_relations WHERE publisher = 'evp-b' OR addressee = 'evp-b'" in SQL[-1][1], SQL[-1:])
+a.events_follow_instance({"tenant": T1}, "evp-b", "evp-neu")
+ok("Umbenennen: alle drei ziehen auf den neuen Namen um",
+   "SET instance = 'evp-neu' WHERE instance = 'evp-b'" in SQL[-1][1]
+   and "SET publisher = 'evp-neu'" in SQL[-1][1] and "SET addressee = 'evp-neu'" in SQL[-1][1])
+a.events_follow_instance({"tenant": T1}, "x'; DROP TABLE y; --")
+ok("Namen werden als SQL-Literal gesetzt", "'x''; DROP TABLE y; --'" in SQL[-1][1])
+n0 = len(SQL)
+a.events_follow_instance({"tenant": "kein-mandant"}, "evp-b")
+ok("ohne gueltigen Mandanten: nichts", len(SQL) == n0)
+rsrc = inspect.getsource(a.remove_instance) + inspect.getsource(a.rename_instance)
+ok("remove_instance und rename_instance rufen es", rsrc.count("events_follow_instance(") == 2)
+
 print()
 print("all events-bus checks passed" if not fails else f"{fails} check(s) FAILED")
 sys.exit(1 if fails else 0)
