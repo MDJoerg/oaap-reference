@@ -26,6 +26,7 @@ STEP_TYPE = {
     "address.wait": "Warten, bis die Adresse antwortet",
     "idp.provision": "Anmeldedienst (Realm) einrichten",
     "idp.admin_group": "Verwaltergruppe im Realm vorbereiten",
+    "idp.app": "Anmeldung der App über den Realm einrichten",
     "tenant.policy": "Richtlinie für die erste Anmeldung",
     "tenant.face": "Gesicht (Titel, Farben)",
     "app.install": "Anwendung installieren",
@@ -229,7 +230,10 @@ def plan(profile):
     for s in doc.get("steps") or []:
         typ = s.get("type", "")
         when = s.get("when") or ""
-        ask = (params.get(when) or {}).get("label") or when
+        names = when if isinstance(when, list) else ([when] if when else [])
+        ask = " und ".join(str((params.get(n) or {}).get("label") or n)
+                           for n in names if isinstance(n, str))
+        when = ask
         text = STEP_TYPE.get(typ, typ)
         m = ADMIN_REF_RE.match(str(s.get("app") or "")) if typ == "app.install" else None
         over = params.get(m.group(1)) if m else None

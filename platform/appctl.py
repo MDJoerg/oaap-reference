@@ -6270,7 +6270,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 22     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 23     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -6321,7 +6321,11 @@ MANIFEST_MINOR = 22     # 0.2 adds app.class (runtime spec 2.10);
                         # tenant admin granted it);
                         # 0.22 adds people.invite (RFC-0126 -- an app
                         # invites people without platform authority; the
-                        # platform makes the login and Keycloak mails).
+                        # platform makes the login and Keycloak mails);
+                        # 0.23 adds mcp_store.kind (RFC-0121, portal 2.20 --
+                        # the MCP door is a store connector of that kind; the
+                        # portal offers "Für den Chat freigeben"). Its own
+                        # block, like mcp_content.
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -10487,6 +10491,33 @@ class _BuildDrivers:
                               "nimm die Verwalterin oder den Verwalter des Vereins hinein")
         return ok, note, []
 
+    # idp.app (portal 2.20) ------------------------------------------------
+    def _check_idp_app(self, a, ctx):
+        key = self._instance_key(a["name"])
+        if not key:
+            return ABSENT_, f"noch keine Instanz '{a['name']}' in diesem Mandanten"
+        inst = load_registry()["instances"].get(key) or {}
+        if not oidc_client_of(inst):
+            return CONFLICT_, (f"'{a['name']}' meldet Personen nicht selbst an "
+                               "(identity.oidc_client fehlt im Manifest)")
+        rec = inst.get("oidc_idp") or {}
+        if rec.get("client_id") and not rec.get("off"):
+            return PRESENT_, f"'{a['name']}' meldet über den Realm an ({rec['client_id']})"
+        return ABSENT_, f"'{a['name']}' hat noch keinen Client im Realm"
+
+    def _do_idp_app(self, a, ctx):
+        key = self._instance_key(a["name"])
+        if not key:
+            return False, (f"keine Instanz '{a['name']}' in diesem Mandanten -- "
+                           "der Schritt gehört hinter ihr app.install"), []
+        lines = []
+        ok, said = app_idp_apply(key, who=self.who, role=self.role, out=lines.append)
+        if not ok:
+            return False, said, []
+        # Nothing claimed: a rollback leaves the client. It is disabled with
+        # the instance's removal (app_idp_retire), never deleted.
+        return True, f"'{a['name']}' meldet jetzt über den Realm des Mandanten an", []
+
     # tenant.policy -------------------------------------------------------
     def _check_tenant_policy(self, a, ctx):
         tid, t = self._tenant()
@@ -10583,8 +10614,16 @@ class _BuildDrivers:
         if self._administer_confirmed(a):
             argv += ["--confirm-administer"]
         code, out = _run_verb(argv)
-        ok = code == 0
-        note = (f"'{a['name']}' ist installiert" if ok else
+        # 0.1.375 (measured on oaap-test): exit 3 is "installed, but the
+        # instance does not run yet" (F2). The catalogue path below hears the
+        # same as a warning and goes on; so does this one -- an app whose
+        # secrets the next app.config steps generate (BookStack) cannot run
+        # before them, and that is no reason to stop the build.
+        settling = code == INSTALL_NOT_RUNNING_EXIT and self._instance_key(a["name"])
+        ok = code == 0 or bool(settling)
+        note = (f"'{a['name']}' ist installiert" if code == 0 else
+                f"'{a['name']}' ist installiert, läuft aber noch nicht (siehe "
+                "die folgenden Schritte und die Diagnose der Instanz)" if settling else
                 (_brief(out, 3) or f"der Befehl endete mit {code}"))
         note = self._administer_note(note, "" if ok else out)
         key = self._instance_key(a["name"])
@@ -16709,6 +16748,11 @@ def validate_manifest(m):
             err = mcp_content_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.23 (RFC-0121, portal 2.20): the door is a store connector.
+        if "mcp_store" in m:
+            err = mcp_store_error(m)
+            if err:
+                errs.append(err)
         # Manifest 0.13 (RFC-0075 D6): the app serves a sandbox page for the
         # views of MCP Apps; the platform gives it a second origin.
         if "ui_sandbox" in m:
@@ -19512,6 +19556,151 @@ def mcp_content_error(m):
     return ""
 
 
+# Manifest 0.23 (RFC-0121, portal 2.20): which kind of store the app's MCP
+# door is a connector for. The platform checks only the form -- which kinds
+# exist is the MCP gateway's knowledge (oaap.work.stores), so a new kind
+# needs no platform update.
+MCP_STORE_KIND_RE = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
+
+
+def mcp_store_kind(m_or_inst):
+    """The store kind of a manifest (`mcp_store.kind`) or a registry record
+    (`mcp_store`), or '' -- '' also without an MCP door."""
+    src = m_or_inst or {}
+    d = src.get("mcp_store")
+    kind = d.get("kind") if isinstance(d, dict) else d
+    if not isinstance(kind, str) or not MCP_STORE_KIND_RE.match(kind) \
+            or not mcp_door(src):
+        return ""
+    return kind
+
+
+def mcp_store_error(m):
+    """'' when `mcp_store:` is valid, else the sentence for the operator."""
+    d = m.get("mcp_store")
+    if not isinstance(d, dict):
+        return "mcp_store: object expected"
+    if set(d) - {"kind"}:
+        return "mcp_store: only 'kind' is known (RFC-0121)"
+    if not isinstance(d.get("kind"), str) or not MCP_STORE_KIND_RE.match(d["kind"]):
+        return ("mcp_store.kind: the store kind in lower case, 2 to 24 "
+                "characters (bookstack, forgejo, ...)")
+    if not mcp_door(m):
+        return "mcp_store: only for an app that declares an MCP door (mcp.path)"
+    return ""
+
+
+CHAT_STORE_LIGHT = "yellow"     # portal 2.20: an internal store starts yellow
+
+
+def chat_store_target(name, gateway=""):
+    """Where "Für den Chat freigeben" would go: (inst, tid, kind, gateway
+    key, gateway record, refusal)."""
+    reg = load_registry()
+    insts = reg.get("instances", {})
+    inst = insts.get(name)
+    none = (None, "", "", "", None)
+    if not inst:
+        return none + (f"no instance called '{name}' on this node",)
+    kind = mcp_store_kind(inst)
+    if not kind:
+        return none + (f"'{name}' brings no store connector (its manifest has "
+                       "no `mcp_store`)",)
+    if is_rehearsal(inst):
+        return none + (f"'{name}' is a rehearsal (RFC-0030): it is no MCP source",)
+    tref = instance_tenant_ref(inst)
+    gws = sorted(k for k, i in insts.items()
+                 if k != name and i.get("mcp_sources") and setup_door(i)
+                 and not is_rehearsal(i) and instance_tenant_ref(i) == tref)
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    if gateway:
+        if gateway not in gws:
+            return none + (f"'{gateway}' is no MCP gateway of the same tenant "
+                           "with a setup door",)
+        gws = [gateway]
+    if not gws:
+        return none + ("the tenant has no MCP gateway on this node that reads "
+                       "its sources (app mcp-gateway, 0.46 or later)",)
+    if len(gws) > 1:
+        return none + ("the tenant has several MCP gateways (" + ", ".join(gws)
+                       + "): name one",)
+    return inst, tid, kind, gws[0], insts[gws[0]], ""
+
+
+def chat_store_name(name, inst):
+    """The store system's name in the gateway: the instance's own name,
+    folded to the gateway's rule (2-40 of a-z, 0-9, '-')."""
+    n = re.sub(r"[^a-z0-9-]+", "-", instance_name(name, inst).lower()).strip("-")
+    n = n[:40].strip("-")
+    return n if len(n) >= 2 else ("ablage-" + n).strip("-")
+
+
+def chat_store_apply(name, gateway="", who="root", role="root", out=print):
+    """Portal 2.20, "Für den Chat freigeben": the gateway of the tenant
+    reads the source, gives it the light of an internal store (only from
+    the red every new server starts with), records the store system and
+    switches its store door on for every access profile -- never a key.
+    The same setup door a tenant build uses; the gateway's rules decide.
+    Returns (ok, sentence)."""
+    inst, tid, kind, gw, ginst, bad = chat_store_target(name, gateway)
+    if bad:
+        return False, bad
+    doc, why = setup_call(gw, ginst, "GET", query="kind=profile", actor=who)
+    if why:
+        return False, why
+    profiles = sorted(str(x.get("id") or "") for x in (doc or {}).get("items") or []
+                      if isinstance(x, dict) and x.get("id"))
+    if not profiles:
+        return False, (f"the gateway '{gw}' has no access profile yet -- a chat "
+                       "reaches stores through its profile; connect the chat first")
+    store = chat_store_name(name, inst)
+    items = [{"kind": "refresh", "id": name},
+             {"kind": "server_light", "id": name, "light": CHAT_STORE_LIGHT},
+             {"kind": "store", "id": store, "title": instance_name(name, inst),
+              "type": kind, "server": name, "light": CHAT_STORE_LIGHT,
+              "doors": profiles}]
+    doc, why = setup_call(gw, ginst, "POST", {"v": 1, "dry": True, "items": items},
+                          actor=who)
+    if why:
+        return False, why
+    res = (doc or {}).get("results") or []
+    if len(res) == 3 and res[1].get("result") == "conflict":
+        # a human set the server's light: it stays theirs, and the store's
+        # light is never looser than its server's (oaap.work.workspaces)
+        out(f"  light of '{name}' stays as set by hand: {res[1].get('note', '')}")
+        items.pop(1)
+        res.pop(1)
+    bad = [r for r in res if r.get("result") in ("conflict", "refused")]
+    if bad:
+        said = "; ".join(f"{r.get('kind')} {r.get('id')}: {r.get('note', '')}" for r in bad)
+        audit_tenant("chat.store", tid, name, "failed", who=who, role=role,
+                     detail=f"{gw} · {said}"[:400])
+        return False, said
+    doc, why = setup_call(gw, ginst, "POST", {"v": 1, "dry": False, "items": items},
+                          actor=who)
+    if why:
+        return False, why
+    res = (doc or {}).get("results") or []
+    for r in res:
+        out(f"  {r.get('kind'):12} {r.get('id'):24} {r.get('result')}  {r.get('note', '')}")
+    bad = [r for r in res if r.get("result") in ("conflict", "refused")]
+    if bad:
+        said = "; ".join(f"{r.get('kind')} {r.get('id')}: {r.get('note', '')}" for r in bad)
+        audit_tenant("chat.store", tid, name, "failed", who=who, role=role,
+                     detail=f"{gw} · {said}"[:400])
+        return False, said
+    reg = load_registry()
+    rec = reg["instances"].get(name)
+    if rec is not None:
+        rec["chat_store"] = {"gateway": gw, "store": store, "kind": kind,
+                             "doors": profiles, "at": _iso_now(), "by": who}
+        save_registry(reg)
+    audit_tenant("chat.store", tid, name, who=who, role=role,
+                 detail=f"{gw} · {store} ({kind}) · door on for {', '.join(profiles)}")
+    return True, (f"'{name}' is a store '{store}' in the gateway '{gw}'; the store "
+                  f"door is on for {', '.join(profiles)}")
+
+
 def mcp_sources_wanted(m):
     """Only a literal `mcp_sources: {read: true}`."""
     d = m.get("mcp_sources")
@@ -19573,6 +19762,9 @@ def mcp_sources_of(insts, scope):
         if i.get("mcp_untrusted") is True:
             # RFC-0116 §4.3: only named when true; a gateway before 0.36 ignores it.
             out[-1]["untrusted_content"] = True
+        if mcp_store_kind(i):
+            # manifest 0.23 (portal 2.20): named only when declared
+            out[-1]["store_kind"] = mcp_store_kind(i)
     twin = twin_mcp_source(me, out)
     if twin:
         out.append(twin)
@@ -28113,6 +28305,9 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.19 (RFC-0116 stage 2): the app says its door delivers
         # foreign content. A proposal to the gateway, never its decision.
         "mcp_untrusted": mcp_untrusted_wanted(m),
+        # Manifest 0.23 (RFC-0121, portal 2.20): the door is a store connector
+        # of this kind ('' when not). Re-read on every install, like `mcp`.
+        "mcp_store": mcp_store_kind(m),
         # Manifest 0.17 (RFC-0094): the help products this app brings, and
         # whether it is a help that reads those of its tenant. Re-read on
         # every install, like `mcp`: both describe the app.
@@ -28276,6 +28471,10 @@ def _install_from_dir(pkg, args, source):
                 and app_idp_retire(name, inst):
             rec["off"], rec["off_by"] = _iso_now(), "redeploy without identity.oidc_client"
         reg["instances"][name]["oidc_idp"] = rec
+    # Portal 2.20: that the gateway knows this app as a store is a fact about
+    # the gateway, not the manifest -- kept by a redeploy.
+    if inst and inst.get("chat_store") and not rehearsal:
+        reg["instances"][name]["chat_store"] = dict(inst["chat_store"])
     # a granted non-HTTP endpoint (RFC-0015) is the operator's decision to
     # open a port — it survives redeploy like the address. The container
     # was already recreated with its publish mapping (via `granted`).
@@ -38254,6 +38453,37 @@ def cmd_process_deploys(_args):
                 lines = []
                 ok, msg = mcp_idp_apply(name, off=(op == "off"), who=who,
                                         role=act_role, out=lines.append)
+        elif action in ("app_idp", "chat_store"):
+            # Portal 2.20: an app's own sign-in through its tenant's realm
+            # (`oaap idp app`), and "Für den Chat freigeben" (the tenant's
+            # MCP gateway learns the app as a store). server_admin or the
+            # tenant_admin of the instance's tenant -- a request of another
+            # tenant never gets here (cross_tenant above). The request
+            # chooses nothing but on/off; connector, realm, client, gateway
+            # and profiles follow from the tenant and the instance.
+            op = str(req.get("op") or "")
+            who = actor or "portal"
+            tid_here = (resolve_tenant((inst or {}).get("tenant"))
+                        or ensure_default_tenant())
+            event = "app.idp" if action == "app_idp" else "chat.store"
+            ops = ("on", "off") if action == "app_idp" else ("on",)
+            if not inst:
+                msg = "unknown instance"
+            elif op not in ops:
+                msg = f"unknown {action} op '{op}'"
+            elif act_role not in ("server_admin", "tenant_admin"):
+                msg = ("this requires server_admin or the tenant_admin of the "
+                       "instance (oaap.core.portal 2.20)")
+                audit_tenant(event, tid_here, subject=name, result="denied",
+                             who=who, role=act_role or "-", detail=msg)
+            elif action == "app_idp":
+                lines = []
+                ok, msg = app_idp_apply(name, off=(op == "off"), who=who,
+                                        role=act_role, out=lines.append)
+            else:
+                lines = []
+                ok, msg = chat_store_apply(name, who=who, role=act_role,
+                                           out=lines.append)
         elif action == "exposure":
             # Freigaben aus dem Portal (oaap.net.connector 2.8.10): open,
             # extend, let go (inner node) and close (outer node). The

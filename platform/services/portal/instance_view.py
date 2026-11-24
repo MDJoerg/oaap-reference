@@ -571,12 +571,14 @@ def mcp_view(name, inst, instances, tenants, manager=False, default_tid=""):
         return ((i.get("tenant") or default_tid) == tref) and not is_rehearsal(i)
 
     out = {"door": door, "reads": reads, "rehearsal": reh, "readers": [],
-           "sources": [], "idp": None, "can_manage": False, "why_not": ""}
+           "sources": [], "idp": None, "can_manage": False, "why_not": "",
+           "store": None}
     if reh:
         return out
     if door:
         out["readers"] = sorted(k for k, i in instances.items()
                                 if k != name and i.get("mcp_sources") and same(i))
+        out["store"] = store_view(inst, out["readers"], instances, manager)
     if reads:
         for k, i in sorted(instances.items()):
             p = mcp_path(i)
@@ -604,3 +606,56 @@ def mcp_view(name, inst, instances, tenants, manager=False, default_tid=""):
                               "MCPGW_* setzen.")
         out["can_manage"] = bool(manager and not out["why_not"])
     return out
+
+
+def store_view(inst, readers, instances, manager=False):
+    """Portal 2.20: „Für den Chat freigeben“ -- nur für eine App, deren
+    MCP-Tür ein Ablagen-Konnektor ist (manifest 0.23 `mcp_store`). None sonst.
+
+    Freigeben geht genau dann, wenn EIN Gateway des Mandanten mit
+    Einrichtungstür die Quelle liest; was das Gateway daraus macht, prüft
+    der Host noch einmal."""
+    kind = str((inst or {}).get("mcp_store") or "")
+    if not kind:
+        return None
+    rec = (inst or {}).get("chat_store") or {}
+    gws = [r for r in readers if ((instances or {}).get(r) or {}).get("setup")]
+    why = ""
+    if not gws:
+        why = ("Kein MCP-Gateway des Mandanten mit Einrichtungstür liest diese Quelle "
+               "(App mcp-gateway ab 0.46).")
+    elif len(gws) > 1:
+        why = ("Mehrere Gateways lesen diese Quelle (" + ", ".join(gws)
+               + "); freigeben geht dann nur auf der Kommandozeile des Gateways.")
+    return {"kind": kind, "done": bool(rec), "gateway": rec.get("gateway", ""),
+            "name": rec.get("store", ""), "doors": rec.get("doors") or [],
+            "at": _stamp(rec.get("at")), "by": rec.get("by", ""),
+            "target": gws[0] if len(gws) == 1 else "",
+            "can": bool(manager and not why), "why_not": why}
+
+
+def signin_view(inst, tenants, manager=False, default_tid=""):
+    """Portal 2.20: die Karte „Anmeldung über den Realm“ einer App, die
+    Personen selbst anmeldet (manifest 0.16 `identity.oidc_client`) -- der
+    Knopf macht, was `oaap idp app` macht. None für jede andere Instanz."""
+    if not (inst or {}).get("oidc_client") or is_rehearsal(inst):
+        return None
+    rec = (inst or {}).get("oidc_idp") or {}
+    tref = (inst or {}).get("tenant") or default_tid
+    prov = ((tenants or {}).get(tref) or {}).get("idp") or {}
+    why = ""
+    if not prov.get("issuer"):
+        why = ("Der Mandant hat noch keinen Anmeldedienst (Realm). Ohne ihn meldet "
+               "sich in dieser App nur ihr eigener Administrator an.")
+    elif not prov.get("connector"):
+        why = ("Der Anmeldedienst des Mandanten wurde von Hand eingetragen: den Client "
+               "von Hand anlegen und die App selbst einstellen.")
+    state = "off" if rec.get("off") else ("on" if rec.get("client_id") else "none")
+    return {"state": state, "client": rec.get("client_id", ""),
+            "issuer": rec.get("issuer", ""), "space": rec.get("space", ""),
+            "uris": rec.get("redirect_uris") or [],
+            "groups": bool(rec.get("groups_claim")),
+            "at": _stamp(rec.get("at")), "by": rec.get("by", ""),
+            "off_at": _stamp(rec.get("off")), "off_by": rec.get("off_by", ""),
+            "can": bool(manager and not why), "why_not": why}
+

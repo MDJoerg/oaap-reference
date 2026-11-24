@@ -3219,6 +3219,31 @@ MCP_CARD = """
   {% else %}
   <p class="muted">Noch kein Gateway des Mandanten liest diese Quelle.</p>
   {% endif %}
+  {% if i.mcp.store %}
+  <h3 id="chat">Für den Chat</h3>
+  {% if i.mcp.store.done %}
+  <p>Freigegeben am {{ i.mcp.store.at }}{% if i.mcp.store.by %} von {{ i.mcp.store.by }}{% endif %}:
+     im Gateway <a href="/instances/{{ i.mcp.store.gateway }}#mcp">{{ i.mcp.store.gateway }}</a>
+     das Ablagesystem <code>{{ i.mcp.store.name }}</code> ({{ i.mcp.store.kind }}), Ablagetür an für
+     {{ i.mcp.store.doors|join(", ") or "—" }}.</p>
+  <p class="muted">Im Chat wählt jede Person einen Arbeitsraum und hängt die Ablage dort ein.
+     Was sie sieht und ändert, entscheidet diese App selbst.</p>
+  {% else %}
+  <p>Diese App bringt einen <strong>Ablagen-Konnektor</strong> ({{ i.mcp.store.kind }}) mit: Im Chat
+     kann sie Teil eines Arbeitsraums werden.</p>
+  {% endif %}
+  {% if i.mcp.store.can %}
+  <form method="post" action="/instances/{{ i.key }}/chat-store" class="inline">
+    <button type="submit"{% if i.mcp.store.done %} class="secondary"{% endif %}>
+      {{ "Erneut freigeben" if i.mcp.store.done else "Für den Chat freigeben" }}</button>
+    <span class="muted">Das Gateway {{ i.mcp.store.target }} liest die Quelle ein, gibt ihr die Ampel gelb
+       (nur, wenn sie noch rot ist), trägt sie als Ablagesystem ein und schaltet die Ablagetür für
+       alle seine Zugangsprofile ein, nie für einen Schlüssel.</span>
+  </form>
+  {% elif i.mcp.store.why_not %}
+  <p class="muted">{{ i.mcp.store.why_not }}</p>
+  {% endif %}
+  {% endif %}
   {% endif %}
   {% if i.mcp.reads %}
   <p>Dieses Gateway liest die <strong>MCP-Quellen seines Mandanten</strong> auf diesem Knoten.</p>
@@ -3270,6 +3295,54 @@ MCP_CARD = """
   <p class="muted">{{ i.mcp.why_not }}</p>
   {% endif %}
   {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+"""
+
+
+# Portal 2.20: eine App, die Personen selbst über den Realm des Mandanten
+# anmeldet (identity.oidc_client) -- der Knopf macht, was `oaap idp app` macht.
+SIGNIN_CARD = """
+{% if i.signin %}
+<div class="card" id="anmeldung">
+  <h2>Anmeldung über den Realm</h2>
+  {% if i.signin.state == "on" %}
+  <p>Eingerichtet am {{ i.signin.at }}{% if i.signin.by %} von {{ i.signin.by }}{% endif %}:
+     Die App meldet Personen über den Realm <code>{{ i.signin.space }}</code> an, als Client
+     <code>{{ i.signin.client }}</code>{% if i.signin.groups %}, mit den Gruppen der Person{% endif %}.</p>
+  <table class="mini">
+    <tr><td>Issuer</td><td><code>{{ i.signin.issuer }}</code></td></tr>
+    {% for u in i.signin.uris %}<tr><td>Rücksprung</td><td><code>{{ u }}</code></td></tr>{% endfor %}
+  </table>
+  <p class="muted">Das Geheimnis des Clients steht nur in der Umgebung der Instanz. Bekommt die
+     Instanz später einen weiteren Namen, hier erneut einrichten.</p>
+  {% elif i.signin.state == "off" %}
+  <p>Abgeschaltet am {{ i.signin.off_at }}{% if i.signin.off_by %} ({{ i.signin.off_by }}){% endif %}:
+     <code>{{ i.signin.client }}</code> ist im Realm deaktiviert, nicht gelöscht.</p>
+  {% else %}
+  <p class="muted">Noch nicht eingerichtet: Die App benutzt ihre eigenen Konten.</p>
+  {% endif %}
+  {% if i.signin.can %}
+  <form method="post" action="/instances/{{ i.key }}/app-idp" class="inline">
+    {% if i.signin.state == "on" %}
+    <input type="hidden" name="op" value="on">
+    <button type="submit" class="secondary">Erneut einrichten</button>
+    <span class="muted">Trägt alle heutigen Namen der Instanz als Rücksprung ein.</span>
+    </form>
+    <form method="post" action="/instances/{{ i.key }}/app-idp" class="inline">
+    <input type="hidden" name="op" value="off">
+    <button type="submit" class="secondary">Abschalten</button>
+    <span class="muted">Deaktiviert den Client im Realm; gelöscht wird nichts.</span>
+    {% else %}
+    <input type="hidden" name="op" value="on">
+    <button type="submit">Anmeldung über den Realm verbinden</button>
+    <span class="muted">Legt im Realm des Mandanten einen Client für diese App an (oder schaltet
+       ihn wieder ein) und gibt der App die Werte; der Container startet dafür neu.</span>
+    {% endif %}
+  </form>
+  {% elif i.signin.why_not %}
+  <p class="muted">{{ i.signin.why_not }}</p>
   {% endif %}
 </div>
 {% endif %}
@@ -3368,7 +3441,7 @@ INSTANCE_EDIT_BODY = """
   </ul>
 </div>
 {% endif %}
-""" + MCP_CARD + """
+""" + MCP_CARD + SIGNIN_CARD + """
 <div class="card">
   <h2>Was die App mitbringt</h2>
   {% if i.description %}<p>{{ i.description }}</p>{% endif %}
@@ -10771,6 +10844,10 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
          "mcp": iv.mcp_view(name, inst, load_instances(), load_tenants(),
                             manager=require_instance_admin(name) is None,
                             default_tid=default_tenant_id()),
+         # Portal 2.20: die eigene Anmeldung einer App über den Realm
+         "signin": iv.signin_view(inst, load_tenants(),
+                                  manager=require_instance_admin(name) is None,
+                                  default_tid=default_tenant_id()),
          # RFC-0081 2.2: a test instance the node archive leaves out says so.
          "backup_out": (_backup_class()["skip_test"]
                         and (inst.get("channel") == "test" or bool(inst.get("rehearsal")))),
@@ -10943,6 +11020,53 @@ def instance_mcp_idp(name):
     if res.get("ok"):
         return _inst_back(name, msg=("Anmeldung eingerichtet." if op == "on"
                                      else "Anmeldung abgeschaltet: beide Clients deaktiviert, nichts gelöscht."))
+    return _inst_back(name, err=res.get("message", "Fehlgeschlagen."))
+
+
+APP_IDP_WAIT_SECONDS = 120     # the provider's calls, then the container is recreated
+CHAT_STORE_WAIT_SECONDS = 90   # three setup calls to the gateway, one reads a catalog
+
+
+@app.post("/instances/<name>/app-idp")
+def instance_app_idp(name):
+    """Portal 2.20: an app's own client in its tenant's realm -- what `oaap
+    idp app` does. server_admin or the tenant_admin of THIS instance; the
+    request chooses nothing but on/off. The worker asks role and tenant
+    again -- the button is not the boundary."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
+    op = request.form.get("op", "")
+    if op not in ("on", "off"):
+        return _inst_back(name, err="Unbekannte Aktion.")
+    res = _queue_and_wait(name, {"action": "app_idp", "op": op}, APP_IDP_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Der Anmeldedienst antwortet noch — bitte gleich erneut prüfen.")
+    if res.get("ok"):
+        return _inst_back(name, msg=("Anmeldung über den Realm eingerichtet; die App startet "
+                                     "dafür einmal neu." if op == "on" else
+                                     "Anmeldung abgeschaltet: Client deaktiviert, nichts gelöscht."))
+    return _inst_back(name, err=res.get("message", "Fehlgeschlagen."))
+
+
+@app.post("/instances/<name>/chat-store")
+def instance_chat_store(name):
+    """Portal 2.20: „Für den Chat freigeben“ -- the tenant's MCP gateway
+    learns this app as a store and opens its store door for its access
+    profiles. The worker decides gateway, name and profiles itself."""
+    denied = require_instance_admin(name)
+    if denied:
+        return denied
+    if not load_instances().get(name):
+        return redirect(f"/instances?back=1&err={quote('Instanz nicht gefunden.')}", code=303)
+    res = _queue_and_wait(name, {"action": "chat_store", "op": "on"}, CHAT_STORE_WAIT_SECONDS)
+    if res is None:
+        return _inst_back(name, err="Das Gateway antwortet noch — bitte gleich erneut prüfen.")
+    if res.get("ok"):
+        return _inst_back(name, msg="Für den Chat freigegeben: Im Chat lässt sich die Ablage "
+                                    "jetzt in einen Arbeitsraum einhängen.")
     return _inst_back(name, err=res.get("message", "Fehlgeschlagen."))
 
 

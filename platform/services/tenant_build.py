@@ -86,6 +86,10 @@ STEP_TYPES = {
     # RFC-0056 inside a build: the group the tenant's own administrator
     # belongs in, in the tenant's realm (a group, never a person).
     "idp.admin_group": ((), ()),
+    # Portal 2.20 / tenant 2.9.2: the app's OWN client in the tenant's realm
+    # (identity.oidc_client) -- what `oaap idp app` does, made by the
+    # connector that made the tenant's realm. Nothing to choose.
+    "idp.app":        (("name",), ()),
     # RFC-0104 D1: an http destination of the tenant, assigned to an
     # instance this build installs (`need` defaults to `name`). Never a
     # secret: one that needs it is made without, and a `manual` step with
@@ -129,6 +133,7 @@ STEP_TYPES = {
 RECIPE_EXPANDER = None
 # `when` names a bool parameter: the step is skipped unless it is true.
 COMMON_KEYS = ("id", "type", "label_text", "when")
+WHEN_MAX = 4
 DONE_WHEN = ("user.exists", "role.tenant_admin", "confirmed",
              "destination.secret", "setup.ready",
              # RFC-0109 section 12: the target's server certificate, read by
@@ -442,8 +447,8 @@ def profile_problems(doc):
         if typ == "app.setup":
             out += _setup_items_problems(where, sid, st.get("items"), params)
         for k, v in st.items():
-            if k in ("id", "type") or (typ == "app.setup" and k == "items"):
-                continue
+            if k in ("id", "type") or (typ == "app.setup" and k == "items")                     or (k == "when" and isinstance(v, list)):
+                continue          # a list in `when` is judged below
             if isinstance(v, str):
                 for ref in TEMPLATE_RE.findall(v):
                     if ref == SELECTION_REF and chooser and k != "app":
@@ -466,11 +471,17 @@ def profile_problems(doc):
             elif v is not None:
                 out.append(f"{where} ('{sid}'): '{k}' must be text")
         if "when" in st:
+            # 0.1.375: one bool parameter, or a list of up to four that must
+            # ALL be ticked (an app that needs the realm: with_wiki and
+            # with_realm)
             w = st["when"]
-            if not isinstance(w, str) or w not in params \
-                    or (params[w] or {}).get("kind") != "bool":
+            names = w if isinstance(w, list) else [w]
+            if not names or len(names) > WHEN_MAX or not all(
+                    isinstance(n, str) and n in params
+                    and (params[n] or {}).get("kind") == "bool" for n in names) \
+                    or len(set(names)) != len(names):
                 out.append(f"{where} ('{sid}'): 'when' must name a parameter "
-                           "of kind bool")
+                           f"of kind bool, or a list of up to {WHEN_MAX} of them")
         if typ == "app.install":
             if ("source" in st) == ("app" in st):
                 out.append(f"{where} ('{sid}'): app.install needs exactly one "
@@ -486,7 +497,7 @@ def profile_problems(doc):
                            "gets its own step with its own tick")
             elif "confirm_administer" in st:
                 m = TEMPLATE_RE.fullmatch(str(st["confirm_administer"]))
-                if not m or m.group(1) != st.get("when"):
+                if not m or m.group(1) not in when_names(st):
                     out.append(f"{where} ('{sid}'): confirm_administer is "
                                "'{p}' naming the same bool parameter as "
                                "'when' -- the tick that installs is the "
@@ -896,10 +907,17 @@ def plan(profile, values):
             for s in steps_of(profile, values) if step_active(s, values)]
 
 
-def step_active(step, values):
-    """False for a step whose `when` parameter is not true."""
+def when_names(step):
+    """The bool parameters a step's `when` names (none, one or a list)."""
     w = step.get("when")
-    return w is None or values.get(w) == "true"
+    if w is None:
+        return []
+    return [n for n in (w if isinstance(w, list) else [w]) if isinstance(n, str)]
+
+
+def step_active(step, values):
+    """False for a step whose `when` parameters are not ALL true."""
+    return all(values.get(n) == "true" for n in when_names(step))
 
 
 # ------------------------------------------------------------- the state
