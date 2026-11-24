@@ -2589,6 +2589,7 @@ def _idp_principal(tid, provider, claims):
                     bool(u.get("email_verified")) != profile["email_verified"]:
                 u["email_verified"] = profile["email_verified"]
                 changed = True
+            first_login = not u["idp"].get("last_login")
             u["idp"]["last_login"] = _now_iso()
             u["idp"]["factor"] = factor
             # Replaced, never merged (spec 2.11): what the provider no
@@ -2625,6 +2626,8 @@ def _idp_principal(tid, provider, claims):
                       who=u["username"], role="-",
                       detail=idp.role_changes_text(role_changes))
             _authz_sync_login(tid, u.get("id", ""), u["username"], claims)
+            if first_login:
+                person_event(u, "activated")
             return u, ""
         roles, groups = idp.first_login_grant(policy, claims)
         roles, source, role_changes = idp.role_sync(
@@ -3931,6 +3934,7 @@ def _update_user(username, body, users, actor_name, role, actor_tenant):
         detail += " (was " + ",".join(was_roles) + ")"
     if was_active != active:
         detail += "; deactivated" if not active else "; reactivated"
+        person_event(u, "unlocked" if active else "locked", by="admin")
     if was_when != (deactivate_at, delete_at):
         detail += (f"; deactivate_at {deactivate_at or '-'}, "
                    f"delete_at {delete_at or '-'}"
@@ -5177,6 +5181,7 @@ def people_act(uid, action):
                 u.setdefault("people", {})["invited_at_ts"] = time.time()
             else:
                 realm.set_enabled(sub, src, action == "unlock")
+                changed = u.get("active", True) != (action == "unlock")
                 u["active"] = action == "unlock"
                 if action == "lock":
                     u["session_epoch"] = u.get("session_epoch", 0) + 1
@@ -5185,4 +5190,133 @@ def people_act(uid, action):
             return _people_err(e)
         save_users(users)
     audit(f"people.{action}", tid, u["username"], who=f"instance:{src}", role="-")
+    if action != "resend" and changed:
+        person_event(u, action + "ed", by="app")
     return _people_public(u, realm, src, _people_hours(t))
+
+
+# ------------------------------------- RFC-0127 stage 2: identity publishes
+#
+# identity tells the instance that invited a person (RFC-0126) when that
+# person logs in for the first time, is locked or unlocked -- addressed
+# events of the platform types in the twin's bus_model (oaap.events.bus
+# 0.4). identity holds no database: it writes each event into a small
+# outbox file first and hands it to the twin's internal door with the
+# platform key, in order; what the twin cannot take yet (down, restarting)
+# stays and is tried again every 30 seconds. A refusal (4xx) is final and
+# written to stderr -- the event was wrong, retrying would not change it.
+import threading  # noqa: E402
+
+BUS_OUTBOX_FILE = os.path.join(DATA_DIR, "bus-outbox.json")
+BUS_OUTBOX_LOCK = os.path.join(DATA_DIR, "bus-outbox.lock")
+BUS_URL = os.environ.get("OAAP_TWIN_URL", "http://twin:8000") + "/internal/bus/platform"
+BUS_OUTBOX_MAX, BUS_OUTBOX_DAYS, BUS_RETRY_S = 1000, 7, 30
+
+
+def person_event_item(u, what, by="", now=None):
+    """The outbox item for user record `u`, or None when no app invited the
+    person (pure; tested)."""
+    inst = u.get("invited_by") or ""
+    if not inst.startswith("instance:") or not u.get("id"):
+        return None
+    data = {"user_id": u["id"]}
+    ref = (u.get("people") or {}).get("ref")
+    if ref:
+        data["ref"] = ref
+    if by:
+        data["by"] = by
+    return {"tenant": u.get("tenant", ""), "publisher": "identity",
+            "type": f"oaap.identity.person.{what}.v1", "subject": u["id"],
+            "data": data, "to": inst[len("instance:"):],
+            "at": time.time() if now is None else now}
+
+
+@contextlib.contextmanager
+def _bus_lock():
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    fd = os.open(BUS_OUTBOX_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _bus_queue():
+    try:
+        with open(BUS_OUTBOX_FILE, encoding="utf-8") as f:
+            q = json.load(f)
+        return q if isinstance(q, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def person_event(u, what, by=""):
+    item = person_event_item(u, what, by)
+    if item is None:
+        return
+    try:
+        with _bus_lock():
+            q = _bus_queue()
+            q.append(item)
+            _save(BUS_OUTBOX_FILE, q[-BUS_OUTBOX_MAX:])
+    except OSError as e:
+        print(f"bus: {item['type']} for {item['subject']} not queued: {e}",
+              file=sys.stderr, flush=True)
+        return
+    threading.Thread(target=bus_flush, daemon=True).start()
+
+
+def _bus_send(item):
+    """'sent', 'refused' or 'later'."""
+    body = json.dumps({k: v for k, v in item.items() if k != "at"}).encode()
+    req = urllib.request.Request(BUS_URL, data=body, method="POST", headers={
+        "Content-Type": "application/json", "X-OAAP-Internal-Key": INTERNAL_KEY})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+            return "sent"
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500 and e.code not in (401, 408, 429):
+            print(f"bus: {item['type']} for {item['subject']} refused {e.code}: "
+                  f"{e.read()[:200]!r}", file=sys.stderr, flush=True)
+            return "refused"
+        return "later"
+    except (OSError, ValueError):
+        return "later"
+
+
+def bus_flush():
+    """Hand the outbox to the twin, oldest first; stop at the first
+    'later' so the order per person holds."""
+    if not os.path.exists(BUS_OUTBOX_FILE):
+        return
+    with _bus_lock():
+        q = _bus_queue()
+        if not q:
+            return
+        old = time.time() - BUS_OUTBOX_DAYS * 86400
+        keep = [i for i in q if i.get("at", 0) >= old]
+        while keep:
+            if _bus_send(keep[0]) == "later":
+                break
+            keep.pop(0)
+        if keep != q:
+            _save(BUS_OUTBOX_FILE, keep)
+
+
+def _bus_loop():
+    while True:
+        time.sleep(BUS_RETRY_S)
+        try:
+            bus_flush()
+        except Exception as e:  # noqa: BLE001 -- the loop must not die
+            print(f"bus: flush failed: {e}", file=sys.stderr, flush=True)
+
+
+if os.environ.get("OAAP_IDENTITY_BUS_LOOP", "1") == "1" and INTERNAL_KEY:
+    threading.Thread(target=_bus_loop, daemon=True).start()

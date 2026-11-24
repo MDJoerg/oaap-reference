@@ -288,6 +288,9 @@ def declaration(m, read_file):
         err = type_error(s.get("type"))
         if err:
             return f"{where}.type: {err}", None
+        if s["type"].startswith("oaap.") and s["type"] not in PLATFORM_TYPES:
+            return (f"{where}.type: {s['type']} is not a platform type -- known are "
+                    + ", ".join(sorted(PLATFORM_TYPES))), None
         if s["type"] in seen:
             return f"{where}.type: {s['type']} twice", None
         seen.add(s["type"])
@@ -385,23 +388,93 @@ def addressee_error(catalogue_entry_of_to, tenant, registry_inst_of_to, t):
 
 def envelope(row, tenant, app_id, semantic=None):
     """The CloudEvent for a stored row ({id, type, source_instance, subject,
-    time, data})."""
+    time, data}). A platform publisher is stored as `platform:<name>`
+    (0.4) -- a value no instance name can take -- and gets its own
+    source, origin and schema URN."""
     tm = row["time"]
     if not isinstance(tm, str):
         tm = tm.astimezone(__import__("datetime").timezone.utc).isoformat(
             timespec="milliseconds").replace("+00:00", "Z")
+    si = row["source_instance"]
+    if si.startswith("platform:"):
+        src, origin = f"urn:oaap:tenant:{tenant}:{si[9:]}", si
+        schema = dataschema("platform", row["type"])
+    else:
+        src, origin = source(tenant, si), f"app:{app_id}"
+        schema = dataschema(app_id, row["type"])
     ev = {"specversion": SPECVERSION, "id": row["id"], "type": row["type"],
-          "source": source(tenant, row["source_instance"]),
-          "subject": row["subject"], "time": tm,
-          "datacontenttype": "application/json",
-          "dataschema": dataschema(app_id, row["type"]),
-          "oaaptenant": tenant, "oaaporigin": f"app:{app_id}",
+          "source": src, "subject": row["subject"], "time": tm,
+          "datacontenttype": "application/json", "dataschema": schema,
+          "oaaptenant": tenant, "oaaporigin": origin,
           "data": row["data"]}
     if semantic or row.get("semantic"):
         ev["oaapsemantic"] = semantic or row.get("semantic")
     if row.get("oaapto"):
         ev["oaapto"] = "instance:" + row["oaapto"]
     return ev
+
+# ------------------------------------------------- platform types (0.4)
+#
+# RFC-0127 stage 2: the platform publishes too. Its types live here, not in
+# a manifest; an app subscribes to them like to any other. The identity
+# types are addressed to the instance that invited the person (RFC-0126):
+# the platform's own record (`invited_by`) is the relation, so they need no
+# grant (§6.1's second case) and reach nobody else.
+
+_PERSON = {"user_id": {"type": "string", "maxLength": 64},
+           "ref": {"type": "string", "maxLength": 200}}
+_BY = {"type": "string", "enum": ["app", "admin"]}
+
+PLATFORM_TYPES = {
+    "oaap.identity.person.activated.v1": {
+        "publisher": "identity", "audience": "addressed", "subject": "user",
+        "title": "Eingeladene Person hat sich zum ersten Mal angemeldet",
+        "semantic_id": "urn:oaap:concept:identity:person:activated",
+        "schema": {"type": "object", "properties": dict(_PERSON),
+                   "required": ["user_id"], "additionalProperties": False}},
+    "oaap.identity.person.locked.v1": {
+        "publisher": "identity", "audience": "addressed", "subject": "user",
+        "title": "Eingeladene Person wurde gesperrt",
+        "semantic_id": "urn:oaap:concept:identity:person:locked",
+        "schema": {"type": "object", "properties": dict(_PERSON, by=_BY),
+                   "required": ["user_id", "by"], "additionalProperties": False}},
+    "oaap.identity.person.unlocked.v1": {
+        "publisher": "identity", "audience": "addressed", "subject": "user",
+        "title": "Eingeladene Person wurde entsperrt",
+        "semantic_id": "urn:oaap:concept:identity:person:unlocked",
+        "schema": {"type": "object", "properties": dict(_PERSON, by=_BY),
+                   "required": ["user_id", "by"], "additionalProperties": False}},
+}
+for _t, _p in PLATFORM_TYPES.items():
+    _p.update(type=_t, listed=[], personal=False)
+
+
+def check_platform_publish(body):
+    """(status, sentence, accepted) for a platform publisher's body
+    {publisher, type, subject, data, to}. Same shape as check_publish;
+    whether `to` exists and wants the type is addressee_error's question."""
+    if not isinstance(body, dict):
+        return 400, "a JSON object", None
+    t, who = body.get("type"), body.get("publisher")
+    p = PLATFORM_TYPES.get(t)
+    if p is None:
+        return 403, f"{t!r} is not a platform type", None
+    if who != p["publisher"]:
+        return 403, f"{t} is published by {p['publisher']}, not {who!r}", None
+    m = OAAPTO_RE.match("instance:" + str(body.get("to") or ""))
+    if p["audience"] == "addressed" and not m:
+        return 400, f"{t} is addressed: `to` names the instance", None
+    subj = body.get("subject")
+    if not isinstance(subj, str) or not subj or len(subj) > SUBJECT_MAX:
+        return 400, f"subject: 1-{SUBJECT_MAX} characters", None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return 400, "data: a JSON object", None
+    bad = validate(data, p["schema"])
+    if bad:
+        return 422, f"{bad[0]}: {bad[1]}", None
+    return 202, "", {"type": t, "subject": subj, "data": data,
+                     "to": m.group(1) if m else None, "publisher": who}
 
 # ----------------------------------------------------------------- grants
 
@@ -415,7 +488,9 @@ def grant_error(catalogue, tenant, instance, t):
         return f"'{instance}' is not an instance of this tenant with an events block"
     if not any(s.get("type") == t for s in me.get("subscribes") or []):
         return f"'{instance}' does not declare {t} under events.subscribes"
-    pubs = [(n, e, find_type(e, t)) for n, e in insts.items()
+    if (PLATFORM_TYPES.get(t) or {}).get("audience") == "addressed":
+        return f"{t} is addressed: it reaches only the instance it names, no grant needed"
+    pubs =[(n, e, find_type(e, t)) for n, e in insts.items()
             if e.get("tenant") == tenant and find_type(e, t)]
     if not pubs:
         return f"no instance of this tenant publishes {t}"

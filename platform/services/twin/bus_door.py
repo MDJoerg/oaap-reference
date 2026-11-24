@@ -126,6 +126,42 @@ def register(app, get_conn, apps_dir):
                          tenant, entry.get("app_id", ""), p.get("semantic_id"))
         return jsonify(id=eid, type=acc["type"], time=ev["time"]), 202
 
+    @app.post("/internal/bus/platform")
+    def bus_platform_publish():
+        """A platform service publishes (0.4): identity today. Behind
+        app.py's '/internal/*' guard (the platform key), never through the
+        gateway. Body {tenant, publisher, type, subject, data, to}. An
+        addressed event to an instance that does not declare the type is
+        not stored -- 200 with stored false, so the caller does not retry
+        what nobody wants."""
+        body = request.get_json(silent=True) or {}
+        tenant = str(body.get("tenant") or "")
+        status, why, acc = bm.check_platform_publish(body)
+        if status != 202:
+            return jsonify(error=why), status
+        to = acc["to"]
+        if to:
+            reg = _load(os.path.join(apps_dir, "registry.json"), {}).get("instances") or {}
+            cat = _load(os.path.join(apps_dir, CATALOG_NAME), {}).get("instances") or {}
+            why = bm.addressee_error(cat.get(to), tenant, reg.get(to), acc["type"])
+            if why:
+                return jsonify(stored=False, why=why), 200
+        conn = get_conn(tenant)
+        if conn is None:
+            return jsonify(stored=False, why="this tenant has no twin -- no event store"), 200
+        p = bm.PLATFORM_TYPES[acc["type"]]
+        eid = bm.ulid()
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bus_events (id, type, source_instance, source_app, subject, "
+                    "data, semantic, oaapto) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (eid, acc["type"], "platform:" + acc["publisher"], "platform",
+                     acc["subject"], json.dumps(acc["data"]), p["semantic_id"], to))
+        finally:
+            conn.close()
+        return jsonify(stored=True, id=eid), 202
+
     @app.get("/bus/v1/feed")
     def bus_feed():
         me, tenant, entry = caller(apps_dir)

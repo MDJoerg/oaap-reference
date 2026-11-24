@@ -18387,7 +18387,10 @@ def cmd_events(args):
                 print(f"  publishes  {p['type']}  [{p['audience']}]  {p['title']}")
             for sb in e.get("subscribes") or []:
                 g = grants.get((n, sb["type"]))
-                state = (f"GRANTED by {g[1]}" + (f", subject {g[0]}*" if g[0] else "")) if g                     else ("addressed only" if sb.get("addressed_only") else "waiting for a grant")
+                state = (f"GRANTED by {g[1]}" + (f", subject {g[0]}*" if g[0] else "")) if g                     else ("addressed only" if sb.get("addressed_only") else
+                           f"addressed by {bus_model.PLATFORM_TYPES[sb['type']]['publisher']}, no grant needed"
+                           if (bus_model.PLATFORM_TYPES.get(sb["type"]) or {}).get("audience") == "addressed"
+                           else "waiting for a grant")
                 print(f"  wants      {sb['type']}  -- {state}  ({sb['why']})")
         return
     if args.action == "resume":
@@ -27487,6 +27490,13 @@ def _install_from_dir(pkg, args, source):
     # oaap.events.bus 0.1 (RFC-0127 D3): the key this instance presents at
     # its own door /platform/events. Minted once; never for a rehearsal.
     if events_entry and not is_artefact and not rehearsal:
+        # oaap.events.bus 0.4: the event store lives in the tenant's twin
+        # schema. Measured 2026-11-24 on oaap-test: a tenant whose apps
+        # bind no twin had none, and identity's first event to such an app
+        # was answered "no event store" -- so an events block provisions
+        # it, as a twin binding does (idempotent).
+        if _store_running():
+            _twin_ensure_schema(twin_tenant)
         if "OAAP_EVENTS_KEY" not in env:
             env["OAAP_EVENTS_KEY"] = _events_issue_key(name, twin_tenant)
             print(f"Issued an events key for '{name}' (oaap.events.bus) "
