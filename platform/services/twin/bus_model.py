@@ -7,6 +7,8 @@ envelope). Nothing here opens a file, a socket or a database: a manifest, a
 schema, a body go in, a verdict or an event comes out -- so every rule is
 tested without Flask, Postgres or a node.
 """
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -21,6 +23,12 @@ FEED_LIMIT_DEFAULT = 100
 FEED_LIMIT_MAX = 200
 RETENTION_DAYS = 30
 AUDIENCES = ("addressed", "tenant", "listed")
+# The push (0.3): one event per POST, in store order, at least once.
+PUSH_PER_PASS = 50
+PUSH_TIMEOUT_S = 5
+PUSH_FAILURES_MAX = 10
+PUSH_BACKOFF_MAX_S = 3600
+ENDPOINT_RE = re.compile(r"^/[A-Za-z0-9._~/-]{0,199}$")
 
 TYPE_RE = re.compile(r"^[a-z][a-z0-9]*(\.[a-z0-9]+){3,7}$")
 MAJOR_RE = re.compile(r"\.v[0-9]+$")
@@ -199,9 +207,15 @@ def declaration(m, read_file):
     app_id = str((m.get("app") or {}).get("id", ""))
     if not isinstance(ev, dict):
         return "events: object expected", None
-    extra = sorted(set(ev) - {"publishes", "subscribes"})
+    extra = sorted(set(ev) - {"publishes", "subscribes", "endpoint"})
     if extra:
-        return f"events: only 'publishes' and 'subscribes' are known (found {', '.join(extra)})", None
+        return ("events: only 'publishes', 'subscribes' and 'endpoint' are known "
+                f"(found {', '.join(extra)})"), None
+    endpoint = ev.get("endpoint")
+    if endpoint is not None and (not isinstance(endpoint, str) or not ENDPOINT_RE.match(endpoint)
+                                 or ".." in endpoint.split("/")):
+        return ("events.endpoint: a path of the app, e.g. /oaap/events "
+                "(letters, digits, . _ ~ - /, no query)"), None
     pubs, subs = ev.get("publishes") or [], ev.get("subscribes") or []
     if not isinstance(pubs, list) or not isinstance(subs, list):
         return "events.publishes / events.subscribes: lists expected", None
@@ -284,7 +298,9 @@ def declaration(m, read_file):
             return f"{where}.addressed_only: true or false", None
         out_s.append({"type": s["type"], "why": why.strip(),
                       "addressed_only": s.get("addressed_only") is True})
-    return "", {"publishes": out_p, "subscribes": out_s}
+    if endpoint and not out_s:
+        return "events.endpoint: only an app that subscribes receives a push", None
+    return "", {"publishes": out_p, "subscribes": out_s, "endpoint": endpoint or ""}
 
 # --------------------------------------------------------------- envelope
 
@@ -411,3 +427,53 @@ def grant_error(catalogue, tenant, instance, t):
     if all(p["audience"] == "addressed" for _n, _e, p in pubs):
         return f"{t} is addressed: it reaches only the instance it names, no grant needed"
     return f"{t} is listed for other apps, not for '{me.get('app_id')}'"
+
+# --------------------------------------------------- what reaches whom
+
+
+def pending_conditions(grants, wanted, me):
+    """(sql, args) of the WHERE part both the feed and the push use: the
+    events of the tenant that `me` holds a live grant for (not addressed),
+    plus those addressed to `me` of a type it declares (0.2), never its
+    own. `grants` = [{type, subject_prefix}], `wanted` = its subscribed
+    types. None when nothing can reach it."""
+    conds, args = [], []
+    for g in grants:
+        if g.get("subject_prefix"):
+            conds.append("(oaapto IS NULL AND type = %s AND starts_with(subject, %s))")
+            args += [g["type"], g["subject_prefix"]]
+        else:
+            conds.append("(oaapto IS NULL AND type = %s)")
+            args.append(g["type"])
+    if wanted:
+        conds.append("(oaapto = %s AND type = ANY(%s))")
+        args += [me, list(wanted)]
+    if not conds:
+        return None
+    return f"source_instance <> %s AND ({' OR '.join(conds)})", [me] + args
+
+# ------------------------------------------------------------- the push
+
+
+def sign(secret, ts, body):
+    """X-OAAP-Signature, the twin webhooks' form: t=<unix>,v1=HMAC-SHA256
+    over '<t>.<body>' with the instance's OAAP_EVENTS_SECRET."""
+    mac = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+    return f"t={ts},v1={mac}"
+
+
+def verify(secret, header, body, now=None, tolerance=300):
+    """What a receiving app does: True when the signature fits and is fresh."""
+    try:
+        parts = dict(p.split("=", 1) for p in (header or "").split(","))
+        ts = int(parts["t"])
+    except (ValueError, KeyError):
+        return False
+    if abs((time.time() if now is None else now) - ts) > tolerance:
+        return False
+    return hmac.compare_digest(sign(secret, ts, body), f"t={ts},v1={parts.get('v1', '')}")
+
+
+def backoff(failures):
+    """Seconds to wait after the n-th failure in a row: 2^n, at most an hour."""
+    return min(2 ** max(1, failures), PUSH_BACKOFF_MAX_S)

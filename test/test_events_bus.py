@@ -296,6 +296,163 @@ a.instance_tenant_ref = lambda i: i.get("tenant")
 ok("cases_target_key nennt den Schluessel des Posteingangs",
    a.cases_target_key(insts, "t1-app") == "t1-vg" and a.cases_target_key({}, "x") == "")
 
+print("\n=== Der Push (0.3) ===")
+e, ent = decl({"subscribes": [{"type": PUB["type"], "why": "w"}], "endpoint": "/oaap/events"})
+ok("endpoint wird uebernommen", e == "" and ent["endpoint"] == "/oaap/events", e)
+for label, ev, frag in [
+    ("endpoint ohne Abo", {"publishes": [PUB], "endpoint": "/x"}, "only an app that subscribes"),
+    ("endpoint mit Query", {"subscribes": [{"type": PUB["type"], "why": "w"}], "endpoint": "/x?a=1"}, "events.endpoint"),
+    ("endpoint relativ", {"subscribes": [{"type": PUB["type"], "why": "w"}], "endpoint": "x"}, "events.endpoint"),
+    ("endpoint mit ..", {"subscribes": [{"type": PUB["type"], "why": "w"}], "endpoint": "/a/../b"}, "events.endpoint"),
+]:
+    e2, _ = decl(ev)
+    ok(f"abgelehnt: {label}", frag in e2, e2)
+body = b'{"id":"x"}'
+sig = bm.sign("geheim", 1700000000, body)
+ok("Signatur: die App prueft sie mit ihrem Geheimnis",
+   bm.verify("geheim", sig, body, now=1700000010) and not bm.verify("anders", sig, body, now=1700000010)
+   and not bm.verify("geheim", sig, body + b" ", now=1700000010)
+   and not bm.verify("geheim", sig, body, now=1700000000 + 301) and not bm.verify("geheim", "", body))
+ok("Backoff: 2^n, hoechstens eine Stunde", bm.backoff(1) == 2 and bm.backoff(3) == 8 and bm.backoff(30) == 3600)
+w = bm.pending_conditions([{"type": "a.b.c.v1", "subject_prefix": None}], ["x.y.z.v1"], "me")
+ok("Feed und Push lesen dieselbe Regel: Freigabe nicht adressiert, adressiert an mich, nie meine eigenen",
+   w[0].startswith("source_instance <> %s") and "oaapto IS NULL AND type = %s" in w[0]
+   and "oaapto = %s AND type = ANY(%s)" in w[0] and w[1] == ["me", "a.b.c.v1", "me", ["x.y.z.v1"]])
+ok("nichts erreichbar -> None", bm.pending_conditions([], [], "me") is None)
+
+import datetime as _dt                                         # noqa: E402
+try:
+    import psycopg2                                            # noqa: F401
+except ImportError:                                            # lokal ohne Treiber: Platzhalter
+    import types as _types
+    _pg = _types.ModuleType("psycopg2")
+    _pg.extras = _types.ModuleType("psycopg2.extras")
+    _pg.Error = Exception
+    sys.modules["psycopg2"], sys.modules["psycopg2.extras"] = _pg, _pg.extras
+import bus_push as bp                                          # noqa: E402
+
+
+class FakeCur:
+    """Genug Postgres fuer push_instance: bus_deliveries, bus_grants, bus_events."""
+    def __init__(self, events, grants=()):
+        self.events, self.grants, self.deliv, self._r = list(events), list(grants), {}, None
+
+    def execute(self, sql, args=()):
+        q = " ".join(sql.split())
+        if q.startswith("SELECT * FROM bus_deliveries"):
+            self._r = [dict(self.deliv[args[0]])] if args[0] in self.deliv else []
+        elif q.startswith("INSERT INTO bus_deliveries"):
+            row = {"instance": args[0], "last_seq": max([e["seq"] for e in self.events] or [0]),
+                   "failures": 0, "next_at": None, "stopped_at": None}
+            self.deliv[args[0]] = row
+            self._r = [dict(row)]
+        elif q.startswith("SELECT type, subject_prefix FROM bus_grants"):
+            self._r = [{"type": g, "subject_prefix": None} for g in self.grants]
+        elif q.startswith("SELECT seq, id"):
+            after, me = args[0], args[1]
+            types = [a for a in args[2:-1] if isinstance(a, str) and a != me]
+            self._r = [e for e in self.events if e["seq"] > after and e["source_instance"] != me
+                       and ((e.get("oaapto") is None and e["type"] in types)
+                            or (e.get("oaapto") == me))][:args[-1]]
+        elif q.startswith("UPDATE bus_deliveries SET last_seq"):
+            d = self.deliv[args[1]]
+            d.update(last_seq=args[0], failures=0, next_at=None)
+        elif q.startswith("UPDATE bus_deliveries SET failures = %s, stopped_at"):
+            d = self.deliv[args[2]]
+            d.update(failures=args[0], stopped_at=_dt.datetime.now(_dt.timezone.utc), last_error=args[1])
+        elif q.startswith("UPDATE bus_deliveries SET failures"):
+            d = self.deliv[args[3]]
+            d.update(failures=args[0], last_error=args[1],
+                     next_at=_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=args[2]))
+        else:
+            raise AssertionError(q)
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+    def fetchall(self):
+        return self._r
+
+
+def ev_row(seq, typ=PUB["type"], src="t1-pub", to=None):
+    return {"seq": seq, "id": f"ID{seq}", "type": typ, "source_instance": src, "source_app": "probe-pub",
+            "subject": "s", "time": "2026-11-24T12:00:00.000Z", "data": {"n": seq}, "semantic": None,
+            "oaapto": to}
+
+
+SENT = []
+
+
+def send_ok(inst, body, headers):
+    SENT.append((inst, json.loads(body), headers))
+    return 200, ""
+
+
+cur = FakeCur([ev_row(1), ev_row(2)], grants=[PUB["type"]])
+ok("erstes Mal: der Push beginnt beim neuesten Ereignis (die Vergangenheit hat der Feed)",
+   bp.push_instance(cur, "T1", "t1-sub", ent, "geheim", send=send_ok) == "nothing" and SENT == [])
+cur.events += [ev_row(3), ev_row(4), ev_row(5, src="t1-sub"), ev_row(6, typ="app.x.y.z.v1"),
+               ev_row(7, to="t1-sub"), ev_row(8, to="t1-other")]
+what = bp.push_instance(cur, "T1", "t1-sub", ent, "geheim", send=send_ok)
+ok("zugestellt in Reihenfolge: freigegebene, adressierte an mich; nie eigene, fremde Typen, an andere adressierte",
+   what == "delivered 3" and [x[1]["id"] for x in SENT] == ["ID3", "ID4", "ID7"], (what, [x[1]["id"] for x in SENT]))
+inst, ce, h = SENT[0]
+ok("ein Ereignis je POST, CloudEvents strukturiert, signiert, an die Instanz",
+   inst == "t1-sub" and ce["specversion"] == "1.0" and h["Content-Type"] == "application/cloudevents+json"
+   and bm.verify("geheim", h["X-OAAP-Signature"], json.dumps(ce, separators=(",", ":")).encode())
+   and h["X-OAAP-Event-Id"] == "ID3")
+ok("Cursor steht hinter dem letzten zugestellten", cur.deliv["t1-sub"]["last_seq"] == 7)
+SENT.clear()
+cur.events += [ev_row(9), ev_row(10)]
+flaky = iter([(500, "boom"), (200, "")])
+
+
+def send_flaky(inst, body, headers):
+    SENT.append(json.loads(body)["id"])
+    return next(flaky)
+
+
+what = bp.push_instance(cur, "T1", "t1-sub", ent, "geheim", send=send_flaky)
+d = cur.deliv["t1-sub"]
+ok("Fehler: Cursor bleibt, Zaehler 1, Wartezeit gesetzt, das naechste wartet",
+   what.startswith("failed (1)") and d["last_seq"] == 7 and d["failures"] == 1 and d["next_at"] is not None
+   and SENT == ["ID9"], (what, d))
+ok("waehrend der Wartezeit: nichts gesendet", bp.push_instance(cur, "T1", "t1-sub", ent, "g", send=send_flaky) == "waiting")
+d["next_at"] = None
+what = bp.push_instance(cur, "T1", "t1-sub", ent, "geheim",
+                        send=lambda i, b, h: (SENT.append(json.loads(b)["id"]) or (200, "")))
+ok("danach: dasselbe Ereignis noch einmal (mindestens einmal), dann weiter",
+   what == "delivered 2" and SENT[1:] == ["ID9", "ID10"] and d["failures"] == 0, (what, SENT))
+cur.events.append(ev_row(11))
+for i in range(bp.bm.PUSH_FAILURES_MAX):
+    d["next_at"] = None
+    what = bp.push_instance(cur, "T1", "t1-sub", ent, "geheim", send=lambda i, b, h: (0, "ConnectionRefused"))
+ok(f"nach {bp.bm.PUSH_FAILURES_MAX} Fehlern in Folge: gestoppt, mit Grund",
+   what.startswith("stopped after 10") and d["stopped_at"] is not None and "ConnectionRefused" in d["last_error"], what)
+ok("gestoppt: nichts mehr, bis resume", bp.push_instance(cur, "T1", "t1-sub", ent, "g", send=send_ok) == "stopped")
+
+print("\n=== Der Push am Knoten ===")
+csrc = open(os.path.join(HERE, "..", "platform", "docker-compose.yml"), encoding="utf-8").read()
+ok("Dienst `bus`: Zwilling-Image, bus_push.py, die Plattformdateien nur lesend",
+   "\n  bus:\n" in csrc and '"bus_push.py"' in csrc)
+dsrc = open(os.path.join(TWIN, "Dockerfile"), encoding="utf-8").read()
+ok("Dockerfile kopiert bus_push.py", "bus_push.py" in dsrc)
+hsrc = inspect.getsource(a.write_internal_health_caddy)
+ok("interner Listener: /e/<name> auf den erklaerten Pfad, ohne Identitaets-Kopfzeilen, nie Generalprobe",
+   'handle /e/{name}' in hsrc and "request_header -{h}" in hsrc and "IDENTITY_HEADERS" in hsrc
+   and "is_rehearsal(inst)" in hsrc)
+ok("OAAP_EVENTS_SECRET ist reserviert", "OAAP_EVENTS_SECRET" in a.RESERVED_ENV)
+a.load_env = lambda name, inst=None: {"OAAP_EVENTS_SECRET": "s3cr3t"} if name == "t1-push" else {}
+got_ep = dict(got, endpoint="/oaap/events", subscribes=[{"type": PUB["type"], "why": "w", "addressed_only": False}])
+reg2 = {"instances": {"t1-push": {"tenant": "T1", "app_id": "probe-pub", "version": "0.3.0", "events": got_ep},
+                      "t1-pub": reg["instances"]["t1-pub"]}}
+a.events_catalog_write(reg2)
+sec = json.load(open(a.EVENTS_SECRETS))
+ok("events-secrets.json: das Geheimnis der Instanz mit endpoint, nur dieser",
+   sec == {"t1-push": "s3cr3t"}, sec)
+ok("... nur fuer root lesbar (0600)", os.name == "nt" or (os.stat(a.EVENTS_SECRETS).st_mode & 0o777) == 0o600)
+ok("Katalog traegt den endpoint", json.load(open(a.EVENTS_CATALOG))["instances"]["t1-push"]["endpoint"] == "/oaap/events")
+
 print()
 print("all events-bus checks passed" if not fails else f"{fails} check(s) FAILED")
 sys.exit(1 if fails else 0)

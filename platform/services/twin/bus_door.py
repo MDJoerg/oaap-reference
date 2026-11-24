@@ -152,27 +152,14 @@ def register(app, get_conn, apps_dir):
                     after = row["seq"]
                 cur.execute("SELECT type, subject_prefix FROM bus_grants "
                             "WHERE instance = %s AND revoked_at IS NULL", (me,))
-                grants = cur.fetchall()
-                wanted = [sb["type"] for sb in entry.get("subscribes") or []]
-                if not grants and not wanted:
+                where = bm.pending_conditions(
+                    cur.fetchall(), [sb["type"] for sb in entry.get("subscribes") or []], me)
+                if where is None:
                     return jsonify(events=[], next=since or None)
-                conds, args = [], []
-                for g in grants:
-                    if g["subject_prefix"]:
-                        conds.append("(oaapto IS NULL AND type = %s AND starts_with(subject, %s))")
-                        args += [g["type"], g["subject_prefix"]]
-                    else:
-                        conds.append("(oaapto IS NULL AND type = %s)")
-                        args.append(g["type"])
-                if wanted:
-                    # 0.2: addressed to me, of a type I declare -- no grant needed
-                    conds.append("(oaapto = %s AND type = ANY(%s))")
-                    args += [me, wanted]
                 cur.execute(
                     "SELECT id, type, source_instance, source_app, subject, time, data, semantic, "
-                    "oaapto FROM bus_events WHERE seq > %s AND source_instance <> %s "
-                    f"AND ({' OR '.join(conds)}) ORDER BY seq LIMIT %s",
-                    [after, me] + args + [limit])
+                    f"oaapto FROM bus_events WHERE seq > %s AND {where[0]} ORDER BY seq LIMIT %s",
+                    [after] + where[1] + [limit])
                 rows = cur.fetchall()
         finally:
             conn.close()

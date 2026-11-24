@@ -324,6 +324,29 @@ services:
       # nothing) -- read-only, the twin's own mount
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
 
+  # The push of the event bus (oaap.events.bus 0.3, RFC-0127 stage 1.4) -- the
+  # 'twin' image with another command (services/twin/bus_push.py), like
+  # 'hooks'. It posts the events an instance may receive to the path it
+  # declares, through the gateway's internal listener (gateway:8099/e/<name>,
+  # platform network only), signed with the instance's secret. No port.
+  bus:
+    build: ./services/twin
+    profiles: ["store"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["python", "-u", "bus_push.py"]
+    depends_on:
+      - store
+    volumes:
+      # twin-secrets.json (the tenants' schema roles), events-catalog.json
+      # (who declares what), events-secrets.json (the signing secrets) --
+      # read-only, the twin's own mount
+      - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+
   # The MQTT broker (oaap.events.broker 0.1, RFC-0032 D2) -- gated by the
   # node profile 'broker' (RFC-0011), INDEPENDENT of 'store': a
   # back-office tenant has a twin but no reason to run real-time

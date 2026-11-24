@@ -17775,6 +17775,18 @@ def _twin_ensure_tables(schema):
             times bigint NOT NULL DEFAULT 1,
             PRIMARY KEY (publisher, addressee)
         );
+        -- The push's cursor per instance (oaap.events.bus 0.3 §2.10):
+        -- bookkeeping like 'webhooks', the one bus table that is UPDATEd.
+        CREATE TABLE IF NOT EXISTS "{schema}".bus_deliveries (
+            instance text PRIMARY KEY,
+            last_seq bigint NOT NULL DEFAULT 0,
+            failures integer NOT NULL DEFAULT 0,
+            next_at timestamptz,
+            stopped_at timestamptz,
+            last_error text,
+            delivered bigint NOT NULL DEFAULT 0,
+            last_ok_at timestamptz
+        );
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS
@@ -18139,6 +18151,10 @@ def cmd_migrate_instance_keys(_args):
 # rename and removal all reach the twin service without a step of their own.
 EVENTS_SCOPE = "oaap.events"
 EVENTS_CATALOG = os.path.join(APPS_DIR, "events-catalog.json")
+# oaap.events.bus 0.3: the push's signing secret per instance, read by the
+# `bus` service only. Written from the instances' environment with the
+# catalogue, so a rename or a removal reaches it without a step of its own.
+EVENTS_SECRETS = os.path.join(APPS_DIR, "events-secrets.json")
 
 
 def events_scope(name):
@@ -18182,6 +18198,7 @@ def events_catalog_write(reg=None):
                 continue
             out[name] = {"tenant": inst.get("tenant"), "app_id": inst.get("app_id"),
                          "version": inst.get("version"),
+                         "endpoint": inst["events"].get("endpoint") or "",
                          "publishes": inst["events"].get("publishes") or [],
                          "subscribes": inst["events"].get("subscribes") or []}
         tmp = EVENTS_CATALOG + ".tmp"
@@ -18190,6 +18207,18 @@ def events_catalog_write(reg=None):
         os.replace(tmp, EVENTS_CATALOG)
         # declarations and schemas, no secret: readable like the registry
         os.chmod(EVENTS_CATALOG, 0o644)
+        secrets_out = {}
+        for name in out:
+            inst = reg["instances"][name]
+            if (inst.get("events") or {}).get("endpoint"):
+                sec = load_env(name, inst).get("OAAP_EVENTS_SECRET", "")
+                if sec:
+                    secrets_out[name] = sec
+        tmp = EVENTS_SECRETS + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(secrets_out, f)
+        os.replace(tmp, EVENTS_SECRETS)
     except OSError as e:
         print(f"WARNING: could not write {EVENTS_CATALOG}: {e}", flush=True)
 
@@ -18245,10 +18274,15 @@ def cmd_events(args):
         if not insts:
             print("No instance declares events.")
             return
-        grants = {}
+        grants, push = {}, {}
         for t in sorted({e["tenant"] for e in insts.values()}):
             if not _twin_schema_exists(f"twin_{t}"):
                 continue
+            for line in _events_psql(t, "SELECT instance || '|' || delivered || '|' || failures || '|' || "
+                                     "COALESCE(stopped_at::text, '') || '|' || COALESCE(last_error, '') "
+                                     "FROM {s}.bus_deliveries").splitlines():
+                parts = (line.split("|", 4) + [""] * 5)[:5]
+                push[parts[0]] = parts[1:]
             out = _events_psql(t, "SELECT instance || '|' || type || '|' || "
                                "COALESCE(subject_prefix, '') || '|' || granted_by FROM {s}.bus_grants "
                                "WHERE revoked_at IS NULL ORDER BY 1")
@@ -18257,12 +18291,33 @@ def cmd_events(args):
                 grants[(i, ty)] = (pre, by)
         for n, e in sorted(insts.items()):
             print(f"{n}  ({e.get('app_id')} {e.get('version')})")
+            if e.get("endpoint"):
+                pd = push.get(n)
+                state = ("not started" if not pd else
+                         f"STOPPED ({pd[3]}) -- oaap events resume {n}" if pd[2] else
+                         f"{pd[0]} delivered" + (f", {pd[1]} failure(s): {pd[3]}" if pd[1] != "0" else ""))
+                print(f"  push       {e['endpoint']}  -- {state}")
             for p in e.get("publishes") or []:
                 print(f"  publishes  {p['type']}  [{p['audience']}]  {p['title']}")
             for sb in e.get("subscribes") or []:
                 g = grants.get((n, sb["type"]))
                 state = (f"GRANTED by {g[1]}" + (f", subject {g[0]}*" if g[0] else "")) if g                     else ("addressed only" if sb.get("addressed_only") else "waiting for a grant")
                 print(f"  wants      {sb['type']}  -- {state}  ({sb['why']})")
+        return
+    if args.action == "resume":
+        if not args.instance:
+            die("usage: oaap events resume <instance>")
+        key, err = resolve_instance_ref(reg, args.instance, args.tenant or "")
+        if err:
+            die(err)
+        tid = _instance_tenant_id(reg["instances"][key])
+        out = _events_psql(tid, "UPDATE {s}.bus_deliveries SET stopped_at = NULL, failures = 0, "
+                           f"next_at = NULL WHERE instance = {_sql_lit(key)} RETURNING last_seq")
+        if not out.strip():
+            print(f"'{key}' has no push yet.")
+            return
+        audit_tenant("events.resume", tid, key, who=os.environ.get("SUDO_USER") or "root")
+        print(f"Resumed: the push to '{key}' continues where it stopped.")
         return
     if not args.instance or not args.type:
         die(f"usage: oaap events {args.action} <instance> <type>")
@@ -22282,6 +22337,16 @@ def write_internal_health_caddy():
             lines.append(f"\t\t\trewrite * {sp}?{{query}}")
             lines.append("\t\t\treverse_proxy %s:%s" % door_target(inst, sp))
             lines.append("\t\t}")
+        # oaap.events.bus 0.3: the push into the app. The `bus` service posts
+        # here; the app checks the signature with OAAP_EVENTS_SECRET. No
+        # identity header passes: the push is not a person and not a key.
+        ep = (inst.get("events") or {}).get("endpoint") if not is_rehearsal(inst) else ""
+        if ep:
+            lines.append(f"\t\thandle /e/{name} {{")
+            lines += [f"\t\t\trequest_header -{h}" for h in IDENTITY_HEADERS]
+            lines.append(f"\t\t\trewrite * {ep}")
+            lines.append("\t\t\treverse_proxy %s:%s" % door_target(inst, ep))
+            lines.append("\t\t}")
         # RFC-0087 §8.2: an app's assets door, for the status document
         ap = assets_door(inst)
         if ap:
@@ -22550,7 +22615,7 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_INSTANCE_NAMES",
                 "OAAP_CASES_KEY", "OAAP_CASES_URL",
                 # oaap.events.bus 0.1 (RFC-0127)
-                "OAAP_EVENTS_KEY", "OAAP_EVENTS_URL",
+                "OAAP_EVENTS_KEY", "OAAP_EVENTS_URL", "OAAP_EVENTS_SECRET",
                 "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_SOURCES_URL",
                 "OAAP_MCP_CLIENT_KEY", "OAAP_MCP_CLIENT_URL",
                 # RFC-0104: the model way and the setup key
@@ -27223,9 +27288,16 @@ def _install_from_dir(pkg, args, source):
             print(f"Issued an events key for '{name}' (oaap.events.bus) "
                   "-- OAAP_EVENTS_KEY/OAAP_EVENTS_URL are in its environment.")
         env["OAAP_EVENTS_URL"] = events_url(port)
+        # oaap.events.bus 0.3: the secret the push signs with, for an app
+        # that declares an endpoint; minted once, like a generated value
+        if events_entry.get("endpoint"):
+            env.setdefault("OAAP_EVENTS_SECRET", secrets.token_hex(32))
+        else:
+            env.pop("OAAP_EVENTS_SECRET", None)
     elif "OAAP_EVENTS_KEY" in env:
         env.pop("OAAP_EVENTS_KEY", None)
         env.pop("OAAP_EVENTS_URL", None)
+        env.pop("OAAP_EVENTS_SECRET", None)
         print(f"'{name}' no longer declares events: its key is no longer "
               "handed to the app.")
     # RFC-0073 D2/D8: a gateway app reads the MCP sources of its tenant
@@ -41613,8 +41685,8 @@ def build_parser():
                       help="create, sweep, extend: say what would happen, change nothing")
     pcoh.set_defaults(fn=cmd_cohort)
     pev = sub.add_parser("events", help="events between apps (oaap.events.bus, RFC-0127): "
-                                        "list, grant, revoke")
-    pev.add_argument("action", choices=["list", "grant", "revoke"])
+                                        "list, grant, revoke, resume")
+    pev.add_argument("action", choices=["list", "grant", "revoke", "resume"])
     pev.add_argument("instance", nargs="?", help="grant, revoke: the receiving instance")
     pev.add_argument("type", nargs="?", help="grant, revoke: the event type")
     pev.add_argument("--tenant", default="", help="the tenant (label) the instance is in")

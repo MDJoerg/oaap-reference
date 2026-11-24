@@ -22,10 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # the host runs assets_run.py here every five minutes (docker exec), and
 # app.py's /internal/twin/assets reads what it wrote.
 # bus_model.py and bus_door.py are the event bus (oaap.events.bus 0.1,
-# RFC-0127): the pure rules, shared with appctl, and the door /bus/v1.
+# RFC-0127): the pure rules, shared with appctl, and the door /bus/v1;
+# bus_push.py the push into the app, run by the 'bus' service (0.3).
 COPY app.py relay.py timeseries.py ts_admin.py fleet.py \
      twin_write.py twin_read.py twin_values.py twin_sync.py twin_inbound.py twin_status.py hooks.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py \
      fleet_affected.py assets_model.py assets_twin.py assets_run.py mcp_door.py \
-     bus_model.py bus_door.py ./
+     bus_model.py bus_door.py bus_push.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]
