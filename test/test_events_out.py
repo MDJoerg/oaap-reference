@@ -199,7 +199,7 @@ ok("CLI: oaap events grant client:<label> mit Hinweis bei personenbezogen",
    and "leaves the tenant" in ac)
 j = ac.find("def cmd_events")
 body = ac[j:ac.find("\ndef ", j + 10)]
-g = body.find('    if args.action == "grant":\n        # a client was checked above')
+g = body.find("        # a client was checked above (client_grant_error); an instance here")
 ok("CLI: der Freigabe-Zweig gilt fuer Instanz UND Client (gemessen: Client fiel in den Widerruf)",
    g > 0 and body.find("INSERT INTO {s}.bus_grants", g) > g
    and body.find("INSERT INTO {s}.bus_grants", g) < body.find("SET revoked_at = now()", g))

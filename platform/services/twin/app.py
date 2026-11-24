@@ -103,6 +103,7 @@ import mcp_door
 import semantic
 import timeseries as ts
 import twin_inbound as tsi
+import bus_model as bm
 import twin_read as tr
 import twin_status as tst
 import twin_sync as tsy
@@ -1284,8 +1285,10 @@ def v1_resume_hook(door, hid):
 
 
 # ------------------------------------- RFC-0120 D13: inbound webhooks (0.14 §2.26)
-def _may_receive(door):
+def _may_receive(door, body=None):
     c = resolve_client(door.principal[len(CLIENT_PREFIX):]) or {}
+    if isinstance(body, dict) and body.get("mapping") is None and body.get("events") is not None:
+        return          # 0.9: CloudEvents only -- nothing is written into the twin
     if not (c.get("writes") or c.get("models")):
         raise tw.Refused(f"'{door.principal}' writes nothing -- a receiver writes as its "
                          "client, so the tenant admin gives it 'writes' first", 403)
@@ -1294,8 +1297,9 @@ def _may_receive(door):
 @app.post("/twin/v1/receivers")
 @v1_write
 def v1_add_receiver(door):
-    _may_receive(door)
-    return jsonify(tsi.add(door.conn, door.principal, door.writable, _body())), 201
+    body = _body()
+    _may_receive(door, body)
+    return jsonify(tsi.add(door.conn, door.principal, door.writable, body)), 201
 
 
 @app.get("/twin/v1/receivers")
@@ -1307,8 +1311,9 @@ def v1_receivers(door):
 @app.put("/twin/v1/receivers/<name>")
 @v1_write
 def v1_replace_receiver(door, name):
-    _may_receive(door)
-    return jsonify(tsi.replace(door.conn, door.principal, door.writable, name, _body()))
+    body = _body()
+    _may_receive(door, body)
+    return jsonify(tsi.replace(door.conn, door.principal, door.writable, name, body))
 
 
 @app.delete("/twin/v1/receivers/<name>")
@@ -1348,6 +1353,27 @@ def v1_inbound(label, name):
             with conn:
                 tsi.note(conn, rec["id"], refused=True)
             return jsonify({"error": "the signature does not fit"}), 401
+        if rec.get("events") and (rec.get("mapping") in (None, {}) or
+                                  request.headers.get("ce-specversion") or "cloudevents" in
+                                  (request.headers.get("Content-Type") or "")):
+            # 0.9 (RFC-0127 D8): CloudEvents in -- every event of the delivery
+            # maps to a declared type, or none is taken
+            evs, why = bm.parse_cloudevents(raw, request.headers)
+            accepted = []
+            for ev in evs or []:
+                a, why = bm.map_cloudevent(ev, (rec["events"] or {}).get("types") or [])
+                if a is None:
+                    break
+                accepted.append(a)
+            if evs is None or why:
+                with conn:
+                    tsi.note(conn, rec["id"], error=why)
+                return jsonify({"error": why}), 422
+            with conn:
+                stored, replayed = tsi.store_events(conn, rec, label, accepted)
+            with conn:
+                tsi.note(conn, rec["id"], written=stored)
+            return jsonify({"accepted": len(accepted), "stored": stored, "replayed": replayed}), 202
         try:
             root = json.loads(raw)
         except ValueError:

@@ -95,7 +95,7 @@ def push_instance(cur, tenant, instance, entry, secret, send=post, now=None):
     if where is None:
         return "nothing"
     cur.execute("SELECT seq, id, type, source_instance, source_app, subject, time, data, semantic, "
-                f"oaapto FROM bus_events WHERE seq > %s AND {where[0]} ORDER BY seq LIMIT %s",
+                f"oaapto, ext FROM bus_events WHERE seq > %s AND {where[0]} ORDER BY seq LIMIT %s",
                 [st["last_seq"]] + where[1] + [bm.PUSH_PER_PASS])
     rows = cur.fetchall()
     if not rows:

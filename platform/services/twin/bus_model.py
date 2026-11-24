@@ -396,7 +396,12 @@ def envelope(row, tenant, app_id, semantic=None):
         tm = tm.astimezone(__import__("datetime").timezone.utc).isoformat(
             timespec="milliseconds").replace("+00:00", "Z")
     si = row["source_instance"]
-    if si.startswith("platform:"):
+    if si.startswith("receiver:"):
+        # 0.9: an event that came in through a client's receiver
+        label = si[len("receiver:"):].split("/", 1)[0]
+        src, origin = f"urn:oaap:tenant:{tenant}:{si}", f"client:{label}"
+        schema = dataschema("receiver", row["type"])
+    elif si.startswith("platform:"):
         src, origin = f"urn:oaap:tenant:{tenant}:{si[9:]}", si
         # the twin's events carry the origin as the twin names it (RFC-0127 §3)
         if si == "platform:twin" and isinstance(row.get("data"), dict)                 and row["data"].get("origin"):
@@ -414,6 +419,16 @@ def envelope(row, tenant, app_id, semantic=None):
         ev["oaapsemantic"] = semantic or row.get("semantic")
     if row.get("oaapto"):
         ev["oaapto"] = "instance:" + row["oaapto"]
+    ext = row.get("ext")
+    if isinstance(ext, str):
+        try:
+            ext = json.loads(ext)
+        except ValueError:
+            ext = None
+    if isinstance(ext, dict):
+        for k in ("source", "type", "id"):
+            if ext.get(k):
+                ev["oaapext" + k] = ext[k]
     return ev
 
 # ------------------------------------------------- platform types (0.4)
@@ -661,6 +676,148 @@ def twin_change_event(change, tenant):
         out["oaapmergedfrom"] = change["merged_from"]
     return out
 
+# ------------------------------------------- receivers in (0.9)
+#
+# RFC-0127 D8, stage 3.2: a client's receiver may declare event types
+# `ext.<client>.<entity>.<what>.v<major>`; a CloudEvent posted to it (SAP's
+# form: structured, batched or binary) becomes an event of the declared type
+# its sender's type maps to (`from`; Jörg 2026-11-24: our own type, the
+# sender's kept as `oaapexttype`, its source as `oaapextsource`, its id as
+# `oaapextid`). Audience `tenant`: an instance or a client receives it after
+# the tenant admin's grant.
+
+RECEIVER_TYPES_MAX = 20
+EXT_FROM_MAX = 200
+
+
+def ext_prefix(label):
+    return "ext." + label.replace("-", "") + "."
+
+
+def receiver_events_error(ev, label):
+    """'' when a receiver's `events` declaration fits, else the sentence.
+    ev = {"types": [{type, title, from?, schema?, personal?}]}."""
+    if not isinstance(ev, dict) or set(ev) - {"types"}:
+        return "'events' is {types: [{type, title, from?, schema?, personal?}]}"
+    ts = ev.get("types")
+    if not isinstance(ts, list) or not ts or len(ts) > RECEIVER_TYPES_MAX:
+        return f"events.types: 1..{RECEIVER_TYPES_MAX} entries"
+    seen, froms = set(), set()
+    for i, t in enumerate(ts):
+        w = f"events.types[{i}]"
+        if not isinstance(t, dict) or set(t) - {"type", "title", "from", "schema", "personal"}:
+            return f"{w}: {{type, title, from?, schema?, personal?}}"
+        err = type_error(t.get("type"))
+        if err:
+            return f"{w}.type: {err}"
+        if not t["type"].startswith(ext_prefix(label)):
+            return f"{w}.type: a receiver of client '{label}' declares types under '{ext_prefix(label)}…'"
+        if t["type"] in seen:
+            return f"{w}.type: {t['type']} twice"
+        seen.add(t["type"])
+        if not isinstance(t.get("title"), str) or not t["title"].strip() or len(t["title"]) > 120:
+            return f"{w}.title: required, at most 120 characters"
+        f = t.get("from", t["type"])
+        if not isinstance(f, str) or not f or len(f) > EXT_FROM_MAX or any(ord(c) < 33 for c in f):
+            return f"{w}.from: the sender's type, 1..{EXT_FROM_MAX} visible characters"
+        if f in froms:
+            return f"{w}.from: {f} maps to two types"
+        froms.add(f)
+        if "schema" in t:
+            if not isinstance(t["schema"], dict) or t["schema"].get("type") not in (None, "object"):
+                return f"{w}.schema: an object schema"
+            err = schema_error(t["schema"])
+            if err:
+                return f"{w}.schema: {err}"
+        if "personal" in t and not isinstance(t["personal"], bool):
+            return f"{w}.personal: true or false"
+    return ""
+
+
+def with_receivers(catalogue, tenant, receivers):
+    """The catalogue plus one entry per receiver with declared types --
+    `receiver:<label>/<name>` publishing them with audience `tenant` -- so
+    grants, the overview and the export treat them like any publisher.
+    receivers = [{principal: 'client:<label>', name, events}]."""
+    out = {"instances": dict((catalogue or {}).get("instances") or {})}
+    for r in receivers or []:
+        ev = r.get("events")
+        if isinstance(ev, str):
+            try:
+                ev = json.loads(ev)
+            except ValueError:
+                ev = None
+        if not isinstance(ev, dict):
+            continue
+        label = str(r.get("principal", "")).split(":", 1)[-1]
+        pubs = [{"type": t["type"], "title": t.get("title", t["type"]), "subject": "external",
+                 "semantic_id": None, "audience": "tenant", "listed": [],
+                 "personal": t.get("personal") is True,
+                 "schema": t.get("schema") or {"type": "object"}, "from": t.get("from", t["type"])}
+                for t in ev.get("types") or [] if isinstance(t, dict) and t.get("type")]
+        out["instances"][f"receiver:{label}/{r.get('name')}"] = {
+            "tenant": tenant, "app_id": "receiver", "version": "", "publishes": pubs,
+            "subscribes": [], "endpoint": ""}
+    return out
+
+
+def parse_cloudevents(raw, headers):
+    """[CloudEvent dict] from a request: `application/cloudevents-batch+json`
+    (a JSON array), `application/cloudevents+json` or a JSON body with
+    `specversion` (structured), or the binary mode (`ce-*` headers, the body is
+    `data`). (None, sentence) when it is none of them."""
+    ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if headers.get("ce-specversion") or headers.get("ce-type"):
+        ev = {k: headers.get("ce-" + k) for k in ("specversion", "id", "source", "type",
+                                                  "subject", "time", "dataschema")
+              if headers.get("ce-" + k)}
+        try:
+            ev["data"] = json.loads(raw) if raw else None
+        except ValueError:
+            return None, "binary mode: the body (data) is JSON"
+        return [ev], ""
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return None, "the body is not JSON"
+    if ctype == "application/cloudevents-batch+json":
+        if not isinstance(doc, list) or not doc or len(doc) > 50:
+            return None, "a batch is a JSON array of 1..50 CloudEvents"
+        return doc, ""
+    if isinstance(doc, dict) and "specversion" in doc:
+        return [doc], ""
+    return None, "not a CloudEvent: structured (specversion in the body), batched or binary (ce-* headers)"
+
+
+def map_cloudevent(ev, declared):
+    """(accepted, sentence) for one incoming CloudEvent against a receiver's
+    declared types. accepted = {type, subject, data, ext}."""
+    if not isinstance(ev, dict):
+        return None, "a CloudEvent is a JSON object"
+    if ev.get("specversion") != "1.0":
+        return None, "specversion: 1.0"
+    for k in ("id", "source", "type"):
+        v = ev.get(k)
+        if not isinstance(v, str) or not v or len(v) > 400 or any(ord(c) < 32 for c in v):
+            return None, f"{k}: required, a printable string"
+    t = next((d for d in declared if d.get("from", d["type"]) == ev["type"]), None)
+    if t is None:
+        return None, f"{ev['type']} is not a type this receiver declares (events.types[].from)"
+    data = ev.get("data")
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        data = {"value": data}
+    if len(json.dumps(data, separators=(",", ":")).encode()) > MAX_DATA_BYTES:
+        return None, f"data is larger than {MAX_DATA_BYTES // 1024} KB"
+    if t.get("schema"):
+        bad = validate(data, t["schema"])
+        if bad:
+            return None, f"{bad[0]}: {bad[1]}"
+    subj = ev.get("subject") if isinstance(ev.get("subject"), str) and ev.get("subject") else ev["id"]
+    return {"type": t["type"], "subject": subj[:SUBJECT_MAX], "data": data,
+            "ext": {"source": ev["source"], "type": ev["type"], "id": ev["id"]}}, ""
+
 # ------------------------------------------- the portal page (0.6)
 
 
@@ -673,8 +830,14 @@ def overview(catalogue, registry, tenant, grants, deliveries, clients=None):
     stopped_at, last_error, last_ok_at}}."""
     live = {(g["instance"], g["type"]): g for g in grants}
     insts = []
+    recv = []
     for name, e in sorted(((catalogue or {}).get("instances") or {}).items()):
         if e.get("tenant") != tenant:
+            continue
+        if name.startswith("receiver:"):
+            recv += [{"receiver": name[len("receiver:"):], "type": p["type"], "title": p["title"],
+                      "from": p.get("from", p["type"]), "personal": p.get("personal", False)}
+                     for p in e.get("publishes") or []]
             continue
         subs = []
         for sb in e.get("subscribes") or []:
@@ -725,7 +888,7 @@ def overview(catalogue, registry, tenant, grants, deliveries, clients=None):
         cls.append({"client": p, "label": label, "grants": held,
                     "grantable": [{"type": t, "personal": is_personal(catalogue, tenant, t)}
                                   for t in offer if t not in have]})
-    return {"instances": insts, "platform_types": plat, "clients": cls}
+    return {"instances": insts, "platform_types": plat, "clients": cls, "receiver_types": recv}
 
 # ------------------------------------------------ AsyncAPI export (0.7)
 #
@@ -773,7 +936,8 @@ def _type_index(catalogue, tenant):
     for name, e in sorted(((catalogue or {}).get("instances") or {}).items()):
         if e.get("tenant") == tenant:
             for p in e.get("publishes") or []:
-                idx.setdefault(p["type"], (p, "instance:" + name))
+                idx.setdefault(p["type"], (p, name if name.startswith("receiver:")
+                                           else "instance:" + name))
     return idx
 
 

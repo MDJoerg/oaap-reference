@@ -13102,6 +13102,21 @@ Erlaubnis für genau dieses Ziel, auch für personenbezogene Typen.</p>
 </div>
 {% endfor %}
 {% endif %}
+{% if receiver_types %}
+<div class="card">
+  <h2>Von außen (Empfänger)</h2>
+  <p class="muted">Ereignisse fremder Systeme, die ein Integrations-Client über
+  einen Empfänger einliefert, im eigenen Typ des Mandanten; Apps erhalten sie
+  nach Ihrer Freigabe.</p>
+  <table>
+  <tr><th>Typ</th><th>Bedeutung</th><th>Empfänger</th><th>Typ beim Absender</th></tr>
+  {% for r in receiver_types %}
+  <tr><td><code>{{ r.type }}</code>{% if r.personal %} <span class="badge off">personenbezogen</span>{% endif %}</td>
+    <td>{{ r.title }}</td><td class="muted">{{ r.receiver }}</td><td class="muted"><code>{{ r.from }}</code></td></tr>
+  {% endfor %}
+  </table>
+</div>
+{% endif %}
 <div class="card">
   <h2>Ereignisse der Plattform</h2>
   <table>

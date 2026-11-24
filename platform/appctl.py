@@ -7968,6 +7968,14 @@ def cmd_migrate_tenant_places(_args):
     except OSError:
         have = ""
     missing = [f for f in want if f"://{f} {{" not in have]
+    # oaap.events.bus 0.9: the sites written before carry no inbound route
+    # -- the same rewrite, said once (quiet afterwards)
+    if have and "handle /twin/v1/inbound/* {" not in have:
+        refresh_generated_sites()
+        reload_gateway()
+        print("")
+        print("Inbound webhooks and CloudEvents now reach the twin at this node's "
+              "external name (/twin/v1/inbound/, oaap.events.bus 0.9).")
     if not missing:
         return
     print("")
@@ -17749,6 +17757,8 @@ def _twin_ensure_tables(schema):
         CREATE INDEX IF NOT EXISTS statuses_event ON "{schema}".statuses (event_id);
         CREATE UNIQUE INDEX IF NOT EXISTS receivers_live
             ON "{schema}".receivers (principal, name) WHERE removed_at IS NULL;
+        -- oaap.events.bus 0.9 (RFC-0127 D8): a receiver's declared event types
+        ALTER TABLE "{schema}".receivers ADD COLUMN IF NOT EXISTS events jsonb;
         -- The tenant's event store (oaap.events.bus 0.1 §2.6, RFC-0127 D6):
         -- what apps published through /platform/events, in the CloudEvents
         -- envelope's parts. Append-only; rows older than the retention
@@ -17767,6 +17777,9 @@ def _twin_ensure_tables(schema):
             oaapto text
         );
         CREATE INDEX IF NOT EXISTS bus_events_type ON "{schema}".bus_events (type, seq);
+        ALTER TABLE "{schema}".bus_events ADD COLUMN IF NOT EXISTS ext jsonb;
+        CREATE INDEX IF NOT EXISTS bus_events_ext ON "{schema}".bus_events
+            (source_instance, (ext->>'id')) WHERE ext IS NOT NULL;
         CREATE INDEX IF NOT EXISTS bus_events_rate ON "{schema}".bus_events (source_instance, time);
         -- Grants (§2.7, RFC-0127 D4): the tenant admin's yes, per instance
         -- and type. Revoking sets revoked_*; a new grant is a new row.
@@ -18355,6 +18368,17 @@ def events_follow_instance(inst, old, new=None):
               f"{'revoked' if new is None else 'carried over'}: {e}", file=sys.stderr)
 
 
+def _events_receivers(tid):
+    """The tenant's receivers that declare event types (oaap.events.bus 0.9)."""
+    try:
+        out = _events_psql(tid, "SELECT coalesce(json_agg(json_build_object('principal', principal, "
+                           "'name', name, 'events', events)), '[]') FROM {s}.receivers "
+                           "WHERE removed_at IS NULL AND events IS NOT NULL")
+        return json.loads(out.strip() or "[]")
+    except (SystemExit, ValueError):
+        return []
+
+
 def cmd_events(args):
     """oaap events list|grant|revoke (oaap.events.bus 0.1 §2.7)."""
     reg = load_registry()
@@ -18444,6 +18468,7 @@ def cmd_events(args):
             die(f"no integration client '{key}' on this node")
         tid = c.get("tenant", "")
         if args.action == "grant":
+            cat = bus_model.with_receivers(cat, tid, _events_receivers(tid))
             why = bus_model.client_grant_error(cat, tid, load_twin_clients(), key, args.type)
             if why:
                 die(why)
@@ -18457,6 +18482,7 @@ def cmd_events(args):
         inst = reg["instances"][key]
         tid = _instance_tenant_id(inst)
     if args.action == "grant":
+        cat = bus_model.with_receivers(cat, tid, _events_receivers(tid))
         # a client was checked above (client_grant_error); an instance here
         if not key.startswith(bus_model.CLIENT_PREFIX):
             why = bus_model.grant_error(cat, tid, key, args.type)
@@ -22013,6 +22039,20 @@ def _portal_site_body():
     lines.append(f"\thandle {CONNECT_FORWARD_ROUTE} {{")
     lines += strip_identity()
     lines += _proxy(CONNECT_SERVICE, "\t\t")
+    lines.append("\t}")
+    # inbound webhooks (oaap.data.twin 0.14 §2.26) and CloudEvents in
+    # (oaap.events.bus 0.9, RFC-0127 D8): a system outside posts to the
+    # node's NAME -- that is this site. The base Caddyfile's block alone was
+    # the /platform/* mistake again: measured 2026-11-24 from the PC, the
+    # external name answered the sender with the login page. No key, no
+    # session: only the receiver's signature counts, every identity header
+    # is stripped, 1 MB at most -- exactly the base Caddyfile's block.
+    lines.append("\thandle /twin/v1/inbound/* {")
+    lines += strip_identity()
+    lines.append("\t\trequest_body {")
+    lines.append("\t\t\tmax_size 1MB")
+    lines.append("\t\t}")
+    lines.append("\t\treverse_proxy twin:8000")
     lines.append("\t}")
     lines.append("\thandle {")
     lines.append("\t\tforward_auth identity:8000 {")

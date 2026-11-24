@@ -199,11 +199,36 @@ def register(app, get_conn, apps_dir):
             return None, (403, "the page \"Ereignisse\" is for the tenant's administrators")
         return (user, tenant), None
 
+    def _receivers(conn):
+        """[{principal, name, events}] of the tenant's receivers that declare
+        event types (0.9) -- empty in a schema from before them."""
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM information_schema.columns WHERE table_schema = "
+                        "current_schema() AND table_name = 'receivers' AND column_name = 'events'")
+            if cur.fetchone() is None:
+                return []
+            cur.execute("SELECT principal, name, events FROM receivers WHERE removed_at IS NULL "
+                        "AND events IS NOT NULL")
+            return cur.fetchall()
+
+    def _catalogue(tenant):
+        cat = _load(os.path.join(apps_dir, CATALOG_NAME), {})
+        conn = get_conn(tenant)
+        if conn is None:
+            return cat
+        try:
+            with conn:
+                return bm.with_receivers(cat, tenant, _receivers(conn))
+        except Exception:                          # noqa: BLE001 -- the page still shows apps
+            return cat
+        finally:
+            conn.close()
+
     def _clients():
         return (_load(os.path.join(apps_dir, "twin-clients.json"), {}) or {}).get("clients") or {}
 
     def _own_instance(tenant, name):
-        cat = _load(os.path.join(apps_dir, CATALOG_NAME), {})
+        cat = _catalogue(tenant)
         m = bm.CLIENT_RE.match(name)
         if m:
             c = _clients().get(m.group(1))
@@ -217,7 +242,7 @@ def register(app, get_conn, apps_dir):
         if who is None:
             return jsonify(error=err[1]), err[0]
         _user, tenant = who
-        cat = _load(os.path.join(apps_dir, CATALOG_NAME), {})
+        cat = _catalogue(tenant)
         reg = _load(os.path.join(apps_dir, "registry.json"), {})
         grants, deliveries, store = [], {}, False
         conn = get_conn(tenant)
@@ -247,7 +272,7 @@ def register(app, get_conn, apps_dir):
             return jsonify(error=err[1]), err[0]
         _user, tenant = who
         name = request.args.get("instance") or None
-        doc = bm.asyncapi(_load(os.path.join(apps_dir, CATALOG_NAME), {}),
+        doc = bm.asyncapi(_catalogue(tenant),
                           _load(os.path.join(apps_dir, "registry.json"), {}), tenant, name,
                           request.args.get("label", ""))
         if doc is None:
@@ -339,7 +364,7 @@ def register(app, get_conn, apps_dir):
                     return jsonify(events=[], next=since or None)
                 cur.execute(
                     "SELECT id, type, source_instance, source_app, subject, time, data, semantic, "
-                    f"oaapto FROM bus_events WHERE seq > %s AND {where[0]} ORDER BY seq LIMIT %s",
+                    f"oaapto, ext FROM bus_events WHERE seq > %s AND {where[0]} ORDER BY seq LIMIT %s",
                     [after] + where[1] + [limit])
                 rows = cur.fetchall()
         finally:

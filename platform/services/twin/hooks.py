@@ -202,7 +202,7 @@ def bus_batch(conn, principal, cursor, limit):
         if where is None:
             return [], cursor
         cur.execute("SELECT seq, id, type, source_instance, source_app, subject, time, data, "
-                    f"semantic, oaapto FROM bus_events WHERE seq > %s AND {where[0]} "
+                    f"semantic, oaapto, ext FROM bus_events WHERE seq > %s AND {where[0]} "
                     "ORDER BY seq LIMIT %s", [cursor] + where[1] + [limit])
         rows = cur.fetchall()
     return rows, (rows[-1]["seq"] if rows else cursor)

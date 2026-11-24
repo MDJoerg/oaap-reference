@@ -21,6 +21,7 @@ import re
 import secrets
 import time
 
+import bus_model as bm
 import twin_sync as tsy
 import twin_write as tw
 
@@ -329,7 +330,8 @@ def receiver_json(r, label=None):
     out = {"name": r["name"], "client": r["principal"].split(":", 1)[1], "state": state,
            "signature": {"scheme": r["scheme"]} | ({"header": r["header"]} if r["header"] else {})
            | ({"prefix": r["prefix"]} if r["prefix"] else {}),
-           "mapping": r["mapping"], "received": r["received"], "written": r["written"],
+           "mapping": r["mapping"], "events": r.get("events"),
+           "received": r["received"], "written": r["written"],
            "refused": r["refused"],
            "last_ok_at": r["last_ok_at"].isoformat() if r.get("last_ok_at") else None,
            "last_error": r.get("last_error"),
@@ -355,12 +357,29 @@ def find(conn, principal, name):
         return cur.fetchone()
 
 
+def _events(principal, body):
+    """The receiver's `events` (0.9) checked, or None. A receiver has a
+    mapping into the twin, declared event types, or both."""
+    ev = body.get("events")
+    if ev is None:
+        if body.get("mapping") is None:
+            _refuse("a receiver has a 'mapping' (into the twin) or 'events' (CloudEvents in, "
+                    "RFC-0127 D8) or both")
+        return None
+    err = bm.receiver_events_error(ev, principal.split(":", 1)[1])
+    if err:
+        _refuse(err)
+    return ev
+
+
 def add(conn, principal, writable, body):
     name = body.get("name")
     if not isinstance(name, str) or not NAME_RE.match(name):
         _refuse("'name' is [a-z0-9][a-z0-9-]{0,38} -- it is part of the receiver's URL")
     scheme, header, prefix = _signature(body.get("signature"))
-    check_mapping(body.get("mapping"), writable)
+    events = _events(principal, body)
+    if body.get("mapping") is not None:
+        check_mapping(body.get("mapping"), writable)
     with conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"receivers:{principal}",))
         cur.execute("SELECT count(*) AS n FROM receivers WHERE removed_at IS NULL "
@@ -371,9 +390,10 @@ def add(conn, principal, writable, body):
             _refuse(f"a receiver '{name}' exists -- PUT replaces its mapping", 409)
         secret = secrets.token_urlsafe(32)
         cur.execute("INSERT INTO receivers (principal, name, scheme, header, prefix, secret, "
-                    "mapping) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                    "mapping, events) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
                     (principal, name, scheme, header, prefix, secret,
-                     json.dumps(body["mapping"])))
+                     json.dumps(body.get("mapping") or {}),
+                     json.dumps(events) if events is not None else None))
         r = cur.fetchone()
     return dict(receiver_json(r), secret=secret)
 
@@ -386,11 +406,14 @@ def replace(conn, principal, writable, name, body):
         scheme, header, prefix = _signature(body.get("signature"))
     else:
         scheme, header, prefix = r["scheme"], r["header"], r["prefix"]
-    check_mapping(body.get("mapping"), writable)
+    events = _events(principal, body)
+    if body.get("mapping") is not None:
+        check_mapping(body.get("mapping"), writable)
     with conn.cursor() as cur:
         cur.execute("UPDATE receivers SET scheme = %s, header = %s, prefix = %s, mapping = %s, "
-                    "last_error = NULL, last_error_at = NULL WHERE id = %s RETURNING *",
-                    (scheme, header, prefix, json.dumps(body["mapping"]), r["id"]))
+                    "events = %s, last_error = NULL, last_error_at = NULL WHERE id = %s RETURNING *",
+                    (scheme, header, prefix, json.dumps(body.get("mapping") or {}),
+                     json.dumps(events) if events is not None else None, r["id"]))
         return receiver_json(cur.fetchone())
 
 
@@ -414,3 +437,26 @@ def note(conn, rid, *, refused=False, written=None, error=None):
         else:
             cur.execute("UPDATE receivers SET received = received + 1, written = written + %s, "
                         "last_ok_at = now() WHERE id = %s", (written or 0, rid))
+
+
+# ------------------------------------------- CloudEvents in (0.9, RFC-0127 D8)
+def store_events(conn, rec, label, accepted):
+    """Write accepted CloudEvents into the tenant's event store, once per
+    (sender's source, sender's id) -- a retry of the same event is taken and
+    not stored again. Returns (stored, replayed)."""
+    src = f"receiver:{label}/{rec['name']}"
+    stored = replayed = 0
+    with conn.cursor() as cur:
+        for a in accepted:
+            cur.execute("SELECT 1 FROM bus_events WHERE source_instance = %s AND "
+                        "ext->>'source' = %s AND ext->>'id' = %s",
+                        (src, a["ext"]["source"], a["ext"]["id"]))
+            if cur.fetchone() is not None:
+                replayed += 1
+                continue
+            cur.execute("INSERT INTO bus_events (id, type, source_instance, source_app, subject, "
+                        "data, semantic, ext) VALUES (%s, %s, %s, %s, %s, %s, NULL, %s)",
+                        (bm.ulid(), a["type"], src, f"client:{label}", a["subject"],
+                         json.dumps(a["data"]), json.dumps(a["ext"])))
+            stored += 1
+    return stored, replayed
