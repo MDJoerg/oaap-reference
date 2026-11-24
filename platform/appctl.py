@@ -23538,6 +23538,20 @@ def report_grants(name, report):
             print(f"WARNING: {name}: grant '{g}': {outcome}", file=sys.stderr)
 
 
+def stale_containers(stored, services):
+    """The containers the registry records for an instance that `services`
+    (its new shape) no longer names -- in the registry's order. Only names
+    of this instance (oaap-app-...), never anything else."""
+    want = {s.get("container") for s in services or []}
+    had = [s.get("container") for s in (stored or {}).get("services") or []]
+    had.append((stored or {}).get("container"))
+    out = []
+    for c in had:
+        if c and c.startswith("oaap-app-") and c not in want and c not in out:
+            out.append(c)
+    return out
+
+
 def recreate_instance_containers(name, services, storage, endpoints=None,
                                  inst=None, cause=None, detail=""):
     """(Re)create ALL of an instance's service containers on its own
@@ -23593,6 +23607,16 @@ def recreate_instance_containers(name, services, storage, endpoints=None,
     # A sleeping instance is re-made, not started: no line.
     if stored.get("state") != "standby":
         restart_record(name, cause or "setting", detail)
+    # A version that changes the SHAPE of an instance (one service -> two:
+    # oaap-app-<inst> -> oaap-app-<inst>-web) must not leave the old
+    # container running beside the new ones: both would mount the same
+    # storage (measured 2026-11-24 with forgejo: two Forgejo processes on
+    # one SQLite database). Whatever the registry knew and the new shape
+    # does not name goes first.
+    for old in stale_containers(stored, services):
+        print(f"Removing container {old}: the new version of '{name}' no "
+              "longer has it (its services changed).")
+        subprocess.run(["docker", "rm", "-f", old], capture_output=True, text=True)
     for s in services:
         uid = image_uid(s["image"])
         mounts = []
