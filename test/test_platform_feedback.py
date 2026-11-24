@@ -359,8 +359,8 @@ ok("der Block steht vor /platform/* und vor der App-Route",
 ok("eine App-Site traegt die Tuer NICHT",
    block(site("hbvp-portal"), "handle /platform/cases/node {") is None
    and block(site("fremd"), "handle /platform/cases/node {") is None)
-ok("der Marker zaehlt das Format 11 (oaap.events.bus 0.2: Eintrag an der Vorgangstuer), damit Sites auf der Platte nachgezogen werden",
-   m.CASES_BLOCK_FORMAT == 11 and f"{m.CASES_MARKER}11 " in body)
+ok("der Marker zaehlt das Format 12 (RFC-0126: /platform/people), damit Sites auf der Platte nachgezogen werden",
+   m.CASES_BLOCK_FORMAT == 12 and f"{m.CASES_MARKER}12 " in body)
 ok("die Migration (Abschnitt 5) findet nichts mehr zu tun", m._cases_sites_behind() == [])
 
 print("")

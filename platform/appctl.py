@@ -6270,7 +6270,7 @@ def _read_file(path):
 # node already in the field, or every extension to the format becomes a
 # flag day for the whole fleet.
 MANIFEST_MAJOR = 0
-MANIFEST_MINOR = 21     # 0.2 adds app.class (runtime spec 2.10);
+MANIFEST_MINOR = 22     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.3 adds data_model/contributes/consumes
                         # (RFC-0031 Schritt 2, oaap.data.model 0.1);
                         # 0.4 adds launchpad.group/embeddable
@@ -6318,7 +6318,10 @@ MANIFEST_MINOR = 21     # 0.2 adds app.class (runtime spec 2.10);
                         # 0.21 adds events.publishes/subscribes
                         # (oaap.events.bus 0.1, RFC-0127 -- an app publishes
                         # through /platform/events and receives what the
-                        # tenant admin granted it).
+                        # tenant admin granted it);
+                        # 0.22 adds people.invite (RFC-0126 -- an app
+                        # invites people without platform authority; the
+                        # platform makes the login and Keycloak mails).
 
 # What an app IS, as opposed to app.type, which says how it is packaged.
 # 'service' means "used by other software" and costs the instance its
@@ -13359,6 +13362,9 @@ def cmd_tenant(args):
     if args.action == "recipe":
         return _tenant_recipe_cli(args)
 
+    if args.action == "people":
+        return _tenant_people_cli(args)
+
     if args.action == "templates":
         return _tenant_templates_cli(args)
 
@@ -16666,6 +16672,13 @@ def validate_manifest(m):
             err = mcp_door_error(m)
             if err:
                 errs.append(err)
+        # Manifest 0.22 (RFC-0126): the app invites people. A literal true and
+        # nothing else, like `cases.submit` -- a typo must not mint a key.
+        if "people" in m:
+            if not isinstance(m["people"], dict) or set(m["people"]) - {"invite"}:
+                errs.append("people: an object with 'invite' only")
+            elif "invite" in m["people"] and not isinstance(m["people"]["invite"], bool):
+                errs.append("people.invite: true or false")
         # Manifest 0.21 (oaap.events.bus 0.1, RFC-0127): the events the app
         # publishes and wants. Here without the package (every schema
         # stands in as an empty object); install checks the files too
@@ -17905,7 +17918,7 @@ def _cases_issue_submit_key(name, tenant_id):
 INSTANCE_KEY_VARS = ("OAAP_PLATFORM_KEY", "OAAP_AUTHZ_KEY",
                      "OAAP_AUTHZ_ADMIN_KEY", "OAAP_CASES_KEY",
                      "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_CLIENT_KEY",
-                     "OAAP_AI_CLIENT_KEY", "OAAP_EVENTS_KEY")
+                     "OAAP_AI_CLIENT_KEY", "OAAP_EVENTS_KEY", "OAAP_PEOPLE_KEY")
 RENEW_DAYS = 30
 
 
@@ -17986,6 +17999,10 @@ def instance_keys_issue(name, tenant_id, app_id, which, administer=False, port=N
             out[var] = _events_issue_key(name, tenant_id)
             if port:
                 out["OAAP_EVENTS_URL"] = events_url(port)
+        elif var == "OAAP_PEOPLE_KEY":
+            out[var] = _people_issue_key(name, tenant_id)
+            if port:
+                out["OAAP_PEOPLE_URL"] = people_url(port)
     return out
 
 
@@ -18176,6 +18193,45 @@ def events_declared(m, pkg):
     if err:
         die(err)
     return entry
+
+
+# RFC-0126 (D1): the key an instance presents at its own door
+# /platform/people/ -- the construction of the cases and events keys.
+PEOPLE_SCOPE = "oaap.people.invite"
+
+
+def people_scope(name):
+    return f"{PEOPLE_SCOPE}:{name}"
+
+
+def people_wanted(m):
+    """Only a literal `people: {invite: true}`."""
+    return isinstance(m.get("people"), dict) and m["people"].get("invite") is True
+
+
+def people_url(port):
+    return f"http://{GATEWAY_CONTAINER}:{port}/platform/people"
+
+
+def _people_issue_key(name, tenant_id):
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "with m.users_rw() as users:\n"
+        "    name = os.environ['OAAP_T_NAME']\n"
+        "    if not m.find_user(users, name):\n"
+        "        users.append({'username': name,\n"
+        "                      'display_name': os.environ['OAAP_T_INST'],\n"
+        "                      'password_hash': '', 'kind': 'machine',\n"
+        "                      'roles': ['user'], 'groups': [],\n"
+        "                      'tenant': os.environ['OAAP_T_TENANT'],\n"
+        "                      'active': True})\n"
+        "        m.save_users(users)\n"
+        "rec, secret = m.issue_key(users, name, ['user'], os.environ['OAAP_T_SCOPE'],\n"
+        "    'oaap.people.invite (RFC-0126)', m.KEY_MAX_DAYS, 'root')\n"
+        "print(json.dumps(secret))\n",
+        {"OAAP_T_NAME": f"instance:{name}", "OAAP_T_INST": name,
+         "OAAP_T_TENANT": tenant_id, "OAAP_T_SCOPE": people_scope(name)})
+    return json.loads(out)
 
 
 def events_url(port):
@@ -18516,6 +18572,84 @@ def _mcp_idp_env(name, inst, values):
     recreate_instance_containers(name, instance_services(inst),
                                  inst.get("storage") or [])
     return True
+
+
+# ------------------------------------------- RFC-0126: apps invite people
+#
+# The tenant's switch `people.invite` (D2): only a server_admin turns it, on
+# the node's command line. On, the connector prepares the tenant's own space
+# (idp_admin.Admin.people_on: the marker attribute, the group, 'forgot
+# password' -- D11 --, the client `oaap-people` with exactly three roles) and
+# its secret goes into the 0600 secrets file identity reads (D12: a credential
+# for THIS realm only). Off disables the client and drops the secret; the
+# people already invited keep their login.
+def tenant_people_apply(label, on, accept_version="", who="root", out=print):
+    """(ok, sentence)."""
+    tid = resolve_tenant_arg(label or DEFAULT_TENANT_LABEL)
+    tenants = load_tenants()
+    t = tenants.get(tid) or {}
+    prov = t.get("idp") or {}
+    if not prov.get("connector") or not prov.get("space"):
+        return False, (f"tenant '{label}' has no space a connector of this node made -- "
+                       "invitations need the tenant's own realm (RFC-0126 D9; "
+                       "`oaap idp provision <connector> --tenant <label>`)")
+    c = load_idp_connectors().get(prov["connector"])
+    if not c:
+        return False, f"the connector '{prov['connector']}' is not on this node"
+    space = prov.get("space") or idp_admin.space_for(t.get("label") or label)
+    admin = idp_admin.Admin(c["kind"], c["base_url"], c["auth"], c["admin_id"],
+                            c["admin_secret"], auth_realm=c.get("auth_realm", ""))
+    accept = accept_version or c.get("accept_version", "")
+    if on:
+        ok, got, msg = admin.people_on(space, accept)
+    else:
+        ok, msg = admin.people_off(space, accept)
+        got = {}
+    for line in admin.trace:
+        out("  " + line)
+    if not ok:
+        audit_tenant("tenant.people-invite", tid, "on" if on else "off", "failed",
+                     who=who, detail=msg)
+        return False, msg
+    held = load_idp_secrets()
+    rec = dict(held.get(tid) or {})
+    if on:
+        rec["people"] = {"client_id": got["client_id"], "secret": got["secret"],
+                         "issuer": got["issuer"], "written": _iso_now()}
+    else:
+        rec.pop("people", None)
+    held[tid] = rec
+    save_idp_secrets(held)
+    tenants = load_tenants()
+    tenants[tid] = dict(tenants[tid], people_invite=bool(on))
+    save_tenants(tenants)
+    audit_tenant("tenant.people-invite", tid, "on" if on else "off", who=who,
+                 detail=f"{space} · {msg}")
+    return True, msg + ("" if on else "; people already invited keep their login")
+
+
+def _tenant_people_cli(args):
+    want = (args.target or "show").strip().lower()
+    label = args.name or DEFAULT_TENANT_LABEL
+    if want == "show":
+        tid = resolve_tenant_arg(label)
+        t = load_tenants().get(tid) or {}
+        has = bool((load_idp_secrets().get(tid) or {}).get("people"))
+        print(f"tenant '{label}': apps may invite people: "
+              f"{'on' if t.get('people_invite') else 'off'}"
+              + ("" if bool(t.get("people_invite")) == has else
+                 f" -- but the realm credential is {'there' if has else 'missing'}; "
+                 "turn it on or off again"))
+        return
+    if want not in ("on", "off"):
+        die("usage: oaap tenant people <label> on|off|show")
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        die("only the node's operator (server_admin, as root) turns this switch (RFC-0126 D2)")
+    ok, msg = tenant_people_apply(label, want == "on",
+                                  who=os.environ.get("SUDO_USER") or "root")
+    if not ok:
+        die(msg)
+    print(msg)
 
 
 def mcp_idp_apply(name, connector_name="", off=False, dry_run=False,
@@ -21039,10 +21173,12 @@ CASES_MARKER = "# platform-feedback "
 # 9: every site carries /platform/context.json (RFC-0118 P3).
 # 10: an instance with an events block carries /platform/events
 #     (oaap.events.bus 0.1, RFC-0127 D3).
+# 12: an instance with `people: {invite: true}` carries /platform/people
+#     (RFC-0126 D1).
 # 11: the case door records who submits to which inbox (a second
 #     forward_auth to the twin service), and the events door serves only
 #     `/` and `/feed` (oaap.events.bus 0.2).
-CASES_BLOCK_FORMAT = 11
+CASES_BLOCK_FORMAT = 12
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -21344,6 +21480,27 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
             lines += ["\t\t\turi strip_prefix /platform/events",
                       "\t\t\trewrite * /bus/v1{uri}",
                       "\t\t\treverse_proxy twin:8000 {"]
+            lines += [f"\t\t\t\theader_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)]
+            lines += ["\t\t\t}", "\t\t}", "\t}"]
+    # RFC-0126 (D1): the instance's people door. Only the key scoped to
+    # people_scope(this instance) passes; identity answers under /people/v1
+    # and believes the source only when its principal names this instance.
+    if me.get("people_invite") and not login_only and not is_rehearsal(me):
+        uri = "/verify?roles="
+        if tenant:
+            uri += f"&tenant={tenant}"
+        uri += f"&instance={people_scope(scope or '-')}"
+        source = (scope or "-", me.get("app_id") or "-",
+                  me.get("version") or "-",
+                  tenant or instance_tenant_ref(me))
+        for matcher in ("/platform/people", "/platform/people/*"):
+            lines += [f"\thandle {matcher} {{", "\t\troute {"]
+            lines += ["\t\t\tforward_auth identity:8000 {", f"\t\t\t\turi {uri}",
+                      "\t\t\t\t" + _COPY_IDENTITY]
+            lines += ["\t" + x for x in _AUTH_NO_UPGRADE] + ["\t\t\t}"]
+            lines += ["\t\t\turi strip_prefix /platform/people",
+                      "\t\t\trewrite * /people/v1{uri}",
+                      "\t\t\treverse_proxy identity:8000 {"]
             lines += [f"\t\t\t\theader_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)]
             lines += ["\t\t\t}", "\t\t}", "\t}"]
     # RFC-0069 stage 2: on a `vorgaenge` site only, the node's door. The
@@ -22646,6 +22803,8 @@ RESERVED_ENV = {"OAAP_APP_SECRET", "OAAP_PLATFORM_KEY", "OAAP_TWIN_URL",
                 "OAAP_CASES_KEY", "OAAP_CASES_URL",
                 # oaap.events.bus 0.1 (RFC-0127)
                 "OAAP_EVENTS_KEY", "OAAP_EVENTS_URL", "OAAP_EVENTS_SECRET",
+                # RFC-0126
+                "OAAP_PEOPLE_KEY", "OAAP_PEOPLE_URL",
                 "OAAP_MCP_SOURCES_KEY", "OAAP_MCP_SOURCES_URL",
                 "OAAP_MCP_CLIENT_KEY", "OAAP_MCP_CLIENT_URL",
                 # RFC-0104: the model way and the setup key
@@ -27310,6 +27469,21 @@ def _install_from_dir(pkg, args, source):
         env.pop("OAAP_CASES_URL", None)
         print(f"'{name}' no longer asks to open cases: its key is no longer "
               "handed to the app.")
+    # RFC-0126 (D1): the key this instance presents at its own door
+    # /platform/people/. Minted once; never for a rehearsal (it would invite
+    # people into the production tenant's realm) or an artefact.
+    if people_wanted(m) and not is_artefact and not rehearsal:
+        if "OAAP_PEOPLE_KEY" not in env:
+            env["OAAP_PEOPLE_KEY"] = _people_issue_key(name, twin_tenant)
+            print(f"Issued a people key for '{name}' (RFC-0126) -- OAAP_PEOPLE_KEY/"
+                  "OAAP_PEOPLE_URL are in its environment. It invites only once the "
+                  "server_admin turned the tenant's switch on (`oaap tenant people`).")
+        env["OAAP_PEOPLE_URL"] = people_url(port)
+    elif "OAAP_PEOPLE_KEY" in env:
+        env.pop("OAAP_PEOPLE_KEY", None)
+        env.pop("OAAP_PEOPLE_URL", None)
+        print(f"'{name}' no longer asks to invite people: its key is no longer "
+              "handed to the app.")
     # oaap.events.bus 0.1 (RFC-0127 D3): the key this instance presents at
     # its own door /platform/events. Minted once; never for a rehearsal.
     if events_entry and not is_artefact and not rehearsal:
@@ -27556,6 +27730,9 @@ def _install_from_dir(pkg, args, source):
         # Manifest 0.21 (oaap.events.bus 0.1): what the app publishes (with
         # its schemas) and wants -- the catalogue is written from this.
         "events": events_entry,
+        # Manifest 0.22 (RFC-0126): the gateway serves /platform/people on
+        # this instance's site only when its manifest asks.
+        "people_invite": people_wanted(m),
         "docs_sources": docs_publish.docs_sources_wanted(m),
         # Manifest 0.20 (RFC-0119): the folder of its assistant templates.
         "assistant_templates": app_templates.folder_of(m),
@@ -42091,7 +42268,7 @@ def build_parser():
                       choices=["list", "show", "check", "log", "create",
                                "rename", "face", "idp", "policy", "adopt", "remove",
                                "build", "recipe", "egress", "allow", "disallow",
-                               "domain", "domains", "templates"])
+                               "domain", "domains", "templates", "people"])
     # RFC-0119 section 4.5: the operator withdraws an app's templates per tenant
     pten.add_argument("--block", dest="block_app", default=None,
                       help="for 'templates': the app id whose assistant templates "

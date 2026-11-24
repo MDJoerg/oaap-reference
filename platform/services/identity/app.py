@@ -2604,6 +2604,12 @@ def _idp_principal(tid, provider, claims):
             # at every login -- only those the mapping gave, never one a
             # person gave by hand. Under the same write lock as the rest.
             new_roles, source, role_changes = idp.role_sync(u, policy, claims)
+            if u.get("invited_by") and role_changes:
+                # RFC-0126 §5: a person an app invited stays at `partner` at
+                # most -- a realm group mapping never raises them; only a
+                # tenant admin by hand, which ends the app's hold on them.
+                new_roles = [r for r in new_roles if r in ("partner", "guest")] or ["partner"]
+                role_changes = new_roles != u.get("roles")
             if role_changes:
                 u["roles"] = new_roles
             if source:
@@ -4939,3 +4945,244 @@ def authz_mappings_remove(mid):
                  actor["username"], role,
                  f"{n} Zuordnung(en) beendet")
     return {"ok": True, "ended": n}
+
+
+# ------------------------------------------------ RFC-0126: apps invite people
+#
+# The gateway serves /platform/people/* on an instance's own site, lets only
+# the key scoped to oaap.people.invite:<instance> through and passes here as
+# /people/v1/... with the source headers. identity believes the source only
+# when its own principal names the same instance, takes the tenant from that
+# principal's record, and acts at the tenant's realm only through the realm's
+# own invitation client (D12; secret written by `oaap tenant people <t> on`).
+import hashlib  # noqa: E402
+import people_kc  # noqa: E402
+
+PEOPLE_LIMITS_FILE = os.path.join(DATA_DIR, "people-limits.json")
+PEOPLE_PER_HOUR, PEOPLE_PER_DAY, PEOPLE_PER_ADDRESS_DAY = 20, 100, 3
+_people_realms = {}
+
+
+def _people_caller():
+    """(instance, tid, tenant_record, realm) or raises people_kc.RealmError."""
+    user = request.headers.get("X-OAAP-User", "")
+    src = request.headers.get("X-OAAP-Source-Instance", "")
+    if not src or user != f"instance:{src}":
+        raise people_kc.RealmError(403, "this door is for an instance's own people key, "
+                                        "on its own site (RFC-0126 §4)")
+    me = find_user(load_users(), user)
+    if not me or me.get("kind") != "machine" or not me.get("active", True):
+        raise people_kc.RealmError(403, f"'{src}' is not an instance of this node")
+    tid = me.get("tenant") or ""
+    t = known_tenants().get(tid) or {}
+    if not t.get("people_invite"):
+        raise people_kc.RealmError(403, "this tenant does not let apps invite people -- "
+                                        "the server_admin turns it on (RFC-0126 D2)")
+    try:
+        with open(IDP_SECRETS_FILE, encoding="utf-8") as f:
+            held = ((json.load(f) or {}).get("providers") or {}).get(tid) or {}
+    except (OSError, ValueError):
+        held = {}
+    p = held.get("people") or {}
+    if not p.get("secret") or not p.get("issuer"):
+        raise people_kc.RealmError(503, "the realm credential for invitations is missing -- "
+                                        "`oaap tenant people <label> on` again")
+    key = (tid, p["issuer"], p["client_id"], p["secret"])
+    realm = _people_realms.get(key)
+    if realm is None:
+        realm = _people_realms[key] = people_kc.Realm(p["issuer"], p["client_id"], p["secret"])
+    return src, tid, t, realm
+
+
+def _people_events():
+    now = time.time()
+    try:
+        with open(PEOPLE_LIMITS_FILE, encoding="utf-8") as f:
+            return [e for e in json.load(f) if now - e[0] < 86400]
+    except (OSError, ValueError):
+        return []
+
+
+def _people_hash(email):
+    return hashlib.sha256(email.strip().lower().encode()).hexdigest()[:16]
+
+
+def _people_limit(instance, email, kind):
+    """'' or the sentence of the limit reached (D5). Counts only mails that
+    went out (_people_sent) -- a refused attempt sends nothing and costs
+    nothing (measured 2026-11-24: refused attempts used up an address)."""
+    now, ev, h = time.time(), _people_events(), _people_hash(email)
+    mine = [e for e in ev if e[1] == instance]
+    if len([e for e in mine if now - e[0] < 3600]) >= PEOPLE_PER_HOUR:
+        return f"more than {PEOPLE_PER_HOUR} invitations an hour from this app"
+    if len(mine) >= PEOPLE_PER_DAY:
+        return f"more than {PEOPLE_PER_DAY} invitations a day from this app"
+    if len([e for e in ev if e[2] == h]) >= PEOPLE_PER_ADDRESS_DAY:
+        return f"more than {PEOPLE_PER_ADDRESS_DAY} mails a day to this address"
+    return ""
+
+
+def _people_sent(instance, email, kind):
+    ev = _people_events()
+    ev.append([time.time(), instance, _people_hash(email), kind])
+    _save(PEOPLE_LIMITS_FILE, ev)
+
+
+def _people_hours(t):
+    try:
+        return max(1, min(int(t.get("people_link_hours") or people_kc.LINK_HOURS_DEFAULT), 720))
+    except (TypeError, ValueError):
+        return people_kc.LINK_HOURS_DEFAULT
+
+
+def _people_public(u, realm, src, hours):
+    try:
+        doc = realm.read(u["idp"]["subject"], src)
+        status = people_kc.status_of(doc, (u.get("people") or {}).get("invited_at_ts"), hours)
+    except people_kc.RealmError as e:
+        status = "unknown" if e.status != 403 else "foreign"
+    if not u.get("active", True) and status != "gone":
+        status = "locked"
+    return {"user_id": u["id"], "status": status, "email": u.get("email", ""),
+            "ref": (u.get("people") or {}).get("ref", ""),
+            "invited_at": (u.get("people") or {}).get("invited_at", ""),
+            "last_login": (u.get("idp") or {}).get("last_login", "")}
+
+
+def _people_err(e):
+    return {"error": str(e)}, e.status
+
+
+@app.post("/people/v1/invite")
+def people_invite():
+    try:
+        src, tid, t, realm = _people_caller()
+    except people_kc.RealmError as e:
+        return _people_err(e)
+    body = request.get_json(silent=True) or {}
+    email = str(body.get("email") or "").strip()
+    bad = people_kc.email_error(email)
+    if bad:
+        return {"error": bad}, 400
+    name = str(body.get("name") or "")[:200]
+    lang = str(body.get("language") or (t.get("language") or "de"))[:5]
+    ref = str(body.get("ref") or "")[:200]
+    provider, _secret = tenant_provider(tid)
+    if not provider:
+        return {"error": "the tenant has no provider -- invitations need its realm (D9)"}, 409
+    pkey = idp.provider_key(provider)
+    with users_rw() as users:
+        low = email.lower()
+        if any((u.get("email") or "").lower() == low and u.get("tenant") == tid for u in users):
+            return {"error": "exists: this address already belongs to a person of the tenant; "
+                             "the tenant admin links existing people (RFC-0126 D8)"}, 409
+        why = _people_limit(src, email, "invite")
+        if why:
+            audit("people.invite", tid, low, "refused", who=f"instance:{src}", detail=why)
+            return {"error": why}, 429
+        try:
+            sub = realm.create(email, src, name, lang)
+        except people_kc.RealmError as e:
+            audit("people.invite", tid, low, "refused", who=f"instance:{src}", detail=str(e))
+            return _people_err(e)
+        username = idp.local_username({"preferred_username": low, "email": low},
+                                      [x.get("username", "") for x in users],
+                                      prefix=idp.tenant_name_prefix(t))
+        now = _now_iso()
+        record = {
+            "username": username, "password_hash": "", "roles": ["partner"], "groups": [],
+            "active": True, "kind": "human", "tenant": tid, "display_name": name or low,
+            "email": low, "email_verified": False, "id": new_user_id(), "session_epoch": 0,
+            "idp": {"provider": pkey, "subject": sub, "bound": now, "last_login": ""},
+            "invited_by": f"instance:{src}",
+            "people": {"invited_at": now, "invited_at_ts": time.time(), "ref": ref},
+        }
+        users.append(record)
+        save_users(users)
+    hours = _people_hours(t)
+    try:
+        realm.mail(sub, src, hours)
+    except people_kc.RealmError as e:
+        audit("people.invite", tid, username, "failed", who=f"instance:{src}",
+              detail=f"login made, mail not sent: {e}")
+        return {"user_id": record["id"], "status": "invited", "mail": "failed",
+                "error": str(e)}, 201
+    _people_sent(src, email, "invite")
+    audit("people.invite", tid, username, who=f"instance:{src}", role="-",
+          detail=f"ref={ref} · link {hours} h · partner")
+    return {"user_id": record["id"], "status": "invited", "ref": ref}, 201
+
+
+def _people_mine(users, src, uid):
+    u = next((x for x in users if x.get("id") == uid), None)
+    if not u or u.get("invited_by") != f"instance:{src}":
+        return None
+    return u
+
+
+@app.get("/people/v1")
+@app.get("/people/v1/")
+def people_list():
+    try:
+        src, tid, t, realm = _people_caller()
+    except people_kc.RealmError as e:
+        return _people_err(e)
+    ref = request.args.get("ref")
+    mine = [u for u in load_users() if u.get("invited_by") == f"instance:{src}"
+            and u.get("tenant") == tid
+            and (ref is None or (u.get("people") or {}).get("ref") == ref)]
+    hours = _people_hours(t)
+    return {"people": [_people_public(u, realm, src, hours) for u in mine[:200]]}
+
+
+@app.get("/people/v1/<uid>")
+def people_one(uid):
+    try:
+        src, tid, t, realm = _people_caller()
+    except people_kc.RealmError as e:
+        return _people_err(e)
+    u = _people_mine(load_users(), src, uid)
+    if not u:
+        return {"error": "not a person this app invited"}, 404
+    return _people_public(u, realm, src, _people_hours(t))
+
+
+@app.post("/people/v1/<uid>/<action>")
+def people_act(uid, action):
+    if action not in ("resend", "lock", "unlock"):
+        return {"error": "resend, lock or unlock"}, 404
+    try:
+        src, tid, t, realm = _people_caller()
+    except people_kc.RealmError as e:
+        return _people_err(e)
+    with users_rw() as users:
+        u = _people_mine(users, src, uid)
+        if not u:
+            return {"error": "not a person this app invited"}, 404
+        sub = u["idp"]["subject"]
+        try:
+            if action == "resend":
+                st_now = people_kc.status_of(realm.read(sub, src),
+                                             (u.get("people") or {}).get("invited_at_ts"),
+                                             _people_hours(t))
+                if st_now not in ("invited", "expired"):
+                    return {"error": f"the person is {st_now}; an invitation goes only to "
+                                     "someone who has not confirmed yet -- 'forgot password' "
+                                     "is the realm's own way (RFC-0126 D11)"}, 409
+                why = _people_limit(src, u.get("email", ""), "resend")
+                if why:
+                    return {"error": why}, 429
+                realm.mail(sub, src, _people_hours(t))
+                _people_sent(src, u.get("email", ""), "resend")
+                u.setdefault("people", {})["invited_at_ts"] = time.time()
+            else:
+                realm.set_enabled(sub, src, action == "unlock")
+                u["active"] = action == "unlock"
+                if action == "lock":
+                    u["session_epoch"] = u.get("session_epoch", 0) + 1
+        except people_kc.RealmError as e:
+            audit(f"people.{action}", tid, u["username"], "refused", who=f"instance:{src}", detail=str(e))
+            return _people_err(e)
+        save_users(users)
+    audit(f"people.{action}", tid, u["username"], who=f"instance:{src}", role="-")
+    return _people_public(u, realm, src, _people_hours(t))

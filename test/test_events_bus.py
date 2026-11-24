@@ -275,7 +275,7 @@ ok("Scope und Adresse", a.events_scope("t1-pub") == "oaap.events:t1-pub"
    and a.events_url(8123) == "http://gateway:8123/platform/events"
    or a.events_url(8123).endswith(":8123/platform/events"))
 ok("Gateway-Zeilen bekommen eine neue Formatnummer (Seiten werden neu geschrieben)",
-   a.CASES_BLOCK_FORMAT >= 11)
+   a.CASES_BLOCK_FORMAT >= 11)  # 12 since RFC-0126
 src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
 door = src[src.index("if events_wanted(me) and not login_only"):src.index("# RFC-0069 stage 2: on a `vorgaenge` site only")]
 ok("die Tuer fragt identity nach genau diesem Scope, ohne Rollen, und reicht an twin:8000",

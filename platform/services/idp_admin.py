@@ -30,6 +30,14 @@ A connector is these verbs and nothing else:
     mcp_clients  the two clients of an MCP gateway in a tenant's space,
               made on request and only ever disabled (RFC-0073 stage 3,
               oaap.core.tenant 2.9.1, built 2026-11-07)
+    invited_users  RFC-0126 (D2, D12): the narrow door through `never:
+              users`. It makes, in ONE tenant's space, the client
+              `oaap-people` whose service account may manage and read that
+              space's users and query its groups -- and identity, holding
+              only that client's secret, creates people with the marker
+              `oaap_invited_by` and touches no other. Made when the
+              server_admin turns the tenant's switch on, only ever
+              disabled; `users` itself stays in `never`.
 
 The first four are required of any connector; `settings` and `export`
 are optional and declared, so a product that cannot do one says so
@@ -169,6 +177,12 @@ CONNECTOR_KINDS = {
             # and never written -- `never` below still holds. A narrow
             # credential gets 403 here, and then nothing is re-pointed.
             "user": "/admin/realms/{space}/users/{uuid}",
+            # RFC-0126 (verb `invited_users`): the client's service account
+            # and its role mappings at the management client.
+            "service_account_user":
+                "/admin/realms/{space}/clients/{uuid}/service-account-user",
+            "user_client_roles":
+                "/admin/realms/{space}/users/{uuid}/role-mappings/clients/{client}",
         },
         # The provider's own id of a space, in the space document. It
         # survives a new address and does NOT survive deleting and making
@@ -258,13 +272,16 @@ CONNECTOR_KINDS = {
         },
         "verbs": ("version", "space", "client", "issuer", "settings",
                   "export", "admin_group", "groups", "mail", "mcp_clients",
-                  "app_clients", "claims"),
+                  "app_clients", "claims", "invited_users"),
         # Empty since step 7, and left here on purpose: a connector
         # that grows a verb should have somewhere to name it first.
         "later": (),
         # Named and never to be built: OAAP does not create, change or
         # remove people in somebody's realm -- that is the club's, and
-        # K3.3 is the whole reason this file has no DELETE.
+        # K3.3 is the whole reason this file has no DELETE. RFC-0126
+        # narrows it for ONE case and one verb (`invited_users`): people
+        # an app invited, marked, in a space OAAP made, for a tenant whose
+        # server_admin allowed it. Every other person stays untouchable.
         "never": ("users",),
         "provider_kind": "oidc",
     },
@@ -276,7 +293,7 @@ REQUIRED_VERBS = ("version", "space", "client", "issuer")
 # What a connector MAY declare. A verb outside both lists is a typo
 # that would otherwise sit in the table looking like a capability.
 OPTIONAL_VERBS = ("settings", "export", "admin_group", "groups", "mail",
-                  "mcp_clients", "app_clients", "claims")
+                  "mcp_clients", "app_clients", "claims", "invited_users")
 KNOWN_VERBS = REQUIRED_VERBS + OPTIONAL_VERBS
 
 # The switches of K7, in OAAP's words rather than any product's. The
@@ -951,6 +968,70 @@ def _keycloak_client_body(client_id, redirect_uris, name=""):
         "webOrigins": [],
         "protocolMappers": [_keycloak_group_mapper()],
     }
+
+
+# RFC-0126 (D12): the invitation client of a tenant's space. Its service
+# account holds exactly these roles of the management client -- manage and
+# read users, find a group -- and nothing that administers the realm.
+PEOPLE_CLIENT = "oaap-people"
+PEOPLE_ROLES = ("manage-users", "view-users", "query-groups")
+PEOPLE_GROUP = "oaap-invited"
+PEOPLE_ATTRIBUTE = "oaap_invited_by"
+
+
+def _keycloak_people_client_body(client_id):
+    """A confidential client with a service account and no login flow: it
+    signs nobody in, it only lets identity act in this one realm."""
+    return {
+        "clientId": client_id,
+        "name": "OAAP: people invited by apps (RFC-0126)",
+        "protocol": "openid-connect",
+        "enabled": True,
+        "publicClient": False,
+        "standardFlowEnabled": False,
+        "implicitFlowEnabled": False,
+        "directAccessGrantsEnabled": False,
+        "serviceAccountsEnabled": True,
+        "redirectUris": [],
+        "webOrigins": [],
+    }
+
+
+def people_attribute():
+    """The marker as Keycloak's declarative user profile takes it: set and
+    changed by administrators only (the invitation client is one), shown to
+    nobody but them, `instance:<name>` -- not the SAP claim's shape."""
+    return {"name": PEOPLE_ATTRIBUTE, "displayName": "Eingeladen von (OAAP)",
+            "permissions": {"view": ["admin"], "edit": ["admin"]},
+            "multivalued": False,
+            "validations": {"length": {"max": 120},
+                            "pattern": {"pattern": "^instance:[a-z0-9][a-z0-9-]{0,80}$",
+                                        "error-message": "instance:<name>"}}}
+
+
+def people_attribute_fix(attr):
+    """(refusal, replacement or None) for an existing marker attribute."""
+    if "user" in ((attr or {}).get("permissions") or {}).get("edit", []):
+        return (f"'{PEOPLE_ATTRIBUTE}' exists and the person may edit it -- anybody could "
+                "mark themselves as invited; OAAP does not take it over"), None
+    want = people_attribute()
+    if {k: attr.get(k) for k in ("permissions", "validations", "multivalued")} == \
+            {k: want.get(k) for k in ("permissions", "validations", "multivalued")}:
+        return "", None
+    return "", dict(attr, **{k: want[k] for k in ("permissions", "validations", "multivalued")})
+
+
+def people_client_fix(doc):
+    """(refusal, body or None): what an existing `oaap-people` client needs.
+    A client that signs people in under that name is not ours to bend."""
+    if doc.get("publicClient") or doc.get("standardFlowEnabled") \
+            or doc.get("directAccessGrantsEnabled") or doc.get("implicitFlowEnabled"):
+        return (f"a client '{doc.get('clientId')}' exists and signs people in -- "
+                "not the invitation client OAAP makes; rename or remove it in the "
+                "product first"), None
+    if doc.get("enabled") is not False and doc.get("serviceAccountsEnabled") is True:
+        return "", None
+    return "", dict(doc, enabled=True, serviceAccountsEnabled=True)
 
 
 def _keycloak_settings_read(docs):
@@ -3551,6 +3632,194 @@ class Admin:
                 return False, err
             self._note(f"disabled '{cid}' (not deleted)")
         return True, "disabled, none deleted"
+
+    # -- RFC-0126: the invitation client (verb `invited_users`) ------
+    def people_on(self, space, accept_version=""):
+        """Prepare a tenant's space for invitations. (ok, result, sentence).
+
+        In order, each only after the reads that can refuse: the version;
+        the space; the management client and the roles that would let a
+        user manager raise himself (refused, nothing written, like the
+        administrator group); then the attribute `oaap_invited_by` in the
+        user profile (administrators only -- Keycloak 26 drops an
+        undeclared attribute, RFC-0126 §1.5 K2), the group `oaap-invited`,
+        "forgot password" on (D11), the client and its service account's
+        three roles. Adds, never removes, creates no person."""
+        bad = verb_refusal(self.kind, "invited_users") or space_refusal(self.kind, space)
+        if bad:
+            return False, {}, bad
+        how, seen, err = self._ready(accept_version)
+        if err:
+            return False, {}, err
+        word = self.decl["space_word"]
+        exists, err = self.find_space(space)
+        if err:
+            return False, {}, err
+        if not exists:
+            return False, {}, (f"there is no {word} '{space}' at {self.base} -- "
+                               "invitations need the tenant's own space "
+                               "(`oaap idp provision`, RFC-0126 D9)")
+        g = admin_group_of(self.kind)
+        mgmt, _doc, err = self.find_client(space, g["roles_client"])
+        if err:
+            return False, {}, err
+        if not mgmt:
+            return False, {}, (f"the client '{g['roles_client']}' is not in the {word} "
+                               f"'{space}' -- not a space made the ordinary way")
+        risky, err = self.escalation_roles(space, mgmt)
+        if err:
+            return False, {}, err
+        if risky:
+            return False, {}, (
+                "refused, nothing was written: the role(s) "
+                + ", ".join(f"'{n}'" for n in risky)
+                + f" in the {word} '{space}' lead to the management roles, and "
+                "whoever may manage users may hand such a role on (RFC-0056 §2.1)")
+        roles, err = self._read_list(self._path("client_roles", space=space, client=mgmt),
+                                     "reading the management roles")
+        if err:
+            return False, {}, err
+        by_name = {r.get("name"): r for r in roles if isinstance(r, dict)}
+        absent = [n for n in PEOPLE_ROLES if n not in by_name]
+        if absent:
+            return False, {}, ("this product has no role " + ", ".join(absent)
+                               + " -- measured against " + self.decl["pinned"])
+        # 1. the marker attribute, administrators only
+        ppath = self._path("user_profile", space=space)
+        st, prof, err = self._call("GET", ppath)
+        if err:
+            return False, {}, err
+        if st != 200 or not isinstance(prof, dict):
+            return False, {}, f"reading the user profile of '{space}' answered {st}"
+        attrs = list(prof.get("attributes") or [])
+        found = next((a for a in attrs if isinstance(a, dict)
+                      and a.get("name") == PEOPLE_ATTRIBUTE), None)
+        put = None
+        if found is None:
+            put = attrs + [people_attribute()]
+            said = f"added the attribute '{PEOPLE_ATTRIBUTE}' (administrators only)"
+        else:
+            bad, fixed = people_attribute_fix(found)
+            if bad:
+                return False, {}, bad
+            if fixed is not None:
+                put = [fixed if a is found else a for a in attrs]
+                said = f"corrected the attribute '{PEOPLE_ATTRIBUTE}' (administrators only, instance:<name>)"
+        if put is not None:
+            st, _d, err = self._call("PUT", ppath, body=dict(prof, attributes=put))
+            if err:
+                return False, {}, err
+            if st not in (200, 204):
+                return False, {}, f"writing the attribute '{PEOPLE_ATTRIBUTE}' answered {st}"
+            self._note(said)
+        # 2. the group
+        gid, err = self._find_group(space, PEOPLE_GROUP)
+        if err:
+            return False, {}, err
+        if not gid:
+            st, _d, err = self._call("POST", self._path("groups", space=space),
+                                     body={"name": PEOPLE_GROUP})
+            if err:
+                return False, {}, err
+            if st not in (201, 204, 409):
+                return False, {}, f"creating the group '{PEOPLE_GROUP}' answered {st}"
+            self._note(f"created the group '{PEOPLE_GROUP}'")
+        # 3. forgot password (D11)
+        rpath = self._path("space", space=space)
+        st, realm, err = self._call("GET", rpath)
+        if err:
+            return False, {}, err
+        if st == 200 and isinstance(realm, dict) and not realm.get("resetPasswordAllowed"):
+            st, _d, err = self._call("PUT", rpath, body={"realm": space,
+                                                        "resetPasswordAllowed": True})
+            if err:
+                return False, {}, err
+            if st not in (200, 204):
+                return False, {}, f"turning on 'forgot password' answered {st}"
+            self._note("turned on 'forgot password' (RFC-0126 D11)")
+        # 4. the client
+        uuid, doc, err = self.find_client(space, PEOPLE_CLIENT)
+        if err:
+            return False, {}, err
+        if uuid:
+            bad, put = people_client_fix(doc)
+            if bad:
+                return False, {}, bad
+            if put is not None:
+                err = self._put_client(space, uuid, put, "enable the invitation client")
+                if err:
+                    return False, {}, err
+                self._note(f"enabled '{PEOPLE_CLIENT}' again")
+        else:
+            st, ans, err = self._call("POST", self._path("clients", space=space),
+                                      body=_keycloak_people_client_body(PEOPLE_CLIENT))
+            if err:
+                return False, {}, err
+            if st == 403:
+                return False, {}, self._not_ours(space, "create a client")
+            if st not in (201, 204):
+                return False, {}, f"creating the client '{PEOPLE_CLIENT}' answered {st}"
+            self._note(f"created the client '{PEOPLE_CLIENT}'")
+            uuid, doc, err = self.find_client(space, PEOPLE_CLIENT)
+            if err or not uuid:
+                return False, {}, err or "the client was created and cannot be found again"
+        # 5. its service account's roles, exactly these
+        st, sa, err = self._call("GET", self._path("service_account_user", space=space, uuid=uuid))
+        if err:
+            return False, {}, err
+        if st != 200 or not isinstance(sa, dict) or not sa.get("id"):
+            return False, {}, f"reading the client's service account answered {st}"
+        mpath = self._path("user_client_roles", space=space, uuid=sa["id"], client=mgmt)
+        held, err = self._read_list(mpath, "reading the service account's roles")
+        if err:
+            return False, {}, err
+        have = {r.get("name") for r in held if isinstance(r, dict)}
+        lack = [by_name[n] for n in PEOPLE_ROLES if n not in have]
+        if lack:
+            st, _d, err = self._call("POST", mpath, body=[{"id": r.get("id"), "name": r.get("name")}
+                                                          for r in lack])
+            if err:
+                return False, {}, err
+            if st not in (200, 204):
+                return False, {}, f"giving the service account its roles answered {st}"
+            self._note("gave the service account: " + ", ".join(r["name"] for r in lack))
+        after, err = self._read_list(mpath, "reading the roles back")
+        if err:
+            return False, {}, err
+        names = sorted(r.get("name") for r in after if isinstance(r, dict))
+        extra = [n for n in names if n not in PEOPLE_ROLES]
+        if extra:
+            return False, {}, ("the invitation client's service account holds more than "
+                               "it should: " + ", ".join(extra) + " -- remove it in the product")
+        secret, err = self.client_secret(space, uuid)
+        if err:
+            return False, {}, err
+        return True, {"space": space, "client_id": PEOPLE_CLIENT, "secret": secret,
+                      "issuer": issuer_for(self.kind, self.base, space),
+                      "roles": names, "version": seen, "version_how": how}, \
+            f"invitations are possible in the {word} '{space}'"
+
+    def people_off(self, space, accept_version=""):
+        """Disable the invitation client, never delete it. (ok, sentence).
+        'Forgot password' stays as it is (D11): others may rely on it."""
+        bad = verb_refusal(self.kind, "invited_users") or space_refusal(self.kind, space)
+        if bad:
+            return False, bad
+        _how, _seen, err = self._ready(accept_version)
+        if err:
+            return False, err
+        uuid, doc, err = self.find_client(space, PEOPLE_CLIENT)
+        if err:
+            return False, err
+        if not uuid:
+            return True, f"there is no '{PEOPLE_CLIENT}' in '{space}' -- nothing to disable"
+        if doc.get("enabled") is False:
+            return True, f"'{PEOPLE_CLIENT}' was already disabled"
+        err = self._put_client(space, uuid, dict(doc, enabled=False), "disable a client")
+        if err:
+            return False, err
+        self._note(f"disabled '{PEOPLE_CLIENT}' (not deleted)")
+        return True, f"'{PEOPLE_CLIENT}' disabled in '{space}', not deleted"
 
     def app_client(self, space, client_id, redirect_uris, groups_claim=False,
                    title="", accept_version=""):
