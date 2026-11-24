@@ -282,17 +282,35 @@ def revoke_node(state, body, now, active_keys, revoke):
 
 # ---------------------------------------------------------- the hub's bridge
 
+BRIDGE_HEAD = "# RFC-0085 stage 3 (A3): the hub "
+# RFC-0085 A4 (§18.4): the form of the file. A file of an older form (no
+# such line) is rewritten by the hub's minute job with the same keys
+# (`bridge_fields`), and the broker restarted once.
+BRIDGE_FORM = "# form: A4"
+# the lines A4 changed, for the tests and the spec
+BRIDGE_LINES = ("cleansession false", "local_cleansession true", "keepalive_interval 120",
+                "restart_timeout 10 120")
+
+
 def bridge_conf(entry, hub, broker, user, secret, cafile="/etc/ssl/certs/ca-certificates.crt"):
     """The hub's bridge to an entry, as RFC-0085 §5.3 and stage 1 wrote it by
-    hand (bridge-oaapx01.conf, 2026-11-12). Holds a key: write it 0600."""
-    hostport = broker[len("mqtts://"):]
+    hand (bridge-oaapx01.conf, 2026-11-12). Holds a key: write it 0600.
+
+    A4 (§18.4): `local_cleansession true` -- the bridge keeps no persistent
+    session in the hub's OWN broker: that local session is what Mosquitto
+    2.0.18 expired on 2026-11-20 before the bridge stopped for four days
+    (issue #3049); what waits for the hub is the entry's queue (`cleansession
+    false` stays). `keepalive_interval 120`: an entry working off a backlog
+    gets two minutes before the hub gives up on its CONNACK, not 45 s."""
+    hostport = broker[len("mqtts://"):] if broker.startswith("mqtts://") else broker
     if ":" not in hostport:
         hostport += ":8883"
-    for v in (entry, hub, user, secret, hostport):
+    for v in (entry, hub, user, secret, hostport, cafile):
         if not re.match(r"^[\x21-\x7e]{1,256}$", v or ""):
             raise Refusal("Die Antwort des Eingangs ist unbrauchbar.")
-    return (f"# RFC-0085 stage 3 (A3): the hub {hub} opens the bridge to the entry\n"
+    return (f"{BRIDGE_HEAD}{hub} opens the bridge to the entry\n"
             f"# {entry}, written by the pairing. Holds a key: 0600.\n"
+            f"{BRIDGE_FORM}\n"
             f"connection entry-{entry}\n"
             f"address {hostport}\n"
             f"bridge_cafile {cafile}\n"
@@ -301,13 +319,42 @@ def bridge_conf(entry, hub, broker, user, secret, cafile="/etc/ssl/certs/ca-cert
             f"remote_clientid oaap-hub-{hub}\n"
             f"local_clientid bridge-{entry}\n"
             "cleansession false\n"
-            "keepalive_interval 30\n"
+            "local_cleansession true\n"
+            "keepalive_interval 120\n"
             "restart_timeout 10 120\n"
             f"topic # in 1 oaap-via/{entry}/ oaap-node/\n"
             f"topic # out 1 oaap-fleet/control/{entry}/ oaap-fleet/control/{entry}/\n"
             "notifications true\n"
             "notifications_local_only false\n"
             f"notification_topic oaap-fleet/bridge/{entry}/{hub}\n")
+
+
+def bridge_form(text):
+    """The form line of a bridge file, or None (written before A4)."""
+    for line in (text or "").splitlines():
+        if line.startswith("# form: "):
+            return line.strip()
+    return None
+
+
+def bridge_fields(text):
+    """The arguments of `bridge_conf` read back from a file the pairing
+    wrote (any form), or None for a file it did not write (by hand,
+    stage 1) -- such a file is never touched."""
+    if not (text or "").startswith(BRIDGE_HEAD):
+        return None
+    kv = {}
+    for line in text.splitlines():
+        if line and not line.startswith("#") and " " in line:
+            k, v = line.split(" ", 1)
+            kv.setdefault(k, v.strip())
+    conn, hub = kv.get("connection", ""), kv.get("remote_clientid", "")
+    if not (conn.startswith("entry-") and hub.startswith("oaap-hub-")):
+        return None
+    out = {"entry": conn[6:], "hub": hub[9:], "broker": "mqtts://" + kv.get("address", ""),
+           "user": kv.get("remote_username", ""), "secret": kv.get("remote_password", ""),
+           "cafile": kv.get("bridge_cafile", "")}
+    return out if all(out.values()) else None
 
 
 # ------------------------------------------------------- HTTPS with a pin

@@ -781,9 +781,11 @@ if [ -f "$OAAP_DATA_DIR/apps/node.json" ] \
   # may still wait for identity and write it from the new template.
   if [ -n "$(docker ps -q -f name=^oaap-broker-1$ -f status=running)" ] \
      && docker exec oaap-broker-1 grep -q '^auth_plugin' /tmp/mosquitto.conf 2>/dev/null \
-     && ! docker exec oaap-broker-1 grep -q '^persistent_client_expiration' /tmp/mosquitto.conf 2>/dev/null; then
+     && { ! docker exec oaap-broker-1 grep -q '^persistent_client_expiration' /tmp/mosquitto.conf 2>/dev/null \
+          || ! docker exec oaap-broker-1 grep -q '^auth_opt_cache true' /tmp/mosquitto.conf 2>/dev/null; }; then
+    # 0.1.377 (RFC-0085 A4): auth_opt_cache -- identity's answers kept 60 s
     say ""
-    say "Restarting the MQTT broker for its new configuration (sessions expire after 7 days) ..."
+    say "Restarting the MQTT broker for its new configuration (sessions expire after 7 days; identity's answers cached 60 s) ..."
     docker restart oaap-broker-1 >/dev/null 2>&1 && say "  Done." \
       || say "  WARNING: could not restart the broker — check 'docker ps'."
   fi

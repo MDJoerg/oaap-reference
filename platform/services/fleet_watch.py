@@ -37,6 +37,24 @@ The rules, in one place:
     (`affected.json`) is trusted for three minutes, like its state. Since
     RFC-0087 §8.1 also an external end whose tunnel app says its tunnel
     or the target is down -- the same matter type, one per end.
+
+Amendment A4 (RFC-0085 §18, after the oaapx02 outage of 2026-11-24):
+
+  * the **bridge watchdog**: a bridge of this hub down for ten minutes
+    whose broker has not even TRIED to connect in those ten minutes
+    (no "Connecting bridge" line in its log) is stuck -- Mosquitto 2.0.18
+    left the bridge to oaapx01 so for four days (issue #3049). The hub's
+    broker is restarted, at most every 30 minutes, doubling to six hours
+    while it does not help (`kick_due`);
+  * **the entry judges its own nodes** while their hub is away: a node
+    paired through this entry that falls silent while its hub has been
+    gone for ten minutes is the ENTRY's node.silent, mailed through the
+    entry's lists, and stays the entry's until the node is back. A node
+    that was already silent before the hub left was the hub's to judge
+    and is not opened twice (`entry_conditions`);
+  * **the hub defers** to the entry for such a node: the entry names it in
+    its broker document (`held`), and the hub shows it silent without a
+    matter of its own (`view`, `hub_conditions`).
 """
 import calendar
 import time
@@ -52,6 +70,11 @@ FLEET_MATTERS = ("node.silent", "bridge.down", "broker.queue", "link.down")
 LINK_DOWN_AFTER = 300
 AFFECTED_STALE = 180       # an older affected.json is no report at all
 LINK_ROWS = 25             # a matter's text names this many, then counts
+# A4 (§18.1): the bridge watchdog
+KICK_AFTER = 600           # down this long AND no connect attempt this long
+KICK_EVERY = 1800          # the first restart, then doubling ...
+KICK_MAX = 6 * 3600        # ... up to this
+JUDGE_MARGIN = 60          # one minute job: when the hub last could have judged
 
 
 def parse_t(s):
@@ -104,13 +127,26 @@ def _just_back(state, via, me, now, t):
             and now - since < WARMUP and t < since)
 
 
+def entry_held(state, via, now):
+    """The nodes the entry `via` holds a node.silent for (A4, its broker
+    document's `held`), when that document is fresh; else an empty set."""
+    b = (state.get("brokers") or {}).get(via) or {}
+    rx = b.get("rx")
+    if not isinstance(rx, (int, float)) or now - rx > STATE_STALE:
+        return set()
+    return {str(x) for x in (b.get("held") or []) if isinstance(x, str)}
+
+
 def view(state, now, me=None, removed=None):
-    """[{name, via, state, age, version, seq, gaps, lost, reason}] sorted --
-    what `oaap fleet hub show` prints and what the conditions use.
+    """[{name, via, state, age, version, seq, gaps, lost, reason, owner}]
+    sorted -- what `oaap fleet hub show` prints and what the conditions use.
 
     `removed` ({name: epoch}, RFC-0085 §4.5 / A3): nodes the hub removed. Such
     a node is "removed", never "silent", until an `alive` newer than the
-    removal arrives (it was paired again)."""
+    removal arrives (it was paired again).
+
+    `owner` (A4): the entry that holds this silent node's matter; the hub
+    shows it silent and opens nothing of its own."""
     removed = removed or {}
     rows = []
     warm = now - (state.get("started") or now) < WARMUP
@@ -141,26 +177,40 @@ def view(state, now, me=None, removed=None):
             st, why = "unknown", "Zentrale gerade zurück, Sender holt auf"
         elif age > SILENT_AFTER:
             st, why = "silent", ""
+        owner = ""
+        if st == "silent" and via and (n.get("name") or key) in entry_held(state, via, now):
+            owner, why = via, f"der Eingang {via} meldet es"
         rows.append({"name": n.get("name") or key, "via": via, "state": st, "age": age,
                      "version": a.get("version", ""), "seq": a.get("seq"),
                      "gaps": int(n.get("gaps", 0)), "lost": a.get("lost"),
-                     "reason": why})
+                     "reason": why, "owner": owner})
     return rows
 
 
-def hub_conditions(state, now, me=None, open_matters=None, removed=None):
+def hub_conditions(state, now, me=None, open_matters=None, removed=None, kicks=None,
+                   configured=None):
     """{key: condition} for the hub's default scope; `me` is the hub's name
     on the wire (only its own bridges count). `open_matters` ({key:
     condition}, the matters open now): one whose subject is "unknown" this
-    minute stays open as it is."""
+    minute stays open as it is. `kicks` ({entry: {"at", "n"}}, A4): what the
+    bridge watchdog did, said in the bridge's matter. `configured` ({entry},
+    A4): the bridges this broker has -- the retained "0" of a bridge that
+    is gone is no bridge.down (measured on oaap-test: a simulation's of
+    2026-11-14, which the daily reminder would have mailed for ever)."""
     out = {}
     held = open_matters or {}
+    kicks = kicks or {}
     rows = view(state, now, me, removed)
     for r in rows:
         key = f"node.silent/{r['name']}"
         if r["state"] == "unknown" and key in held:
             out[key] = held[key]
         if r["state"] != "silent":
+            continue
+        if r.get("owner"):
+            # the entry mails it (A4); a matter the hub opened before stays
+            if key in held:
+                out[key] = held[key]
             continue
         last = iso(now - r["age"])
         out[f"node.silent/{r['name']}"] = {
@@ -173,6 +223,8 @@ def hub_conditions(state, now, me=None, open_matters=None, removed=None):
                      "'oaap metrics queue', ob sein Sender arbeitet.")}
     warm = now - (state.get("started") or now) < WARMUP
     for entry, b in sorted(own_bridges(state, me).items()):
+        if configured is not None and entry not in configured:
+            continue
         since = b.get("since")
         if warm and not b.get("up") and f"bridge.down/{entry}" in held:
             out[f"bridge.down/{entry}"] = held[f"bridge.down/{entry}"]
@@ -181,12 +233,21 @@ def hub_conditions(state, now, me=None, open_matters=None, removed=None):
         if now - since < BRIDGE_DOWN_AFTER:
             continue
         behind = sorted(r["name"] for r in rows if r["via"] == entry)
+        k = kicks.get(entry) or {}
+        kicked = ""
+        if isinstance(k.get("at"), (int, float)) and k["at"] >= since and k.get("n"):
+            kicked = (f"Der Wachhund hat den Broker dieser Zentrale {int(k['n'])}-mal neu "
+                      f"gestartet, zuletzt {iso(k['at'])} UTC, weil die Brücke es nicht "
+                      "einmal mehr versuchte.\n")
         out[f"bridge.down/{entry}"] = {
             "type": "bridge.down", "kurz": entry, "began": iso(since),
             "text": (f"Die Brücke zum Eingang {entry} ist seit {minutes(now - since)} "
                      f"getrennt (seit {iso(since)} UTC).\n"
-                     + ("Dahinter, ohne Nachricht bis die Brücke zurück ist: "
-                        + ", ".join(behind) + ".\n" if behind else "")
+                     + ("Dahinter, hier ohne Nachricht bis die Brücke zurück ist: "
+                        + ", ".join(behind) + ". Schweigt einer davon, meldet es "
+                        f"der Eingang {entry} über seine eigenen Verteiler.\n"
+                        if behind else "")
+                     + kicked
                      + "Was der Eingang inzwischen annimmt, wartet in seiner "
                        "Warteschlange und kommt nach.")}
     for node, b in sorted((state.get("brokers") or {}).items()):
@@ -223,12 +284,76 @@ def loss_events(state, prev):
     return events, new
 
 
-def entry_conditions(watch, now):
+def _hub_away_since(watch, hub, now):
+    """Since when the hub `hub` has been away from this entry, if it is
+    away long enough to be hub.unreachable (A4); else None."""
+    h = (watch.get("hubs") or {}).get(hub) or {}
+    since = h.get("since")
+    if h.get("up") or not isinstance(since, (int, float)) or not h:
+        return None
+    return since if now - since >= HUB_UNREACHABLE_AFTER else None
+
+
+def entry_node_rows(watch, now, held=None):
+    """[{name, hub, state, age, reason}] for the nodes paired through this
+    entry (A4): what the entry judges itself. "silent" only where the entry
+    owns the matter -- the node fell silent while its hub was away, or the
+    entry opened it before (`held`, keys of its open matters)."""
+    held = held or {}
+    rows = []
+    up_since = now - watch["uptime"] if isinstance(watch.get("uptime"), (int, float)) else None
+    for name, n in sorted((watch.get("nodes") or {}).items()):
+        if not isinstance(n, dict):
+            continue
+        t = parse_t(n.get("t"))
+        age = None if t is None else max(0, now - t)
+        hub = str(n.get("hub") or "")
+        away = _hub_away_since(watch, hub, now)
+        mine = f"node.silent/{name}" in held
+        st, why = "up", ""
+        if age is None:
+            st, why = "unknown", "kein Lebenszeichen im Broker"
+        elif age <= SILENT_AFTER:
+            st = "up"
+        elif up_since is not None and t < up_since and now - up_since < CATCHUP:
+            # this broker restarted; a node waits up to 15 minutes between tries
+            st, why = "unknown", "Broker gerade zurück, Sender holt auf"
+        elif mine:
+            st, why = "silent", ""
+        elif away is not None and t + SILENT_AFTER + JUDGE_MARGIN >= away:
+            # it fell silent while the hub could not see it
+            st, why = "silent", f"Zentrale {hub} getrennt"
+        else:
+            st, why = "hub", f"die Zentrale {hub or '?'} urteilt"
+        rows.append({"name": name, "hub": hub, "state": st, "age": age, "reason": why})
+    return rows
+
+
+def entry_conditions(watch, now, held=None):
     """{key: condition} on an entry from its broker watch, or None when the
-    watch is stale (then open matters stay)."""
+    watch is stale (then open matters stay). `held` ({key: condition}): the
+    entry's open node.silent matters (A4) -- one whose node is "unknown"
+    this minute stays open as it is."""
     if not isinstance(watch, dict) or now - int(watch.get("at", 0)) > STATE_STALE:
         return None
+    held = held or {}
     out = {}
+    for r in entry_node_rows(watch, now, held):
+        key = f"node.silent/{r['name']}"
+        if r["state"] == "unknown" and key in held:
+            out[key] = held[key]
+        if r["state"] != "silent":
+            continue
+        last = iso(now - r["age"])
+        out[key] = {
+            "type": "node.silent", "kurz": r["name"], "began": last,
+            "text": (f"Der Knoten {r['name']} hat seit {minutes(r['age'])} kein "
+                     f"Lebenszeichen an diesen Eingang geschickt (zuletzt {last} UTC).\n"
+                     + (f"Die Zentrale {r['hub']} ist von hier aus nicht verbunden und "
+                        "kann es nicht melden -- deshalb meldet es der Eingang.\n"
+                        if r["hub"] else "")
+                     + "Läuft der Rechner? Hat er Netz? Auf dem Knoten zeigt "
+                       "'oaap metrics queue', ob sein Sender arbeitet.")}
     for hub, h in sorted((watch.get("hubs") or {}).items()):
         since = h.get("since")
         if h.get("up") or not isinstance(since, (int, float)):
@@ -239,9 +364,90 @@ def entry_conditions(watch, now):
                 "text": (f"Die Zentrale {hub} ist seit {minutes(now - since)} nicht mit "
                          f"diesem Eingang verbunden (seit {iso(since)} UTC).\n"
                          "Solange sie fehlt, sieht niemand die Flotte: kein Alarm über "
-                         "schweigende Knoten. Was hier ankommt, wartet in der "
-                         "Warteschlange.")}
+                         "schweigende Knoten außer von diesem Eingang über die "
+                         "Knoten, die über ihn gekoppelt sind. Was hier ankommt, "
+                         "wartet in der Warteschlange.")}
     return out
+
+
+def entry_held_names(conds):
+    """The nodes the entry holds a matter for -- its broker document's
+    `held`, which the hub reads (A4)."""
+    return sorted(k.split("/", 1)[1] for k, c in (conds or {}).items()
+                  if c.get("type") == "node.silent")
+
+
+# ------------------------------------------------- A4: the bridge watchdog
+
+def bridge_attempts(log_text):
+    """{entry: epoch of its newest connect attempt} from Mosquitto's log
+    ("1764000000: Connecting bridge entry-oaapx01 (oaap.joomp.de:8883)")."""
+    out = {}
+    for line in (log_text or "").splitlines():
+        head, sep, rest = line.partition(": Connecting bridge ")
+        if not sep or not head.strip().isdigit():
+            continue
+        conn = rest.split(" ", 1)[0]
+        if conn.startswith("entry-") and len(conn) > 6:
+            out[conn[6:]] = max(out.get(conn[6:], 0), int(head.strip()))
+    return out
+
+
+def kick_backoff(n):
+    """Seconds after the n-th restart before the next one may come."""
+    return min(KICK_MAX, KICK_EVERY * (2 ** max(0, int(n) - 1)))
+
+
+def bridge_connections(conf_texts):
+    """{entry} of the bridges this broker is configured with -- the
+    `connection entry-<e>` lines of its conf.d files."""
+    out = set()
+    for text in conf_texts:
+        for line in (text or "").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] == "connection" and parts[1].startswith("entry-") \
+                    and len(parts[1]) > 6:
+                out.add(parts[1][6:])
+    return out
+
+
+def kick_due(state, now, me, attempts, kicks, configured=None):
+    """[entry] whose bridge is stuck and may be kicked now.
+
+    `attempts`: {entry: epoch of the newest "Connecting bridge entry-<e>"
+    line in the broker's log of the last KICK_AFTER seconds} -- a missing
+    entry means no attempt at all. `kicks`: {entry: {"at", "n"}}, what the
+    watchdog did so far in this outage. A bridge that keeps trying and
+    fails (the entry is down, refuses, or chokes -- §18.4) is NOT stuck:
+    a restart of this broker does not help it. `configured` ({entry}): the
+    bridges this broker HAS -- a retained "0" of a bridge that is no longer
+    configured never tries again, and a restart cannot change that
+    (measured on oaap-test: a simulation's "0" of 2026-11-14 restarted the
+    broker)."""
+    out = []
+    for entry, b in sorted(own_bridges(state, me).items()):
+        if configured is not None and entry not in configured:
+            continue
+        since = b.get("since")
+        if b.get("up") or not isinstance(since, (int, float)) or now - since < KICK_AFTER:
+            continue
+        seen = attempts.get(entry)
+        if isinstance(seen, (int, float)) and now - seen < KICK_AFTER:
+            continue
+        k = kicks.get(entry) or {}
+        at, n = k.get("at"), int(k.get("n") or 0)
+        if isinstance(at, (int, float)) and at >= since:
+            if now - at < max(KICK_AFTER, kick_backoff(n)):
+                continue
+        out.append(entry)
+    return out
+
+
+def kicks_after(state, me, kicks):
+    """The watchdog's record without the bridges that are up again (their
+    count starts anew at the next outage)."""
+    return {e: k for e, k in (kicks or {}).items()
+            if bridge_up(state, e, me) is False}
 
 
 _KIND = {"tunnel": "Tunnel", "destination": "Destination", "instance": "Instanz",

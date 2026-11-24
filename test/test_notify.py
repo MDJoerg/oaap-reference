@@ -128,7 +128,12 @@ FAIL = {"on": False}
 def fake(mail, sender, rcpts, subject, body):
     if FAIL["on"]:
         return False, "SMTPServerDisconnected: gone"
-    SENT.append({"sender": sender, "rcpts": rcpts, "subject": subject, "body": body})
+    # RFC-0085 A4 (§18.8): the symbol before the subject is checked on its
+    # own (test_fleet_a4.py and below); here the words are compared
+    marks = (n.MARK_CRITICAL, n.MARK_WARNING, n.MARK_REMIND, n.MARK_CLOSED)
+    words = next((subject[len(m) + 1:] for m in marks if subject.startswith(m + " ")), subject)
+    SENT.append({"sender": sender, "rcpts": rcpts, "subject": words, "raw": subject,
+                 "body": body})
     return True, f"accepted for {sum(len(v) for v in rcpts.values())}"
 
 
@@ -206,6 +211,9 @@ SENT.clear()
 a.notify_minute({"advisories": {"open": 0}})
 ok("80 % -> Platte behoben", [s["subject"] for s in SENT] == ["Behoben: [oaap.example] Platte zu 96 % voll"],
    [s["subject"] for s in SENT])
+ok("RFC-0085 A4: vorn steht der Haken, vor dem Betreff",
+   [s["raw"] for s in SENT] == ["✅ Behoben: [oaap.example] Platte zu 96 % voll"],
+   [s["raw"] for s in SENT])
 
 print("=== Rückfall, Grenze, Ausfall ===")
 a.notify_list_set(tid, "Mandantenverwaltung", a.notify_parse_entries("Mandanten-Admins"))

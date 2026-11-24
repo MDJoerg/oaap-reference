@@ -35,6 +35,16 @@ CATALOGUE = {
     "disk.full": {"category": "health", "scope": "node", "matter": True,
                   "title": "Platte fast voll",
                   "subject": "[{knoten}] Platte {kurz}"},
+    # RFC-0085 A4 (§18.7): the disk will be full soon -- forecast on the node
+    # itself from its own metrics, so it warns also when the hub is blind.
+    # Two types, because the category decides the reminder and the mail's
+    # importance: a warning under 48 hours, critical under 12 (daily).
+    "disk.trend": {"category": "health", "scope": "node", "matter": True,
+                   "title": "Die Platte wird voraussichtlich in weniger als zwei Tagen voll",
+                   "subject": "[{knoten}] Platte bald voll: {kurz}"},
+    "disk.soon": {"category": "critical", "scope": "node", "matter": True,
+                  "title": "Die Platte wird voraussichtlich in wenigen Stunden voll",
+                  "subject": "[{knoten}] Platte gleich voll: {kurz}"},
     "advisory.host": {"category": "security", "scope": "node", "matter": True,
                       "title": "Sicherheitsupdates für den Server offen",
                       "subject": "[{knoten}] Sicherheitsupdates offen"},
@@ -90,17 +100,21 @@ CATALOGUE = {
     # wrong in the body. Closing a matter is the "back" message (node.back,
     # bridge.back in the RFC), with how long it lasted.
     "node.silent": {"category": "health", "scope": "node", "matter": True,
+                    "remind": 24,   # RFC-0085 A4 (§18.2)
                     "title": "Ein Knoten der Flotte meldet sich nicht mehr",
                     "subject": "[{knoten}] Knoten schweigt: {kurz}"},
     "bridge.down": {"category": "health", "scope": "node", "matter": True,
+                    "remind": 24,   # RFC-0085 A4 (§18.2)
                     "title": "Die Brücke zu einem Eingang ist getrennt",
                     "subject": "[{knoten}] Brücke getrennt: {kurz}"},
     "broker.queue": {"category": "health", "scope": "node", "matter": True,
+                     "remind": 24,   # RFC-0085 A4 (§18.2)
                      "title": "Die Warteschlange eines Brokers füllt sich",
                      "subject": "[{knoten}] Warteschlange voll: {kurz}"},
     # RFC-0087 §6: one matter per broken tunnel at the hub, naming what
     # depends on it -- the halves' attention items are not mailed one by one.
     "link.down": {"category": "health", "scope": "node", "matter": True,
+                  "remind": 24,   # RFC-0085 A4 (§18.2)
                   # since RFC-0087 §8.1 also an external end behind a
                   # tunnel app -- an unreachable PC is no tunnel
                   "title": "Eine Verbindung der Flotte ist getrennt",
@@ -126,7 +140,7 @@ DELIVERY_WORDS = {"now": "sofort", "report": "nur im Wochenbericht"}
 # Never only in the report: a failed backup that waits until Monday is the
 # failure this platform exists to prevent. Enforced when a line is set AND
 # when it is read (a category line set to "report" does not carry these).
-NEVER_REPORT_ONLY = frozenset({"backup.failed", "backup.missing", "disk.full",
+NEVER_REPORT_ONLY = frozenset({"backup.failed", "backup.missing", "disk.full", "disk.soon",
                                "instance.down", "report.weekly", "exposure.found"})
 
 
@@ -368,6 +382,18 @@ def _parse(s):
         return None
 
 
+def remind_hours(ntype):
+    """Hours between reminders of an open matter, or None: critical ones
+    daily (RFC-0080 D6); since RFC-0085 A4 also a type whose catalogue entry
+    says `remind` -- the fleet's matters, which can last for days unnoticed
+    (bridge.down to oaapx01 was mailed once on 2026-11-20 and then never
+    again for four days)."""
+    c = CATALOGUE.get(ntype, {})
+    if c.get("remind"):
+        return int(c["remind"])
+    return REMIND_HOURS if c.get("category") == "critical" else None
+
+
 def matter_ops(current, stored, now):
     """current: {key: {"type", "kurz", "text", ...}} -- the conditions true
     now in one scope; stored: {key: {"type", "opened", "last_sent", ...}}.
@@ -390,8 +416,8 @@ def matter_ops(current, stored, now):
         if b_old is not None and (b_new is None or b_old < b_new):
             rec["began"] = old["began"]
         last = _parse(old.get("last_sent")) or now
-        if (CATALOGUE.get(c["type"], {}).get("category") == "critical"
-                and now - last >= timedelta(hours=REMIND_HOURS)):
+        every = remind_hours(c["type"])
+        if every and now - last >= timedelta(hours=every):
             rec["last_sent"] = now.isoformat()
             ops.append(("remind", key, rec))
         new[key] = rec
@@ -602,6 +628,47 @@ def body(ntype, op, values, text, link=""):
 
 def subject_for(op, subject):
     return {"close": "Behoben: ", "remind": "Erinnerung: "}.get(op, "") + subject
+
+
+# RFC-0085 A4 (§18.8): how important a mail looks -- sparingly, so nobody
+# gets used to it. A symbol in front of the subject: red for something
+# critical that begins (or an event of that category), orange for a matter
+# of health that begins, a cycle for a reminder, a check mark when it is
+# over. Everything else -- operations, security notices, reports, tests --
+# carries none. Only critical mails ask the mail program to flag them.
+MARK_CRITICAL = "\U0001F534"   # red circle
+MARK_WARNING = "\U0001F7E0"    # orange circle
+MARK_REMIND = "\U0001F501"     # repeat
+MARK_CLOSED = "✅"         # check mark
+
+
+def subject_mark(ntype, op):
+    """The symbol for a mail's subject, or "" (see above)."""
+    c = CATALOGUE.get(ntype) or {}
+    if op == "close" and c.get("matter"):
+        return MARK_CLOSED
+    if op == "remind":
+        return MARK_REMIND
+    if op in ("open", "event"):
+        if c.get("category") == "critical":
+            return MARK_CRITICAL
+        if c.get("category") == "health" and c.get("matter"):
+            return MARK_WARNING
+    return ""
+
+
+def marked_subject(ntype, op, subject):
+    m = subject_mark(ntype, op)
+    return f"{m} {subject}" if m else subject
+
+
+def importance_headers(ntype, op):
+    """{header: value} that ask the mail program to flag the mail: only for
+    the category critical, and not for its "Behoben"."""
+    if (CATALOGUE.get(ntype) or {}).get("category") == "critical" and op in ("open", "event",
+                                                                           "remind"):
+        return {"Importance": "high", "X-Priority": "1"}
+    return {}
 
 
 def now_utc():

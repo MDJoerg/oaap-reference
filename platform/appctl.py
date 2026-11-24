@@ -142,6 +142,7 @@ import images  # noqa: E402
 import notify  # noqa: E402
 import connect_fresh  # noqa: E402  (0.1.286: a state.json left behind is no state)
 import fleet_watch  # noqa: E402
+import disk_trend  # noqa: E402
 # ... and what it says once a week (RFC-0083): ledger, report, Markdown.
 import report  # noqa: E402
 # ... and the secret files it refuses and looks for (RFC-0084).
@@ -2987,7 +2988,7 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "login.locked": "/users", "node.silent": "/health",
                 "bridge.down": "/health", "broker.queue": "/health",
                 "node.loss": "/health", "hub.unreachable": "/health",
-                "link.down": "/health"}
+                "link.down": "/health", "disk.trend": "/health", "disk.soon": "/health"}
 
 
 def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False,
@@ -3122,12 +3123,16 @@ NOTIFY_SEND = None      # tests replace it: (mail, sender_name, rcpts, subject, 
 #                         -> (ok, said) or (ok, said, final)
 
 
-def notify_smtp(mail, sender_name, rcpts, subject, body, html=None):
+NOTIFY_HEADERS_SEEN = []  # tests read the importance headers of the last mails here
+
+
+def notify_smtp(mail, sender_name, rcpts, subject, body, html=None, headers=None):
     """Send one plain mail from the host -> (ok, sentence, final). `final`
     says a failure will not get better by trying again: the server refused
     with a 5xx (measured on oaap-test 2026-11-11: "521 5.1.2 Domain does not
     exist" was retried every minute). A connection that broke, a 4xx: not
     final. The password never reaches the sentence; Bcc never a header."""
+    NOTIFY_HEADERS_SEEN[:] = NOTIFY_HEADERS_SEEN[-19:] + [dict(headers or {})]
     if NOTIFY_SEND:
         got = (NOTIFY_SEND(mail, sender_name, rcpts, subject, body, html=html) if html
                else NOTIFY_SEND(mail, sender_name, rcpts, subject, body))
@@ -3147,6 +3152,8 @@ def notify_smtp(mail, sender_name, rcpts, subject, body, html=None):
     msg["Subject"] = subject
     msg["Message-ID"] = make_msgid(domain=mail["from"].split("@", 1)[1])
     msg["Auto-Submitted"] = "auto-generated"
+    for k, v in (headers or {}).items():
+        msg[k] = v              # RFC-0085 A4 (§18.8): only critical mails
     msg.set_content(body)
     if html:
         msg.add_alternative(html, subtype="html")
@@ -3260,8 +3267,10 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
     if not values["mandant"]:
         # the node's own instances: "[oaap.example] …", never "[] …"
         tpl = tpl.replace("{mandant}", "{knoten}")
-    subject = notify.subject_with_prefix(lists, scope, notify.subject_for(
-        op, notify.expand(tpl, values)))
+    # RFC-0085 A4 (§18.8): the symbol goes first, before a list's prefix --
+    # it is what the eye catches in a full inbox
+    subject = notify.marked_subject(ntype, op, notify.subject_with_prefix(
+        lists, scope, notify.subject_for(op, notify.expand(tpl, values))))
     page = "/nachrichten" if op == "test" else NOTIFY_PAGES.get(ntype, "/")
     if "{instanz}" in page:
         page = (page.replace("{instanz}", urllib.parse.quote(item.get("instanz") or "", safe=""))
@@ -3285,7 +3294,8 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
         body = md + "\nIm Portal: " + notify_link(tid, "/nachrichten?tab=berichte&woche="
                                                  + item.get("kurz", "")) + "\n"
         html_body = report.to_html(body, title=subject)
-    ok, said, final = notify_smtp(mail, sender, rcpts, subject, body, html=html_body)
+    ok, said, final = notify_smtp(mail, sender, rcpts, subject, body, html=html_body,
+                                  headers=notify.importance_headers(ntype, op))
     if ok:
         state["stamps"][bucket] = kept + [now.isoformat()]
         _notify_log(dict(log, result="sent", said=said))
@@ -3563,6 +3573,22 @@ def _notify_tenant_backup_conditions(tid, now):
     return None, None
 
 
+def disk_forecast(pct=None, now=None):
+    """RFC-0085 A4 (§18.7): the disk's forecast from this node's metrics
+    tiers (30m for the week, 5m for the day), or None."""
+    pts = disk_trend.points([metrics._read(METRICS_DIR, "30m"), metrics._read(METRICS_DIR, "5m")])
+    return disk_trend.forecast(pts, int(now or time.time()), pct)
+
+
+def disk_trend_conditions(pct, open_keys, now=None):
+    fc = disk_forecast(pct, now)
+    try:
+        total = shutil.disk_usage(DATA_DIR).total
+    except OSError:
+        total = None
+    return disk_trend.conditions(fc, open_keys, total)
+
+
 def notify_conditions(facts=None, now=None):
     """The conditions true now, per scope: {tid: {key: condition}}."""
     now = now or notify.now_utc()
@@ -3602,6 +3628,12 @@ def notify_conditions(facts=None, now=None):
                 "text": f"Die Datenplatte des Servers ist zu {pct:.1f} % belegt "
                         f"({level}; Schwellen {s['disk_warn']:.0f} % / "
                         f"{s['disk_crit']:.0f} %)."}
+    # RFC-0085 A4 (§18.7): when will it be full -- from this node's own tiers
+    try:
+        open_now = set(((_notify_state_rw().get("matters") or {}).get(dflt) or {}))
+        cur[dflt].update(disk_trend_conditions(pct, open_now))
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: disk trend: {type(e).__name__}: {e}", file=sys.stderr)
     adv = facts.get("advisories") or {}
     if adv.get("open"):
         cur[dflt]["advisory.host"] = {
@@ -14560,6 +14592,14 @@ def broker_sync(announce=False):
         state = run(["docker", "ps", "-a", "--filter", "name=^oaap-broker-1$",
                      "--format", "{{.State}}"]).stdout.strip()
         if state == "running":
+            try:
+                if bridge_files_upgrade():
+                    run(["docker", "restart", "oaap-broker-1"])   # a bridge needs a restart
+                    print("broker: bridge file(s) rewritten in the form of RFC-0085 A4 "
+                          "-- broker restarted")
+            except Exception as exc:  # noqa: BLE001
+                print(f"broker: bridge form check skipped ({type(exc).__name__}: {exc})",
+                      file=sys.stderr)
             try:
                 broker_watch()        # RFC-0085 stage 2: counters, the hub's bridge
             except Exception as exc:  # noqa: BLE001
@@ -32413,8 +32453,19 @@ def broker_watch(now=None):
     cfg = {"url": f"mqtt://{ip}:1883", "user": mqtt_acl_watch_user(), "node": socket.gethostname()}
     client = metrics_sender.Client(cfg, time.monotonic() + 20, client_id=WATCH_CLIENT)
     client.connect(key)
+    # A4 (RFC-0085 §18.3): the nodes paired through this entry -- their
+    # retained `alive`, so the entry can judge them while their hub is away
+    me = fleet_node_name()
     try:
-        got = client.collect(["$SYS/broker/#", "oaap-fleet/bridge/#"], WATCH_SECONDS)
+        paired = {n: str((r or {}).get("hub") or "")
+                  for n, r in ((_pair_load().get("entry") or {}).get("nodes") or {}).items()}
+    except Exception:  # noqa: BLE001 -- no pairing file is no paired node
+        paired = {}
+    paired = {n: h for n, h in paired.items() if h and h != me and n != me}
+    try:
+        got = client.collect(["$SYS/broker/#", "oaap-fleet/bridge/#"]
+                             + [f"oaap-node/{n}/alive" for n in sorted(paired)],
+                             WATCH_SECONDS)
     finally:
         client.close()
 
@@ -32430,7 +32481,16 @@ def broker_watch(now=None):
         num("$SYS/broker/retained messages/count")
     old = _read_json_file(FLEET_WATCH_FILE) or {}
     hubs = {}
-    me = fleet_node_name()
+    nodes = {}
+    for n, hub in sorted(paired.items()):
+        rec = got.get(f"oaap-node/{n}/alive")
+        t = None
+        if rec is not None:
+            try:
+                t = json.loads(rec[0].decode("utf-8", "replace")).get("t")
+            except (ValueError, AttributeError):
+                t = None
+        nodes[n] = {"hub": hub, "t": t if isinstance(t, str) else None}
     for topic, (payload, _r) in got.items():
         p = topic.split("/")
         # only a hub's bridge INTO this node: oaap-fleet/bridge/<me>/<hub>.
@@ -32449,7 +32509,11 @@ def broker_watch(now=None):
             "queued": max(0, stored - retained) if stored is not None and retained is not None else None,
             "dropped": num("$SYS/broker/publish/messages/dropped"),
             "uptime": num("$SYS/broker/uptime"), "max_queued": _broker_max_queued(),
-            "sys_topics": sum(1 for t in got if t.startswith("$SYS/")), "hubs": hubs}
+            "sys_topics": sum(1 for t in got if t.startswith("$SYS/")), "hubs": hubs,
+            "nodes": nodes,
+            # A4: what this entry mailed itself -- kept from the last minute
+            # until fleet_conditions writes it anew; the hub defers to it
+            "held": [x for x in (old.get("held") or []) if x in nodes]}
     _write_json_private(FLEET_WATCH_FILE, data, 0o644)
     return data
 
@@ -32490,6 +32554,79 @@ def _fleet_write_verdict(state, now_e):
         print(f"fleet: verdict not written ({exc})", file=sys.stderr)
 
 
+def _entry_held_write(watch, names):
+    """A4: the entry's own node.silent matters into broker-watch.json, which
+    the sender carries to the hub (class `broker`) -- the hub defers to it."""
+    if not isinstance(watch, dict) or watch.get("held") == names:
+        return
+    try:
+        _write_json_private(FLEET_WATCH_FILE, dict(watch, held=names), 0o644)
+    except OSError as exc:
+        print(f"fleet: held nodes not written ({exc})", file=sys.stderr)
+
+
+FLEET_KICKS = os.path.join(FLEET_DIR, "kicks.json")         # A4: the bridge watchdog
+
+
+def _broker_log_since(seconds):
+    """The hub broker's log of the last `seconds` (Mosquitto writes to
+    stdout; Docker keeps it, RFC-0038 D5)."""
+    p = subprocess.run(["docker", "logs", "--since", f"{int(seconds)}s", "oaap-broker-1"],
+                       capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        raise OSError((p.stderr or "docker logs failed").strip()[:200])
+    return (p.stdout or "") + (p.stderr or "")
+
+
+def _broker_conf_texts():
+    """The texts of the broker's extra configuration (data/broker-conf.d)."""
+    out = []
+    try:
+        for name in sorted(os.listdir(BROKER_CONF_DIR)):
+            if name.endswith(".conf"):
+                with open(os.path.join(BROKER_CONF_DIR, name), encoding="utf-8") as f:
+                    out.append(f.read())
+    except OSError:
+        pass
+    return out
+
+
+def fleet_bridge_watchdog(state, now_e):
+    """RFC-0085 A4 §18.1: a bridge of this hub that has been down for ten
+    minutes and has not even tried to connect in that time is stuck
+    (Mosquitto 2.0.18 left the bridge to oaapx01 so from 2026-11-20 to
+    11-24); restart the hub's broker, backing off while it does not help.
+    -> the watchdog's record {entry: {"at", "n"}}. Never raises."""
+    me = fleet_node_name()
+    kicks = fleet_watch.kicks_after(state, me, _read_json_file(FLEET_KICKS) or {})
+    try:
+        configured = fleet_watch.bridge_connections(_broker_conf_texts())
+        if any(b.get("up") is False and e in configured
+               for e, b in fleet_watch.own_bridges(state, me).items()):
+            attempts = fleet_watch.bridge_attempts(
+                _broker_log_since(fleet_watch.KICK_AFTER + 60))
+            due = fleet_watch.kick_due(state, now_e, me, attempts, kicks, configured)
+            if due:
+                run(["docker", "restart", "oaap-broker-1"])
+                for entry in due:
+                    since = (fleet_watch.own_bridges(state, me).get(entry) or {}).get("since") or 0
+                    k = kicks.get(entry) or {}
+                    n = int(k.get("n") or 0) if (k.get("at") or 0) >= since else 0
+                    kicks[entry] = {"at": int(now_e), "n": n + 1}
+                    audit_fleet({"event": "bridge.kick", "entry": entry, "n": n + 1})
+                print(f"fleet: bridge(s) {', '.join(due)} stuck without a connect attempt "
+                      f"for {fleet_watch.KICK_AFTER // 60} minutes -- broker restarted",
+                      file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 -- never fails the minute job
+        print(f"fleet: bridge watchdog skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+    try:
+        if kicks or os.path.exists(FLEET_KICKS):
+            _write_json_private(FLEET_KICKS, kicks)
+    except OSError as exc:
+        print(f"fleet: watchdog record not written ({exc})", file=sys.stderr)
+    return kicks
+
+
 def fleet_conditions(now):
     """RFC-0085 §6: the fleet's matters in the node's default scope. On a
     hub from the fleet service's state, on a broker node from its broker
@@ -32509,9 +32646,11 @@ def fleet_conditions(now):
     if has_profile("fleet-hub"):
         state = _read_json_file(FLEET_STATE)
         if fleet_watch.trusted(state, now_e):
-            out.update(fleet_watch.hub_conditions(state, now_e, fleet_node_name(),
-                                                  held(fleet_watch.FLEET_MATTERS),
-                                                  _pair_removed()))
+            kicks = fleet_bridge_watchdog(state, now_e)
+            out.update(fleet_watch.hub_conditions(
+                state, now_e, fleet_node_name(), held(fleet_watch.FLEET_MATTERS),
+                _pair_removed(), kicks,
+                fleet_watch.bridge_connections(_broker_conf_texts())))
             # RFC-0087 §6: a broken tunnel, one matter, with what depends on it
             links = fleet_watch.link_conditions(_read_json_file(FLEET_AFFECTED), now_e,
                                                 held(("link.down",)))
@@ -32537,11 +32676,16 @@ def fleet_conditions(now):
         else:
             keep(fleet_watch.FLEET_MATTERS)
     if has_profile("broker"):
-        conds = fleet_watch.entry_conditions(_read_json_file(FLEET_WATCH_FILE), now_e)
+        watch = _read_json_file(FLEET_WATCH_FILE)
+        mine = {k: v for k, v in held(("node.silent",)).items()
+                if k.split("/", 1)[-1] in ((watch or {}).get("nodes") or {})}
+        conds = fleet_watch.entry_conditions(watch, now_e, mine)
         if conds is None:
             keep(("hub.unreachable",))
+            out.update(mine)
         else:
             out.update(conds)
+            _entry_held_write(watch, fleet_watch.entry_held_names(conds))
     try:
         # RFC-0085 stage 3: the page "Flotte" reads it -- on EVERY node: a
         # fresh node with no pairing yet is exactly the one that needs the
@@ -32584,11 +32728,15 @@ def _fleet_hub_show():
               f" seq {r['seq']} gaps {r['gaps']} lost {r['lost']}"
               + (f"  ({r['reason']})" if r["reason"] else ""))
     print("\nBridges:")
+    kicks = _read_json_file(FLEET_KICKS) or {}
     for _k, b in sorted((state.get("bridges") or {}).items()):
         own = b.get("hub") == me
+        k = kicks.get(b.get("entry")) if own else None
         print(f"  {b.get('entry', '?'):<16} {'up' if b.get('up') else 'DOWN'} since "
               f"{fleet_watch.iso(b['since']) if b.get('since') else '?'}"
-              + ("" if own else f"  (bridge of {b.get('hub')} into this node, not judged here)"))
+              + ("" if own else f"  (bridge of {b.get('hub')} into this node, not judged here)")
+              + (f"  (watchdog: broker restarted {k.get('n')}x, last "
+                 f"{fleet_watch.iso(k['at'])})" if isinstance(k, dict) and k.get("at") else ""))
     if not state.get("bridges"):
         print("  (none seen)")
     print("\nBrokers:")
@@ -33234,6 +33382,51 @@ def fleet_pair_code(node, via="", lan=False, replace=False, now=None):
     audit_fleet({"event": "pair.code", "node": rec["node"], "entry": via,
                  "replace": bool(replace)})
     return text, rec
+
+
+def bridge_files_upgrade(conf_dir=None, keep_dir=None, now=None):
+    """RFC-0085 A4 (§18.4): rewrite the bridge files the pairing wrote in an
+    older form, with the same keys -- the old file is kept in
+    data/fleet-pair/. A hand-made file is left alone. -> [entry] rewritten
+    (the caller restarts the broker once)."""
+    conf_dir = conf_dir or BROKER_CONF_DIR
+    keep_dir = keep_dir or FLEET_PAIR_DIR
+    done = []
+    try:
+        names = sorted(os.listdir(conf_dir))
+    except OSError:
+        return done
+    for name in names:
+        if not (name.startswith("bridge-") and name.endswith(".conf")):
+            continue
+        path = os.path.join(conf_dir, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if fleet_pair.bridge_form(text) == fleet_pair.BRIDGE_FORM:
+            continue
+        fields = fleet_pair.bridge_fields(text)
+        if not fields:
+            continue
+        new = fleet_pair.bridge_conf(**fields)
+        os.makedirs(keep_dir, exist_ok=True)
+        os.chmod(keep_dir, 0o700)
+        shutil.copy2(path, os.path.join(keep_dir, f"{name}.before-{int(now or time.time())}"))
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new)
+        try:
+            os.chown(tmp, broker_certs.BROKER_UID, broker_certs.BROKER_UID)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+        audit_fleet({"event": "bridge.form", "entry": fields["entry"],
+                     "form": fleet_pair.BRIDGE_FORM})
+        done.append(fields["entry"])
+    return done
 
 
 def fleet_pair_entry_add(text, now=None):

@@ -53,3 +53,18 @@ auth_opt_http_aclcheck_uri /mqtt-auth/aclcheck?k=__INTERNAL_API_KEY__
 auth_opt_http_params_mode json
 auth_opt_http_response_mode json
 auth_opt_http_method POST
+# RFC-0085 A4 (§18.4, oaap.events.broker 0.6): go-auth remembers identity's
+# answers for 60 seconds. Without it Mosquitto asked identity once per
+# message -- also once per QUEUED message when a persistent session came
+# back, before that client got anything: measured on oaap-test 2026-11-24,
+# 10000 queued took 30 s, 100000 never arrived (the hub gave up waiting
+# for its CONNACK and tried again, every minute -- the loop oaapx01 was in
+# from 2026-11-24 21:24). With the cache: 100000 in 11 s, publishing 50
+# times faster. The price: a revoked key or a withdrawn grant can work up
+# to 60 seconds longer. Only here: an auth_opt_ line in a conf.d file is
+# refused (the broker does not start -- measured).
+auth_opt_cache true
+auth_opt_cache_type go-cache
+auth_opt_cache_reset true
+auth_opt_auth_cache_seconds 60
+auth_opt_acl_cache_seconds 60

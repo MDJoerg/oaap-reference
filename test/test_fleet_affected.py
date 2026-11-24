@@ -183,8 +183,8 @@ ok("ohne began (alle anderen Typen): wie bisher ab opened",
 ok("weder began noch opened: unbekannt", notify.matter_duration({}, t_close) is None)
 src_w = open(os.path.join(HERE, "..", "platform", "services", "fleet_watch.py"),
              encoding="utf-8").read()
-ok("node.silent, bridge.down, hub.unreachable, link.down tragen began",
-   src_w.count('"began": ') == 4)
+ok("node.silent (Zentrale und, seit RFC-0085 A4, Eingang), bridge.down, hub.unreachable, "
+   "link.down tragen began", src_w.count('"began": ') == 5)
 src_a = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
 ok("appctl rechnet die Dauer über matter_duration", "notify.matter_duration(rec, now)" in src_a)
 

@@ -16605,7 +16605,7 @@ MESSAGES_BODY = """
   <h2>Benachrichtigungen</h2>
   <p class="muted">Welcher Verteiler welche Meldung bekommt. Ohne Haken geht sie an den
   Pflicht-Verteiler. Eine Lage wird gemeldet, wenn sie beginnt und wenn sie behoben ist,
-  Kritisches zusätzlich einmal täglich. Höchstens {{ n.per_hour }} Mails je Stunde.</p>
+  Kritisches und Lagen der Flotte zusätzlich einmal täglich. Höchstens {{ n.per_hour }} Mails je Stunde.</p>
   <form method="post" action="/nachrichten/benachrichtigungen{{ q }}">
   <table class="list"><tr><th>Kategorie</th>{% for nm in n.names %}<th>{{ nm }}</th>{% endfor %}<th>Betreff</th><th>nur im Bericht</th></tr>
   {% for r in n.rows if r.is_cat %}<tr><td><strong>{{ r.word }}</strong></td>
