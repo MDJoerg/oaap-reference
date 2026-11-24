@@ -356,7 +356,7 @@ def register(app, get_conn, apps_dir):
                         return jsonify(error=f"since: {since} is not (or no longer) in the "
                                              "store -- read from the oldest without since"), 400
                     after = row["seq"]
-                cur.execute("SELECT type, subject_prefix FROM bus_grants "
+                cur.execute("SELECT type, subject_prefix, granted_at FROM bus_grants "
                             "WHERE instance = %s AND revoked_at IS NULL", (me,))
                 where = bm.pending_conditions(
                     cur.fetchall(), [sb["type"] for sb in entry.get("subscribes") or []], me)

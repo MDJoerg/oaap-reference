@@ -7969,13 +7969,15 @@ def cmd_migrate_tenant_places(_args):
         have = ""
     missing = [f for f in want if f"://{f} {{" not in have]
     # oaap.events.bus 0.9: the sites written before carry no inbound route
-    # -- the same rewrite, said once (quiet afterwards)
-    if have and "handle /twin/v1/inbound/* {" not in have:
+    # -- the same rewrite, said once (quiet afterwards); 0.10 (RFC-0127
+    # D15): nor the clients' door /twin/v1/*
+    if have and ("handle /twin/v1/inbound/* {" not in have
+                 or "@twin_nokey not header_regexp Authorization" not in have):
         refresh_generated_sites()
         reload_gateway()
         print("")
-        print("Inbound webhooks and CloudEvents now reach the twin at this node's "
-              "external name (/twin/v1/inbound/, oaap.events.bus 0.9).")
+        print("Inbound webhooks, CloudEvents and integration clients now reach the twin "
+              "at this node's external name (/twin/v1/, oaap.events.bus 0.10).")
     if not missing:
         return
     print("")
@@ -13091,12 +13093,14 @@ def tenant_recipe_job(req, act_tenant, role, actor):
             except SystemExit:
                 return False, "the tenant's types could not be read: " + (LAST_DIE or "?"), {}
             writes, models = str(a.get("writes") or ""), a.get("models") is True
+            events = a.get("events") is True
             why = twin_client_problem(name, tid, str(a.get("reads") or ""), active, writes,
-                                      models)
+                                      models, events)
             if why:
                 return False, why, {}
             twin_client_add(name, tid, str(a.get("reads") or ""), who=actor,
-                            active_types=active, issue=False, writes=writes, models=models)
+                            active_types=active, issue=False, writes=writes, models=models,
+                            events=events)
             return True, (f"Client „{name}“ angelegt. Den Schlüssel stellst du jetzt auf "
                           "dieser Seite aus -- er wird genau einmal gezeigt."), {"client": name}
         elif op in ("release", "unrelease"):
@@ -17840,6 +17844,12 @@ def _twin_ensure_tables(schema):
 # enforce elsewhere, a syntactic impossibility. Used only here and in
 # the Caddyfile's '/twin/*' block; the two must always agree.
 TWIN_KEY_SCOPE = "oaap.twin"
+# RFC-0127 D15: the gateway's word that a call came in at the node's
+# external name; the twin reads it (twin/app.py TWIN_DOOR_HEADER) and lets
+# only an integration client through there. Written by the gateway on that
+# route, overwriting the sender's -- a sender who forges it elsewhere only
+# shuts its own door.
+TWIN_DOOR_HEADER = "X-OAAP-Twin-Door"
 
 
 def _twin_issue_instance_key(name, tenant_id):
@@ -20299,18 +20309,24 @@ def _type_list(raw):
     return sorted({t.strip() for t in (raw or "").split(",") if t.strip()})
 
 
-def twin_client_problem(label, tid, reads, active_types, writes="", models=False):
+def twin_client_problem(label, tid, reads, active_types, writes="", models=False,
+                        events=False):
     """'' or the sentence why this client cannot be made (RFC-0120 stage 0;
     stage 3: `writes` -- the types it creates objects of and writes its own
-    groups on, `models` -- it may create types of its tenant, D8)."""
+    groups on, `models` -- it may create types of its tenant, D8; RFC-0127
+    D14: `events` -- a client for events only, no right in the twin)."""
     if not re.fullmatch(DEST_NAME_RE, label or ""):
         return ("a client label is [a-z0-9-], 2-40 characters, starting and "
                 "ending with a letter or digit")
     types = _type_list(reads)
     wtypes = _type_list(writes)
-    if not types and not wtypes and not models:
-        return ("name the types this client may read or write, or let it model -- "
-                "there is no default (RFC-0120)")
+    if events and (types or wtypes or models):
+        return ("--events makes a client for events only -- it reads, writes and models "
+                "nothing in the twin; a client with twin rights may be granted events "
+                "anyway (RFC-0127 D14)")
+    if not types and not wtypes and not models and not events:
+        return ("name the types this client may read or write, let it model, or make it "
+                "a client for events only (--events) -- there is no default (RFC-0120)")
     if label in load_twin_clients():
         return f"an integration client '{label}' exists -- remove it first"
     missing = [t for t in types + wtypes if t not in active_types]
@@ -20321,7 +20337,7 @@ def twin_client_problem(label, tid, reads, active_types, writes="", models=False
 
 
 def twin_client_add(label, tid, reads, days=None, who="root", active_types=None, issue=True,
-                    writes="", models=False):
+                    writes="", models=False, events=False):
     """RFC-0120 stage 0: `client:<label>` in tenant `tid`, reading exactly
     `reads` (stage 3: writing `writes`, modelling with `models`). With
     `issue`, also a key scoped to the twin -> (secret, expires); without (the
@@ -20329,7 +20345,7 @@ def twin_client_add(label, tid, reads, days=None, who="root", active_types=None,
     portal straight from identity, shown once, never through a job's files."""
     if active_types is None:
         active_types = {t["key"] for t in model_types(tid)}
-    why = twin_client_problem(label, tid, reads, active_types, writes, models)
+    why = twin_client_problem(label, tid, reads, active_types, writes, models, events)
     if why:
         die(why)
     wtypes = _type_list(writes)
@@ -20363,7 +20379,8 @@ def twin_client_add(label, tid, reads, days=None, who="root", active_types=None,
         {"OAAP_R_NAME": principal, "OAAP_R_TENANT": tid, "OAAP_R_ISSUE": "1" if issue else "0",
          "OAAP_R_TITLE": f"integration client {label}",
          "OAAP_R_SCOPE": TWIN_KEY_SCOPE,
-         "OAAP_R_LABEL": f"oaap.data.twin integration client ({','.join(types) or 'models'})",
+         "OAAP_R_LABEL": "oaap.data.twin integration client ("
+                         + (",".join(types) or ("events" if events else "models")) + ")",
          "OAAP_R_DAYS": str(days or "")})
     res = json.loads(out.strip().splitlines()[-1])
     if res.get("error"):
@@ -20375,9 +20392,11 @@ def twin_client_add(label, tid, reads, days=None, who="root", active_types=None,
         clients[label]["writes"] = wtypes
     if models:
         clients[label]["models"] = True
+    if events:
+        clients[label]["events"] = True
     save_twin_clients(clients)
     audit_tenant("twin.client.add", tid, subject=principal, who=who,
-                 detail="reads " + (",".join(types) or "-")
+                 detail=("events only" if events else "reads " + (",".join(types) or "-"))
                  + (f", writes {','.join(wtypes)}" if wtypes else "")
                  + (", models" if models else "") + f", key {res['id']}")
     return res["secret"], res["expires"]
@@ -20568,6 +20587,7 @@ def cmd_data_twin(args):
                   f"  reads {','.join(c.get('reads') or []) or '-'}"
                   + (f"  writes {','.join(c['writes'])}" if c.get("writes") else "")
                   + ("  models" if c.get("models") else "")
+                  + ("  events only" if c.get("events") else "")
                   + f"  key {c.get('key', '?')} until {c.get('expires', '?')}")
         return
     if args.action in ("add-client", "remove-client"):
@@ -20582,17 +20602,29 @@ def cmd_data_twin(args):
         tid = resolve_tenant_arg(args.tenant) or die(
             "add-client needs --tenant (the tenant whose twin it reads)")
         key, expires = twin_client_add(label, tid, args.reads, args.days, who=who,
-                                       writes=args.writes, models=args.models)
-        print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' reads {args.reads or '-'}"
-              + (f", writes {args.writes}" if args.writes else "")
-              + (", models types of its tenant" if args.models else "")
-              + f" of tenant '{tenant_label(tid) or tid}' (RFC-0120).")
+                                       writes=args.writes, models=args.models,
+                                       events=args.events)
+        if args.events:
+            print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' of tenant "
+                  f"'{tenant_label(tid) or tid}' for events only -- nothing in the twin "
+                  "(RFC-0127 D14).")
+        else:
+            print(f"Integration client '{TWIN_CLIENT_PREFIX}{label}' reads {args.reads or '-'}"
+                  + (f", writes {args.writes}" if args.writes else "")
+                  + (", models types of its tenant" if args.models else "")
+                  + f" of tenant '{tenant_label(tid) or tid}' (RFC-0120).")
         print(f"Its key, shown ONCE (valid until {expires}) -- for the program, never for an app:")
         print("")
         print(f"  {key}")
         print("")
-        print("The program calls  GET <node>/twin/v1/types  and  GET <node>/twin/v1/openapi.json")
-        print("with  Authorization: Bearer <key>.")
+        if args.events:
+            print("Grant it event types:  sudo oaap events grant " + TWIN_CLIENT_PREFIX + label
+                  + " <type> --tenant ...")
+            print("It registers a webhook (format cloudevents) or a receiver with events at")
+            print("<node>/twin/v1/webhooks and /twin/v1/receivers, Authorization: Bearer <key>.")
+        else:
+            print("The program calls  GET <node>/twin/v1/types  and  GET <node>/twin/v1/openapi.json")
+            print("with  Authorization: Bearer <key>.")
         return
     if args.action == "readers":
         readers = load_twin_readers()
@@ -22053,6 +22085,37 @@ def _portal_site_body():
     lines.append("\t\t\tmax_size 1MB")
     lines.append("\t\t}")
     lines.append("\t\treverse_proxy twin:8000")
+    lines.append("\t}")
+    # the clients' door at the node's NAME (RFC-0127 D15, Jörg 2026-11-24):
+    # an integration client outside -- an ERP in the cloud, a script on a
+    # laptop -- reaches /twin/v1 here as it does at the node's own address:
+    # identity checks its key, scoped oaap.twin (the base Caddyfile's
+    # '/twin/*'). Only /twin/v1, never the apps' /twin/objects. The gateway
+    # names the door (TWIN_DOOR_HEADER, overwriting whatever the sender
+    # wrote): the twin then lets only a 'client:' through -- an instance's
+    # key and a remote reader's are for the node and the connector, never
+    # for the internet; a person's session counts nothing at /twin/v1.
+    # No key at all answers 401 here, before identity: /verify would take
+    # the session's way and send the program to the login form (303) --
+    # measured from outside 2026-11-24. A program reads a status code.
+    lines.append("\thandle /twin/v1/* {")
+    # no bearer at all (none, or Basic): a session counts nothing here
+    lines.append("\t\t@twin_nokey not header_regexp Authorization (?i)^bearer\\s")
+    lines.append("\t\thandle @twin_nokey {")
+    lines.append('\t\t\theader Content-Type "application/json"')
+    lines.append('\t\t\theader WWW-Authenticate "Bearer"')
+    lines.append('\t\t\trespond `{"error": "an integration client\'s key: '
+                 'Authorization: Bearer <key> (RFC-0127 D15)"}` 401')
+    lines.append("\t\t}")
+    lines.append("\t\thandle {")
+    lines.append(f"\t\t\trequest_header {TWIN_DOOR_HEADER} external")
+    lines.append("\t\t\tforward_auth identity:8000 {")
+    lines.append(f"\t\t\t\turi /verify?roles=user&instance={TWIN_KEY_SCOPE}")
+    lines.append("\t\t\t\t" + _COPY_IDENTITY)
+    lines += ["\t" + x for x in _AUTH_NO_UPGRADE]
+    lines.append("\t\t\t}")
+    lines.append("\t\t\treverse_proxy twin:8000")
+    lines.append("\t\t}")
     lines.append("\t}")
     lines.append("\thandle {")
     lines.append("\t\tforward_auth identity:8000 {")
@@ -42990,6 +43053,9 @@ def build_parser():
                           "its own groups on, comma-separated (RFC-0120 stage 3)")
     pdt.add_argument("--models", action="store_true",
                      help="twin add-client: it may create types of its tenant (RFC-0120 D8)")
+    pdt.add_argument("--events", action="store_true",
+                     help="twin add-client: a client for events only -- webhooks and receivers "
+                          "for granted event types, nothing in the twin (RFC-0127 D14)")
     pdt.set_defaults(fn=cmd_data)
     pe = sub.add_parser("external",
                         help="the node's public hostname and TLS, also behind an edge (RFC-0006)")

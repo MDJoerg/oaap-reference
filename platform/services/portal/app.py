@@ -5684,7 +5684,7 @@ Mandanten anlegen (RFC-0120). Die Beschreibung der Tür liefert <code>/twin/v1/o
 {% if clients %}
 <table><tr><th>Client</th><th>liest</th><th>schreibt</th><th>Schlüssel</th><th></th></tr>
 {% for c in clients %}<tr><td><code>client:{{ c.label }}</code></td><td>{{ c.reads|join(', ') or '–' }}</td>
-<td>{{ c.writes|join(', ') or '–' }}{% if c.models %}<br><span class="muted">modelliert</span>{% endif %}</td>
+<td>{{ c.writes|join(', ') or '–' }}{% if c.models %}<br><span class="muted">modelliert</span>{% endif %}{% if c.events %}<br><span class="muted">nur Ereignisse</span>{% endif %}</td>
 <td>{% if c.client_keys %}{% for k in c.client_keys %}{{ k.id }} bis {{ k.expires[:10] }}<br>{% endfor %}{% else %}<span class="muted">keiner</span>{% endif %}</td>
 <td><form method="post" action="/zugaenge/integration/{{ c.label }}/schluessel" style="display:inline">
 <input name="days" value="90" size="3"> Tage <button class="btn">Schlüssel ausstellen</button></form>
@@ -5731,6 +5731,10 @@ Schreibregel, alles oder nichts. Der Client legt Empfänger über <code>/twin/v1
 <p><label><input type="checkbox" name="models" value="ja"> Modelliert</label>
 <span class="muted">darf eigene Typen dieses Mandanten anlegen (Objekttypen heißen dann
 <code>t.{{ label }}.&lt;Name&gt;</code>) und schreibt Objekte dieser Typen.</span></p>
+<p><label><input type="checkbox" name="events" value="ja"> Nur Ereignisse</label>
+<span class="muted">liest und schreibt nichts im Zwilling; bekommt freigegebene Ereignistypen
+(<a href="/ereignisse">Ereignisse</a>) per Webhook und reicht über Empfänger eigene herein.
+Dann bleiben die Felder oben leer.</span></p>
 <p><button class="btn">Anlegen</button> <span class="muted">Danach stellst du hier den Schlüssel aus.</span></p>
 </form></div>
 """
@@ -5752,6 +5756,7 @@ def _integration_clients(tid):
             continue
         out.append({"label": label, "reads": c.get("reads") or [],
                     "writes": c.get("writes") or [], "models": c.get("models") is True,
+                    "events": c.get("events") is True,
                     "client_keys": [k for k in keys if k["principal"] == "client:" + label
                              and str(k.get("expires") or "") > now]})
     return out
@@ -5815,7 +5820,8 @@ def integration_new():
     jid = management_api.enqueue(tid, role, "twin-client-add",
                                  {"tenant": label, "label": name, "reads": reads,
                                   "writes": writes,
-                                  "models": request.form.get("models") == "ja"},
+                                  "models": request.form.get("models") == "ja",
+                                  "events": request.form.get("events") == "ja"},
                                  action="tenant-recipe")
     return redirect(f"/zugaenge/integration?job={jid}")
 

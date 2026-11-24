@@ -628,6 +628,10 @@ def add_hook(conn, principal, readable, body, allowed_private=(), closed=False):
     kinds = body.get("kinds") or []
     if not isinstance(types, list) or not isinstance(kinds, list):
         _refuse("'types' and 'kinds' are lists")
+    if not readable and fmt == "oaap-v1":
+        _refuse(f"'{principal}' reads nothing in the twin -- a webhook in the oaap-v1 format "
+                "would carry nothing; register it with format cloudevents for its granted "
+                "event types (RFC-0127 D14)")
     for t in types:
         if t not in readable:
             _refuse(f"'{principal}' may not read type '{t}' -- it may read: "

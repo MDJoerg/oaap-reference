@@ -626,15 +626,27 @@ def client_conditions(grants, me):
     None when it holds none."""
     conds, args = [], []
     for g in grants:
-        c = "(oaapto IS NULL AND type = %s AND time >= %s"
-        args += [g["type"], g["granted_at"]]
-        if g.get("subject_prefix"):
-            c += " AND starts_with(subject, %s)"
-            args.append(g["subject_prefix"])
-        conds.append(c + ")")
+        c, a = grant_condition(g)
+        conds.append(c)
+        args += a
     if not conds:
         return None
     return f"source_instance <> %s AND ({' OR '.join(conds)})", [me] + args
+
+
+def grant_condition(g):
+    """(sql, args) of what one live grant opens -- the one rule for every
+    receiver, instance or client (RFC-0127 D13, Jörg 2026-11-24): the
+    granted type, not addressed, under its subject prefix, **from the moment
+    of the grant on** (`time >= granted_at`). The store's past stays closed;
+    it is read in the twin. A grant without `granted_at` is a fault, not an
+    open door: KeyError."""
+    c = "(oaapto IS NULL AND type = %s AND time >= %s"
+    args = [g["type"], g["granted_at"]]
+    if g.get("subject_prefix"):
+        c += " AND starts_with(subject, %s)"
+        args.append(g["subject_prefix"])
+    return c + ")", args
 
 
 def is_personal(catalogue, tenant, t):
@@ -1031,16 +1043,14 @@ def pending_conditions(grants, wanted, me):
     """(sql, args) of the WHERE part both the feed and the push use: the
     events of the tenant that `me` holds a live grant for (not addressed),
     plus those addressed to `me` of a type it declares (0.2), never its
-    own. `grants` = [{type, subject_prefix}], `wanted` = its subscribed
-    types. None when nothing can reach it."""
+    own. A grant opens its type from `granted_at` on (grant_condition, D13).
+    `grants` = [{type, subject_prefix, granted_at}], `wanted` = its
+    subscribed types. None when nothing can reach it."""
     conds, args = [], []
     for g in grants:
-        if g.get("subject_prefix"):
-            conds.append("(oaapto IS NULL AND type = %s AND starts_with(subject, %s))")
-            args += [g["type"], g["subject_prefix"]]
-        else:
-            conds.append("(oaapto IS NULL AND type = %s)")
-            args.append(g["type"])
+        c, a = grant_condition(g)
+        conds.append(c)
+        args += a
     if wanted:
         conds.append("(oaapto = %s AND type = ANY(%s))")
         args += [me, list(wanted)]

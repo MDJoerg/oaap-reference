@@ -314,10 +314,10 @@ ok("Signatur: die App prueft sie mit ihrem Geheimnis",
    and not bm.verify("geheim", sig, body + b" ", now=1700000010)
    and not bm.verify("geheim", sig, body, now=1700000000 + 301) and not bm.verify("geheim", "", body))
 ok("Backoff: 2^n, hoechstens eine Stunde", bm.backoff(1) == 2 and bm.backoff(3) == 8 and bm.backoff(30) == 3600)
-w = bm.pending_conditions([{"type": "a.b.c.v1", "subject_prefix": None}], ["x.y.z.v1"], "me")
+w = bm.pending_conditions([{"type": "a.b.c.v1", "subject_prefix": None, "granted_at": "T0"}], ["x.y.z.v1"], "me")
 ok("Feed und Push lesen dieselbe Regel: Freigabe nicht adressiert, adressiert an mich, nie meine eigenen",
    w[0].startswith("source_instance <> %s") and "oaapto IS NULL AND type = %s" in w[0]
-   and "oaapto = %s AND type = ANY(%s)" in w[0] and w[1] == ["me", "a.b.c.v1", "me", ["x.y.z.v1"]])
+   and "oaapto = %s AND type = ANY(%s)" in w[0] and w[1] == ["me", "a.b.c.v1", "T0", "me", ["x.y.z.v1"]])
 ok("nichts erreichbar -> None", bm.pending_conditions([], [], "me") is None)
 
 import datetime as _dt                                         # noqa: E402
@@ -346,8 +346,9 @@ class FakeCur:
                    "failures": 0, "next_at": None, "stopped_at": None}
             self.deliv[args[0]] = row
             self._r = [dict(row)]
-        elif q.startswith("SELECT type, subject_prefix FROM bus_grants"):
-            self._r = [{"type": g, "subject_prefix": None} for g in self.grants]
+        elif q.startswith("SELECT type, subject_prefix, granted_at FROM bus_grants"):
+            self._r = [{"type": g, "subject_prefix": None, "granted_at": "2026-01-01T00:00:00Z"}
+                       for g in self.grants]
         elif q.startswith("SELECT seq, id"):
             after, me = args[0], args[1]
             types = [a for a in args[2:-1] if isinstance(a, str) and a != me]
@@ -389,7 +390,7 @@ def send_ok(inst, body, headers):
 
 
 cur = FakeCur([ev_row(1), ev_row(2)], grants=[PUB["type"]])
-ok("erstes Mal: der Push beginnt beim neuesten Ereignis (die Vergangenheit hat der Feed)",
+ok("erstes Mal: der Push beginnt beim neuesten Ereignis (die Vergangenheit steht im Zwilling, D13)",
    bp.push_instance(cur, "T1", "t1-sub", ent, "geheim", send=send_ok) == "nothing" and SENT == [])
 cur.events += [ev_row(3), ev_row(4), ev_row(5, src="t1-sub"), ev_row(6, typ="app.x.y.z.v1"),
                ev_row(7, to="t1-sub"), ev_row(8, to="t1-other")]

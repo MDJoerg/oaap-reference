@@ -124,6 +124,9 @@ REMOTE_PREFIX = "remote:"
 # tenant each, reading exactly the types the operator (later the tenant
 # admin) bound them to. Written by appctl only; no secret in it.
 CLIENTS_FILE = os.path.join(PLATFORM_APPS_DIR, "twin-clients.json")
+# RFC-0127 D15: written by the gateway on the external sites' /twin/v1/*
+# (appctl.py TWIN_DOOR_HEADER) -- there only a 'client:' passes
+TWIN_DOOR_HEADER = "X-OAAP-Twin-Door"
 CLIENT_PREFIX = "client:"
 # the tenants' labels (the namespace of a tenant's object types, RFC-0120 D9)
 # and whether a tenant's outbound traffic is closed (RFC-0068: no webhooks)
@@ -245,6 +248,12 @@ def require_caller():
     route, per the deployment contract every other protected route
     already relies on)."""
     user = request.headers.get("X-OAAP-User", "")
+    if request.headers.get(TWIN_DOOR_HEADER, "") and not is_client(user):
+        # RFC-0127 D15: at the node's external name only an integration
+        # client -- an instance's key and a remote reader's never leave
+        # the node, a person's session counts nothing here
+        return None, ("at this node's external name /twin/v1 is an integration client's "
+                      "door only (RFC-0127 D15)"), 403
     if is_client(user):
         resolved = resolve_client(user[len(CLIENT_PREFIX):])
         if resolved is None:

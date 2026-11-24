@@ -88,7 +88,7 @@ def push_instance(cur, tenant, instance, entry, secret, send=post, now=None):
     t = time.time() if now is None else now
     if st["next_at"] is not None and st["next_at"].timestamp() > t:
         return "waiting"
-    cur.execute("SELECT type, subject_prefix FROM bus_grants "
+    cur.execute("SELECT type, subject_prefix, granted_at FROM bus_grants "
                 "WHERE instance = %s AND revoked_at IS NULL", (instance,))
     where = bm.pending_conditions(cur.fetchall(),
                                   [sb["type"] for sb in entry.get("subscribes") or []], instance)
