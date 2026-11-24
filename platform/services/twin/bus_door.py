@@ -15,6 +15,7 @@ events-catalog.json).
                          never reachable through /platform/events (the
                          gateway serves only `/` and `/feed` there)
 """
+import datetime
 import json
 import os
 import random
@@ -25,6 +26,29 @@ from flask import jsonify, request
 import bus_model as bm
 
 CATALOG_NAME = "events-catalog.json"
+AUDIT_LOG = "/audit/tenant-log.jsonl"
+# who acts on the portal page (0.6): the tenant's own administrators
+PAGE_ROLES = {"tenant_admin", "server_admin"}
+
+
+def audit(action, tenant, subject, who, detail=""):
+    """One line in the tenant audit log (oaap.core.tenant 1.7), the form
+    appctl and identity write -- appended, never rewritten; a failure to
+    write never fails the action, it is said on stderr."""
+    entry = {"when": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+             "who": who or "?", "role": "-", "action": action, "tenant": tenant,
+             "tenant_label": "", "subject": subject, "result": "ok"}
+    if detail:
+        entry["detail"] = detail
+    try:
+        with open(AUDIT_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"bus: audit not written: {e}", file=sys.stderr, flush=True)
+
+
+def _iso(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
 
 
 def _load(path, default):
@@ -161,6 +185,100 @@ def register(app, get_conn, apps_dir):
         finally:
             conn.close()
         return jsonify(stored=True, id=eid), 202
+
+    # ------------------------------------------- the portal page (0.6)
+    def _page_person():
+        """(username, tenant) of a tenant admin the portal relays, or
+        (None, (status, sentence)). Behind the '/internal/*' guard."""
+        user = request.headers.get("X-OAAP-Person-User", "").strip()
+        tenant = request.headers.get("X-OAAP-Person-Tenant", "").strip()
+        roles = set(filter(None, request.headers.get("X-OAAP-Person-Roles", "").split(",")))
+        if not user or not tenant:
+            return None, (400, "missing person context")
+        if not roles & PAGE_ROLES:
+            return None, (403, "the page \"Ereignisse\" is for the tenant's administrators")
+        return (user, tenant), None
+
+    def _own_instance(tenant, name):
+        cat = _load(os.path.join(apps_dir, CATALOG_NAME), {})
+        e = (cat.get("instances") or {}).get(name)
+        return cat if e and e.get("tenant") == tenant else None
+
+    @app.get("/internal/bus/overview")
+    def bus_overview():
+        who, err = _page_person()
+        if who is None:
+            return jsonify(error=err[1]), err[0]
+        _user, tenant = who
+        cat = _load(os.path.join(apps_dir, CATALOG_NAME), {})
+        reg = _load(os.path.join(apps_dir, "registry.json"), {})
+        grants, deliveries, store = [], {}, False
+        conn = get_conn(tenant)
+        if conn is not None:
+            store = True
+            try:
+                with conn, conn.cursor() as cur:
+                    cur.execute("SELECT instance, type, subject_prefix, granted_by, granted_at "
+                                "FROM bus_grants WHERE revoked_at IS NULL")
+                    grants = [dict(r, granted_at=_iso(r["granted_at"])) for r in cur.fetchall()]
+                    cur.execute("SELECT instance, delivered, failures, stopped_at, last_error, "
+                                "last_ok_at FROM bus_deliveries")
+                    deliveries = {r["instance"]: {k: _iso(v) for k, v in r.items()}
+                                  for r in cur.fetchall()}
+            finally:
+                conn.close()
+        out = bm.overview(cat, reg, tenant, grants, deliveries)
+        out["store"] = store
+        return jsonify(out)
+
+    @app.post("/internal/bus/<action>")
+    def bus_page_action(action):
+        if action not in ("grant", "revoke", "resume"):
+            return jsonify(error="grant, revoke or resume"), 404
+        who, err = _page_person()
+        if who is None:
+            return jsonify(error=err[1]), err[0]
+        user, tenant = who
+        body = request.get_json(silent=True) or {}
+        name, t = str(body.get("instance") or ""), str(body.get("type") or "")
+        pre = str(body.get("subject_prefix") or "").strip()
+        cat = _own_instance(tenant, name)
+        if cat is None:
+            return jsonify(error=f"'{name}' is not an instance of this tenant with an events block"), 404
+        if action == "grant":
+            why = bm.grant_error(cat, tenant, name, t)
+            if why:
+                return jsonify(error=why), 409
+            if len(pre) > bm.SUBJECT_MAX or any(ord(c) < 32 for c in pre):
+                return jsonify(error="subject prefix: at most 200 printable characters"), 400
+        elif action == "revoke" and not t:
+            return jsonify(error="type: required"), 400
+        conn = get_conn(tenant)
+        if conn is None:
+            return jsonify(error="this tenant has no event store yet"), 409
+        try:
+            with conn, conn.cursor() as cur:
+                if action == "grant":
+                    cur.execute("INSERT INTO bus_grants (instance, type, subject_prefix, granted_by) "
+                                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING id",
+                                (name, t, pre or None, user))
+                elif action == "revoke":
+                    cur.execute("UPDATE bus_grants SET revoked_at = now(), revoked_by = %s "
+                                "WHERE instance = %s AND type = %s AND revoked_at IS NULL "
+                                "RETURNING id", (user, name, t))
+                else:
+                    cur.execute("UPDATE bus_deliveries SET stopped_at = NULL, failures = 0, "
+                                "next_at = NULL WHERE instance = %s RETURNING instance", (name,))
+                done = cur.fetchone() is not None
+        finally:
+            conn.close()
+        if not done:
+            return jsonify(error={"grant": f"'{name}' already holds a grant for {t}",
+                                  "revoke": f"'{name}' holds no grant for {t}",
+                                  "resume": f"'{name}' has no push yet"}[action]), 409
+        audit(f"events.{action}", tenant, name if action == "resume" else f"{name} {t}", user,
+              f"subject_prefix={pre}" if action == "grant" and pre else "")
+        return jsonify(ok=True), 200
 
     @app.get("/bus/v1/feed")
     def bus_feed():

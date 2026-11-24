@@ -296,6 +296,11 @@ services:
       # by appctl, read by nobody else) -- both read-only, same posture
       # as identity's own '/platform-apps' mount.
       - "${OAAP_DATA_DIR}/apps:/platform-apps:ro"
+      # oaap.events.bus 0.6 (RFC-0127 step 2.3): a tenant admin grants,
+      # revokes and resumes on the portal page "Ereignisse"; the twin
+      # appends that to the tenant audit log -- the third appender after
+      # appctl and identity, single short lines, never a rewrite.
+      - "${OAAP_DATA_DIR}/data/audit:/audit"
 
   # Webhook delivery (RFC-0120 stage 3, oaap.data.twin 0.13 §2.25) -- the
   # 'twin' image with a different command (services/twin/hooks.py), the same

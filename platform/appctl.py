@@ -42950,7 +42950,7 @@ def cmd_help(args, parser):
 WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
                   "files", "user", "cohort", "disk", "machine", "authz", "key",
                   "fleet", "assets", "tenant", "metrics", "broker", "idp", "mail",
-                  "notify", "report", "guard", "destination", "connect", "connector", "help")
+                  "notify", "report", "guard", "destination", "connect", "connector", "events", "help")
 
 # What `bin/oaap` does by itself, without appctl.py -- argparse cannot know
 # these, so the reference names them from here (same test as above).

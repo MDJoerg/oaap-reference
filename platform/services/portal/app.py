@@ -4897,6 +4897,8 @@ def page(body_template, title, active, status=200, **ctx):
         "can_fleet": bool(caller & {"server_admin", "tenant_admin"}),
         # The page "Assets" (RFC-0088 §5): the tenant's own universe.
         "can_assets": bool(caller & {"server_admin", "tenant_admin"}),
+        # The page "Ereignisse" (oaap.events.bus 0.6): who grants events
+        "can_events": bool(caller & {"server_admin", "tenant_admin"}),
     }
     groups = nav_view.nav_groups(flags, active)
     # Long pages without tabs: jump marks from what THIS caller sees (6.2.3).
@@ -13001,6 +13003,132 @@ TWIN_TREE_BODY = """
 </div>
 {% endif %}
 """
+
+
+EVENTS_BODY = """
+<h1>Ereignisse</h1>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="{{ 'ok' if msg_ok else 'err' }}">{{ msg }}</p>{% endif %}
+<p class="muted">Was die Apps dieses Mandanten veröffentlichen und abonnieren
+(oaap.events.bus, RFC-0127). Ein Abonnement liefert erst, wenn Sie es hier
+freigeben; adressierte Ereignisse gehen nur an die genannte App und brauchen
+keine Freigabe. Jede Freigabe, jeder Widerruf steht im Protokoll.</p>
+{% if not store %}<div class="card warn"><p>Dieser Mandant hat noch keinen
+Ereignisspeicher. Er entsteht mit der ersten App, die Ereignisse erklärt.</p></div>{% endif %}
+{% for i in instances %}
+<div class="card">
+  <h2>{{ i.instance }} <span class="muted">({{ i.app_id }} {{ i.version }})</span></h2>
+  {% if i.push %}
+  <p>Zustellung an <code>{{ i.push.endpoint }}</code>:
+  {% if not i.push.started %}<span class="badge todo">noch nicht gestartet</span>
+  {% elif i.push.stopped_at %}<span class="badge off">angehalten</span>
+    <span class="muted">{{ i.push.last_error }}</span>
+    <form method="post" action="/ereignisse/resume" style="display:inline">
+      <input type="hidden" name="instance" value="{{ i.instance }}">
+      <button>Fortsetzen</button></form>
+  {% else %}<span class="badge">{{ i.push.delivered }} zugestellt</span>
+    {% if i.push.failures %}<span class="badge todo">{{ i.push.failures }} Fehlversuch(e)</span>
+    <span class="muted">{{ i.push.last_error }}</span>{% endif %}
+  {% endif %}</p>
+  {% else %}<p class="muted">Keine Zustellung erklärt — die App holt selbst ab (Feed).</p>{% endif %}
+  {% if i.subscribes %}
+  <table>
+  <tr><th>Möchte empfangen</th><th>Wozu</th><th>Stand</th><th></th></tr>
+  {% for sb in i.subscribes %}
+  <tr><td><code>{{ sb.type }}</code></td><td class="muted">{{ sb.why }}</td>
+    <td>{% if sb.state == 'granted' %}<span class="badge">freigegeben</span>
+        <span class="muted">von {{ sb.granted_by }}{% if sb.subject_prefix %}, nur Betreff {{ sb.subject_prefix }}…{% endif %}</span>
+      {% elif sb.state == 'addressed' %}<span class="muted">nur an sie adressiert, keine Freigabe nötig</span>
+      {% elif sb.state == 'addressed_platform' %}<span class="muted">von {{ sb.publisher }} an sie adressiert, keine Freigabe nötig</span>
+      {% else %}<span class="badge todo">wartet auf Freigabe</span>{% endif %}</td>
+    <td>{% if sb.state == 'granted' %}
+      <form method="post" action="/ereignisse/revoke" style="display:inline">
+        <input type="hidden" name="instance" value="{{ i.instance }}">
+        <input type="hidden" name="type" value="{{ sb.type }}">
+        <button>Widerrufen</button></form>
+      {% elif sb.grantable %}
+      <form method="post" action="/ereignisse/grant" style="display:inline">
+        <input type="hidden" name="instance" value="{{ i.instance }}">
+        <input type="hidden" name="type" value="{{ sb.type }}">
+        <input name="subject_prefix" placeholder="nur Betreff beginnend mit … (leer = alle)" size="22">
+        <button>Freigeben</button></form>
+      {% elif sb.refusal %}<span class="muted">{{ sb.refusal }}</span>{% endif %}</td></tr>
+  {% endfor %}
+  </table>
+  {% endif %}
+  {% if i.publishes %}
+  <table>
+  <tr><th>Veröffentlicht</th><th>Bedeutung</th><th>An wen</th></tr>
+  {% for p in i.publishes %}
+  <tr><td><code>{{ p.type }}</code></td><td>{{ p.title }}</td>
+    <td class="muted">{{ {'addressed': 'nur an die genannte App', 'tenant': 'jede freigegebene App', 'listed': 'nur genannte Apps'}[p.audience] }}{% if p.personal %} · personenbezogen{% endif %}</td></tr>
+  {% endfor %}
+  </table>
+  {% endif %}
+</div>
+{% else %}
+<div class="card"><p class="muted">Keine App dieses Mandanten erklärt Ereignisse.</p></div>
+{% endfor %}
+<div class="card">
+  <h2>Ereignisse der Plattform</h2>
+  <table>
+  <tr><th>Typ</th><th>Bedeutung</th><th>Von</th><th>An wen</th></tr>
+  {% for p in platform_types %}
+  <tr><td><code>{{ p.type }}</code></td><td>{{ p.title }}</td><td class="muted">{{ p.publisher }}</td>
+    <td class="muted">{{ 'nur an die einladende App' if p.audience == 'addressed' else 'jede freigegebene App' }}</td></tr>
+  {% endfor %}
+  </table>
+</div>
+"""
+
+
+def require_events_admin():
+    if not caller_roles() & {"tenant_admin", "server_admin"}:
+        return "Zugriff verweigert: erfordert die Rolle tenant_admin.", 403
+    return None
+
+
+@app.get("/ereignisse")
+def events_page():
+    denied = require_events_admin()
+    if denied:
+        return denied
+    ctx = {"instances": [], "platform_types": [], "store": True, "error": None,
+           "msg": request.args.get("msg"), "msg_ok": request.args.get("err") is None}
+    try:
+        r = _twin_call("GET", "/internal/bus/overview")
+        if r.status_code == 200:
+            ctx.update(r.json())
+        else:
+            ctx["error"] = (r.json() if r.headers.get("Content-Type", "").startswith(
+                "application/json") else {}).get("error") or f"HTTP {r.status_code}"
+    except requests.RequestException as e:
+        ctx["error"] = f"Der Zwilling antwortet nicht ({type(e).__name__})."
+    return page(EVENTS_BODY, "Ereignisse", "events", **ctx)
+
+
+@app.post("/ereignisse/<action>")
+def events_action(action):
+    denied = require_events_admin()
+    if denied:
+        return denied
+    if action not in ("grant", "revoke", "resume"):
+        return "unbekannt", 404
+    body = {"instance": request.form.get("instance", ""), "type": request.form.get("type", ""),
+            "subject_prefix": request.form.get("subject_prefix", "")}
+    done = {"grant": "Freigegeben.", "revoke": "Widerrufen.", "resume": "Zustellung fortgesetzt."}
+    try:
+        r = _twin_call("POST", f"/internal/bus/{action}", json=body)
+    except requests.RequestException as e:
+        return redirect("/ereignisse?err=1&msg=" + quote(
+            f"Der Zwilling antwortet nicht ({type(e).__name__})."), code=303)
+    if r.status_code != 200:
+        try:
+            why = r.json().get("error") or f"HTTP {r.status_code}"
+        except ValueError:
+            why = f"HTTP {r.status_code}"
+        return redirect("/ereignisse?err=1&msg=" + quote(why), code=303)
+    return redirect("/ereignisse?msg=" + quote(done[action]), code=303)
 
 
 @app.get("/zwilling")

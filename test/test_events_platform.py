@@ -214,6 +214,98 @@ src = open(os.path.join(TWIN, "app.py"), encoding="utf-8").read()
 ok("die Tuer liegt unter /internal/ -- der Plattformschluessel-Waechter des Zwillings gilt",
    'request.path.startswith("/internal/")' in src and P.startswith("/internal/"))
 
+print("\n=== Die Portalseite Ereignisse (Stufe 2.3) ===")
+OV_CAT = {"instances": {
+    "inv1-pp-a": {"tenant": "T1", "app_id": "peopleprobe", "version": "0.2.2", "endpoint": "/oaap/events",
+                  "publishes": [], "subscribes": [
+                      {"type": ACT, "why": "da"}, {"type": TC, "why": "Zwilling"},
+                      {"type": TX, "why": "Zwilling"},
+                      {"type": "app.vorgaenge.case.statuschanged.v1", "why": "x", "addressed_only": True}]},
+    "fremd": {"tenant": "T2", "app_id": "x", "subscribes": [{"type": TC, "why": "y"}]}}}
+ov = bm.overview(OV_CAT, {"instances": {}}, "T1",
+                 [{"instance": "inv1-pp-a", "type": TX, "subject_prefix": "urn:oaap:obj:1",
+                   "granted_by": "anna", "granted_at": "2026-11-24T15:00:00"}],
+                 {"inv1-pp-a": {"delivered": 12, "failures": 0, "stopped_at": None,
+                                "last_error": None, "last_ok_at": "x"}})
+st = {s["type"]: s for s in ov["instances"][0]["subscribes"]}
+ok("Uebersicht: nur Instanzen des eigenen Mandanten", [i["instance"] for i in ov["instances"]] == ["inv1-pp-a"])
+ok("... identity-Typ: adressiert von identity, keine Freigabe", st[ACT]["state"] == "addressed_platform"
+   and st[ACT]["publisher"] == "identity" and not st[ACT]["grantable"])
+ok("... Zwilling-Typ ohne Freigabe: wartet, freigebbar", st[TC]["state"] == "waiting" and st[TC]["grantable"])
+ok("... freigegeben mit wem und Betreff-Praefix", st[TX]["state"] == "granted"
+   and st[TX]["granted_by"] == "anna" and st[TX]["subject_prefix"] == "urn:oaap:obj:1")
+ok("... App-Typ nur adressiert", st["app.vorgaenge.case.statuschanged.v1"]["state"] == "addressed")
+ok("... Zustellung: 12 zugestellt", ov["instances"][0]["push"]["delivered"] == 12
+   and ov["instances"][0]["push"]["started"])
+ok("... die Plattformtypen alle sieben", len(ov["platform_types"]) == 7)
+
+json.dump(OV_CAT, open(os.path.join(apps, "events-catalog.json"), "w"))
+json.dump({"instances": {"inv1-pp-a": {"tenant": "T1"}, "fremd": {"tenant": "T2"}}},
+          open(os.path.join(apps, "registry.json"), "w"))
+
+
+class Cur2(Cur):
+    answer = {"id": 1}
+
+    def fetchone(self):
+        return Cur2.answer
+
+    def fetchall(self):
+        return []
+
+
+class Conn2(Conn):
+    def cursor(self):
+        return Cur2()
+
+
+fapp2 = Flask("t2")
+bus_door.register(fapp2, lambda t: Conn2() if t == "T1" else None, apps)
+bus_door.AUDIT_LOG = os.path.join(apps, "audit.jsonl")
+c2 = fapp2.test_client()
+ADM = {"X-OAAP-Internal-Key": "x", "X-OAAP-Person-User": "anna", "X-OAAP-Person-Tenant": "T1",
+       "X-OAAP-Person-Roles": "tenant_admin"}
+r = c2.get("/internal/bus/overview", headers=dict(ADM, **{"X-OAAP-Person-Roles": "user"}))
+ok("Seite: eine Person ohne Admin-Rolle -> 403", r.status_code == 403)
+r = c2.get("/internal/bus/overview", headers=ADM)
+ok("Seite: Admin liest die Uebersicht seines Mandanten", r.status_code == 200
+   and r.get_json()["store"] is True and r.get_json()["instances"][0]["instance"] == "inv1-pp-a")
+r = c2.post("/internal/bus/grant", json={"instance": "inv1-pp-a", "type": TC}, headers=ADM)
+sql, args = Cur.rows[-1]
+ok("Freigeben: 200, Zeile mit granted_by = die Person", r.status_code == 200
+   and "INSERT INTO bus_grants" in sql and args == ("inv1-pp-a", TC, None, "anna"), (r.get_json(), args))
+au = [json.loads(x) for x in open(bus_door.AUDIT_LOG, encoding="utf-8")]
+ok("... im Mandanten-Protokoll: events.grant, wer, welcher Mandant",
+   au[-1]["action"] == "events.grant" and au[-1]["who"] == "anna" and au[-1]["tenant"] == "T1"
+   and au[-1]["subject"] == "inv1-pp-a " + TC, au[-1])
+r = c2.post("/internal/bus/grant", json={"instance": "inv1-pp-a", "type": ACT}, headers=ADM)
+ok("Freigeben eines adressierten Typs -> 409 mit Grund", r.status_code == 409
+   and "no grant needed" in r.get_json()["error"])
+r = c2.post("/internal/bus/grant", json={"instance": "fremd", "type": TC}, headers=ADM)
+ok("Instanz eines anderen Mandanten -> 404", r.status_code == 404)
+r = c2.post("/internal/bus/grant", json={"instance": "inv1-pp-a", "type": TC, "subject_prefix": "x\ty"},
+            headers=ADM)
+ok("Praefix mit Steuerzeichen -> 400", r.status_code == 400)
+Cur2.answer = None
+r = c2.post("/internal/bus/revoke", json={"instance": "inv1-pp-a", "type": TC}, headers=ADM)
+ok("Widerrufen ohne Freigabe -> 409, kein Protokolleintrag", r.status_code == 409
+   and len(open(bus_door.AUDIT_LOG, encoding="utf-8").readlines()) == len(au))
+Cur2.answer = {"instance": "inv1-pp-a"}
+r = c2.post("/internal/bus/resume", json={"instance": "inv1-pp-a"}, headers=ADM)
+ok("Fortsetzen: 200, Protokoll events.resume", r.status_code == 200
+   and json.loads(open(bus_door.AUDIT_LOG, encoding="utf-8").readlines()[-1])["action"] == "events.resume")
+ok("die Plattform-Tuer bleibt eine eigene Route (statisch vor <action>)",
+   c2.post("/internal/bus/platform", json={}).status_code == 403)
+psrc = open(os.path.join(SERVICES, "portal", "app.py"), encoding="utf-8").read()
+nsrc = open(os.path.join(SERVICES, "portal", "nav_view.py"), encoding="utf-8").read()
+ok("Portal: Seite /ereignisse, Aktionen ueber _twin_call an /internal/bus/, nur Admins",
+   '@app.get("/ereignisse")' in psrc and '_twin_call("POST", f"/internal/bus/{action}"' in psrc
+   and 'caller_roles() & {"tenant_admin", "server_admin"}' in psrc)
+ok("Portal: Menue Katalog & Daten -> Ereignisse", '("events", "/ereignisse", "Ereignisse", "can_events")' in nsrc)
+csrc = open(os.path.join(HERE, "..", "platform", "docker-compose.yml"), encoding="utf-8").read()
+ok("der Zwilling haengt an das Mandanten-Protokoll an (Mount /audit)",
+   '${OAAP_DATA_DIR}/data/audit:/audit"' in csrc.split("  twin:")[1].split("\n  hooks:")[0].split("# Webhook")[0])
+
 print("\n=== identity: Ausgang zum Bus ===")
 DATA = tempfile.mkdtemp(prefix="oaap-bus-id-")
 os.environ.update(SESSION_SECRET="s", SETUP_TOKEN="t", INTERNAL_API_KEY="k",

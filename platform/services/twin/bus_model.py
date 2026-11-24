@@ -563,6 +563,59 @@ def grant_error(catalogue, tenant, instance, t):
         return f"{t} is addressed: it reaches only the instance it names, no grant needed"
     return f"{t} is listed for other apps, not for '{me.get('app_id')}'"
 
+# ------------------------------------------- the portal page (0.6)
+
+
+def overview(catalogue, registry, tenant, grants, deliveries):
+    """What the portal page "Ereignisse" shows for one tenant (pure;
+    tested): every instance with an events block, what it publishes, what
+    it wants and in which state, its push; and the platform's types.
+    `grants` = [{instance, type, subject_prefix, granted_by, granted_at}]
+    (live ones), `deliveries` = {instance: {delivered, failures,
+    stopped_at, last_error, last_ok_at}}."""
+    live = {(g["instance"], g["type"]): g for g in grants}
+    insts = []
+    for name, e in sorted(((catalogue or {}).get("instances") or {}).items()):
+        if e.get("tenant") != tenant:
+            continue
+        subs = []
+        for sb in e.get("subscribes") or []:
+            t, g = sb["type"], live.get((name, sb["type"]))
+            plat = PLATFORM_TYPES.get(t) or {}
+            if g:
+                state = "granted"
+            elif sb.get("addressed_only"):
+                state = "addressed"
+            elif plat.get("audience") == "addressed":
+                state = "addressed_platform"
+            else:
+                state = "waiting"
+            subs.append({"type": t, "why": sb.get("why", ""), "state": state,
+                         "grantable": state == "waiting" and not grant_error(catalogue, tenant, name, t),
+                         "refusal": grant_error(catalogue, tenant, name, t) if state == "waiting" else "",
+                         "publisher": plat.get("publisher", ""),
+                         "subject_prefix": (g or {}).get("subject_prefix") or "",
+                         "granted_by": (g or {}).get("granted_by") or "",
+                         "granted_at": (g or {}).get("granted_at") or ""})
+        reg = ((registry or {}).get("instances") or {}).get(name) or {}
+        d = (deliveries or {}).get(name)
+        push = None
+        if e.get("endpoint"):
+            push = {"endpoint": e["endpoint"], "started": d is not None}
+            if d is not None:
+                push.update({k: d.get(k) for k in ("delivered", "failures", "stopped_at",
+                                                     "last_error", "last_ok_at")})
+        insts.append({"instance": name, "app_id": e.get("app_id", ""),
+                      "version": e.get("version") or reg.get("version", ""),
+                      "publishes": [{k: p.get(k) for k in ("type", "title", "audience", "personal",
+                                                           "semantic_id")}
+                                    for p in e.get("publishes") or []],
+                      "subscribes": subs, "push": push})
+    plat = [{"type": t, "title": p["title"], "publisher": p["publisher"],
+             "audience": p["audience"], "semantic_id": p["semantic_id"]}
+            for t, p in sorted(PLATFORM_TYPES.items())]
+    return {"instances": insts, "platform_types": plat}
+
 # --------------------------------------------------- what reaches whom
 
 

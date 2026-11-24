@@ -41,6 +41,8 @@ GROUPS = (
     ("Katalog & Daten", (
         ("store", "/store", "Store", "can_store"),
         ("twin", "/zwilling", "Zwilling", "can_twin"),
+        # oaap.events.bus 0.6 (RFC-0127 step 2.3): the tenant's events
+        ("events", "/ereignisse", "Ereignisse", "can_events"),
         ("assets", "/assets", "Assets", "can_assets"),
     )),
     ("Kommunikation", (
