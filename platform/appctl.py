@@ -23538,6 +23538,14 @@ def report_grants(name, report):
             print(f"WARNING: {name}: grant '{g}': {outcome}", file=sys.stderr)
 
 
+def image_tag(version):
+    """The Docker tag of a version. Semver allows build metadata after '+'
+    (`15.0.11+oaap.1`, a package of an upstream version); a Docker tag does
+    not ([A-Za-z0-9_.-]) -- measured 2026-11-24: the build refused. '+'
+    becomes '_', nothing else changes."""
+    return str(version).replace("+", "_")
+
+
 def stale_containers(stored, services):
     """The containers the registry records for an instance that `services`
     (its new shape) no longer names -- in the registry's order. Only names
@@ -27934,8 +27942,9 @@ def _install_from_dir(pkg, args, source):
     for sname, svc in ordered:
         cname = f"oaap-app-{name}" if not multi else f"oaap-app-{name}-{sname}"
         if app["type"] == "native" or svc.get("build"):
-            img = (f"oaap-app/{app['id']}:{app['version']}" if not multi
-                   else f"oaap-app/{app['id']}-{sname}:{app['version']}")
+            tag = image_tag(app["version"])
+            img = (f"oaap-app/{app['id']}:{tag}" if not multi
+                   else f"oaap-app/{app['id']}-{sname}:{tag}")
             print(f"Building {img} on this node ...")
             run(docker_build_cmd(img, os.path.join(pkg, svc.get("build", "."))))
             build = svc.get("build", "")

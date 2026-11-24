@@ -199,8 +199,9 @@ def profile_version(doc):
 
 def version_key(v):
     """Numeric ordering: 1.2.10 after 1.2.9, 1.0.0 after 1.0.0-rc1 -- the
-    rule the marketplace orders releases by."""
-    core, _, pre = str(v).partition("-")
+    rule the marketplace orders releases by. Build metadata after '+'
+    (semver: `15.0.11+oaap.1`) does not order and is dropped."""
+    core, _, pre = str(v).partition("+")[0].partition("-")
     nums = tuple(int(x) for x in core.split("."))
     parts = []
     for p in pre.split(".") if pre else []:

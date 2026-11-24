@@ -58,5 +58,31 @@ class StaleTest(unittest.TestCase):
                         body.index('["docker", "rm", "-f", s["container"]]'))
 
 
+class BuildMetadataTest(unittest.TestCase):
+    """C. Eine Version mit Build-Metadaten (`15.0.11+oaap.1`, ein Paket einer
+    Upstream-Version): gültig im Manifest, baubar als Docker-Tag, nie „älter“
+    als die Version ohne, und das Store-Update bietet sie an."""
+
+    def test_image_tag(self):
+        self.assertEqual(m.image_tag("15.0.11+oaap.1"), "15.0.11_oaap.1")
+        self.assertEqual(m.image_tag("0.2.1"), "0.2.1")
+        self.assertEqual(m.image_tag("1.0.0-rc1"), "1.0.0-rc1")
+        import re
+        self.assertTrue(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", m.image_tag("15.0.11+oaap.1")))
+
+    def test_ordering(self):
+        import tenant_build as tb
+        self.assertEqual(tb.version_key("15.0.11+oaap.1"), tb.version_key("15.0.11"))
+        self.assertFalse(m.version_older("15.0.11+oaap.1", "15.0.11"))
+        self.assertTrue(m.version_older("15.0.10+oaap.9", "15.0.11"))
+        self.assertTrue(m._version_gt("15.0.11+oaap.1", "15.0.11"))
+        self.assertTrue(m._version_gt("15.0.11+oaap.2", "15.0.11+oaap.1"))
+
+    def test_build_uses_the_tag(self):
+        src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+        self.assertIn('tag = image_tag(app["version"])', src)
+        self.assertNotIn("f\"oaap-app/{app['id']}:{app['version']}\"", src)
+
+
 if __name__ == "__main__":
     unittest.main()
