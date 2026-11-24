@@ -17763,6 +17763,18 @@ def _twin_ensure_tables(schema):
         );
         CREATE UNIQUE INDEX IF NOT EXISTS bus_grants_live
             ON "{schema}".bus_grants (instance, type) WHERE revoked_at IS NULL;
+        -- Who may address whom (oaap.events.bus 0.2 §2.9, RFC-0127 §6.2):
+        -- written by the case door's second forward_auth when `addressee`
+        -- submits a case to `publisher`. One row per pair, then counted.
+        CREATE TABLE IF NOT EXISTS "{schema}".bus_relations (
+            publisher text NOT NULL,
+            addressee text NOT NULL,
+            via text NOT NULL,
+            first_at timestamptz NOT NULL DEFAULT now(),
+            last_at timestamptz NOT NULL DEFAULT now(),
+            times bigint NOT NULL DEFAULT 1,
+            PRIMARY KEY (publisher, addressee)
+        );
         CREATE OR REPLACE VIEW "{schema}".current_attributes AS
             SELECT * FROM "{schema}".attributes WHERE superseded_by IS NULL;
         CREATE OR REPLACE VIEW "{schema}".current_relations AS
@@ -20942,7 +20954,10 @@ CASES_MARKER = "# platform-feedback "
 # 9: every site carries /platform/context.json (RFC-0118 P3).
 # 10: an instance with an events block carries /platform/events
 #     (oaap.events.bus 0.1, RFC-0127 D3).
-CASES_BLOCK_FORMAT = 10
+# 11: the case door records who submits to which inbox (a second
+#     forward_auth to the twin service), and the events door serves only
+#     `/` and `/feed` (oaap.events.bus 0.2).
+CASES_BLOCK_FORMAT = 11
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -20981,6 +20996,16 @@ def _cases_registry():
         _CASES_CACHE["insts"] = reg.get("instances") or {}
         _CASES_CACHE["stamp"] = stamp
     return _CASES_CACHE["insts"]
+
+
+def cases_target_key(insts, scope):
+    """The registry key of the inbox cases_target() names, or ""."""
+    addr = cases_target(insts, scope)
+    for k, i in insts.items():
+        if addr and f"{i.get('container')}:{i.get('svc_port')}" == addr \
+                and i.get("app_id") == CASES_APP_ID:
+            return k
+    return ""
 
 
 def cases_target(insts, scope):
@@ -21193,6 +21218,15 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
         uri += f"&instance={cases_submit_scope(scope or '-')}"
         lines += ["\t\tforward_auth identity:8000 {", f"\t\t\turi {uri}",
                   "\t\t\t" + _COPY_IDENTITY] + _AUTH_NO_UPGRADE + ["\t\t}"]
+        # oaap.events.bus 0.2 (RFC-0127 §6.2): the platform's own record of
+        # who submitted to which inbox -- the one fact that lets the inbox
+        # address an event back. Asked after identity, so only this
+        # instance's own key writes it; copies nothing back.
+        inbox = cases_target_key(insts, scope)
+        if inbox and scope:
+            lines += ["\t\tforward_auth twin:8000 {",
+                      f"\t\t\turi /bus/v1/relate?from={scope}&to={inbox}"]
+            lines += _AUTH_NO_UPGRADE + ["\t\t}"]
         source = (scope or "-", me.get("app_id") or "-",
                   me.get("version") or "-",
                   tenant or (instance_tenant_ref(me) if me else "-"))
@@ -21214,7 +21248,10 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
                   tenant or instance_tenant_ref(me))
         # `route` keeps the written order: Caddy would otherwise rewrite
         # before forward_auth asks identity.
-        for matcher in ("/platform/events", "/platform/events/*"):
+        # Exact paths only: publish and feed. Anything else under it falls
+        # to the static /platform/* below and is a 404 -- the twin's other
+        # /bus/v1 paths (the record of 0.2) are never reachable from here.
+        for matcher in ("/platform/events", "/platform/events/", "/platform/events/feed"):
             lines += [f"\thandle {matcher} {{", "\t\troute {"]
             lines += ["\t\t\tforward_auth identity:8000 {", f"\t\t\t\turi {uri}",
                       "\t\t\t\t" + _COPY_IDENTITY]

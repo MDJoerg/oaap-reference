@@ -114,10 +114,11 @@ st, why, acc = bm.check_publish({"type": PUB["type"], "subject": "V-1",
                                  "source": "urn:fake", "id": "X", "time": "1999",
                                  "oaaptenant": "fremd"}, entry)
 ok("202, und angenommen wird NUR type/subject/data -- source, id, time, oaaptenant fallen weg",
-   st == 202 and set(acc) == {"type", "subject", "data"}, (st, why, acc))
+   st == 202 and set(acc) == {"type", "subject", "data", "to"}, (st, why, acc))
 for label, body, code in [
     ("kein Objekt", [], 400),
-    ("oaapto vor 0.2", {"type": PUB["type"], "subject": "a", "oaapto": "instance:x"}, 400),
+    ("oaapto bei einem nicht adressierten Typ", {"type": PUB["type"], "subject": "a",
+                                                  "oaapto": "instance:x"}, 400),
     ("nicht erklaerter Typ", {"type": "app.probepub.other.thing.v1", "subject": "a"}, 403),
     ("subject fehlt", {"type": PUB["type"], "data": {"case": "a", "to": "open"}}, 400),
     ("subject mit Steuerzeichen", {"type": PUB["type"], "subject": "a\nb"}, 400),
@@ -129,9 +130,14 @@ for label, body, code in [
     ok(f"{code}: {label}", bm.check_publish(body, entry)[0] == code,
        bm.check_publish(body, entry)[:2])
 err_a, entry_a = decl({"publishes": [dict(PUB, audience="addressed")]})
-ok("409: ein adressierter Typ vor 0.2",
-   bm.check_publish({"type": PUB["type"], "subject": "a", "data": {"case": "a", "to": "open"}},
-                    entry_a)[0] == 409)
+GOOD_A = {"type": PUB["type"], "subject": "a", "data": {"case": "a", "to": "open"}}
+ok("adressierter Typ ohne oaapto -> 400", bm.check_publish(GOOD_A, entry_a)[0] == 400)
+ok("adressierter Typ, oaapto nicht 'instance:<name>' -> 400",
+   bm.check_publish(dict(GOOD_A, oaapto="t1-sub"), entry_a)[0] == 400
+   and bm.check_publish(dict(GOOD_A, oaapto="instance:../x"), entry_a)[0] == 400)
+st, _w, acc_a = bm.check_publish(dict(GOOD_A, oaapto="instance:t1-sub"), entry_a)
+ok("adressierter Typ mit oaapto -> 202, der Empfaenger als `to`", st == 202 and acc_a["to"] == "t1-sub")
+ok("ein nicht adressierter Typ hat to None", acc["to"] is None)
 
 print("\n=== Umschlag und Kennung ===")
 u1, u2 = bm.ulid(1700000000000, b"\0" * 10), bm.ulid(1700000000001, b"\0" * 10)
@@ -145,6 +151,10 @@ ok("CloudEvents 1.0: Pflichtattribute, Quelle von der Plattform, Erweiterungen",
    and ev["oaaptenant"] == "T-ID" and ev["oaaporigin"] == "app:probe-pub"
    and ev["oaapsemantic"] == "oaap-aas:X" and ev["datacontenttype"] == "application/json"
    and ev["dataschema"] == f"urn:oaap:events:schema:probe-pub:{PUB['type']}", ev)
+eva = bm.envelope({"id": u1, "type": PUB["type"], "source_instance": "t1-pub", "subject": "V-1",
+                   "time": "2026-11-24T12:00:00.000Z", "data": {}, "oaapto": "t1-sub"}, "T", "p")
+ok("adressiertes Ereignis traegt oaapto als instance:<name>", eva.get("oaapto") == "instance:t1-sub"
+   and "oaapto" not in ev)
 ok("Attributnamen nach CloudEvents: a-z0-9, hoechstens 20 Zeichen",
    all(k.isalnum() and k.islower() and len(k) <= 20 for k in ev))
 
@@ -166,6 +176,14 @@ _, listed = decl({"publishes": [dict(PUB, audience="listed", listed=["andere-app
 cat2 = {"instances": dict(cat["instances"], **{"t1-pub": dict(listed, tenant="T1", app_id="probe-pub")})}
 ok("listed fuer eine andere App: abgelehnt",
    "listed for other apps" in bm.grant_error(cat2, "T1", "t1-sub", PUB["type"]))
+
+ok("Empfaenger muss im Mandanten sein und den Typ erklaeren",
+   bm.addressee_error(cat["instances"]["t1-sub"], "T1", {"tenant": "T1"}, PUB["type"]) == ""
+   and "no instance of this tenant" in bm.addressee_error(cat["instances"]["t2-sub"], "T1",
+                                                           {"tenant": "T2"}, PUB["type"])
+   and "does not declare" in bm.addressee_error(cat["instances"]["t1-nix"], "T1",
+                                                {"tenant": "T1"}, PUB["type"])
+   and "no instance" in bm.addressee_error(None, "T1", None, PUB["type"]))
 
 print("\n=== Die Tuer (bus_door, ohne Datenbank) ===")
 apps = tempfile.mkdtemp(prefix="oaap-events-apps-")
@@ -208,6 +226,14 @@ ok("Binaermodus (ce-* Kopfzeilen) wird gelesen", r.status_code == 409, r.get_jso
 r = c.get("/bus/v1/feed", headers={"X-OAAP-User": "instance:t1-sub",
                                    "X-OAAP-Source-Instance": "t1-sub"})
 ok("Feed ohne Zwilling: leer, kein Fehler", r.status_code == 200 and r.get_json()["events"] == [])
+print("  -- der Eintrag, wer wen adressieren darf (0.2)")
+r = c.get("/bus/v1/relate?from=t1-sub&to=t1-pub", headers={"X-OAAP-User": "instance:t1-pub"})
+ok("relate: nur fuer die einreichende Instanz selbst (fremder Schluessel -> 403)", r.status_code == 403)
+r = c.get("/bus/v1/relate?from=t1-sub&to=weg", headers={"X-OAAP-User": "instance:t1-sub"})
+ok("relate: unbekanntes Ziel -> 403", r.status_code == 403)
+r = c.get("/bus/v1/relate?from=t1-sub&to=t1-pub", headers={"X-OAAP-User": "instance:t1-sub"})
+ok("relate: richtig, Mandant ohne Zwilling -> 200, die Einreichung geht weiter",
+   r.status_code == 200, r.status_code)
 r = c.get("/bus/v1/feed?limit=x", headers={"X-OAAP-User": "instance:t1-sub",
                                            "X-OAAP-Source-Instance": "t1-sub"})
 ok("Feed: limit keine Zahl -> 400", r.status_code == 400)
@@ -249,13 +275,26 @@ ok("Scope und Adresse", a.events_scope("t1-pub") == "oaap.events:t1-pub"
    and a.events_url(8123) == "http://gateway:8123/platform/events"
    or a.events_url(8123).endswith(":8123/platform/events"))
 ok("Gateway-Zeilen bekommen eine neue Formatnummer (Seiten werden neu geschrieben)",
-   a.CASES_BLOCK_FORMAT >= 10)
+   a.CASES_BLOCK_FORMAT >= 11)
 src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
 door = src[src.index("if events_wanted(me) and not login_only"):src.index("# RFC-0069 stage 2: on a `vorgaenge` site only")]
 ok("die Tuer fragt identity nach genau diesem Scope, ohne Rollen, und reicht an twin:8000",
    "events_scope(scope" in door and "/verify?roles=" in door and "reverse_proxy twin:8000" in door
    and "rewrite * /bus/v1{uri}" in door and "SOURCE_HEADERS" in door)
 ok("... in `route`, damit forward_auth vor dem Umschreiben fragt", '"\\t\\troute {"' in door)
+ok("... nur `/` und `/feed`: der Eintrag /bus/v1/relate ist von dort nie erreichbar",
+   '("/platform/events", "/platform/events/", "/platform/events/feed")' in door
+   and "/platform/events/*" not in door)
+sub = src[src.index('lines.append("\\thandle /platform/cases/submit {")'):src.index("# oaap.events.bus 0.1 (RFC-0127 D3): the instance's events door")]
+ok("die Vorgangstuer fragt nach identity den Zwilling und nennt Einreicher und Posteingang",
+   sub.index("forward_auth identity:8000") < sub.index("forward_auth twin:8000")
+   and "/bus/v1/relate?from={scope}&to={inbox}" in sub and "copy_headers" not in sub.split("forward_auth twin:8000")[1].split("source =")[0])
+insts = {"t1-app": {"tenant": "T1", "app_id": "probe", "channel": "production"},
+         "t1-vg": {"tenant": "T1", "app_id": "vorgaenge", "channel": "production",
+                   "container": "oaap-app-t1-vg", "svc_port": 8080}}
+a.instance_tenant_ref = lambda i: i.get("tenant")
+ok("cases_target_key nennt den Schluessel des Posteingangs",
+   a.cases_target_key(insts, "t1-app") == "t1-vg" and a.cases_target_key({}, "x") == "")
 
 print()
 print("all events-bus checks passed" if not fails else f"{fails} check(s) FAILED")

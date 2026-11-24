@@ -9,11 +9,16 @@ types -- from files only the node writes (registry.json,
 events-catalog.json).
 
     POST /bus/v1/        publish (CloudEvents structured or binary)
-    GET  /bus/v1/feed    the granted events after ?since=<id>
+    GET  /bus/v1/feed    the granted and addressed events after ?since=<id>
+    GET  /bus/v1/relate  the record of who may address whom (0.2): asked by
+                         the gateway's case door as a second forward_auth,
+                         never reachable through /platform/events (the
+                         gateway serves only `/` and `/feed` there)
 """
 import json
 import os
 import random
+import sys
 
 from flask import jsonify, request
 
@@ -90,12 +95,26 @@ def register(app, get_conn, apps_dir):
                     return (jsonify(error=f"more than {bm.RATE_PER_MINUTE} events a minute"),
                             429, {"Retry-After": "60"})
                 p = bm.find_type(entry, acc["type"])
+                to = acc.get("to")
+                if to:
+                    reg = _load(os.path.join(apps_dir, "registry.json"), {}).get("instances") or {}
+                    cat = _load(os.path.join(apps_dir, CATALOG_NAME), {}).get("instances") or {}
+                    why = bm.addressee_error(cat.get(to), tenant, reg.get(to), acc["type"])
+                    if why:
+                        return jsonify(error=why), 403
+                    cur.execute("SELECT 1 FROM bus_relations WHERE publisher = %s AND addressee = %s",
+                                (me, to))
+                    if cur.fetchone() is None:
+                        return jsonify(error=(
+                            f"'{to}' gave '{me}' nothing to address -- an addressed event goes "
+                            "only to an instance the platform saw submit to this one "
+                            "(oaap.events.bus 0.2 §2.9)")), 403
                 eid = bm.ulid()
                 cur.execute(
                     "INSERT INTO bus_events (id, type, source_instance, source_app, subject, "
-                    "data, semantic) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING time",
+                    "data, semantic, oaapto) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING time",
                     (eid, acc["type"], me, entry.get("app_id", ""), acc["subject"],
-                     json.dumps(acc["data"]), p.get("semantic_id")))
+                     json.dumps(acc["data"]), p.get("semantic_id"), to))
                 tm = cur.fetchone()["time"]
                 if random.random() < 0.01:
                     cur.execute("DELETE FROM bus_events WHERE time < now() - %s * interval '1 day'",
@@ -134,19 +153,24 @@ def register(app, get_conn, apps_dir):
                 cur.execute("SELECT type, subject_prefix FROM bus_grants "
                             "WHERE instance = %s AND revoked_at IS NULL", (me,))
                 grants = cur.fetchall()
-                if not grants:
+                wanted = [sb["type"] for sb in entry.get("subscribes") or []]
+                if not grants and not wanted:
                     return jsonify(events=[], next=since or None)
                 conds, args = [], []
                 for g in grants:
                     if g["subject_prefix"]:
-                        conds.append("(type = %s AND starts_with(subject, %s))")
+                        conds.append("(oaapto IS NULL AND type = %s AND starts_with(subject, %s))")
                         args += [g["type"], g["subject_prefix"]]
                     else:
-                        conds.append("type = %s")
+                        conds.append("(oaapto IS NULL AND type = %s)")
                         args.append(g["type"])
+                if wanted:
+                    # 0.2: addressed to me, of a type I declare -- no grant needed
+                    conds.append("(oaapto = %s AND type = ANY(%s))")
+                    args += [me, wanted]
                 cur.execute(
-                    "SELECT id, type, source_instance, source_app, subject, time, data, semantic "
-                    "FROM bus_events WHERE seq > %s AND source_instance <> %s AND oaapto IS NULL "
+                    "SELECT id, type, source_instance, source_app, subject, time, data, semantic, "
+                    "oaapto FROM bus_events WHERE seq > %s AND source_instance <> %s "
                     f"AND ({' OR '.join(conds)}) ORDER BY seq LIMIT %s",
                     [after, me] + args + [limit])
                 rows = cur.fetchall()
@@ -154,3 +178,33 @@ def register(app, get_conn, apps_dir):
             conn.close()
         events = [bm.envelope(r, tenant, r["source_app"]) for r in rows]
         return jsonify(events=events, next=events[-1]["id"] if events else (since or None))
+
+    @app.get("/bus/v1/relate")
+    def bus_relate():
+        """The case door's second forward_auth (0.2 §2.9): identity has
+        just accepted the key of instance:<from> for its case door, the
+        gateway names the inbox it passes to. Recorded once per pair, then
+        counted. Always 200 once the caller is the right one -- a record
+        that cannot be written (no twin, a database fault) must not stop a
+        case: the addressed event is refused later, visibly, instead."""
+        frm, to = request.args.get("from", ""), request.args.get("to", "")
+        if request.headers.get("X-OAAP-User", "") != f"instance:{frm}" or not frm or not to:
+            return jsonify(error="the record is written for the submitting instance only"), 403
+        reg = _load(os.path.join(apps_dir, "registry.json"), {}).get("instances") or {}
+        a, b = reg.get(frm), reg.get(to)
+        if not a or not b or a.get("tenant") != b.get("tenant"):
+            return jsonify(error="both instances, one tenant"), 403
+        conn = get_conn(a["tenant"])
+        if conn is None:
+            return "", 200
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO bus_relations (publisher, addressee, via) VALUES (%s, %s, 'cases') "
+                    "ON CONFLICT (publisher, addressee) DO UPDATE SET last_at = now(), "
+                    "times = bus_relations.times + 1", (to, frm))
+        except Exception as e:                       # noqa: BLE001
+            print(f"bus: relation {frm} -> {to} not recorded: {e}", file=sys.stderr, flush=True)
+        finally:
+            conn.close()
+        return "", 200

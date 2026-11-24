@@ -314,22 +314,33 @@ def find_type(catalogue_entry, t):
     return None
 
 
+OAAPTO_RE = __import__("re").compile(r"^instance:([a-z0-9][a-z0-9-]{0,80})$")
+
+
 def check_publish(body, entry):
     """(status, sentence, accepted) for a publish body against the
-    publisher's catalogue entry. `accepted` = {type, subject, data} when
-    status is 202 -- whatever else the body carried is dropped."""
+    publisher's catalogue entry. `accepted` = {type, subject, data, to}
+    when status is 202 -- whatever else the body carried is dropped. `to`
+    is the addressee's instance name for an addressed type (0.2), else
+    None; whether the publisher may address it is the door's question
+    (it needs the store's record)."""
     if not isinstance(body, dict):
         return 400, "the body is a CloudEvent: a JSON object", None
-    if "oaapto" in body:
-        return 400, "oaapto (addressed events) comes with oaap.events.bus 0.2", None
     t = body.get("type")
     if not isinstance(t, str) or not t:
         return 400, "type: required", None
     p = find_type(entry, t)
     if p is None:
         return 403, f"{t} is not a type this app declares under events.publishes", None
+    to = None
     if p.get("audience") == "addressed":
-        return 409, f"{t} is an addressed type; addressed events come with oaap.events.bus 0.2", None
+        m = OAAPTO_RE.match(str(body.get("oaapto") or ""))
+        if not m:
+            return 400, (f"{t} is addressed: oaapto names the receiving instance, "
+                         "'instance:<name>'"), None
+        to = m.group(1)
+    elif "oaapto" in body:
+        return 400, f"{t} is not an addressed type; it takes no oaapto", None
     subj = body.get("subject")
     if not isinstance(subj, str) or not subj or len(subj) > SUBJECT_MAX or \
             any(ord(c) < 32 for c in subj):
@@ -342,7 +353,18 @@ def check_publish(body, entry):
     bad = validate(data, p["schema"])
     if bad:
         return 422, f"{bad[0]}: {bad[1]}", None
-    return 202, "", {"type": t, "subject": subj, "data": data}
+    return 202, "", {"type": t, "subject": subj, "data": data, "to": to}
+
+
+def addressee_error(catalogue_entry_of_to, tenant, registry_inst_of_to, t):
+    """'' when the named instance can receive addressed type `t`: it exists
+    in the same tenant and declares `t` under events.subscribes. The record
+    (did it give the publisher something to address) is checked apart."""
+    if not registry_inst_of_to or registry_inst_of_to.get("tenant") != tenant:
+        return "oaapto names no instance of this tenant"
+    if not any(sb.get("type") == t for sb in (catalogue_entry_of_to or {}).get("subscribes") or []):
+        return f"the addressed instance does not declare {t} under events.subscribes"
+    return ""
 
 
 def envelope(row, tenant, app_id, semantic=None):
@@ -361,6 +383,8 @@ def envelope(row, tenant, app_id, semantic=None):
           "data": row["data"]}
     if semantic or row.get("semantic"):
         ev["oaapsemantic"] = semantic or row.get("semantic")
+    if row.get("oaapto"):
+        ev["oaapto"] = "instance:" + row["oaapto"]
     return ev
 
 # ----------------------------------------------------------------- grants
@@ -385,5 +409,5 @@ def grant_error(catalogue, tenant, instance, t):
         if p["audience"] == "listed" and me.get("app_id") in p.get("listed", []):
             return ""
     if all(p["audience"] == "addressed" for _n, _e, p in pubs):
-        return f"{t} is addressed: it reaches only the instance it names, no grant needed (0.2)"
+        return f"{t} is addressed: it reaches only the instance it names, no grant needed"
     return f"{t} is listed for other apps, not for '{me.get('app_id')}'"
