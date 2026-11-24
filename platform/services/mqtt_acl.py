@@ -8,9 +8,13 @@ without Flask, Mosquitto or a clock.
 Three kinds of key reach the broker:
 
   tenant    the RFC-0027 key of a principal of a tenant. Its tree is
-            `oaap/<tenant-id>/...`, read and write, and nothing else.
-            A record without a `kind` is one of these -- every key that
-            existed before this module behaves exactly as it did.
+            `oaap/<tenant-id>/...`, READ ONLY, and nothing else.
+            A record without a `kind` is one of these. Until 0.1.360 it
+            could also write there -- and so put a forged twin state,
+            retained, onto the relay's topics (RFC-0127 F3, measured
+            2026-11-24). Since RFC-0127 D11 only platform principals
+            publish in a tenant's tree: the relay (identity's own check,
+            not this module) and nobody else.
   node      one OAAP node (RFC-0052). May publish under
             `<root>/<node>/#` and do nothing else: it cannot subscribe,
             so a stolen node key reads nothing, not even its own branch.
@@ -245,6 +249,11 @@ def decide(rec, topic, acc, root, tenant_allowed):
                     covers(g["filter"], topic):
                 return True, ""
         return False, "no grant of this key covers that topic"
-    if tenant_allowed(topic, rec.get("tenant", "")):
-        return True, ""
-    return False, "topic outside this principal's tenant"
+    if not tenant_allowed(topic, rec.get("tenant", "")):
+        return False, "topic outside this principal's tenant"
+    if what == "write":
+        # RFC-0127 D11: the tenant's tree is written by the platform only
+        # (the relay, its own principal). A tenant key reads it.
+        return False, ("only the platform publishes in a tenant's tree "
+                       "(RFC-0127 D11); a tenant key reads it")
+    return True, ""

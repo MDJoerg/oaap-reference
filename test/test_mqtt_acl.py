@@ -10,7 +10,8 @@ Containers), und die Sichtbarkeit in der Schluesselliste.
 
 Was geprueft wird, weil es am ehesten still schiefginge:
 
-    ein Schluessel von vor diesem Stand verhaelt sich genau wie vorher;
+    ein Schluessel von vor diesem Stand verhaelt sich wie vorher -- nur
+    schreibt er seit RFC-0127 D11 nicht mehr in den Baum seines Mandanten;
     ein Knoten- oder Betreiberschluessel oeffnet NIE eine HTTP-Tuer;
     unter der Metrik-Wurzel schreibt nur der passende Knoten -- auch
     wenn ein anderer Schluessel ein ueberlappendes Recht traegt;
@@ -107,12 +108,19 @@ def d(rec, topic, acc):
     return acl.decide(rec, topic, acc, R, tenant_rule)[0]
 
 
-print("\n=== Mandantenschluessel: wie vorher ===")
-ok("ohne `kind` ist es ein Mandantenschluessel (alte Eintraege)",
-   d(ten, "oaap/t1/x", 2) and d(ten, "oaap/t1/x", 1) and d(ten, "oaap/t1/+", 4))
-ok("... und bleibt in seinem Baum", not d(ten, "oaap/t2/x", 2) and not d(ten, "home/x", 2)
-   and not d(ten, "#", 4))
-ok("... ein Schluessel ohne Mandant darf nichts", not d({}, "oaap/t1/x", 2))
+print("\n=== Mandantenschluessel: liest seinen Baum, schreibt nicht (RFC-0127 D11) ===")
+ok("ohne `kind` ist es ein Mandantenschluessel (alte Eintraege): liest und abonniert",
+   d(ten, "oaap/t1/x", 1) and d(ten, "oaap/t1/+", 4) and d(ten, "oaap/t1/#", 4)
+   and d(ten, "oaap/t1/#", 8))
+ok("... schreibt NICHT in den eigenen Baum (F3: keine gefaelschten Zwillingszustaende)",
+   not d(ten, "oaap/t1/x", 2) and not d(ten, "oaap/t1/Firma/o1/crm.core", 2)
+   and not d(ten, "oaap/t1", 2) and not d(ten, "oaap/t1/events/app.x.v1", 2))
+ok("... die Ablehnung nennt den Grund",
+   "only the platform publishes" in acl.decide(ten, "oaap/t1/x", 2, R, tenant_rule)[1])
+ok("... und bleibt in seinem Baum", not d(ten, "oaap/t2/x", 1) and not d(ten, "home/x", 1)
+   and not d(ten, "#", 4) and not d(ten, "oaap/t2/x", 2))
+ok("... ein Schluessel ohne Mandant darf nichts", not d({}, "oaap/t1/x", 2)
+   and not d({}, "oaap/t1/x", 1))
 ok("... und schreibt nie unter der Metrik-Wurzel", not d(dict(ten, tenant="oaap-node"), "oaap-node/x", 2))
 
 print("\n=== Knotenschluessel ===")
@@ -320,8 +328,9 @@ ok("Betreiber: schreibt im Smarthome-Baum, liest dort, abonniert ihn",
    may(otok, "home/kitchen/light", 2) and may(otok, "home/kitchen/light", 1) and may(otok, "home/#", 4))
 ok("Betreiber: DIE METRIK-WURZEL -- sein ueberlappendes Schreibrecht greift nicht, Lesen schon",
    not may(otok, "oaap-node/oaapx02/metrics/cpu", 2) and may(otok, "oaap-node/#", 4))
-ok("Mandantenschluessel: wie vorher",
-   may(old_tok, "oaap/t-cls/x", 2) and may(old_tok, "oaap/t-cls/x", 1) and not may(old_tok, "oaap/t-default/x", 2)
+ok("Mandantenschluessel: liest seinen Baum, schreibt dort nicht mehr (RFC-0127 D11)",
+   not may(old_tok, "oaap/t-cls/x", 2) and may(old_tok, "oaap/t-cls/x", 1)
+   and may(old_tok, "oaap/t-cls/#", 4) and not may(old_tok, "oaap/t-default/x", 2)
    and not may(old_tok, "oaap-node/x", 2))
 ok("ein unbekannter Schluessel darf nichts", not may("deadbeef", "home/x", 2))
 ok("ein gesperrter darf nichts mehr (sofort)", (m.revoke_key(orec["id"]), not may(otok, "home/x", 2))[1])

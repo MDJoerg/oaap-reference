@@ -261,6 +261,10 @@ r = aclcheck(rec["id"], "oaap/t-cls/#", acc=4)
 ok("aclcheck: a wildcard subscription within the own tenant -> Ok:true",
    r.get_json()["Ok"] is True)
 
+r = aclcheck(rec["id"], "oaap/t-cls/Machine/obj1/telemetry", acc=2)
+ok("aclcheck: publishing into the own tenant's tree -> Ok:false (RFC-0127 D11)",
+   r.get_json()["Ok"] is False and "platform" in r.get_json()["Error"])
+
 r = aclcheck("unknown-kid", "oaap/t-cls/x")
 ok("aclcheck: unknown key id -> Ok:false", r.get_json()["Ok"] is False)
 

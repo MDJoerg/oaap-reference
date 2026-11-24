@@ -323,7 +323,10 @@ if flask is not None:
     rec, token = m.issue_key(m.load_users(), "geraet-1", ["user"], "", "probe", 90, "test")
     ok("ein normaler Maschinen-Schluessel meldet sich weiter an (unveraendert)",
        getuser(rec["id"], token)["Ok"] is True)
-    ok("und darf weiter in seinen eigenen Baum", acl(rec["id"], f"oaap/{T}/x", 2)["Ok"] is True)
+    ok("und liest weiter seinen eigenen Baum", acl(rec["id"], f"oaap/{T}/x", 1)["Ok"] is True)
+    ok("... schreibt dort aber nicht mehr -- nur das Relais (RFC-0127 D11)",
+       acl(rec["id"], f"oaap/{T}/x", 2)["Ok"] is False
+       and acl(rec["id"], good, 2)["Ok"] is False)
 
     m2 = load_identity(tempfile.mkdtemp(prefix="oaap-relay-test-"), None)
     c = m2.app.test_client()
