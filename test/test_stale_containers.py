@@ -80,7 +80,11 @@ class BuildMetadataTest(unittest.TestCase):
 
     def test_build_uses_the_tag(self):
         src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
-        self.assertIn('tag = image_tag(app["version"])', src)
+        # RFC-0130 §2.1: the build names the image after the instance, and the
+        # tag still goes through image_tag ('+' -> '_')
+        self.assertIn('img = instance_image(name, sname if multi else "", app["version"])', src)
+        self.assertEqual(m.instance_image("pxx-git", "web", "15.0.11+oaap.1"),
+                         "oaap-inst/pxx-git-web:15.0.11_oaap.1")
         self.assertNotIn("f\"oaap-app/{app['id']}:{app['version']}\"", src)
 
 

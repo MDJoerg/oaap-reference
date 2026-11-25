@@ -1183,7 +1183,7 @@ REBUILD_DECLARED = ("self", "release")
 
 
 def _built(inst):
-    return any(str(s.get("image", "")).startswith("oaap-app/")
+    return any(str(s.get("image", "")).startswith(("oaap-app/", "oaap-inst/"))
                for s in (inst.get("services") or [{"image": inst.get("image", "")}]))
 
 

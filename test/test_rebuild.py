@@ -202,7 +202,7 @@ okk, msg = m.rebuild_instance("wegweiser", say=lambda *_: None)
 w = inst("wegweiser")
 ok("5 not answering: back to the predecessor by itself", not okk
    and RUNNING["oaap-app-wegweiser"] == before and "previous image" in msg, (msg, RUNNING))
-ok("5 the tag points to the previous image again", TAGS["oaap-app/wegweiser:0.4.1"] == before)
+ok("5 the tag points to the previous image again", TAGS["oaap-inst/wegweiser:0.4.1"] == before)
 ok("5 the base record of the previous image came back", w["services"][0]["base"]["digest"] == D_NEW,
    w["services"][0]["base"])
 ok("5 the case says so", w["rebuild"]["state"] == "fallback" and AUDIT[-1][2] == "failed"
@@ -223,7 +223,14 @@ FAIL["build"] = True
 before = RUNNING["oaap-app-hub-test"]
 okk, msg = m.rebuild_instance("hub-test", say=lambda *_: None)
 ok("7 a failing build: nothing changed, said", not okk and RUNNING["oaap-app-hub-test"] == before
-   and TAGS["oaap-app/hub:1"] == before and inst("hub-test")["rebuild"]["state"] == "build-failed", msg)
+   and TAGS["oaap-inst/hub-test:1"] == before and inst("hub-test")["rebuild"]["state"] == "build-failed", msg)
+# RFC-0130 §2.1: hub-test rebuilt under its OWN name; its sibling 'hub' shared
+# the tag oaap-app/hub:1 and still runs the image that tag names
+ok("7 RFC-0130: the instance moved to its own name", inst("hub-test")["services"][0]["image"]
+   == "oaap-inst/hub-test:1", inst("hub-test")["services"][0]["image"])
+ok("7 RFC-0130: the sibling's shared tag was never moved", TAGS["oaap-app/hub:1"] == APP_OLD
+   and inst("hub")["services"][0]["image"] == "oaap-app/hub:1", TAGS.get("oaap-app/hub:1"))
+
 FAIL["build"] = False
 FAIL["pull"].add("python:3.13-slim")
 st = inst("hub-test")["rebuild"]

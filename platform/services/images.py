@@ -250,6 +250,42 @@ def read_image(image_id, list_text, run=sh, older=advisories.dpkg_older):
 
 # --- the state of an instance -------------------------------------------------------
 
+def pulled_after_asked(pulled, asked):
+    """Whether a rebuild pulled the base after upstream was last asked."""
+    p = advisories.parse_iso(pulled or "")
+    if p is None:
+        return False
+    a = advisories.parse_iso(asked or "")
+    return a is None or p > a
+
+
+# RFC-0130 §2.3: "unknown" with one of three reasons, each its own sentence.
+UNKNOWN_REASONS = {
+    "unreadable": ("Nicht lesbar: das Abbild hat kein Debian-Paketverzeichnis "
+                   "(z. B. Alpine) – nichts zu tun.",
+                   "not readable: the image has no Debian package database "
+                   "(e.g. Alpine) -- nothing to do"),
+    "no-base": ("Basis nicht erfasst – ein Neubau erfasst sie.",
+                "base not recorded -- a rebuild records it"),
+    "gone": ("Das laufende Abbild ist nicht mehr da – ein Fehler, bitte neu bauen.",
+             "the running image is gone -- a fault, rebuild it"),
+    "upstream": ("Upstream-Stand zu alt oder nicht erreichbar – kommt mit der "
+                 "nächsten Abfrage.",
+                 "the upstream answer is too old or missing -- comes with the next ask"),
+}
+
+
+def unknown_reason(word, open_n, why, row, upstream):
+    """'' unless `word` is 'unknown'; else a key of UNKNOWN_REASONS."""
+    if word != "unknown":
+        return ""
+    if open_n is None:
+        return "gone" if "removed" in (why or "") else "unreadable"
+    if not row.get("base_ref") or not row.get("base_digest"):
+        return "no-base"
+    return "upstream"
+
+
 def service_state(open_n, behind, upstream_age):
     """One word (RFC-0071 §3) for one service."""
     if open_n is None:
@@ -281,7 +317,9 @@ def targets(instances, run=sh):
             img = s.get("image") or ""
             if not img:
                 continue
-            foreign = not img.startswith("oaap-app/")
+            # RFC-0130 §2.1: `oaap-inst/` is the instance's own name since
+            # 0.1.378; `oaap-app/` the shared one of instances built before.
+            foreign = not img.startswith(("oaap-app/", "oaap-inst/"))
             base = s.get("base") or {}
             out.append({"instance": name, "service": s.get("service", ""),
                         "container": s.get("container", ""), "image": img,
@@ -289,6 +327,8 @@ def targets(instances, run=sh):
                         "base_ref": img if foreign else base.get("ref", ""),
                         "base_digest": base.get("digest", ""),
                         "built": base.get("built", ""),
+                        # RFC-0130 §2.2: when a rebuild pulled this base
+                        "pulled": "" if foreign else base.get("pulled", ""),
                         # None: recorded before 0.1.252 (or a foreign image)
                         "upgrades": None if foreign else base.get("upgrades")})
     return out
@@ -409,9 +449,10 @@ def refresh(apps_dir, instances, now=None, budget=BUDGET, run=sh,
     for iid in list(imgs):
         if iid not in {r["image_id"] for r in rows}:
             imgs.pop(iid, None)
-    state["rows"] = [{k: r[k] for k in ("instance", "service", "container", "image",
-                                        "foreign", "base_ref", "base_digest", "built",
-                                        "image_id")}
+    state["rows"] = [{k: r.get(k, "") for k in ("instance", "service", "container",
+                                                "image", "foreign", "base_ref",
+                                                "base_digest", "built", "pulled",
+                                                "image_id")}
                      | {"upgrades": r.get("upgrades")} for r in rows]
     state["computed"] = now_iso(now)
     try:
@@ -435,13 +476,23 @@ def summary(state, now=None):
         behind = None
         if r["base_ref"] and r["base_digest"] and u.get("digest"):
             behind = u["digest"] != r["base_digest"]
+        age = _age(u.get("asked", ""), now)
+        if pulled_after_asked(r.get("pulled", ""), u.get("asked", "")):
+            # RFC-0130 §2.2 (D3): a rebuild pulled this base AFTER upstream
+            # was last asked -- at that moment base and upstream were one;
+            # only a later answer can say "behind" (2026-11-25, oaapx01: 28
+            # instances "behind" a minute after their rebuild).
+            behind, age = False, _age(r["pulled"], now)
         open_n = im.get("open") if im else None
-        word = service_state(open_n, behind, _age(u.get("asked", ""), now))
+        word = service_state(open_n, behind, age)
         svc = {"service": r["service"], "image": r["image"], "state": word,
                "open": open_n, "oldest": im.get("oldest", ""),
                "base": r["base_ref"], "built": r["built"], "behind": behind,
                "upgrades": r.get("upgrades"),
-               "why": im.get("why", "") if open_n is None else ""}
+               "why": im.get("why", "") if open_n is None else "",
+               "unknown": unknown_reason(word, open_n, im.get("why", ""), r, u)}
+        svc["unknown_de"] = UNKNOWN_REASONS[svc["unknown"]][0] if svc["unknown"] else ""
+        svc["unknown_en"] = UNKNOWN_REASONS[svc["unknown"]][1] if svc["unknown"] else ""
         if r["instance"]:
             e = inst.setdefault(r["instance"], {"services": []})
             e["services"].append(svc)

@@ -14916,7 +14916,7 @@ def rebuild_instance(name, who="root", role="server_admin", back=False, say=prin
         r = live[name]
         raise RebuildRefused(f"held by a reboot protection until {r.get('until')} "
                              f"({r.get('reason', '')}) -- the rebuild waits for its end")
-    built = [s for s in services if str(s.get("image", "")).startswith("oaap-app/")]
+    built = [s for s in services if is_built_image(s.get("image"))]
     prev_state = inst.get("rebuild")
     _rebuild_record(name, {"at": _iso_now(), "state": "running", "by": who})
     tmp = tempfile.mkdtemp(prefix="oaap-rebuild-")
@@ -14976,8 +14976,14 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
         if not ok:
             raise RebuildRefused(f"pulling {ref} was refused ({why}) -- nothing changed")
         digest = images.local_digest(images.inspect_image(ref).get("RepoDigests"), ref)
+        # RFC-0130 §2.1: a built service is rebuilt under ITS instance's name --
+        # an instance still on the shared `oaap-app/` tag moves here, and the
+        # siblings that share that tag keep their image.
+        target = (instance_image(name, svc, inst.get("version")
+                                 or str(s["image"]).rsplit(":", 1)[-1]) if s in built
+                  else s["image"])
         plan.append({"s": s, "svc": svc, "ctx": ctx, "ref": ref, "old": old_id,
-                     "digest": digest})
+                     "digest": digest, "target": target})
     # 3. Test first (RFC-0050): the test instance must stand on these bases.
     sib = _rebuild_sibling(reg, name, inst)
     if sib and built:
@@ -14996,10 +15002,10 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
     # 5. Build. A failing build changes nothing: the old container never stopped.
     for p in plan:
         if p["s"] in built:
-            say(f"Building {p['s']['image']} on {p['ref']} ...")
-            ok, why = _docker_ok(docker_build_cmd(p["s"]["image"], p["ctx"]))
+            say(f"Building {p['target']} on {p['ref']} ...")
+            ok, why = _docker_ok(docker_build_cmd(p["target"], p["ctx"]))
             if not ok:
-                _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["s"]["image"]])
+                _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["target"]])
                 _rebuild_record(name, {"at": _iso_now(), "state": "build-failed",
                                        "by": who, "why": why})
                 audit_tenant("instance.rebuild", tid, name, "failed", who=who, role=role,
@@ -15009,8 +15015,12 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
             rec = images.base_record(p["ctx"])
             if rec.get("digest") != p["digest"]:
                 raise RebuildRefused("the build did not use the base just pulled (§8.2)")
+            # RFC-0130 §2.2 (D3): this build pulled its base a moment ago, so
+            # at this moment the base IS upstream -- "behind" may only come
+            # from an upstream answer asked after this.
+            rec["pulled"] = images.now_iso()
             p["base"] = rec
-        p["new"] = images.inspect_image(p["s"]["image"]).get("Id", "")
+        p["new"] = images.inspect_image(p["target"]).get("Id", "")
         # The image id says little: a Dockerfile that upgrades packages is
         # built with --no-cache, and even a cached build of a freshly
         # unpacked package got a new id (measured 2026-11-11 on oaap-test:
@@ -15023,15 +15033,29 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
                 and old_digest and old_digest == p["digest"]):
             new_pk = images.package_list(p["new"])
             if new_pk and new_pk == images.package_list(p["old"]):
-                _docker_ok(["docker", "tag", p["old"], p["s"]["image"]])
+                _docker_ok(["docker", "tag", p["old"], p["target"]])
                 p["new"] = p["old"]
+    def _record_targets(reg):
+        # RFC-0130 §2.1: from now on the instance runs its own name. When
+        # nothing changed, that name points at the image already running.
+        for s in reg["instances"][name].get("services") or []:
+            for p in plan:
+                if s.get("container") == p["s"].get("container") and p["s"] in built:
+                    s["image"] = p["target"]
+                    if s.get("container") == reg["instances"][name].get("container"):
+                        reg["instances"][name]["image"] = p["target"]
+
     if all(p["new"] == p["old"] for p in plan):
+        reg = load_registry()
+        _record_targets(reg)
+        save_registry(reg)
         _rebuild_record(name, {"at": _iso_now(), "state": "unchanged", "by": who})
         return True, (f"nothing to rebuild on: the base of {name} has not moved "
                       "upstream -- the image stays as it is")
     # 6. Recreate, health; the ladder of §5 when it does not answer.
     reg = load_registry()
     old_bases = {}
+    _record_targets(reg)
     for s in reg["instances"][name].get("services") or []:
         old_bases[s.get("container")] = s.get("base")
         for p in plan:
@@ -15053,7 +15077,7 @@ def _rebuild_steps(name, inst, reg, services, built, tmp, tid, who, role, say):
         return True, f"{name} rebuilt on a fresh base and answers ({detail})."
     say("Not answering -- back to the previous image ...")
     for p in plan:
-        _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["s"]["image"]])
+        _docker_ok(["docker", "tag", _prev_tag(name, p["svc"]), p["target"]])
     reg = load_registry()
     for s in reg["instances"][name].get("services") or []:
         # The previous image's record comes back with it (none, if it
@@ -15570,7 +15594,8 @@ def cmd_node_care(args):
             print(f"  {label:<30} {s['state']:<8} open {opn:<3}"
                   + (f" since {s['oldest']}" if s["oldest"] else "")
                   + f"  {s['image']}  [{base}{', ' + beh if beh else ''}]"
-                  + (f"  ({s['why']})" if s["why"] else ""))
+                  + (f"  ({s['why']})" if s["why"] else "")
+                  + (f"  -- {s['unknown_en']}" if s.get("unknown_en") else ""))
             names = [f"{i['package']} ({i.get('dsa', '?')} {i.get('published', '')}, "
                      f"image {i.get('installed', '?')}, fixed in {i.get('fixed', '?')})"
                      for i in images.names_for(st, r.get("image_id"))]
@@ -23586,6 +23611,27 @@ def image_tag(version):
     return str(version).replace("+", "_")
 
 
+# RFC-0130 §2.1 (D2): the image an instance runs is named after the
+# INSTANCE. Before, every instance of one app version ran the shared tag
+# `oaap-app/<id>[-<svc>]:<tag>`; a rebuild or install of one moved it, and on
+# a node with the containerd image store the untagged image of every sibling
+# was gone at once -- its container ran on, the reading saw nothing
+# (measured 2026-11-25 on oaapx01: 29 containers "unknown"). Layers are still
+# shared, so the bytes are not doubled. `oaap-app/` stays readable for the
+# instances built before (they move at their next install or rebuild).
+BUILT_IMAGE_PREFIXES = ("oaap-app/", "oaap-inst/")
+
+
+def is_built_image(image):
+    """Whether the node built this image itself (from a package)."""
+    return str(image or "").startswith(BUILT_IMAGE_PREFIXES)
+
+
+def instance_image(name, service, version):
+    """`oaap-inst/<instance>[-<service>]:<tag>` -- one name per instance."""
+    return f"oaap-inst/{name}{('-' + service) if service else ''}:{image_tag(version)}"
+
+
 def stale_containers(stored, services):
     """The containers the registry records for an instance that `services`
     (its new shape) no longer names -- in the registry's order. Only names
@@ -27982,9 +28028,7 @@ def _install_from_dir(pkg, args, source):
     for sname, svc in ordered:
         cname = f"oaap-app-{name}" if not multi else f"oaap-app-{name}-{sname}"
         if app["type"] == "native" or svc.get("build"):
-            tag = image_tag(app["version"])
-            img = (f"oaap-app/{app['id']}:{tag}" if not multi
-                   else f"oaap-app/{app['id']}-{sname}:{tag}")
+            img = instance_image(name, sname if multi else "", app["version"])
             print(f"Building {img} on this node ...")
             run(docker_build_cmd(img, os.path.join(pkg, svc.get("build", "."))))
             build = svc.get("build", "")
@@ -28708,6 +28752,10 @@ def remove_instance(reg, name, purge):
         # only; Docker keeps the bytes while another image still uses them.
         subprocess.run(["docker", "rmi", _prev_tag(name, s.get("service", ""))],
                        capture_output=True, text=True)
+        # RFC-0130 §2.1: and so does the instance's own name (never the
+        # shared `oaap-app/` tag, which other instances may still run).
+        if str(s.get("image", "")).startswith("oaap-inst/"):
+            subprocess.run(["docker", "rmi", s["image"]], capture_output=True, text=True)
     # RFC-0063 §4.9: the grants go with the instance, and so does its base
     if inst.get("id") and os.path.isdir(disks.grant_base(inst["id"])):
         try:
@@ -41169,7 +41217,7 @@ def _deploy_from_registry(name, inst):
     # pull each. The package source is fetched once if ANY service needs
     # a local build.
     services = instance_services(inst)
-    needs_build = any(s["image"].startswith("oaap-app/") for s in services)
+    needs_build = any(is_built_image(s["image"]) for s in services)
     tmp = None
     pkg = ""
     try:
@@ -41203,7 +41251,7 @@ def _deploy_from_registry(name, inst):
                       f"copy the package here or reinstall it under the same name.")
                 return False
         for s in services:
-            if s["image"].startswith("oaap-app/"):
+            if is_built_image(s["image"]):
                 print(f"Building {s['image']} ...")
                 run(docker_build_cmd(s["image"], os.path.join(pkg, s.get("build") or ".")))
                 s["base"] = images.base_record(os.path.join(pkg, s.get("build") or "."))

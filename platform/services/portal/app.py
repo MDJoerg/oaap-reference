@@ -3156,9 +3156,9 @@ IMAGE_CARD = """
      <span class="muted">gelesen {{ i.imgcare.computed }} UTC</span></p>
   {% for s in i.imgcare.services %}
   <p>{% if s.service %}<strong>{{ s.service }}</strong>: {% endif %}<code>{{ s.image }}</code><br>
-     {% if s.open is none %}Sicherheitsmeldungen im Abbild: nicht lesbar{% if s.why %} ({{ s.why }}){% endif %}.
+     {% if s.open is none %}Sicherheitsmeldungen im Abbild: {% if s.unknown_de %}{{ s.unknown_de }}{% else %}nicht lesbar{% if s.why %} ({{ s.why }}){% endif %}.{% endif %}
      {% elif s.open %}<span class="err">{{ s.open }} offene Sicherheitsmeldung(en) im Abbild, die älteste seit {{ s.oldest }}.</span>
-     {% else %}Keine offene Sicherheitsmeldung im Abbild.{% endif %}<br>
+     {% else %}Keine offene Sicherheitsmeldung im Abbild.{% if s.unknown_de %} <span class="muted">{{ s.unknown_de }}</span>{% endif %}{% endif %}<br>
      {% if s.pkgs %}<span class="muted">Betroffen:
        {% for it in s.pkgs %}<code>{{ it.package }}</code> ({{ it.dsa }} vom {{ it.published }};
        im Abbild {{ it.installed }}, bei Debian korrigiert in {{ it.fixed }}){{ "; " if not loop.last }}{% endfor %}.</span><br>{% endif %}
@@ -12467,6 +12467,8 @@ def _image_view(name):
             "built": (s.get("built") or "")[:10],
             "behind": s.get("behind"),
             "why": s.get("why", ""),
+            # RFC-0130 §2.3: why "unknown", in one sentence
+            "unknown_de": s.get("unknown_de", ""),
         })
     rb = (load_instances().get(name) or {}).get("rebuild") or {}
     helps = host_care.rebuild_helps(e["services"], de=True)

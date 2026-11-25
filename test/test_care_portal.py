@@ -225,7 +225,9 @@ def const(name, env=None):
 
 CARD = Environment(autoescape=True).from_string(const("CARE_CARD"))
 body = const("INSTANCE_EDIT_BODY", {"CARE_CARD": "<!--care-->", "IMAGE_CARD": "<!--image-->",
-                                    "MCP_CARD": "<!--mcp-->"})
+                                    "MCP_CARD": "<!--mcp-->",
+                                    # 0.1.375: the card "Anmeldung über den Realm"
+                                    "SIGNIN_CARD": "<!--signin-->"})
 ok("die Karte MCP steht im Reiter Ueberblick (Portal 2.16)",
    "<!--mcp-->" in body.split("tab == 'ueberblick'")[1].split("tab == 'zugang'")[0])
 ok("... und dort ganz oben, vor „Was die App mitbringt“ (L7, 0.1.308)",
