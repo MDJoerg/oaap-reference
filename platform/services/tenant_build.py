@@ -342,8 +342,12 @@ def upload_problems(doc, known_apps=None):
                 out.append(f"step '{sid}': an uploaded profile names an app of "
                            "the catalogue ('app'), not a 'source', 'path' or 'ref'")
             app = st.get("app")
+            # RFC-0133 §4 (D4): an app named only under a tick (`when`) is not
+            # a refusal here -- the page greys the tick, the start refuses it
+            # when set (ticked_unknown_apps); without `when` nothing changes
             if isinstance(app, str) and not TEMPLATE_RE.search(app) \
-                    and known_apps is not None and app not in known_apps:
+                    and known_apps is not None and app not in known_apps \
+                    and not when_names(st):
                 out.append(f"step '{sid}': '{app}' is not in any configured "
                            "store source")
     return out
@@ -582,8 +586,10 @@ def profile_problems(doc):
 
 def _setup_items_problems(where, sid, items, params):
     """An app.setup's items: a list of objects with a text `kind` and `id`;
-    values are text (parameters allowed), true/false, or lists of text.
-    Never a field that names a secret (RFC-0104 §3.1)."""
+    values are text (parameters allowed), true/false, or lists of text --
+    since RFC-0133 also a list of flat objects of text (a view's fixed tool
+    list: [{"server", "tool", "effect"}, ...]). Never a field that names a
+    secret (RFC-0104 §3.1)."""
     out = []
     if not isinstance(items, list) or not items or len(items) > SETUP_ITEMS_MAX:
         return [f"{where} ('{sid}'): items is a list of 1 to {SETUP_ITEMS_MAX} objects"]
@@ -600,8 +606,15 @@ def _setup_items_problems(where, sid, items, params):
                 out.append(f"{at}: a profile never holds a secret ('{k}')")
                 continue
             texts = v if isinstance(v, list) else [v]
-            if isinstance(v, list) and not all(isinstance(x, str) for x in v):
-                out.append(f"{at}: '{k}' is a list of text")
+            if isinstance(v, list) and all(isinstance(x, dict) for x in v) and v:
+                flat = [y for x in v for y in x.values()]
+                if not all(isinstance(y, str) for y in flat) or any(
+                        str(a).lower() in SECRET_WORDS for x in v for a in x):
+                    out.append(f"{at}: '{k}' is a list of objects of text")
+                    continue
+                texts = flat
+            elif isinstance(v, list) and not all(isinstance(x, str) for x in v):
+                out.append(f"{at}: '{k}' is a list of text (or of objects of text)")
                 continue
             if isinstance(v, dict):
                 if not all(isinstance(x, str) for x in v.values()):
@@ -646,6 +659,10 @@ def render_items(items, values, sid):
                 r = _render_text(v, values, sid, f"'{k}'")
                 if r is not None:
                     row[k] = r
+            elif isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                row[k] = [{a: r for a, r in ((a, _render_text(t, values, sid, f"'{k}'"))
+                                             for a, t in x.items()) if r is not None}
+                          for x in v]
             elif isinstance(v, list):
                 row[k] = [x for x in (_render_text(t, values, sid, f"'{k}'")
                                       for t in v) if x is not None]
@@ -919,6 +936,24 @@ def when_names(step):
 def step_active(step, values):
     """False for a step whose `when` parameters are not ALL true."""
     return all(values.get(n) == "true" for n in when_names(step))
+
+
+def ticked_unknown_apps(profile, values, known_apps):
+    """RFC-0133 §4: the literal apps of ACTIVE `app.install` steps with a
+    `when` that no configured source lists -> [(step id, app, tick names)].
+    `known_apps` None (no source readable) -> []: the general check says it."""
+    if known_apps is None:
+        return []
+    out = []
+    for st in (profile or {}).get("steps") or []:
+        if not isinstance(st, dict) or st.get("type") != "app.install":
+            continue
+        app = st.get("app")
+        if not isinstance(app, str) or TEMPLATE_RE.search(app) or not when_names(st):
+            continue
+        if step_active(st, values) and app not in known_apps:
+            out.append((st.get("id", ""), app, when_names(st)))
+    return out
 
 
 # ------------------------------------------------------------- the state

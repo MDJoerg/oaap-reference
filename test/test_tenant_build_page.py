@@ -72,6 +72,14 @@ B_HAND = {**B_WAIT, "id": "b-20261003t100200-vhand", "label": "vhand",
                     {**B_WAIT["steps"][2]}]}
 B_DONE = {**B_WAIT, "id": "b-20261003t100300-vdone", "label": "vdone",
           "state": "rolled-back"}
+# RFC-0133 §4: ein Haken, dessen App kein Katalog des Knotens kennt
+ARBEIT = {"id": "arbeit", "title": "Arbeitsplatz", "problem": "",
+          "params": {"label": {"kind": "label", "required": True},
+                     "with_bdt": {"kind": "bool", "default": False, "label": "Mit BDT-TEAM"},
+                     "with_research": {"kind": "bool", "default": False, "label": "Mit Recherche"}},
+          "steps": [{"id": "tenant", "type": "tenant.create"},
+                    {"id": "bdt", "type": "app.install", "app": "bdt-team", "when": "with_bdt"},
+                    {"id": "rech", "type": "app.install", "app": "recherche", "when": "with_research"}]}
 VIEW = {"profiles": [PROFILE, BAD],
         "builds": [B_WAIT, B_FAIL, B_HAND, B_DONE]}
 
@@ -196,6 +204,24 @@ ok("ein unbekanntes oder abgelehntes Profil: 404, kein Formular",
    c.get("/aufbau/neu?profil=kaputt", headers=H).status_code == 404
    and c.get("/aufbau/neu?profil=../x", headers=H).status_code == 404
    and c.get("/aufbau/neu", headers=H).status_code == 404)
+
+print("=== RFC-0133: Haken ohne App im Katalog ===")
+_cat = portal.store_catalogue
+json.dump({"schema": "0.1", **dict(VIEW, profiles=VIEW["profiles"] + [ARBEIT])}, open(VF, "w"))
+portal.store_catalogue = lambda *x, **k: ([{"id": "recherche"}], [])
+t133 = c.get("/aufbau/neu?profil=arbeit", headers=H).get_data(as_text=True)
+box = lambda name: re.search(r'<input type="checkbox" name="%s"[^>]*>' % name, t133)
+ok("BDT-Haken grau mit Satz, Recherche-Haken frei",
+   box("with_bdt") and "disabled" in box("with_bdt").group(0)
+   and "bdt-team steht in keiner Paketquelle" in t133
+   and box("with_research") and "disabled" not in box("with_research").group(0),
+   [box("with_bdt") and box("with_bdt").group(0), box("with_research") and box("with_research").group(0)])
+portal.store_catalogue = lambda *x, **k: (_ for _ in ()).throw(RuntimeError("weg"))
+t133 = c.get("/aufbau/neu?profil=arbeit", headers=H).get_data(as_text=True)
+ok("Katalog nicht lesbar: nichts grau, die Seite steht", "disabled" not in (box("with_bdt").group(0) if box("with_bdt") else "x")
+   and "keiner Paketquelle" not in t133, t133[-800:])
+portal.store_catalogue = _cat
+json.dump({"schema": "0.1", **VIEW}, open(VF, "w"))
 
 print("=== Starten: nur die Anfrage der API ===")
 r = c.post("/aufbau/neu", headers=H, data={"profil": "verein", "label": "",

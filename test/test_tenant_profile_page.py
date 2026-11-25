@@ -46,8 +46,14 @@ ok("die Vorlage besteht die Pruefung des Knotens und die Regeln fuer Hochgeladen
    tb.profile_problems(bv.TEMPLATE) == []
    and tb.upload_problems(bv.TEMPLATE, {"webseite", "rollen-rechte"}) == [],
    tb.upload_problems(bv.TEMPLATE, {"webseite", "rollen-rechte"}))
-ok("...und eine Vorlage mit einer App, die der Katalog nicht hat, faellt auf",
-   any("rollen-rechte" in p for p in tb.upload_problems(bv.TEMPLATE, {"webseite"})))
+# RFC-0133 §4 (D4): die App steht nur unter einem Haken -- das Hochladen geht,
+# der Haken wird grau und ein gesetzter Haken beim Start abgelehnt
+ok("...eine App unter einem Haken, die der Katalog nicht hat, haelt das Hochladen nicht auf",
+   tb.upload_problems(bv.TEMPLATE, {"webseite"}) == [])
+ok("...ohne Haken faellt sie weiter auf",
+   any("rollen-rechte" in p for p in tb.upload_problems(
+       dict(bv.TEMPLATE, steps=[{k: v for k, v in s.items() if k != "when"}
+                                for s in bv.TEMPLATE["steps"]]), {"webseite"})))
 ok("...und ist als Text wieder dieselbe Vorlage", json.loads(bv.template_text()) == bv.TEMPLATE)
 ok("die Vorlage erklaert sich selbst (Schrittarten, bool, when, App aus dem Katalog)",
    all(w in bv.TEMPLATE["description"] for w in ("bool", "when", "app.install", "Katalog")))

@@ -11480,12 +11480,25 @@ def tenant_build_apps_refusal(profile, values, catalogue=None):
     not run."""
     chosen = {k: v for k, v in tenant_build.selected_apps(profile, values).items()
               if v}
-    if not chosen:
+    # RFC-0133 §4 (D4): an app.install under a tick may name an app this node
+    # does not list (the upload let it through); with the tick SET it is
+    # refused here, before the first step, with the tick named
+    ticked = [s for s in (profile or {}).get("steps") or []
+              if isinstance(s, dict) and s.get("type") == "app.install"
+              and tenant_build.when_names(s) and tenant_build.step_active(s, values)
+              and isinstance(s.get("app"), str)
+              and not tenant_build.TEMPLATE_RE.search(s["app"])]
+    if not chosen and not ticked:
         return ""
     ids = catalogue if catalogue is not None else _catalogue_app_ids()
     if ids is None:
         return ("no store source can be read, so the chosen apps cannot be "
                 "checked; nothing was started")
+    params = (profile or {}).get("params") or {}
+    for _sid, app_, ticks in tenant_build.ticked_unknown_apps(profile, values, ids):
+        names = " and ".join(str((params.get(n) or {}).get("label") or n) for n in ticks)
+        return (f"'{app_}' is not listed in any store source of this node, so the "
+                f"tick '{names}' cannot be built here; untick it (RFC-0133)")
     unknown = [a for v in chosen.values() for a in v if a not in ids]
     if unknown:
         return ("not listed in any configured store source: "

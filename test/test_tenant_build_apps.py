@@ -320,5 +320,41 @@ ok("der Plan nennt die Auswahlschritte in Klartext",
    any("Je gewählte App" in r["text"] and "(Test)" in r["text"] for r in plan_rows)
    and any("(Produktiv)" in r["text"] for r in plan_rows), plan_rows)
 
+
+# RFC-0133 §4 (D4): eine App nur unter einem Haken
+print("--- RFC-0133: App unter einem Haken")
+P133 = prof(params={"label": {"kind": "label", "required": True},
+                    "with_bdt": {"kind": "bool", "default": False, "label": "Mit BDT-TEAM"}},
+            steps=[{"id": "tenant", "type": "tenant.create", "label": "{label}"},
+                   {"id": "bdt", "type": "app.install", "app": "bdt-team", "name": "bdt-team",
+                    "when": "with_bdt"},
+                   {"id": "chat", "type": "app.install", "app": "n8n", "name": "n8n"}])
+ok("Hochladen: unbekannte App NUR unter einem Haken ist kein Grund",
+   tb.upload_problems(P133, {"n8n"}) == [], tb.upload_problems(P133, {"n8n"}))
+P133b = dict(P133, steps=[dict(s, app="bdt-team") if s["id"] == "chat" else s for s in P133["steps"]])
+ok("KÖDER: dieselbe unbekannte App OHNE Haken lehnt weiter ab",
+   has(tb.upload_problems(P133b, {"n8n"}), "bdt-team"), tb.upload_problems(P133b, {"n8n"}))
+ok("Start mit Haken aus: kein Einwand",
+   a.tenant_build_apps_refusal(P133, {"with_bdt": "false"}, catalogue={"n8n"}) == "")
+why = a.tenant_build_apps_refusal(P133, {"with_bdt": "true"}, catalogue={"n8n"})
+ok("Start mit gesetztem Haken: abgelehnt, nennt App und Haken",
+   "bdt-team" in why and "Mit BDT-TEAM" in why, why)
+ok("Start mit Haken, App bekannt: kein Einwand",
+   a.tenant_build_apps_refusal(P133, {"with_bdt": "true"}, catalogue={"n8n", "bdt-team"}) == "")
+KNOWN["ids"] = None
+ok("Start mit Haken, kein Katalog lesbar: nicht ungeprüft",
+   "cannot be checked" in a.tenant_build_apps_refusal(P133, {"with_bdt": "true"}))
+ok("… mit Haken aus braucht es keinen Katalog",
+   a.tenant_build_apps_refusal(P133, {"with_bdt": "false"}) == "")
+v133 = {"id": "kunde", "params": P133["params"], "doc": P133}
+f133 = bv.fields(v133)
+ok("Seite: der Haken kennt seine App",
+   [f["needs_apps"] for f in f133 if f["name"] == "with_bdt"] == [["bdt-team"]], f133)
+ok("Seite: App in keinem Katalog -> Haken grau",
+   bv.unavailable_ticks(f133, [{"id": "n8n"}]) == {"with_bdt": ["bdt-team"]})
+ok("Seite: App im Katalog -> nicht grau",
+   bv.unavailable_ticks(f133, [{"id": "n8n"}, {"id": "bdt-team"}]) == {})
+ok("Seite: kein Katalog lesbar -> nichts grau (der Host urteilt)", bv.unavailable_ticks(f133, []) == {})
+
 print(f"\n{'OK' if not fails else f'{fails} FEHLER'}")
 sys.exit(1 if fails else 0)

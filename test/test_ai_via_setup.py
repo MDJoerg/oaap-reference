@@ -404,6 +404,22 @@ ok("ein Element ohne kind/id wird abgelehnt",
 ok("ein unbekannter Parameter wird abgelehnt",
    any("not a declared parameter" in p for p in problems([{"kind": "a", "id": "{nix}"}])))
 ok("eine leere Liste wird abgelehnt", any("items is a list" in p for p in problems([])))
+# RFC-0133: die feste Werkzeugliste einer Sicht -- eine Liste flacher Objekte aus Text
+TL = [{"kind": "view", "id": "bdt", "tools": [{"server": "{label}-bdt", "tool": "bdt_kanaele", "effect": "read"},
+                                              {"server": "{label}-bdt", "tool": "bdt_aufrufen", "effect": "write"}]}]
+ok("RFC-0133: eine Liste flacher Objekte aus Text ist gültig", problems(TL) == [], problems(TL))
+rt = tb.render_items(TL, {"label": "kt"}, "s")
+ok("… und die Parameter füllen auch die Objekte",
+   rt[0]["tools"] == [{"server": "kt-bdt", "tool": "bdt_kanaele", "effect": "read"},
+                      {"server": "kt-bdt", "tool": "bdt_aufrufen", "effect": "write"}], rt)
+ok("KÖDER: verschachteltes Objekt in der Liste wird abgelehnt",
+   any("objects of text" in p for p in problems([{"kind": "view", "id": "v", "tools": [{"a": {"b": "c"}}]}])))
+ok("KÖDER: ein Geheimnis als Feld eines Listenobjekts wird abgelehnt",
+   any("objects of text" in p for p in problems([{"kind": "view", "id": "v", "tools": [{"token": "x"}]}])))
+ok("KÖDER: Text und Objekt gemischt wird abgelehnt",
+   any("list of text" in p for p in problems([{"kind": "view", "id": "v", "tools": ["a", {"b": "c"}]}])))
+ok("KÖDER: unbekannter Parameter in einem Listenobjekt fällt auf",
+   any("not a declared parameter" in p for p in problems([{"kind": "view", "id": "v", "tools": [{"s": "{gibtsnicht}"}]}])))
 
 print("")
 print("FEHLER: %d" % fails if fails else "Alles gruen.")

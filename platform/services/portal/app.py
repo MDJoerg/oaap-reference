@@ -14505,9 +14505,13 @@ BUILD_NEW_BODY = """
         {% if values.get(f.name ~ '__none') or (not values.get(f.name) and not f.default and not f.required) %}checked{% endif %}>
         keine Farbe (es gilt die der Plattform)</label>
     {% elif f.kind == 'bool' %}
+      {% set gone = (grey or {}).get(f.name) %}
       <label class="seatopt"><input type="checkbox" name="{{ f.name }}" value="1"
-        {% if (values and values.get(f.name)) or (not values and f.default) %}checked{% endif %}>
+        {% if gone %}disabled aria-describedby="grey-{{ f.name }}"{% elif (values and values.get(f.name)) or (not values and f.default) %}checked{% endif %}>
         {{ f.label }}</label>
+      {% if gone %}<span class="muted grey-note" id="grey-{{ f.name }}">
+        {{ gone|join(", ") }} steht in keiner Paketquelle dieses Knotens -- dieser Haken
+        lässt sich hier nicht aufbauen (RFC-0133).</span>{% endif %}
       {% if f.administer %}<span class="muted administer-note" id="administer-{{ f.name }}">
         <strong>Dieser Haken ist deine Zusage als Server-Admin</strong>: „{{ f.administer }}“
         verwaltet die fachlichen Berechtigungen des neuen Mandanten
@@ -14756,10 +14760,17 @@ def _build_new(pid, values=None, error=None, status=200):
                     rows=build_view.rows(view), profiles=build_view.profiles(view),
                     job=None, error="Dieses Profil gibt es nicht (oder der Knoten hat es abgelehnt).")
     fields = build_view.fields(prof)
+    grey = {}
+    if any(f.get("needs_apps") for f in fields):
+        # RFC-0133 §4: ein Haken, dessen App kein Katalog des Knotens kennt
+        try:
+            grey = build_view.unavailable_ticks(fields, store_catalogue()[0])
+        except Exception:  # noqa: BLE001 -- ohne Katalog urteilt der Host beim Start
+            grey = {}
     return page(BUILD_NEW_BODY, "Aufbau starten", "build", status=status,
                 profile=prof, fields=fields, offers=_app_offers(fields),
                 plan=build_view.plan(prof), values=values or {}, job=None,
-                error=error)
+                error=error, grey=grey)
 
 
 def _app_offers(fields, catalogue=True):

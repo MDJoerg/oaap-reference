@@ -168,6 +168,7 @@ def fields(profile):
     die der Datei.
     """
     admin = administer_fields(profile)
+    needs = tick_apps(profile)
     out = []
     for name, spec in (profile.get("params") or {}).items():
         spec = spec if isinstance(spec, dict) else {}
@@ -182,7 +183,41 @@ def fields(profile):
                     "max": spec.get("max"),
                     "choices": (spec.get("choices")
                                 if isinstance(spec.get("choices"), list) else None),
-                    "administer": admin.get(name, "")})
+                    "administer": admin.get(name, ""),
+                    "needs_apps": needs.get(name, []) if kind == "bool" else []})
+    return out
+
+
+def tick_apps(profile):
+    """RFC-0133 §4: die Apps, die ein Haken installiert -> {Haken: [App-Id]}.
+    Nur feste IDs (keine App-Auswahl); gelesen aus der vollen Datei."""
+    doc = profile.get("doc") if isinstance(profile.get("doc"), dict) else profile
+    out = {}
+    for st in doc.get("steps") or []:
+        if not isinstance(st, dict) or st.get("type") != "app.install":
+            continue
+        app = st.get("app")
+        if not isinstance(app, str) or "{" in app:
+            continue
+        w = st.get("when")
+        for n in (w if isinstance(w, list) else [w] if w else []):
+            if isinstance(n, str) and app not in out.setdefault(n, []):
+                out[n].append(app)
+    return out
+
+
+def unavailable_ticks(fields, entries):
+    """RFC-0133 §4: Haken, deren App kein Katalog dieses Knotens kennt ->
+    {Haken: [App-Id]}. Ohne lesbaren Katalog (leere Liste) nichts grau --
+    dann urteilt der Host beim Start."""
+    ids = {e.get("id") for e in entries or [] if e.get("id")}
+    if not ids:
+        return {}
+    out = {}
+    for f in fields:
+        miss = [a for a in f.get("needs_apps") or [] if a not in ids]
+        if miss:
+            out[f["name"]] = miss
     return out
 
 

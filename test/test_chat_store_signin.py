@@ -126,6 +126,33 @@ if os.path.exists(prof_path):
     vals = {"label": "kit2", "with_realm": "false", "with_wiki": "true"}
     ok("Haken Wiki ohne Realm: kein Wiki-Schritt läuft",
        not any(tb.step_active(s, vals) for s in wiki_steps))
+    # RFC-0133 (Profil 3.0): vier Haken, jedes Zugangsprofil des Chats mit Ablagetür
+    proj = [s for s in prof["steps"] if "with_projects" in tb.when_names(s)]
+    ok("RFC-0133: jeder Projekte-Schritt verlangt auch den Realm, BDT und Recherche nicht",
+       proj and all("with_realm" in tb.when_names(s) for s in proj)
+       and not any("with_realm" in tb.when_names(s) for s in prof["steps"]
+                   if {"with_bdt", "with_research"} & set(tb.when_names(s))), proj)
+    profiles_ = [i for s in prof["steps"] if s["type"] == "app.setup" for i in s["items"]
+                 if i["kind"] == "profile"]
+    ok("RFC-0133: jedes Zugangsprofil des Chats bringt die Ablagetür mit (stores: true)",
+       len(profiles_) == 3 and all(i.get("stores") is True for i in profiles_), profiles_)
+    ok("RFC-0133: alle vier Haken sind aus", all(prof["params"][n]["default"] is False for n in
+                                                  ("with_wiki", "with_projects", "with_bdt", "with_research")))
+    full = tb.param_values(prof, {"label": "kit3", "title": "KI", "with_realm": "true", "with_wiki": "true",
+                                  "with_projects": "true", "with_bdt": "true", "with_research": "true"})
+    full = full[0] if isinstance(full, tuple) else full
+    ran = [sid for sid, _t, _a in tb.plan(prof, full)]
+    bdt_set = [a for sid, _t, a in tb.plan(prof, full) if sid == "bdt-einrichten"][0]
+    view = [i for i in bdt_set["items"] if i["kind"] == "view"][0]
+    ok("RFC-0133: mit allen Haken laufen Projekte, BDT und Recherche; die BDT-Sicht hat genau vier Werkzeuge",
+       {"projekte", "projekte-ablage", "bdt", "bdt-einrichten", "recherche", "recherche-einrichten"} <= set(ran)
+       and [x["tool"] for x in view["tools"]] == ["bdt_kanaele", "bdt_werkzeuge", "bdt_ergebnis", "bdt_aufrufen"]
+       and view["tools"][0]["server"] == "kit3-bdt-team", (ran, view))
+    none_ = tb.param_values(prof, {"label": "kit4", "title": "KI"})
+    none_ = none_[0] if isinstance(none_, tuple) else none_
+    ran0 = {sid for sid, _t, _a in tb.plan(prof, none_)}
+    ok("RFC-0133: ohne Haken läuft keiner der neuen Schritte",
+       not ran0 & {"projekte", "bdt", "recherche", "bdt-einrichten", "recherche-einrichten"}, ran0)
 else:
     print("SKIP  ki-arbeitsplatz.json nicht neben oaap-reference (Container ohne oaap-docs)")
 
