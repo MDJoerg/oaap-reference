@@ -10520,7 +10520,7 @@ class _BuildDrivers:
             return False, "der Mandant meldet sich noch über keinen Konnektor an", []
         ok, note = self._verb(["idp", "admin-group", name, "--tenant", self.label],
                               "die Verwaltergruppe steht im Realm; "
-                              "nimm die Verwalterin oder den Verwalter des Vereins hinein")
+                              "nimm die Personen hinein, die den Mandanten verwalten")
         return ok, note, []
 
     # idp.app (portal 2.20) ------------------------------------------------
