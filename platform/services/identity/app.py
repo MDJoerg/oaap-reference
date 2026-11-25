@@ -24,7 +24,7 @@ import uuid
 from datetime import timedelta
 import urllib.error
 import urllib.request
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode
 
 from datetime import datetime, timezone
 
@@ -871,6 +871,25 @@ def _return_target(raw):
         return ""
     return raw
 
+
+
+LOGIN_HINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,99}$")
+
+
+def _login_hint(raw_hint, target):
+    """Der Name, den der Anbieter in sein Anmeldefeld schreiben darf, oder "".
+
+    OIDC `login_hint` (Core 3.1.2.1): nur ein Vorschlag fürs Namensfeld --
+    kein Beweis, kein Konto, keine Abkürzung am Kennwort vorbei. Er kommt
+    als eigener Parameter oder steckt in der Rückkehradresse (`next`), weil
+    ein QR-Code des Chats die Adresse samt `?login_hint=` trägt und das
+    Gateway sie unverändert als `next` weitergibt. Nur ein schlichter Name
+    passiert; alles andere fällt still weg (die Anmeldung geht trotzdem).
+    """
+    hint = (raw_hint or "").strip()
+    if not hint and target and "?" in target:
+        hint = (parse_qs(target.split("?", 1)[1]).get("login_hint") or [""])[0].strip()
+    return hint if LOGIN_HINT_RE.match(hint) else ""
 
 
 def _requested_uri():
@@ -2430,11 +2449,15 @@ def oidc_start():
                        "redirect_uri": redirect_uri,
                        "back": _return_host(request.args.get("back", "")),
                        "next": _return_target(request.args.get("next", ""))}
-    query = urlencode({"response_type": "code", "scope": "openid profile email",
-                       "client_id": provider["client_id"],
-                       "redirect_uri": redirect_uri, "state": state,
-                       "nonce": nonce, "code_challenge": challenge,
-                       "code_challenge_method": "S256"})
+    params = {"response_type": "code", "scope": "openid profile email",
+              "client_id": provider["client_id"],
+              "redirect_uri": redirect_uri, "state": state,
+              "nonce": nonce, "code_challenge": challenge,
+              "code_challenge_method": "S256"}
+    hint = _login_hint(request.args.get("login_hint", ""), session["oidc"]["next"])
+    if hint:
+        params["login_hint"] = hint     # nur das Namensfeld vorbelegt
+    query = urlencode(params)
     sep = "&" if "?" in ends["authorize"] else "?"
     return redirect(ends["authorize"] + sep + query, code=303)
 

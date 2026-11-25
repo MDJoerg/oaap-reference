@@ -558,6 +558,27 @@ ok("mit einer Rueckkehradresse an DIESEM Ort",
 
 from urllib.parse import unquote                               # noqa: E402
 
+ok("ohne Hinweis kein login_hint", "login_hint" not in params, params)
+
+# 0.1.379: login_hint -- nur das Namensfeld des Anbieters vorbelegt (QR-Code des Chats)
+from urllib.parse import quote as _q                           # noqa: E402
+r = c.get("/auth/oidc/start?next=" + _q("/?login_hint=joerg.m@pxx", safe=""), headers={"Host": f"hbvp.{HOST}"})
+p2 = dict(x.split("=", 1) for x in r.headers["Location"].split("?", 1)[1].split("&"))
+ok("login_hint aus der Rückkehradresse geht zum Anbieter", unquote(p2.get("login_hint", "")) == "joerg.m@pxx", p2)
+ok("… PKCE bleibt", p2.get("code_challenge_method") == "S256", p2)
+r = c.get("/auth/oidc/start?login_hint=anna", headers={"Host": f"hbvp.{HOST}"})
+p3 = dict(x.split("=", 1) for x in r.headers["Location"].split("?", 1)[1].split("&"))
+ok("login_hint als eigener Parameter", p3.get("login_hint") == "anna", p3)
+for bad in ["<script>", "a b", "x" * 101, "-anfang", "a%22b", "a&prompt=none"]:
+    r = c.get("/auth/oidc/start?login_hint=" + _q(bad, safe=""), headers={"Host": f"hbvp.{HOST}"})
+    loc = r.headers.get("Location", "")
+    ok(f"Köder-Hinweis {bad[:12]!r} fällt still weg, Anmeldung geht trotzdem",
+       r.status_code == 303 and "login_hint" not in loc and "prompt=" not in loc, loc[:200])
+ok("_login_hint: Regel ausgeführt", ident._login_hint("", "/x?login_hint=bert&y=1") == "bert"
+   and ident._login_hint("", "/x") == "" and ident._login_hint("a/b", "") == "")
+
+r = c.get("/auth/oidc/start", headers={"Host": f"hbvp.{HOST}"})
+params = dict(p.split("=", 1) for p in r.headers["Location"].split("?", 1)[1].split("&"))
 state, nonce = unquote(params["state"]), unquote(params["nonce"])
 
 # Erst der Fall, der nichts werden darf: ein Token mit fremdem nonce.
