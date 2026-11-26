@@ -8,6 +8,7 @@ COPY place.py .
 COPY idp.py .
 COPY assertion.py .
 COPY act.py .
+COPY gates.py .
 COPY authorization.py .
 COPY mqtt_acl.py .
 COPY people_kc.py .

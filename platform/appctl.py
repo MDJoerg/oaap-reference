@@ -151,6 +151,8 @@ import catalog_source  # noqa: E402
 # ... and the sender that forwards its outbound queue (RFC-0052).
 import metrics_sender  # noqa: E402
 import fleet_pair  # noqa: E402  (RFC-0085 stage 3)
+# RFC-0135: gates -- field list, templates, the check; shared with identity
+import gates  # noqa: E402
 # The broker's certificate (RFC-0054 stage 3): copied from the gateway or
 # issued by this node's own CA; the acting is cmd_broker.
 import broker_certs  # noqa: E402
@@ -21378,6 +21380,7 @@ def _site_identity_stale(body):
     not_platform = {f"request_header -{h}" for h in NOT_PLATFORM_HEADERS}
     strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")
               and not ln.startswith("request_header -X-OAAP-Source-")
+              and not ln.startswith("request_header -X-OAAP-Gate-")
               and ln not in ("request_header -X-OAAP-Act-Token",
                              "request_header -X-OAAP-Act-Assertion",
                              f"request_header -{MCP_DISCOVER_HEADER}")
@@ -21566,7 +21569,9 @@ CASES_MARKER = "# platform-feedback "
 # 11: the case door records who submits to which inbox (a second
 #     forward_auth to the twin service), and the events door serves only
 #     `/` and `/feed` (oaap.events.bus 0.2).
-CASES_BLOCK_FORMAT = 12
+# 13: every site strips the gate headers (RFC-0135 §6) -- the `vorgaenge`
+#     target believes them on /platform/cases/gate.
+CASES_BLOCK_FORMAT = 13
 
 # RFC-0069 stage 2: the NODE opens a case for its reboot plan in every
 # inbox on it. The credential is a key of the machine principal
@@ -21778,6 +21783,8 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
     lines = ["\t" + cases_marker(insts, scope)]
     # Site level, so it runs before every handle block below and above.
     lines += [f"\trequest_header -{h}" for h in SOURCE_HEADERS]
+    # RFC-0135: what a gate's block tells its target -- never from a client
+    lines += [f"\trequest_header -{h}" for h in GATE_HEADERS]
     # Two exact matchers, never /platform/feedback*: that one also takes
     # /platform/feedback.js, the script itself, and answers it with the
     # 404 or the proxy meant for the form.
@@ -22491,6 +22498,8 @@ def write_external_caddy():
     if edge:
         lines += _edge_guard(edge)
     lines += _LOG_BLOCK
+    # RFC-0135: the default tenant's place IS the apex
+    lines += gate_site_lines(default_tenant_id()) if default_tenant_id() else []
     lines += _portal_site_body()
     lines.append("}")
     # The tenant as a place (RFC-0042 T2): the SAME portal, the same
@@ -22505,6 +22514,7 @@ def write_external_caddy():
         if edge:
             lines += _edge_guard(edge)
         lines += _LOG_BLOCK
+        lines += gate_site_lines(_tid)
         lines += _portal_site_body()
         lines.append("}")
     # RFC-0115: a tenant's own domain -- its place on the apex (the same
@@ -22528,6 +22538,7 @@ def write_external_caddy():
         if edge:
             lines += _edge_guard(edge)
         lines += _LOG_BLOCK
+        lines += gate_site_lines(_tid)
         lines += _portal_site_body()
         lines.append("}")
         if edge:
@@ -29949,6 +29960,393 @@ def cmd_authz(args):
               else "It had ended already.")
         return
     die(f"unknown verb '{verb}'")
+
+
+# ------------------------------------------------- gates (RFC-0135 stage 1)
+#
+# A gate is a named way in of one tenant: /gate/<name> on the tenant's
+# place, with its accesses (one machine principal each, its key limited
+# to the gate), the fields it expects and the process it starts. The
+# records live in gates.json beside tenants.json -- written here, read by
+# identity through its read-only mount (ping, templates, the check of an
+# access). A process is a target door and its parameters; stage 1 knows
+# one kind, a case in the tenant's `vorgaenge` instance.
+#
+# The gateway's block on the place site (gate_site_lines) sends a ping and
+# the templates to identity, and a delivery or a reading by ref -- after
+# identity said yes -- to /platform/cases/gate of the target, with the
+# gate's description in headers the client cannot set (§6).
+GATES_FILE = os.path.join(APPS_DIR, "gates.json")
+# Set by the gateway on a gate's blocks only; stripped first there and on
+# every instance site, so the target believes them.
+GATE_HEADERS = ("X-OAAP-Gate-Tenant", "X-OAAP-Gate-Target", "X-OAAP-Gate-Access",
+                "X-OAAP-Gate-Label", "X-OAAP-Gate-Name", "X-OAAP-Gate-Process",
+                "X-OAAP-Gate-Fields")
+GATE_ACCESS_DAYS = 90
+
+
+def load_gates():
+    try:
+        with open(GATES_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return gates.empty_store()
+    if not isinstance(doc, dict):
+        return gates.empty_store()
+    doc.setdefault("gates", {})
+    doc.setdefault("processes", {})
+    return doc
+
+
+def save_gates(doc):
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = GATES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, sort_keys=True, ensure_ascii=False)
+    os.replace(tmp, GATES_FILE)
+    # identity reads it through a read-only mount; it holds no secret --
+    # names, fields and which queue a delivery goes to
+    os.chmod(GATES_FILE, 0o644)
+
+
+def gate_target(insts, tid, proc):
+    """(registry key, container:port) of the `vorgaenge` instance a process
+    delivers to, or ("", ""). Same tenant always; the named instance, else
+    the tenant's production inbox -- never a rehearsal."""
+    if not proc or proc.get("kind", "case") != "case":
+        return "", ""
+    cands = [(k, i) for k, i in sorted(insts.items())
+             if i.get("app_id") == CASES_APP_ID and not is_rehearsal(i)
+             and i.get("container") and i.get("svc_port")
+             and resolve_tenant(instance_tenant_ref(i)) == tid]
+    if proc.get("instance"):
+        cands = [c for c in cands if c[0] == proc["instance"]]
+    else:
+        cands = [c for c in cands if c[1].get("channel") == "production"]
+    if not cands:
+        return "", ""
+    k, i = cands[0]
+    return k, f"{i['container']}:{i['svc_port']}"
+
+
+def gate_site_lines(tid, insts=None, doc=None):
+    """The /gate/* block of a tenant's place site (RFC-0135 §2), or [] when
+    the tenant has no gate. Every gate gets two handles: its delivery and
+    reading (identity asks, then the target) and its ping and templates
+    (identity answers). Anything else under /gate/ goes to identity too,
+    which answers an unknown gate exactly like a wrong key (D6)."""
+    doc = load_gates() if doc is None else doc
+    mine = sorted((g for g in doc["gates"].values() if g.get("tenant") == tid),
+                  key=lambda g: g["name"])
+    if not mine:
+        return []
+    insts = _cases_registry() if insts is None else insts
+    out = [f"\t# gates of tenant {tid} (RFC-0135)", "\thandle /gate/* {"]
+    out += [f"\t\trequest_header -{h}" for h in GATE_HEADERS]
+    out += strip_identity()
+    out += ["\t\trequest_body {", f"\t\t\tmax_size {gates.BODY_MAX_KB}KB", "\t\t}"]
+
+    def door(matcher, target_key):
+        lines = [f"\t\thandle {matcher} {{".replace("handle  {", "handle {"), "\t\t\troute {",
+                 "\t\t\t\turi strip_prefix /gate", "\t\t\t\trewrite * /gate-door{uri}",
+                 "\t\t\t\treverse_proxy identity:8000 {",
+                 f"\t\t\t\t\theader_up X-OAAP-Gate-Tenant {tid}",
+                 f"\t\t\t\t\theader_up X-OAAP-Gate-Target {target_key or '-'}",
+                 "\t\t\t\t}", "\t\t\t}", "\t\t}"]
+        return lines
+
+    for idx, g in enumerate(mine):
+        n = g["name"]
+        proc = doc["processes"].get(gates.gate_key(tid, g.get("process") or ""))
+        tkey, target = gate_target(insts, tid, proc)
+        if target:
+            out += [f"\t\t@gate{idx} {{", f"\t\t\tpath /gate/{n} /gate/{n}/*",
+                    f"\t\t\tnot path /gate/{n}/template",
+                    "\t\t\tnot {", "\t\t\t\tmethod GET HEAD", f"\t\t\t\tpath /gate/{n}",
+                    "\t\t\t}", "\t\t}"]
+            pdesc = {"process": proc["name"], "queue": proc.get("queue") or "eingang",
+                     "kind": proc.get("case_kind") or "internal",
+                     "label": proc.get("label") or ""}
+            extra = ["header_up -Authorization",
+                     f"header_up X-OAAP-Gate-Name {n}",
+                     f"header_up X-OAAP-Gate-Tenant {tid}",
+                     f"header_up X-OAAP-Gate-Process {gates.pack(pdesc)}",
+                     f"header_up X-OAAP-Gate-Fields {gates.pack(g['fields'])}"]
+            extra += [f"header_up {h} {v}" for h, v in
+                      zip(SOURCE_HEADERS, (f"gate:{n}", "gate", "-", tid))]
+            out += [f"\t\thandle @gate{idx} {{", "\t\t\troute {",
+                    "\t\t\t\tforward_auth identity:8000 {",
+                    f"\t\t\t\t\turi /verify?gate={tid}/{n}",
+                    "\t\t\t\t\t" + _COPY_IDENTITY + " X-OAAP-Gate-Access X-OAAP-Gate-Label"]
+            out += ["\t\t" + x for x in _AUTH_NO_UPGRADE] + ["\t\t\t\t}"]
+            out += [f"\t\t\t\turi strip_prefix /gate/{n}",
+                    "\t\t\t\trewrite * /platform/cases/gate{uri}"]
+            out += _proxy(target, "\t\t\t\t", extra=extra)
+            out += ["\t\t\t}", "\t\t}"]
+        out += [f"\t\t@gatedoor{idx} path /gate/{n} /gate/{n}/*"]
+        out += door(f"@gatedoor{idx}", tkey)
+    out += door("", "")
+    out.append("\t}")
+    return out
+
+
+def _gate_tenant(label):
+    tid = resolve_tenant(label) or tenant_by_label(label)[0] if label else None
+    if not tid:
+        die(f"this node has no tenant '{label}'" if label else "--tenant is required")
+    return tid
+
+
+def gate_url(tid, name):
+    """The address an SM59 destination points at, '' without an external name."""
+    ext = load_external()
+    t = load_tenants().get(tid) or {}
+    dom = place.tenant_domain(t)
+    if dom:
+        return f"https://{dom}/gate/{name}"
+    prefixes = tenant_host_prefixes(tid)
+    if not ext or not prefixes:
+        return ""
+    host = f"{prefixes[0]}.{ext}" if prefixes[0] else ext
+    return f"https://{host}/gate/{name}"
+
+
+def _gate_keys(scope):
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "sc = os.environ['OAAP_G_SCOPE']\n"
+        "users = {u['username']: u for u in m.load_users()}\n"
+        "print(json.dumps([dict(m.public_key(k), active=bool((users.get(k['principal']) or {})"
+        ".get('active'))) for k in m.load_keys() if k.get('instance') == sc]))\n",
+        {"OAAP_G_SCOPE": scope})
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def _gate_rewrite():
+    write_external_caddy()
+    try:
+        reload_gateway()
+    except subprocess.CalledProcessError as e:
+        print(f"note: the gateway did not reload ({(e.stderr or '').strip()[:200]})")
+
+
+def cmd_gate(args):
+    """`oaap gate` -- gates, their processes and accesses (RFC-0135 stage 1)."""
+    who = os.environ.get("SUDO_USER") or "root"
+    doc = load_gates()
+    act = args.action
+    if act == "list":
+        tid = _gate_tenant(args.tenant) if args.tenant else None
+        rows = sorted((g for g in doc["gates"].values() if tid is None or g["tenant"] == tid),
+                      key=lambda g: (g["tenant"], g["name"]))
+        procs = sorted((p for p in doc["processes"].values() if tid is None or p["tenant"] == tid),
+                       key=lambda p: (p["tenant"], p["name"]))
+        if not rows and not procs:
+            print("No gates on this node.")
+            return
+        for g in rows:
+            print(f"gate     {tenant_label(g['tenant']) or g['tenant']:<12} {g['name']:<22} "
+                  f"-> process {g.get('process') or '-':<20} user {g.get('user') or g['name']}")
+        for p in procs:
+            tkey, _t = gate_target(_cases_registry(), p["tenant"], p)
+            print(f"process  {tenant_label(p['tenant']) or p['tenant']:<12} {p['name']:<22} "
+                  f"queue {p.get('queue') or 'eingang':<12} kind {p.get('case_kind') or 'internal':<9} "
+                  f"target {tkey or 'NONE'}")
+        return
+    name = (args.name or "").strip().lower()
+    if not gates.NAME_RE.match(name):
+        die("a gate or process name: 2-40 characters, a-z, 0-9, '-', starting with a letter")
+    tid = _gate_tenant(args.tenant)
+    key = gates.gate_key(tid, name)
+    label = tenant_label(tid) or "default"
+
+    if act == "process":
+        proc = dict(doc["processes"].get(key) or {"tenant": tid, "name": name, "kind": "case"})
+        if args.queue:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", args.queue):
+                die("--queue: a queue id of the vorgaenge instance (a-z, 0-9, '-')")
+            proc["queue"] = args.queue
+        if args.kind:
+            if args.kind not in ("bug", "question", "idea", "change", "internal"):
+                die("--kind: bug, question, idea, change or internal")
+            proc["case_kind"] = args.kind
+        if args.instance is not None:
+            proc["instance"] = args.instance.strip()
+        if args.label is not None:
+            proc["label"] = args.label.strip()[:80]
+        proc.setdefault("queue", "eingang")
+        proc.setdefault("case_kind", "internal")
+        doc["processes"][key] = proc
+        save_gates(doc)
+        audit_tenant("gate.process", tid, subject=name,
+                     detail=f"queue {proc['queue']}, kind {proc['case_kind']}, "
+                            f"instance {proc.get('instance') or '(production inbox)'}", who=who)
+        tkey, _t = gate_target(_cases_registry(), tid, proc)
+        _gate_rewrite()
+        print(f"Process '{name}' in '{label}': a case in queue '{proc['queue']}' "
+              f"(kind {proc['case_kind']}) of "
+              + (f"instance '{tkey}'." if tkey else "-- NO vorgaenge instance found; "
+                 "gates pointing here refuse deliveries."))
+        return
+
+    if act == "add":
+        if not args.process:
+            die("--process is required: the process this gate starts (oaap gate process ...)")
+        if gates.gate_key(tid, args.process) not in doc["processes"]:
+            die(f"no process '{args.process}' in '{label}' -- create it first: "
+                f"oaap gate process {args.process} --tenant {label} --queue <queue>")
+        fields = gates.DEFAULT_FIELDS
+        if args.fields:
+            try:
+                with open(args.fields, encoding="utf-8") as f:
+                    fields = json.load(f)
+            except (OSError, ValueError) as e:
+                die(f"--fields: {e}")
+        try:
+            fields = gates.check_fields(fields)
+        except ValueError as e:
+            die(f"--fields: {e}")
+        user = (args.user or name).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", user):
+            die("--user: 1-40 characters, letters, digits, '.', '_', '-' (it is typed into SM59)")
+        was = doc["gates"].get(key)
+        doc["gates"][key] = {"tenant": tid, "name": name, "user": user,
+                             "process": args.process, "fields": fields,
+                             "created": (was or {}).get("created") or _now_iso_z(),
+                             "by": (was or {}).get("by") or who}
+        save_gates(doc)
+        audit_tenant("gate.change" if was else "gate.create", tid, subject=name,
+                     detail=f"process {args.process}, user {user}, {len(fields)} fields", who=who)
+        _gate_rewrite()
+        url = gate_url(tid, name)
+        print(f"Gate '{name}' in '{label}' {'changed' if was else 'created'}: "
+              f"{url or '/gate/' + name} -> process '{args.process}'.")
+        print(f"It has no access yet: oaap gate access {name} --tenant {label} "
+              f"--label 'SAP A4H 001'")
+        return
+
+    gate = doc["gates"].get(key)
+    if not gate:
+        die(f"no gate '{name}' in '{label}' (oaap gate list)")
+    scope = gates.scope(tid, name)
+
+    if act == "show":
+        url = gate_url(tid, name)
+        proc = doc["processes"].get(gates.gate_key(tid, gate.get("process") or ""))
+        tkey, _t = gate_target(_cases_registry(), tid, proc)
+        print(f"Gate      {name} (tenant {label})")
+        print(f"Address   {url or '/gate/' + name}")
+        print(f"User      {gate.get('user') or name}   (SM59: logon with basic authentication)")
+        print(f"Process   {gate.get('process') or '-'}"
+              + (f" -> queue {proc.get('queue')}, instance {tkey or 'NONE'}" if proc else " (missing)"))
+        print(f"Fields    " + ", ".join(f["name"] + ("*" if f["required"] else "")
+                                         for f in gate["fields"]) + "   (* required)")
+        keys = _gate_keys(scope)
+        if not keys:
+            print("Accesses  none")
+        for k in keys:
+            state = ("REVOKED" if k["revoked"] else "INACTIVE" if not k["active"]
+                     else f"until {k['expires'][:10]}")
+            print(f"Access    {k['principal']:<24} {k['label'] or '-':<24} key {k['id']}  "
+                  f"{state:<18} last used {(k['last_used'] or '')[:10] or 'never'}")
+        return
+
+    if act == "access":
+        if not args.label:
+            die("--label is required: who sends through this access, e.g. 'SAP A4H 001'")
+        days = args.days if args.days else GATE_ACCESS_DAYS
+        out = _identity_exec(
+            "import json, os, sys, app as m\n"
+            "a = json.loads(os.environ['OAAP_G_ARGS'])\n"
+            "with m.users_rw() as users:\n"
+            "    n = 1\n"
+            "    while m.find_user(users, f\"gate-{a['name']}-{n}\"):\n"
+            "        n += 1\n"
+            "    p = f\"gate-{a['name']}-{n}\"[:40]\n"
+            "    users.append({'username': p, 'display_name': a['label'], 'password_hash': '',\n"
+            "                  'kind': 'machine', 'roles': ['user'], 'groups': [],\n"
+            "                  'tenant': a['tenant'], 'active': True})\n"
+            "    m.save_users(users)\n"
+            "try:\n"
+            "    rec, secret = m.issue_key(m.load_users(), p, ['user'], a['scope'], a['label'],\n"
+            "                              a['days'], 'root')\n"
+            "except ValueError as e:\n"
+            "    print(str(e), file=sys.stderr); sys.exit(1)\n"
+            "print(json.dumps({'principal': p, 'key': m.public_key(rec), 'secret': secret}))\n",
+            {"OAAP_G_ARGS": json.dumps({"name": name, "tenant": tid, "scope": scope,
+                                        "label": args.label.strip()[:80], "days": days})})
+        res = json.loads(out.strip().splitlines()[-1])
+        rec, secret = res["key"], res["secret"]
+        audit_tenant("gate.access", tid, subject=name,
+                     detail=f"principal {res['principal']}, key {rec['id']}, "
+                            f"label {rec['label']}, until {rec['expires'][:10]}", who=who)
+        url = gate_url(tid, name)
+        host, _, path = (url[len("https://"):] if url else "").partition("/")
+        print("")
+        print(f"Access '{rec['label']}' to gate '{name}' ({label}): principal "
+              f"{res['principal']}, key {rec['id']}, valid until {rec['expires'][:10]}.")
+        print("")
+        print("  " + secret)
+        print("")
+        print("This is the ONLY time the key is shown. In SM59 (type G):")
+        print(f"  Target host   {host or '<the tenant host>'}")
+        print("  Service no.   443, SSL active")
+        print(f"  Path prefix   /{path or 'gate/' + name}")
+        print(f"  Logon         basic authentication, user {gate.get('user') or name}, "
+              "password = the key above")
+        print("  Connection test = the ping (GET).")
+        return
+
+    if act == "revoke":
+        principal = (args.access or "").strip()
+        if not principal:
+            die("--access PRINCIPAL is required (oaap gate show ...)")
+        out = _identity_exec(
+            "import json, os, app as m\n"
+            "a = json.loads(os.environ['OAAP_G_ARGS'])\n"
+            "done = []\n"
+            "for k in m.load_keys():\n"
+            "    if k['principal'] == a['p'] and k.get('instance') == a['scope'] and not k['revoked']:\n"
+            "        m.revoke_key(k['id']); done.append(k['id'])\n"
+            "with m.users_rw() as users:\n"
+            "    u = m.find_user(users, a['p'])\n"
+            "    ok = bool(u and u.get('kind') == 'machine' and m.resolve_tenant(u.get('tenant')) == a['tenant'])\n"
+            "    if ok:\n"
+            "        u['active'] = False\n"
+            "        m.save_users(users)\n"
+            "print(json.dumps({'keys': done, 'principal': ok}))\n",
+            {"OAAP_G_ARGS": json.dumps({"p": principal, "scope": scope, "tenant": tid})})
+        res = json.loads(out.strip().splitlines()[-1])
+        if not res["keys"] and not res["principal"]:
+            die(f"no access '{principal}' at gate '{name}'")
+        audit_tenant("gate.revoke", tid, subject=name,
+                     detail=f"principal {principal}, keys {','.join(res['keys']) or '-'}", who=who)
+        print(f"Access '{principal}' at gate '{name}' is closed: "
+              f"{len(res['keys'])} key(s) revoked, principal deactivated.")
+        return
+
+    if act == "remove":
+        if not args.yes:
+            die(f"removing gate '{name}' revokes every access to it -- repeat with --yes")
+        keys = [k for k in _gate_keys(scope) if not k["revoked"]]
+        if keys:
+            _identity_exec(
+                "import json, os, app as m\n"
+                "for kid in json.loads(os.environ['OAAP_G_KEYS']):\n"
+                "    m.revoke_key(kid)\n",
+                {"OAAP_G_KEYS": json.dumps([k["id"] for k in keys])})
+        del doc["gates"][key]
+        save_gates(doc)
+        audit_tenant("gate.remove", tid, subject=name,
+                     detail=f"{len(keys)} key(s) revoked", who=who)
+        _gate_rewrite()
+        print(f"Gate '{name}' removed from '{label}'; {len(keys)} key(s) revoked.")
+        return
+    die(f"unknown action '{act}'")
+
+
+def _now_iso_z():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def cmd_machine(args):
@@ -43582,6 +43980,32 @@ def build_parser():
     pm.add_argument("--clear", action="store_true",
                     help="propagate: remove every fixed claim")
     pm.set_defaults(fn=cmd_machine)
+    pg = sub.add_parser("gate", help="gates -- the way in for other systems "
+                        "(RFC-0135): gates, processes, accesses")
+    pg.add_argument("action", choices=["list", "show", "add", "remove", "process",
+                                       "access", "revoke"])
+    pg.add_argument("name", nargs="?", help="the gate (or, for 'process', the process)")
+    pg.add_argument("--tenant", default="", help="tenant label or id")
+    pg.add_argument("--process", default="", help="add: the process this gate starts")
+    pg.add_argument("--user", default="",
+                    help="add: the user name SM59 sends with basic authentication "
+                         "(default: the gate's name)")
+    pg.add_argument("--fields", default="",
+                    help="add: a JSON file with the field list (default: ref, title, "
+                         "text, system, occurred)")
+    pg.add_argument("--queue", default="", help="process: the queue of the case")
+    pg.add_argument("--kind", default="",
+                    help="process: the case kind (bug, question, idea, change, internal)")
+    pg.add_argument("--instance", default=None,
+                    help="process: the vorgaenge instance (default: the tenant's "
+                         "production inbox)")
+    pg.add_argument("--label", default=None,
+                    help="access: who sends ('SAP A4H 001'); process: its title")
+    pg.add_argument("--days", type=int, default=0,
+                    help=f"access: validity of the key in days (default {90})")
+    pg.add_argument("--access", default="", help="revoke: the access's principal")
+    pg.add_argument("--yes", action="store_true", help="remove: really")
+    pg.set_defaults(fn=cmd_gate)
     pk = sub.add_parser("key", help="API keys (RFC-0027) -- issue, list, revoke")
     pk.add_argument("action", choices=["issue", "list", "revoke"])
     pk.add_argument("name", nargs="?",
@@ -43941,7 +44365,7 @@ def cmd_help(args, parser):
 # appctl.py knows is reached as `oaap app <cmd>`. test/test_cli_reference.py
 # holds this list against the wrapper's `case`.
 WRAPPER_GROUPS = ("store", "node", "data", "external", "edge", "backup",
-                  "files", "user", "cohort", "disk", "machine", "authz", "key",
+                  "files", "user", "cohort", "disk", "machine", "gate", "authz", "key",
                   "fleet", "assets", "tenant", "metrics", "broker", "idp", "mail",
                   "notify", "report", "guard", "destination", "connect", "connector", "events", "help")
 
@@ -43993,7 +44417,10 @@ def is_read_only(args):
                  or (args.cmd == "tenant"
                      and args.action in ("list", "show", "check", "log"))
                  or (args.cmd == "metrics"
-                     and args.action in ("show", "queue")))
+                     and args.action in ("show", "queue"))
+                 # RFC-0135: reading the gates.json needs no root; `show`
+                 # asks identity for the accesses and so does need it
+                 or (args.cmd == "gate" and args.action == "list"))
 
 
 def main():

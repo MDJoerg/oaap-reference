@@ -59,6 +59,9 @@ import authorization as authz  # noqa: E402
 import assertion  # noqa: E402
 # RFC-0073 procedure I: checking an act token (RS256 against the realm's keys).
 import act  # noqa: E402
+# RFC-0135: gates -- the field list, the templates and the ping, shared
+# with appctl (and copied into the `vorgaenge` app, which checks deliveries).
+import gates  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -2179,6 +2182,9 @@ def verify():
         return _verify_discover(request.args.get("discover", ""))
     if request.args.get("via"):
         return _verify_via(request.args.get("via", ""))
+    # RFC-0135: a gate's delivery or reading -- its own check, never a session
+    if request.args.get("gate"):
+        return _verify_gate(request.args.get("gate", ""))
     user, _method, refusal = resolve_principal(
         request.args.get("instance", ""))
     # RFC-0059: before anything else, so an anonymous visitor sees the
@@ -2256,6 +2262,168 @@ def agent_assertion():
     resp = make_response({"assertion": tok, "expires_in": assertion.LIFETIME})
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# ------------------------------------------------- gates (RFC-0135 stage 1)
+#
+# A gate is a named way in of one tenant, /gate/<name> on the tenant's
+# place. appctl writes the gates into gates.json (read-only here) and the
+# gateway's blocks: ping and templates come to /gate-door/<name> below,
+# a delivery and a reading by ref pass /verify?gate=<tenant>/<name> and
+# go on to the gate's target. Both ask gate_access() -- one rule, one
+# function.
+GATES_FILE = os.environ.get("OAAP_GATES_FILE", "/platform-apps/gates.json")
+# set by the gateway on the gate door only, after stripping what a client sent
+GATE_TENANT_HEADER = "X-OAAP-Gate-Tenant"
+GATE_TARGET_HEADER = "X-OAAP-Gate-Target"
+
+
+def load_gates():
+    doc = _load(GATES_FILE, None)
+    if not isinstance(doc, dict):
+        return gates.empty_store()
+    doc.setdefault("gates", {})
+    doc.setdefault("processes", {})
+    return doc
+
+
+def _gate_credential():
+    """(basic_user or None, token) from Authorization, or None.
+
+    Basic is taken here and nowhere else: the password is the key, the
+    user is the gate's user name (RFC-0135 §3). A client's `sap-user`
+    header is never read -- it says what SAP believes, not who calls."""
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() == "bearer ":
+        return None, auth[7:].strip()
+    if auth[:6].lower() == "basic ":
+        try:
+            raw = base64.b64decode(auth[6:].strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        user, sep, pw = raw.partition(":")
+        if not sep:
+            return None
+        return user, pw
+    return None
+
+
+def gate_access(tid, name):
+    """(gate, principal, key record) for a valid access to this gate, or
+    None -- for EVERY reason alike (unknown gate, no or wrong credential,
+    a key of another gate, of another tenant, an unlimited key, a person),
+    so that the address tells a stranger nothing (RFC-0135 D6)."""
+    if not tid or not gates.NAME_RE.match(name or ""):
+        return None
+    gate = load_gates()["gates"].get(gates.gate_key(tid, name))
+    cred = _gate_credential()
+    if not gate or not cred:
+        return None
+    buser, token = cred
+    # a Basic password that is not our key is not a gate's credential
+    if not token.startswith(KEY_PREFIX):
+        return None
+    if buser is not None and buser != (gate.get("user") or name):
+        return None
+    sc = gates.scope(tid, name)
+    user, _m, refusal = _by_key(token, sc)
+    if refusal is not None:
+        return None
+    m = KEY_TOKEN_RE.fullmatch(token)
+    rec = next((k for k in load_keys() if m and k["id"] == m.group(1)), None)
+    # _by_key lets an unlimited key pass anywhere; a gate wants exactly its own
+    if not rec or rec.get("instance") != sc or user.get("kind") != "machine":
+        return None
+    if resolve_tenant(user.get("tenant")) != tid:
+        return None
+    return gate, user, rec
+
+
+def _gate_wants_json():
+    return "application/json" in (request.headers.get("Accept") or "")
+
+
+def _gate_answer(code, text, doc=None):
+    if _gate_wants_json():
+        resp = make_response(json.dumps(doc if doc is not None else {"error": text.strip()},
+                                        ensure_ascii=False), code)
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    else:
+        resp = make_response(text if text.endswith("\n") else text + "\n", code)
+        resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _gate_refusal(name):
+    shown = name if gates.NAME_RE.match(name or "") else "?"
+    resp = _gate_answer(401, f"Tor {shown}: Anmeldung fehlt oder Schluessel ungueltig")
+    resp.headers["WWW-Authenticate"] = f'Basic realm="OAAP-Tor {shown}", charset="UTF-8"'
+    return resp
+
+
+def _gate_process_line(tid, gate, target):
+    proc = load_gates()["processes"].get(gates.gate_key(tid, gate.get("process") or ""))
+    if not proc:
+        return "keiner zugeordnet - Lieferungen werden abgelehnt"
+    what = f"Vorgang im Bereich {proc.get('queue') or 'eingang'}"
+    if proc.get("label"):
+        what = f"{proc['label']} ({what})"
+    return what + ("" if target and target != "-" else " - Ziel nicht erreichbar")
+
+
+def _verify_gate(spec):
+    """forward_auth of a gate's delivery and reading (RFC-0135 §3). The
+    tenant and the name come from the generated gateway config."""
+    tid, _, name = (spec or "").partition("/")
+    got = gate_access(tid, name)
+    if not got:
+        return _gate_refusal(name)
+    _gate, user, rec = got
+    h = identity_headers(user, "")
+    h["X-OAAP-Gate-Access"] = user["username"]
+    h["X-OAAP-Gate-Label"] = quote(rec.get("label") or user.get("display_name") or "", safe="")
+    return "", 204, h
+
+
+@app.route("/gate-door/<name>", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
+@app.route("/gate-door/<name>/<path:rest>", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
+def gate_door(name, rest=""):
+    """Ping and templates of a gate (RFC-0135 §4/§5) -- and the answer for
+    whatever the gateway sends here because the gate has no target."""
+    tid = request.headers.get(GATE_TENANT_HEADER, "").strip()
+    if not tid:
+        return _gate_answer(404, "nicht gefunden")
+    got = gate_access(tid, name)
+    if not got:
+        return _gate_refusal(name)
+    gate, user, rec = got
+    target = request.headers.get(GATE_TARGET_HEADER, "").strip()
+    rest = rest.strip("/")
+    if request.method in ("GET", "HEAD") and rest == "":
+        now = _now_iso()
+        proc = _gate_process_line(tid, gate, target)
+        label = rec.get("label") or user.get("display_name") or user["username"]
+        text = gates.ping_text(gate, _label_of(tid) or tid, label, rec.get("expires", ""),
+                               proc, now)
+        return _gate_answer(200, text, {
+            "gate": gate["name"], "tenant": _label_of(tid) or tid, "access": label,
+            "expires": rec.get("expires", ""), "process": proc,
+            "fields": len(gate["fields"]),
+            "required": sum(1 for f in gate["fields"] if f["required"]),
+            "template": f"/gate/{gate['name']}/template?form=placeholders",
+            "max_kb": gates.BODY_MAX_KB, "now": now})
+    if request.method in ("GET", "HEAD") and rest == "template":
+        form = request.args.get("form", "sample")
+        if form not in ("sample", "placeholders", "fields"):
+            return _gate_answer(400, "form: sample, placeholders oder fields")
+        resp = make_response(gates.template(gate["fields"], form), 200)
+        resp.headers["Content-Type"] = ("application/json; charset=utf-8" if form == "sample"
+                                        else "text/plain; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    return _gate_answer(503, f"Tor {gate['name']}: kein Ziel erreichbar "
+                             "(Prozess fehlt oder seine Instanz)")
 
 
 @app.get("/auth/login")
