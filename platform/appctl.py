@@ -143,6 +143,8 @@ import notify  # noqa: E402
 import connect_fresh  # noqa: E402  (0.1.286: a state.json left behind is no state)
 import fleet_watch  # noqa: E402
 import disk_trend  # noqa: E402
+# ... and the images it may remove again (RFC-0128).
+import space  # noqa: E402
 # ... and what it says once a week (RFC-0083): ledger, report, Markdown.
 import report  # noqa: E402
 # ... and the secret files it refuses and looks for (RFC-0084).
@@ -3619,10 +3621,17 @@ def notify_conditions(facts=None, now=None):
     if missing:
         cur[dflt]["backup.missing"] = missing
     pct = metrics.read_disk_percent(DATA_DIR)
+    pressed = ""
     if pct is not None:
         s = notify_settings()
         open_before = "disk.full" in ((_notify_state_rw().get("matters") or {})
                                       .get(dflt) or {})
+        # RFC-0128 §4.2 (D5): before "disk full" OPENS, the node frees A-C
+        # once, measures again, and the mail says what that did.
+        if pct >= s["disk_warn"] and not open_before:
+            pressed = space_pressure(s["disk_warn"])
+            if pressed:
+                pct = metrics.read_disk_percent(DATA_DIR) or pct
         # Two points of hysteresis: a disk at 89.9/90.1 % must not mail
         # every minute (D6 is "begins and ends", not "flickers").
         if pct >= s["disk_warn"] or (open_before and pct >= s["disk_warn"] - 2):
@@ -3631,11 +3640,19 @@ def notify_conditions(facts=None, now=None):
                 "type": "disk.full", "kurz": f"zu {pct:.0f} % voll",
                 "text": f"Die Datenplatte des Servers ist zu {pct:.1f} % belegt "
                         f"({level}; Schwellen {s['disk_warn']:.0f} % / "
-                        f"{s['disk_crit']:.0f} %)."}
+                        f"{s['disk_crit']:.0f} %)." + (("\n" + pressed) if pressed else "")}
     # RFC-0085 A4 (§18.7): when will it be full -- from this node's own tiers
     try:
         open_now = set(((_notify_state_rw().get("matters") or {}).get(dflt) or {}))
-        cur[dflt].update(disk_trend_conditions(pct, open_now))
+        trend = disk_trend_conditions(pct, open_now)
+        fresh = [k for k in trend if k not in open_now]
+        if fresh and not pressed:
+            # RFC-0128 §4.2: the same before a forecast opens.
+            pressed = space_pressure(notify_settings()["disk_warn"])
+        if pressed:
+            for k in fresh:
+                trend[k]["text"] += "\n" + pressed
+        cur[dflt].update(trend)
     except Exception as e:                          # noqa: BLE001
         print(f"notify: disk trend: {type(e).__name__}: {e}", file=sys.stderr)
     adv = facts.get("advisories") or {}
@@ -7121,7 +7138,7 @@ def single_tenant():
 
 
 def audit_tenant(action, tenant, subject="", result="ok", who="root",
-                 role="root", detail=""):
+                 role="root", detail="", extra=None):
     """Append one line to the tenant audit log (spec 1.7).
 
     Two processes append here: this file, for everything that happens
@@ -7144,6 +7161,8 @@ def audit_tenant(action, tenant, subject="", result="ok", who="root",
              "result": result}
     if detail:
         entry["detail"] = detail
+    for k, v in (extra or {}).items():
+        entry.setdefault(k, v)
     with open(TENANT_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     try:
@@ -11400,7 +11419,7 @@ def job_result_fill(req, rid, ok, msg):
     if str(req.get("action") or "") not in (
             "cohort", "tenant-build", "tenant-recipe", "tenant-request",
             "tenant-request-submit",
-            "tenant-profile", "disk", "fleet-disclose", "fleet-pair",
+            "tenant-profile", "disk", "space", "fleet-disclose", "fleet-pair",
             "fleet-pair-public", "assets-set"):
         return
     if not JOB_ID_RE.match(str(rid or "")):
@@ -15521,6 +15540,306 @@ def _care_reboot_if_due(facts):
     return True
 
 
+# ------------------------------------------------- freeing disk space (RFC-0128)
+#
+#   apps/space.json        what a run would free, per class; class D listed (0644,
+#                          the portal's page "Platz" reads it, never Docker)
+#   apps/space-state.json  when a run first saw an image without an instance (D6),
+#                          the last run (0600)
+#
+# The rules are space.py's; here only the registry, Docker and the audit.
+
+SPACE_VIEW = os.path.join(APPS_DIR, space.VIEW_FILE)
+SPACE_STATE = os.path.join(APPS_DIR, space.STATE_FILE)
+SPACE_LOCK = os.path.join(DATA_DIR, "data", "space.lock")
+
+
+def _space_state():
+    try:
+        with open(SPACE_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _space_write(path, data, mode):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1, ensure_ascii=False)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def space_platform_refs():
+    """What the platform's compose files name with `image:` -- its own
+    foreign images (caddy, pgvector, mosquitto) are the platform's."""
+    refs = set()
+    try:
+        names = [n for n in os.listdir(APP_DIR)
+                 if n.startswith("docker-compose") and n.endswith(".yml")]
+    except OSError:
+        names = []
+    for n in names:
+        try:
+            with open(os.path.join(APP_DIR, n), encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"^\s+image:\s*['\"]?([^'\"\s]+)", line)
+                    if m and "${" not in m.group(1):
+                        refs.add(m.group(1))
+        except OSError:
+            pass
+    return refs
+
+
+def _space_disk_path():
+    root = (space.sh(["docker", "info", "--format", "{{.DockerRootDir}}"], timeout=30) or "").strip()
+    return root if root and os.path.isdir(root) else DATA_DIR
+
+
+def space_measure(save_seen=True):
+    """(rows, cache, disk, state): the plan of now. The grace of class C
+    counts from the first run that saw an image without an instance, so a
+    dry run writes it too (it must, or the portal's preview would never
+    start the clock)."""
+    imgs = space.read_images()
+    if imgs is None:
+        raise RuntimeError("Docker antwortet nicht (docker image ls)")
+    state = _space_state()
+    rows, seen = space.plan(imgs, space.read_used_ids(), load_registry().get("instances") or {},
+                            platform_refs=space_platform_refs(), seen=state.get("seen") or {})
+    state["seen"] = seen
+    if save_seen:
+        _space_write(SPACE_STATE, state, 0o600)
+    cache = space.read_cache()
+    dk = space.disk(_space_disk_path())
+    _space_write(SPACE_VIEW, space.view(rows, cache, dk, last=state.get("last")), 0o644)
+    return rows, cache, dk, state
+
+
+@contextlib.contextmanager
+def _space_lock():
+    """One run at a time; a second one says so and does nothing."""
+    try:
+        import fcntl
+    except ImportError:
+        yield True
+        return
+    os.makedirs(os.path.dirname(SPACE_LOCK), exist_ok=True)
+    fd = os.open(SPACE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def space_run(classes=space.AUTO_CLASSES, who="root", role="root", cause="hand"):
+    """One run (§3): measure, remove A/B/C, measure again, one audit line
+    in the node's log. Returns (text, freed bytes, result) -- text '' when
+    the run did not happen (another one, or a backup copying)."""
+    classes = tuple(c for c in classes if c in space.AUTO_CLASSES)
+    if backup_running_now():
+        return "", 0, {"skipped": "backup"}
+    with _space_lock() as got:
+        if not got:
+            return "", 0, {"skipped": "running"}
+        rows, cache, before, state = space_measure()
+        freeable = space.summary(rows, cache)
+        res = space.remove(rows, classes)
+        rows2, cache2, after, state = space_measure()
+        text, freed = space.result_line(res, before, after, freeable)
+        state["last"] = {"when": space.now_iso(), "cause": cause, "who": who,
+                         "freed": freed, "text": text,
+                         "before": (before or {}).get("percent"),
+                         "after": (after or {}).get("percent")}
+        _space_write(SPACE_STATE, state, 0o600)
+        _space_write(SPACE_VIEW, space.view(rows2, cache2, after, last=state["last"]), 0o644)
+        audit_tenant("space.freed", default_tenant_id(), cause, "ok", who=who, role=role,
+                     detail=text, extra={"bytes": freed})
+        return text, freed, res
+
+
+def space_pressure(warn, now=None):
+    """RFC-0128 §4.2 (D5): a run A-C before a disk matter opens, at most
+    every six hours. Returns the sentence for the mail ('' when no run
+    happened): what was freed and, still above the threshold, the foreign
+    images by size -- what only a person may remove (§6.3)."""
+    now = now or time.time()
+    state = _space_state()
+    if now - (state.get("pressure_at") or 0) < space.PRESSURE_EVERY:
+        return ""
+    state["pressure_at"] = now
+    _space_write(SPACE_STATE, state, 0o600)
+    try:
+        text, _freed, _res = space_run(space.AUTO_CLASSES, who="node", role="root",
+                                       cause="pressure")
+    except Exception as e:                          # noqa: BLE001
+        print(f"space: pressure: {type(e).__name__}: {e}", file=sys.stderr)
+        return ""
+    if not text:
+        return ""
+    out = "Vor dieser Meldung hat der Knoten aufgeräumt (RFC-0128): " + text + "."
+    pct = metrics.read_disk_percent(DATA_DIR)
+    if pct is not None and pct >= warn:
+        try:
+            with open(SPACE_VIEW, encoding="utf-8") as f:
+                foreign = (json.load(f) or {}).get("foreign") or []
+        except (OSError, ValueError):
+            foreign = []
+        if foreign:
+            out += ("\nNoch immer über der Schwelle. Nur ein Mensch darf entfernen (fremde "
+                    "Images, Portal → Platz): "
+                    + ", ".join(f"{r['ref']} ({space.fmt_bytes(r['size'])})" for r in foreign[:5])
+                    + (" …" if len(foreign) > 5 else "") + ".")
+        else:
+            out += "\nNoch immer über der Schwelle; fremde Images gibt es keine."
+    return out
+
+
+def space_nightly_due(now=None):
+    now = now or time.time()
+    last = space.parse_iso((_space_state().get("last") or {}).get("when"))
+    run = last_backup_run() or {}
+    try:
+        with open(BACKUP_SCHEDULE_FILE, encoding="utf-8") as f:
+            sched = json.load(f) or {}
+    except (OSError, ValueError):
+        sched = {}
+    tz = host_care.local_tz()
+    hour = datetime.datetime.fromtimestamp(now, tz).hour
+    return space.due(last, now, hour, backup_on=bool(sched.get("enabled")),
+                     backup_finished=space.parse_iso(run.get("finished")),
+                     backup_running=backup_running_now())
+
+
+def space_minute():
+    """From the minute job: start the nightly run in its own process when
+    due -- `docker rmi` of many images must not hold the minute."""
+    if not space_nightly_due():
+        return False
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "node", "care", "space",
+                      "--nightly"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True,
+                     env=dict(os.environ, OAAP_DATA_DIR=DATA_DIR))
+    return True
+
+
+def space_print(rows, cache, dk, state):
+    s = space.summary(rows, cache)
+    if dk:
+        print(f"Platte: {dk['percent']:.0f} % belegt, {space.fmt_bytes(dk['free'])} frei")
+    for c in ("A", "B", "C", "D"):
+        print(f"  {c} {space.CLASS_TITLES[c]:<52} {s[c]['count']:>4}  "
+              + ("bis " if c != "A" and s[c]["count"] else "") + space.fmt_bytes(s[c]["bytes"]))
+    for r in rows:
+        if r["cls"] in ("B", "C"):
+            print(f"    {r['cls']} {r['ref']:<60} {space.fmt_bytes(r['size']):>9}  {r['why']}")
+    fr = [r for r in rows if r["cls"] == "D"]
+    if fr:
+        print("  Fremde Images -- nur einzeln: sudo oaap node care space rmi <image>")
+        for r in sorted(fr, key=lambda x: -x["size"]):
+            print(f"    D {r['ref']:<60} {space.fmt_bytes(r['size']):>9}")
+    last = state.get("last") or {}
+    if last:
+        print(f"Letzter Lauf: {last.get('when', '')[:16]} ({last.get('cause')}): {last.get('text')}")
+
+
+def space_rmi(ref, who="root", role="server_admin"):
+    """Class D, one image, by a person (D3), audited with name and size."""
+    rows, _cache, _dk, _state = space_measure()
+    ok, why = space.remove_one(ref, rows)
+    if not ok:
+        raise ValueError(why)
+    size = next((r["size"] for r in rows if r["ref"] == ref), 0)
+    if space.sh(["docker", "rmi", ref], timeout=300) is None:
+        raise ValueError(f"Docker hat {ref} abgelehnt (wird es doch benutzt?)")
+    audit_tenant("space.foreign", default_tenant_id(), ref, "ok", who=who, role=role,
+                 detail=f"fremdes Image {ref} entfernt ({space.fmt_bytes(size)})",
+                 extra={"bytes": size})
+    space_measure()
+    return f"{ref} entfernt ({space.fmt_bytes(size)})"
+
+
+def space_job(req, role, actor):
+    """One button of the page "Platz" -> (ok, German sentence). Only the
+    server_admin (from the actor's record, never the request); class D one
+    image at a time and only what the plan of NOW calls foreign (§6.3)."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    if role != "server_admin":
+        return False, "Platz gibt nur der Server-Admin frei (RFC-0128 §5)."
+    who = actor or "portal"
+    try:
+        if op == "measure":
+            rows, cache, dk, _st = space_measure()
+            s = space.summary(rows, cache)
+            return True, ("Neu gemessen: frei werden könnten bis "
+                          + space.fmt_bytes(sum(s[c]["bytes"] for c in space.AUTO_CLASSES))
+                          + " (A–C).")
+        if op == "run":
+            text, _freed, res = space_run(space.AUTO_CLASSES, who=who, role="server_admin",
+                                          cause="portal")
+            if not text:
+                return False, {"backup": "Eine Sicherung läuft gerade -- später noch einmal.",
+                               "running": "Ein anderer Lauf läuft gerade."}.get(
+                                   res.get("skipped"), "Kein Lauf.")
+            return True, text
+        if op == "rmi":
+            ref = str(a.get("ref") or "").strip()
+            if not ref or len(ref) > 300 or any(c.isspace() for c in ref):
+                return False, "Kein Image genannt."
+            return True, space_rmi(ref, who=who, role="server_admin")
+    except (ValueError, RuntimeError) as e:
+        return False, str(e)
+    return False, "Unbekannter Auftrag."
+
+
+def cmd_care_space(args, rest, root, who):
+    """`oaap node care space [--dry-run] [--class A,B,C] | rmi <image>`."""
+    if not root:
+        die("oaap node care space needs root (sudo): it reads and removes images")
+    if rest[:1] == ["rmi"]:
+        if len(rest) != 2:
+            die("usage: oaap node care space rmi <image>")
+        try:
+            print(space_rmi(rest[1], who=who))
+        except ValueError as e:
+            die(str(e))
+        return
+    if rest:
+        die("usage: oaap node care space [--dry-run] [--class A,B,C] | rmi <image>")
+    nightly = bool(getattr(args, "space_nightly", False))
+    if getattr(args, "space_dry", False):
+        try:
+            space_print(*space_measure())
+        except RuntimeError as e:
+            die(str(e))
+        print("(Probelauf -- nichts entfernt)")
+        return
+    classes = tuple(c.strip().upper() for c in (getattr(args, "space_class", "") or "A,B,C")
+                    .split(",") if c.strip())
+    bad = [c for c in classes if c not in space.AUTO_CLASSES]
+    if bad:
+        die("--class: nur A, B, C (D nur einzeln mit 'space rmi', E nie) -- nicht "
+            + ",".join(bad))
+    if nightly and not space_nightly_due():
+        return
+    text, _freed, res = space_run(classes, who="node" if nightly else who,
+                                  role="root" if nightly else "server_admin",
+                                  cause="nightly" if nightly else "hand")
+    if not text:
+        print({"backup": "Eine Sicherung läuft gerade -- kein Lauf.",
+               "running": "Ein anderer Lauf läuft gerade."}.get(res.get("skipped"), "Kein Lauf."))
+        return
+    print(text)
+
+
 def cmd_node_care(args):
     """`oaap node care [measure | sample | auto-updates on |
     reboot-window HH:MM|off | reboot at <time>|cancel | protect <inst> |
@@ -15563,11 +15882,18 @@ def cmd_node_care(args):
                 host_care.write(facts, APPS_DIR)
         # RFC-0080: conditions and the outbox, before a reboot can come.
         notify_minute(facts)
+        # RFC-0128 D1: the nightly run, in its own process.
+        try:
+            space_minute()
+        except Exception as e:                      # noqa: BLE001
+            print(f"space: {type(e).__name__}: {e}", file=sys.stderr)
         _care_reboot_if_due(facts)
         return
     if verb == "measure":
         _care_fresh(read_images=True)
         return
+    if verb == "space":
+        return cmd_care_space(args, rest, root, who)
     if verb == "advisories":
         # 2.8.2: the names are the server_admin's, on the node.
         if not root:
@@ -15729,7 +16055,8 @@ def cmd_node_care(args):
     else:
         die("usage: oaap node care [measure | sample | auto-updates on | "
             "reboot-window HH:MM|off | reboot at <time>|cancel | "
-            "protect <instance> | release <instance> | advisories [--read] | images [--read]]")
+            "protect <instance> | release <instance> | advisories [--read] | images [--read] | "
+            "space [--dry-run] [--class A,B,C] | space rmi <image>]")
     print("")
     host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
@@ -40469,6 +40796,22 @@ def cmd_process_deploys(_args):
                 audit_tenant("disk." + str(req.get("op") or "?"),
                              ensure_default_tenant(), result="denied",
                              who=actor or "portal", role=act_role or "-")
+        elif action == "space":
+            # RFC-0128 stage 2: the page "Platz". Role and actor from the
+            # ACTOR's record; a run and a removal audit themselves.
+            ok, msg = space_job(req, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("space." + str(req.get("op") or "?"),
+                             ensure_default_tenant(), result="denied",
+                             who=actor or "portal", role=act_role or "-", detail=msg)
         elif action == "fleet-disclose":
             # RFC-0087 §4: the page "Flotte". A done change audits itself
             # (node level in the fleet log, a tenant's in its own log); a
@@ -40658,7 +41001,7 @@ def cmd_process_deploys(_args):
                "envelope": "portal", "rollback": "portal",
                "artifact-remove": "portal",
                "tenant-request": "portal", "tenant-profile": "portal",
-               "disk": "portal", "egress": "portal", "fleet-disclose": "portal", "assets-set": "portal", "fleet-pair": "portal", "fleet-pair-public": "pairing", "care": "portal", "rebuild": "portal", "bulk": "portal",
+               "disk": "portal", "space": "portal", "egress": "portal", "fleet-disclose": "portal", "assets-set": "portal", "fleet-pair": "portal", "fleet-pair-public": "pairing", "care": "portal", "rebuild": "portal", "bulk": "portal",
                "tenant-request-submit": "invitation",
                "grant": "portal", "promote": "portal", "catalog-put": "portal",
                "sideload": "portal", "sideload-review": "portal"}.get(
@@ -44830,6 +45173,12 @@ def build_parser():
                     help="for care reboot at: urgency critical (overrides protections)")
     pn.add_argument("--read", dest="care_read", action="store_true",
                     help="for care advisories | images: read now, not only when due")
+    pn.add_argument("--dry-run", dest="space_dry", action="store_true",
+                    help="for care space: say what would go, remove nothing (RFC-0128)")
+    pn.add_argument("--class", dest="space_class", default="",
+                    help="for care space: the classes, default A,B,C (RFC-0128)")
+    pn.add_argument("--nightly", dest="space_nightly", action="store_true",
+                    help=argparse.SUPPRESS)
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "

@@ -49,6 +49,7 @@ import metrics_view
 import nav_view
 import gates_view
 import coupling  # noqa: E402  (RFC-0136, beside app.py in the image)
+import qr  # noqa: E402  (RFC-0136 F6: the browser link as a QR code)
 import base64
 from werkzeug.security import generate_password_hash
 import tenant_health_view as thv
@@ -16290,6 +16291,129 @@ def disks_act(verb):
     return redirect(f"/datentraeger?job={rid}")
 
 
+# ---------------------------------------------------------------------------
+# Platz -- freeing disk space (RFC-0128 stage 2, oaap.core.updates host care)
+#
+# The page reads the view the host writes (space.json) -- never Docker. A run
+# (A, B, C) and one foreign image (D) are one request each (action `space`);
+# the host re-checks the role from the actor's record and decides class D from
+# its plan of NOW, not from this page. Operator only, at the node's address.
+SPACE_VIEW_FILE = "/apps-registry/space.json"
+SPACE_OPS = ("measure", "run", "rmi")
+
+
+def _space_view():
+    try:
+        with open(SPACE_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _fmt_gb(n):
+    n = float(n or 0)
+    if n >= 1e9:
+        return f"{n / 1e9:.1f} GB".replace(".", ",")
+    if n >= 1e6:
+        return f"{n / 1e6:.0f} MB"
+    return f"{n / 1e3:.0f} KB"
+
+
+SPACE_BODY = """
+<div class="pagehead"><h1>Platz</h1></div>
+""" + BUILD_BANNER + """
+<p class="muted">Was dieser Knoten an Images angesammelt hat und wieder freigeben darf
+(RFC-0128). Nachts nach der Sicherung gibt er die Klassen A–C von selbst frei; hier
+geht es sofort. Daten (Volumes, Speicher der Instanzen, Sicherungen, Pakete) fasst
+diese Seite nie an.{% if measured %} Stand: {{ measured }}.{% endif %}</p>
+{% if not measured %}
+<div class="card"><p>Noch nicht gemessen.</p>
+<form method="post" action="/platz/measure"><button>Jetzt messen</button></form></div>
+{% else %}
+<div class="card">
+<h2>Platte</h2>
+{% if disk %}<p><b>{{ disk.percent }} %</b> belegt, {{ disk.free }} frei von {{ disk.total }}.</p>{% endif %}
+{% if last %}<p class="muted">Letzter Lauf {{ last.when }} ({{ last.cause }}): {{ last.text }}</p>{% endif %}
+</div>
+<div class="card" style="overflow-x:auto">
+<h2>Was frei werden kann</h2>
+<table><tr><th>Klasse</th><th>Anzahl</th><th>Größe</th></tr>
+{% for c in classes %}<tr><td>{{ c.key }} — {{ c.title }}</td><td>{{ c.count }}</td><td>{{ c.size }}</td></tr>{% endfor %}
+</table>
+<p class="muted">Die Größen von B–D zählen gemeinsame Schichten mehrfach: Sie sind
+eine Obergrenze. Was wirklich frei wurde, sagt die Platte vorher und nachher.
+Es bleiben je Instanz das laufende Image, der Vorgänger eines Neubaus und die vorige
+Version; ein Image ohne Instanz geht erst nach 7 Tagen.</p>
+{% if candidates %}<details><summary>{{ candidates|length }} Image(s) der Klassen B und C</summary>
+<table><tr><th>Klasse</th><th>Image</th><th>Größe</th><th>Warum</th></tr>
+{% for r in candidates %}<tr><td>{{ r.cls }}</td><td><code>{{ r.ref }}</code></td><td>{{ r.size }}</td><td>{{ r.why }}</td></tr>{% endfor %}
+</table></details>{% endif %}
+<form method="post" action="/platz/run" style="display:inline"><button>Jetzt freigeben (A–C)</button></form>
+<form method="post" action="/platz/measure" style="display:inline"><button class="secondary">Neu messen</button></form>
+</div>
+<div class="card" style="overflow-x:auto">
+<h2>Fremde Images</h2>
+<p class="muted">Images, die nicht die Plattform gebaut hat — ein Download, den nur ein
+Mensch beurteilen kann. Sie gehen nie von selbst, nur einzeln hier oder mit
+<code>sudo oaap node care space rmi &lt;image&gt;</code>. Was ein Container benutzt,
+steht hier nicht.</p>
+{% if foreign %}<table><tr><th>Image</th><th>Größe</th><th>Gebaut</th><th>Hinweis</th><th></th></tr>
+{% for r in foreign %}<tr><td><code>{{ r.ref }}</code></td><td>{{ r.size }}</td><td>{{ r.created }}</td><td class="muted">{{ r.why if r.why and r.why.startswith("Grundlage") else "" }}</td>
+<td><form method="post" action="/platz/rmi" onsubmit="return confirm('{{ r.ref }} ({{ r.size }}) wirklich entfernen? Ein neuer Download kann lange dauern.')">
+<input type="hidden" name="ref" value="{{ r.ref }}"><button class="danger">Entfernen</button></form></td></tr>{% endfor %}
+</table>{% else %}<p>Keine.</p>{% endif %}
+</div>
+{% endif %}
+"""
+
+
+@app.get("/platz")
+def space_page():
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    v = _space_view()
+    dk = v.get("disk") or {}
+    last = v.get("last") or {}
+    cls = v.get("classes") or {}
+    return page(SPACE_BODY, "Platz", "space",
+                measured=build_view._when(v.get("measured")),
+                disk={"percent": f"{dk.get('percent', 0):.0f}", "free": _fmt_gb(dk.get("free")),
+                      "total": _fmt_gb(dk.get("total"))} if dk else None,
+                last={"when": build_view._when(last.get("when")),
+                      "cause": {"nightly": "nachts", "portal": "Portal", "hand": "Kommandozeile",
+                                "pressure": "bei Druck"}.get(last.get("cause"), last.get("cause", "")),
+                      "text": last.get("text", "")} if last else None,
+                classes=[{"key": k, "title": (cls.get(k) or {}).get("title", ""),
+                          "count": (cls.get(k) or {}).get("count", 0),
+                          "size": ("bis " if k != "A" and (cls.get(k) or {}).get("count") else "")
+                          + _fmt_gb((cls.get(k) or {}).get("bytes"))} for k in "ABCD"],
+                candidates=[dict(r, size=_fmt_gb(r.get("size"))) for r in v.get("candidates") or []],
+                foreign=[dict(r, size=_fmt_gb(r.get("size"))) for r in v.get("foreign") or []],
+                job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
+                error=request.args.get("err"))
+
+
+@app.post("/platz/<op>")
+def space_act(op):
+    """One button, one request through the spool."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if op not in SPACE_OPS:
+        return redirect("/platz")
+    args = {}
+    if op == "rmi":
+        ref = (request.form.get("ref") or "").strip()
+        if not ref or ref not in {r.get("ref") for r in _space_view().get("foreign") or []}:
+            return redirect("/platz?err=" + quote("Dieses Image steht nicht in der Liste."))
+        args = {"ref": ref}
+    rid = management_api.enqueue(sc[0], sc[1], op, args, action="space")
+    return redirect(f"/platz?job={rid}")
+
+
 # --- Nachrichten (RFC-0072 stage 2, oaap.core.portal 2.15) --------------------
 #
 # Today one section, "Postausgang": which mailbox a tenant's realm sends with,
@@ -18434,6 +18558,11 @@ COUPLE_BODY = """
   <p>Diesen Link schicken; wer ihn öffnet, sieht einen Knopf, und erst der Klick erzeugt den
   Schlüssel — mit den SM59-Angaben. Eine Linkvorschau verbraucht ihn nicht.</p>
   <p><code style="word-break:break-all">{{ t.links.browser }}</code></p>
+  {% if qr_svg %}<div style="display:flex;gap:1rem;align-items:center;flex-wrap:wrap">
+  <div style="width:180px;max-width:100%" aria-label="QR-Code des Links">{{ qr_svg|safe }}</div>
+  <p class="muted" style="flex:1;min-width:12rem">Oder mit dem Telefon scannen: Der QR-Code
+  enthält nur diesen Link — er öffnet die Seite mit dem Knopf, nichts wird beim Scannen
+  eingelöst.</p></div>{% endif %}
 </div>
 <div class="card">
   <h2>Für ein Programm (Node-RED, Skript, anderer Knoten)</h2>
@@ -18603,7 +18732,15 @@ def gates_post(op):
         return redirect(f"{back}{joiner}err=" + quote(res.get("message") or "abgewiesen"), code=303)
     if op == "couple" and isinstance(res.get("detail"), dict) and res["detail"].get("id"):
         t = coupling.gate_ticket(res["detail"], code, link)
+        try:
+            # F6: the whole ticket (940 characters, 2 KB with `ca`) makes a QR
+            # code too dense to scan; the browser link (~80) does not.
+            qr_svg = qr.svg(qr.encode(t["links"]["browser"]), scale=4).replace(
+                ' width="', ' style="width:100%;height:auto" data-w="', 1)
+        except (ValueError, KeyError):
+            qr_svg = ""
         return page(COUPLE_BODY, f"Kopplung {name}", "gates", name=name, t=t, d=res["detail"],
+                    qr_svg=qr_svg,
                     line=coupling.encode(t), file=base64.b64encode(json.dumps(
                         t, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
                     q=(f"?tenant={quote(label)}" if named else ""))

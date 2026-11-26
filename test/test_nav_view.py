@@ -47,7 +47,7 @@ server_admin = {"is_user_admin": True, "can_health": True, "can_store": True,
                 "can_build": True, "has_cohorts": True}
 g = nv.nav_groups(server_admin, "health")
 ok("Serververwalter auf Einzelknoten: alles ausser Zwilling und Mandant",
-   labels(g) == ["Apps", "Instanzen", "Gesundheit", "Aufbau", "Datenträger",
+   labels(g) == ["Apps", "Instanzen", "Gesundheit", "Aufbau", "Datenträger", "Platz",
                  "Benutzer", "Zugänge", "Kohorten", "Store", "Nachrichten", "Destinationen",
                  "Tore", "Kopplungen"], labels(g))
 ok("Gruppen in fester Reihenfolge, leere fehlen nicht hier",

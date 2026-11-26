@@ -31,6 +31,7 @@ GROUPS = (
         ("fleet", "/flotte", "Flotte", "can_fleet"),
         ("build", "/aufbau", "Aufbau", "can_build"),
         ("disks", "/datentraeger", "Datenträger", "can_build"),
+        ("space", "/platz", "Platz", "can_build"),
     )),
     ("Menschen & Zugänge", (
         ("users", "/users", "Benutzer", "is_user_admin"),

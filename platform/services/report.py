@@ -25,7 +25,7 @@ REPORT_KEEP_DAYS = 366
 EVENT_PREFIXES = ("reboot.", "backup.", "node.identity", "tenant.create", "tenant.remove",
                   "tenant.rename", "tenant.adopted", "instance.rename", "instance.purge",
                   "instance.rebuild", "instance.sideload", "instance.restarted",
-                  "disk.", "rehearsal.create", "rehearsal.expire")
+                  "disk.", "rehearsal.create", "rehearsal.expire", "space.")
 
 EVENT_WORDS = {
     "reboot.planned": "Neustart geplant", "reboot.started": "Neustart",
@@ -39,6 +39,7 @@ EVENT_WORDS = {
     "instance.rebuild": "Instanz neu gebaut", "instance.sideload": "Instanz von Hand eingespielt",
     "instance.restarted": "Instanz neu gestartet", "rehearsal.create": "Generalprobe angelegt",
     "rehearsal.expire": "Generalprobe abgelaufen",
+    "space.freed": "Platz freigegeben", "space.foreign": "Fremdes Image entfernt",
 }
 
 SERIES_WORDS = {"cpu": ("CPU", "%"), "mem": ("Speicher", "%"), "disk": ("Platte", "%"),
@@ -64,10 +65,13 @@ def day_events(log_entries, start, end):
         a = str(e.get("action") or "")
         if not is_event(a):
             continue
-        out.append({"t": e.get("when"), "a": a,
-                    "s": str(e.get("subject") or "")[:80],
-                    "r": str(e.get("result") or "ok")[:20],
-                    "d": str(e.get("detail") or "")[:200]})
+        row = {"t": e.get("when"), "a": a,
+               "s": str(e.get("subject") or "")[:80],
+               "r": str(e.get("result") or "ok")[:20],
+               "d": str(e.get("detail") or "")[:200]}
+        if isinstance(e.get("bytes"), int):
+            row["b"] = e["bytes"]
+        out.append(row)
     out.sort(key=lambda x: _epoch(x["t"]) or 0)
     return out[-LEDGER_EVENTS_MAX:]
 
@@ -239,6 +243,9 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
                 foreign["names"][nm] = foreign["names"].get(nm, 0) + k
     sent = [m for m in mails if m.get("r") == "sent"]
     reboots = [e for e in events if e["a"] == "reboot.started"]
+    # RFC-0128 §4.1: the nightly runs are one line, not seven rows.
+    freed = [e for e in events if e["a"] == "space.freed"]
+    events = [e for e in events if e["a"] != "space.freed"]
     out = [f"# {title}", ""]
     if len(have) < len(week_days):
         out += [f"_Für {len(have)} von {len(week_days)} Tagen liegen Aufzeichnungen vor._", ""]
@@ -267,6 +274,9 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     if disk is not None:
         summary.append(f"Platte: {disk:.0f} % belegt"
                        + (f" ({fmt_delta(growth)} diese Woche)" if growth is not None else ""))
+    if freed:
+        summary.append(f"Platz freigegeben: {fmt_bytes(sum(e.get('b') or 0 for e in freed))} in "
+                       f"{len(freed)} " + ("Lauf" if len(freed) == 1 else "Läufen"))
     if brake:
         total = sum(b["count"] for b in brake.values())
         who = max(brake.values(), key=lambda b: b["count"])
@@ -282,7 +292,8 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
         summary.append(f"{foreign['locks']} Sperre" + ("" if foreign["locks"] == 1 else "n")
                        + " nach Anmeldeversuchen auf unbekannte Namen von " + _foreign_clients(foreign)
                        + f" (häufigster Name: {_foreign_name(_top_names(foreign, 1)[0][0])})")
-    if not events and not sent and not brake and not guarded and not exposed and not foreign["locks"]:
+    if (not events and not sent and not brake and not guarded and not exposed
+            and not foreign["locks"] and not freed):
         summary.append("Keine besonderen Ereignisse")
     out += [f"- {s}" for s in summary] + [""]
 

@@ -534,6 +534,37 @@ for svc in ("portal", "identity"):
     df = open(os.path.join(SERVICES, svc, "Dockerfile"), encoding="utf-8").read()
     ok(f"coupling.py kommt ins Abbild von {svc}", "COPY coupling.py ." in df)
 
+print("=== der QR-Code (F6) ===")
+import qr  # noqa: E402
+# Orakel aus der App wegweiser: dieselbe Matrix, die segno 1.6 für diese
+# 26-Byte-Adresse mit Maske 6 erzeugt -- der übernommene Kodierer ist derselbe.
+ORACLE = ("1fd0c7f;1053841;175c85d;174fb5d;175845d;1047541;1fd557f;000e800;13f1297;1d2be3e;"
+          "1b69b29;1f1742f;0d4d1e1;1031b12;1a4129f;15ab62d;105edf6;0015916;1fda151;1051b10;"
+          "17547f0;17536c3;174759f;10494b7;1fd7189")
+rows = [int("".join(map(str, row)), 2) for row in qr.encode("https://go.joomp.de/r/ab12", mask=6)]
+ok("qr.py: Matrix Bit für Bit wie segno (unabhängiges Orakel)",
+   rows == [int(h, 16) for h in ORACLE.split(";")])
+link_ = t_["links"]["browser"]
+mq = qr.encode(link_)
+ok(f"der Browser-Link ({len(link_)} Zeichen) passt in Version {(len(mq) - 17) // 4} "
+   f"({len(mq)} Module) -- gut zu scannen",
+   len(link_) < 120 and len(mq) <= 37, (len(link_), len(mq)))
+try:
+    qr.encode(cp.encode(t_))
+    ok("das ganze Ticket (mit ca) ist zu groß für einen QR-Code -- deshalb nur der Link", False)
+except ValueError:
+    ok("das ganze Ticket (mit ca) ist zu groß für einen QR-Code -- deshalb nur der Link", True)
+svg_ = qr.svg(mq, scale=4)
+ch2 = tpl("COUPLE_BODY").render(name="sap-support", t=t_, d=d_, line=cp.encode(t_), q="",
+                                file="", qr_svg=svg_)
+ok("die Ticketseite zeigt den QR-Code beim Link für den Menschen, mit dem Satz, dass Scannen "
+   "nichts einlöst", "<svg" in ch2 and "nichts wird beim Scannen" in ch2
+   and ch2.index("<svg") > ch2.index("Für einen Menschen") and ch2.index("<svg") < ch2.index("Für ein Programm"))
+ok("ohne QR (Fehler beim Kodieren): die Seite bleibt, ohne Bild", "<svg" not in ch)
+ok("das Portal kodiert den Browser-Link, nicht das Ticket, und qr.py kommt ins Abbild",
+   'qr.encode(t["links"]["browser"])' in src and "qr_svg=qr_svg" in src
+   and "COPY qr.py ." in open(os.path.join(PORTAL, "Dockerfile"), encoding="utf-8").read())
+
 print("")
 print("ALL PASS" if not fails else f"{fails} FAILURES")
 sys.exit(1 if fails else 0)

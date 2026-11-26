@@ -818,3 +818,27 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" rehearsal-index   2>
 # updates is TOLD so in the status, not changed (2.6.3).
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" node care measure 2>&1 | sed 's/^/  /' \
   || say "  WARNING: the care state could not be measured — run 'sudo oaap node care'."
+
+# --- journald capped at 2 GB (RFC-0128 D4) ---
+# Container logs are capped per container (CONTAINER_LOG_OPTS); the host's
+# journal was not: 1.3 GB on oaap-demo (2026-11-24) and growing. 2 GB, not
+# the recommended 1 GB -- Jörg's word: more history for finding faults. A
+# drop-in of our own, so an operator's journald.conf stays theirs; written
+# only when it differs, so an update that changes nothing restarts nothing.
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd ]; then
+  JD_FILE=/etc/systemd/journald.conf.d/oaap.conf
+  JD_WANT="# Written by OAAP (RFC-0128 D4): the journal keeps at most 2 GB.
+[Journal]
+SystemMaxUse=2G"
+  if [ "$(cat "$JD_FILE" 2>/dev/null)" != "$JD_WANT" ]; then
+    mkdir -p /etc/systemd/journald.conf.d
+    printf '%s\n' "$JD_WANT" > "$JD_FILE"
+    if systemctl restart systemd-journald >/dev/null 2>&1; then
+      journalctl --vacuum-size=2G >/dev/null 2>&1 || true
+      say ""
+      say "The host's journal is capped at 2 GB (RFC-0128)."
+    else
+      say "  WARNING: journald could not be restarted -- the cap applies after the next reboot."
+    fi
+  fi
+fi
