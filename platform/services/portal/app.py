@@ -48,6 +48,8 @@ import twin_view
 import metrics_view
 import nav_view
 import gates_view
+import coupling  # noqa: E402  (RFC-0136, beside app.py in the image)
+import base64
 from werkzeug.security import generate_password_hash
 import tenant_health_view as thv
 import traffic  # noqa: E402  (the hour per host, for the tenant health page)
@@ -18175,7 +18177,7 @@ def tenant_egress_act(op):
 GATES_FILE = "/apps-registry/gates.json"
 GATE_STATS_FILE = "/apps-registry/gate-stats.json"   # stage 2b, the node counts
 GATE_WAIT_SECONDS = 60
-GATE_OPS = ("process", "add", "fields", "access", "revoke", "remove")
+GATE_OPS = ("process", "add", "fields", "access", "couple", "withdraw", "revoke", "remove")
 _GATE_NAME = _re.compile(r"^[a-z][a-z0-9-]{1,39}$")
 
 
@@ -18188,6 +18190,17 @@ def _gates_doc():
     return doc if isinstance(doc, dict) else {"gates": {}, "processes": {}}
 
 
+def identity_couplings():
+    """The coupling tickets this caller may see (RFC-0136 §5) -- identity
+    decides, as for the keys."""
+    try:
+        r = INTERNAL.get(f"{IDENTITY}/internal/couplings",
+                         params={"actor": caller_name()}, timeout=5)
+        return (r.json() or {}).get("couplings", []) if r.status_code == 200 else []
+    except Exception:
+        return []
+
+
 def _gates_view(tid, label):
     try:
         with open(GATE_STATS_FILE, encoding="utf-8") as f:
@@ -18197,7 +18210,8 @@ def _gates_view(tid, label):
     return gates_view.tenant_view(
         _gates_doc(), tid, load_instances(), identity_keys(), resolve_tenant,
         lambda n: _place_url(label, f"/gate/{n}") if label else
-        (f"https://{external_host()}/gate/{n}" if external_host() else ""), stats=stats)
+        (f"https://{external_host()}/gate/{n}" if external_host() else ""), stats=stats,
+        couplings=identity_couplings())
 
 
 GATES_BODY = """
@@ -18254,12 +18268,32 @@ In SAP ist das eine Destination in SM59; der Verbindungstest ist der Ping.</p>
       {% endfor %}
     </table>
     {% else %}<p class="muted">Noch kein Zugang — ohne Zugang kommt niemand durch.</p>{% endif %}
-    <form method="post" action="/tore/access{{ q }}" class="row">
+    {% if g.pending %}
+    <table>
+      <tr><th>Wartet auf Einlösung</th><th>Kopplung</th><th>Einlösbar bis</th><th>von</th><th></th></tr>
+      {% for c in g.pending %}
+      <tr><td>{{ c.label }}</td><td><code>{{ c.id }}</code></td><td>{{ c.until }}</td>
+        <td class="muted">{{ c.issuer }}</td>
+        <td><form method="post" action="/tore/withdraw{{ q }}" style="display:inline">
+          <input type="hidden" name="name" value="{{ g.name }}">
+          <input type="hidden" name="coupling" value="{{ c.id }}">
+          <button class="rowaction">Zurückziehen</button></form></td></tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+    <form method="post" action="/tore/couple{{ q }}" class="row">
       <input type="hidden" name="name" value="{{ g.name }}">
       <label>Absender <input name="label" required maxlength="80" placeholder="SAP A4H 001"></label>
       <label>Gültig (Tage) <input name="days" type="number" min="1" max="365" value="90" style="width:6rem"></label>
-      <button>Zugang ausstellen</button>
+      <label>Einlösbar <select name="window">{% for k, w in windows %}
+        <option value="{{ k }}">{{ w }}</option>{% endfor %}</select></label>
+      <button>Kopplung erzeugen</button>
+      <button formaction="/tore/access{{ q }}" class="secondary">Schlüssel sofort zeigen</button>
     </form>
+    <p class="muted">Eine <strong>Kopplung</strong> trägt keinen Schlüssel, sondern einen Code,
+    der einmal und nur im gewählten Fenster eingelöst werden kann — erst dann entsteht der
+    Schlüssel (RFC-0136). „Schlüssel sofort zeigen“ ist der alte Weg für den, der selbst an
+    SM59 sitzt.</p>
     <details><summary class="muted">Felder bearbeiten</summary>
       <form method="post" action="/tore/fields{{ q }}">
         <input type="hidden" name="name" value="{{ g.name }}">
@@ -18377,13 +18411,121 @@ GATE_KEY_BODY = """
 <a class="btn" href="/tore{{ q }}">Fertig</a>
 """
 
+# RFC-0136: the ticket, rendered directly like GATE_KEY_BODY -- it carries
+# the redemption code, so it is in no URL, no log, and a reload does not
+# show it again.
+COUPLE_BODY = """
+<a class="back" href="/tore{{ q }}">← Zurück zu den Toren</a>
+<h1>Kopplung „{{ d.label }}“ zum Tor {{ name }}</h1>
+<div class="card">
+  <p><strong>Einlösbar bis {{ d.until.replace("T", " ")[:16] }} UTC, genau einmal.</strong>
+  Der Schlüssel entsteht erst beim Einlösen und gilt dann {{ d.key_days }} Tage.
+  Diese Seite zeigt das Ticket nur jetzt.</p>
+  <p>Das Ticket (eine Zeile; ein Zeilenumbruch beim Kopieren schadet nicht):</p>
+  <textarea readonly rows="5" style="width:100%;font-family:monospace;font-size:.85rem"
+    onfocus="this.select()">{{ line }}</textarea>
+  <p><a class="btn" download="kopplung-{{ name }}-{{ d.id }}.json"
+        href="data:application/json;charset=utf-8;base64,{{ file }}">Als Datei herunterladen</a></p>
+  <p class="muted">Kopplung <code>{{ d.id }}</code> · Prinzipal <code>{{ d.principal }}</code> —
+  der Zugang steht als „wartet auf Einlösung“ beim Tor, bis jemand einlöst.</p>
+</div>
+<div class="card">
+  <h2>Für einen Menschen (SAP SM59)</h2>
+  <p>Diesen Link schicken; wer ihn öffnet, sieht einen Knopf, und erst der Klick erzeugt den
+  Schlüssel — mit den SM59-Angaben. Eine Linkvorschau verbraucht ihn nicht.</p>
+  <p><code style="word-break:break-all">{{ t.links.browser }}</code></p>
+</div>
+<div class="card">
+  <h2>Für ein Programm (Node-RED, Skript, anderer Knoten)</h2>
+  <p>Ein <code>POST</code> mit dem Code löst ein und bekommt den Schlüssel als JSON:</p>
+  <pre style="white-space:pre-wrap;word-break:break-all">curl {% if t.pin %}--pinnedpubkey '{{ t.pin }}' -k {% endif %}-H 'Content-Type: application/json' \\
+  -d '{"code":"{{ t.code }}"}' {{ t.redeem }}</pre>
+  {% if t.pin %}<p class="muted">Diese Adresse hat kein öffentlich vertrautes Zertifikat. Das Ticket
+  trägt deshalb den Fingerabdruck (<code>pin</code>, für curl) und das Zertifikat (<code>ca</code>,
+  für Node-RED: TLS-Konfiguration „CA-Zertifikat“, für SAP: STRUST).</p>{% endif %}
+  <p class="muted">Node-RED kann seine eigenen Zugangsdaten nicht selbst speichern: Der Fluss behält
+  den Schlüssel in einem Kontextspeicher — oder ein Mensch löst über den Link ein und trägt ihn im
+  Knoten „http request“ ein.</p>
+</div>
+<a class="btn" href="/tore{{ q }}">Fertig</a> <a href="/kopplungen{{ q }}">Alle Kopplungen</a>
+"""
+
+COUPLINGS_BODY = """
+<div class="pagehead">
+  <h1>Kopplungen{% if label %} · {{ label }}{% endif %}</h1>
+</div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+<p class="muted">Eine <strong>Kopplung</strong> übergibt einen Schlüssel, ohne ihn zu zeigen: ein
+Ticket mit einem Code, der einmal und nur in seinem Fenster eingelöst werden kann. Erst das
+Einlösen erzeugt den Schlüssel. Erzeugt werden sie auf der Seite <a href="/tore{{ q }}">Tore</a>.</p>
+<div class="card">
+  <h2>Offen</h2>
+  {% if v.open %}
+  <table>
+    <tr><th>Art</th><th>Tor</th><th>Absender</th><th>Kopplung</th><th>Einlösbar bis</th><th>von</th><th></th></tr>
+    {% for c in v.open %}
+    <tr><td>{{ c.kind_title }}</td><td><code>{{ c.gate }}</code></td><td>{{ c.label }}</td>
+      <td><code>{{ c.id }}</code></td><td>{{ c.until }}</td><td class="muted">{{ c.issuer }}</td>
+      <td><form method="post" action="/tore/withdraw{{ q }}" style="display:inline">
+        <input type="hidden" name="name" value="{{ c.gate }}">
+        <input type="hidden" name="coupling" value="{{ c.id }}">
+        <input type="hidden" name="back" value="kopplungen">
+        <button class="rowaction">Zurückziehen</button></form></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Keine offene Kopplung.</p>{% endif %}
+</div>
+<div class="card">
+  <h2>Eingelöst</h2>
+  {% if v.redeemed %}
+  <table>
+    <tr><th>Tor</th><th>Absender</th><th>Kopplung</th><th>Eingelöst</th><th>von Adresse</th><th>Weg</th><th>Schlüssel</th></tr>
+    {% for c in v.redeemed %}
+    <tr><td><code>{{ c.gate }}</code></td><td>{{ c.label }}</td><td><code>{{ c.id }}</code></td>
+      <td>{{ c.redeemed }}</td><td class="muted">{{ c.redeemed_from }}</td><td>{{ c.via_title }}</td>
+      <td><a href="/tore{{ q }}"><code>{{ c.key_id }}</code></a></td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Noch keine.</p>{% endif %}
+</div>
+<div class="card">
+  <h2>Abgelaufen oder zurückgezogen <span class="muted" style="font-weight:normal">(30 Tage)</span></h2>
+  {% if v.ended %}
+  <table>
+    <tr><th>Tor</th><th>Absender</th><th>Kopplung</th><th>Zustand</th><th>seit</th><th>von</th></tr>
+    {% for c in v.ended %}
+    <tr><td><code>{{ c.gate }}</code></td><td>{{ c.label }}</td><td><code>{{ c.id }}</code></td>
+      <td>{{ c.state_title }}</td><td>{{ c.ended }}</td><td class="muted">{{ c.issuer }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">Keine.</p>{% endif %}
+</div>
+"""
+
+
+@app.get("/kopplungen")
+def couplings_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    named = role == "server_admin" and tid != default_tenant_id()
+    return page(COUPLINGS_BODY, "Kopplungen", "couplings",
+                v=gates_view.coupling_view(identity_couplings(), tid),
+                label=(label if tid != default_tenant_id() else ""),
+                q=(f"?tenant={quote(label)}" if named else ""),
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
 
 def _gates_render(tid, label, role, msg=None, error=None):
     named = role == "server_admin" and tid != default_tenant_id()
     return page(GATES_BODY, "Tore", "gates", v=_gates_view(tid, label),
                 label=(label if tid != default_tenant_id() else ""),
                 kinds=dict(gates_view.CASE_KINDS), field_types=gates_view.FIELD_TYPES,
-                field_targets=gates_view.FIELD_TARGETS,
+                field_targets=gates_view.FIELD_TARGETS, windows=coupling.WINDOW_CHOICES,
                 q=(f"?tenant={quote(label)}" if named else ""), msg=msg, error=error)
 
 
@@ -18411,7 +18553,8 @@ def gates_post(op):
     if tid is None:
         return role
     named = role == "server_admin" and tid != default_tenant_id()
-    back = "/tore" + (f"?tenant={quote(label)}" if named else "")
+    back = ("/kopplungen" if request.form.get("back") == "kopplungen" else "/tore") + (
+        f"?tenant={quote(label)}" if named else "")
     joiner = "&" if "?" in back else "?"
     if op not in GATE_OPS:
         return redirect(back, code=303)
@@ -18421,7 +18564,8 @@ def gates_post(op):
             "Name: 2–40 Zeichen, a–z, 0–9 und Bindestrich, am Anfang ein Buchstabe."), code=303)
     args = {"tenant": tid, "name": name}
     for k, mx in (("queue", 40), ("kind", 12), ("instance", 80), ("label", 80),
-                  ("process", 40), ("user", 40), ("access", 60), ("days", 4)):
+                  ("process", 40), ("user", 40), ("access", 60), ("days", 4),
+                  ("window", 6), ("coupling", 8)):
         v = (request.form.get(k) or "").strip()[:mx]
         if v:
             args[k] = v
@@ -18435,7 +18579,15 @@ def gates_post(op):
         if not request.form.get("confirm"):
             return redirect(f"{back}{joiner}err=" + quote("Bitte „wirklich“ ankreuzen."), code=303)
         args["yes"] = True
-    secret = None
+    secret = code = link = None
+    if op == "couple":
+        if not args.get("label"):
+            return redirect(f"{back}{joiner}err=" + quote(
+                "Wer sendet durch diesen Zugang? z. B. „SAP A4H 001“."), code=303)
+        # RFC-0136: code and link are made here and go into the ticket; the
+        # host and identity get only their SHA-256.
+        code, link = coupling.new_code(), coupling.new_link()
+        args["code_hash"], args["link_hash"] = coupling.digest(code), coupling.digest(link)
     if op == "access":
         if not args.get("label"):
             return redirect(f"{back}{joiner}err=" + quote(
@@ -18449,6 +18601,12 @@ def gates_post(op):
             "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
     if not res.get("ok"):
         return redirect(f"{back}{joiner}err=" + quote(res.get("message") or "abgewiesen"), code=303)
+    if op == "couple" and isinstance(res.get("detail"), dict) and res["detail"].get("id"):
+        t = coupling.gate_ticket(res["detail"], code, link)
+        return page(COUPLE_BODY, f"Kopplung {name}", "gates", name=name, t=t, d=res["detail"],
+                    line=coupling.encode(t), file=base64.b64encode(json.dumps(
+                        t, ensure_ascii=False, indent=2).encode("utf-8")).decode("ascii"),
+                    q=(f"?tenant={quote(label)}" if named else ""))
     if op == "access" and isinstance(res.get("detail"), dict) and res["detail"].get("id"):
         d = res["detail"]
         return page(GATE_KEY_BODY, f"Zugang {name}", "gates", name=name, d=d,

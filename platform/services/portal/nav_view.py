@@ -49,6 +49,7 @@ GROUPS = (
         ("messages", "/nachrichten", "Nachrichten", "is_user_admin"),
         ("destinations", "/destinationen", "Destinationen", "is_user_admin"),
         ("gates", "/tore", "Tore", "is_user_admin"),
+        ("couplings", "/kopplungen", "Kopplungen", "is_user_admin"),
     )),
 )
 

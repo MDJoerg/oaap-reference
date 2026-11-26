@@ -154,6 +154,7 @@ import fleet_pair  # noqa: E402  (RFC-0085 stage 3)
 # RFC-0135: gates -- field list, templates, the check; shared with identity
 import gates  # noqa: E402
 import gate_stats  # noqa: E402
+import coupling  # noqa: E402  (RFC-0136)
 # The broker's certificate (RFC-0054 stage 3): copied from the gateway or
 # issued by this node's own CA; the acting is cmd_broker.
 import broker_certs  # noqa: E402
@@ -30047,7 +30048,8 @@ def gate_site_lines(tid, insts=None, doc=None):
     if not mine:
         return []
     insts = _cases_registry() if insts is None else insts
-    out = [f"\t# gates of tenant {tid} (RFC-0135)", "\thandle /gate/* {"]
+    out = couple_site_lines(tid)
+    out += [f"\t# gates of tenant {tid} (RFC-0135)", "\thandle /gate/* {"]
     out += [f"\t\trequest_header -{h}" for h in GATE_HEADERS]
     out += strip_identity()
     out += ["\t\trequest_body {", f"\t\t\tmax_size {gates.BODY_MAX_KB}KB", "\t\t}"]
@@ -30097,6 +30099,34 @@ def gate_site_lines(tid, insts=None, doc=None):
         out += door(f"@gatedoor{idx}", tkey, n)
     out += door("", "")
     out.append("\t}")
+    return out
+
+
+COUPLE_HEADERS = ("X-OAAP-Couple-Tenant", "X-OAAP-Client")
+
+
+def couple_site_lines(tid):
+    """The redemption door of RFC-0136 on the tenant's place:
+    /platform/couple/redeem and the browser links /platform/couple/<uuid>
+    go to identity, which knows the tenant from a header only this block
+    sets. No login -- the code is the proof; identity counts failures per
+    client address, which the gateway vouches for (X-OAAP-Client, as the
+    guard). Stage 1: only where the tenant has a gate."""
+    edge = load_external_conf()[1]
+    client = ("{http.request.header.X-Forwarded-For}" if edge
+              else "{http.request.remote.host}")
+    out = [f"\t# coupling door of tenant {tid} (RFC-0136)", "\thandle /platform/couple/* {"]
+    out += [f"\t\trequest_header -{h}" for h in COUPLE_HEADERS]
+    out += strip_identity()
+    # `route`: in a bare handle Caddy sorts by its own directive order, and
+    # rewrite runs before uri -- identity got /couple-door/platform/couple/...
+    # (measured on oaap-test 2026-11-26: a 404 from Flask)
+    out += ["\t\trequest_body {", "\t\t\tmax_size 4KB", "\t\t}", "\t\troute {",
+            "\t\t\turi strip_prefix /platform/couple", "\t\t\trewrite * /couple-door{uri}",
+            "\t\t\treverse_proxy identity:8000 {",
+            f"\t\t\t\theader_up X-OAAP-Couple-Tenant {tid}",
+            f"\t\t\t\theader_up X-OAAP-Client {client}",
+            "\t\t\t}", "\t\t}", "\t}"]
     return out
 
 
@@ -30354,6 +30384,55 @@ def cmd_gate(args):
         print("  Connection test = the ping (GET).")
         return
 
+    if act == "couple":
+        # RFC-0136 stage 1: a ticket instead of a shown key. The CLI makes
+        # code and link itself; the portal makes them and sends their hashes.
+        code_hash = getattr(args, "code_hash", None)
+        link_hash = getattr(args, "link_hash", None)
+        code = link = None
+        if not code_hash:
+            code, link = coupling.new_code(), coupling.new_link()
+            code_hash, link_hash = coupling.digest(code), coupling.digest(link)
+        days = args.days if args.days else GATE_ACCESS_DAYS
+        d = gate_couple(tid, name, args.label, days, args.window or None, who,
+                        code_hash, link_hash)
+        if code is None:
+            # the portal builds the ticket with the code it made (gate_job)
+            print("coupling-detail: " + json.dumps(d, ensure_ascii=False))
+            return
+        t = coupling.gate_ticket(d, code, link)
+        print("")
+        print(f"Coupling for access '{d['label']}' to gate '{name}' ({label}): ticket {d['id']}, "
+              f"redeemable until {d['until']} (once), key valid {d['key_days']} days from then.")
+        print("")
+        print(coupling.encode(t))
+        print("")
+        print(f"A program redeems:  POST {d['redeem']}  {{\"code\": \"{code}\"}}")
+        print(f"A person opens:     {t['links']['browser']}")
+        if t.get("pin"):
+            print(f"The address is not publicly trusted -- the ticket carries pin and ca "
+                  f"(curl --pinnedpubkey '{t['pin']}' -k ...).")
+        print("Nothing in it is the key: the key is made at redemption.")
+        return
+
+    if act == "withdraw":
+        cid = (args.coupling or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{8}", cid):
+            die("--coupling ID is required (oaap gate show ..., the page Kopplungen)")
+        out = _identity_exec(
+            "import json, os, app as m\n"
+            "a = json.loads(os.environ['OAAP_C_ARGS'])\n"
+            "print(json.dumps({'error': m.coupling_withdraw(a['tenant'], a['id'], a['who'])}))\n",
+            {"OAAP_C_ARGS": json.dumps({"tenant": tid, "id": cid, "who": who})})
+        try:
+            err = json.loads(out.strip().splitlines()[-1])["error"]
+        except (ValueError, IndexError, KeyError):
+            die("the identity container did not answer")
+        if err:
+            die(err)
+        print(f"Coupling {cid} at gate '{name}' withdrawn; it can no longer be redeemed.")
+        return
+
     if act == "revoke":
         principal = (args.access or "").strip()
         if not principal:
@@ -30445,7 +30524,89 @@ def gate_issue_access(tid, name, label, days, who, secret_hash=None):
     return res
 
 
-GATE_ADMIN_OPS = ("process", "add", "fields", "access", "revoke", "remove")
+def couple_trust(host):
+    """What a ticket says about the certificate (RFC-0136 §2, D8, F1):
+    nothing when `host` presents a publicly trusted certificate, else pin
+    and ca of the certificate it presents. Asked by name first, then (not
+    behind an edge) at this node itself -- a node that cannot reach its own
+    name still knows what it serves. Unreachable: nothing (the normal chain)."""
+    import socket
+    import ssl
+    if not host:
+        return {}
+
+    def hello(addr, verify):
+        ctx = ssl.create_default_context()
+        if not verify:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((addr, 443), timeout=4) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as s:
+                return s.getpeercert(binary_form=True)
+
+    for addr in [host] + ([] if load_external_conf()[1] else ["127.0.0.1"]):
+        try:
+            hello(addr, True)
+            return {}
+        except ssl.SSLCertVerificationError:
+            try:
+                return coupling.trust_of(hello(addr, False), False)
+            except (OSError, ssl.SSLError, ValueError, IndexError):
+                return {}
+        except (OSError, ssl.SSLError):
+            continue
+    return {}
+
+
+def gate_couple(tid, name, label, days, window, who, code_hash, link_hash):
+    """A coupling ticket for one access to a gate (RFC-0136 stage 1) ->
+    what the ticket needs besides code and link. identity makes the inactive
+    principal and keeps the ticket with the hashes; audited there
+    (`coupling.issue`)."""
+    label = str(label or "").strip()[:80]
+    if not label:
+        die("--label is required: who sends through this access, e.g. 'SAP A4H 001'")
+    try:
+        window = coupling.window_minutes(window)
+    except ValueError as e:
+        die(f"--{e}")
+    url = gate_url(tid, name)
+    if not url:
+        die("this tenant has no external address -- a coupling is redeemed there "
+            "(oaap external, or the tenant's domain)")
+    origin = url.split("/gate/")[0]
+    trust = couple_trust(origin[len("https://"):])
+    gate = load_gates()["gates"].get(gates.gate_key(tid, name)) or {}
+    out = _identity_exec(
+        "import json, os, app as m\n"
+        "a = json.loads(os.environ['OAAP_C_ARGS'])\n"
+        "try:\n"
+        "    rec = m.coupling_create(a['tenant'], a['gate'], a['address'], a['user'], a['label'],\n"
+        "                            a['days'], a['window'], a['who'], a['code'], a['link'],\n"
+        "                            a['trust'])\n"
+        "    print(json.dumps({'rec': rec}))\n"
+        "except ValueError as e:\n"
+        "    print(json.dumps({'error': str(e)}))\n",
+        {"OAAP_C_ARGS": json.dumps({"tenant": tid, "gate": name, "address": url,
+                                    "user": gate.get("user") or name, "label": label,
+                                    "days": days, "window": window, "who": who or "root",
+                                    "code": code_hash, "link": link_hash, "trust": trust})})
+    try:
+        res = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        die("the identity container did not issue the coupling")
+    if res.get("error"):
+        die(res["error"])
+    rec = res["rec"]
+    return {"id": rec["id"], "principal": rec["principal"], "label": rec["label"],
+            "address": url, "user": rec["user"], "until": rec["until"],
+            "key_days": rec["key_days"], "issued": rec["issued"], "issuer": rec["issuer"],
+            "redeem": origin + "/platform/couple/redeem",
+            "browser": origin + "/platform/couple/", **trust}
+
+
+GATE_ADMIN_OPS = ("process", "add", "fields", "access", "couple", "withdraw", "revoke",
+                  "remove")
 
 # Stage 2b: the page is German, the command line English. ONE table turns
 # what cmd_gate, gates.check_fields and acting_tenant say into the page's
@@ -30465,6 +30626,24 @@ _GATE_DE = [
     (r"no gate '([^']*)' in", lambda m: f"Kein Tor „{m.group(1)}“ in diesem Mandanten."),
     (r"--label is required", lambda m: "Wer sendet durch diesen Zugang? z. B. „SAP A4H 001“."),
     (r"--access PRINCIPAL", lambda m: "Welcher Zugang? Der Prinzipal fehlt."),
+    (r"--coupling ID", lambda m: "Welche Kopplung? Die Kennung fehlt."),
+    (r"gate: not a gate name", lambda m: "Name: kein Name eines Tors."),
+    (r"--window: minutes, a number", lambda m: "Fenster: eine Zahl von Minuten."),
+    (r"--window: 1 to", lambda m: "Fenster: 1 Minute bis 7 Tage."),
+    (r"this tenant has no external address",
+     lambda m: "Dieser Mandant hat keine Adresse von außen — eine Kopplung wird dort eingelöst."),
+    (r"no coupling '([^']*)' in this tenant",
+     lambda m: f"Keine Kopplung „{m.group(1)}“ in diesem Mandanten."),
+    (r"coupling '([^']*)' is not open \((\w+)\)",
+     lambda m: f"Die Kopplung „{m.group(1)}“ ist nicht mehr offen "
+               f"({coupling.STATE_TITLES.get(m.group(2), m.group(2))})."),
+    (r"this code was used before", lambda m: "Dieser Code war schon vergeben — bitte neu erzeugen."),
+    (r"code and link arrive as SHA-256",
+     lambda m: "Das Portal schickt die Hashes von Code und Link."),
+    (r"key validity: 1 to (\d+) days",
+     lambda m: f"Gültigkeit des Schlüssels: 1 bis {m.group(1)} Tage."),
+    (r"the identity container did not (issue the coupling|answer)",
+     lambda m: "identity hat die Kopplung nicht angelegt."),
     (r"no access '([^']*)' at gate '([^']*)'",
      lambda m: f"Kein Zugang „{m.group(1)}“ am Tor „{m.group(2)}“."),
     (r"removing gate", lambda m: "Bitte „wirklich“ ankreuzen — alle Zugänge werden entzogen."),
@@ -30544,6 +30723,8 @@ def _gate_done_de(op, tid, name, said):
                 "Die Vorlagen folgen sofort.")
     if op == "revoke":
         return f"Zugang entzogen: {n} Schlüssel gesperrt, der Prinzipal ist abgeschaltet."
+    if op == "withdraw":
+        return "Kopplung zurückgezogen — sie lässt sich nicht mehr einlösen."
     if op == "remove":
         return f"Tor „{name}“ entfernt; {n} Schlüssel gesperrt."
     return "Gespeichert."
@@ -30577,7 +30758,8 @@ def gate_job(req, actor):
                             instance=txt("instance", 80), label=txt("label", 80),
                             process=txt("process", 40), user=txt("user", 40), fields=None,
                             days=None, access=txt("access", 60), yes=bool(a.get("yes")),
-                            secret_hash=None, fields_doc=None)
+                            secret_hash=None, fields_doc=None, window=None,
+                            coupling=txt("coupling", 8), code_hash=None, link_hash=None)
     if op == "fields":
         # the field editor: the gate keeps its process and user (cmd_gate add)
         g = load_gates()["gates"].get(gates.gate_key(tid, ns.name)) \
@@ -30588,6 +30770,25 @@ def gate_job(req, actor):
             return False, "Felder: nicht lesbar.", None
         ns.action, ns.process, ns.user = "add", g.get("process"), g.get("user") or ns.name
         ns.fields_doc = a["fields"]
+    if op == "couple":
+        # RFC-0136: the portal made code and link and sends their hashes
+        ch, lh = str(a.get("code_hash") or ""), str(a.get("link_hash") or "")
+        if not (coupling.HASH_RE.match(ch) and coupling.HASH_RE.match(lh)):
+            return False, "Das Portal schickt die Hashes von Code und Link.", None
+        try:
+            ns.days = int(a.get("days") or GATE_ACCESS_DAYS)
+            ns.window = int(a.get("window") or coupling.WINDOW_DEFAULT_MIN)
+        except (TypeError, ValueError):
+            return False, "Gültigkeit und Fenster: Zahlen.", None
+        ns.code_hash, ns.link_hash = ch, lh
+        ok_, said = _run_captured(cmd_gate, ns)
+        if not ok_:
+            return False, gate_refusal_de(said), None
+        lines = [ln for ln in said.splitlines() if ln.startswith("coupling-detail: ")]
+        if not lines:
+            return False, "identity hat die Kopplung nicht angelegt.", None
+        d = json.loads(lines[-1][len("coupling-detail: "):])
+        return True, f"Kopplung für „{d['label']}“ erzeugt.", d
     if op == "access":
         h = str(a.get("hash") or "")
         if not h:
@@ -44341,7 +44542,7 @@ def build_parser():
     pg = sub.add_parser("gate", help="gates -- the way in for other systems "
                         "(RFC-0135): gates, processes, accesses")
     pg.add_argument("action", choices=["list", "show", "add", "remove", "process",
-                                       "access", "revoke"])
+                                       "access", "couple", "withdraw", "revoke"])
     pg.add_argument("name", nargs="?", help="the gate (or, for 'process', the process)")
     pg.add_argument("--tenant", default="", help="tenant label or id")
     pg.add_argument("--process", default="", help="add: the process this gate starts")
@@ -44362,6 +44563,10 @@ def build_parser():
     pg.add_argument("--days", type=int, default=0,
                     help=f"access: validity of the key in days (default {90})")
     pg.add_argument("--access", default="", help="revoke: the access's principal")
+    pg.add_argument("--window", type=int, default=0,
+                    help="couple: how long the ticket can be redeemed, in minutes "
+                         f"(default {coupling.WINDOW_DEFAULT_MIN}, at most 7 days)")
+    pg.add_argument("--coupling", default="", help="withdraw: the ticket's id")
     pg.add_argument("--yes", action="store_true", help="remove: really")
     pg.set_defaults(fn=cmd_gate)
     pk = sub.add_parser("key", help="API keys (RFC-0027) -- issue, list, revoke")

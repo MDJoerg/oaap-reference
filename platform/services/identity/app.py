@@ -62,6 +62,9 @@ import act  # noqa: E402
 # RFC-0135: gates -- the field list, the templates and the ping, shared
 # with appctl (and copied into the `vorgaenge` app, which checks deliveries).
 import gates  # noqa: E402
+# RFC-0136: coupling tickets -- the ticket form and the states, shared with
+# appctl and the portal.
+import coupling  # noqa: E402
 
 # The mount inside the container. Overridable only so that a test can
 # drive this service without inventing a /data on the developer's
@@ -2448,6 +2451,284 @@ def gate_door(name, rest=""):
         return resp
     return _gate_answer(503, f"Tor {gate['name']}: kein Ziel erreichbar "
                              "(Prozess fehlt oder seine Instanz)")
+
+
+# ------------------------------------------------------------ couplings
+# RFC-0136 stage 1: a gate access is handed over as a TICKET with a one-time
+# redemption code, not as a shown key. The ticket record lives here, beside
+# the keys; it keeps only the SHA-256 of the code and of the browser link.
+# The principal is made with the ticket, INACTIVE ("wartet auf Einlösung",
+# D4); the key is born at redemption -- before, there is nothing to steal.
+# Everything that changes a ticket runs under the user store's lock, so a
+# redemption is one step: two calls with one code, one of them gets 410.
+COUPLINGS_FILE = os.path.join(DATA_DIR, "couplings.json")
+# set by the gateway on the couple door only, after stripping what a client sent
+COUPLE_TENANT_HEADER = "X-OAAP-Couple-Tenant"
+
+
+def load_couplings():
+    recs = _load(COUPLINGS_FILE, [])
+    return recs if isinstance(recs, list) else []
+
+
+def _gate_principal_name(users, gate):
+    n = 1
+    while find_user(users, f"gate-{gate}-{n}"[:40]):
+        n += 1
+    return f"gate-{gate}-{n}"[:40]
+
+
+def coupling_create(tid, gate, address, user, label, key_days, window_min, issuer,
+                    code_hash, link_hash, trust=None):
+    """A ticket for one access to a gate -> its public record. The caller
+    (appctl, for the CLI or the portal) made code and link and hands over
+    only their hashes; `trust` is what the ticket says about the certificate
+    (pin, ca) -- kept so the browser page and the list can show it."""
+    if not gates.NAME_RE.match(gate or ""):
+        raise ValueError("gate: not a gate name")
+    if gates.gate_key(tid, gate) not in load_gates()["gates"]:
+        raise ValueError(f"no gate '{gate}' in this tenant")
+    for h in (code_hash, link_hash):
+        if not coupling.HASH_RE.match(str(h or "")):
+            raise ValueError("code and link arrive as SHA-256 (hex)")
+    window = coupling.window_minutes(window_min)
+    days = int(key_days) if str(key_days or "").isdigit() else KEY_DEFAULT_DAYS
+    if not 1 <= days <= KEY_MAX_DAYS:
+        raise ValueError(f"key validity: 1 to {KEY_MAX_DAYS} days")
+    label = str(label or "").strip()[:80]
+    if not label:
+        raise ValueError("--label is required")
+    now = time.time()
+    with users_rw() as users:
+        recs = load_couplings()
+        if any(r.get("code_hash") == code_hash or r.get("link_hash") == link_hash
+               for r in recs):
+            raise ValueError("this code was used before -- make a new one")
+        # a ticket that ended unredeemed more than 30 days ago leaves the
+        # list -- and so does the inactive principal it made, which never
+        # held a key (measured on oaap-test: every unredeemed ticket left one)
+        kept = coupling.prune(recs, now)
+        keyed = {k["principal"] for k in load_keys()}
+        for r in recs:
+            if r in kept or r.get("state") == "redeemed":
+                continue
+            u = find_user(users, r.get("principal") or "")
+            if u and not u.get("active") and u.get("kind") == "machine" \
+                    and u["username"] not in keyed:
+                users.remove(u)
+        recs = kept
+        p = _gate_principal_name(users, gate)
+        users.append({"username": p, "display_name": label, "password_hash": "",
+                      "kind": "machine", "roles": ["user"], "groups": [],
+                      "tenant": tid, "active": False})
+        save_users(users)
+        rec = {"id": secrets.token_hex(4), "kind": "gate-access", "tenant": tid,
+               "gate": gate, "scope": gates.scope(tid, gate), "principal": p,
+               "label": label, "address": address or "", "user": user or gate,
+               "key_days": days, "code_hash": code_hash, "link_hash": link_hash,
+               "issued": coupling.iso(now), "until": coupling.iso(now + window * 60),
+               "issuer": issuer or "?", "state": "open",
+               "trust": "pin" if (trust or {}).get("pin") else "public"}
+        recs = recs + [rec]
+        _save(COUPLINGS_FILE, recs)
+    audit("coupling.issue", tid, subject=gate, who=issuer or "?",
+          detail=f"ticket {rec['id']}, principal {p}, label {label}, until {rec['until']}")
+    return coupling.public(rec, _now_iso())
+
+
+def coupling_redeem(tid, ip, code=None, link=None):
+    """(status, answer) of one redemption (§3). 200 with the key once; 410
+    for a ticket that is over; 404 for an unknown code -- never which."""
+    h = coupling.digest(code if code is not None else link)
+    field = "code_hash" if code is not None else "link_hash"
+    now = _now_iso()
+    with users_rw() as users:
+        recs = load_couplings()
+        rec = next((r for r in recs if r.get(field) == h and r.get("tenant") == tid), None)
+        if rec is None:
+            return 404, {"error": coupling.UNKNOWN}, None
+        st = coupling.state(rec, now)
+        gate = load_gates()["gates"].get(gates.gate_key(tid, rec["gate"]))
+        u = find_user(users, rec["principal"])
+        if st != "open" or not gate or not u:
+            why = st if st != "open" else ("gate removed" if not gate else "principal gone")
+            audit("coupling.refused", tid, subject=rec["gate"], result="refused",
+                  who=f"ticket:{rec['id']}", detail=f"{why}, from {ip}")
+            return 410, {"error": coupling.GONE}, rec
+        u["active"] = True
+        save_users(users)
+        try:
+            krec, secret = issue_key(users, rec["principal"], ["user"], rec["scope"],
+                                     rec["label"], rec["key_days"], f"coupling:{rec['id']}")
+        except ValueError as e:
+            u["active"] = False
+            save_users(users)
+            audit("coupling.refused", tid, subject=rec["gate"], result="refused",
+                  who=f"ticket:{rec['id']}", detail=f"key not issued: {e}")
+            return 500, {"error": "Der Schlüssel konnte nicht erzeugt werden."}, rec
+        rec.update(state="redeemed", redeemed=now, redeemed_from=ip, key_id=krec["id"],
+                   via="link" if code is None else "code")
+        _save(COUPLINGS_FILE, recs)
+    audit("coupling.redeem", tid, subject=rec["gate"], who=f"ticket:{rec['id']}",
+          detail=f"key {krec['id']}, principal {rec['principal']}, from {ip}, "
+                 f"via {rec['via']}, until {krec['expires']}")
+    addr = rec.get("address") or ""
+    host, _, path = (addr[len("https://"):] if addr.startswith("https://") else "").partition("/")
+    user = gate.get("user") or rec["gate"]
+    return 200, {"kind": "gate-access", "key": secret, "user": user, "address": addr,
+                 "expires": krec["expires"], "label": rec["label"],
+                 "sm59": {"host": host, "port": "443", "path": "/" + path if path else "",
+                          "user": user, "logon": "basic"}}, rec
+
+
+def coupling_withdraw(tid, cid, who):
+    """Withdraw an open ticket (§5) -> '' or why not. The principal stays
+    inactive and never gets a key."""
+    now = _now_iso()
+    with users_rw() as users:
+        recs = load_couplings()
+        rec = next((r for r in recs if r.get("id") == cid and r.get("tenant") == tid), None)
+        if rec is None:
+            return f"no coupling '{cid}' in this tenant"
+        if coupling.state(rec, now) != "open":
+            return f"coupling '{cid}' is not open ({coupling.state(rec, now)})"
+        rec.update(state="withdrawn", withdrawn=now, withdrawn_by=who or "?")
+        u = find_user(users, rec["principal"])
+        if u and not any(k["principal"] == rec["principal"] for k in load_keys()):
+            u["active"] = False
+            save_users(users)
+        _save(COUPLINGS_FILE, recs)
+    audit("coupling.withdraw", tid, subject=rec["gate"], who=who or "?",
+          detail=f"ticket {cid}, principal {rec['principal']}")
+    return ""
+
+
+def _couple_json(code, doc):
+    resp = make_response(json.dumps(doc, ensure_ascii=False), code)
+    resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _couple_tenant():
+    return request.headers.get(COUPLE_TENANT_HEADER, "").strip()
+
+
+def _couple_blocked(ip):
+    return _login_blocked(f"couple|{ip}")
+
+
+COUPLE_PAGE = _HEAD + "<title>Kopplung — OAAP</title>" + _CARD_STYLE + "{{ theme_style }}" \
+    + _MARK_SVG.join(["<body><div class='card'>", """
+<h1>Kopplung{% if rec %}: {{ rec.label }}{% endif %}</h1>
+{% if error %}<p class="err">{{ error }}</p>
+{% elif key %}
+  <p class="ok">Der Schlüssel ist erzeugt. <strong>Er wird nur jetzt angezeigt</strong> —
+  diese Seite lässt sich nicht noch einmal öffnen.</p>
+  <p><code style="word-break:break-all;font-size:1.05rem">{{ key }}</code></p>
+  <p class="hint">Gültig bis {{ ans.expires[:10] }}.</p>
+  <h2>In SAP: SM59, Verbindungstyp G</h2>
+  <p>Zielhost <code>{{ ans.sm59.host }}</code> · Servicenummer <code>443</code>, SSL aktiv<br>
+  Pfadpräfix <code>{{ ans.sm59.path }}</code><br>
+  Anmeldung: Basis-Authentifizierung · Benutzer <code>{{ ans.user }}</code> ·
+  Passwort = der Schlüssel oben</p>
+  <p class="hint">Der Verbindungstest ist der Ping. Die Vorlage zum Befüllen:
+  <code>{{ ans.address }}/template?form=placeholders</code></p>
+{% else %}
+  <p>Hier entsteht der Schlüssel für den Zugang <strong>{{ rec.label }}</strong>
+  zum Tor <code>{{ rec.gate }}</code> ({{ rec.address }}).</p>
+  <p class="hint">Erst der Knopf erzeugt ihn — und nur einmal. Danach ist dieser Link
+  verbraucht. Gültig bis {{ rec.until.replace("T", " ")[:16] }} UTC.</p>
+  <form method="post"><button>Schlüssel jetzt erzeugen</button></form>
+{% endif %}
+</div></body></html>"""])
+
+
+def _couple_page(status, **kw):
+    kw.setdefault("rec", None)
+    kw.setdefault("error", None)
+    kw.setdefault("key", None)
+    kw.setdefault("ans", None)
+    resp = make_response(render_template_string(COUPLE_PAGE, **kw), status)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Robots-Tag"] = "noindex"
+    return resp
+
+
+@app.post("/couple-door/redeem")
+def couple_redeem():
+    """The redemption door (§3): POST {"code": ...}, JSON or form, no login."""
+    tid = _couple_tenant()
+    if not tid:
+        return _couple_json(404, {"error": coupling.UNKNOWN})
+    ip = _throttle_client()
+    if _couple_blocked(ip):
+        return _couple_json(429, {"error": "Zu viele Versuche — bitte später noch einmal."})
+    body = request.get_json(silent=True) if request.is_json else None
+    code = str(((body if isinstance(body, dict) else None) or request.form).get("code") or "")
+    code = "".join(code.split())[:200]
+    if not coupling.CODE_RE.match(code):
+        _login_failed(f"couple|{ip}")
+        return _couple_json(404, {"error": coupling.UNKNOWN})
+    status, ans, _rec = coupling_redeem(tid, ip, code=code)
+    if status == 404:
+        _login_failed(f"couple|{ip}")
+    return _couple_json(status, ans)
+
+
+@app.route("/couple-door/<link>", methods=["GET", "HEAD"])
+def couple_link_page(link):
+    """The browser link (§3, D5): shows what will be made and a button --
+    nothing is redeemed here, so a link preview spends nothing (F3)."""
+    tid = _couple_tenant()
+    ip = _throttle_client()
+    if not tid or not coupling.LINK_RE.match(link or ""):
+        return _couple_page(404, error=coupling.UNKNOWN)
+    if _couple_blocked(ip):
+        return _couple_page(429, error="Zu viele Versuche — bitte später noch einmal.")
+    h = coupling.digest(link)
+    rec = next((r for r in load_couplings()
+                if r.get("link_hash") == h and r.get("tenant") == tid), None)
+    if rec is None:
+        _login_failed(f"couple|{ip}")
+        return _couple_page(404, error=coupling.UNKNOWN)
+    if coupling.state(rec, _now_iso()) != "open":
+        return _couple_page(410, error=coupling.GONE)
+    return _couple_page(200, rec=rec)
+
+
+@app.post("/couple-door/<link>")
+def couple_link_redeem(link):
+    """The click: redeem by the link, show the key once."""
+    tid = _couple_tenant()
+    ip = _throttle_client()
+    if not tid or not coupling.LINK_RE.match(link or ""):
+        return _couple_page(404, error=coupling.UNKNOWN)
+    if _couple_blocked(ip):
+        return _couple_page(429, error="Zu viele Versuche — bitte später noch einmal.")
+    status, ans, rec = coupling_redeem(tid, ip, link=link)
+    if status == 404:
+        _login_failed(f"couple|{ip}")
+    if status != 200:
+        return _couple_page(status, rec=rec, error=ans.get("error"))
+    return _couple_page(200, rec=rec, key=ans["key"], ans=ans)
+
+
+@app.get("/internal/couplings")
+def couplings_list():
+    """The tickets this actor may see (§5): a server_admin every tenant, a
+    tenant_admin their own -- judged from the actor's own record."""
+    actor_name = _actor(request.args)
+    if not actor_name:
+        return {"error": "actor fehlt."}, 400
+    role, actor_tenant, _err = authority(actor_name)
+    now = _now_iso()
+    recs = [coupling.public(r, now) for r in load_couplings()
+            if role == "server_admin" or (role == "tenant_admin" and actor_tenant
+                                           and r.get("tenant") == actor_tenant)]
+    recs.sort(key=lambda r: r.get("issued") or "", reverse=True)
+    return {"couplings": recs, "scope": role or "self"}
 
 
 @app.get("/auth/login")

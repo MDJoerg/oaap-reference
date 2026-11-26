@@ -109,9 +109,53 @@ def counts_row(c):
                 if c["last_refusal"] and c["last_refusal_reason"] else "")}
 
 
-def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None, stats=None):
+def _when(ts):
+    return (ts or "")[:16].replace("T", " ")
+
+
+KIND_TITLES = {"gate-access": "Zugang zu einem Tor"}
+VIA_TITLES = {"code": "Programm (Code)", "link": "Mensch (Link)"}
+
+
+def coupling_rows(couplings, tid, gate=None):
+    """The coupling tickets of one tenant (RFC-0136 §5), newest first, as
+    the pages show them; identity already said which the caller may see."""
+    rows = []
+    for c in couplings or []:
+        if c.get("tenant") != tid or (gate is not None and c.get("gate") != gate):
+            continue
+        st = c.get("state") or "open"
+        rows.append({"id": c.get("id", ""), "kind_title": KIND_TITLES.get(c.get("kind"), c.get("kind")),
+                     "gate": c.get("gate", ""), "label": c.get("label", ""),
+                     "issuer": c.get("issuer", ""), "issued": _when(c.get("issued")),
+                     "until": _when(c.get("until")), "state": st,
+                     "state_title": STATE_TITLES.get(st, st),
+                     "redeemed": _when(c.get("redeemed")),
+                     "redeemed_from": c.get("redeemed_from", ""),
+                     "via_title": VIA_TITLES.get(c.get("via"), c.get("via") or ""),
+                     "key_id": c.get("key_id", ""), "principal": c.get("principal", ""),
+                     "ended": _when(c.get("withdrawn") or c.get("until"))})
+    rows.sort(key=lambda r: r["issued"], reverse=True)
+    return rows
+
+
+STATE_TITLES = {"open": "wartet auf Einlösung", "redeemed": "eingelöst",
+                "expired": "abgelaufen", "withdrawn": "zurückgezogen"}  # coupling.STATE_TITLES
+
+
+def coupling_view(couplings, tid):
+    rows = coupling_rows(couplings, tid)
+    return {"open": [r for r in rows if r["state"] == "open"],
+            "redeemed": [r for r in rows if r["state"] == "redeemed"],
+            "ended": [r for r in rows if r["state"] in ("expired", "withdrawn")]}
+
+
+def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None, stats=None,
+                couplings=None):
     """Everything the page shows of one tenant: processes and gates.
-    `stats` is gate-stats.json (stage 2b) or None."""
+    `stats` is gate-stats.json (stage 2b) or None; `couplings` the tickets
+    identity lets the caller see (RFC-0136) -- an open one is an access
+    „wartet auf Einlösung“."""
     doc = doc or {}
     sg = (stats or {}).get("gates") if isinstance((stats or {}).get("gates"), dict) else {}
     epoch = now.timestamp() if isinstance(now, datetime) else None
@@ -133,6 +177,9 @@ def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None, stats=None
         acc = access_rows(keys, tid, g["name"], now)
         counts = gate_stats.summary(sg.get(f"{tid}/{g['name']}"), epoch)
         colour, why = light(target, acc, counts, epoch)
+        pending = [c for c in coupling_rows(couplings, tid, g["name"]) if c["state"] == "open"]
+        if pending and why == "kein gültiger Zugang":
+            why += " — eine Kopplung wartet auf Einlösung"
         row = {"name": g["name"], "user": g.get("user") or g["name"],
                "process": g.get("process") or "", "process_missing": proc is None,
                "target": target, "url": url_of(g["name"]),
@@ -140,7 +187,7 @@ def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None, stats=None
                           for f in g.get("fields") or []],
                "field_rows": field_rows(g.get("fields") or []),
                "accesses": acc, "light": colour, "why": why, "last_use": last_use(acc),
-               "counts": counts_row(counts)}
+               "counts": counts_row(counts), "pending": pending}
         gate_rows.append(row)
         if g.get("process") in by_proc:
             by_proc[g["process"]]["gates"].append(g["name"])
