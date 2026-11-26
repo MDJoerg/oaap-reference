@@ -32,6 +32,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 from datetime import datetime, timedelta, timezone
 
@@ -240,6 +241,156 @@ ok("der Admin eines anderen Mandanten stellt keinen Zugang aus",
    not any(k.get("label") == "fremd" for k in ident.load_keys()), r)
 
 print("")
+print("=== Stufe 2b: Felder auf der Seite, deutsche Sätze ===")
+sys.path.insert(0, PORTAL)
+import gates_view as gv                                       # noqa: E402
+import gate_stats as gs_mod                                   # noqa: E402
+
+rows_ = gv.field_rows(gate(KUNDE, "sap-support")["fields"])
+ok("der Feld-Editor zeigt die Felder des Tors und zwei leere Zeilen",
+   [r_["name"] for r_ in rows_] == ["ref", "title", "text", "", ""], rows_)
+form = {}
+for i, r_ in enumerate(rows_):
+    for k, v_ in r_.items():
+        if v_ not in ("", False, None):
+            form[f"f{i}_{k}"] = "1" if v_ is True else str(v_)
+form.update({"f2_drop": "1", "f3_name": "prio", "f3_type": "choice", "f3_choices": "hoch, normal",
+             "f4_name": "system", "f4_max": "40", "f4_description": "System/Mandant"})
+fl = gv.fields_from_form(form.get, len(rows_))
+ok("aus dem Formular: entfernte und leere Zeilen fallen weg, neue kommen dazu",
+   [f["name"] for f in fl] == ["ref", "title", "prio", "system"]
+   and fl[2]["choices"] == ["hoch", "normal"] and fl[3]["max"] == "40", fl)
+r = queue("karin", "fields", tenant=KUNDE, name="sap-support", fields=fl)
+g = gate(KUNDE, "sap-support") or {}
+ok("Felder speichern: das Tor hat die neue Liste, Prozess und Benutzer bleiben",
+   r["ok"] and [f["name"] for f in g["fields"]] == ["ref", "title", "prio", "system"]
+   and g["fields"][3]["max"] == 40 and g["user"] == "SAPSUP" and g["process"] == "sap-anfrage", r)
+ok("... die Antwort ist ein deutscher Satz", r["message"].startswith("Felder von „sap-support“ gespeichert: 4 Felder"),
+   r)
+ok("... und steht als Änderung im Protokoll", any(e["who"] == "karin" and "4 fields" in (e.get("detail") or "")
+                                                 for e in log(KUNDE, "gate.change")), log(KUNDE, "gate.change"))
+r = queue("karin", "fields", tenant=KUNDE, name="sap-support", fields=[f for f in fl if f["name"] != "title"])
+ok("eine Liste ohne Titel wird abgewiesen -- auf Deutsch",
+   not r["ok"] and r["message"] == "Felder: genau ein Feld geht in den Titel."
+   and len(gate(KUNDE, "sap-support")["fields"]) == 4, r)
+r = queue("karin", "fields", tenant=KUNDE, name="sap-support",
+          fields=fl + [{"name": "Prio X", "type": "text"}])
+ok("ein ungültiger Feldname: deutscher Satz mit dem Namen", not r["ok"] and "„Prio X“" in r["message"], r)
+r = queue("karin", "fields", tenant=KUNDE, name="gibtsnicht", fields=fl)
+ok("Felder eines fehlenden Tors: abgewiesen", not r["ok"] and r["message"].startswith("Kein Tor"), r)
+r = queue("karin", "add", tenant=KUNDE, name="x2", process="gibtsnicht")
+ok("Tor auf fehlenden Prozess: deutscher Satz", r["message"].startswith("Kein Prozess „gibtsnicht“"), r)
+r = queue("uwe", "process", tenant=KUNDE, name="p2")
+ok("ein Benutzer: deutscher Satz", r["message"].startswith("Nur Verwalter"), r)
+r = queue("karin", "revoke", tenant=KUNDE, name="sap-support", access="gate-gibtsnicht-9")
+ok("unbekannter Zugang: deutscher Satz", r["message"] == "Kein Zugang „gate-gibtsnicht-9“ am Tor „sap-support“.",
+   r)
+r = queue("karin", "process", tenant=KUNDE, name="sap-anfrage", queue="Sap Support")
+ok("ungültige Warteschlange: deutscher Satz", r["message"].startswith("Warteschlange:"), r)
+
+# Jede Absage von cmd_gate hat einen deutschen Satz (die Regeln in EINER Tabelle).
+import re as _re                                              # noqa: E402
+csrc = open(os.path.join(PLATFORM, "appctl.py"), encoding="utf-8").read()
+body = csrc.split("\ndef cmd_gate(")[1].split("\ndef ")[0]
+said = [_re.sub(r"\{[^}]*\}", "x", d) for d in _re.findall(r'die\(f?"([^"]+)"', body)]
+untranslated = [d for d in said if m.gate_refusal_de(d).startswith("Der Knoten lehnt ab")]
+ok(f"jede Absage von cmd_gate ({len(said)}) hat einen deutschen Satz", said and not untranslated,
+   untranslated)
+fsrc = open(os.path.join(SERVICES, "gates.py"), encoding="utf-8").read()
+fbody = fsrc.split("\ndef check_fields(")[1].split("\ndef ")[0]
+fsaid = [_re.sub(r"\{[^}]*\}", lambda x: "'x'" if "!r" in x.group(0) else "7", d)
+         for d in _re.findall(r'ValueError\(f?"([^"]+)"', fbody)]
+fun = [d for d in fsaid if m.gate_refusal_de("--fields: " + d) in ("Felder: nicht lesbar.",)
+       or m.gate_refusal_de("--fields: " + d).startswith("Der Knoten")]
+ok(f"... und jede Absage der Feldliste ({len(fsaid)})", fsaid and not fun, fun)
+ok("Unbekanntes bleibt erkennbar das Wort des Knotens",
+   m.gate_refusal_de("something new") == "Der Knoten lehnt ab: something new")
+
+print("")
+print("=== Stufe 2b: Zählen, Ereignisse, Ping, Zwilling ===")
+site = "\n".join(m.gate_site_lines(KUNDE))
+ok("das Gateway markiert Lieferung und Ping des Tors im Zugriffsprotokoll",
+   site.count(f"log_append oaap_gate {KUNDE}/sap-support") == 2, site[:900])
+ok("... aber nicht den Rest unter /gate/ (unbekannte Tore)",
+   site.rstrip().endswith("}") and site.split("@gatedoor0")[-1].count("log_append") == 1)
+T0 = time.time()
+
+
+def acc_line(method, uri, status):
+    return json.dumps({"ts": T0, "status": status, "oaap_gate": f"{KUNDE}/sap-support",
+                       "request": {"method": method, "uri": uri}})
+
+
+m.gate_stats_fold([acc_line("POST", "/gate/sap-support", 201),
+                   acc_line("POST", "/gate/sap-support", 422),
+                   acc_line("GET", "/gate/sap-support", 200)], T0)
+gst = json.load(open(m.GATE_STATS_FILE, encoding="utf-8"))
+ok("der Minutenlauf schreibt die Zählung neben gates.json, lesbar für Portal und identity",
+   gst["gates"][f"{KUNDE}/sap-support"]["last_delivery"]
+   and oct(os.stat(m.GATE_STATS_FILE).st_mode & 0o777) == "0o644", gst)
+outbox = json.load(open(m.GATE_EVENTS_FILE, encoding="utf-8"))
+ok("... und zwei Ereignisse in den Ausgang (angenommen, abgelehnt)",
+   [e["type"].split(".")[-2] for e in outbox] == ["accepted", "refused"], outbox)
+m.has_profile = lambda p: True
+_calls = []
+
+
+class _R:
+    def __init__(self, out):
+        self.stdout, self.stderr, self.returncode = out, "", 0
+
+
+def fake_run(cmd, input=None, **kw):
+    _calls.append((cmd, json.loads(input)))
+    return _R(json.dumps({"taken": 1}))
+
+
+_old_run = m.subprocess.run
+m.subprocess.run = fake_run
+try:
+    took = m.gate_events_flush()
+finally:
+    m.subprocess.run = _old_run
+ok("der Ausgang geht im Zwilling-Container an den Bus; was er nahm, verlässt ihn",
+   took == 1 and _calls[0][0][-2:] == ["python", "gate_events.py"]
+   and len(json.load(open(m.GATE_EVENTS_FILE))) == 1, _calls)
+
+ident.GATE_STATS_FILE = m.GATE_STATS_FILE
+r_ = ident.app.test_client().get("/gate-door/sap-support", headers={
+    "Authorization": basic, "X-OAAP-Gate-Tenant": KUNDE, "X-OAAP-Gate-Target": "kunde-vorgaenge"})
+ok("der Ping nennt die letzte angenommene Lieferung", r_.status_code == 200
+   and "Zuletzt angenommen: " + gst["gates"][f"{KUNDE}/sap-support"]["last_delivery"]
+   in r_.get_data(as_text=True), r_.get_data(as_text=True))
+
+keys_ = m._gate_keys_all()
+ans = m.gate_assets(KUNDE, m.load_gates(), keys_, gst, m._cases_registry(), T0)
+kinds = [(a["kind"], a.get("light"), a.get("delivered"), a.get("refused")) for a in ans["assets"]]
+ok("der Zwilling: das Tor mit Ampel und heutigen Zahlen, der gültige Zugang",
+   kinds[0] == ("gate", "yellow", 1, 1) and ans["assets"][0]["destination"] == "kunde-vorgaenge"
+   and [a["kind"] for a in ans["assets"]] == ["gate", "access"]
+   and ans["assets"][1]["gate"] == "sap-support", ans)
+ok("... ein Mandant ohne Tor: keine Antwort", m.gate_assets(ANDERE, m.load_gates(), keys_, gst,
+                                                           m._cases_registry(), T0) is None)
+m.assets_on = lambda tid, s=None: True
+plan_seen = {}
+
+
+def fake_run2(cmd, input=None, **kw):
+    plan_seen.update(json.loads(input))
+    return _R(json.dumps({"tenants": {}}))
+
+
+m._assets_ready = lambda tid: ""
+m.subprocess.run = fake_run2
+try:
+    m.assets_collect(force=True)
+finally:
+    m.subprocess.run = _old_run
+ok("der Lauf der Assets nimmt die Tore als Antwort des Knotens mit",
+   (plan_seen.get("tenants") or {}).get(KUNDE, {}).get("platform:tore", {}).get("answer", {})
+   .get("assets", [{}])[0].get("kind") == "gate", plan_seen)
+
+print("")
 print("=== entziehen, entfernen ===")
 r = queue("karin", "revoke", tenant=KUNDE, name="sap-support", access="gate-sap-support-1")
 rec = next((k for k in ident.load_keys() if k["id"] == d.get("id")), {})
@@ -255,8 +406,6 @@ ok("eine unbekannte Aktion wird abgewiesen", not r["ok"], r)
 
 print("")
 print("=== die Ansicht: Ziel und Ampel ===")
-sys.path.insert(0, PORTAL)
-import gates_view as gv                                       # noqa: E402
 
 now = datetime(2026, 11, 26, tzinfo=timezone.utc)
 
@@ -309,13 +458,18 @@ doc = {"processes": {f"{KUNDE}/sap-anfrage": {"tenant": KUNDE, "name": "sap-anfr
                                           "fields": [{"name": "ref", "required": True},
                                                      {"name": "system", "required": False}]}}}
 v = gv.tenant_view(doc, KUNDE, insts, ks, res_, lambda n: f"https://kunde.example/gate/{n}", now)
-html = tpl("GATES_BODY").render(v=v, label="kunde", kinds=dict(gv.CASE_KINDS), q="", msg=None, error=None)
+html = tpl("GATES_BODY").render(v=v, label="kunde", kinds=dict(gv.CASE_KINDS), q="", msg=None, error=None,
+                                field_types=gv.FIELD_TYPES, field_targets=gv.FIELD_TARGETS)
 ok("die Seite zeigt Tor, Adresse, Ampel, Prozess mit Ziel und die Zugänge",
    "sap-support" in html and "https://kunde.example/gate/sap-support" in html and "dot warn" in html
    and "kunde-vorgaenge" in html and "gate-sap-support-2" in html and "entzogen" in html, html[:400])
 ok("... Entziehen nur für gültige Zugänge", html.count('action="/tore/revoke') == 2)
 ok("... Formulare für Zugang, Tor und Prozess", 'action="/tore/access' in html
    and 'action="/tore/add' in html and 'action="/tore/process' in html)
+ok("... und der Feld-Editor mit den Feldern des Tors und leeren Zeilen",
+   'action="/tore/fields' in html and 'name="f0_name" value="ref"' in html
+   and 'name="f3_name" value=""' in html and 'name="n" value="4"' in html
+   and '<option value="choice"' in html, html[html.find("/tore/fields"):][:300])
 ok("... und nie einen Schlüssel", "oaapk_" not in html)
 empty = tpl("GATES_BODY").render(v={"gates": [], "processes": []}, label="", kinds=dict(gv.CASE_KINDS),
                                  q="", msg=None, error=None)
@@ -332,6 +486,22 @@ src = open(os.path.join(PORTAL, "app.py"), encoding="utf-8").read()
 ok("das Portal schickt den Hash, nie den Schlüssel, in den Spool",
    'args["hash"] = generate_password_hash(secret)' in src and '"secret": secret' not in src.split("# --- Tore")[1])
 nav = open(os.path.join(PORTAL, "nav_view.py"), encoding="utf-8").read()
+v2 = gv.tenant_view(doc, KUNDE, insts, ks, res_, lambda n: f"https://kunde.example/gate/{n}", now,
+                    stats={"gates": {f"{KUNDE}/sap-support": {
+                        "days": {now.strftime("%Y-%m-%d"): {"delivered": 3, "ping": 1,
+                                                            "refused": {"anmeldung": 2}}},
+                        "last_delivery": iso(0)}}})
+html2 = tpl("GATES_BODY").render(v=v2, label="kunde", kinds=dict(gv.CASE_KINDS), q="", msg=None, error=None,
+                                 field_types=gv.FIELD_TYPES, field_targets=gv.FIELD_TARGETS)
+ok("die Seite zeigt die Zählung: heute, 14 Tage, zuletzt",
+   "3 angenommen, 2 abgelehnt (Anmeldung 2), 1 Ping" in html2 and "14 Tage" in html2
+   and "angenommen " + iso(0) in html2, html2[html2.find("Heute"):][:400])
+ok("... und die Ampel sagt die Ablehnungen", v2["gates"][0]["why"] in (
+    "heute 2 abgelehnt", f"ein Schlüssel läuft in weniger als {gv.WARN_DAYS} Tagen ab"), v2["gates"][0])
+c_ = gs_mod.summary({"days": {now.strftime("%Y-%m-%d"): {"delivered": 1, "ping": 0, "refused": {}}},
+                     "last_delivery": iso(0)}, now.timestamp())
+ok("grün „in Gebrauch“ mit Lieferungen und ohne Ablehnung",
+   gv.light("t", rows[:1], c_, now.timestamp()) == ("green", "in Gebrauch"))
 ok("„Tore“ steht in der Navigation für Mandanten-Admins", '("gates", "/tore", "Tore", "is_user_admin")' in nav)
 dockerfile = open(os.path.join(PORTAL, "Dockerfile"), encoding="utf-8").read()
 ok("gates_view.py kommt ins Abbild", "portal/gates_view.py" in dockerfile)

@@ -31,6 +31,7 @@ REL_FIELDS = {
     "tool": {"toolOf": ("source", ("source",))},
     "signin": {"opens": ("source", ("source",))},
     "agent": {"agentUses": ("uses", ("model", "tool"))},
+    "access": {"opens": ("gate", ("gate",))},
 }
 REL_KEYS = ("assetOf", "uses", "mayUse", "toolOf", "opens", "agentUses")
 # who depends on whom: `a --rel--> b` means a depends on b
@@ -66,7 +67,7 @@ def _join(items, limit=TEXT_MAX):
 def _values(kind, a):
     """The whitelisted attributes of one asset, short names."""
     v = {"name": _name(a.get("name")), "kind": kind}
-    if kind in ("source", "model"):
+    if kind in ("source", "model", "gate"):
         v["state"] = a.get("state") if a.get("state") in am.STATES else "unknown"
     else:
         v["state"] = "present"
@@ -86,7 +87,14 @@ def _values(kind, a):
         ups = [u for u in a["upstream"] if isinstance(u, dict)]
         v["upstream"] = _join(f"{_name(u.get('source'))}: {_name(u.get('model'))}"
                               for u in ups if _name(u.get("source")) and _name(u.get("model")))
-    if kind in ("key", "cohort", "signin"):
+    if kind == "gate":
+        if isinstance(a.get("light"), str) and _LIGHT.match(a["light"]):
+            v["light"] = a["light"]
+        if _name(a.get("destination")):
+            v["destination"] = _name(a["destination"])
+        v["deliveredToday"], v["refusedToday"] = _int(a.get("delivered")), _int(a.get("refused"))
+        v["lastDelivery"], v["lastPing"] = _iso(a.get("last_delivery")), _iso(a.get("last_ping"))
+    if kind in ("key", "cohort", "signin", "access"):
         v["expires"] = _iso(a.get("expires"))
     if kind == "key":
         v["budget"], v["used"] = _num(a.get("budget")), _num(a.get("used"))

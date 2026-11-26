@@ -237,7 +237,7 @@ ok("... freigegeben mit wem und Betreff-Praefix", st[TX]["state"] == "granted"
 ok("... App-Typ nur adressiert", st["app.vorgaenge.case.statuschanged.v1"]["state"] == "addressed")
 ok("... Zustellung: 12 zugestellt", ov["instances"][0]["push"]["delivered"] == 12
    and ov["instances"][0]["push"]["started"])
-ok("... die Plattformtypen alle sieben", len(ov["platform_types"]) == 7)
+ok("... die Plattformtypen alle neun (mit den zwei der Tore)", len(ov["platform_types"]) == 9)
 
 json.dump(OV_CAT, open(os.path.join(apps, "events-catalog.json"), "w"))
 json.dump({"instances": {"inv1-pp-a": {"tenant": "T1"}, "fremd": {"tenant": "T2"}}},

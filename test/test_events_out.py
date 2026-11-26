@@ -57,14 +57,15 @@ ok("unbekannter Client / kein client:-Name -> nein",
    ce(CAT, "T1", CL, "client:weg", P1["type"]) and ce(CAT, "T1", CL, "t1-pub", P1["type"]))
 ok("Typ eines anderen Mandanten -> nein", "no instance" in
    ce(CAT, "T1", CL, "client:erp", "app.probe.far.away.v1"))
-ok("Angebot fuer Clients: nur tenant-Typen des Mandanten",
-   bm.client_types(CAT, "T1") == sorted([P1["type"], P2["type"]]))
+ok("Angebot fuer Clients: nur tenant-Typen des Mandanten (und die Tore, RFC-0135 2b)",
+   bm.client_types(CAT, "T1") == sorted([P1["type"], P2["type"]] + ["oaap.gate.delivery.accepted.v1", "oaap.gate.delivery.refused.v1"]))
 ov = bm.overview(CAT, {}, "T1", [{"instance": "client:erp", "type": P1["type"], "subject_prefix": None,
                                   "granted_by": "anna", "granted_at": "x"}], {}, CL)
 ok("Uebersicht: Client mit Freigabe und Angebot, personenbezogen markiert",
    [c["client"] for c in ov["clients"]] == ["client:erp"]
    and [g["type"] for g in ov["clients"][0]["grants"]] == [P1["type"]]
-   and ov["clients"][0]["grantable"] == [{"type": P2["type"], "personal": True}], ov["clients"])
+   and ov["clients"][0]["grantable"] == [{"type": P2["type"], "personal": True}]
+   + [{"type": t, "personal": False} for t in ["oaap.gate.delivery.accepted.v1", "oaap.gate.delivery.refused.v1"]], ov["clients"])
 
 w = bm.client_conditions([{"type": P1["type"], "subject_prefix": "S-", "granted_at": "T0"}], "client:erp")
 ok("Client bekommt nur Ereignisse ab dem Freigabezeitpunkt (time >= granted_at), mit Praefix",

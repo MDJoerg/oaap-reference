@@ -153,6 +153,7 @@ import metrics_sender  # noqa: E402
 import fleet_pair  # noqa: E402  (RFC-0085 stage 3)
 # RFC-0135: gates -- field list, templates, the check; shared with identity
 import gates  # noqa: E402
+import gate_stats  # noqa: E402
 # The broker's certificate (RFC-0054 stage 3): copied from the gateway or
 # issued by this node's own CA; the acting is cmd_broker.
 import broker_certs  # noqa: E402
@@ -9887,7 +9888,8 @@ def cmd_metrics(args):
                 METRICS_DIR, DATA_DIR,
                 log_path=os.path.join(GATEWAY_LOG_DIR, "external-access.log"),
                 containers=traffic.docker_stats,
-                instances=instance_metrics_targets)
+                instances=instance_metrics_targets,
+                gates=gate_stats_fold)
         except Exception as exc:  # noqa: BLE001 -- see the docstring
             print(f"metrics: sample skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
@@ -9898,6 +9900,10 @@ def cmd_metrics(args):
         except Exception as exc:  # noqa: BLE001
             print(f"metrics: status skipped ({type(exc).__name__}: {exc})",
                   file=sys.stderr)
+        try:
+            gate_events_flush()       # RFC-0135 stage 2b: the gates' events to the bus
+        except BaseException as exc:  # noqa: BLE001 -- the unit does not fail
+            print(f"gates: events skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
         try:
             assets_collect()          # RFC-0088: every five minutes, the tenants' twins
         except BaseException as exc:  # noqa: BLE001 -- die() too: the unit does not fail
@@ -30046,8 +30052,11 @@ def gate_site_lines(tid, insts=None, doc=None):
     out += strip_identity()
     out += ["\t\trequest_body {", f"\t\t\tmax_size {gates.BODY_MAX_KB}KB", "\t\t}"]
 
-    def door(matcher, target_key):
-        lines = [f"\t\thandle {matcher} {{".replace("handle  {", "handle {"), "\t\t\troute {",
+    def door(matcher, target_key, name=""):
+        # stage 2b: every request of a known gate carries its name into the
+        # access log, where gate_stats counts it (D10 a)
+        mark = [f"\t\t\t\tlog_append {gate_stats.FIELD} {tid}/{name}"] if name else []
+        lines = [f"\t\thandle {matcher} {{".replace("handle  {", "handle {"), "\t\t\troute {"] + mark + [
                  "\t\t\t\turi strip_prefix /gate", "\t\t\t\trewrite * /gate-door{uri}",
                  "\t\t\t\treverse_proxy identity:8000 {",
                  f"\t\t\t\t\theader_up X-OAAP-Gate-Tenant {tid}",
@@ -30075,6 +30084,7 @@ def gate_site_lines(tid, insts=None, doc=None):
             extra += [f"header_up {h} {v}" for h, v in
                       zip(SOURCE_HEADERS, (f"gate:{n}", "gate", "-", tid))]
             out += [f"\t\thandle @gate{idx} {{", "\t\t\troute {",
+                    f"\t\t\t\tlog_append {gate_stats.FIELD} {tid}/{n}",
                     "\t\t\t\tforward_auth identity:8000 {",
                     f"\t\t\t\t\turi /verify?gate={tid}/{n}",
                     "\t\t\t\t\t" + _COPY_IDENTITY + " X-OAAP-Gate-Access X-OAAP-Gate-Label"]
@@ -30084,7 +30094,7 @@ def gate_site_lines(tid, insts=None, doc=None):
             out += _proxy(target, "\t\t\t\t", extra=extra)
             out += ["\t\t\t}", "\t\t}"]
         out += [f"\t\t@gatedoor{idx} path /gate/{n} /gate/{n}/*"]
-        out += door(f"@gatedoor{idx}", tkey)
+        out += door(f"@gatedoor{idx}", tkey, n)
     out += door("", "")
     out.append("\t}")
     return out
@@ -30095,6 +30105,63 @@ def _gate_tenant(label):
     if not tid:
         die(f"this node has no tenant '{label}'" if label else "--tenant is required")
     return tid
+
+
+# --- what happened at the gates (RFC-0135 stage 2b, D10 a) ---
+# Counted from the gateway's access log by the minutely sampler; the portal
+# and identity read the counts (gate-stats.json beside gates.json, no
+# secret in it), the bus gets one event per delivery and refusal.
+GATE_STATS_FILE = os.path.join(APPS_DIR, "gate-stats.json")
+GATE_EVENTS_FILE = os.path.join(DATA_DIR, "data", "gates", "bus-outbox.json")
+
+
+def gate_stats_fold(lines, now=None):
+    """The sampler's hook: add the gates' log lines to the counts and their
+    events to the outbox. Writes only when there is something to write, or
+    once a day to let old days fall out."""
+    known = set(load_gates()["gates"])
+    old = _read_json_file(GATE_STATS_FILE)
+    day = time.strftime("%Y-%m-%d", time.gmtime(now or time.time()))
+    if not lines and isinstance(old, dict) and old.get("folded") == day \
+            and set(old.get("gates") or {}) <= known:
+        return
+    stats, events = gate_stats.fold(old, lines, known, now)
+    stats["folded"] = day
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = GATE_STATS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(stats, f, sort_keys=True, ensure_ascii=False)
+    os.chmod(tmp, 0o644)           # identity and the portal read it; no secret
+    os.replace(tmp, GATE_STATS_FILE)
+    if events:
+        q = gate_stats.queue_events(_read_json_file(GATE_EVENTS_FILE), events, now)
+        os.makedirs(os.path.dirname(GATE_EVENTS_FILE), exist_ok=True)
+        _write_json_private(GATE_EVENTS_FILE, q)
+
+
+def gate_events_flush():
+    """Hand the outbox to the bus (twin's container, gate_events.py); what
+    it took from the front leaves the outbox. Without a twin the events
+    wait -- and age out after gate_stats.EVENTS_DAYS."""
+    q = _read_json_file(GATE_EVENTS_FILE)
+    if not isinstance(q, list) or not q or not has_profile("store"):
+        return 0
+    q = gate_stats.queue_events(q, [])
+    try:
+        r = subprocess.run(["docker", "exec", "-i", TWIN_CONTAINER, "python", "gate_events.py"],
+                           input=json.dumps(q), capture_output=True, text=True, timeout=60)
+        taken = int(json.loads((r.stdout or "").strip().splitlines()[-1]).get("taken") or 0)
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        return 0
+    rest = q[taken:]
+    if rest:
+        _write_json_private(GATE_EVENTS_FILE, rest)
+    else:
+        try:
+            os.remove(GATE_EVENTS_FILE)
+        except OSError:
+            pass
+    return taken
 
 
 def gate_url(tid, name):
@@ -30208,6 +30275,9 @@ def cmd_gate(args):
                     fields = json.load(f)
             except (OSError, ValueError) as e:
                 die(f"--fields: {e}")
+        # stage 2b: the portal's field editor hands the list itself
+        if getattr(args, "fields_doc", None) is not None:
+            fields = args.fields_doc
         try:
             fields = gates.check_fields(fields)
         except ValueError as e:
@@ -30375,7 +30445,108 @@ def gate_issue_access(tid, name, label, days, who, secret_hash=None):
     return res
 
 
-GATE_ADMIN_OPS = ("process", "add", "access", "revoke", "remove")
+GATE_ADMIN_OPS = ("process", "add", "fields", "access", "revoke", "remove")
+
+# Stage 2b: the page is German, the command line English. ONE table turns
+# what cmd_gate, gates.check_fields and acting_tenant say into the page's
+# sentence; test_gates_portal holds every die() of cmd_gate against it.
+_GATE_TO_DE = {"ref": "die Referenz", "title": "den Titel", "text": "den Text"}
+_GATE_DE = [
+    (r"a gate or process name", lambda m: "Name: 2–40 Zeichen, a–z, 0–9 und Bindestrich, "
+                                          "am Anfang ein Buchstabe."),
+    (r"--queue:", lambda m: "Warteschlange: eine Kennung der Vorgänge-Instanz "
+                            "(a–z, 0–9, Bindestrich)."),
+    (r"--kind:", lambda m: "Art: Fehler, Frage, Idee, Änderung oder intern."),
+    (r"--process is required", lambda m: "Bitte einen Prozess wählen."),
+    (r"no process '([^']*)' in", lambda m: f"Kein Prozess „{m.group(1)}“ in diesem Mandanten "
+                                           "— bitte zuerst anlegen."),
+    (r"--user:", lambda m: "Benutzer: 1–40 Zeichen aus Buchstaben, Ziffern, Punkt, Unterstrich "
+                           "und Bindestrich (er wird in SM59 eingetragen)."),
+    (r"no gate '([^']*)' in", lambda m: f"Kein Tor „{m.group(1)}“ in diesem Mandanten."),
+    (r"--label is required", lambda m: "Wer sendet durch diesen Zugang? z. B. „SAP A4H 001“."),
+    (r"--access PRINCIPAL", lambda m: "Welcher Zugang? Der Prinzipal fehlt."),
+    (r"no access '([^']*)' at gate '([^']*)'",
+     lambda m: f"Kein Zugang „{m.group(1)}“ am Tor „{m.group(2)}“."),
+    (r"removing gate", lambda m: "Bitte „wirklich“ ankreuzen — alle Zugänge werden entzogen."),
+    (r"the identity container did not issue the key",
+     lambda m: "identity hat den Schlüssel nicht ausgestellt."),
+    (r"unknown action", lambda m: "Unbekannte Aktion."),
+    # gates.check_fields, behind "--fields: "
+    (r"--fields: fields: a non-empty list", lambda m: "Felder: mindestens eines."),
+    (r"--fields: fields: at most (\d+)", lambda m: f"Felder: höchstens {m.group(1)}."),
+    (r"--fields: fields: each one an object", lambda m: "Felder: unlesbare Zeile."),
+    (r"--fields: field name '([^']*)'",
+     lambda m: f"Feldname „{m.group(1)}“: a–z, 0–9 und _, am Anfang ein Buchstabe."),
+    (r"--fields: field '([^']*)' twice", lambda m: f"Feld „{m.group(1)}“ steht zweimal da."),
+    (r"--fields: field (\w+): type one of", lambda m: f"Feld „{m.group(1)}“: unbekannter Typ."),
+    (r"--fields: field (\w+): to one of", lambda m: f"Feld „{m.group(1)}“: unbekanntes Ziel."),
+    (r"--fields: field (\w+): only a text goes to (\w+)",
+     lambda m: f"Feld „{m.group(1)}“: in {_GATE_TO_DE.get(m.group(2), m.group(2))} "
+               "geht nur ein Text."),
+    (r"--fields: field (\w+): max is a number",
+     lambda m: f"Feld „{m.group(1)}“: die Länge ist eine Zahl."),
+    (r"--fields: field (\w+): max 1\.\.(\d+)",
+     lambda m: f"Feld „{m.group(1)}“: Länge 1 bis {m.group(2)}."),
+    (r"--fields: field (\w+): a choice needs choices",
+     lambda m: f"Feld „{m.group(1)}“: eine Auswahl braucht ihre Werte."),
+    (r"--fields: fields: exactly one field goes to (\w+)",
+     lambda m: f"Felder: genau ein Feld geht in {_GATE_TO_DE.get(m.group(1), m.group(1))}."),
+    (r"--fields: fields: at most one field goes to text",
+     lambda m: "Felder: höchstens ein Feld geht in den Text."),
+    (r"--fields: field (\w+): the (\w+) is required",
+     lambda m: f"Feld „{m.group(1)}“: {_GATE_TO_DE.get(m.group(2), m.group(2))} ist Pflicht."),
+    (r"--fields:", lambda m: "Felder: nicht lesbar."),
+    # acting_tenant
+    (r"requires server_admin or tenant_admin",
+     lambda m: "Nur Verwalter des Mandanten oder des Servers pflegen Tore."),
+    (r"that tenant does not exist", lambda m: "Diesen Mandanten gibt es auf dem Knoten nicht."),
+    (r"your account names a tenant",
+     lambda m: "Dein Konto nennt einen Mandanten, den dieser Knoten nicht hat."),
+    (r"a tenant_admin acts only in their own tenant",
+     lambda m: "Mandantenverwalter handeln nur im eigenen Mandanten."),
+]
+
+
+def gate_refusal_de(said):
+    """The page's German sentence for what cmd_gate (or its helpers) said
+    when it refused -- the first line that a rule of _GATE_DE knows; else
+    the original, marked as the node's own words."""
+    lines = [ln.strip() for ln in str(said or "").splitlines() if ln.strip()]
+    for ln in lines:
+        ln = re.sub(r"^(error|fehler):\s*", "", ln, flags=re.I)
+        for pat, out in _GATE_DE:
+            m = re.match(pat, ln)
+            if m:
+                return out(m)
+    return "Der Knoten lehnt ab: " + (lines[-1] if lines else "ohne Begründung")
+
+
+def _gate_done_de(op, tid, name, said):
+    """The page's German sentence after a change went through."""
+    doc = load_gates()
+    if op == "process":
+        p = doc["processes"].get(gates.gate_key(tid, name)) or {}
+        tkey, _t = gate_target(_cases_registry(), tid, p)
+        return (f"Prozess „{name}“ gespeichert: ein Vorgang in der Warteschlange "
+                f"„{p.get('queue') or 'eingang'}“ " +
+                (f"der Instanz „{tkey}“." if tkey else
+                 "— aber keine Vorgänge-Instanz gefunden; Tore dorthin lehnen Lieferungen ab."))
+    g = doc["gates"].get(gates.gate_key(tid, name)) or {}
+    n = re.search(r"(\d+) key", said or "")
+    n = n.group(1) if n else "0"
+    if op == "add":
+        return (f"Tor „{name}“ {'geändert' if ' changed' in (said or '') else 'angelegt'} "
+                f"→ Prozess „{g.get('process') or '-'}“. Nächster Schritt: ein Zugang.")
+    if op == "fields":
+        fs = g.get("fields") or []
+        return (f"Felder von „{name}“ gespeichert: {len(fs)} Felder, "
+                f"{sum(1 for f in fs if f.get('required'))} Pflicht. "
+                "Die Vorlagen folgen sofort.")
+    if op == "revoke":
+        return f"Zugang entzogen: {n} Schlüssel gesperrt, der Prinzipal ist abgeschaltet."
+    if op == "remove":
+        return f"Tor „{name}“ entfernt; {n} Schlüssel gesperrt."
+    return "Gespeichert."
 
 
 def gate_job(req, actor):
@@ -30390,11 +30561,11 @@ def gate_job(req, actor):
     a = req.get("args") if isinstance(req.get("args"), dict) else {}
     tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
     if not tid:
-        return False, err or "requires tenant_admin or server_admin", None
+        return False, gate_refusal_de(err or "requires server_admin or tenant_admin"), None
     if role not in ("server_admin", "tenant_admin"):
-        return False, "gates are kept by the tenant's administrator (RFC-0135 §5)", None
+        return False, "Tore pflegt der Verwalter des Mandanten (RFC-0135 §5).", None
     if op not in GATE_ADMIN_OPS:
-        return False, f"unknown action '{op}'", None
+        return False, "Unbekannte Aktion.", None
     label = tenant_label(tid) or tid
 
     def txt(k, mx):
@@ -30406,11 +30577,21 @@ def gate_job(req, actor):
                             instance=txt("instance", 80), label=txt("label", 80),
                             process=txt("process", 40), user=txt("user", 40), fields=None,
                             days=None, access=txt("access", 60), yes=bool(a.get("yes")),
-                            secret_hash=None)
+                            secret_hash=None, fields_doc=None)
+    if op == "fields":
+        # the field editor: the gate keeps its process and user (cmd_gate add)
+        g = load_gates()["gates"].get(gates.gate_key(tid, ns.name)) \
+            if gates.NAME_RE.match(ns.name) else None
+        if not g:
+            return False, f"Kein Tor „{ns.name}“ in diesem Mandanten.", None
+        if not isinstance(a.get("fields"), list):
+            return False, "Felder: nicht lesbar.", None
+        ns.action, ns.process, ns.user = "add", g.get("process"), g.get("user") or ns.name
+        ns.fields_doc = a["fields"]
     if op == "access":
         h = str(a.get("hash") or "")
         if not h:
-            return False, "the portal sends the hash of the key it made", None
+            return False, "Das Portal schickt den Hash des Schlüssels, den es gemacht hat.", None
         try:
             days = int(a.get("days") or GATE_ACCESS_DAYS)
         except (TypeError, ValueError):
@@ -30420,18 +30601,21 @@ def gate_job(req, actor):
             if gates.NAME_RE.match(ns.name) else set()
         ok_, said = _run_captured(cmd_gate, ns)
         if not ok_:
-            return False, said, None
+            return False, gate_refusal_de(said), None
         new = [k for k in _gate_keys(gates.scope(tid, ns.name)) if k["id"] not in before]
         if len(new) != 1:
-            return False, "the key was not found after issuing it", None
+            return False, "Der Schlüssel war nach dem Ausstellen nicht zu finden.", None
         k = new[0]
         doc = load_gates()
         g = doc["gates"].get(gates.gate_key(tid, ns.name)) or {}
-        return True, said, {"id": k["id"], "principal": k["principal"], "label": k["label"],
-                            "expires": k["expires"], "url": gate_url(tid, ns.name),
-                            "user": g.get("user") or ns.name}
+        return True, f"Zugang „{k['label']}“ ausgestellt.", {
+            "id": k["id"], "principal": k["principal"], "label": k["label"],
+            "expires": k["expires"], "url": gate_url(tid, ns.name),
+            "user": g.get("user") or ns.name}
     ok_, said = _run_captured(cmd_gate, ns)
-    return ok_, said, None
+    if not ok_:
+        return False, gate_refusal_de(said), None
+    return True, _gate_done_de(op, tid, ns.name, said), None
 
 
 def _now_iso_z():
@@ -34453,6 +34637,68 @@ def assets_plan(reg=None, settings=None):
     return out
 
 
+GATES_ASSETS = "platform:tore"   # the node's own "instance" in the plan (stage 2b)
+_GATES_VIEW = None
+
+
+def _gates_view():
+    """gates_view from the portal's directory -- the light is ONE rule, the
+    page's and the twin's (RFC-0135 §7)."""
+    global _GATES_VIEW
+    if _GATES_VIEW is None:
+        import importlib.util
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "services", "portal")
+        spec = importlib.util.spec_from_file_location(
+            "gates_view", os.path.join(here, "gates_view.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _GATES_VIEW = mod
+    return _GATES_VIEW
+
+
+def _gate_keys_all():
+    """Every key limited to a gate, in one call to identity (public records)."""
+    out = _identity_exec(
+        "import json, app as m\n"
+        "print(json.dumps([m.public_key(k) for k in m.load_keys()"
+        " if str(k.get('instance') or '').startswith('oaap.gate:')]))\n")
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return []
+
+
+def gate_assets(tid, doc, keys, stats, insts, now=None):
+    """The tenant reader's answer for the node's own gates (RFC-0135 §7,
+    stage 2b) -> {"v": 1, "assets": [...]} or None without a gate. A gate:
+    state, light, target, today's counts, last delivery and ping. An
+    access: its expiry and the gate it opens. The same light as the page."""
+    gv = _gates_view()
+    mine = sorted((g for g in doc["gates"].values() if g.get("tenant") == tid),
+                  key=lambda g: g["name"])
+    if not mine:
+        return None
+    sg = (stats or {}).get("gates") if isinstance((stats or {}).get("gates"), dict) else {}
+    out = []
+    for g in mine:
+        n = g["name"]
+        proc = doc["processes"].get(gates.gate_key(tid, g.get("process") or ""))
+        tkey, _t = gate_target(insts, tid, proc)
+        acc = gv.access_rows(keys, tid, n)
+        c = gate_stats.summary(sg.get(gates.gate_key(tid, n)), now)
+        colour, _why = gv.light(tkey, acc, c, now)
+        out.append({"kind": "gate", "name": n,
+                    "state": {"red": "down", "yellow": "idle"}.get(colour, "ok"),
+                    "light": colour, "destination": tkey,
+                    "delivered": c["today"]["delivered"], "refused": c["today"]["refused_n"],
+                    "last_delivery": c["last_delivery"], "last_ping": c["last_ping"]})
+        for a in acc:
+            if a["state"] in ("valid", "soon"):
+                out.append({"kind": "access", "name": f"{n} · {a['label'] or a['principal']}",
+                            "expires": a["expires"], "gate": n})
+    return {"v": 1, "assets": out}
+
+
 def _assets_ready(tid):
     """'' once the tenant's twin carries the reader's types and its time
     series exist (idempotent, done once per model version), else why not."""
@@ -34485,6 +34731,17 @@ def assets_collect(now=None, force=False):
         return None
     settings = assets_settings_load()
     plan = assets_plan(settings=settings)
+    # RFC-0135 stage 2b: the node's gates, for every tenant that has one
+    gdoc = load_gates()
+    gtenants = sorted({g.get("tenant") for g in gdoc["gates"].values()
+                       if g.get("tenant") and assets_on(g.get("tenant"), settings)})
+    if gtenants:
+        gkeys, gstats, ginsts = _gate_keys_all(), _read_json_file(GATE_STATS_FILE), _cases_registry()
+        for tid in gtenants:
+            ans = gate_assets(tid, gdoc, gkeys, gstats, ginsts, now)
+            if ans:
+                plan.setdefault(tid, {})[GATES_ASSETS] = {"app": "oaap.core.gates", "ask": False,
+                                                          "answer": ans}
     view = {"run": now, "at": _iso_now(), "tenants": {},
             "off": sorted(t for t, v in settings["tenants"].items() if v == "off")}
     todo = {}

@@ -307,6 +307,10 @@ def measure(directory, now, proc="/proc", log_path=None, containers=None,
     new_pos = {k: state[k] for k in ("ino", "off") if k in state}
     if log_path:
         lines, new_pos = _read_new(log_path, new_pos)
+        # RFC-0135 stage 2b: the gates' lines, also after a gap -- a
+        # delivery is a delivery whenever it was read (gate_stats.py)
+        if lines and keep is not None:
+            keep["gate_lines"] = [ln for ln in lines if '"oaap_gate"' in ln]
         if lines is not None and fresh:
             hosts = tally(lines)
             if keep is not None:

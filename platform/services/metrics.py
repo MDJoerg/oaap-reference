@@ -261,7 +261,7 @@ def _save_last(directory, d):
 
 def take_sample(directory, data_path, now=None, proc="/proc",
                 sleep=time.sleep, log_path=None, containers=None,
-                instances=None):
+                instances=None, gates=None):
     """Read the host once and file the sample. Returns the entry, or None
     when this minute already has one (the job may fire twice).
 
@@ -319,6 +319,13 @@ def take_sample(directory, data_path, now=None, proc="/proc",
     # RFC-0108: the same minute per instance, from what was read above.
     # `instances` is a function (the registry is the caller's); a failure
     # costs the instance lines, never the node's.
+    # RFC-0135 stage 2b: the gates' lines of this read, to the caller's
+    # counter (appctl.gate_stats_fold); a failure costs the gates, nothing else
+    if gates is not None:
+        try:
+            gates(keep.get("gate_lines") or [], now)
+        except Exception:                                  # noqa: BLE001
+            pass
     if instances is not None:
         try:
             import instance_metrics

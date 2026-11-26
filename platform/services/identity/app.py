@@ -2289,6 +2289,8 @@ def agent_assertion():
 # go on to the gate's target. Both ask gate_access() -- one rule, one
 # function.
 GATES_FILE = os.environ.get("OAAP_GATES_FILE", "/platform-apps/gates.json")
+# stage 2b: the node's counts from the access log, beside gates.json
+GATE_STATS_FILE = os.path.join(os.path.dirname(GATES_FILE), "gate-stats.json")
 # set by the gateway on the gate door only, after stripping what a client sent
 GATE_TENANT_HEADER = "X-OAAP-Gate-Tenant"
 GATE_TARGET_HEADER = "X-OAAP-Gate-Target"
@@ -2422,7 +2424,13 @@ def gate_door(name, rest=""):
         label = rec.get("label") or user.get("display_name") or user["username"]
         text = gates.ping_text(gate, _label_of(tid) or tid, label, rec.get("expires", ""),
                                proc, now)
+        st = ((_load(GATE_STATS_FILE, None) or {}).get("gates") or {}).get(
+            gates.gate_key(tid, gate["name"])) or {}
+        last = st.get("last_delivery") if isinstance(st, dict) else ""
+        text = text.rstrip("\n") + "\nZuletzt angenommen: " + (
+            f"{last} (gezaehlt jede Minute)" if last else "noch nie") + "\n"
         return _gate_answer(200, text, {
+            "last_delivery": last or "",
             "gate": gate["name"], "tenant": _label_of(tid) or tid, "access": label,
             "expires": rec.get("expires", ""), "process": proc,
             "fields": len(gate["fields"]),

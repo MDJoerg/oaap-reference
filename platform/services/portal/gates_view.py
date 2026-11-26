@@ -9,6 +9,8 @@ are tested without a running portal. Changing anything is the host's
 """
 from datetime import datetime, timedelta, timezone
 
+import gate_stats  # the counts (stage 2b); beside this file in the image
+
 CASES_APP_ID = "vorgaenge"        # appctl.CASES_APP_ID
 SCOPE_PREFIX = "oaap.gate:"       # gates.SCOPE_PREFIX
 WARN_DAYS = 14                    # §7: yellow when a key runs out within 14 days
@@ -59,10 +61,11 @@ def access_rows(keys, tid, name, now=None):
     return rows
 
 
-def light(target, accesses):
+def light(target, accesses, counts=None, now=None):
     """(colour, sentence) of one gate (§7). Red: the target is gone or no
-    access is valid. Yellow: a key runs out within 14 days. Green otherwise.
-    Refusals and the usual rhythm come with the gate's own counts (stage 2b)."""
+    access is valid. Yellow: a key runs out within 14 days, refusals today,
+    or a gate used regularly is unusually quiet (stage 2b, gate_stats).
+    Green otherwise."""
     live = [a for a in accesses if a["state"] in ("valid", "soon")]
     if not target:
         return "red", "kein Ziel: keine Vorgänge-Instanz für diesen Prozess"
@@ -70,6 +73,15 @@ def light(target, accesses):
         return "red", "kein gültiger Zugang"
     if any(a["state"] == "soon" for a in live):
         return "yellow", f"ein Schlüssel läuft in weniger als {WARN_DAYS} Tagen ab"
+    if counts:
+        n = counts["today"]["refused_n"]
+        if n:
+            return "yellow", f"heute {n} abgelehnt"
+        quiet = gate_stats.unusually_quiet(counts, now)
+        if quiet:
+            return "yellow", quiet
+        if counts["last_delivery"]:
+            return "green", "in Gebrauch"
     return "green", "bereit"
 
 
@@ -79,9 +91,30 @@ def last_use(accesses):
     return used[0] if used else ""
 
 
-def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None):
-    """Everything the page shows of one tenant: processes and gates."""
+def counts_row(c):
+    """The page's line of a gate's counts (stage 2b)."""
+    def refused(r):
+        return ", ".join(f"{gate_stats.REASON_TITLES.get(k, k)} {n}"
+                         for k, n in sorted(r.items(), key=lambda x: -x[1]))
+    t, w = c["today"], c["window"]
+    return {"today": f"{t['delivered']} angenommen, {t['refused_n']} abgelehnt"
+                     + (f" ({refused(t['refused'])})" if t["refused_n"] else "")
+                     + f", {t['ping']} Ping",
+            "window": f"{w['delivered']} angenommen, {w['refused_n']} abgelehnt"
+                      + (f" ({refused(w['refused'])})" if w["refused_n"] else "")
+                      + f", {w['ping']} Ping",
+            "last_delivery": c["last_delivery"], "last_ping": c["last_ping"],
+            "last_refusal": c["last_refusal"] + (
+                f" ({gate_stats.REASON_TITLES.get(c['last_refusal_reason'], '')})"
+                if c["last_refusal"] and c["last_refusal_reason"] else "")}
+
+
+def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None, stats=None):
+    """Everything the page shows of one tenant: processes and gates.
+    `stats` is gate-stats.json (stage 2b) or None."""
     doc = doc or {}
+    sg = (stats or {}).get("gates") if isinstance((stats or {}).get("gates"), dict) else {}
+    epoch = now.timestamp() if isinstance(now, datetime) else None
     procs = {p["name"]: p for p in (doc.get("processes") or {}).values()
              if p.get("tenant") == tid}
     proc_rows = []
@@ -98,17 +131,67 @@ def tenant_view(doc, tid, instances, keys, resolve, url_of, now=None):
         proc = procs.get(g.get("process") or "")
         target = case_target(instances, tid, proc, resolve)
         acc = access_rows(keys, tid, g["name"], now)
-        colour, why = light(target, acc)
+        counts = gate_stats.summary(sg.get(f"{tid}/{g['name']}"), epoch)
+        colour, why = light(target, acc, counts, epoch)
         row = {"name": g["name"], "user": g.get("user") or g["name"],
                "process": g.get("process") or "", "process_missing": proc is None,
                "target": target, "url": url_of(g["name"]),
                "fields": [f.get("name", "") + ("*" if f.get("required") else "")
                           for f in g.get("fields") or []],
-               "accesses": acc, "light": colour, "why": why, "last_use": last_use(acc)}
+               "field_rows": field_rows(g.get("fields") or []),
+               "accesses": acc, "light": colour, "why": why, "last_use": last_use(acc),
+               "counts": counts_row(counts)}
         gate_rows.append(row)
         if g.get("process") in by_proc:
             by_proc[g["process"]]["gates"].append(g["name"])
     return {"processes": proc_rows, "gates": gate_rows}
+
+
+FIELD_TYPES = (("text", "Text"), ("number", "Zahl"), ("timestamp", "Zeitpunkt (UTC)"),
+               ("date", "Datum"), ("yesno", "Ja/Nein"), ("choice", "Auswahl"))
+FIELD_TARGETS = (("ref", "Referenz"), ("title", "Titel"), ("text", "Text"),
+                 ("tech", "technisches Feld"))
+BLANK_ROWS = 2
+
+
+def field_rows(fields):
+    """The rows of the field editor (stage 2b): the gate's fields as the
+    form shows them, then BLANK_ROWS empty ones to add a field."""
+    rows = []
+    for f in fields:
+        rows.append({"name": f.get("name", ""), "type": f.get("type", "text"),
+                     "max": f.get("max", "") if f.get("type", "text") == "text" else "",
+                     "required": bool(f.get("required")), "to": f.get("to", "tech"),
+                     "choices": ", ".join(f.get("choices") or []),
+                     "description": f.get("description", ""), "sample": f.get("sample", "")})
+    rows += [{"name": "", "type": "text", "max": "", "required": False, "to": "tech",
+              "choices": "", "description": "", "sample": ""} for _ in range(BLANK_ROWS)]
+    return rows
+
+
+def fields_from_form(get, n):
+    """The field list from the editor's form (`get(key)` -> str or None)
+    -> list for gates.check_fields, which the host runs. Empty rows and
+    rows ticked "entfernen" fall out; nothing else is judged here."""
+    out = []
+    for i in range(min(int(n), 60)):
+        name = (get(f"f{i}_name") or "").strip().lower()
+        if not name or get(f"f{i}_drop"):
+            continue
+        f = {"name": name[:40], "type": (get(f"f{i}_type") or "text").strip()[:12],
+             "required": bool(get(f"f{i}_required")), "to": (get(f"f{i}_to") or "tech")[:8],
+             "description": (get(f"f{i}_description") or "").strip()[:200]}
+        mx = (get(f"f{i}_max") or "").strip()
+        if mx and f["type"] == "text":
+            f["max"] = mx[:6]
+        ch = [c.strip() for c in (get(f"f{i}_choices") or "").split(",") if c.strip()]
+        if ch:
+            f["choices"] = ch[:30]
+        sm = (get(f"f{i}_sample") or "").strip()
+        if sm:
+            f["sample"] = sm[:200]
+        out.append(f)
+    return out
 
 
 def sm59(url, user):

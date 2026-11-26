@@ -17579,7 +17579,7 @@ ASSET_KIND_TEXT = {
     "source": ("Bezugsquellen", "Bezugsquelle"), "model": ("Modellnamen", "Modellname"),
     "key": ("Schlüssel", "Schlüssel"), "cohort": ("Kohorten", "Kohorte"),
     "signin": ("Anmeldungen", "Anmeldung"), "tool": ("Werkzeuge", "Werkzeug"),
-    "agent": ("Agenten", "Agent")}
+    "agent": ("Agenten", "Agent"), "gate": ("Tore", "Tor"), "access": ("Zugänge", "Zugang")}
 ASSET_STATE_TEXT = {"ok": "erreichbar", "down": "nicht erreichbar", "idle": "ruhig",
                     "unknown": "unbekannt", "present": "vorhanden", "removed": "entfernt",
                     "paused": "angehalten"}
@@ -18173,8 +18173,9 @@ def tenant_egress_act(op):
 # the host and identity get only its hash, as with the creation grant.
 
 GATES_FILE = "/apps-registry/gates.json"
+GATE_STATS_FILE = "/apps-registry/gate-stats.json"   # stage 2b, the node counts
 GATE_WAIT_SECONDS = 60
-GATE_OPS = ("process", "add", "access", "revoke", "remove")
+GATE_OPS = ("process", "add", "fields", "access", "revoke", "remove")
 _GATE_NAME = _re.compile(r"^[a-z][a-z0-9-]{1,39}$")
 
 
@@ -18188,10 +18189,15 @@ def _gates_doc():
 
 
 def _gates_view(tid, label):
+    try:
+        with open(GATE_STATS_FILE, encoding="utf-8") as f:
+            stats = json.load(f)
+    except (OSError, ValueError):
+        stats = None
     return gates_view.tenant_view(
         _gates_doc(), tid, load_instances(), identity_keys(), resolve_tenant,
         lambda n: _place_url(label, f"/gate/{n}") if label else
-        (f"https://{external_host()}/gate/{n}" if external_host() else ""))
+        (f"https://{external_host()}/gate/{n}" if external_host() else ""), stats=stats)
 
 
 GATES_BODY = """
@@ -18222,6 +18228,10 @@ In SAP ist das eine Destination in SM59; der Verbindungstest ist der Ping.</p>
       <tr><th>Felder</th><td class="muted">{{ g.fields|join(", ") }} (* Pflicht) ·
         Vorlage: <code>{{ (g.url or "/gate/" ~ g.name) }}/template?form=placeholders</code></td></tr>
       <tr><th>Zuletzt benutzt</th><td>{{ g.last_use or "nie" }}</td></tr>
+      <tr><th>Heute</th><td>{{ g.counts.today }}</td></tr>
+      <tr><th>14 Tage</th><td>{{ g.counts.window }}</td></tr>
+      <tr><th>Zuletzt</th><td class="muted">angenommen {{ g.counts.last_delivery or "nie" }} ·
+        Ping {{ g.counts.last_ping or "nie" }} · abgelehnt {{ g.counts.last_refusal or "nie" }}</td></tr>
     </table>
     <h4>Zugänge</h4>
     {% if g.accesses %}
@@ -18250,6 +18260,38 @@ In SAP ist das eine Destination in SM59; der Verbindungstest ist der Ping.</p>
       <label>Gültig (Tage) <input name="days" type="number" min="1" max="365" value="90" style="width:6rem"></label>
       <button>Zugang ausstellen</button>
     </form>
+    <details><summary class="muted">Felder bearbeiten</summary>
+      <form method="post" action="/tore/fields{{ q }}">
+        <input type="hidden" name="name" value="{{ g.name }}">
+        <input type="hidden" name="n" value="{{ g.field_rows|length }}">
+        <table>
+          <tr><th>Name</th><th>Typ</th><th>Länge</th><th>Pflicht</th><th>Geht in</th>
+            <th>Auswahlwerte</th><th>Beschreibung</th><th>Beispiel</th><th>entfernen</th></tr>
+          {% for f in g.field_rows %}{% set i = loop.index0 %}
+          <tr>
+            <td><input name="f{{ i }}_name" value="{{ f.name }}" maxlength="40" size="10"
+                       pattern="[a-z][a-z0-9_]{0,39}"{% if not f.name %} placeholder="neu"{% endif %}></td>
+            <td><select name="f{{ i }}_type">{% for k, w in field_types %}
+              <option value="{{ k }}"{% if k == f.type %} selected{% endif %}>{{ w }}</option>{% endfor %}</select></td>
+            <td><input name="f{{ i }}_max" value="{{ f.max }}" type="number" min="1" max="10000" style="width:5rem"></td>
+            <td><input type="checkbox" name="f{{ i }}_required" value="1"{% if f.required %} checked{% endif %}></td>
+            <td><select name="f{{ i }}_to">{% for k, w in field_targets %}
+              <option value="{{ k }}"{% if k == f.to %} selected{% endif %}>{{ w }}</option>{% endfor %}</select></td>
+            <td><input name="f{{ i }}_choices" value="{{ f.choices }}" size="12" placeholder="a, b, c"></td>
+            <td><input name="f{{ i }}_description" value="{{ f.description }}" maxlength="200" size="20"></td>
+            <td><input name="f{{ i }}_sample" value="{{ f.sample }}" maxlength="200" size="12"></td>
+            <td>{% if f.name %}<input type="checkbox" name="f{{ i }}_drop" value="1">{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </table>
+        <p class="muted">Genau ein Feld geht in die <strong>Referenz</strong> und eines in den
+        <strong>Titel</strong> (beide Pflicht), höchstens eines in den <strong>Text</strong>;
+        alles andere wird ein technisches Feld des Vorgangs. Länge nur bei Text. Die Vorlagen
+        entstehen aus dieser Liste — was das Tor beschreibt und was es annimmt, ist dasselbe.
+        Unbekannte Felder lehnt das Tor mit ihrem Namen ab.</p>
+        <button>Felder speichern</button>
+      </form>
+    </details>
     <details><summary class="muted">Tor ändern oder entfernen</summary>
       <form method="post" action="/tore/add{{ q }}" class="row">
         <input type="hidden" name="name" value="{{ g.name }}">
@@ -18340,7 +18382,8 @@ def _gates_render(tid, label, role, msg=None, error=None):
     named = role == "server_admin" and tid != default_tenant_id()
     return page(GATES_BODY, "Tore", "gates", v=_gates_view(tid, label),
                 label=(label if tid != default_tenant_id() else ""),
-                kinds=dict(gates_view.CASE_KINDS),
+                kinds=dict(gates_view.CASE_KINDS), field_types=gates_view.FIELD_TYPES,
+                field_targets=gates_view.FIELD_TARGETS,
                 q=(f"?tenant={quote(label)}" if named else ""), msg=msg, error=error)
 
 
@@ -18382,6 +18425,12 @@ def gates_post(op):
         v = (request.form.get(k) or "").strip()[:mx]
         if v:
             args[k] = v
+    if op == "fields":
+        try:
+            n = int(request.form.get("n") or 0)
+        except ValueError:
+            n = 0
+        args["fields"] = gates_view.fields_from_form(request.form.get, n)
     if op == "remove":
         if not request.form.get("confirm"):
             return redirect(f"{back}{joiner}err=" + quote("Bitte „wirklich“ ankreuzen."), code=303)

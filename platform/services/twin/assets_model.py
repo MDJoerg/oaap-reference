@@ -15,12 +15,14 @@ prefix `assets` (ak()), because attribute and relation keys are node-wide.
 
 ORIGIN = "platform:assets"
 PACKAGE = "oaap-assets"
-VERSION = "0.1.0"
+VERSION = "0.2.0"     # 0.2.0: gates and their accesses (RFC-0135 stage 2b)
 
 APP, ITEM = "AssetApp", "AssetItem"
 
 # what a door may name (RFC-0088 §2); stage 1 writes every kind it is given
-KINDS = ("source", "model", "key", "cohort", "signin", "tool", "agent")
+# 0.2.0: `gate` and `access` are the platform's own (RFC-0135 stage 2b) -- the
+# node names them, no app's door does
+KINDS = ("source", "model", "key", "cohort", "signin", "tool", "agent", "gate", "access")
 STATES = ("ok", "down", "idle")
 REMOVED = "removed"
 
@@ -50,6 +52,11 @@ _ATTRS = [
     ("used", "decimal", _own("TenantAssets/0/1/Item/Used"), "Verbraucht"),
     ("seats", "int", _own("TenantAssets/0/1/Item/Seats"), "Plätze"),
     ("owner", "text", _own("TenantAssets/0/1/Item/Owner"), "Verantwortlich"),
+    # 0.2.0, a gate (RFC-0135 §7): today's counts and the last delivery and ping
+    ("deliveredToday", "int", _own("TenantAssets/0/1/Item/DeliveredToday"), "Heute angenommen"),
+    ("refusedToday", "int", _own("TenantAssets/0/1/Item/RefusedToday"), "Heute abgelehnt"),
+    ("lastDelivery", "datetime", _own("TenantAssets/0/1/Item/LastDelivery"), "Zuletzt angenommen"),
+    ("lastPing", "datetime", _own("TenantAssets/0/1/Item/LastPing"), "Zuletzt Ping"),
 ]
 
 GROUPS = [
@@ -58,7 +65,8 @@ GROUPS = [
      "App"),
     ("oaap.assetitem", ITEM, _own("TenantAssets/0/1/Item"),
      ["name", "kind", "state", "light", "checked", "checkedOk", "modelCount", "upstream",
-      "destination", "expires", "budget", "used", "seats", "owner"],
+      "destination", "expires", "budget", "used", "seats", "owner",
+      "deliveredToday", "refusedToday", "lastDelivery", "lastPing"],
      ["assetOf", "uses", "mayUse", "toolOf", "opens", "agentUses"], "Asset"),
 ]
 
@@ -82,7 +90,7 @@ OBJECTS = [
 # The text series of an asset's state over time (RFC-0086), one per source
 # and model name: "when was the gaming PC unreachable last week".
 TEXT_STATE = "state"
-SERIES_KINDS = ("source", "model")
+SERIES_KINDS = ("source", "model", "gate")
 
 
 def ak(name):

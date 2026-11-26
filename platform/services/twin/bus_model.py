@@ -493,6 +493,27 @@ PLATFORM_TYPES.update({
         dict(_OBJ, **{"from": {"type": ["string", "null"], "maxLength": 80},
                       "to": {"type": "string", "maxLength": 80}}), ("type", "to")),
 })
+# RFC-0135 stage 2b: what happened at a gate, counted by the node from the
+# gateway's access log (gate_stats.py). Audience `tenant`: an app of the
+# tenant holds a grant like for any other type. No payload, no access, no
+# case number -- the log has none of them, the target keeps them.
+_GATE = {"gate": {"type": "string", "maxLength": 40},
+         "status": {"type": "integer", "minimum": 100, "maximum": 599}}
+PLATFORM_TYPES.update({
+    "oaap.gate.delivery.accepted.v1": {
+        "publisher": "node", "audience": "tenant", "subject": "gate",
+        "title": "Ein Tor hat eine Lieferung angenommen",
+        "semantic_id": "urn:oaap:concept:gate:delivery:accepted",
+        "schema": {"type": "object", "properties": dict(_GATE),
+                   "required": ["gate", "status"], "additionalProperties": False}},
+    "oaap.gate.delivery.refused.v1": {
+        "publisher": "node", "audience": "tenant", "subject": "gate",
+        "title": "Ein Tor hat eine Lieferung abgelehnt",
+        "semantic_id": "urn:oaap:concept:gate:delivery:refused",
+        "schema": {"type": "object", "properties": dict(_GATE, reason={
+            "type": "string", "enum": ["anmeldung", "inhalt", "zu_gross", "zu_viele", "ziel"]}),
+            "required": ["gate", "status", "reason"], "additionalProperties": False}},
+})
 for _t, _p in PLATFORM_TYPES.items():
     _p.update(type=_t, listed=[], personal=False)
 

@@ -24,9 +24,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # bus_model.py and bus_door.py are the event bus (oaap.events.bus 0.1,
 # RFC-0127): the pure rules, shared with appctl, and the door /bus/v1;
 # bus_push.py the push into the app, run by the 'bus' service (0.3).
+# gate_events.py hands the gates' events to the bus (RFC-0135 stage 2b):
+# the host runs it here when its outbox has something (docker exec).
 COPY app.py relay.py timeseries.py ts_admin.py fleet.py \
      twin_write.py twin_read.py twin_values.py twin_sync.py twin_inbound.py twin_status.py hooks.py semantic.py fleet_model.py fleet_twin.py fleet_sink.py \
      fleet_affected.py assets_model.py assets_twin.py assets_run.py mcp_door.py \
-     bus_model.py bus_door.py bus_push.py ./
+     bus_model.py bus_door.py bus_push.py gate_events.py ./
 EXPOSE 8000
 CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:app"]

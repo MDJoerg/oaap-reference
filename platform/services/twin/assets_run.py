@@ -168,7 +168,11 @@ def run_tenant(tid, insts, now, secrets_map):
         return res
     answers = {}
     for name, spec in sorted(insts.items()):
-        answers[name] = (ask(name) if spec.get("ask") else "paused") or "unknown"
+        if isinstance(spec.get("answer"), dict):
+            # the node's own assets (RFC-0135 stage 2b: gates), same rules
+            answers[name] = at.read_tenant_answer(spec["answer"]) or "unknown"
+        else:
+            answers[name] = (ask(name) if spec.get("ask") else "paused") or "unknown"
         res["instances"][name] = answers[name] if isinstance(answers[name], str) else "ok"
     conn = drv = None
     try:
