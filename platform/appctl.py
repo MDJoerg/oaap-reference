@@ -21870,6 +21870,16 @@ def _platform_site_lines(routes, groups, scope, tenant, login_only):
                       "\t\t\treverse_proxy twin:8000 {"]
             lines += [f"\t\t\t\theader_up {h} {v}" for h, v in zip(SOURCE_HEADERS, source)]
             lines += ["\t\t\t}", "\t\t}", "\t}"]
+    # RFC-0134 D10 (a): the agent's assertion door. An instance that holds
+    # an agent's key (limited to this instance) asks here for an assertion
+    # addressed to itself; identity answers only for a machine principal
+    # with a fixed claim (`oaap machine propagate`). The query is written
+    # here -- `rewrite *` replaces whatever the client sent.
+    if scope and not login_only and not is_rehearsal(me):
+        q = f"instance={scope}&tenant={tenant or instance_tenant_ref(me)}"
+        lines += ["\thandle /platform/assertion {", "\t\troute {",
+                  f"\t\t\trewrite * /agent-assertion?{q}",
+                  "\t\t\treverse_proxy identity:8000", "\t\t}", "\t}"]
     # RFC-0126 (D1): the instance's people door. Only the key scoped to
     # people_scope(this instance) passes; identity answers under /people/v1
     # and believes the source only when its principal names this instance.
@@ -29960,9 +29970,14 @@ def cmd_machine(args):
         for u in machines:
             groups = ",".join(u.get("groups") or []) or "-"
             status = "active" if u["active"] else "INACTIVE"
+            fixed = u.get("fixed_propagate") or {}
+            claims = ("  claims " + ",".join(f"{k}={v}" for k, v in sorted(fixed.items()))
+                      if fixed else "")
             print(f"{u['username']:<24} roles={','.join(u['roles']):<24} "
-                  f"groups={groups:<18} {status}")
+                  f"groups={groups:<18} {status}{claims}")
         return
+    if args.action == "propagate":
+        return _machine_propagate(args)
 
     name = (args.name or "").strip().lower()
     if not name:
@@ -30010,6 +30025,67 @@ def cmd_machine(args):
           f"'{tenant_label(tid) or 'default'}' with roles {','.join(roles)}.")
     print("It has no password and cannot use the login form. Give it a key:")
     print(f"  sudo oaap key issue {name}")
+
+
+def _machine_propagate(args):
+    """`oaap machine propagate NAME --tenant T --set sap_user=OAAP_SPZ_AN`
+    (or `--clear`): the claims an agent carries to a propagation
+    destination (RFC-0134 D10 (a)).
+
+    Only for a machine principal, only claims a sign-in could carry
+    (identity's own filter), and replacing what was there -- the same rule
+    a sign-in follows. Its own act with its own audit entry, because it
+    decides which user in a target system the agent becomes."""
+    name = (args.name or "").strip().lower()
+    if not name or not args.tenant or not (args.set or args.clear):
+        die("usage: oaap machine propagate NAME --tenant T --set sap_user=USER "
+            "[--set ...] | --clear")
+    tid = resolve_tenant(args.tenant) or tenant_by_label(args.tenant)[0]
+    if tid is None:
+        die(f"this node has no tenant '{args.tenant}'")
+    want = {}
+    for item in args.set or []:
+        k, sep, v = item.partition("=")
+        if not sep or not k.strip() or not v.strip():
+            die(f"--set wants claim=value, got '{item}'")
+        want[k.strip()] = v.strip()
+    out = _identity_exec(
+        "import json, os, app as m, idp\n"
+        "a = json.loads(os.environ['OAAP_P_ARGS'])\n"
+        "with m.users_rw() as users:\n"
+        "    u = m.find_user(users, a['name'])\n"
+        "    if not u or u.get('kind') != 'machine':\n"
+        "        r = {'error': 'no machine principal with this name'}\n"
+        "    elif m.resolve_tenant(u.get('tenant')) != a['tenant']:\n"
+        "        r = {'error': 'this principal belongs to another tenant'}\n"
+        "    else:\n"
+        "        keep = idp.propagation_from(a['want'])\n"
+        "        bad = sorted(set(a['want']) - set(keep))\n"
+        "        if bad:\n"
+        "            r = {'error': 'not a claim a sign-in could carry: ' + ', '.join(bad)}\n"
+        "        else:\n"
+        "            if keep:\n"
+        "                u['fixed_propagate'] = keep\n"
+        "            else:\n"
+        "                u.pop('fixed_propagate', None)\n"
+        "            m.save_users(users)\n"
+        "            r = {'ok': True, 'claims': keep}\n"
+        "print(json.dumps(r))\n",
+        {"OAAP_P_ARGS": json.dumps({"name": name, "tenant": tid,
+                                    "want": {} if args.clear else want})})
+    res = json.loads(out.strip().splitlines()[-1])
+    if res.get("error"):
+        die(res["error"])
+    claims = res["claims"]
+    shown = ",".join(f"{k}={v}" for k, v in sorted(claims.items())) or "none"
+    audit_tenant("machine.propagate", tid, subject=name, detail="claims: " + shown,
+                 who=os.environ.get("SUDO_USER") or "root")
+    if claims:
+        print(f"'{name}' now carries {shown} to a propagation destination "
+              f"(an instance asks for it at /platform/assertion with a key of "
+              f"'{name}' limited to that instance).")
+    else:
+        print(f"'{name}' carries no claims any more.")
 
 
 def _key_issue_broker(args):
@@ -43490,7 +43566,7 @@ def build_parser():
     pz.set_defaults(fn=cmd_authz)
     pm = sub.add_parser("machine", help="machine principals (RFC-0027) -- "
                         "accounts that authenticate by key, never by password")
-    pm.add_argument("action", choices=["add", "list"])
+    pm.add_argument("action", choices=["add", "list", "propagate"])
     pm.add_argument("name", nargs="?")
     pm.add_argument("--roles", default="user",
                     help="comma-separated, default 'user'; server_admin refused")
@@ -43499,6 +43575,12 @@ def build_parser():
     pm.add_argument("--tenant", default="",
                     help="tenant label or id; default is this node's default tenant")
     pm.add_argument("--title", default="", help="display name")
+    pm.add_argument("--set", action="append", default=[],
+                    help="propagate: claim=value an agent carries to a "
+                         "propagation destination, e.g. sap_user=OAAP_SPZ_AN "
+                         "(repeatable; replaces what was set) -- RFC-0134")
+    pm.add_argument("--clear", action="store_true",
+                    help="propagate: remove every fixed claim")
     pm.set_defaults(fn=cmd_machine)
     pk = sub.add_parser("key", help="API keys (RFC-0027) -- issue, list, revoke")
     pk.add_argument("action", choices=["issue", "list", "revoke"])

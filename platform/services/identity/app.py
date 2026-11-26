@@ -713,7 +713,11 @@ def public_user(u):
             "delete_at": u.get("delete_at", ""),
             "schedule_reason": u.get("schedule_reason", ""),
             # oaap.core.tenant 2.8.1: which roles a realm group gave.
-            "role_source": dict(u.get("role_source") or {})}
+            "role_source": dict(u.get("role_source") or {}),
+            # RFC-0134 D10 (a): what an agent becomes in a target system --
+            # shown to whoever lists machines, it is the reason to look.
+            **({"fixed_propagate": dict(u["fixed_propagate"])}
+               if u.get("kind") == "machine" and u.get("fixed_propagate") else {})}
 
 
 def _header_value(value):
@@ -773,6 +777,27 @@ def user_assertion(user, instance):
                           resolve_tenant(user.get("tenant")) or "",
                           instance,
                           (user.get("idp") or {}).get("propagate") or {})
+
+
+def machine_assertion(user, instance):
+    """RFC-0134 D10 (a): an assertion for a MACHINE principal (an agent of
+    RFC-0067), or "".
+
+    Only from the claims the operator fixed on its record
+    (`fixed_propagate`, `oaap machine propagate`) -- never from a sign-in,
+    which a machine never has, and never for a person: a person's claims
+    come from their sign-in and nowhere else (user_assertion). The claims
+    pass the same filter as a sign-in's (idp.propagation_from), so a fixed
+    claim can name nothing a provider could not have named."""
+    if not instance or user.get("kind") != "machine":
+        return ""
+    prop = idp.propagation_from(user.get("fixed_propagate") or {})
+    if not prop:
+        return ""
+    return assertion.mint(assertion_key(), user.get("id", ""),
+                          user.get("username", ""),
+                          resolve_tenant(user.get("tenant")) or "",
+                          instance, prop)
 
 
 def user_idp(user):
@@ -2192,6 +2217,45 @@ def verify():
     # that, whoever it belongs to, so it gets the header empty.
     return "", 204, identity_headers(
         user, "" if _method == "key" else request.args.get("instance", ""))
+
+
+@app.get("/agent-assertion")
+def agent_assertion():
+    """RFC-0134 D10 (a): the platform answers an instance's question "an
+    assertion for the agent whose key I hold, addressed to me".
+
+    Reached only through the reserved /platform/assertion block of an
+    instance site, which writes `instance` and `tenant` itself (a client's
+    query never arrives). The key must be limited to exactly that instance
+    and belong to a machine principal with a fixed claim of the same tenant.
+    The answer is the assertion and nothing else; connect checks it like a
+    person's. A session is refused: a person's assertion comes with every
+    request through the gateway and needs no door."""
+    instance = request.args.get("instance", "")
+    if not instance:
+        return {"error": "no instance"}, 400
+    auth = request.headers.get("Authorization", "")
+    if auth[:7].lower() != "bearer ":
+        return {"error": "a machine's key is required"}, 401
+    user, method, refusal = _by_key(auth[7:].strip(), instance)
+    if refusal is not None:
+        return refusal
+    m = KEY_TOKEN_RE.fullmatch(auth[7:].strip())
+    rec = next((k for k in load_keys() if m and k["id"] == m.group(1)), None)
+    # _by_key lets an UNscoped key pass anywhere; this door wants the key
+    # limited to exactly this instance, so it cannot be used for another.
+    if user.get("kind") != "machine" or not rec or rec.get("instance") != instance:
+        return {"error": "only a machine's key limited to this instance"}, 403
+    want = resolve_tenant(request.args.get("tenant", ""))
+    if want is None or resolve_tenant(user.get("tenant")) != want:
+        return {"error": "this principal belongs to another tenant"}, 403
+    tok = machine_assertion(user, instance)
+    if not tok:
+        return {"error": "no claim is fixed for this principal "
+                         "(oaap machine propagate)"}, 404
+    resp = make_response({"assertion": tok, "expires_in": assertion.LIFETIME})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.get("/auth/login")

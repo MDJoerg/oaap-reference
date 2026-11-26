@@ -391,6 +391,78 @@ else:
     ok("dieselbe Kopfzeilenliste wie appctl",
        set(h) == set(m.IDENTITY_HEADERS), set(h) ^ set(m.IDENTITY_HEADERS))
 
+    # RFC-0134 D10 (a): ein Agent (Maschine) mit festem Anspruch
+    agent = {"username": "spez-analyse", "roles": ["user"], "id": "uuid-agent",
+             "kind": "machine", "tenant": "default", "active": True,
+             "fixed_propagate": {"sap_user": "OAAP_SPZ_AN"}}
+    claims, why = propagate.check_assertion(
+        KEY, ident.machine_assertion(agent, "probe"), "probe")
+    ok("Maschine mit festem Anspruch: Zusicherung fuer diese Instanz, mit sap_user",
+       not why and claims["prop"] == {"sap_user": "OAAP_SPZ_AN"}
+       and claims["sub"] == "uuid-agent", why)
+    ok("Maschine: die Kopfzeile bleibt trotzdem leer (nur die eigene Tuer gibt sie)",
+       ident.identity_headers(agent, "probe")["X-OAAP-User-Assertion"] == "")
+    ok("eine Person mit fixed_propagate bekommt daraus NICHTS (nur aus der Anmeldung)",
+       ident.machine_assertion(dict(agent, kind="human"), "probe") == "")
+    ok("Maschine ohne festen Anspruch: leer",
+       ident.machine_assertion(dict(agent, fixed_propagate={}), "probe") == "")
+    ok("ein Anspruch, den keine Anmeldung tragen koennte, faellt weg",
+       ident.machine_assertion(dict(agent, fixed_propagate={"role": "SAP_ALL"}), "probe") == "")
+    ok("Maschine ohne Instanz: leer", ident.machine_assertion(agent, "") == "")
+
+    # die Tuer /agent-assertion (hinter /platform/assertion der Instanz-Site)
+    import json as _json
+    users_file = os.path.join(idata, "users.json")
+    ident.load_users = lambda: [agent, dict(agent, username="ohne", id="uuid-ohne",
+                                            fixed_propagate={})]
+    keys = []
+
+    def _mkkey(kid, principal, instance):
+        from werkzeug.security import generate_password_hash
+        keys.append({"id": kid, "principal": principal, "roles": ["user"],
+                     "instance": instance, "hash": generate_password_hash("s" * 22),
+                     "revoked": False, "expires": ""})
+        return f"oaapk_{kid}_" + "s" * 22
+    ident.load_keys = lambda: keys
+    ident._touch_key = lambda kid: None
+    k_good = _mkkey("aaaa0001", "spez-analyse", "probe")
+    k_other = _mkkey("aaaa0002", "spez-analyse", "andere")
+    k_wide = _mkkey("aaaa0003", "spez-analyse", "")
+    k_none = _mkkey("aaaa0004", "ohne", "probe")
+    cl = ident.app.test_client()
+
+    def ask(key, q="instance=probe&tenant=default"):
+        r = cl.get("/agent-assertion?" + q,
+                   headers={"Authorization": "Bearer " + key} if key else {})
+        try:
+            return r.status_code, _json.loads(r.data or b"{}")
+        except ValueError:
+            return r.status_code, {}
+    st, doc = ask(k_good)
+    claims, why = propagate.check_assertion(KEY, doc.get("assertion", ""), "probe")
+    ok("Tuer: Schluessel des Agenten fuer diese Instanz -> 200 mit pruefbarer Zusicherung",
+       st == 200 and not why and claims["prop"] == {"sap_user": "OAAP_SPZ_AN"}, (st, doc, why))
+    st, _ = ask(k_other)
+    ok("Tuer: Schluessel fuer eine andere Instanz -> 403", st == 403, st)
+    st, _ = ask(k_wide)
+    ok("Tuer: ein Schluessel ohne Instanzgrenze -> 403 (nur fuer genau diese)", st == 403, st)
+    st, doc = ask(k_none)
+    ok("Tuer: Maschine ohne festen Anspruch -> 404 mit Hinweis", st == 404
+       and "oaap machine propagate" in doc.get("error", ""), (st, doc))
+    st, _ = ask(k_good, "instance=probe&tenant=fremd")
+    ok("Tuer: anderer Mandant -> 403", st == 403, st)
+    st, _ = ask("")
+    ok("Tuer: ohne Schluessel -> 401", st == 401, st)
+
+    # die Instanz-Site schreibt die Tuer selbst, die Anfrage des Clients kommt nie an
+    site = "\n".join(m._platform_site_lines([], [], "probe-gw", "T-default", False))
+    ok("Instanz-Site: /platform/assertion schreibt instance und tenant selbst",
+       "handle /platform/assertion {" in site
+       and "rewrite * /agent-assertion?instance=probe-gw&tenant=T-default" in site, site[-600:])
+    site_lo = "\n".join(m._platform_site_lines([], [], "probe-gw", "T-default", True))
+    ok("Instanz-Site im Nur-Anmelden-Zustand: keine Tuer",
+       "/platform/assertion" not in site_lo)
+
 # ---------------------------------------------------------------------------
 print("")
 print("connect: jede Person kommt als sie selbst an -- nichts bleibt haengen")
