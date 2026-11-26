@@ -164,8 +164,22 @@ check("die HTTP-Weiterleitung deckt die zweite Stufe mit ab",
 
 print("\n=== die Grenze steht am Gateway, nicht in der App ===")
 
-body = "\n".join(m.site_body(reg["instances"]["viewer"]["routes"],
-                             "oaap-viewer", 8080, tenant=KUNDE))
+body_all = "\n".join(m.site_body(reg["instances"]["viewer"]["routes"],
+                                 "oaap-viewer", 8080, tenant=KUNDE))
+
+
+def app_routes(text):
+    """Only the app's own routes. Since 0.1.340 (RFC-0118) every instance
+    site carries the platform's door /platform/context.json in front of
+    them, asked with /verify and the instance's tenant like any signed-in
+    route -- that door is the platform's, not one of the app's routes, and
+    counting it here made five checks red without the boundary changing."""
+    return text.split("\thandle /platform/* {", 1)[1]
+
+
+check("vor den Routen der App: die Tür /platform/context.json fragt mit dem Mandanten (RFC-0118)",
+      f"uri /verify?roles=&tenant={KUNDE}" in body_all.split("\thandle /platform/* {", 1)[0])
+body = app_routes(body_all)
 check("jede angemeldete Route traegt den Mandanten der Instanz",
       f"&tenant={KUNDE}" in body)
 check("die oeffentliche Route traegt ihn nicht",
@@ -182,9 +196,9 @@ check("auch die LAN-Adresse der Instanz ist eingegrenzt",
 # das ist -- damit ein API-Schluessel auf eine App begrenzt werden kann.
 # Geprueft wird hier nur die Erzeugung; was identity damit macht, steht
 # in test_api_keys.py.
-body_i = "\n".join(m.site_body(reg["instances"]["viewer"]["routes"],
-                                "oaap-viewer", 8080, tenant=KUNDE,
-                                scope="viewer"))
+body_i = app_routes("\n".join(m.site_body(reg["instances"]["viewer"]["routes"],
+                                           "oaap-viewer", 8080, tenant=KUNDE,
+                                           scope="viewer")))
 check("jede angemeldete Route nennt auch die Instanz (RFC-0027 D5)",
       "&instance=viewer" in body_i)
 check("die oeffentliche Route nennt sie nicht",
@@ -317,7 +331,7 @@ with open(pub_site, "w", encoding="utf-8") as f:
                          "oaap-app-pub", 3000, scope="oeffentlich",
                          throttle=m.throttle_of(reg["instances"]["oeffentlich"]),
                          tenant=DEFAULT))
-site_text = open(pub_site, encoding="utf-8").read()
+site_text = app_routes(open(pub_site, encoding="utf-8").read())
 check("die Bremse benutzt forward_auth, aber nicht /verify",
       "forward_auth" in site_text and "/throttle?" in site_text
       and "/verify?" not in site_text)
