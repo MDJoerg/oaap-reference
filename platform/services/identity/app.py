@@ -148,6 +148,9 @@ GROUP_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 KEYS_FILE = os.path.join(DATA_DIR, "api-keys.json")
 KEY_PREFIX = "oaapk_"   # what makes a bearer OURS (I-44)
 KEY_TOKEN_RE = re.compile(r"^oaapk_([0-9a-f]{8})_([A-Za-z0-9_-]{22,})$")
+# What werkzeug's generate_password_hash writes (scrypt or pbkdf2) -- the only
+# form a hash made elsewhere may have (issue_key with secret_hash).
+KEY_HASH_RE = re.compile(r"^(scrypt:\d+:\d+:\d+|pbkdf2:sha256:\d+)\$[A-Za-z0-9./+=_-]{4,64}\$[0-9a-f]{32,256}$")
 KEY_DEFAULT_DAYS, KEY_MAX_DAYS = 90, 365
 # RFC-0027 D2: no key ever carries platform authority. A leaked
 # server_admin key is the whole node, and unlike a password it lives in
@@ -1129,9 +1132,14 @@ def public_key(k):
 
 
 def issue_key(users, principal, roles, instance, label, days, created_by,
-              terminal=False):
+              terminal=False, secret_hash=None):
     """Mint one key. Returns (record, secret) -- the secret is the only
     time the caller ever sees it.
+
+    With `secret_hash` (RFC-0135 stage 2, the portal's page „Tore“) the
+    caller made the secret itself and hands over only its hash: the record
+    stores that hash and the second value returned is None. The readable
+    key then never passes the spool, the host or this process.
 
     Two ceilings, both checked here and the second one again at use
     (RFC-0027 3.3): a key may not carry more than its PRINCIPAL holds,
@@ -1168,11 +1176,19 @@ def issue_key(users, principal, roles, instance, label, days, created_by,
         kid = secrets.token_hex(4)
         if not any(k["id"] == kid for k in keys):
             break
-    secret = secrets.token_urlsafe(32)
+    if secret_hash is not None:
+        secret_hash = str(secret_hash)
+        if not KEY_HASH_RE.match(secret_hash):
+            raise ValueError("Der Hash des Schluessels hat nicht die Form eines "
+                             "Passwort-Hashes (scrypt/pbkdf2).")
+        secret = None
+    else:
+        secret = secrets.token_urlsafe(32)
+        secret_hash = generate_password_hash(secret)
     rec = {"id": kid, "principal": principal, "tenant": u.get("tenant", ""),
            "roles": sorted(wanted), "instance": (instance or "").strip(),
            "label": (label or "").strip(),
-           "hash": generate_password_hash(secret),
+           "hash": secret_hash,
            "created": _now_iso(), "expires": _in_days_iso(days),
            "last_used": "", "created_by": created_by, "revoked": False,
            # Only a label for the list -- a terminal key is an ordinary
@@ -1181,7 +1197,7 @@ def issue_key(users, principal, roles, instance, label, days, created_by,
            "terminal": bool(terminal)}
     keys.append(rec)
     _save(KEYS_FILE, keys)
-    return rec, f"oaapk_{kid}_{secret}"
+    return rec, (f"oaapk_{kid}_{secret}" if secret is not None else None)
 
 
 def issue_broker_key(kind, name, node, grants, label, days, created_by):

@@ -47,6 +47,8 @@ import relay_view
 import twin_view
 import metrics_view
 import nav_view
+import gates_view
+from werkzeug.security import generate_password_hash
 import tenant_health_view as thv
 import traffic  # noqa: E402  (the hour per host, for the tenant health page)
 import instance_metrics  # noqa: E402  (RFC-0108: the history per instance)
@@ -18160,3 +18162,248 @@ def tenant_egress_act(op):
                         + quote("Bitte bestätigen: das startet Instanzen neu."), code=303)
     rid = management_api.enqueue(tid, role, op, args, action="egress")
     return redirect(f"{back}{joiner}job={rid}", code=303)
+
+
+# --- Tore (RFC-0135 stage 2) ------------------------------------------------
+# The page where the tenant's administrator sets up a way in for another
+# system -- what Jörg asked for on 2026-11-26: the people who set up an
+# interface have no command line. The page reads gates.json, the registry and
+# the keys identity lets the caller see; every change is a request the host
+# judges again (appctl.gate_job). An access's key is made HERE and shown once;
+# the host and identity get only its hash, as with the creation grant.
+
+GATES_FILE = "/apps-registry/gates.json"
+GATE_WAIT_SECONDS = 60
+GATE_OPS = ("process", "add", "access", "revoke", "remove")
+_GATE_NAME = _re.compile(r"^[a-z][a-z0-9-]{1,39}$")
+
+
+def _gates_doc():
+    try:
+        with open(GATES_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return {"gates": {}, "processes": {}}
+    return doc if isinstance(doc, dict) else {"gates": {}, "processes": {}}
+
+
+def _gates_view(tid, label):
+    return gates_view.tenant_view(
+        _gates_doc(), tid, load_instances(), identity_keys(), resolve_tenant,
+        lambda n: _place_url(label, f"/gate/{n}") if label else
+        (f"https://{external_host()}/gate/{n}" if external_host() else ""))
+
+
+GATES_BODY = """
+<div class="pagehead">
+  <h1>Tore{% if label %} · {{ label }}{% endif %}</h1>
+</div>
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+<p class="muted">Ein <strong>Tor</strong> ist der Weg, auf dem ein anderes System — SAP,
+ein Node-RED-Fluss, ein Formular — Arbeit in diesen Mandanten bringt. Es hat eine
+Adresse, seine <strong>Zugänge</strong> (je Absender ein Schlüssel) und einen
+<strong>Prozess</strong>, den es startet: heute einen Vorgang in einer Warteschlange.
+In SAP ist das eine Destination in SM59; der Verbindungstest ist der Ping.</p>
+
+<div class="card">
+  <h2>Tore</h2>
+  {% if not v.gates %}<p>Noch kein Tor. Lege unten zuerst einen Prozess an, dann das Tor.</p>{% endif %}
+  {% for g in v.gates %}
+  <div class="card" style="margin:.8rem 0">
+    <h3><span class="dot {{ {'green':'ok','yellow':'warn','red':'err'}[g.light] }}"></span>{{ g.name }}
+      <span class="muted" style="font-weight:normal">— {{ g.why }}</span></h3>
+    <table>
+      <tr><th>Adresse</th><td><code>{{ g.url or "/gate/" ~ g.name }}</code></td></tr>
+      <tr><th>Benutzer (SM59)</th><td><code>{{ g.user }}</code> · Passwort = der Schlüssel eines Zugangs</td></tr>
+      <tr><th>Prozess</th><td>{{ g.process }}{% if g.process_missing %} <span class="badge off">fehlt</span>
+        {% elif g.target %} → Vorgänge-Instanz <code>{{ g.target }}</code>
+        {% else %} <span class="badge off">keine Vorgänge-Instanz</span>{% endif %}</td></tr>
+      <tr><th>Felder</th><td class="muted">{{ g.fields|join(", ") }} (* Pflicht) ·
+        Vorlage: <code>{{ (g.url or "/gate/" ~ g.name) }}/template?form=placeholders</code></td></tr>
+      <tr><th>Zuletzt benutzt</th><td>{{ g.last_use or "nie" }}</td></tr>
+    </table>
+    <h4>Zugänge</h4>
+    {% if g.accesses %}
+    <table>
+      <tr><th>Absender</th><th>Prinzipal</th><th>Schlüssel</th><th>Gültig bis</th><th>Zuletzt benutzt</th><th></th></tr>
+      {% for a in g.accesses %}
+      <tr>
+        <td>{{ a.label or "–" }}</td><td><code>{{ a.principal }}</code></td><td><code>{{ a.id }}</code></td>
+        <td>{% if a.state == "revoked" %}<span class="badge off">entzogen</span>
+            {% elif a.state == "expired" %}<span class="badge off">abgelaufen</span>
+            {% elif a.state == "soon" %}<span class="badge todo">{{ a.expires }}</span>
+            {% else %}{{ a.expires }}{% endif %}</td>
+        <td class="muted">{{ a.last_used or "nie" }}</td>
+        <td>{% if a.state in ("valid", "soon") %}
+          <form method="post" action="/tore/revoke{{ q }}" style="display:inline">
+            <input type="hidden" name="name" value="{{ g.name }}">
+            <input type="hidden" name="access" value="{{ a.principal }}">
+            <button class="rowaction">Entziehen</button></form>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}<p class="muted">Noch kein Zugang — ohne Zugang kommt niemand durch.</p>{% endif %}
+    <form method="post" action="/tore/access{{ q }}" class="row">
+      <input type="hidden" name="name" value="{{ g.name }}">
+      <label>Absender <input name="label" required maxlength="80" placeholder="SAP A4H 001"></label>
+      <label>Gültig (Tage) <input name="days" type="number" min="1" max="365" value="90" style="width:6rem"></label>
+      <button>Zugang ausstellen</button>
+    </form>
+    <details><summary class="muted">Tor ändern oder entfernen</summary>
+      <form method="post" action="/tore/add{{ q }}" class="row">
+        <input type="hidden" name="name" value="{{ g.name }}">
+        <label>Prozess <select name="process">{% for p in v.processes %}
+          <option value="{{ p.name }}"{% if p.name == g.process %} selected{% endif %}>{{ p.name }}</option>{% endfor %}</select></label>
+        <label>Benutzer <input name="user" value="{{ g.user }}" maxlength="40"></label>
+        <button>Speichern</button>
+      </form>
+      <form method="post" action="/tore/remove{{ q }}" class="row">
+        <input type="hidden" name="name" value="{{ g.name }}">
+        <label><input type="checkbox" name="confirm" value="1"> wirklich — alle Zugänge werden entzogen</label>
+        <button class="danger">Tor entfernen</button>
+      </form>
+    </details>
+  </div>
+  {% endfor %}
+  {% if v.processes %}
+  <h3>Neues Tor</h3>
+  <form method="post" action="/tore/add{{ q }}" class="row">
+    <label>Name <input name="name" required pattern="[a-z][a-z0-9-]{1,39}" maxlength="40" placeholder="sap-support"></label>
+    <label>Prozess <select name="process">{% for p in v.processes %}<option value="{{ p.name }}">{{ p.name }}</option>{% endfor %}</select></label>
+    <label>Benutzer <input name="user" maxlength="40" placeholder="(wie der Name)"></label>
+    <button>Tor anlegen</button>
+  </form>
+  <p class="muted">Ein neues Tor erwartet die Standardfelder <code>ref</code>, <code>title</code>,
+  <code>text</code> (Pflicht), <code>system</code> und <code>occurred</code>.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Prozesse</h2>
+  <p class="muted">Was ein Tor startet. Ein Prozess kann mehrere Tore haben (SAP, Formular, …).</p>
+  {% if v.processes %}
+  <table>
+    <tr><th>Name</th><th>Warteschlange</th><th>Art</th><th>Ziel</th><th>Tore</th></tr>
+    {% for p in v.processes %}
+    <tr><td>{{ p.name }}{% if p.label %} <span class="muted">· {{ p.label }}</span>{% endif %}</td>
+      <td><code>{{ p.queue }}</code></td><td>{{ kinds.get(p.kind, p.kind) }}</td>
+      <td>{% if p.target %}<code>{{ p.target }}</code>{% else %}<span class="badge off">keine Vorgänge-Instanz</span>{% endif %}</td>
+      <td>{{ p.gates|join(", ") or "–" }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  <h3>Prozess anlegen oder ändern</h3>
+  <form method="post" action="/tore/process{{ q }}" class="row">
+    <label>Name <input name="name" required pattern="[a-z][a-z0-9-]{1,39}" maxlength="40" placeholder="sap-anfrage"></label>
+    <label>Warteschlange <input name="queue" maxlength="40" placeholder="eingang"></label>
+    <label>Art <select name="kind">{% for k, w in kinds.items() %}<option value="{{ k }}">{{ w }}</option>{% endfor %}</select></label>
+    <label>Instanz <input name="instance" maxlength="80" placeholder="(die Produktions-Instanz)"></label>
+    <label>Bezeichnung <input name="label" maxlength="80"></label>
+    <button>Speichern</button>
+  </form>
+  <p class="muted">Die Warteschlange ist eine der Vorgänge-Instanz (z. B. <code>sap-support</code>);
+  wer die Arbeit dort aufnimmt, entscheidet ihre Einstellung (Erstbearbeitung, Leitung).</p>
+</div>
+"""
+
+# Rendered directly, NOT via Post/Redirect/Get -- like TOKEN_SHOW_BODY: a
+# reload must not show the key again, and it is in no URL and no log.
+GATE_KEY_BODY = """
+<a class="back" href="/tore{{ q }}">← Zurück zu den Toren</a>
+<h1>Zugang „{{ d.label }}“ zum Tor {{ name }}</h1>
+<div class="card">
+  <p><strong>Dieser Schlüssel wird nur jetzt angezeigt.</strong> Er ist das Passwort
+  des Zugangs; die Plattform hat nur seinen Hash.</p>
+  <p><code style="font-size:1.05rem;word-break:break-all">{{ key }}</code></p>
+  <p class="muted">Gültig bis {{ d.expires[:10] }} · Prinzipal <code>{{ d.principal }}</code> ·
+  Schlüssel <code>{{ d.id }}</code></p>
+</div>
+<div class="card">
+  <h2>In SAP: SM59, Verbindungstyp G</h2>
+  <table>
+    <tr><th>Zielhost</th><td><code>{{ s.host or "(der Host des Mandanten)" }}</code></td></tr>
+    <tr><th>Servicenummer</th><td><code>443</code>, SSL aktiv (Zertifikatskette in STRUST)</td></tr>
+    <tr><th>Pfadpräfix</th><td><code>{{ s.path or "/gate/" ~ name }}</code></td></tr>
+    <tr><th>Anmeldung</th><td>Basis-Authentifizierung · Benutzer <code>{{ s.user }}</code> ·
+      Passwort = der Schlüssel oben</td></tr>
+  </table>
+  <p class="muted">Der Verbindungstest ist der Ping: Er antwortet mit dem Namen des Tors,
+  dem Zugang und seinem Ablauf. Die Vorlage zum Befüllen:
+  <code>{{ d.url or "/gate/" ~ name }}/template?form=placeholders</code>.</p>
+</div>
+<a class="btn" href="/tore{{ q }}">Fertig</a>
+"""
+
+
+def _gates_render(tid, label, role, msg=None, error=None):
+    named = role == "server_admin" and tid != default_tenant_id()
+    return page(GATES_BODY, "Tore", "gates", v=_gates_view(tid, label),
+                label=(label if tid != default_tenant_id() else ""),
+                kinds=dict(gates_view.CASE_KINDS),
+                q=(f"?tenant={quote(label)}" if named else ""), msg=msg, error=error)
+
+
+@app.get("/tore")
+def gates_page():
+    denied = require_user_admin()
+    if denied:
+        return denied
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    return _gates_render(tid, label, role, request.args.get("msg"), request.args.get("err"))
+
+
+@app.post("/tore/<op>")
+def gates_post(op):
+    """One form, one request; the host asks the role again (tenant_admin of
+    this tenant or server_admin) and runs the same function as `oaap gate`."""
+    denied = require_user_admin()
+    if denied:
+        return denied
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    tid, label, role = _messages_target()
+    if tid is None:
+        return role
+    named = role == "server_admin" and tid != default_tenant_id()
+    back = "/tore" + (f"?tenant={quote(label)}" if named else "")
+    joiner = "&" if "?" in back else "?"
+    if op not in GATE_OPS:
+        return redirect(back, code=303)
+    name = (request.form.get("name") or "").strip().lower()
+    if not _GATE_NAME.match(name):
+        return redirect(f"{back}{joiner}err=" + quote(
+            "Name: 2–40 Zeichen, a–z, 0–9 und Bindestrich, am Anfang ein Buchstabe."), code=303)
+    args = {"tenant": tid, "name": name}
+    for k, mx in (("queue", 40), ("kind", 12), ("instance", 80), ("label", 80),
+                  ("process", 40), ("user", 40), ("access", 60), ("days", 4)):
+        v = (request.form.get(k) or "").strip()[:mx]
+        if v:
+            args[k] = v
+    if op == "remove":
+        if not request.form.get("confirm"):
+            return redirect(f"{back}{joiner}err=" + quote("Bitte „wirklich“ ankreuzen."), code=303)
+        args["yes"] = True
+    secret = None
+    if op == "access":
+        if not args.get("label"):
+            return redirect(f"{back}{joiner}err=" + quote(
+                "Wer sendet durch diesen Zugang? z. B. „SAP A4H 001“."), code=303)
+        # Made here, shown once; the host and identity get only the hash.
+        secret = secrets.token_urlsafe(32)
+        args["hash"] = generate_password_hash(secret)
+    res = _queue_and_wait("", {"action": "gate-admin", "op": op, "args": args}, GATE_WAIT_SECONDS)
+    if res is None:
+        return redirect(f"{back}{joiner}err=" + quote(
+            "Der Knoten hat noch nicht geantwortet — bitte gleich neu laden."), code=303)
+    if not res.get("ok"):
+        return redirect(f"{back}{joiner}err=" + quote(res.get("message") or "abgewiesen"), code=303)
+    if op == "access" and isinstance(res.get("detail"), dict) and res["detail"].get("id"):
+        d = res["detail"]
+        return page(GATE_KEY_BODY, f"Zugang {name}", "gates", name=name, d=d,
+                    key=f"oaapk_{d['id']}_{secret}", s=gates_view.sm59(d.get("url") or "",
+                                                                     d.get("user") or name),
+                    q=(f"?tenant={quote(label)}" if named else ""))
+    return redirect(f"{back}{joiner}msg=" + quote(res.get("message") or "gespeichert"), code=303)

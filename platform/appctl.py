@@ -30131,8 +30131,11 @@ def _gate_rewrite():
 
 
 def cmd_gate(args):
-    """`oaap gate` -- gates, their processes and accesses (RFC-0135 stage 1)."""
-    who = os.environ.get("SUDO_USER") or "root"
+    """`oaap gate` -- gates, their processes and accesses (RFC-0135 stage 1).
+
+    Stage 2: the portal's page „Tore“ runs the same function through
+    gate_job, with the person as `who` (args.who)."""
+    who = getattr(args, "who", None) or os.environ.get("SUDO_USER") or "root"
     doc = load_gates()
     act = args.action
     if act == "list":
@@ -30195,7 +30198,10 @@ def cmd_gate(args):
         if gates.gate_key(tid, args.process) not in doc["processes"]:
             die(f"no process '{args.process}' in '{label}' -- create it first: "
                 f"oaap gate process {args.process} --tenant {label} --queue <queue>")
-        fields = gates.DEFAULT_FIELDS
+        was = doc["gates"].get(key)
+        # stage 2: changing a gate (process, user) keeps the fields it has;
+        # only --fields replaces them, a new gate starts with the defaults
+        fields = (was or {}).get("fields") or gates.DEFAULT_FIELDS
         if args.fields:
             try:
                 with open(args.fields, encoding="utf-8") as f:
@@ -30209,7 +30215,6 @@ def cmd_gate(args):
         user = (args.user or name).strip()
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", user):
             die("--user: 1-40 characters, letters, digits, '.', '_', '-' (it is typed into SM59)")
-        was = doc["gates"].get(key)
         doc["gates"][key] = {"tenant": tid, "name": name, "user": user,
                              "process": args.process, "fields": fields,
                              "created": (was or {}).get("created") or _now_iso_z(),
@@ -30255,36 +30260,18 @@ def cmd_gate(args):
         if not args.label:
             die("--label is required: who sends through this access, e.g. 'SAP A4H 001'")
         days = args.days if args.days else GATE_ACCESS_DAYS
-        out = _identity_exec(
-            "import json, os, sys, app as m\n"
-            "a = json.loads(os.environ['OAAP_G_ARGS'])\n"
-            "with m.users_rw() as users:\n"
-            "    n = 1\n"
-            "    while m.find_user(users, f\"gate-{a['name']}-{n}\"):\n"
-            "        n += 1\n"
-            "    p = f\"gate-{a['name']}-{n}\"[:40]\n"
-            "    users.append({'username': p, 'display_name': a['label'], 'password_hash': '',\n"
-            "                  'kind': 'machine', 'roles': ['user'], 'groups': [],\n"
-            "                  'tenant': a['tenant'], 'active': True})\n"
-            "    m.save_users(users)\n"
-            "try:\n"
-            "    rec, secret = m.issue_key(m.load_users(), p, ['user'], a['scope'], a['label'],\n"
-            "                              a['days'], 'root')\n"
-            "except ValueError as e:\n"
-            "    print(str(e), file=sys.stderr); sys.exit(1)\n"
-            "print(json.dumps({'principal': p, 'key': m.public_key(rec), 'secret': secret}))\n",
-            {"OAAP_G_ARGS": json.dumps({"name": name, "tenant": tid, "scope": scope,
-                                        "label": args.label.strip()[:80], "days": days})})
-        res = json.loads(out.strip().splitlines()[-1])
+        res = gate_issue_access(tid, name, args.label, days, who,
+                                getattr(args, "secret_hash", None))
         rec, secret = res["key"], res["secret"]
-        audit_tenant("gate.access", tid, subject=name,
-                     detail=f"principal {res['principal']}, key {rec['id']}, "
-                            f"label {rec['label']}, until {rec['expires'][:10]}", who=who)
         url = gate_url(tid, name)
         host, _, path = (url[len("https://"):] if url else "").partition("/")
         print("")
         print(f"Access '{rec['label']}' to gate '{name}' ({label}): principal "
               f"{res['principal']}, key {rec['id']}, valid until {rec['expires'][:10]}.")
+        if secret is None:
+            # the portal made the key and shows it itself (stage 2)
+            print("The key was made by the portal and is shown there once.")
+            return
         print("")
         print("  " + secret)
         print("")
@@ -30343,6 +30330,108 @@ def cmd_gate(args):
         print(f"Gate '{name}' removed from '{label}'; {len(keys)} key(s) revoked.")
         return
     die(f"unknown action '{act}'")
+
+
+def gate_issue_access(tid, name, label, days, who, secret_hash=None):
+    """One access to a gate (RFC-0135 D4): a machine principal
+    `gate-<name>-<n>` and one key limited to the gate. -> {principal, key
+    (public record), secret or None}. With `secret_hash` the portal made the
+    secret and only its hash comes here (stage 2) -- the readable key never
+    touches the spool or this host. Audited `gate.access`."""
+    label = str(label or "").strip()[:80]
+    if not label:
+        die("--label is required: who sends through this access, e.g. 'SAP A4H 001'")
+    scope = gates.scope(tid, name)
+    out = _identity_exec(
+        "import json, os, sys, app as m\n"
+        "a = json.loads(os.environ['OAAP_G_ARGS'])\n"
+        "with m.users_rw() as users:\n"
+        "    n = 1\n"
+        "    while m.find_user(users, f\"gate-{a['name']}-{n}\"):\n"
+        "        n += 1\n"
+        "    p = f\"gate-{a['name']}-{n}\"[:40]\n"
+        "    users.append({'username': p, 'display_name': a['label'], 'password_hash': '',\n"
+        "                  'kind': 'machine', 'roles': ['user'], 'groups': [],\n"
+        "                  'tenant': a['tenant'], 'active': True})\n"
+        "    m.save_users(users)\n"
+        "try:\n"
+        "    kw = {'secret_hash': a['hash']} if a.get('hash') else {}\n"
+        "    rec, secret = m.issue_key(m.load_users(), p, ['user'], a['scope'], a['label'],\n"
+        "                              a['days'], a['who'], **kw)\n"
+        "except ValueError as e:\n"
+        "    print(str(e), file=sys.stderr); sys.exit(1)\n"
+        "print(json.dumps({'principal': p, 'key': m.public_key(rec), 'secret': secret}))\n",
+        {"OAAP_G_ARGS": json.dumps({"name": name, "tenant": tid, "scope": scope,
+                                    "label": label, "days": days, "who": who or "root",
+                                    "hash": secret_hash or ""})})
+    try:
+        res = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        die("the identity container did not issue the key")
+    rec = res["key"]
+    audit_tenant("gate.access", tid, subject=name,
+                 detail=f"principal {res['principal']}, key {rec['id']}, "
+                        f"label {rec['label']}, until {rec['expires'][:10]}", who=who)
+    return res
+
+
+GATE_ADMIN_OPS = ("process", "add", "access", "revoke", "remove")
+
+
+def gate_job(req, actor):
+    """The portal's page „Tore“ (RFC-0135 stage 2) -> (ok, sentence, detail).
+
+    tenant_admin of the tenant or server_admin, judged from the ACTOR's own
+    record (acting_tenant), never from the request -- the spool is data, not
+    trust. The same function as `oaap gate`, with every check it makes. An
+    access arrives with the HASH of a key the portal made; the detail names
+    the key's id, so the portal can show `oaapk_<id>_<secret>` once."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    tid, role, err = acting_tenant(actor, str(a.get("tenant") or ""))
+    if not tid:
+        return False, err or "requires tenant_admin or server_admin", None
+    if role not in ("server_admin", "tenant_admin"):
+        return False, "gates are kept by the tenant's administrator (RFC-0135 §5)", None
+    if op not in GATE_ADMIN_OPS:
+        return False, f"unknown action '{op}'", None
+    label = tenant_label(tid) or tid
+
+    def txt(k, mx):
+        v = a.get(k)
+        return str(v).strip()[:mx] if v not in (None, "") else None
+
+    ns = argparse.Namespace(action=op, tenant=label, name=txt("name", 40) or "",
+                            who=actor, queue=txt("queue", 40), kind=txt("kind", 12),
+                            instance=txt("instance", 80), label=txt("label", 80),
+                            process=txt("process", 40), user=txt("user", 40), fields=None,
+                            days=None, access=txt("access", 60), yes=bool(a.get("yes")),
+                            secret_hash=None)
+    if op == "access":
+        h = str(a.get("hash") or "")
+        if not h:
+            return False, "the portal sends the hash of the key it made", None
+        try:
+            days = int(a.get("days") or GATE_ACCESS_DAYS)
+        except (TypeError, ValueError):
+            return False, "Gültigkeit in Tagen: eine Zahl", None
+        ns.days, ns.secret_hash = days, h
+        before = {k["id"] for k in _gate_keys(gates.scope(tid, ns.name))} \
+            if gates.NAME_RE.match(ns.name) else set()
+        ok_, said = _run_captured(cmd_gate, ns)
+        if not ok_:
+            return False, said, None
+        new = [k for k in _gate_keys(gates.scope(tid, ns.name)) if k["id"] not in before]
+        if len(new) != 1:
+            return False, "the key was not found after issuing it", None
+        k = new[0]
+        doc = load_gates()
+        g = doc["gates"].get(gates.gate_key(tid, ns.name)) or {}
+        return True, said, {"id": k["id"], "principal": k["principal"], "label": k["label"],
+                            "expires": k["expires"], "url": gate_url(tid, ns.name),
+                            "user": g.get("user") or ns.name}
+    ok_, said = _run_captured(cmd_gate, ns)
+    return ok_, said, None
 
 
 def _now_iso_z():
@@ -39762,6 +39851,18 @@ def cmd_process_deploys(_args):
                              subject=str((req.get("args") or {}).get("cohort") or ""),
                              result="denied", who=actor or "api",
                              role=act_role or "-", detail=msg)
+        elif action == "gate-admin":
+            # RFC-0135 stage 2: the page „Tore“. Role and tenant from the
+            # ACTOR's record; the request carries a key's hash, never the key.
+            ok, msg, _gd = gate_job(req, actor)
+            if _gd is not None:
+                detail = _gd
+            if not ok:
+                audit_tenant("gate." + str(req.get("op") or "?"),
+                             act_tenant or ensure_default_tenant(),
+                             subject=str((req.get("args") or {}).get("name") or ""),
+                             result="denied", who=actor or "portal", role=act_role or "-",
+                             detail=msg[:200])
         elif action == "destination-admin":
             # oaap.net.destinations 0.10: the page "Destinationen". Role from the
             # ACTOR's record; the secret in this request goes with the claim.
