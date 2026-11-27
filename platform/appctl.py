@@ -27580,7 +27580,7 @@ def check_instance_address(reg, name, inst, hostname):
     tenants = load_tenants()
     dtid, dom = place.domain_claim(host, tenants)
     if dtid is not None and resolve_tenant(inst.get("tenant")) != dtid:
-        raise ValueError(f"{host} lies under {dom}, the own domain of tenant "
+        raise ValueError(f"{host} {'is' if host == dom else 'lies under'} {dom}, the own domain of tenant "
                          f"'{(tenants.get(dtid) or {}).get('label', dtid)}' -- only an "
                          "instance of that tenant takes a name there")
     for r in load_edge():
