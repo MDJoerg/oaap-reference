@@ -8448,6 +8448,36 @@ def cmd_migrate_guard(_args):
           + " rewritten: .env, .git/, keys, dumps ... now get 404 from the gateway.")
 
 
+def cmd_migrate_hardening(_args):
+    """0.1.400 (RFC-0140 stage 1): compression and the refused methods into
+    instance sites written before them. Idempotent; silent when every site
+    already has them."""
+    reg = load_registry()
+    behind = []
+    for name, inst in sorted(reg["instances"].items()):
+        f = _read_file(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"))
+        if f is None:
+            continue
+        want_encode = hardening_of(inst)["compress"]
+        if "@oaap_method" not in f or (want_encode and ENCODE_LINE + "\n" not in f):
+            behind.append(name)
+    generated = []
+    for fn in ("external.caddy", "instance-addresses.caddy"):
+        text = _read_file(os.path.join(CADDY_APPS_DIR, fn)) or ""
+        if "\thandle " in text and "@oaap_method" not in text:
+            generated.append(fn)
+    if not behind and not generated:
+        return
+    print("")
+    print("Base hardening at the gateway (RFC-0140) ...")
+    for name in behind:
+        write_app_caddy(name, reg["instances"][name])
+    refresh_generated_sites()
+    reload_gateway()
+    print(f"  {len(behind)} instance site(s)" + (", " + ", ".join(generated) if generated else "")
+          + " rewritten: compressed (encode zstd gzip), TRACE/TRACK/CONNECT get 405.")
+
+
 def cmd_migrate_care_url(_args):
     """0.1.223 (RFC-0069 stage 3): the listener for /platform/care.json in
     the gateway, and OAAP_CARE_URL in every instance.env. A running
@@ -22903,6 +22933,9 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     # is looking for one. Nothing at all while no window is open: this
     # RFC does not turn on permanent per-instance logging.
     lines = list(diagnose_site_lines(scope))
+    # RFC-0140 (gateway 0.2.28): compression and the methods no app needs.
+    # First of the rewrites: a TRACE meets its 405 whatever else matches.
+    lines += harden_site_lines(scope)
     # gateway 0.2.27: the operator's switch "KI-Abrufer" -- before the
     # guard (of two rewrites in one block only the first that matches
     # runs), so a shut-out fetcher meets its 403 and nothing else.
@@ -26237,7 +26270,8 @@ def maintenance_of(inst):
 
 
 _MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset(),
-               "strict": frozenset(), "noindex": frozenset(), "ai": {}}
+               "strict": frozenset(), "noindex": frozenset(), "ai": {},
+               "nocompress": frozenset()}
 
 
 def noindex_of(inst):
@@ -26269,6 +26303,77 @@ def noindex_site_lines(scope):
     if not (scope and scope in noindex_keys()):
         return []
     return ["	header {", f'		X-Robots-Tag "{NOINDEX_VALUE}"', "		defer", "	}"]
+
+
+# RFC-0140 (gateway 0.2.28): base hardening of every instance site.
+METHOD_RESERVED = "/.oaap-method-refused"
+REFUSED_METHODS = ("TRACE", "TRACK", "CONNECT")
+ENCODE_LINE = "\tencode zstd gzip"
+
+
+def hardening_of(inst):
+    """RFC-0140: the instance's base-hardening switches, defaults filled in.
+    Compression is on unless the operator switched it off (D1) -- stored
+    only when off, so a record without the key means the default."""
+    h = (inst or {}).get("hardening")
+    h = h if isinstance(h, dict) else {}
+    return {"compress": h.get("compress") is not False}
+
+
+def nocompress_keys():
+    """The instances whose sites carry no `encode`, from the same cached
+    reading of the registry as mode_keys()."""
+    mode_keys()
+    return _MODE_CACHE["nocompress"]
+
+
+def harden_site_lines(scope):
+    """RFC-0140 §2 and §5, site level so every entry point has them.
+
+    `encode` compresses what the app sent uncompressed (Caddy leaves an
+    answer that already carries Content-Encoding alone, and skips images
+    and answers under 512 bytes); streams keep coming in pieces, measured
+    in stage 0 (M2). TRACE, TRACK and CONNECT are refused here with 405 --
+    before stage 1 the answer depended on the app (sglok-sbk.de: 500,
+    oaap-test: CONNECT 502). Rewritten to a reserved path like the guard,
+    so the refusal runs ahead of every handle block, /platform/* and
+    /auth/* included. No list of ALLOWED methods: WebDAV apps need
+    PROPFIND and friends."""
+    lines = [] if (scope and scope in nocompress_keys()) else [ENCODE_LINE]
+    return lines + [
+        f"\t@oaap_method method {' '.join(REFUSED_METHODS)}",
+        f"\trewrite @oaap_method {METHOD_RESERVED}",
+        f"\thandle {METHOD_RESERVED} {{",
+        "\t\trespond 405",
+        "\t}",
+    ]
+
+
+def hardening_set(name, inst, compress, who="root", role="root"):
+    """RFC-0140: compression for this instance on (the default) or off --
+    for an app that has a reason the platform does not know."""
+    reg = load_registry()
+    cur = reg["instances"][name]
+    if hardening_of(cur)["compress"] == bool(compress):
+        return "already " + ("compressed at the gateway" if compress
+                             else "not compressed at the gateway")
+    h = dict(cur.get("hardening") or {})
+    if compress:
+        h.pop("compress", None)
+    else:
+        h["compress"] = False
+        h["since"], h["by"] = _iso_now(), who
+    if any(k not in ("since", "by") for k in h):
+        cur["hardening"] = h
+    else:
+        cur.pop("hardening", None)
+    save_registry(reg)
+    _republish_sites(name, cur)
+    audit_tenant("instance.hardening", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail="compress " + ("on" if compress else "off"))
+    return ("compressed at the gateway again" if compress
+            else "no longer compressed at the gateway (the app's own encoding is untouched)")
 
 
 AI_RESERVED = "/.oaap-ai-refused"
@@ -26378,6 +26483,8 @@ def mode_keys():
         _MODE_CACHE["ai"] = {k: lv for k, lv in
                              ((k, ai_fetchers_level(i)) for k, i in insts.items())
                              if lv}
+        _MODE_CACHE["nocompress"] = frozenset(
+            k for k, i in insts.items() if not hardening_of(i)["compress"])
         _MODE_CACHE["stamp"] = stamp
     return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
 
@@ -26842,6 +26949,20 @@ def cmd_ai_fetchers(args):
     """`oaap app ai-fetchers <instance> allow|training|all [--reason TEXT]`."""
     _mode_cli(args, lambda n, i, who: ai_fetchers_set(
         n, i, args.level, args.reason, who=who))
+
+
+def cmd_hardening(args):
+    """`oaap app hardening <instance> [--compress on|off]` (RFC-0140)."""
+    if args.compress is None:
+        inst = (load_registry().get("instances") or {}).get(args.name)
+        if not inst:
+            die(f"unknown instance '{args.name}'")
+        h = hardening_of(inst)
+        print(f"{args.name}:")
+        print(f"  compression  {'on' if h['compress'] else 'off'} (encode zstd gzip at the gateway)")
+        print(f"  methods      {', '.join(REFUSED_METHODS)} refused with 405 (always)")
+        return
+    _mode_cli(args, lambda n, i, who: hardening_set(n, i, args.compress == "on", who=who))
 
 
 def cmd_site_watch(args):
@@ -29643,6 +29764,9 @@ def _install_from_dir(pkg, args, source):
     # gateway 0.2.27: so is "KI-Abrufer" -- an update must not let them in.
     if inst and ai_fetchers_of(inst):
         reg["instances"][name]["ai_fetchers"] = dict(inst["ai_fetchers"])
+    # RFC-0140: and a switched-off compression
+    if inst and isinstance(inst.get("hardening"), dict) and inst["hardening"]:
+        reg["instances"][name]["hardening"] = dict(inst["hardening"])
     # I-81 idea 5: and whether its people hear about the web site
     if inst and site_watch_of(inst):
         reg["instances"][name]["site_watch"] = dict(inst["site_watch"])
@@ -44995,6 +45119,13 @@ def build_parser():
     plr.add_argument("--reason", default="",
                      help="why; goes into the tenant's log")
     plr.set_defaults(fn=cmd_login_required)
+    phd = sub.add_parser("hardening",
+                         help="base hardening at the gateway: compression, "
+                              "refused methods (RFC-0140, gateway 0.2.28)")
+    phd.add_argument("name")
+    phd.add_argument("--compress", choices=["on", "off"], default=None,
+                     help="encode zstd gzip at the gateway (default on)")
+    phd.set_defaults(fn=cmd_hardening)
     pai = sub.add_parser("ai-fetchers",
                          help="shut AI fetchers out: robots.txt from the "
                               "platform and 403 for their User-Agent "
@@ -45818,6 +45949,10 @@ def build_parser():
     pmg = sub.add_parser("migrate-guard", help="internal: the secret-file guard into old "
                                                 "instance sites (RFC-0084, called by update)")
     pmg.set_defaults(fn=cmd_migrate_guard)
+    pmh = sub.add_parser("migrate-hardening", help="internal: compression and refused "
+                                                    "methods into old instance sites "
+                                                    "(RFC-0140, called by update)")
+    pmh.set_defaults(fn=cmd_migrate_hardening)
     pd = sub.add_parser("process-deploys",
                         help="internal: work the deploy spool (called by the path unit and the portal)")
     pd.set_defaults(fn=cmd_process_deploys)

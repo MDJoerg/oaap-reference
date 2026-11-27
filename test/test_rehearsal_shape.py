@@ -170,8 +170,10 @@ def blocks(text):
         elif cur is not None:
             cur.append(line)
             if line == "\t}":
-                # RFC-0084: the secret-file guard answers 404 and hands nothing on
-                if not cur[0].startswith(("\thandle /auth/*", "\thandle /.oaap-guard")):
+                # RFC-0084: the secret-file guard answers 404 and hands nothing on;
+                # RFC-0140: neither does the 405 for TRACE/TRACK/CONNECT
+                if not cur[0].startswith(("\thandle /auth/*", "\thandle /.oaap-guard",
+                                          "\thandle /.oaap-method-refused")):
                     out.append("\n".join(cur))
                 cur = None
     return out

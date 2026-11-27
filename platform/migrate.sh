@@ -358,6 +358,11 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-platform-rou
 # --- secret files refused at the gateway (0.1.263, RFC-0084) ---
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-guard   2>&1 | sed 's/^/  /' || say "  WARNING: the secret-file guard could not be written into the gateway sites — run 'oaap guard status'."
 
+# --- base hardening at the gateway (0.1.400, RFC-0140 stage 1) ---
+# compression and the refused methods; site files are written once, at
+# deployment, so the files on disk learn it here.
+OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-hardening 2>&1 | sed 's/^/  /' || say "  WARNING: compression could not be written into the gateway sites -- run 'oaap app hardening <instance>'."
+
 # --- the door an instance reads (0.1.223, RFC-0069 stage 3) ---
 # /platform/care.json on a listener that is never published, and the
 # address in every instance.env; a running container learns it at its

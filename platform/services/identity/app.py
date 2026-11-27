@@ -3745,15 +3745,114 @@ def whoami():
 # route since the RFC's amendment of 2026-09-29). It is a volume brake,
 # not an authentication substitute (see the RFC).
 #
-# Counters live in process memory on purpose: this runs in the hot path
-# of every public request, and the login throttle's file-per-request
-# approach would be far too expensive. Consequence, documented rather
-# than hidden: each gunicorn worker counts on its own, so the effective
-# ceiling is the configured limit times the worker count, and a restart
-# forgets the counters. Both are acceptable for a coarse abuse brake.
+# Counters live in ONE small SQLite file in /dev/shm that every gunicorn
+# worker of this container shares (RFC-0140 F1/D9). Until 0.1.400 they
+# lived in each worker's own memory, and the documented consequence --
+# "the effective ceiling is the limit times the worker count" -- was
+# measured on oaap-test: with two workers the first 429 came at request
+# 594 of a 300-per-minute route. tmpfs keeps it in RAM (this runs in the
+# hot path of every public request) and a restart still forgets it, which
+# is fine for a coarse abuse brake. Should the file ever fail -- /dev/shm
+# full, a locked database for longer than the timeout -- the brake falls
+# back to this worker's own memory for that request instead of failing
+# the request: a brake that answers 500 would be worse than a lax one.
 
-_RATE = {}
 _RATE_MAX_KEYS = 20000
+_RATE_KEEP = 3600          # rows older than this (or the longest window) go
+
+
+class _SharedRate:
+    """The brake's buckets, shared by every worker of this container.
+
+    One transaction per hit (BEGIN IMMEDIATE): drop the key's expired
+    rows, count, then either refuse or record -- so two workers can never
+    both take the last slot. Opened lazily and again after a fork, since a
+    SQLite connection must not cross one."""
+
+    def __init__(self, path):
+        import threading
+        self.path = path
+        self._pid = None
+        self._db = None
+        self._lock = threading.Lock()
+        self._n = 0
+        self._keep = _RATE_KEEP
+        self.local = {}          # the fallback: this worker's own memory
+
+    def _conn(self):
+        import sqlite3
+        if self._db is None or self._pid != os.getpid():
+            db = sqlite3.connect(self.path, timeout=2, isolation_level=None,
+                                 check_same_thread=False)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=OFF")
+            db.execute("CREATE TABLE IF NOT EXISTS hits (k TEXT NOT NULL, t REAL NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS hits_kt ON hits (k, t)")
+            self._db, self._pid = db, os.getpid()
+        return self._db
+
+    def hit(self, key, limit, window, now):
+        """(allowed, oldest hit still in the window or None)."""
+        try:
+            with self._lock:
+                db = self._conn()
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    db.execute("DELETE FROM hits WHERE k = ? AND t <= ?", (key, now - window))
+                    n, oldest = db.execute(
+                        "SELECT COUNT(*), MIN(t) FROM hits WHERE k = ?", (key,)).fetchone()
+                    if n >= limit:
+                        db.execute("COMMIT")
+                        return False, oldest
+                    db.execute("INSERT INTO hits (k, t) VALUES (?, ?)", (key, now))
+                    self._keep = max(self._keep, window)
+                    self._n += 1
+                    if self._n % 500 == 0:
+                        # every key's leftovers, so a spray of addresses
+                        # cannot fill /dev/shm
+                        db.execute("DELETE FROM hits WHERE t <= ?", (now - self._keep,))
+                    db.execute("COMMIT")
+                    return True, oldest if oldest is not None else now
+                except Exception:
+                    db.execute("ROLLBACK")
+                    raise
+        except Exception as e:  # noqa: BLE001 -- see the comment above the class
+            print(f"identity: shared brake unavailable, counting in this worker: {e}",
+                  file=sys.stderr)
+            self._db = None
+            return self._hit_local(key, limit, window, now)
+
+    def _hit_local(self, key, limit, window, now):
+        hits = [t for t in self.local.get(key, ()) if now - t < window]
+        if len(hits) >= limit:
+            self.local[key] = hits
+            return False, hits[0]
+        hits.append(now)
+        if key not in self.local and len(self.local) >= _RATE_MAX_KEYS:
+            self.local.pop(min(self.local, key=lambda k: self.local[k][-1]), None)
+        self.local[key] = hits
+        return True, hits[0]
+
+    def clear(self):
+        """Forget every bucket (tests)."""
+        self.local.clear()
+        with self._lock:
+            self._conn().execute("DELETE FROM hits")
+
+
+def _rate_path():
+    """One file per identity (its data directory names it): every worker of
+    this container finds the same file, a second identity on the same
+    host -- a test run beside another -- never shares its buckets."""
+    if os.environ.get("OAAP_THROTTLE_DB"):
+        return os.environ["OAAP_THROTTLE_DB"]
+    shm = os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK)
+    d = "/dev/shm" if shm else tempfile.gettempdir()
+    tag = hashlib.sha256(os.path.abspath(DATA_DIR).encode()).hexdigest()[:10]
+    return os.path.join(d, f"oaap-throttle-{tag}.sqlite")
+
+
+_RATE = _SharedRate(_rate_path())
 
 
 def _throttle_client():
@@ -3901,19 +4000,12 @@ def throttle():
     route = request.args.get("route", "")[:200]
     key = f"{scope}|{route}|{_throttle_client()}"
     now = time.time()
-    hits = [t for t in _RATE.get(key, ()) if now - t < window]
-    if len(hits) >= limit:
-        _RATE[key] = hits
+    allowed, oldest = _RATE.hit(key, limit, window, now)
+    if not allowed:
         _braked_note(scope, _throttle_client())
-        retry = max(1, int(window - (now - hits[0])))
+        retry = max(1, int(window - (now - (oldest or now))))
         return ("Too many requests", 429,
                 {"Retry-After": str(retry), "Cache-Control": "no-store"})
-    hits.append(now)
-    if key not in _RATE and len(_RATE) >= _RATE_MAX_KEYS:
-        # keep memory bounded under a spray of distinct addresses; the
-        # oldest bucket is the least interesting one to lose
-        _RATE.pop(min(_RATE, key=lambda k: _RATE[k][-1]), None)
-    _RATE[key] = hits
     return "", 204
 
 
