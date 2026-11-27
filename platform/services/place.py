@@ -123,6 +123,26 @@ def domain_of_host(host, tenants):
     return None, False
 
 
+def domain_claim(host, tenants):
+    """(tenant_id, domain) when `host` is at or below a tenant's domain that is
+    pending or active, else (None, ""). Unlike domain_of_host a PENDING domain
+    counts: a name below it is already promised to that tenant, and an own name
+    (RFC-0009/0018) set there now would be served -- and get the domain's
+    cookie -- the moment it becomes active (RFC-0115 §17, D10). A switched-off
+    domain claims nothing."""
+    host = (host or "").split(":")[0].lower().rstrip(".")
+    if not host:
+        return None, ""
+    for tid, t in sorted((tenants or {}).items()):
+        d = (t or {}).get("domain") or {}
+        name = str(d.get("name") or "").strip().lower()
+        if not name or d.get("state") not in ("pending", "active"):
+            continue
+        if host == name or host.endswith("." + name):
+            return tid, name
+    return None, ""
+
+
 def domain_refusal(name, ext_host, tenants, tid):
     """Why `name` may not become tenant `tid`'s domain, or "".
 

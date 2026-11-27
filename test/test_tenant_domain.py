@@ -503,6 +503,122 @@ os.environ["SETUP_TOKEN"] = "test-setup-token"
 os.environ["INTERNAL_API_KEY"] = "test-internal-key"
 ID_DATA = tempfile.mkdtemp(prefix="oaap-domain-id-")
 os.environ["OAAP_IDENTITY_DATA_DIR"] = ID_DATA
+# ---------------------------------------------------------------------------
+print("\n§17: eigene Namen unter einer Mandanten-Domain nur für deren Mandanten (D10)")
+
+assert m.load_tenants()[bec_id]["domain"]["state"] == "active"
+_reg0 = json.loads(json.dumps(m.load_registry()))
+_sync0 = m.sync_instance_names
+m.sync_instance_names = lambda *a, **k: ([], [])
+
+
+def addr(action, name, host):
+    return quiet(m.cmd_address, argparse.Namespace(action=action, name=name, hostname=host))
+
+
+def loud(fn, *a):
+    err = _io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc, out = fn(*a)
+    return rc, out + err.getvalue()
+
+
+def own_caddy():
+    path = os.path.join(m.CADDY_APPS_DIR, "instance-addresses.caddy")
+    return open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+
+
+rc, out = addr("set", "cls-wiki", f"www.{DOM}")
+ok("KÖDER: eine Instanz eines anderen Mandanten bekommt www.<domain> nicht",
+   rc != 0 and not m.load_registry()["instances"]["cls-wiki"].get("address"), out)
+try:
+    m.check_instance_address(m.load_registry(), "cls-wiki", m.load_registry()["instances"]["cls-wiki"], DOM)
+    said = ""
+except ValueError as e:
+    said = str(e)
+ok("KÖDER: ... auch nicht die Domain selbst, und der Satz nennt den Mandanten der Domain",
+   "own domain of tenant 'bec'" in said, said)
+r = spool("root", "cls-wiki", action="address", op="set", hostname=f"shop.{DOM}")
+ok("KÖDER: auch über die Warteschlange des Portals abgelehnt",
+   not r.get("ok") and "own domain of tenant 'bec'" in r.get("message", ""), r)
+rc, out = addr("set", "bec-chat", f"www.{DOM}")
+ok("eine Instanz des Mandanten bekommt www.<domain> als eigenen Namen",
+   rc == 0 and f"https://www.{DOM} {{" in own_caddy(), out)
+rc, out = addr("alias-add", "bec-chat", DOM)
+m.write_external_caddy()
+ok("... und die Domain selbst als Alias: dann ist sie die Webseite, kein Ort dort (heute, F2)",
+   rc == 0 and f"https://{DOM} {{" in own_caddy() and f"https://{DOM} {{" not in caddy(), out)
+rc, out = addr("set", "cls-wiki", "wiki.cls-eigen.example")
+ok("ein Name außerhalb jeder Mandanten-Domain bleibt für alle frei", rc == 0, out)
+
+# eine wartende Domain beansprucht ihre Namen schon
+TT = m.load_tenants()
+TT[cls_id]["domain"] = {"name": "cls.anders.example", "state": "pending", "canonical": "domain"}
+m.save_tenants(TT)
+rc, out = addr("alias-add", "bec-chat", "x.cls.anders.example")
+ok("KÖDER: unter einer WARTENDEN Domain eines anderen ist kein Name zu haben", rc != 0, out)
+TT[cls_id]["domain"]["state"] = "off"
+m.save_tenants(TT)
+rc, out = addr("alias-add", "bec-chat", "x.cls.anders.example")
+ok("eine abgeschaltete Domain beansprucht nichts", rc == 0, out)
+addr("alias-remove", "bec-chat", "x.cls.anders.example")
+TT[cls_id].pop("domain")
+m.save_tenants(TT)
+
+# eine Registry von vorher: der fremde Name steht schon drin
+reg = m.load_registry()
+reg["instances"]["cls-wiki"]["aliases"] = [f"alt.{DOM}"]
+reg["instances"]["bec-chat"]["aliases"] = []
+m.save_registry(reg)
+m.write_instance_address_caddy()
+m.write_external_caddy()
+oc = own_caddy()
+ok("KÖDER: ein fremder Name von vorher bekommt keine Seite, die Datei sagt warum",
+   f"https://alt.{DOM} {{" not in oc and "NOT served" in oc and "wiki.cls-eigen.example" in oc, oc[:600])
+ok("der Ort steht wieder auf der Domain (kein Alias der eigenen Instanz mehr)", f"https://{DOM} {{" in caddy())
+reg["instances"]["cls-wiki"]["aliases"] = [DOM]
+m.save_registry(reg)
+m.write_instance_address_caddy()
+m.write_external_caddy()
+ok("KÖDER: hält eine fremde Instanz die Domain selbst, bleibt der Ort dort, sie bekommt nichts",
+   f"https://{DOM} {{" in caddy() and f"https://{DOM} {{" not in own_caddy())
+ok("die Liste der fremden Namen nennt Name, Instanz und Domain",
+   (DOM, "cls-wiki", bec_id, DOM) in m.foreign_own_names(m.load_registry(), m.load_tenants()))
+
+# binden, solange ein fremder Name darunter steht
+reg["instances"]["cls-wiki"]["aliases"] = ["shop.neu.example"]
+m.save_registry(reg)
+rc, out = loud(tenant, "domain", "bec", "neu.example")
+ok("KÖDER: eine Domain, unter der eine fremde Instanz einen Namen hat, wird nicht gebunden -- mit Namen",
+   rc != 0 and "shop.neu.example (cls-wiki)" in out, (rc, out))
+ok("... und die alte Domain bleibt, wie sie war", m.load_tenants()[bec_id]["domain"]["name"] == DOM)
+r = spool("root", "", action="tenant-domain", tenant=bec_id, what="neu.example")
+ok("KÖDER: auch aus dem Portal nicht", not r.get("ok") and "cls-wiki" in r.get("message", ""), r)
+
+# eine wartende Domain wird nicht aktiv, solange ein fremder Name darunter steht
+reg["instances"]["cls-wiki"]["aliases"] = []
+m.save_registry(reg)
+TT = m.load_tenants()
+TT[bec_id]["domain"]["state"] = "pending"
+m.save_tenants(TT)
+reg["instances"]["cls-wiki"]["aliases"] = [f"alt.{DOM}"]
+m.save_registry(reg)
+rc, out = tenant("domains")
+ok("KÖDER: täglich: wartend bleibt sie, mit dem Grund im Protokoll",
+   m.load_tenants()[bec_id]["domain"]["state"] == "pending" and "stays pending" in out, out)
+rc, out = loud(tenant, "domain", "bec", "check")
+ok("KÖDER: check aktiviert sie auch nicht",
+   rc != 0 and m.load_tenants()[bec_id]["domain"]["state"] == "pending", (rc, out))
+reg["instances"]["cls-wiki"]["aliases"] = []
+m.save_registry(reg)
+rc, out = tenant("domain", "bec", "check")
+ok("ohne den fremden Namen: aktiv", m.load_tenants()[bec_id]["domain"]["state"] == "active", out[-300:])
+
+m.save_registry(_reg0)
+m.sync_instance_names = _sync0
+m.write_instance_address_caddy()
+m.write_external_caddy()
+
 import importlib.util                                          # noqa: E402
 
 spec = importlib.util.spec_from_file_location("identity_app_domain", os.path.join(SERVICES, "identity", "app.py"))

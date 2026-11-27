@@ -14034,7 +14034,7 @@ def _tenant_domain_cli(args, tenants):
         if not ext:
             die("this node has no external name yet (`oaap external set` first) -- "
                 "a domain is checked against it")
-        bad = place.domain_refusal(what, ext, tenants, tid)
+        bad = place.domain_refusal(what, ext, tenants, tid)             or _foreign_names_refusal(load_registry(), tenants, tid, what)
         if bad:
             die(bad)
         dom = {"name": what, "state": "pending", "canonical": dom.get("canonical") or "domain"}
@@ -14044,6 +14044,10 @@ def _tenant_domain_cli(args, tenants):
         print(f"{what} is entered for tenant '{label}', pending until DNS points here.")
     if not dom.get("name"):
         die(f"tenant '{label}' has no own domain")
+    if dom.get("state") != "active":
+        bad = _foreign_names_refusal(load_registry(), tenants, tid, dom["name"])
+        if bad:
+            die(bad)
     ok_, said = domain_dns_check(dom["name"], ext)
     dom.update(checked=_iso_now(), said=said)
     was = dom.get("state")
@@ -14173,7 +14177,13 @@ def _tenant_domains_sweep(tenants):
             continue
         ok_, said = domain_dns_check(dom["name"], ext)
         dom.update(checked=_iso_now(), said=said)
-        if dom["state"] == "pending" and ok_:
+        held = (_foreign_names_refusal(load_registry(), tenants, tid, dom["name"])
+                if dom["state"] == "pending" and ok_ else "")
+        if held:
+            audit_tenant("tenant.domain", tid, t.get("label", ""), result="warn",
+                         detail=f"{dom['name']} stays pending: {held}")
+            print(f"{dom['name']}: stays pending -- {held}")
+        elif dom["state"] == "pending" and ok_:
             dom["state"] = "active"
             activated.append(tid)
             audit_tenant("tenant.domain", tid, t.get("label", ""), detail=f"active {dom['name']} (daily check)")
@@ -22874,7 +22884,10 @@ def write_external_caddy():
     # that site: Caddy refuses two sites for one name, and the operator's
     # explicit choice wins over the automatic one (measured on oaapx01,
     # 2026-11-20: chat.bec.brandeis.de was an alias before bec got the domain).
-    own_names = {h for i in reg["instances"].values() for h in instance_names(i)}
+    # A FOREIGN own name gets no site at all (RFC-0115 §17, D10, below), so
+    # it never takes the place's name either.
+    _foreign = {h for h, _k, _t, _d in foreign_own_names(reg, load_tenants())}
+    own_names = {h for i in reg["instances"].values() for h in instance_names(i)} - _foreign
     for _tid, dom in domains:
         if dom in own_names:
             lines.append(f"# {dom} -> held as an instance's own name; no place site")
@@ -23035,6 +23048,43 @@ def instance_names(inst):
     return [canon] + [a for a in (inst.get("aliases") or []) if a and a != canon]
 
 
+def foreign_own_names(reg, tenants, only=None):
+    """[(host, instance key, domain tenant id, domain)] for every own name
+    (RFC-0009/0018) that lies at or below a pending or active tenant domain
+    while its instance belongs to ANOTHER tenant. Such a name breaks §7.2 of
+    RFC-0115 -- the domain names exactly one tenant -- and would receive that
+    tenant's session cookie (D4). Refused when set and when a domain is bound
+    (§17, D10); the gateway writes no site for it. `only` = (tid, domain):
+    judge against that one domain, e.g. before it is stored."""
+    out = []
+    for key, inst in sorted((reg.get("instances") or {}).items()):
+        mine = resolve_tenant(inst.get("tenant"))
+        for h in instance_names(inst):
+            if only:
+                dtid, dom = only
+                if not (h == dom or h.endswith("." + dom)):
+                    continue
+            else:
+                dtid, dom = place.domain_claim(h, tenants)
+                if dtid is None:
+                    continue
+            if mine != dtid:
+                out.append((h, key, dtid, dom))
+    return out
+
+
+def _foreign_names_refusal(reg, tenants, tid, dom):
+    """The sentence that refuses binding `dom` to `tid` while instances of
+    other tenants hold own names under it, or "" (RFC-0115 §17, D10)."""
+    bad = foreign_own_names(reg, tenants, only=(tid, dom))
+    if not bad:
+        return ""
+    held = ", ".join(f"{h} ({k})" for h, k, _t, _d in bad)
+    return (f"{dom} cannot name tenant '{(tenants.get(tid) or {}).get('label', tid)}' while instances "
+            f"of other tenants hold own names under it: {held} -- remove them first "
+            f"(`oaap app address remove|alias-remove <instance> ...`)")
+
+
 # ------------------------------------------------------ RFC-0043: names
 # The instance tells the app its own names. Until 0.1.126 nothing did:
 # an app saw the Host of the request in front of it and nothing else,
@@ -23171,8 +23221,15 @@ def write_instance_address_caddy():
     scheme = "http" if edge else "https"
     mode = f"behind edge {edge}" if edge else "direct (TLS via ACME)"
     lines = [f"# generated by appctl — per-instance public hostnames — {mode}"]
+    # RFC-0115 §17 (D10): an own name under another tenant's domain is
+    # refused when set; one written before that rule gets no site here.
+    foreign = {(h, k): d for h, k, _t, d in foreign_own_names(reg, load_tenants())}
     for name, inst in entries:
         for host in instance_names(inst):
+            if (host, name) in foreign:
+                lines.append(f"# {host} -> instance {name}: NOT served -- it lies under "
+                             f"{foreign[(host, name)]}, another tenant's own domain (RFC-0115 §17)")
+                continue
             lines.append(f"# {host} -> instance {name}")
             lines.append(f"{scheme}://{host} {{")
             if edge:
@@ -27517,6 +27574,15 @@ def check_instance_address(reg, name, inst, hostname):
                else f"'{name}' has none, because it names a tenant this node "
                     f"does not have — repair that instead of setting an "
                     f"address under {ext_host}"))
+    # RFC-0115 §17 (D10): a name at or below a tenant's own domain belongs to
+    # that tenant -- an instance of another would be served there and get
+    # the domain's session cookie.
+    tenants = load_tenants()
+    dtid, dom = place.domain_claim(host, tenants)
+    if dtid is not None and resolve_tenant(inst.get("tenant")) != dtid:
+        raise ValueError(f"{host} lies under {dom}, the own domain of tenant "
+                         f"'{(tenants.get(dtid) or {}).get('label', dtid)}' -- only an "
+                         "instance of that tenant takes a name there")
     for r in load_edge():
         if host == r["host"] or host.endswith(f".{r['host']}"):
             raise ValueError(f"{host} is covered by the edge route for "
