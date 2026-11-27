@@ -15552,6 +15552,7 @@ def _care_reboot_if_due(facts):
 SPACE_VIEW = os.path.join(APPS_DIR, space.VIEW_FILE)
 SPACE_STATE = os.path.join(APPS_DIR, space.STATE_FILE)
 SPACE_LOCK = os.path.join(DATA_DIR, "data", "space.lock")
+SPACE_UNIT = "oaap-space-nightly"
 
 
 def _space_state():
@@ -15723,8 +15724,19 @@ def space_minute():
     due -- `docker rmi` of many images must not hold the minute."""
     if not space_nightly_due():
         return False
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "node", "care", "space",
-                      "--nightly"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    argv = [sys.executable, os.path.abspath(__file__), "node", "care", "space", "--nightly"]
+    if shutil.which("systemd-run"):
+        # A unit of its own: the minute job is a oneshot service with
+        # KillMode=control-group, so systemd killed a mere child process
+        # with it -- start_new_session does not leave the cgroup (measured
+        # 2026-11-27 on raspberrypi: due all night, no run). The fixed unit
+        # name also keeps a second start out while one runs.
+        subprocess.run(["systemd-run", f"--unit={SPACE_UNIT}", "--collect", "--nice=10",
+                        "-p", "IOSchedulingClass=idle", f"--setenv=OAAP_DATA_DIR={DATA_DIR}"]
+                       + argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30, check=False)
+        return True
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True,
                      env=dict(os.environ, OAAP_DATA_DIR=DATA_DIR))
     return True

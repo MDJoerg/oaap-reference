@@ -261,8 +261,12 @@ ok("appctl: Verb space, --dry-run, --class, rmi, Protokoll space.freed/space.for
    'if verb == "space":' in src and '"--dry-run", dest="space_dry"' in src
    and '"--class", dest="space_class"' in src and 'audit_tenant("space.freed"' in src
    and 'audit_tenant("space.foreign"' in src)
-ok("appctl: der Minutenjob startet den nächtlichen Lauf in einem eigenen Prozess",
-   "space_minute()" in src and "start_new_session=True" in src.split("def space_minute", 1)[1][:900])
+_sm = src.split("def space_minute", 1)[1][:1800]
+ok("appctl: der Minutenjob startet den nächtlichen Lauf in einer eigenen systemd-Unit "
+   "(sonst tötet KillMode=control-group ihn mit dem Minutenjob)",
+   "space_minute()" in src and '"systemd-run", f"--unit={SPACE_UNIT}"' in _sm
+   and "--setenv=OAAP_DATA_DIR=" in _sm and 'SPACE_UNIT = "oaap-space-nightly"' in src
+   and _sm.index("systemd-run") < _sm.index("start_new_session=True"))
 ok("appctl: kein Lauf während einer Sicherung, einer zur Zeit",
    "backup_running_now()" in src.split("def space_run", 1)[1][:900]
    and "_space_lock()" in src.split("def space_run", 1)[1][:900])
