@@ -1408,6 +1408,47 @@ HEALTH_BODY = """
      <code>sudo oaap node care protect &lt;instanz&gt; --reason …</code>,
      <code>sudo oaap node care reboot at 'YYYY-MM-DD HH:MM' --reason …</code>.</p>
 </div>
+{% if upg %}
+{# RFC-0139 stage 3 (D8): server_admin at the node's own address only. #}
+<div class="card" id="updates">
+  <h2>Updates</h2>
+  {% if job %}<p class="{{ 'err' if job.failed else 'ok' if job.done else 'muted' }}" style="white-space:pre-wrap">{{ job.text }}</p>{% endif %}
+  {% if upg.running %}
+  <p><b>Ein Update läuft</b> (seit {{ upg.run.started }}, von {{ upg.run.who }}{% if upg.run.docker %}, mit Docker{% endif %}).
+     Zuerst die Sicherung, dann apt, dann die Prüfung, ob alle Apps wieder laufen.
+     {% if upg.run.docker %}Während Docker neu startet, ist auch dieses Portal etwa eine Minute weg — die Seite versucht es weiter.{% endif %}</p>
+  {% if upg.log %}<pre style="max-height:18rem;overflow:auto;font-size:.85rem">{{ upg.log }}</pre>{% endif %}
+  {% elif upg.run and upg.run.text %}
+  <p class="{{ 'ok' if upg.run.result == 'ok' else 'err' }}">Letzter Lauf {{ upg.run.finished }} von {{ upg.run.who }}: {{ upg.run.text }}</p>
+  {% endif %}
+  {% if not upg.running %}
+  {% if upg.packages %}
+  <p>{{ upg.packages|length }} Paket(e) warten{% if upg.measured %} (gezählt {{ upg.measured }}){% endif %}.
+     Sicherheitsupdates spielt der Knoten ohnehin selbst ein; hier geht alles Wartende auf einmal.</p>
+  {% for g in upg.groups %}
+  <details{% if g.kind != 'other' or upg.packages|length < 15 %} open{% endif %}><summary>{{ g.title }} ({{ g.rows|length }})</summary>
+  <table><tr><th>Paket</th><th>installiert</th><th>neu</th><th>Quelle</th></tr>
+  {% for r in g.rows %}<tr><td><code>{{ r.package }}</code></td><td class="muted">{{ r.installed }}</td><td>{{ r.version }}</td><td class="muted">{{ r.archive }}</td></tr>{% endfor %}
+  </table></details>
+  {% endfor %}
+  <form method="post" action="/health/upgrade/run"
+        onsubmit="var d=this.docker&&this.docker.checked;return confirm('Updates jetzt einspielen? Zuerst läuft eine Sicherung (einige Minuten).'+(d?' Mit Docker starten ALLE Apps dieses Servers einmal neu, etwa eine Minute — auch dieses Portal.':''))">
+    {% if upg.docker_count %}
+    <p><label><input type="checkbox" name="docker" value="1">
+       Docker mit aktualisieren ({{ upg.docker_count }} Paket(e)) — alle Apps starten dabei einmal neu (etwa eine Minute)</label></p>
+    {% endif %}
+    <button class="btn">Jetzt einspielen</button>
+  </form>
+  {% else %}
+  <p>Keine Pakete warten{% if upg.measured %} (gezählt {{ upg.measured }}){% endif %}.</p>
+  {% endif %}
+  <form method="post" action="/health/upgrade/measure" style="margin-top:.5rem"><button class="secondary">Neu zählen</button></form>
+  <p class="muted">Dasselbe an der Maschine: <code>sudo oaap node care upgrade [--docker]</code>.
+     Ein neuer Kernel startet den Server nicht sofort neu — das übernimmt die Neustartplanung (Pflegestand).</p>
+  {% endif %}
+  {% if upg.running or (job and not job.done) %}<script>setTimeout(function(){location.reload();}, 5000);</script>{% endif %}
+</div>
+{% endif %}
 <div class="card">
   <h2>Kernservices</h2>
   <table>
@@ -8085,7 +8126,58 @@ def health():
                 dns=dns_check(), reach=reach_check(), braked=braked_requests(),
                 guarded=guard_state(),
                 deploys=recent_deploys(), bk=backup_state(), cx=connect_view(),
+                upg=_upgrade_section(),
+                job=(_build_job_note(*_build_scope(), request.args.get("job", ""))
+                     if _build_scope() else None),
                 msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+# --- RFC-0139 stage 3: the section "Updates" --------------------------------
+UPGRADE_VIEW_FILE = "/apps-registry/upgrade.json"
+UPGRADE_OPS = ("run", "measure")
+UPGRADE_GROUPS = (("security", "Sicherheit"), ("docker", "Docker"), ("other", "Sonstige"))
+
+
+def _upgrade_view():
+    try:
+        with open(UPGRADE_VIEW_FILE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _upgrade_section():
+    """The section for the server_admin at the node's own address, else
+    None (D8: tenants and other places never see the names)."""
+    if _build_scope() is None:
+        return None
+    v = _upgrade_view()
+    rows = v.get("packages") or []
+    run = dict(v.get("run") or {})
+    for k in ("started", "finished"):
+        if run.get(k):
+            run[k] = build_view._when(run[k])
+    return {"packages": rows, "measured": build_view._when(v.get("measured")) if v.get("measured") else "",
+            "groups": [{"kind": k, "title": t, "rows": [r for r in rows if r.get("kind") == k]}
+                       for k, t in UPGRADE_GROUPS if any(r.get("kind") == k for r in rows)],
+            "docker_count": sum(1 for r in rows if r.get("kind") == "docker"),
+            "run": run, "running": run.get("state") in ("starting", "running"),
+            "log": "\n".join(v.get("log") or [])}
+
+
+@app.post("/health/upgrade/<op>")
+def health_upgrade(op):
+    """One button, one request through the spool (as "Platz")."""
+    sc = _build_scope()
+    if sc is None:
+        return _build_denied()
+    if not _same_origin():
+        return "Zugriff verweigert: fremde Herkunft.", 403
+    if op not in UPGRADE_OPS:
+        return redirect("/health#updates")
+    args = {"docker": request.form.get("docker") == "1"} if op == "run" else {}
+    rid = management_api.enqueue(sc[0], sc[1], op, args, action="upgrade")
+    return redirect(f"/health?job={rid}#updates")
 
 
 BACKUP_SCHEDULE_WAIT = 30

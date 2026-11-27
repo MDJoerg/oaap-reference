@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Die wartenden Pakete des Servers (RFC-0139 Stufen 1 und 2).
+"""Die wartenden Pakete des Servers (RFC-0139 Stufen 1 bis 3).
 
 Sicherheitsupdates spielt der Knoten selbst ein (unattended-upgrades). Was
 sonst wartet -- auf unseren Knoten fast nur Docker --, sagte bisher niemand.
@@ -11,6 +11,7 @@ Braucht keinen Knoten. Aufruf: python3 test/test_host_updates.py
 """
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -159,7 +160,7 @@ ok("mit --docker alle acht", "take 8 package(s)" in out, out)
 A.space_dry = False
 started = []
 real_start, real_follow = m.upgrade_start, m._upgrade_follow
-m.upgrade_start = lambda with_docker=False, who="root": (started.append(with_docker) or (True, "Update gestartet (Unit oaap-upgrade)."))
+m.upgrade_start = lambda with_docker=False, who="root", cause="hand": (started.append(with_docker) or (True, "Update gestartet (Unit oaap-upgrade)."))
 m._upgrade_follow = lambda poll=2.0: {"result": "ok"}
 out, code = run_cli(A())
 ok("ohne --dry-run: startet die Unit (Stufe 2), mit Docker wie angehakt",
@@ -337,6 +338,128 @@ m.time.sleep = real_sleep
 m.upgrade_unit_active = real_active
 ok("Mitlesen hört erst nach zweimal klar beendet auf", r == {} and "beendet" in buf.getvalue()
    and next(answers, "leer") == "leer", (r, buf.getvalue()))
+
+print("\nDer Auftrag aus dem Portal (Stufe 3)")
+starts = []
+real_start = m.upgrade_start
+m.upgrade_start = lambda with_docker=False, who="root", cause="hand": (starts.append((with_docker, who, cause)) or (True, "Update gestartet (Unit oaap-upgrade)."))
+host_care.apt_upgradable = lambda run=None: APT
+ok("nur der Server-Admin (aus dem Datensatz des Handelnden)",
+   m.upgrade_job({"op": "run", "args": {"docker": True}}, "tenant_admin", "eva")[0] is False and not starts)
+okj, txt = m.upgrade_job({"op": "run", "args": {"docker": True}}, "server_admin", "joerg")
+ok("Jetzt einspielen mit Haken: dieselbe Unit, mit Docker, mit dem Menschen",
+   okj and starts == [(True, "joerg", "portal")] and "auch dieses Portal" in txt, (okj, txt, starts))
+starts.clear()
+m.upgrade_job({"op": "run", "args": {"docker": "yes"}}, "server_admin", "joerg")
+ok("Docker nur bei echtem true (kein Text, keine 1)", starts == [(False, "joerg", "portal")], starts)
+starts.clear()
+host_care.apt_upgradable = lambda run=None: "\n".join(l for l in APT.splitlines()
+                                                      if l.startswith(("Listing", "containerd", "docker")))
+okj, txt = m.upgrade_job({"op": "run", "args": {}}, "server_admin", "joerg")
+ok("nur Docker wartet, ohne Haken: nichts gestartet, Hinweis auf den Haken",
+   not okj and not starts and "Haken" in txt, txt)
+ok("unbekannter Auftrag", m.upgrade_job({"op": "rm"}, "server_admin", "joerg")[0] is False)
+m.upgrade_start = real_start
+host_care.apt_upgradable = real
+src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+branch = src.split('elif action == "upgrade":', 1)[1].split("elif action ==", 1)[0]
+ok("der Spool-Zweig ruft upgrade_job mit Rolle und Mensch des Handelnden und schreibt das Ergebnis",
+   "upgrade_job(req, act_role, actor)" in branch and "result.json" in branch
+   and 'audit_tenant("host.upgrade."' in branch, branch[:400])
+
+print("\nDie Ansicht für das Portal (apps/upgrade.json)")
+m._upgrade_write({"state": "finished", "started": "2026-11-27T11:00:00+00:00",
+                  "finished": "2026-11-27T11:07:00+00:00", "who": "joerg", "docker": False,
+                  "result": {"result": "ok", "text": "1 Paket(e) eingespielt"}})
+m.upgrade_view_write(rows=host_care.upgradable(APT), measured="2026-11-27T11:08:00Z")
+view = json.load(open(m.UPGRADE_VIEW, encoding="utf-8"))
+ok("Pakete mit Versionen und Art, der letzte Lauf, kein Protokoll ohne Lauf",
+   len(view["packages"]) == 8 and view["packages"][0]["kind"] == "docker"
+   and view["run"]["text"] == "1 Paket(e) eingespielt" and view["log"] == [], view)
+ok("lesbar für das Portal (0644)", oct(os.stat(m.UPGRADE_VIEW).st_mode & 0o777) == "0o644")
+m._upgrade_write({"state": "running", "started": "2026-11-27T12:00:00+00:00", "who": "joerg"})
+m._upgrade_say("2026-11-27T12:00:01+00:00 Sicherung ...")
+view = json.load(open(m.UPGRADE_VIEW, encoding="utf-8"))
+ok("während eines Laufs: Zustand und Protokollende; die Liste bleibt",
+   view["run"]["state"] == "running" and view["log"][-1].endswith("Sicherung ...")
+   and len(view["packages"]) == 8, view)
+ok("die Pflegedatei trägt weiterhin nur Zahlen (keine Namen)",
+   "rows_out.extend(rows)" in open(os.path.join(HERE, "..", "platform", "services", "host_care.py"),
+                                   encoding="utf-8").read()
+   and "updates_rows=rows" in src)
+
+print("\nDer Abschnitt „Updates“ auf der Gesundheitsseite")
+try:
+    sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))
+    import app as portal  # noqa: E402
+except ImportError as e:
+    print(f"NOT RUN  die Seite: {e} (Flask steht im Portal-Abbild)")
+    print(f"{fails} FAIL" if fails else "PARTIAL PASS (Seite nicht geprüft)")
+    sys.exit(1 if fails else 2)
+portal.UPGRADE_VIEW_FILE = m.UPGRADE_VIEW
+m._upgrade_write({"state": "finished", "finished": "2026-11-27T12:07:00+00:00", "who": "joerg",
+                  "result": {"result": "ok", "text": "1 Paket(e) eingespielt"}})
+TMP = tempfile.mkdtemp(prefix="oaap-upg-page-")
+mg = portal.management_api
+mg.SPOOL_DIR = TMP
+for d_ in ("queue", "jobs"):
+    os.makedirs(os.path.join(TMP, d_), exist_ok=True)
+QUEUED = []
+mg.CTX["queue"] = lambda rid, name, payload, wait: QUEUED.append(dict(payload, _rid=rid))
+WHO = {"role": "server_admin", "roles": {"server_admin"}, "tenant": "", "host": None}
+portal.caller_roles = lambda: WHO["roles"]
+portal.caller_scope = lambda: (WHO["role"], WHO["tenant"])
+portal.host_tenant_scope = lambda host: (WHO["host"], True)
+c = portal.app.test_client()
+H = {"X-OAAP-User": "betreiber", "X-OAAP-Roles": "server_admin"}
+body = portal.HEALTH_BODY
+card = body[body.index("{% if upg %}"):body.index('<div class="card">\n  <h2>Kernservices')]
+tpl = portal.app.jinja_env.from_string(card)
+with portal.app.test_request_context("/health", headers=H):
+    sec = portal._upgrade_section()
+    html = tpl.render(upg=sec, job=None)
+ok("Server-Admin am Knoten: Gruppen, Versionen, Haken für Docker, Knopf, letzter Lauf",
+   sec and "Docker mit aktualisieren (6 Paket(e))" in html and "Jetzt einspielen" in html
+   and "libssl3t64" in html and "5:29.10.1-1~debian.13~trixie" in html
+   and "Sicherheit (1)" in html and "1 Paket(e) eingespielt" in html, html[:1500])
+ok("die Rückfrage nennt Sicherung und den Neustart aller Apps", "confirm(" in html
+   and "ALLE Apps" in html)
+m._upgrade_write({"state": "running", "started": "2026-11-27T12:10:00+00:00", "who": "joerg",
+                  "docker": True})
+m._upgrade_say("2026-11-27T12:10:01+00:00 Sicherung ...")
+with portal.app.test_request_context("/health", headers=H):
+    html = tpl.render(upg=portal._upgrade_section(), job=None)
+ok("läuft: kein Knopf, Protokoll, lädt sich neu, sagt: auch das Portal ist kurz weg",
+   "Ein Update läuft" in html and "Jetzt einspielen" not in html and "Sicherung ..." in html
+   and "location.reload" in html and "auch dieses Portal" in html, html[:1200])
+for who, role, roles in (("Verwalter", "tenant_admin", {"tenant_admin"}), ("Mitglied", "", {"user"})):
+    WHO.update(role=role, roles=roles, tenant="t-a")
+    with portal.app.test_request_context("/health", headers=H):
+        hidden = portal._upgrade_section() is None
+    code = c.post("/health/upgrade/run", headers=H, data={"docker": "1"}).status_code
+    ok(f"{who}: kein Abschnitt, 403 an der Tür, nichts im Spool", hidden and code == 403 and not QUEUED,
+       (hidden, code))
+WHO.update(role="server_admin", roles={"server_admin"}, tenant="", host="t-kunde")
+with portal.app.test_request_context("/health", headers=H):
+    hidden = portal._upgrade_section() is None
+code = c.post("/health/upgrade/run", headers=H).status_code
+ok("Server-Admin am Ort eines Mandanten: kein Abschnitt, 404", hidden and code == 404 and not QUEUED)
+WHO.update(host=None)
+r = c.post("/health/upgrade/run", headers=H, data={"docker": "1"})
+ok("Jetzt einspielen mit Haken: ein Auftrag upgrade/run mit docker true, zurück mit Job",
+   len(QUEUED) == 1 and QUEUED[0]["action"] == "upgrade" and QUEUED[0]["op"] == "run"
+   and QUEUED[0]["args"] == {"docker": True} and "/health?job=" in r.headers["Location"], QUEUED)
+QUEUED.clear()
+c.post("/health/upgrade/run", headers=H)
+ok("ohne Haken: docker false", QUEUED and QUEUED[0]["args"] == {"docker": False}, QUEUED)
+QUEUED.clear()
+c.post("/health/upgrade/measure", headers=H)
+ok("Neu zählen: upgrade/measure", QUEUED and QUEUED[0]["op"] == "measure", QUEUED)
+QUEUED.clear()
+r = c.post("/health/upgrade/purge", headers=H)
+ok("ein Auftrag, den es nicht gibt: nichts im Spool", not QUEUED and r.status_code == 302)
+r = c.post("/health/upgrade/run", headers=dict(H, Origin="https://evil.example"))
+ok("fremde Herkunft: 403", r.status_code == 403 and not QUEUED)
 
 print("")
 print("OK" if not fails else f"{fails} FAIL")

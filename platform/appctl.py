@@ -15529,13 +15529,22 @@ def _care_images(read=False, force=False):
 def _care_fresh(who="root", role="root", read_images=False):
     """Measure, evaluate, write -- the one path every verb ends in."""
     host_care.migrate_conf()
+    rows = []
     facts = host_care.measure(external=load_external() or "",
                               advisories=_care_advisories(),
                               images=_care_images(read_images),
                               # RFC-0139: while apt runs, the last count stands
-                              updates_before=(host_care.read(APPS_DIR) or {}).get("updates"))
+                              updates_before=(host_care.read(APPS_DIR) or {}).get("updates"),
+                              updates_rows=rows)
     facts = _care_evaluate(facts, who=who, role=role)
     host_care.write(facts, APPS_DIR)
+    try:
+        # RFC-0139 stage 3: the names for the portal -- only from a reading
+        # that happened (apt answered, nothing busy); else the last stand.
+        if facts.get("updates") is not None and (rows or not facts["updates"].get("waiting")):
+            upgrade_view_write(rows=rows, measured=facts.get("measured"))
+    except OSError as e:
+        print(f"upgrade view: {e}", file=sys.stderr)
     return facts
 
 
@@ -15894,6 +15903,45 @@ UPGRADE_STATE = os.path.join(UPGRADE_DIR, "state.json")
 UPGRADE_LOG = os.path.join(UPGRADE_DIR, "upgrade.log")
 
 
+UPGRADE_VIEW = os.path.join(APPS_DIR, host_care.UPGRADE_VIEW_FILE)
+UPGRADE_VIEW_LOG_LINES = 30
+
+
+def upgrade_view_write(rows=None, measured=None):
+    """apps/upgrade.json for the portal's section "Updates" (RFC-0139 stage
+    3): the waiting packages of the last reading, the run (state, result)
+    and, while one runs, the end of its log. `rows` None keeps the list."""
+    try:
+        with open(UPGRADE_VIEW, encoding="utf-8") as f:
+            view = json.load(f) or {}
+    except (OSError, ValueError):
+        view = {}
+    if rows is not None:
+        view["packages"] = [{k: r.get(k) for k in ("package", "installed", "version",
+                                                    "archive", "kind")} for r in rows]
+        view["measured"] = measured or _iso_now()
+    st = upgrade_state()
+    view["run"] = {k: st.get(k) for k in ("state", "started", "finished", "who", "docker", "cause")
+                   if st.get(k) is not None}
+    if st.get("result"):
+        view["run"]["text"] = st["result"].get("text", "")
+        view["run"]["result"] = st["result"].get("result", "")
+    tail = []
+    if st.get("state") in ("starting", "running"):
+        try:
+            with open(UPGRADE_LOG, encoding="utf-8") as f:
+                tail = f.read().splitlines()[-UPGRADE_VIEW_LOG_LINES:]
+        except OSError:
+            pass
+    view["log"] = tail
+    os.makedirs(APPS_DIR, exist_ok=True)
+    tmp = UPGRADE_VIEW + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(view, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, UPGRADE_VIEW)
+
+
 def upgrade_state():
     try:
         with open(UPGRADE_STATE, encoding="utf-8") as f:
@@ -15909,12 +15957,21 @@ def _upgrade_write(state):
         json.dump(state, f, indent=1)
     os.chmod(tmp, 0o600)
     os.replace(tmp, UPGRADE_STATE)
+    try:
+        upgrade_view_write()
+    except OSError as e:
+        print(f"upgrade view: {e}", file=sys.stderr)
 
 
-def _upgrade_say(line):
+def _upgrade_say(line, view=True):
     os.makedirs(UPGRADE_DIR, mode=0o700, exist_ok=True)
     with open(UPGRADE_LOG, "a", encoding="utf-8") as f:
         f.write(line.rstrip("\n") + "\n")
+    if view:
+        try:
+            upgrade_view_write()
+        except OSError as e:
+            print(f"upgrade view: {e}", file=sys.stderr)
 
 
 def _upgrade_log_clear():
@@ -16026,7 +16083,7 @@ def upgrade_run(with_docker=False, who="root", role="root", cause="hand",
     lines = [x for x in out.strip().splitlines()
              if not (x.startswith("(Reading database") and "files and directories" not in x)]
     for line in lines[-40:]:
-        _upgrade_say("  " + line)
+        _upgrade_say("  " + line, view=False)
     if rc != 0:
         tail = (out.strip().splitlines() or ["?"])[-1][:300]
         return finish({"result": "apt-failed", "packages": 0, "detail": f"Code {rc}: {tail}"})
@@ -16048,7 +16105,7 @@ def upgrade_run(with_docker=False, who="root", role="root", cause="hand",
                    "reboot_required": bool(host_care.kernel_facts().get("reboot_required"))})
 
 
-def upgrade_start(with_docker=False, who="root"):
+def upgrade_start(with_docker=False, who="root", cause="hand"):
     """Start the run in its own unit (RFC-0128 F13: the minute job and an
     ssh session may die, apt must not). (ok, sentence)."""
     if upgrade_unit_active() is not False:
@@ -16060,7 +16117,8 @@ def upgrade_start(with_docker=False, who="root"):
     if not shutil.which("systemd-run"):
         return False, "systemd-run fehlt -- ohne eigene Unit spielt der Knoten nichts ein."
     argv = [sys.executable, os.path.abspath(__file__), "node", "care", "upgrade", "--in-unit",
-            "--by", who] + (["--docker"] if with_docker else [])
+            "--by", who, "--cause", "portal" if cause == "portal" else "hand"] + (
+                ["--docker"] if with_docker else [])
     _upgrade_log_clear()
     r = subprocess.run(["systemd-run", f"--unit={host_care.UPGRADE_UNIT}", "--collect",
                         f"--setenv=OAAP_DATA_DIR={DATA_DIR}"] + argv,
@@ -16068,7 +16126,7 @@ def upgrade_start(with_docker=False, who="root"):
     if r.returncode != 0:
         return False, "systemd-run: " + ((r.stderr or "").strip()[:200] or "?")
     _upgrade_write({"state": "starting", "started": _iso_now(), "who": who,
-                    "docker": bool(with_docker)})
+                    "docker": bool(with_docker), "cause": cause})
     return True, "Update gestartet (Unit oaap-upgrade)."
 
 
@@ -16104,6 +16162,37 @@ def _upgrade_follow(poll=2.0):
         return None
 
 
+def upgrade_job(req, role, actor):
+    """The portal's section "Updates" (RFC-0139 stage 3) -> (ok, German
+    sentence). Only the server_admin, from the ACTOR's record, never from
+    the request. The run is the CLI's: the same start, the same unit."""
+    op = str(req.get("op") or "")
+    a = req.get("args") if isinstance(req.get("args"), dict) else {}
+    if role != "server_admin":
+        return False, "Updates spielt nur der Server-Admin ein (RFC-0139 D8)."
+    who = actor or "portal"
+    if op == "measure":
+        _care_fresh(read_images=False)
+        upd = (host_care.read(APPS_DIR) or {}).get("updates")
+        if upd is None:
+            return True, "Neu gezählt -- apt hat nicht geantwortet oder läuft gerade."
+        return True, f"Neu gezählt: {upd.get('waiting', 0)} Paket(e) warten."
+    if op == "run":
+        with_docker = a.get("docker") is True
+        rows = host_care.upgradable(host_care.apt_upgradable())
+        if not host_care.upgrade_plan(rows, with_docker):
+            return False, ("Nichts einzuspielen"
+                           + (" -- es warten nur Pakete von Docker; dafür den Haken setzen."
+                              if rows else "."))
+        ok, text = upgrade_start(with_docker, who=who, cause="portal")
+        if ok:
+            text += (" Erst die Sicherung (einige Minuten), dann apt"
+                     + (" -- mit Docker sind alle Apps etwa eine Minute weg, auch dieses Portal."
+                        if with_docker else ".") + " Diese Seite zeigt den Fortschritt.")
+        return ok, text
+    return False, "Unbekannter Auftrag."
+
+
 def cmd_care_upgrade(args, root, who):
     """`oaap node care upgrade [--dry-run] [--docker] [--status]`."""
     if not root:
@@ -16111,7 +16200,9 @@ def cmd_care_upgrade(args, root, who):
     with_docker = bool(getattr(args, "upgrade_docker", False))
     if getattr(args, "upgrade_in_unit", False):
         upgrade_run(with_docker, who=getattr(args, "upgrade_by", "") or "root",
-                    role="server_admin", cause="hand", fresh_log=False)
+                    role="server_admin",
+                    cause="portal" if getattr(args, "upgrade_cause", "") == "portal" else "hand",
+                    fresh_log=False)
         return
     if getattr(args, "upgrade_status", False):
         st = upgrade_state()
@@ -41172,6 +41263,23 @@ def cmd_process_deploys(_args):
                 audit_tenant("space." + str(req.get("op") or "?"),
                              ensure_default_tenant(), result="denied",
                              who=actor or "portal", role=act_role or "-", detail=msg)
+        elif action == "upgrade":
+            # RFC-0139 stage 3: the section "Updates" on the health page.
+            # Role and actor from the ACTOR's record; a run audits itself
+            # at its end (host.upgraded), a refusal is recorded here.
+            ok, msg = upgrade_job(req, act_role, actor)
+            _jd = os.path.join(JOBS_DIR, rid) if JOB_ID_RE.match(rid or "") else ""
+            if _jd and os.path.isdir(_jd):
+                with open(os.path.join(_jd, "result.json.tmp"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"id": rid, "op": req.get("op", ""), "ok": ok,
+                               "message": msg, "finished": _iso_now()}, f)
+                os.replace(os.path.join(_jd, "result.json.tmp"),
+                           os.path.join(_jd, "result.json"))
+            if not ok:
+                audit_tenant("host.upgrade." + str(req.get("op") or "?"),
+                             ensure_default_tenant(), result="denied",
+                             who=actor or "portal", role=act_role or "-", detail=msg)
         elif action == "fleet-disclose":
             # RFC-0087 §4: the page "Flotte". A done change audits itself
             # (node level in the fleet log, a tenant's in its own log); a
@@ -45542,6 +45650,7 @@ def build_parser():
     pn.add_argument("--in-unit", dest="upgrade_in_unit", action="store_true",
                     help=argparse.SUPPRESS)
     pn.add_argument("--by", dest="upgrade_by", default="", help=argparse.SUPPRESS)
+    pn.add_argument("--cause", dest="upgrade_cause", default="", help=argparse.SUPPRESS)
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "

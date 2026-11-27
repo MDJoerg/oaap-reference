@@ -428,7 +428,7 @@ def apt_busy(proc="/proc"):
     return False
 
 
-def updates_facts(run=sh, before=None, busy=None):
+def updates_facts(run=sh, before=None, busy=None, rows_out=None):
     """{waiting, security, docker, other} -- counts only; the names are the
     operator's and come from `oaap node care upgrade --dry-run`. None when
     apt cannot be asked (an absent reading, never 0). While apt or dpkg
@@ -439,6 +439,10 @@ def updates_facts(run=sh, before=None, busy=None):
     if not text.strip():
         return None
     rows = upgradable(text)
+    if rows_out is not None:
+        # RFC-0139 stage 3: the names for the portal's view (server_admin
+        # only) -- never into the care file, which carries counts.
+        rows_out.extend(rows)
     n = {k: sum(1 for r in rows if r["kind"] == k) for k in ("security", "docker", "other")}
     return {"waiting": len(rows), **n}
 
@@ -466,6 +470,7 @@ def updates_line(upd, kernel=None, de=False):
 # --- installing on the administrator's word (RFC-0139 stage 2) -------------
 
 UPGRADE_UNIT = "oaap-upgrade"
+UPGRADE_VIEW_FILE = "upgrade.json"     # in apps/, for the portal (stage 3)
 UPGRADE_SETTLE = 300          # seconds the check waits for every container
 UPGRADE_APT_TIMEOUT = 1800
 
@@ -549,7 +554,8 @@ def measure(run=sh, os_release="/etc/os-release", external="", advisories=None,
         "gateway": gateway_facts(run),
         # RFC-0139 stage 1: the packages that wait, counted
         "updates": updates_facts(run, before=probes.get("updates_before"),
-                                 busy=probes.get("apt_busy")),
+                                 busy=probes.get("apt_busy"),
+                                 rows_out=probes.get("updates_rows")),
         "external_name": external or "",
         # 2.8: the reading the caller made (advisories.care_block) --
         # None when the node never had a list, which is not "0 open".
