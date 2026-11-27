@@ -7243,6 +7243,16 @@ def care_rows(facts):
                   else f"{adv['open']} offen" + (" (veraltet)" if adv.get("stale") else "")),
         "detail": text + (f" — offen: {names}" if names else ""),
     })
+    # RFC-0139 Stufe 1: die wartenden Pakete, gezählt
+    if facts.get("updates") is not None:
+        upd = facts["updates"]
+        ust, utext = host_care.updates_line(facts.get("updates"), facts.get("kernel"), de=True)
+        rows.append({
+            "name": "Updates",
+            "state": {"ok": "ok", "warn": "warn"}.get(ust, "unknown"),
+            "label": f"{upd.get('waiting', 0)} warten",
+            "detail": utext,
+        })
     # 2.9 (RFC-0071 Stufe 1): die Abbilder der Instanzen, in Zahlen.
     il = host_care.images_line(facts.get("images"), de=True)
     if il:

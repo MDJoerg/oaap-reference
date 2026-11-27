@@ -3595,6 +3595,23 @@ def disk_trend_conditions(pct, open_keys, now=None):
     return disk_trend.conditions(fc, open_keys, total)
 
 
+def host_updates_conditions(facts):
+    """{"host.updates": ...} while packages wait, else {} (RFC-0139 §3)."""
+    upd = (facts or {}).get("updates") or {}
+    n = upd.get("waiting") or 0
+    if not n:
+        return {}
+    s, d = upd.get("security", 0), upd.get("docker", 0)
+    reboot = bool(((facts or {}).get("kernel") or {}).get("reboot_required"))
+    text = (f"{n} Paket(e) warten auf ein Update, davon {s} Sicherheitsupdate(s), "
+            f"{d} von Docker. "
+            + ("Ein Neustart wartet (neuer Kernel). " if reboot else "Ein Neustart ist nicht nötig. ")
+            + ("Docker-Updates starten alle Apps des Servers einmal neu (etwa eine Minute). "
+               if d else "")
+            + "Ansehen: sudo oaap node care upgrade --dry-run")
+    return {"host.updates": {"type": "host.updates", "kurz": str(n), "text": text}}
+
+
 def notify_conditions(facts=None, now=None):
     """The conditions true now, per scope: {tid: {key: condition}}."""
     now = now or notify.now_utc()
@@ -3664,6 +3681,8 @@ def notify_conditions(facts=None, now=None):
                     + (f" (das älteste: {adv.get('oldest_package')}, seit "
                        f"{str(adv.get('oldest', ''))[:10]})." if adv.get("oldest_package")
                        else ".")}
+    # RFC-0139 stage 1: the packages that wait -- a daily reminder (D1)
+    cur[dflt].update(host_updates_conditions(facts))
     # ONE matter per tenant, not one per instance: measured on oaap-test
     # (2026-11-11) the first minute opened one per instance -- on a node with
     # twenty apps that is twenty mails at the rollout. The text names them.
@@ -3989,7 +4008,9 @@ def ledger_lines_for_day(day, measured_now):
                 adv = (care or {}).get("advisories") or {}
                 parts["care"] = {"kernel": k.get("running", ""),
                                  "reboot_required": bool(k.get("reboot_required")),
-                                 "advisories": adv.get("open")} if care else None
+                                 "advisories": adv.get("open"),
+                                 # RFC-0139 stage 1
+                                 "updates": (care or {}).get("updates")} if care else None
             else:
                 parts["bytes"] = None
         else:
@@ -15916,6 +15937,33 @@ def cmd_node_care(args):
         return
     if verb == "space":
         return cmd_care_space(args, rest, root, who)
+    if verb == "upgrade":
+        # RFC-0139 §4 step 1: show first. The names are the operator's.
+        if not root:
+            die("oaap node care upgrade needs root (sudo): it names the packages")
+        if not getattr(args, "space_dry", False):
+            die("oaap node care upgrade: only --dry-run so far (RFC-0139 stage 1); "
+                "updating comes with stage 2")
+        rows = host_care.upgradable(host_care.apt_upgradable())
+        with_docker = bool(getattr(args, "upgrade_docker", False))
+        words = {"security": "Security", "docker": "Docker", "other": "Other"}
+        if not rows:
+            print("No package waits for an update.")
+        for kind in ("security", "docker", "other"):
+            part = [r for r in rows if r["kind"] == kind]
+            if not part:
+                continue
+            print(f"{words[kind]} ({len(part)}):")
+            for r in part:
+                print(f"  {r['package']:<28} {r['installed']} -> {r['version']}  ({r['archive']})")
+        take = [r for r in rows if with_docker or r["kind"] != "docker"]
+        skipped = len(rows) - len(take)
+        print("")
+        print(f"An upgrade now would take {len(take)} package(s)"
+              + (f"; {skipped} of Docker only with --docker (every app restarts, about a minute)"
+                 if skipped else "")
+              + ". Nothing was changed (dry run).")
+        return
     if verb == "advisories":
         # 2.8.2: the names are the server_admin's, on the node.
         if not root:
@@ -16078,7 +16126,8 @@ def cmd_node_care(args):
         die("usage: oaap node care [measure | sample | auto-updates on | "
             "reboot-window HH:MM|off | reboot at <time>|cancel | "
             "protect <instance> | release <instance> | advisories [--read] | images [--read] | "
-            "space [--dry-run] [--class A,B,C] | space rmi <image>]")
+            "space [--dry-run] [--class A,B,C] | space rmi <image> | "
+            "upgrade --dry-run [--docker]]")
     print("")
     host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
@@ -45236,6 +45285,8 @@ def build_parser():
                     help="for care space: the classes, default A,B,C (RFC-0128)")
     pn.add_argument("--nightly", dest="space_nightly", action="store_true",
                     help=argparse.SUPPRESS)
+    pn.add_argument("--docker", dest="upgrade_docker", action="store_true",
+                    help="for care upgrade: Docker's packages too (RFC-0139)")
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "

@@ -48,6 +48,12 @@ CATALOGUE = {
     "advisory.host": {"category": "security", "scope": "node", "matter": True,
                       "title": "Sicherheitsupdates für den Server offen",
                       "subject": "[{knoten}] Sicherheitsupdates offen"},
+    # RFC-0139 D1/D2: a reminder, not an alarm -- daily while packages wait,
+    # the node's administrators only.
+    "host.updates": {"category": "operations", "scope": "node", "matter": True,
+                     "remind": 24,
+                     "title": "Updates für den Server warten",
+                     "subject": "[{knoten}] {kurz} Updates für den Server warten"},
     "advisory.image": {"category": "security", "scope": "tenant", "matter": True,
                        "title": "Sicherheitskorrekturen im Abbild einer Instanz offen",
                        "subject": "[{mandant}] Abbild von {instanz}: Sicherheitskorrekturen offen"},

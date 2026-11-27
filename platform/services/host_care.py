@@ -352,6 +352,78 @@ def gateway_facts(run=sh):
 
 # --- the measurement -------------------------------------------------------
 
+# --- the packages that wait (RFC-0139 stage 1) ----------------------------
+
+# Docker's own archive (download.docker.com) names its suite like the
+# distribution's ("trixie"), so the archive cannot tell its packages apart --
+# the names can. What makes them special is measured (RFC-0139 §9): their
+# update restarts containerd and dockerd, every app of the node is away for
+# about a minute.
+DOCKER_PACKAGES = frozenset({"containerd.io", "docker-ce", "docker-ce-cli",
+                             "docker-ce-rootless-extras", "docker-buildx-plugin",
+                             "docker-compose-plugin", "docker-model-plugin"})
+_UPGRADABLE = re.compile(r"^([^/\s]+)/(\S+)\s+(\S+)\s+(\S+)\s+\[[^\]]*?:\s*([^\]]+)\]")
+
+
+def is_docker_package(name):
+    return name in DOCKER_PACKAGES or name.startswith("docker-")
+
+
+def upgradable(text):
+    """`apt list --upgradable` (C locale) -> [{package, archive, version,
+    installed, kind}], kind = security | docker | other. Lines that are not
+    a package (the "Listing..." head) are skipped."""
+    out = []
+    for line in (text or "").splitlines():
+        m = _UPGRADABLE.match(line.strip())
+        if not m:
+            continue
+        name, archive, version, _arch, installed = m.groups()
+        kind = ("security" if "-security" in archive
+                else "docker" if is_docker_package(name) else "other")
+        out.append({"package": name, "archive": archive, "version": version,
+                    "installed": installed.strip(), "kind": kind})
+    return out
+
+
+def apt_upgradable(run=sh):
+    """The raw list, in the C locale (the parser reads English), or ''."""
+    return run(["apt", "list", "--upgradable"], timeout=120,
+               env={"LC_ALL": "C", "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")})
+
+
+def updates_facts(run=sh):
+    """{waiting, security, docker, other} -- counts only; the names are the
+    operator's and come from `oaap node care upgrade --dry-run`. None when
+    apt cannot be asked (an absent reading, never 0)."""
+    text = apt_upgradable(run)
+    if not text.strip():
+        return None
+    rows = upgradable(text)
+    n = {k: sum(1 for r in rows if r["kind"] == k) for k in ("security", "docker", "other")}
+    return {"waiting": len(rows), **n}
+
+
+def updates_line(upd, kernel=None, de=False):
+    """(state, text) for `oaap status` and the portal: how many packages wait,
+    of them security and Docker, and whether a reboot waits."""
+    if not upd:
+        return ("unknown", "Updates: nicht messbar (apt antwortet nicht)" if de
+                else "Updates: not measurable (apt did not answer)")
+    n, s, d = upd.get("waiting", 0), upd.get("security", 0), upd.get("docker", 0)
+    reboot = bool((kernel or {}).get("reboot_required"))
+    if not n:
+        return ("ok", ("Updates: keine warten" if de else "Updates: none waiting")
+                + ((" — ein Neustart wartet" if de else " — a reboot waits") if reboot else ""))
+    text = (f"Updates: {n} warten, davon {s} Sicherheit, {d} Docker"
+            + (" — ein Neustart wartet" if reboot else "")
+            + " — ansehen: sudo oaap node care upgrade --dry-run") if de else (
+            f"Updates: {n} waiting, {s} security, {d} Docker"
+            + (" — a reboot waits" if reboot else "")
+            + " — see: sudo oaap node care upgrade --dry-run")
+    return ("warn" if s else "ok", text)
+
+
 def measure(run=sh, os_release="/etc/os-release", external="", advisories=None,
             images=None, **probes):
     """The facts of 2.6.1 plus, for 2.7.3, whether the node is exposed:
@@ -375,6 +447,8 @@ def measure(run=sh, os_release="/etc/os-release", external="", advisories=None,
         "auto_updates": {k: v for k, v in auto.items() if k != "window"},
         "reboot_window": auto["window"],
         "gateway": gateway_facts(run),
+        # RFC-0139 stage 1: the packages that wait, counted
+        "updates": updates_facts(run),
         "external_name": external or "",
         # 2.8: the reading the caller made (advisories.care_block) --
         # None when the node never had a list, which is not "0 open".
@@ -1385,6 +1459,10 @@ def status_lines(facts, now=None, de=False):
         out.append(("unknown", "Automatische Updates: nicht messbar" if de
                     else "Auto-updates: not measurable"))
     out.append(advisory_line(facts.get("advisories"), de, now))
+    if facts.get("updates") is not None:
+        # RFC-0139: only a reading is a line -- a node whose apt did not
+        # answer says nothing here rather than a number it does not have
+        out.append(updates_line(facts["updates"], k, de))
     il = images_line(facts.get("images"), de)
     if il:
         out.append(il)

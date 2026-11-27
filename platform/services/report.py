@@ -274,6 +274,13 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     if disk is not None:
         summary.append(f"Platte: {disk:.0f} % belegt"
                        + (f" ({fmt_delta(growth)} diese Woche)" if growth is not None else ""))
+    # RFC-0139 §3: what waits at the end of the week
+    upd = _last_care(week, have, "updates")
+    if scope_is_node and upd and upd.get("waiting"):
+        summary.append(f"Updates für den Server: {upd['waiting']} warten "
+                       f"({upd.get('security', 0)} Sicherheit, {upd.get('docker', 0)} Docker)"
+                       + (" — ein Neustart wartet" if _last_care(week, have, "reboot_required")
+                          else ""))
     if freed:
         summary.append(f"Platz freigegeben: {fmt_bytes(sum(e.get('b') or 0 for e in freed))} in "
                        f"{len(freed)} " + ("Lauf" if len(freed) == 1 else "Läufen"))
@@ -447,6 +454,15 @@ def _top_names(f, k):
 
 def _foreign_name(nm):
     return f"„{nm}“" if nm else "(leer)"
+
+
+def _last_care(week, have, key):
+    """The care part's `key` of the last day that has a care part."""
+    for d in reversed(have):
+        c = week[d].get("care")
+        if c:
+            return c.get(key)
+    return None
 
 
 def _last_value(week, have, part, key):
