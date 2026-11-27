@@ -689,11 +689,183 @@ def find_user(users, username):
     return next((u for u in users if u["username"] == username), None)
 
 
-def session_username():
+def _flat_username():
+    """The one person of the session form before RFC-0137 -- a terminal's
+    form to this day (D7)."""
     user = session.get("user")
     if isinstance(user, dict):  # session format before user management
         return user.get("username")
     return user
+
+
+# RFC-0137: one sign-in per tenant in one browser. Every tenant under the
+# node's names shares the one cookie (place.cookie_scope), so a single
+# person in it meant that signing in to tenant B's chat signed the browser
+# out of tenant A's. The session now holds
+#   session["accounts"] = {<tenant id>: {"user", "epoch", "at",
+#                                        "idp"?, "idp_out"?}}
+#   session["last"]     = <tenant id of the newest sign-in>
+# and every request picks exactly ONE of them (_pick) -- by the tenant of
+# the instance or place it is about, never by anything the browser says.
+ACCOUNTS_MAX = 8                     # D5; ~150 bytes each, the cookie holds 4 KB
+SITE_TENANT_HEADER = "X-OAAP-Site-Tenant"   # set by the gateway on an instance's /auth/*
+
+
+def _accounts():
+    """The sign-ins of this browser, {tenant id: entry}; {} for none and
+    for a terminal (D7: a terminal keeps exactly one person, the old form).
+
+    The form before RFC-0137 (one person at the top level) is read as a
+    list of one and rewritten in the new form, so nobody is signed out by
+    the update."""
+    if session.get("terminal_key"):
+        return {}
+    acc = session.get("accounts")
+    if isinstance(acc, dict):
+        return acc
+    name = _flat_username()
+    if not name:
+        return {}
+    u = find_user(load_users(), name)
+    tid = resolve_tenant(u.get("tenant")) if u else None
+    entry = {"user": name, "epoch": session.get("epoch", 0), "at": _signin_at()}
+    for k in ("idp", "idp_out"):
+        if session.get(k):
+            entry[k] = session[k]
+    for k in ("user", "epoch", "idp", "idp_out"):
+        session.pop(k, None)
+    if tid is None:
+        return {}
+    session["accounts"] = {tid: entry}
+    session["last"] = tid
+    return session["accounts"]
+
+
+def _context_tenant():
+    """(tenant id or None, known) -- which tenant this request is about.
+
+    /verify: the instance's tenant, written by the generated gateway config.
+    An identity page on an instance's address: the same, as the header the
+    gateway sets on that site's /auth/* (a client cannot pick a sign-in it
+    does not hold either way -- the choice is only among this browser's
+    own). A tenant's place: the host. Anything else (the node's own name, a
+    LAN address): not known. A known but unresolvable tenant is (None,
+    True) and fails closed further on."""
+    if request.path == "/verify":
+        ref = (request.args.get("tenant") or "").strip()
+        return (resolve_tenant(ref), True) if ref else (None, False)
+    ref = (request.headers.get(SITE_TENANT_HEADER) or "").strip()
+    if ref:
+        return resolve_tenant(ref), True
+    try:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        tid, _resolved = place.host_place(_forwarded_host(), _external_host(),
+                                          known_tenants(), default_tenant_id(), now)
+    except Exception:            # noqa: BLE001 -- a bad store must not cost a login
+        tid = None
+    return (tid, True) if tid else (None, False)
+
+
+def _signin_at():
+    """When a sign-in happened, to the microsecond: two in one second must
+    still sort, or "newest" and the limit of D5 would guess."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _newest(acc):
+    return max(acc, key=lambda k: acc[k].get("at", "")) if acc else None
+
+
+def _pick():
+    """(tenant id, entry) of the ONE sign-in this request uses, or (None, None).
+
+    1. A known tenant: that tenant's sign-in. Without one, a server_admin's
+       sign-in (D4: the member wins where the browser holds one), else none
+       -- the browser is not signed in THERE and goes to that login.
+    2. Unknown context: the newest sign-in (D3), today's behaviour.
+    A tenant the node does not have takes the newest too, so the tenant
+    boundary refuses it exactly as before."""
+    acc = _accounts()
+    if not acc:
+        return None, None
+    tid, known = _context_tenant()
+    if known and tid is not None:
+        if tid in acc:
+            return tid, acc[tid]
+        users = load_users()
+        for k in sorted(acc, key=lambda k: acc[k].get("at", ""), reverse=True):
+            u = find_user(users, acc[k].get("user", ""))
+            if u and "server_admin" in (u.get("roles") or []):
+                return k, acc[k]
+        return None, None
+    last = session.get("last")
+    k = last if last in acc else _newest(acc)
+    return k, acc[k]
+
+
+def _put_accounts(acc):
+    """Write the list back (a new dict, so the session sees the change)."""
+    if not acc:
+        for k in ("accounts", "last"):
+            session.pop(k, None)
+        return
+    session["accounts"] = dict(acc)
+    if session.get("last") not in acc:
+        session["last"] = _newest(acc)
+
+
+def _add_account(u, idp_rec=None, idp_out=None):
+    """A sign-in of `u` beside the others (RFC-0137 §2.1, §2.3).
+
+    One per tenant (D2): a second sign-in of the same tenant replaces the
+    first. At most ACCOUNTS_MAX (D5), the oldest drops out. The provider's
+    id token hint is kept for the newest realm sign-in only -- it only
+    spares the provider's "really sign out?" question, and several of them
+    would burst the cookie. A terminal's session is replaced, as before."""
+    acc = {} if session.get("terminal_key") else dict(_accounts())
+    oidc = session.get("oidc")
+    session.clear()
+    if oidc:
+        session["oidc"] = oidc
+    tid = resolve_tenant(u.get("tenant"))
+    tid = tid if tid is not None else ""
+    entry = {"user": u["username"], "epoch": u.get("session_epoch", 0),
+             "at": _signin_at()}
+    if idp_rec:
+        entry["idp"] = idp_rec
+    if idp_out:
+        entry["idp_out"] = dict(idp_out)
+        if idp_out.get("hint"):
+            for k, e in list(acc.items()):
+                if (e.get("idp_out") or {}).get("hint"):
+                    acc[k] = dict(e, idp_out={x: y for x, y in e["idp_out"].items()
+                                              if x != "hint"})
+    acc[tid] = entry
+    while len(acc) > ACCOUNTS_MAX:
+        acc.pop(min((k for k in acc if k != tid), key=lambda k: acc[k].get("at", "")))
+    session["accounts"] = acc
+    session["last"] = tid
+
+
+def _drop_account(tid):
+    acc = dict(_accounts())
+    acc.pop(tid, None)
+    _put_accounts(acc)
+
+
+def session_username():
+    """The person of the sign-in this request uses (RFC-0137 _pick)."""
+    if session.get("terminal_key"):
+        return _flat_username()
+    _tid, entry = _pick()
+    return (entry or {}).get("user")
+
+
+def signed_in_names():
+    """The persons this browser is signed in as, newest first."""
+    acc = _accounts()
+    return [acc[k].get("user", "") for k in
+            sorted(acc, key=lambda k: acc[k].get("at", ""), reverse=True)]
 
 
 def public_user(u):
@@ -1382,17 +1554,30 @@ def _terminal_key_ok(kid):
 
 
 def _by_session():
-    """Method `session` (RFC-0027 3.2): the browser cookie."""
-    username = session_username()
-    user = find_user(load_users(), username) if username else None
-    if (not user or not user["active"]
-            or session.get("epoch") != user.get("session_epoch", 0)):
-        session.clear()
-        return None, "session", login_redirect()
+    """Method `session` (RFC-0027 3.2): the browser cookie.
+
+    RFC-0137: the sign-in this request is about (_pick). A stale one --
+    signed out elsewhere, deactivated, moved to another tenant -- drops
+    out of the list alone; the browser's other sign-ins stay."""
     kid = session.get("terminal_key")
-    if kid and not _terminal_key_ok(kid):
-        session.clear()
-        return None, "session", login_redirect()
+    if kid:
+        username = _flat_username()
+        user = find_user(load_users(), username) if username else None
+        if (not user or not user["active"]
+                or session.get("epoch") != user.get("session_epoch", 0)
+                or not _terminal_key_ok(kid)):
+            session.clear()
+            return None, "session", login_redirect()
+    else:
+        tid, entry = _pick()
+        if entry is None:
+            return None, "session", login_redirect()
+        user = find_user(load_users(), entry.get("user", ""))
+        if (not user or not user["active"]
+                or entry.get("epoch") != user.get("session_epoch", 0)
+                or resolve_tenant(user.get("tenant")) != tid):
+            _drop_account(tid)
+            return None, "session", login_redirect()
     # RFC-0046 §6.2: a session whose password somebody else chose reaches
     # the password page and nothing else. Here, in the one function every
     # session-shaped answer comes from (/verify, /auth/whoami), so that no
@@ -1516,6 +1701,8 @@ LOGIN_PAGE = _HEAD + "<title>Anmelden — {{ face.title if at_place else 'OAAP' 
    {{ "Betreibersicht" if not show_face else "OAAP" }}</p>{% endif %}
 <h1>Anmelden</h1>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
+{% if signed_in %}<p class="hint">Angemeldet als {{ signed_in|join(", ") }}.
+   Hier meldest du dich zusätzlich an; die bisherigen Anmeldungen bleiben.</p>{% endif %}
 {% if not has_users %}
   <p class="hint">Es gibt noch keine Benutzer — bitte zuerst die
   Einrichtung abschließen (URL und Token stehen in der
@@ -2173,6 +2360,34 @@ def _verify_via(scope):
     return _act_answer(person, target, want, f"instance:{chat}", what, "A")
 
 
+OTHER_TENANT_PAGE = _HEAD + "<title>Anderer Mandant — OAAP</title>" + _CARD_STYLE \
+    + "{{ theme_style }}" + _MARK_SVG.join([
+        "<body><div class='card'>",
+        """<h1>Anderer Mandant</h1>
+<p>Diese Anwendung gehört zu einem anderen Mandanten als dein Konto
+   <strong>{{ who }}</strong>.</p>
+<form method="get" action="/auth/login">
+{% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+{% if tenant %}<input type="hidden" name="tenant" value="{{ tenant }}">{% endif %}
+  <button>Mit anderem Konto anmelden</button>
+</form>
+<p class="hint">Deine bisherige Anmeldung bleibt bestehen.</p>
+</div></body></html>"""])
+
+
+def _other_tenant_refusal(user):
+    """RFC-0137 stage 0: a person reaching another tenant's instance. A
+    browser navigating gets a page with the way to the right sign-in; a
+    script the sentence, as before."""
+    if not is_navigation():
+        return "Forbidden: this app belongs to another tenant", 403
+    target = _return_target(_requested_uri())
+    return render_template_string(
+        OTHER_TENANT_PAGE, who=user.get("username", ""),
+        next=target if target and target != "/" else "",
+        tenant=request.args.get("tenant", "")), 403
+
+
 @app.get("/verify")
 def verify():
     """Forward-auth endpoint for the gateway (RFC-0002 default deny).
@@ -2237,7 +2452,7 @@ def verify():
         want = resolve_tenant(required_tenant)
         mine = resolve_tenant(user.get("tenant"))
         if want is None or mine is None or want != mine:
-            return "Forbidden: this app belongs to another tenant", 403
+            return _other_tenant_refusal(user)
     # Spec 2.11: an assertion says a PERSON is at the screen. A key is not
     # that, whoever it belongs to, so it gets the header empty.
     return "", 204, identity_headers(
@@ -2739,7 +2954,8 @@ def login_form():
     return render_template_string(
         LOGIN_PAGE, error=None, has_users=_has_people(load_users()),
         provider=login_provider_label(),
-        next=_return_target(request.args.get("next", "")))
+        next=_return_target(request.args.get("next", "")),
+        signed_in=signed_in_names())
 
 
 @app.post("/auth/login")
@@ -2775,8 +2991,7 @@ def login():
             and idp.has_local_password(u)
             and check_password_hash(u["password_hash"], password)):
         _login_succeeded(throttle_key)
-        session["user"] = u["username"]
-        session["epoch"] = u.get("session_epoch", 0)
+        _add_account(u)   # RFC-0137: beside the browser's other sign-ins
         print(f"login ok: {u['username']} from {_client_ip()}", flush=True)
         if u.get("must_change_password"):
             # RFC-0046 §6.2: straight to the one page this session may
@@ -3078,18 +3293,17 @@ def oidc_callback():
     if bad:
         return _idp_failed(bad, 403, tid=tid,
                            who=str(claims.get("sub"))[:40])
-    session["user"] = user["username"]
-    session["epoch"] = user.get("session_epoch", 0)
-    session["idp"] = {"provider": idp.provider_key(provider),
-                      "factor": idp.second_factor(claims)}
+    idp_rec = {"provider": idp.provider_key(provider),
+               "factor": idp.second_factor(claims)}
     # What signing OUT at the provider needs. The id token is only a hint
     # (it lets the provider skip its "really log out?" question), and it
     # travels in the cookie, which has a hard size limit -- so a large one
     # is left out rather than risking the whole session.
     raw_token = str((tok or {}).get("id_token") or "")
-    session["idp_out"] = {"tenant": tid}
+    idp_out = {"tenant": tid}
     if raw_token and len(raw_token) <= IDP_HINT_MAX:
-        session["idp_out"]["hint"] = raw_token
+        idp_out["hint"] = raw_token
+    _add_account(user, idp_rec, idp_out)   # RFC-0137: beside the others
     print(f"idp login ok: {user['username']} from {_client_ip()}", flush=True)
     path = _return_target(started.get("next", "")) or "/"
     back = _return_host(started.get("back", ""))
@@ -3232,6 +3446,19 @@ def _idp_principal(tid, provider, claims):
     return record, ""
 
 
+def _keep_epoch(username, epoch):
+    """This browser stays signed in as `username` after a change that
+    revoked every other copy (RFC-0137: in each entry of that person)."""
+    if session.get("terminal_key"):
+        session["epoch"] = epoch
+        return
+    acc = dict(_accounts())
+    for k, e in list(acc.items()):
+        if e.get("user") == username:
+            acc[k] = dict(e, epoch=epoch)
+    _put_accounts(acc)
+
+
 def _revoke_sessions(username):
     """Bump a user's session epoch, invalidating every copy of their
     cookie immediately (see load_users()/verify()) — used by logout and
@@ -3360,13 +3587,26 @@ def logout():
         return ("Ein Terminal meldet sich nicht ab. Beendet wird das im "
                 "Portal unter Zugänge, indem der Schlüssel dieses Geräts "
                 "entzogen wird."), 403
-    username = session_username()
-    if username:
-        _revoke_sessions(username)
-        print(f"logout: {username}", flush=True)
-    out = session.get("idp_out") or {}
-    away = _provider_logout_url(out) if username else ""
-    session.clear()
+    # RFC-0137 D6: the sign-in of THIS place; `all=1` ("Überall abmelden")
+    # every sign-in of this browser.
+    acc = dict(_accounts())
+    if request.form.get("all") == "1":
+        targets = list(acc)
+    else:
+        tid, entry = _pick()
+        targets = [tid] if entry is not None else []
+    away = ""
+    for tid in targets:
+        username = acc[tid].get("user", "")
+        if username:
+            _revoke_sessions(username)
+            print(f"logout: {username}", flush=True)
+            away = away or _provider_logout_url(acc[tid].get("idp_out") or {})
+        acc.pop(tid, None)
+    if acc:
+        _put_accounts(acc)
+    else:
+        session.clear()
     if away:
         return redirect(away, code=303)
     # No return target here, deliberately (RFC-0040 §5 is about a
@@ -3423,7 +3663,7 @@ def password_change():
         # own session to match (else the request right after this one would
         # find itself logged out too).
         u["session_epoch"] = u.get("session_epoch", 0) + 1
-        session["epoch"] = u["session_epoch"]
+        _keep_epoch(u["username"], u["session_epoch"])
         save_users(users)
     print(f"password changed: {u['username']} (other sessions revoked)", flush=True)
     if forced:

@@ -101,7 +101,11 @@ ok("als die Person der Sitzung", r.headers.get("X-OAAP-User") == "anna", dict(r.
 r = verify(client("anna"), JWT, roles="support")
 ok("die Rollen der Route gelten weiter (403 ohne support)", r.status_code == 403, r.status_code)
 r = verify(client("bert"), JWT, tenant="t-cls")
-ok("die Mandantengrenze gilt weiter (403)", r.status_code == 403, r.status_code)
+# RFC-0137: ein Browser ohne Anmeldung dieses Mandanten ist DORT nicht
+# angemeldet -- die Antwort ist die eines Anonymen (401 fuer ein Skript),
+# nicht mehr die 403 der Grenze. Was zaehlt: bert kommt nie hinein.
+ok("in einen fremden Mandanten kein Durchkommen (401/403, nie bert)",
+   r.status_code in (401, 403) and r.headers.get("X-OAAP-User") != "bert", r.status_code)
 ok("auch 'bearer' klein geschrieben",
    client("anna").get("/verify", query_string={"roles": "user"},
                       headers={"Authorization": "bearer " + JWT}).status_code == 204)

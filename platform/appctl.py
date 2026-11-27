@@ -21696,12 +21696,29 @@ _COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
 # (RFC-0073) is read by identity's /verify. A prefix strip would cut it.
 # X-OAAP-Tenant stays legitimate towards the platform itself: the
 # connector's /connect/tunnel on the portal apex, never an app site.
-NOT_PLATFORM_HEADERS = ("X-OAAP-Groups", "X-OAAP-Tenant")
+#
+# X-OAAP-Site-Tenant (RFC-0137) is the gateway's word to IDENTITY on an
+# instance's /auth/*: whose instance this address is, so that a sign-out
+# there ends the right one of the browser's sign-ins. Set inside that
+# block only; an app never receives it.
+SITE_TENANT_HEADER = "X-OAAP-Site-Tenant"
+NOT_PLATFORM_HEADERS = ("X-OAAP-Groups", "X-OAAP-Tenant", SITE_TENANT_HEADER)
 
 
 def strip_not_platform(indent="\t"):
     """Site-level strip of the names the platform never sets (see above)."""
     return [f"{indent}request_header -{h}" for h in NOT_PLATFORM_HEADERS]
+
+
+def site_tenant_lines(tenant, indent="\t\t"):
+    """RFC-0137: identity learns on an instance's /auth/* whose instance it
+    is. The raw stored value, like the tenant parameter of /verify; a value
+    that is not a plain name is left out (identity then takes the newest
+    sign-in, the behaviour before)."""
+    t = str(tenant or "")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", t):
+        return []
+    return [f'{indent}request_header {SITE_TENANT_HEADER} "{t}"']
 
 
 def strip_identity(indent="\t\t", keep=()):
@@ -22454,6 +22471,7 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     lines += strip_not_platform()
     lines.append("\thandle /auth/* {")
     lines += strip_identity()
+    lines += site_tenant_lines(tenant)
     lines.append("\t\treverse_proxy identity:8000")
     lines.append("\t}")
     lines += _platform_site_lines(routes, groups, scope, tenant, login_only)
