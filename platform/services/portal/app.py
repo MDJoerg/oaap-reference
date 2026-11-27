@@ -24,7 +24,7 @@ from urllib.parse import parse_qsl as _parse_qsl, urlencode as _urlencode
 
 import requests
 from flask import (Flask, g, make_response, redirect, render_template_string,
-                   request, send_file)
+                   has_request_context, request, send_file)
 from markupsafe import Markup
 
 import build_view
@@ -55,6 +55,7 @@ from werkzeug.security import generate_password_hash
 import tenant_health_view as thv
 import traffic  # noqa: E402  (the hour per host, for the tenant health page)
 import instance_metrics  # noqa: E402  (RFC-0108: the history per instance)
+import site_stats  # noqa: E402  (I-81: page statistics per instance)
 # The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
@@ -2904,7 +2905,11 @@ INSTANCES_LIST_BODY = """
 {% endif %}
 {% if total %}
 <form class="card" method="get" action="/instances">
-<style>.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));
+{% if sort != "name" or desc %}<input type="hidden" name="sort" value="{{ sort }}">
+{% if desc %}<input type="hidden" name="dir" value="desc">{% endif %}{% endif %}
+<style>.sorthead{color:inherit;text-decoration:none;white-space:nowrap}
+  .sorthead:hover{text-decoration:underline}.sorthead.on{color:var(--oaap-accent, inherit)}
+  .filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));
    gap:.2rem .8rem;align-items:end}
   .filters label{font-size:.82rem;color:var(--oaap-muted);display:block}
   .filters select,.filters input{margin:.2rem 0 .6rem}</style>
@@ -2936,7 +2941,14 @@ INSTANCES_LIST_BODY = """
 {% if instances %}
 <div class="card" style="overflow-x:auto;padding:.4rem 1.4rem">
 <table>
-  <tr><th>Instanz</th><th>Status</th><th>App</th>{% if show_tenant %}<th>Mandant</th>{% endif %}<th>Kanal</th><th>Pflege</th><th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
+  {# Jörg 27.11.: sortierte Liste -- ein Klick auf eine Spalte sortiert,
+     ein zweiter dreht die Richtung; die Wahl bleibt wie der Filter erhalten. #}
+  <tr>{% for col in ["name", "status", "app", "tenant", "channel", "care"] %}{% if col in sort_cols %}
+    <th aria-sort="{{ ('descending' if desc else 'ascending') if heads[col].active else 'none' }}"><a
+      class="sorthead{{ ' on' if heads[col].active }}" href="{{ heads[col].href }}"
+      title="Nach {{ sort_cols[col] }} sortieren">{{ sort_cols[col] }}{% if heads[col].arrow %}
+      <span aria-hidden="true">{{ heads[col].arrow }}</span>{% endif %}</a></th>{% endif %}{% endfor %}
+    <th>Sichtbarkeit</th><th>Kachel</th><th></th></tr>
   {% for i in instances %}
   <tr class="rowlink">
     {# Jörg 20.11.: vorn die Seite der Instanz (neues Fenster), hinten das Bearbeiten --
@@ -4019,6 +4031,18 @@ INSTANCE_EDIT_BODY = """
     {% endif %}
     <button>In den Katalog übernehmen</button>
   </form>
+  {% set jp = i.catalog_put.just_put %}
+  {% if jp and jp.package %}
+  <p class="ok" style="margin:.6rem 0">Das Paket liegt in „{{ jp.name }}“ —
+     <a class="btn" href="{{ jp.package }}" target="_blank" rel="noopener"
+        title="{{ jp.package }}">Jetzt im Katalog freigeben <span aria-hidden="true">&#8599;</span></a></p>
+  {% endif %}
+  {% for c in i.catalog_put.catalogs if c.home %}
+  <p style="margin:.4rem 0">{% if i.catalog_put.catalogs|length > 1 %}{{ c.name }}: {% endif %}<a
+     href="{{ c.home }}" target="_blank" rel="noopener" title="{{ c.home }}">{{ i.catalog_put.app_id }}
+     im Katalog öffnen <span aria-hidden="true">&#8599;</span></a>
+     <span class="muted">— dort Freigeben und „Sichtbar für“</span></p>
+  {% endfor %}
   <p class="muted">Das Paket kommt <strong>nicht freigegeben</strong> an: Was
      andere Mandanten sehen, entscheidest Du im Katalog — dort auch, für
      welche Mandanten („Sichtbar für“). Eine Version, die der Katalog schon hat,
@@ -4358,6 +4382,81 @@ INSTANCE_EDIT_BODY = """
      nachreichen: Was eine App braucht, sagt sie selbst.</p>
 </div>
 {% endif %}
+</section>
+
+<section class="panel {{ 'active' if tab == 'statistik' }}">
+{# I-81 Idee 2+3 (Jörg 27.11.: "Bau die Seitenstatistik aus I-81") #}
+<style>.st-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.6rem;margin:.4rem 0 .8rem}
+  .st-tile{border:1px solid var(--oaap-border, #ddd);border-radius:8px;padding:.5rem .7rem}
+  .st-tile .v{font-size:1.4rem;font-weight:600;display:block}
+  .st-tile .k{font-size:.8rem;color:var(--oaap-muted)}
+  .st-bars{display:flex;align-items:flex-end;gap:2px;height:7rem;margin:.6rem 0 .2rem}
+  .st-bars span{flex:1;background:var(--oaap-accent, #3b6fd8);min-height:1px;border-radius:2px 2px 0 0;opacity:.85}
+  .st-bars span.zero{background:var(--oaap-border, #ddd)}
+  .st-axis{display:flex;justify-content:space-between;font-size:.75rem;color:var(--oaap-muted)}
+  .st-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:.8rem}
+  .st-grid td.n{text-align:right;white-space:nowrap}
+  .st-grid td.p{word-break:break-all}</style>
+<div class="card">
+  <h2>Seitenstatistik</h2>
+  <p style="margin:.2rem 0 .6rem">Zeitraum:
+    {% for d in (7, 30, 90) %}{% if i.site_days == d %}<strong>{{ d }} Tage</strong>{% else %}<a
+      href="/instances/{{ i.key }}?tab=statistik&amp;sd={{ d }}">{{ d }} Tage</a>{% endif %}{% if not loop.last %} · {% endif %}{% endfor %}
+    <span class="muted">(Tage nach UTC)</span></p>
+  {% set s = i.site %}
+  {% if not s %}
+  <p class="muted" style="margin:0">Noch nichts gezählt. Gezählt wird, was über die
+     Adressen dieser Instanz <strong>von außen</strong> kommt (eigener Name, Alias,
+     automatische Adresse) — nicht der LAN-Port. Die Zählung beginnt mit dieser
+     Version; frühere Tage gibt es nicht.</p>
+  {% else %}
+  <div class="st-tiles">
+    <div class="st-tile"><span class="v">{{ s.views }}</span><span class="k">Seitenaufrufe</span></div>
+    <div class="st-tile"><span class="v">{{ (s.views / i.site_days)|round(1) }}</span><span class="k">pro Tag im Mittel</span></div>
+    <div class="st-tile"><span class="v">{{ s.nf|sum(attribute=1) }}</span><span class="k">Seite nicht gefunden (404)</span></div>
+    <div class="st-tile"><span class="v">{{ s.bots|selectattr(1, "equalto", "search")|sum(attribute=2) }}</span><span class="k">Anfragen von Suchmaschinen</span></div>
+    <div class="st-tile"><span class="v">{{ s.bots|selectattr(1, "equalto", "ai")|sum(attribute=2) }}</span><span class="k">Anfragen von KI-Abrufern</span></div>
+  </div>
+  {% set peak = s.days|map(attribute=1)|max %}
+  <div class="st-bars" role="img" aria-label="Seitenaufrufe je Tag">
+    {% for day, v in s.days %}<span class="{{ 'zero' if not v }}" title="{{ day }}: {{ v }} Aufruf{{ 'e' if v != 1 }}"
+      style="height:{{ ((v / peak * 100) if peak else 0)|round(1) }}%"></span>{% endfor %}
+  </div>
+  <div class="st-axis"><span>{{ s.days[0][0] }}</span><span>{{ s.days[-1][0] }}</span></div>
+  {% endif %}
+</div>
+{% if s %}
+<div class="st-grid">
+  <div class="card"><h2>Seiten</h2>
+    {% if s.pages %}<table>{% for p, n in s.pages[:15] %}<tr><td class="p"><code>{{ p }}</code></td><td class="n">{{ n }}</td></tr>{% endfor %}</table>
+    {% if s.pages|length > 15 %}<p class="muted">… und {{ s.pages|length - 15 }} weitere</p>{% endif %}
+    {% else %}<p class="muted">Keine Seitenaufrufe im Zeitraum.</p>{% endif %}</div>
+  <div class="card"><h2>Herkunft</h2>
+    {% if s.ref %}<table>{% for h, n in s.ref[:15] %}<tr><td class="p">{{ h }}</td><td class="n">{{ n }}</td></tr>{% endfor %}</table>
+    {% else %}<p class="muted">Kein Aufruf kam mit einem fremden Verweis — direkt
+      eingegeben, aus einem Lesezeichen oder ohne Referer.</p>{% endif %}</div>
+  <div class="card"><h2>Geräte</h2>
+    {% if s.dev %}<table>{% for d, n in s.dev %}<tr><td>{{ device_titles.get(d, d) }}</td>
+      <td class="n">{{ n }} <span class="muted">({{ (n * 100 / s.views)|round|int if s.views else 0 }} %)</span></td></tr>{% endfor %}</table>
+    {% else %}<p class="muted">—</p>{% endif %}</div>
+  <div class="card"><h2>Suchmaschinen und KI</h2>
+    {% if s.bots %}<table><tr><th>Wer</th><th>Art</th><th class="n">Anfragen</th><th>zuletzt</th></tr>
+    {% for name, kind, n, last in s.bots %}<tr><td>{{ name }}</td><td class="muted">{{ kind_titles.get(kind, kind) }}</td>
+      <td class="n">{{ n }}</td><td class="muted">{{ last or "—" }}</td></tr>{% endfor %}</table>
+    {% else %}<p class="muted">Noch keine Suchmaschine und kein KI-Abrufer.</p>{% endif %}
+    <p class="muted" style="margin:.5rem 0 0">Erkannt an der Kennung (User-Agent), die
+      jeder Abrufer selbst angibt — ungeprüft. „Zuletzt“ gilt über alle gespeicherten Tage.</p></div>
+  <div class="card"><h2>Nicht gefunden (404)</h2>
+    {% if s.nf %}<table>{% for p, n in s.nf[:15] %}<tr><td class="p"><code>{{ p }}</code></td><td class="n">{{ n }}</td></tr>{% endfor %}</table>
+    {% else %}<p class="muted">Keine 404 im Zeitraum.</p>{% endif %}</div>
+</div>
+{% endif %}
+<p class="muted">Gezählt wird aus dem Zugriffsprotokoll des Gateways, <strong>ohne
+Cookie und ohne Skript</strong> — beim Besucher wird nichts gespeichert. Ein Aufruf
+ist eine HTML-Seite, die mit Erfolg ausgeliefert wurde (keine Bilder, Skripte,
+Anmeldeseiten der Plattform). Abgelegt werden nur Zahlen je Tag: keine IP-Adresse,
+kein Benutzer, kein Suchteil der Adresse. Darum gibt es hier keine „Besucher“, nur
+Aufrufe. Aufbewahrt werden {{ site_keep_days }} Tage.</p>
 </section>
 
 <section class="panel {{ 'active' if tab == 'diagnose' }}">
@@ -9313,7 +9412,8 @@ INSTALL_WAIT_SECONDS = 120  # < gunicorn --timeout (150s)
 from store_view import (AUDIENCE_LABEL, CATEGORY_LABEL, CLASS_LABEL,
                         MATURITY_LABEL, TRUST_LABEL, CARE_FILTER_LABEL,
                         annotate_care, care_matches, instance_care,
-                        instance_matches, matches, merge_catalogue, options)
+                        instance_matches, matches, merge_catalogue, options,
+                        INSTANCE_SORT_LABEL, sort_instances, sort_links, sort_state)
 
 def all_sources():
     """Every configured store source, in the object form of RFC-0012 §2.
@@ -10218,7 +10318,7 @@ def _instance_config(name, inst, fresh=None, typed=None):
 
 
 INSTANCES_FILTER_COOKIE = "oaap_instances_filter"
-INSTANCES_FILTER_KEYS = ("q", "state", "channel", "tenant", "care")
+INSTANCES_FILTER_KEYS = ("q", "state", "channel", "tenant", "care", "sort", "dir")
 
 
 @app.get("/instances")
@@ -10293,6 +10393,13 @@ def instances_page():
                    "security": sum(1 for r in rows if r["care"]["open"])}
     total = len(rows)
     rows = [r for r in rows if instance_matches(r, f)]
+    sort, desc = sort_state(request.args)
+    rows = sort_instances(rows, sort, desc)
+    if not (multi_tenant() and role == "server_admin"):
+        sort_cols = {k: v for k, v in INSTANCE_SORT_LABEL.items() if k != "tenant"}
+    else:
+        sort_cols = INSTANCE_SORT_LABEL
+    heads = sort_links(list(request.args.items(multi=True)), sort, desc)
     pending = pending_installs()
     installing = [{"name": e["instance"], "state": e["state"], "since": e["since"]}
                   for e in _in_flight() if e["action"] == "install" and e["instance"] in pending]
@@ -10300,6 +10407,7 @@ def instances_page():
                 total=total, installing=installing, f=f, filtered=any(f.values()),
                 opt_state=opt_state, opt_channel=opt_channel, opt_tenant=opt_tenant,
                 care_counts=care_counts, care_labels=CARE_FILTER_LABEL,
+                heads=heads, sort_cols=sort_cols, sort=sort, desc=desc,
                 can_create="dev" in node_profiles(),
                 show_tenant=multi_tenant() and role == "server_admin",
                 scope_note=(tenant_name(mine) if role == "tenant_admin"
@@ -10796,7 +10904,7 @@ def _tab(default=""):
     return iv.valid_tab(request.values.get("tab"), default)
 
 
-def _inst_back(name, msg="", err="", keep=()):
+def _inst_back(name, msg="", err="", keep=(), extra=()):
     """Post/Redirect/Get back to the instance page, same section.
 
     `keep` names form fields whose value has to survive the round trip.
@@ -10817,6 +10925,8 @@ def _inst_back(name, msg="", err="", keep=()):
         value = (request.form.get(field) or "").strip()
         if value:
             q.append(f"{field}=" + quote(value))
+    for field, value in extra:
+        q.append(f"{field}=" + quote(value))
     tab = _tab()
     if tab:
         q.append("tab=" + tab)
@@ -10976,6 +11086,14 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
             instance_metrics.window(METRICS_DIR, tid, name, wkey, now=now), wkey, now,
             f"/instances/{quote(name)}?tab=diagnose&", "Verlauf", "verlauf"))
         i["mx_style"] = Markup(metrics_view.STYLE)
+    # I-81: the page statistics on the tab Seitenstatistik
+    try:
+        sd = int(request.args.get("sd", "30"))
+    except ValueError:
+        sd = 30
+    i["site_days"] = sd if sd in (7, 30, 90) else 30
+    i["site"] = (site_stats.read(instance_metrics.instance_dir(METRICS_DIR, tid, name),
+                                 i["site_days"]) if tid else None)
     # RFC-0109 §7 (stage 3): "Einrichten…" -- the recipes that need this
     # app, for whoever may run them in this instance's tenant
     sc = _recipe_scope()
@@ -10984,6 +11102,8 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
         if sc and sc[0] == tid and not inst.get("rehearsal") else [])
     return page(INSTANCE_EDIT_BODY, f"Instanz {name}", "instances", i=i,
                 tabs=iv.TABS, tab=_tab(iv.DEFAULT_TAB),
+                device_titles=site_stats.DEVICE_TITLES,
+                kind_titles=site_stats.KIND_TITLES, site_keep_days=site_stats.DAYS,
                 # Carried back by _inst_back after a refused removal, so
                 # the destructive choice does not quietly revert to the
                 # safe default while the operator fixes another field.
@@ -11574,14 +11694,38 @@ def _catalog_put_offer(name, inst):
         return None
     if (inst.get("source") or {}).get("kind") != "artifact":
         return None
-    cats = [{"id": s["id"], "name": s.get("name") or s["id"]}
-            for s in configured_sources()
-            if str(s.get("url") or "").startswith("catalog:")
-            and str(s["url"])[len("catalog:"):] != name]
+    app_id, version = inst.get("app_id", ""), inst.get("version", "")
+    insts = load_instances()
+    just = request.args.get("put", "") if has_request_context() else ""
+    cats = []
+    for s in configured_sources():
+        url = str(s.get("url") or "")
+        if not url.startswith("catalog:") or url[len("catalog:"):] == name:
+            continue
+        cats.append(dict({"id": s["id"], "name": s.get("name") or s["id"],
+                          "just_put": s["id"] == just},
+                         **catalog_links(url[len("catalog:"):], insts, app_id, version)))
     if not cats:
         return None
-    return {"catalogs": cats, "app_id": inst.get("app_id", ""),
-            "version": inst.get("version", "")}
+    return {"catalogs": cats, "app_id": app_id, "version": version,
+            "just_put": next((c for c in cats if c["just_put"]), None)}
+
+
+def catalog_links(key, insts, app_id, version):
+    """Where the catalog instance answers, for the jump from "In den Katalog
+    übernehmen" to releasing it (Jörg, 27.11.: "ein Sprung in den Katalog aus
+    den Details der Instanz -- so muss ich in die Instanzen-Liste und den
+    Katalog suchen"). `home` searches the catalog for the app -- before the
+    first hand-over its package page does not exist yet; `package` is the
+    page of exactly this version, where "Freigeben" and "Sichtbar für" are.
+    Empty when the catalog instance is not on this node or has no address."""
+    site = _site_url(key, insts.get(key)) if insts.get(key) else ""
+    if not site:
+        return {"home": "", "package": ""}
+    site = site if site.endswith("/") else site + "/"
+    return {"home": site + "?" + _urlencode([("q", app_id)]),
+            "package": (site + "paket/" + quote(app_id, safe="") + "?"
+                        + _urlencode([("version", version)]))}
 
 
 CATALOG_PUT_WAIT_SECONDS = 60   # the host waits up to 30 s for the catalog
@@ -11659,7 +11803,9 @@ def instance_catalog_put(name):
     if not res.get("ok"):
         return _inst_back(name, err=res.get("message", "Übergabe fehlgeschlagen."))
     return _inst_back(name, msg=res.get("message", "Übergeben.")
-                      + " Freigeben im Katalog bleibt Deine Entscheidung.")
+                      + " Freigeben im Katalog bleibt Deine Entscheidung.",
+                      extra=[("put", catalog or res.get("catalog") or "")]
+                      if (catalog or res.get("catalog")) else ())
 
 
 @app.post("/instances/<name>/rollback")

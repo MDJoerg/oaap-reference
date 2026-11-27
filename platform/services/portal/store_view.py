@@ -9,6 +9,7 @@ those rules can be read and tested without Flask, a request, or a node.
 `app.py` supplies the I/O — reading the sources file, fetching the
 lists, knowing what is installed — and renders the result.
 """
+from urllib.parse import urlencode as _urlencode
 import re
 from datetime import date
 
@@ -308,6 +309,80 @@ def care_matches(item, want):
     else:
         upd, sec = bool(item["care"]["newer"]), item["care"]["open"] > 0
     return {"update": upd, "security": sec, "attention": upd or sec}.get(want, True)
+
+
+# Instanzliste sortieren (Jörg, 27.11.: "sortierte Liste für die Übersicht
+# der Instanzen"). Vorher galt die Reihenfolge der Registry-Schlüssel
+# (`<mandant>-<name>`), angezeigt wird aber der Name ohne Mandant -- auf einem
+# Knoten mit mehreren Mandanten sah die Liste darum ungeordnet aus.
+# Jede Spalte sortiert nach dem, was in ihr steht; Gleichstand immer nach
+# Name, dann Mandant, damit die Reihenfolge nie zufällig ist.
+INSTANCE_SORT_LABEL = {"name": "Instanz", "status": "Status", "app": "App",
+                       "tenant": "Mandant", "channel": "Kanal", "care": "Pflege"}
+INSTANCE_SORT_DEFAULT = "name"
+
+
+def _fold(s):
+    return (s or "").casefold()
+
+
+def _care_rank(row):
+    c = row.get("care") or {}
+    # das Dringende zuerst, wenn aufsteigend sortiert wird
+    if c.get("open"):
+        return 0
+    if c.get("newer"):
+        return 1
+    if c.get("behind"):
+        return 2
+    return 3
+
+
+def instance_sort_key(sort):
+    def base(r):
+        return (_fold(r["name"]), _fold(r.get("tenant")), r["key"])
+    first = {
+        "name": lambda r: (),
+        "status": lambda r: (_fold(r["status"]["label"]),),
+        "app": lambda r: (_fold(r["app_name"]),),
+        "tenant": lambda r: (_fold(r.get("tenant")),),
+        "channel": lambda r: (_fold(r.get("channel_label") or r["channel"]),),
+        "care": lambda r: (_care_rank(r),),
+    }.get(sort, lambda r: ())
+    return lambda r: first(r) + base(r)
+
+
+def sort_state(args):
+    """(sort, desc) from the query; an unknown column falls back to name."""
+    sort = args.get("sort", "")
+    if sort not in INSTANCE_SORT_LABEL:
+        sort = INSTANCE_SORT_DEFAULT
+    return sort, args.get("dir", "") == "desc"
+
+
+def sort_instances(rows, sort, desc=False):
+    """Rows sorted by one column. Descending reverses only the column, the
+    tie-break stays name ascending, so equal rows keep a readable order."""
+    key = instance_sort_key(sort)
+    if not desc or sort == "name":
+        return sorted(rows, key=key, reverse=desc)
+    tie = instance_sort_key("name")
+    rows = sorted(rows, key=tie)
+    return sorted(rows, key=lambda r: key(r)[:1], reverse=True)
+
+
+def sort_links(params, sort, desc):
+    """One header link per sortable column: the current filter kept, the
+    column set, and a click on the active column flips the direction."""
+    keep = [(k, v) for k, v in params if k not in ("sort", "dir") and v]
+    out = {}
+    for col in INSTANCE_SORT_LABEL:
+        flip = col == sort and not desc
+        q = keep + [("sort", col)] + ([("dir", "desc")] if flip else [])
+        out[col] = {"href": "/instances?" + _urlencode(q),
+                    "active": col == sort,
+                    "arrow": ("▼" if desc else "▲") if col == sort else ""}
+    return out
 
 
 def instance_matches(row, f):

@@ -15,6 +15,7 @@ COPY gate_stats.py .
 COPY coupling.py .
 COPY qr.py .
 COPY instance_metrics.py .
+COPY site_stats.py .
 # oaap.core.updates 2.6: the host's care state, read from the file the
 # node writes; the module renders the same facts the CLI renders.
 COPY host_care.py .

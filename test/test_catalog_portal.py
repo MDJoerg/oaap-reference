@@ -210,7 +210,7 @@ sources(src())
 ok("eine Instanz aus einem Paket: Angebot mit dem Katalog",
    (portal._catalog_put_offer("bdt-app-test", {"source": {"kind": "artifact"},
                                                "app_id": "bdt-app", "version": "1.0.0"})
-    or {}).get("catalogs") == [{"id": "catalog-katalog", "name": "Betreiber-Katalog"}])
+    or {}).get("catalogs", [{}])[0].get("id") == "catalog-katalog")
 ok("eine Instanz aus Git: kein Angebot (nur ein Paket beweist die Bytes)",
    portal._catalog_put_offer("x", {"source": {"kind": "git"}}) is None)
 ok("der Katalog selbst: kein Angebot in sich hinein",
@@ -222,6 +222,55 @@ portal.caller_roles = lambda: {"server_admin"}
 sources()
 ok("ohne Katalog als Quelle: kein Angebot, das nur scheitern kann",
    portal._catalog_put_offer("bdt-app-test", {"source": {"kind": "artifact"}}) is None)
+
+print("\n=== Sprung in den Katalog zum Freigeben (Jörg 27.11.) ===")
+sources(src())
+CAT = {"katalog": {"app_id": "package-catalog", "address": "katalog.example.org"},
+       "bdt-app-test": {"app_id": "bdt-app", "version": "1.0.0", "channel": "test",
+                        "source": {"kind": "artifact"}}}
+real_load = portal.load_instances
+portal.load_instances = lambda: dict(CAT)
+with portal.app.test_request_context("/instances/bdt-app-test"):
+    o = portal._catalog_put_offer("bdt-app-test", CAT["bdt-app-test"])
+c0 = (o or {}).get("catalogs", [{}])[0]
+ok("Link sucht die App im Katalog (vor der ersten Übergabe gibt es die Paketseite nicht)",
+   c0.get("home") == "https://katalog.example.org/?q=bdt-app", c0)
+ok("Paketseite genau dieser Version",
+   c0.get("package") == "https://katalog.example.org/paket/bdt-app?version=1.0.0", c0)
+ok("ohne ?put kein Freigeben-Knopf", o and o.get("just_put") is None, o)
+with portal.app.test_request_context("/instances/bdt-app-test?put=catalog-katalog"):
+    o = portal._catalog_put_offer("bdt-app-test", CAT["bdt-app-test"])
+ok("nach der Übergabe (?put=Katalog): dieser Katalog ist markiert",
+   (o.get("just_put") or {}).get("id") == "catalog-katalog", o)
+with portal.app.test_request_context("/instances/bdt-app-test?put=fremd"):
+    o = portal._catalog_put_offer("bdt-app-test", CAT["bdt-app-test"])
+ok("?put mit unbekanntem Katalog: nichts markiert", o.get("just_put") is None, o)
+CAT2 = {"bdt-app-test": CAT["bdt-app-test"]}
+portal.load_instances = lambda: dict(CAT2)
+with portal.app.test_request_context("/instances/bdt-app-test"):
+    o = portal._catalog_put_offer("bdt-app-test", CAT["bdt-app-test"])
+ok("Katalog-Instanz nicht auf diesem Knoten: Angebot bleibt, nur ohne Link",
+   o and o["catalogs"][0]["home"] == "" and o["catalogs"][0]["package"] == "", o)
+with portal.app.test_request_context("/"):
+    lk = portal.catalog_links("katalog", {"katalog": {"address": "k.example"}},
+                              'x"><script>', "1.0")
+ok("App-Kennung wird in der Adresse kodiert",
+   "<" not in lk["package"] and '"' not in lk["package"] and "<" not in lk["home"], lk)
+
+# Übergabe -> Umleitung mit ?put, Seite zeigt den Knopf
+portal.load_instances = lambda: dict(CAT)
+portal._queue_and_wait = lambda n, job, wait: {"ok": True, "message": "Übernommen."}
+r = c.post("/instances/bdt-app-test/catalog-put", headers=H,
+           data={"catalog": "catalog-katalog", "tab": "deployment"})
+loc = r.headers.get("Location", "")
+ok("nach erfolgreicher Übergabe trägt die Rückleitung ?put=<Katalog>",
+   r.status_code == 303 and "put=catalog-katalog" in loc and "tab=deployment" in loc, loc)
+portal._queue_and_wait = lambda n, job, wait: {"ok": False, "message": "Version schon da."}
+r = c.post("/instances/bdt-app-test/catalog-put", headers=H,
+           data={"catalog": "catalog-katalog", "tab": "deployment"})
+ok("abgelehnte Übergabe: kein ?put (nichts freizugeben)",
+   "put=" not in r.headers.get("Location", ""), r.headers.get("Location"))
+portal.load_instances = real_load
 
 print("\nFAILS:", fails)
 sys.exit(1 if fails else 0)

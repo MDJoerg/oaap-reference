@@ -198,6 +198,9 @@ TABS = (
     # die Gateway-Sicht hinter eine ausdrückliche Handlung, weil sie
     # Inhalte zeigen, die die App geschrieben hat.
     ("diagnose", "Diagnose"),
+    # I-81 (Jörg 27.11.): was über die Adressen der Instanz von außen kommt,
+    # gezählt aus dem Zugriffsprotokoll -- ohne Cookie, ohne Skript.
+    ("statistik", "Seitenstatistik"),
     # RFC-0044 Stufe 1: ein eigener Reiter, kein Unterpunkt von "Zugang"
     # (das ist die API-Schlüssel-Seite, RFC-0027) -- ein anderes Objekt,
     # eine andere Berechtigung, ein anderes Gewicht (öffnet einen Weg in

@@ -311,6 +311,8 @@ def measure(directory, now, proc="/proc", log_path=None, containers=None,
         # delivery is a delivery whenever it was read (gate_stats.py)
         if lines and keep is not None:
             keep["gate_lines"] = [ln for ln in lines if '"oaap_gate"' in ln]
+            # I-81: the page statistics count every line read (site_stats)
+            keep["lines"] = lines
         if lines is not None and fresh:
             hosts = tally(lines)
             if keep is not None:

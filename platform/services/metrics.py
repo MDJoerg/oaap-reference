@@ -327,10 +327,21 @@ def take_sample(directory, data_path, now=None, proc="/proc",
         except Exception:                                  # noqa: BLE001
             pass
     if instances is not None:
+        targets = None
         try:
             import instance_metrics
-            instance_metrics.sample(directory, now, keep, instances(),
+            targets = instances()
+            instance_metrics.sample(directory, now, keep, targets,
                                     roll=roll, trim=cut)
+        except Exception:                                  # noqa: BLE001
+            pass
+        # I-81: page statistics per instance from the same lines; a failure
+        # costs the statistics, nothing else
+        try:
+            import site_stats
+            if targets:
+                site_stats.sample(directory, now, keep.get("lines") or [], targets,
+                                  instance_metrics.instance_dir)
         except Exception:                                  # noqa: BLE001
             pass
     last.update({"cpu": list(cur) if cur else None, "at": now, "t": t})
