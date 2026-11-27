@@ -128,9 +128,10 @@ ok("Hauptname zuerst, dann Alias, dann die Knoten-Adresse, alle mit https",
    m.instance_names_env("crm", crm))
 ok("ohne eigenen Namen: nur die Knoten-Adresse",
    m.instance_names_env("lager", lager) == "https://lager.oaap.example.org")
-ok("hinter einer Edge bedient das Gateway http -- die App erfaehrt es",
+ok("hinter einer Edge: trotzdem https -- die Edge beendet TLS, die App veroeffentlicht "
+   "die Adresse, die Besucher erreichen (0.1.399, I-81)",
    m.instance_names_env("crm", crm, ("oaap.example.org", "10.0.0.2"))
-   == "http://crm.example.org,http://kunden.example.org,http://crm.oaap.example.org")
+   == "https://crm.example.org,https://kunden.example.org,https://crm.oaap.example.org")
 ok("Knoten ohne externen Namen: nur die eigenen Namen",
    m.instance_names_env("crm", crm, ("", "")) == "https://crm.example.org,https://kunden.example.org")
 ok("gar kein Name: leer, die Variable bleibt dann weg",

@@ -19,14 +19,38 @@ Per instance and day:
     bots     every request of a known automaton per name (search engines,
              AI fetchers, others) -- "springt Google an?"
 
+    fake     (0.1.399) requests that claimed a search engine whose reverse
+             DNS says otherwise, per claimed name -- counted under
+             FAKE_NAME in `bots`, never as the engine
+    checked  (0.1.399) requests of such an engine that reverse DNS confirmed
+    vis, multi, dur, vpg
+             (0.1.399) visits: how many ended that day (counted on the day
+             they began), how many had more than one page, their seconds
+             from the first to the last page, and their pages
+
 and over all days `bot_last`: when each named automaton was last seen.
 
 What is NOT kept: an IP address, a user, a cookie, a query string, the
-User-Agent itself. So there is no "visitor" here, only views -- the honest
-word for what an access log can count without tracking anybody.
+User-Agent itself.
 
-A bot is what its User-Agent SAYS it is. Anybody can claim to be Googlebot;
-checking the big ones by reverse DNS is a later stage (I-81 idea 3).
+**Visits** (0.1.399, Jörg 2026-11-27: "Tagessalz, 30 Min"). Views of one
+browser belong to one visit while no more than 30 minutes lie between them.
+"One browser" is a hash of a salt, the instance, the address and the
+User-Agent; the salt is random and new every UTC day, so yesterday's hash
+cannot be linked to today's and no visitor can be followed across days.
+The open visits and the salt live in /run (RUN_DIR) -- memory, gone with a
+reboot, never on the disk -- and only the numbers per day reach `site.json`.
+A visit open at midnight ends there. A visit's duration runs from its first
+to its last page: how long the last page was read no access log can see.
+
+**Search engines are checked** (0.1.399, I-81 idea 3). Anybody can claim to
+be Googlebot. For the engines that publish how (VERIFY), the address is
+looked up backwards and forwards: its name must end in the engine's domain
+and that name must point back at the address. A request that fails is
+counted as FAKE_NAME -- so a fake Googlebot never keeps `site.google` quiet.
+The verdict per address is kept in /run for the UTC day, under the day's
+salt, never the address itself; at most DNS_BUDGET new addresses per minute
+are looked up -- one beyond it counts as what it claims, unchecked.
 
 The log is DATA from the internet: every field is parsed, never trusted;
 only hosts the registry knows are counted, every list per day is bounded.
@@ -35,8 +59,13 @@ only hosts the registry knows are counted, every list per day is bounded.
 history (instance_metrics), so it goes away with the instance.
 """
 import calendar
+import hashlib
+import ipaddress
 import json
 import os
+import secrets
+import socket
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -153,6 +182,29 @@ GENERIC = ("bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-",
 GENERIC_NAME = "andere Automaten"
 BOT_KIND[GENERIC_NAME] = "other"
 
+# I-81 idea 3 (0.1.399): the engines that say how to check them by reverse
+# DNS -- the name of the address must end in one of these. Not
+# googleusercontent.com: that is anybody's machine in Google's cloud.
+VERIFY = {
+    "Googlebot": (".googlebot.com", ".google.com"),
+    "Google (andere)": (".googlebot.com", ".google.com"),
+    "Bingbot": (".search.msn.com",),
+    "Applebot": (".applebot.apple.com",),
+    "YandexBot": (".yandex.ru", ".yandex.net", ".yandex.com"),
+    "Baiduspider": (".baidu.com", ".baidu.jp"),
+}
+VERIFY_NEEDLES = tuple(b[2] for b in BOTS if b[0] in VERIFY)
+FAKE_NAME = "angebliche Suchmaschine"
+BOT_KIND[FAKE_NAME] = "other"
+DNS_BUDGET = 16           # new addresses looked up per minute
+DNS_WAIT = 4.0            # seconds the minute waits for them, all together
+
+# Visits (0.1.399): the short-lived state lives in memory (/run is tmpfs)
+RUN_DIR = os.environ.get("OAAP_SITE_RUN_DIR") or "/run/oaap-site"
+RUN_FILE = "state.json"
+VISIT_IDLE = 30 * 60      # a pause longer than this ends a visit
+VISIT_CAP = 5000          # open visits per instance; beyond, not followed
+
 
 def empty():
     return {"v": FORMAT, "days": {}, "bot_last": {}}
@@ -198,6 +250,20 @@ def _host(h):
     return h.split(":", 1)[0]
 
 
+def _ip(req):
+    """The visitor's address: behind an edge Caddy writes `client_ip` from
+    the edge's X-Forwarded-For (trusted_proxies), else `remote_ip`. Only
+    ever an address, normalised -- or ""."""
+    for k in ("client_ip", "remote_ip"):
+        v = req.get(k)
+        if isinstance(v, str) and v:
+            try:
+                return str(ipaddress.ip_address(v.strip("[]")))
+            except ValueError:
+                continue
+    return ""
+
+
 def _path(uri):
     if not isinstance(uri, str) or not uri.startswith("/"):
         return ""
@@ -240,7 +306,7 @@ def classify(d, hostmap):
     headers = req.get("headers")
     ua = _hdr(headers, "User-Agent")
     rec = {"ts": ts, "what": "other", "path": _path(req.get("uri")), "ref": "",
-           "dev": "", "bot": bot_of(ua)}
+           "dev": "", "bot": bot_of(ua), "ip": _ip(req), "ua": ua}
     method = req.get("method")
     if rec["bot"]:
         rec["what"] = "bot"
@@ -278,9 +344,14 @@ def classify(d, hostmap):
     return key, rec
 
 
-def fold(stats_by_key, lines, hostmap, now=None):
+def fold(stats_by_key, lines, hostmap, now=None, verdict=None, visit=None):
     """Add the log lines to {instance key: stats}; returns the set of keys
-    that changed. Old days fall out (DAYS)."""
+    that changed. Old days fall out (DAYS).
+
+    `verdict(bot, ip)` -> True / False / None (unknown): the reverse DNS
+    check of a search engine (VERIFY). `visit(key, rec)` is told every
+    view, to follow visits. Both optional -- without them nothing is
+    checked and no visit is counted."""
     changed = set()
     for line in lines or []:
         line = line.strip() if isinstance(line, str) else ""
@@ -314,6 +385,15 @@ def fold(stats_by_key, lines, hostmap, now=None):
                 # I-81 idea 5: a person's 404 -- a scanner's flood of
                 # /wp-login.php is no reason to mail anybody
                 day["nfp"] = (day.get("nfp") or 0) + 1
+        if rec["what"] == "bot" and verdict and rec["bot"] in VERIFY:
+            v = verdict(rec["bot"], rec.get("ip"))
+            if v is False:
+                _bump(day.setdefault("fake", {}), rec["bot"], cap=len(BOT_KIND) + 1)
+                rec["bot"] = FAKE_NAME
+            elif v:
+                _bump(day.setdefault("checked", {}), rec["bot"], cap=len(BOT_KIND) + 1)
+        if rec["what"] == "view" and visit:
+            visit(key, rec)
         if rec["what"] == "bot":
             _bump(day["bots"], rec["bot"], cap=len(BOT_KIND) + 1)
             if rec.get("denied"):
@@ -341,6 +421,194 @@ def fold(stats_by_key, lines, hostmap, now=None):
             if old:
                 changed.add(key)
     return changed
+
+
+def close_visits(stats_by_key, closed, load=None):
+    """Count ended visits [(key, first ts, last ts, pages)] on the day each
+    began. `load(key)` gives the stats of a key not in `stats_by_key` yet.
+    Returns the keys that changed."""
+    changed = set()
+    for key, first, last, pages in closed:
+        stats = stats_by_key.get(key)
+        if not isinstance(stats, dict) and load:
+            stats = stats_by_key[key] = load(key)
+        if not isinstance(stats, dict):
+            continue
+        day = _day(stats, time.strftime("%Y-%m-%d", time.gmtime(first)))
+        day["vis"] = (day.get("vis") or 0) + 1
+        day["vpg"] = (day.get("vpg") or 0) + max(1, int(pages))
+        if pages > 1:
+            day["multi"] = (day.get("multi") or 0) + 1
+            day["dur"] = (day.get("dur") or 0) + max(0, int(last - first))
+        changed.add(key)
+    return changed
+
+
+class Visits:
+    """The open visits of a run, from and to the state in RUN_DIR."""
+
+    def __init__(self, state):
+        self.state = state
+        self.open = state.setdefault("visits", {})
+        self.ended = []           # visits a returning browser ended this run
+
+    def sid(self, key, rec):
+        h = hashlib.sha256("|".join((self.state["salt"], key, rec.get("ip") or "",
+                                     rec.get("ua") or "")).encode("utf-8", "replace"))
+        return h.hexdigest()[:20]
+
+    def see(self, key, rec):
+        mine = self.open.setdefault(key, {})
+        sid = self.sid(key, rec)
+        v = mine.get(sid)
+        ts = rec["ts"]
+        if v and ts - v[1] > VISIT_IDLE:
+            self.ended.append((key, v[0], v[1], v[2]))
+            v = None
+        if v is None:
+            if len(mine) >= VISIT_CAP:
+                return
+            mine[sid] = [ts, ts, 1]
+            return
+        v[1] = max(v[1], ts)
+        v[2] += 1
+
+    def expire(self, now, everything=False):
+        out = []
+        for key, mine in list(self.open.items()):
+            for sid, v in list(mine.items()):
+                if everything or now - v[1] > VISIT_IDLE:
+                    out.append((key, v[0], v[1], v[2]))
+                    del mine[sid]
+            if not mine:
+                del self.open[key]
+        return out
+
+
+def run_state(run_dir, now):
+    """(state, ended visits) -- the salt is new every UTC day, and a new
+    day ends every open visit and forgets every DNS verdict. None as
+    state when RUN_DIR cannot be used: then no visit is followed."""
+    if not run_dir:
+        return None, []
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    try:
+        os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        with open(os.path.join(run_dir, RUN_FILE), encoding="utf-8") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            st = {}
+    except (OSError, ValueError):
+        st = {}
+        if not os.path.isdir(run_dir) or not os.access(run_dir, os.W_OK):
+            return None, []
+    ended = []
+    if st.get("day") != today or not isinstance(st.get("salt"), str):
+        if isinstance(st.get("visits"), dict) and isinstance(st.get("salt"), str):
+            ended = Visits(st).expire(now, everything=True)
+        st = {"day": today, "salt": secrets.token_hex(16), "dns": {}, "visits": {}}
+    if not isinstance(st.get("dns"), dict):
+        st["dns"] = {}
+    return st, ended
+
+
+def save_run_state(run_dir, st):
+    if not run_dir or st is None:
+        return
+    try:
+        p = os.path.join(run_dir, RUN_FILE)
+        tmp = p + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f, separators=(",", ":"))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def check_dns(ip, suffixes):
+    """True when the address's name ends in one of `suffixes` and that name
+    points back at the address; False when it does not (or has no name);
+    None when DNS could not say (a timeout, a server failure)."""
+    try:
+        host = socket.gethostbyaddr(ip)[0].lower().rstrip(".")
+    except socket.herror as e:
+        return False if e.errno in (1, 4) else None      # not found / no data
+    except (socket.gaierror, OSError, UnicodeError):
+        return None
+    if not host.endswith(tuple(suffixes)):
+        return False
+    try:
+        back = {str(ipaddress.ip_address(a[4][0].split("%", 1)[0]))
+                for a in socket.getaddrinfo(host, None)}
+    except socket.gaierror as e:
+        return False if e.errno == socket.EAI_NONAME else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return ip in back
+
+
+def resolve_all(asks, resolve=check_dns, wait=DNS_WAIT):
+    """{(bot, ip): verdict} for the asks, in parallel, all together at most
+    `wait` seconds. A lookup still running then is None -- its thread is a
+    daemon and does not hold the minute up."""
+    out = {}
+    lock = threading.Lock()
+
+    def one(bot, ip):
+        try:
+            v = resolve(ip, VERIFY[bot])
+        except Exception:                                  # noqa: BLE001
+            v = None
+        with lock:
+            out[(bot, ip)] = v
+
+    threads = [threading.Thread(target=one, args=a, daemon=True) for a in asks]
+    for t in threads:
+        t.start()
+    end = time.monotonic() + wait
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+    with lock:
+        return {a: out.get(a) for a in asks}
+
+
+def dns_verdicts(lines, hostmap, st, resolve=check_dns, budget=DNS_BUDGET, wait=DNS_WAIT):
+    """The verdict function for `fold`: looks up the new addresses of this
+    run's search engine requests (at most `budget`) and keeps each verdict
+    in the run state for the day, under the day's salt."""
+    cache = st["dns"] if st is not None else {}
+    salt = (st or {}).get("salt") or ""
+
+    def h(bot, ip):
+        # the same domains, the same verdict: Googlebot and "Google (andere)" share it
+        return hashlib.sha256(f"{salt}|{','.join(VERIFY[bot])}|{ip}".encode()).hexdigest()[:20]
+
+    asks = []
+    for line in lines or []:
+        if not isinstance(line, str):
+            continue
+        low = line.lower()
+        if not any(n in low for n in VERIFY_NEEDLES):
+            continue
+        try:
+            got = classify(json.loads(line), hostmap)
+        except ValueError:
+            continue
+        if not got or got[1]["bot"] not in VERIFY or not got[1]["ip"]:
+            continue
+        a = (got[1]["bot"], got[1]["ip"])
+        if h(*a) not in cache and a not in asks:
+            asks.append(a)
+    for a, v in resolve_all(asks[:budget], resolve, wait).items():
+        if v is not None:
+            cache[h(*a)] = v
+
+    def verdict(bot, ip):
+        if not ip:
+            return None
+        return cache.get(h(bot, ip))
+    return verdict
 
 
 # --- disk (the sampler) ------------------------------------------------
@@ -376,10 +644,12 @@ def hostmap_of(targets):
     return {h: k for h, k in seen.items() if h not in dup}
 
 
-def sample(base, now, lines, targets, instance_dir):
+def sample(base, now, lines, targets, instance_dir, run_dir=RUN_DIR, resolve=check_dns):
     """Fold this run's lines into the instances' files. `instance_dir` is
     instance_metrics.instance_dir (base, tenant, key) -> path. Writes only
-    the files that changed, and once a day each (old days fall out)."""
+    the files that changed, and once a day each (old days fall out).
+    `run_dir` holds the open visits and the day's DNS verdicts (memory);
+    `resolve` is the reverse DNS check (a test hands its own)."""
     if not targets:
         return
     hostmap = hostmap_of(targets)
@@ -401,15 +671,33 @@ def sample(base, now, lines, targets, instance_dir):
             daily = f.read().strip() != today
     except OSError:
         daily = True
+    all_paths = dict(paths)
     if not daily:
         blob = "\n".join(lines or [])
         hit = {k for h, k in hostmap.items()
                if '"' + h + '"' in blob or '"' + h + ':' in blob}
         paths = {k: p for k, p in paths.items() if k in hit}
+    st, ended = run_state(run_dir, now)
+    if st is not None:
+        # an instance with an open visit must be read when the visit ends
+        paths.update({k: all_paths[k] for k in (st.get("visits") or {}) if k in all_paths})
+    paths.update({k: all_paths[k] for k, *_r in ended if k in all_paths})
+    full_hostmap = hostmap
     hostmap = {h: k for h, k in hostmap.items() if k in paths}
     for key, p in paths.items():
         stats[key] = _load(p)
-    changed = fold(stats, lines or [], hostmap, now)
+    visits = Visits(st) if st is not None else None
+    verdict = dns_verdicts(lines, full_hostmap, st, resolve)
+    changed = fold(stats, lines or [], hostmap, now, verdict=verdict,
+                   visit=visits.see if visits else None)
+    if visits:
+        ended += visits.ended + visits.expire(now)
+        for key in stats:
+            if not stats[key].get("vis_from"):
+                stats[key]["vis_from"] = today
+                changed.add(key)
+    changed |= close_visits(stats, [e for e in ended if e[0] in paths])
+    save_run_state(run_dir, st)
     for key, p in paths.items():
         s = stats[key]
         if key in changed or (s.get("days") and s.get("folded") != today):
@@ -441,7 +729,10 @@ def read(base_dir, days=30, now=None):
     want = [time.strftime("%Y-%m-%d", time.gmtime(now - i * 86400))
             for i in range(days - 1, -1, -1)]
     out = {"days": [], "views": 0, "pages": {}, "ref": {}, "nf": {}, "dev": {},
-           "bots": {}, "denied": {}, "hours": [0] * 24,
+           "bots": {}, "denied": {}, "fake": {}, "checked": {}, "hours": [0] * 24,
+           # 0.1.399: visits (n, more than one page, their seconds, pages)
+           "visits": {"n": 0, "multi": 0, "dur": 0, "pages": 0,
+                      "from": s.get("vis_from") or ""},
            # I-81 idea 5: two more numbers per day for the portal's bars
            "series": {"search": [], "nf": []}}
     for day in want:
@@ -454,7 +745,11 @@ def read(base_dir, days=30, now=None):
         out["series"]["nf"].append(
             (day, sum(n for n in (d.get("nf") or {}).values() if isinstance(n, int))))
         out["views"] += v
-        for k in ("pages", "ref", "nf", "dev", "bots", "denied"):
+        for k, src in (("n", "vis"), ("multi", "multi"), ("dur", "dur"), ("pages", "vpg")):
+            n = d.get(src)
+            if isinstance(n, int):
+                out["visits"][k] += n
+        for k in ("pages", "ref", "nf", "dev", "bots", "denied", "fake", "checked"):
             for name, n in (d.get(k) or {}).items():
                 if isinstance(n, int):
                     out[k][name] = out[k].get(name, 0) + n

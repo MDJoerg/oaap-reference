@@ -137,6 +137,8 @@ ok("Tage älter als DAYS fallen heraus", old_day not in st3["web-site"]["days"] 
 
 # sample() auf der Platte
 base = tempfile.mkdtemp(prefix="oaap-site-")
+RUN = os.path.join(base, "run")          # nie /run des Rechners
+NODNS = lambda ip, suffixes: None        # noqa: E731  (kein echtes DNS im Test)
 
 
 def idir(b, tenant, key):
@@ -147,7 +149,7 @@ targets = {"web-site": {"tenant": "T1", "hosts": ["www.example.org", "example.or
            "web-wiki": {"tenant": "T1", "hosts": ["wiki.example.org"]},
            "web-still": {"tenant": "T1", "hosts": ["still.example.org"]},
            "kaputt": {"tenant": "../x", "hosts": ["k.example.org"]}}
-ss.sample(base, NOW, L, targets, idir)
+ss.sample(base, NOW, L, targets, idir, run_dir=RUN, resolve=NODNS)
 f1 = os.path.join(idir(base, "T1", "web-site"), ss.FILE)
 ok("Datei liegt neben den Verlaufsdaten der Instanz", os.path.isfile(f1), f1)
 ok("eine Instanz ohne Zugriff bekommt keine leere Datei",
@@ -156,12 +158,12 @@ ok("Mandant mit / wird nicht als Pfad benutzt", not os.path.exists(os.path.join(
 ok("Tagesmarke gesetzt", open(os.path.join(base, ".site-folded")).read() == DAY)
 before = os.path.getmtime(f1)
 os.utime(f1, (before - 100, before - 100))
-ss.sample(base, NOW + 60, [line(host="wiki.example.org", uri="/b", ts=NOW + 60)], targets, idir)
+ss.sample(base, NOW + 60, [line(host="wiki.example.org", uri="/b", ts=NOW + 60)], targets, idir, run_dir=RUN, resolve=NODNS)
 ok("nach der Tagesrunde: nur die betroffene Datei wird geschrieben",
    os.path.getmtime(f1) == before - 100, (os.path.getmtime(f1), before))
 w = json.load(open(os.path.join(idir(base, "T1", "web-wiki"), ss.FILE)))
 ok("betroffene Datei fortgeschrieben", w["days"][DAY]["views"] == 2, w["days"][DAY])
-ss.sample(base, NOW + 120, [line(ts=NOW + 120)], targets, idir)
+ss.sample(base, NOW + 120, [line(ts=NOW + 120)], targets, idir, run_dir=RUN, resolve=NODNS)
 r1 = json.load(open(f1))
 ok("zweite Runde addiert", r1["days"][DAY]["views"] == 7, r1["days"][DAY]["views"])
 

@@ -26,6 +26,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# site_stats (0.1.399) keeps open visits in /run -- never the machine's in a test
+os.environ.setdefault("OAAP_SITE_RUN_DIR", tempfile.mkdtemp(prefix="oaap-im-run-"))
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services"))
 import instance_metrics as im  # noqa: E402
 import metrics  # noqa: E402

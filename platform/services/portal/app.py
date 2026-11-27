@@ -4418,6 +4418,20 @@ INSTANCE_EDIT_BODY = """
     <div class="st-tile"><span class="v">{{ s.bots|selectattr(1, "equalto", "search")|sum(attribute=2) }}</span><span class="k">Anfragen von Suchmaschinen</span></div>
     <div class="st-tile"><span class="v">{{ s.bots|selectattr(1, "equalto", "ai")|sum(attribute=2) }}</span><span class="k">Anfragen von KI-Abrufern</span></div>
   </div>
+  {# 0.1.399: Besuche (Tagessalz, 30 Min Pause) #}
+  {% set vz = s.visits %}
+  {% if vz and vz.n %}
+  {% set mean = (vz.dur / vz.multi)|int if vz.multi else 0 %}
+  <div class="st-tiles">
+    <div class="st-tile"><span class="v">{{ vz.n }}</span><span class="k">Besuche</span></div>
+    <div class="st-tile"><span class="v">{{ (vz.multi * 100 / vz.n)|round|int }} %</span><span class="k">mit mehr als einer Seite</span></div>
+    <div class="st-tile"><span class="v">{% if vz.multi %}{{ mean // 60 }} Min {{ mean % 60 }} s{% else %}—{% endif %}</span><span class="k">Dauer im Mittel (ab zwei Seiten)</span></div>
+    <div class="st-tile"><span class="v">{{ (vz.pages / vz.n)|round(1) }}</span><span class="k">Seiten je Besuch</span></div>
+  </div>
+  {% elif vz and vz.from %}
+  <p class="muted" style="margin:.4rem 0 0">Besuche werden seit {{ vz.from }} gezählt — ein Besuch
+     zählt, sobald 30 Minuten nichts mehr von ihm kam.</p>
+  {% endif %}
   {% set peak = s.days|map(attribute=1)|max %}
   <div class="st-bars" role="img" aria-label="Seitenaufrufe je Tag">
     {% for day, v in s.days %}<span class="{{ 'zero' if not v }}" title="{{ day }}: {{ v }} Aufruf{{ 'e' if v != 1 }}"
@@ -4505,12 +4519,15 @@ INSTANCE_EDIT_BODY = """
       <td class="n">{{ n }} <span class="muted">({{ (n * 100 / s.views)|round|int if s.views else 0 }} %)</span></td></tr>{% endfor %}</table>
     {% else %}<p class="muted">—</p>{% endif %}</div>
   <div class="card"><h2>Suchmaschinen und KI</h2>
-    {% if s.bots %}<table><tr><th>Wer</th><th>Art</th><th class="n">Anfragen</th><th class="n">abgewiesen</th><th>zuletzt</th></tr>
+    {% if s.bots %}<table><tr><th>Wer</th><th>Art</th><th class="n">Anfragen</th><th class="n">abgewiesen</th><th class="n">nicht echt</th><th>zuletzt</th></tr>
     {% for name, kind, n, last in s.bots %}<tr><td>{{ name }}</td><td class="muted">{{ kind_titles.get(kind, kind) }}</td>
-      <td class="n">{{ n }}</td><td class="n">{{ s.denied.get(name, 0) or "—" }}</td><td class="muted">{{ last or "—" }}</td></tr>{% endfor %}</table>
+      <td class="n">{{ n }}</td><td class="n">{{ s.denied.get(name, 0) or "—" }}</td><td class="n">{{ (s.fake or {}).get(name, 0) or "—" }}</td><td class="muted">{{ last or "—" }}</td></tr>{% endfor %}</table>
     {% else %}<p class="muted">Noch keine Suchmaschine und kein KI-Abrufer.</p>{% endif %}
     <p class="muted" style="margin:.5rem 0 0">Erkannt an der Kennung (User-Agent), die
-      jeder Abrufer selbst angibt — ungeprüft. „Zuletzt“ gilt über alle gespeicherten Tage.</p></div>
+      jeder Abrufer selbst angibt. Google, Bing, Apple, Yandex und Baidu werden zusätzlich
+      per Rückwärts-DNS geprüft: Wer sich nur als eine von ihnen ausgibt, steht unter
+      „angebliche Suchmaschine“ und in der Spalte „nicht echt“. KI-Abrufer sind ungeprüft.
+      „Zuletzt“ gilt über alle gespeicherten Tage.</p></div>
   <div class="card"><h2>Nicht gefunden (404)</h2>
     {% if s.nf %}<table>{% for p, n in s.nf[:15] %}<tr><td class="p"><code>{{ p }}</code></td><td class="n">{{ n }}</td></tr>{% endfor %}</table>
     {% else %}<p class="muted">Keine 404 im Zeitraum.</p>{% endif %}</div>
@@ -4520,8 +4537,14 @@ INSTANCE_EDIT_BODY = """
 Cookie und ohne Skript</strong> — beim Besucher wird nichts gespeichert. Ein Aufruf
 ist eine HTML-Seite, die mit Erfolg ausgeliefert wurde (keine Bilder, Skripte,
 Anmeldeseiten der Plattform). Abgelegt werden nur Zahlen je Tag: keine IP-Adresse,
-kein Benutzer, kein Suchteil der Adresse. Darum gibt es hier keine „Besucher“, nur
-Aufrufe. Aufbewahrt werden {{ site_keep_days }} Tage.</p>
+kein Benutzer, kein Suchteil der Adresse. Aufbewahrt werden {{ site_keep_days }} Tage.
+Ein <strong>Besuch</strong> sind die Aufrufe eines Browsers mit höchstens 30 Minuten
+Pause. Wiedererkannt wird er nur an einem Prüfwert aus Adresse und Browserkennung mit
+einem Zufallssalz, das jeden Tag neu ist und nur im Arbeitsspeicher des Servers liegt —
+niemand lässt sich über Tage verfolgen, und abgelegt wird nur die Zahl. Die Dauer reicht
+von der ersten bis zur letzten Seite; wie lange die letzte gelesen wurde, sieht kein
+Protokoll. Mehrere Menschen hinter einem Anschluss mit demselben Browser zählen als
+einer.</p>
 </section>
 
 <section class="panel {{ 'active' if tab == 'diagnose' }}">

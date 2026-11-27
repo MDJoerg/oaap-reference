@@ -23562,14 +23562,21 @@ INSTANCE_NAMES_ENV = "OAAP_INSTANCE_NAMES"
 def instance_names_env(name, inst, ext_conf=None):
     """Every public origin of an instance as the app is told it (RFC-0043
     §2.1): the canonical name first, then the aliases in registry order,
-    then the automatic node addresses -- each with the scheme the gateway
-    actually serves it under (`http` behind an edge, `https` otherwise),
-    never a path. Empty when the instance has no public name at all,
-    and then the variable is absent rather than blank."""
-    host, edge = load_external_conf() if ext_conf is None else ext_conf
-    scheme = "http" if edge else "https"
+    then the automatic node addresses -- each as the PUBLIC sees it:
+    `https`, never a path. Empty when the instance has no public name at
+    all, and then the variable is absent rather than blank.
+
+    Until 0.1.399 a node behind an edge said `http` here -- the scheme its
+    own gateway serves, while the edge terminates TLS (RFC-0006) and every
+    visitor, every search engine and every link reaches the name over
+    https. Each app that published an address had to turn it back (chat,
+    vorgaenge, bookstack, mcp-gateway); the website starter wrote
+    `http://` into its sitemap and canonical link (I-81, found 0.1.395).
+    The list answers "under which names may I publish myself?" -- so it
+    names what one publishes, like OAAP_UI_SANDBOX_ORIGINS always did."""
+    host, _edge = load_external_conf() if ext_conf is None else ext_conf
     names = instance_names(inst or {}) + instance_auto_hosts(name, inst, ext_host=host)
-    return ",".join(f"{scheme}://{h}" for h in dict.fromkeys(names))
+    return ",".join(f"https://{h}" for h in dict.fromkeys(names))
 
 
 def sandbox_origins_env(name, inst, ext_conf=None, reg=None):
@@ -23578,9 +23585,9 @@ def sandbox_origins_env(name, inst, ext_conf=None, reg=None):
     but the edge terminates TLS (RFC-0006), and an origin the browser compares is
     the public one. '' when the instance declares no sandbox.
 
-    Unlike OAAP_INSTANCE_NAMES, which names the scheme the gateway serves: measured
-    on oaap-test (behind oaap-demo) 2026-11-08 -- with http here, frame-ancestors
-    and the sandbox's own check would never match the https page."""
+    Measured on oaap-test (behind oaap-demo) 2026-11-08: with http here,
+    frame-ancestors and the sandbox's own check would never match the https
+    page. OAAP_INSTANCE_NAMES follows the same rule since 0.1.399."""
     host, _edge = load_external_conf() if ext_conf is None else ext_conf
     return ",".join(f"https://{h}" for h in instance_sandbox_hosts(name, inst, ext_host=host, reg=reg))
 
