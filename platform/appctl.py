@@ -22856,6 +22856,9 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     # RFC does not turn on permanent per-instance logging.
     lines = list(diagnose_site_lines(scope))
     lines += guard_site_lines(scope, edge)
+    # I-81: a test instance and a rehearsal stay out of search engines, on
+    # every entry point -- asked here like the rehearsal, from the scope.
+    lines += noindex_site_lines(scope)
     # Site level: runs before every handle block, so before forward_auth
     # (NOT_PLATFORM_HEADERS says why a list and not a prefix).
     lines += strip_not_platform()
@@ -26175,7 +26178,38 @@ def maintenance_of(inst):
 
 
 _MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset(),
-               "strict": frozenset()}
+               "strict": frozenset(), "noindex": frozenset()}
+
+
+def noindex_of(inst):
+    """I-81 idea 1 (gateway 0.2.26): is this instance kept out of search
+    engines? A test instance and a rehearsal always, a production instance
+    never. The platform knows which one it is -- a switch inside every app
+    (the website starter's WEB_NOINDEX) is a thing somebody forgets on the
+    day the site goes live, and the copy of production data a rehearsal
+    holds has no business in an index either."""
+    inst = inst or {}
+    return is_rehearsal(inst) or (inst.get("channel") or "production") != "production"
+
+
+def noindex_keys():
+    """The instances whose every answer carries `X-Robots-Tag: noindex`,
+    from the same cached reading of the registry as mode_keys()."""
+    mode_keys()
+    return _MODE_CACHE["noindex"]
+
+
+NOINDEX_VALUE = "noindex, nofollow"
+
+
+def noindex_site_lines(scope):
+    """Site level, so EVERY answer of the site carries it -- the app's
+    pages, a login redirect, a 404, /platform/*. Deferred, so it is set
+    when the response is written and replaces whatever the app said: on
+    a test instance the platform's answer is the only one."""
+    if not (scope and scope in noindex_keys()):
+        return []
+    return ["	header {", f'		X-Robots-Tag "{NOINDEX_VALUE}"', "		defer", "	}"]
 
 
 def login_required_of(inst):
@@ -26213,6 +26247,8 @@ def mode_keys():
             k for k, i in insts.items() if maintenance_of(i))
         _MODE_CACHE["strict"] = frozenset(
             k for k, i in insts.items() if login_required_of(i))
+        _MODE_CACHE["noindex"] = frozenset(
+            k for k, i in insts.items() if noindex_of(i))
         _MODE_CACHE["stamp"] = stamp
     return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
 
