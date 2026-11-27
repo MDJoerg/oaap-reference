@@ -98,6 +98,28 @@ body = m.site_body([{"path": "/", "roles": ["public"]}], "oaap-app-x", 8080, sco
 ok("site_body selbst trägt beides (jeder Eingang: LAN, Namen, Aliase)",
    m.ENCODE_LINE in body and "\t@oaap_method method TRACE TRACK CONNECT" in body)
 
+print("\nGrund-Header (Stufe 2)")
+w = site("web")
+lines = w.splitlines()
+ok("nosniff und Referrer-Policy genau einmal je Site-Block, nur mit ?",
+   lines.count(m.HEADER_MARK) == n_sites
+   and lines.count("\theader ?Referrer-Policy strict-origin-when-cross-origin") == n_sites, w[:900])
+ok("HSTS ein Jahr, ohne includeSubDomains/preload, nur mit ?",
+   f'\theader @oaap_tls ?Strict-Transport-Security "{m.HSTS_VALUE}"' in lines
+   and m.HSTS_VALUE == "max-age=31536000" and "includeSubDomains" not in w
+   and "preload" not in w)
+ok("HSTS nur bei https: TLS-Site oder Edge mit X-Forwarded-Proto https",
+   "\t@oaap_tls protocol https" in lines
+   and "\t@oaap_edge_tls header X-Forwarded-Proto https" in lines
+   and not any("Strict-Transport-Security" in ln and "@oaap_" not in ln for ln in lines))
+ok("jede Header-Zeile setzt nur, wo die App nichts gesetzt hat",
+   all("?" in ln for ln in lines if ln.startswith("\theader ") and "X-Robots-Tag" not in ln
+       and ln.strip() != "header {"), [ln for ln in lines if ln.startswith("\theader ")])
+ok("keine CSP, kein frame-ancestors, keine Permissions-Policy (§3, D4)",
+   "Content-Security-Policy" not in w and "X-Frame-Options" not in w
+   and "Permissions-Policy" not in w)
+ok("site_body trägt die Header für jeden Eingang", m.HEADER_MARK in body)
+
 print("\nSchalter")
 msg = m.hardening_set("shop", m.load_registry()["instances"]["shop"], False, who="joerg",
                       role="server_admin")
@@ -117,15 +139,44 @@ ok("an: der Satz verschwindet ganz (Standard steht nicht im Satz)", "hardening" 
 ok("an: encode wieder da", m.ENCODE_LINE in site("shop"))
 ok("hardening_of: fremde Werte heißen Standard",
    m.hardening_of({"hardening": "quatsch"})["compress"] is True
-   and m.hardening_of({"hardening": {"compress": False}})["compress"] is False)
+   and m.hardening_of({"hardening": {"compress": False}})["compress"] is False
+   and m.hardening_of({"hardening": {"compress": False}})["headers"] is True)
+
+msg = m.hardening_set("shop", m.load_registry()["instances"]["shop"], headers=False, who="joerg")
+rec = m.load_registry()["instances"]["shop"]
+ok("Header aus: im Satz, Kompression bleibt an",
+   rec.get("hardening", {}).get("headers") is False and "compress" not in rec["hardening"],
+   rec.get("hardening"))
+ok("Antwort sagt, dass die eigenen Header der App bleiben", "untouched" in msg, msg)
+s_off = site("shop")
+ok("Header aus: keine Header-Zeilen, encode und Methodensperre bleiben",
+   "Strict-Transport-Security" not in s_off and m.HEADER_MARK not in s_off
+   and m.ENCODE_LINE in s_off and "@oaap_method" in s_off, s_off[:600])
+m.hardening_set("shop", m.load_registry()["instances"]["shop"], False, who="joerg")
+m.hardening_set("shop", m.load_registry()["instances"]["shop"], headers=True, who="joerg")
+rec = m.load_registry()["instances"]["shop"]
+ok("Header wieder an, Kompression bleibt aus (Schalter unabhängig)",
+   rec.get("hardening", {}).get("compress") is False and "headers" not in rec["hardening"]
+   and m.HEADER_MARK in site("shop") and m.ENCODE_LINE not in site("shop"), rec.get("hardening"))
+m.hardening_set("shop", m.load_registry()["instances"]["shop"], True, who="joerg")
+ok("beide an: Satz leer", "hardening" not in m.load_registry()["instances"]["shop"])
 
 print("\nCLI")
-ns = type("A", (), {"name": "web", "compress": None})()
+ns = type("A", (), {"name": "web", "compress": None, "headers": None})()
 buf = io.StringIO()
 with redirect_stdout(buf):
     m.cmd_hardening(ns)
-ok("show nennt Kompression und Methoden", "compression  on" in buf.getvalue()
+ok("show nennt Kompression, Header und Methoden", "compression  on" in buf.getvalue()
+   and "headers      on" in buf.getvalue()
    and "TRACE, TRACK, CONNECT" in buf.getvalue(), buf.getvalue())
+ns2 = type("A", (), {"name": "web", "compress": "off", "headers": "off"})()
+try:
+    with redirect_stdout(io.StringIO()):
+        m.cmd_hardening(ns2)
+    refused = False
+except SystemExit:
+    refused = True
+ok("beide Schalter auf einmal: abgelehnt", refused)
 
 print("\nUmzug alter Seiten")
 p = os.path.join(m.CADDY_APPS_DIR, "web.caddy")
@@ -145,6 +196,18 @@ buf = io.StringIO()
 with redirect_stdout(buf):
     m.cmd_migrate_hardening(None)
 ok("zweiter Lauf still", buf.getvalue() == "", buf.getvalue())
+# eine Seite aus Stufe 1 (encode + Methoden, keine Header)
+s1 = "\n".join(ln for ln in site("web").splitlines()
+               if "Strict-Transport-Security" not in ln and "oaap_tls" not in ln
+               and "oaap_edge_tls" not in ln and ln != m.HEADER_MARK
+               and "Referrer-Policy" not in ln) + "\n"
+with open(p, "w", encoding="utf-8") as f:
+    f.write(s1)
+buf = io.StringIO()
+with redirect_stdout(buf):
+    m.cmd_migrate_hardening(None)
+ok("Seite aus Stufe 1 lernt die Header", m.HEADER_MARK in open(p, encoding="utf-8").read()
+   and "1 instance site" in buf.getvalue(), buf.getvalue())
 m.hardening_set("shop", m.load_registry()["instances"]["shop"], False)
 buf = io.StringIO()
 with redirect_stdout(buf):

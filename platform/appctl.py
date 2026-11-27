@@ -8450,21 +8450,23 @@ def cmd_migrate_guard(_args):
 
 def cmd_migrate_hardening(_args):
     """0.1.400 (RFC-0140 stage 1): compression and the refused methods into
-    instance sites written before them. Idempotent; silent when every site
-    already has them."""
+    instance sites written before them; 0.1.401 (stage 2) the base headers.
+    Idempotent; silent when every site already has them. A switched-off
+    piece is never switched back on."""
     reg = load_registry()
     behind = []
     for name, inst in sorted(reg["instances"].items()):
         f = _read_file(os.path.join(CADDY_APPS_DIR, f"{name}.caddy"))
         if f is None:
             continue
-        want_encode = hardening_of(inst)["compress"]
-        if "@oaap_method" not in f or (want_encode and ENCODE_LINE + "\n" not in f):
+        want = hardening_of(inst)
+        if ("@oaap_method" not in f or (want["compress"] and ENCODE_LINE + "\n" not in f)
+                or (want["headers"] and HEADER_MARK + "\n" not in f)):
             behind.append(name)
     generated = []
     for fn in ("external.caddy", "instance-addresses.caddy"):
         text = _read_file(os.path.join(CADDY_APPS_DIR, fn)) or ""
-        if "\thandle " in text and "@oaap_method" not in text:
+        if "\thandle " in text and ("@oaap_method" not in text or HEADER_MARK not in text):
             generated.append(fn)
     if not behind and not generated:
         return
@@ -8475,7 +8477,8 @@ def cmd_migrate_hardening(_args):
     refresh_generated_sites()
     reload_gateway()
     print(f"  {len(behind)} instance site(s)" + (", " + ", ".join(generated) if generated else "")
-          + " rewritten: compressed (encode zstd gzip), TRACE/TRACK/CONNECT get 405.")
+          + " rewritten: compressed (encode zstd gzip), base headers (HSTS on https, "
+            "nosniff, Referrer-Policy) where the app sets none, TRACE/TRACK/CONNECT get 405.")
 
 
 def cmd_migrate_care_url(_args):
@@ -26271,7 +26274,7 @@ def maintenance_of(inst):
 
 _MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset(),
                "strict": frozenset(), "noindex": frozenset(), "ai": {},
-               "nocompress": frozenset()}
+               "nocompress": frozenset(), "noheaders": frozenset()}
 
 
 def noindex_of(inst):
@@ -26309,6 +26312,11 @@ def noindex_site_lines(scope):
 METHOD_RESERVED = "/.oaap-method-refused"
 REFUSED_METHODS = ("TRACE", "TRACK", "CONNECT")
 ENCODE_LINE = "\tencode zstd gzip"
+# Stage 2 (gateway 0.2.29): base headers, each only where the app set none
+# (Caddy's `?`, which also defers to the moment the answer goes out).
+HSTS_VALUE = "max-age=31536000"
+HEADER_MARK = "\theader ?X-Content-Type-Options nosniff"
+HARDENING_KEYS = ("compress", "headers")
 
 
 def hardening_of(inst):
@@ -26317,7 +26325,7 @@ def hardening_of(inst):
     only when off, so a record without the key means the default."""
     h = (inst or {}).get("hardening")
     h = h if isinstance(h, dict) else {}
-    return {"compress": h.get("compress") is not False}
+    return {k: h.get(k) is not False for k in HARDENING_KEYS}
 
 
 def nocompress_keys():
@@ -26325,6 +26333,36 @@ def nocompress_keys():
     reading of the registry as mode_keys()."""
     mode_keys()
     return _MODE_CACHE["nocompress"]
+
+
+def noheaders_keys():
+    """The instances whose sites carry no base headers (RFC-0140 stage 2)."""
+    mode_keys()
+    return _MODE_CACHE["noheaders"]
+
+
+def header_site_lines():
+    """RFC-0140 §3: HSTS, nosniff, Referrer-Policy -- each with `?`, so an
+    app that sets its own value keeps it.
+
+    HSTS only on an answer the browser got over https: the site itself
+    speaks TLS (direct mode, own names, aliases), or the edge in front of
+    it does (behind-edge mode, where the edge's X-Forwarded-Proto is the
+    only one Caddy believes -- write_edge_trust). On a LAN `http://` port
+    there is no such header; one a LAN client forges buys nothing, a
+    browser ignores HSTS on plain http (RFC 6797 §8.1). Two matchers
+    rather than one CEL expression: both lines set the same header with
+    `?`, so whichever comes first wins and the other is a no-op. Without
+    includeSubDomains/preload (D5): the tenant decides about its other
+    names."""
+    return [
+        "\t@oaap_tls protocol https",
+        f'\theader @oaap_tls ?Strict-Transport-Security "{HSTS_VALUE}"',
+        "\t@oaap_edge_tls header X-Forwarded-Proto https",
+        f'\theader @oaap_edge_tls ?Strict-Transport-Security "{HSTS_VALUE}"',
+        HEADER_MARK,
+        "\theader ?Referrer-Policy strict-origin-when-cross-origin",
+    ]
 
 
 def harden_site_lines(scope):
@@ -26340,6 +26378,8 @@ def harden_site_lines(scope):
     /auth/* included. No list of ALLOWED methods: WebDAV apps need
     PROPFIND and friends."""
     lines = [] if (scope and scope in nocompress_keys()) else [ENCODE_LINE]
+    if not (scope and scope in noheaders_keys()):
+        lines += header_site_lines()
     return lines + [
         f"\t@oaap_method method {' '.join(REFUSED_METHODS)}",
         f"\trewrite @oaap_method {METHOD_RESERVED}",
@@ -26349,19 +26389,38 @@ def harden_site_lines(scope):
     ]
 
 
-def hardening_set(name, inst, compress, who="root", role="root"):
-    """RFC-0140: compression for this instance on (the default) or off --
-    for an app that has a reason the platform does not know."""
+_HARDENING_SAY = {
+    ("compress", True): "compressed at the gateway again",
+    ("compress", False): "no longer compressed at the gateway (the app's own encoding is untouched)",
+    ("headers", True): "base headers (HSTS on https, nosniff, Referrer-Policy) set again "
+                       "where the app sets none",
+    ("headers", False): "no base headers from the gateway any more (the app's own are untouched)",
+}
+_HARDENING_ALREADY = {
+    ("compress", True): "already compressed at the gateway",
+    ("compress", False): "already not compressed at the gateway",
+    ("headers", True): "base headers already set at the gateway",
+    ("headers", False): "base headers already off at the gateway",
+}
+
+
+def hardening_set(name, inst, compress=None, who="root", role="root", headers=None):
+    """RFC-0140: one base-hardening switch of this instance on (the
+    default) or off -- for an app that has a reason the platform does not
+    know. `compress` (stage 1) or `headers` (stage 2), one per call."""
+    key, on = ("compress", compress) if compress is not None else ("headers", headers)
+    if on is None:
+        raise ValueError("hardening_set: compress or headers")
+    on = bool(on)
     reg = load_registry()
     cur = reg["instances"][name]
-    if hardening_of(cur)["compress"] == bool(compress):
-        return "already " + ("compressed at the gateway" if compress
-                             else "not compressed at the gateway")
+    if hardening_of(cur)[key] == on:
+        return _HARDENING_ALREADY[(key, on)]
     h = dict(cur.get("hardening") or {})
-    if compress:
-        h.pop("compress", None)
+    if on:
+        h.pop(key, None)
     else:
-        h["compress"] = False
+        h[key] = False
         h["since"], h["by"] = _iso_now(), who
     if any(k not in ("since", "by") for k in h):
         cur["hardening"] = h
@@ -26371,9 +26430,8 @@ def hardening_set(name, inst, compress, who="root", role="root"):
     _republish_sites(name, cur)
     audit_tenant("instance.hardening", resolve_tenant(cur.get("tenant"))
                  or ensure_default_tenant(), subject=name, who=who, role=role,
-                 detail="compress " + ("on" if compress else "off"))
-    return ("compressed at the gateway again" if compress
-            else "no longer compressed at the gateway (the app's own encoding is untouched)")
+                 detail=f"{key} " + ("on" if on else "off"))
+    return _HARDENING_SAY[(key, on)]
 
 
 AI_RESERVED = "/.oaap-ai-refused"
@@ -26485,6 +26543,8 @@ def mode_keys():
                              if lv}
         _MODE_CACHE["nocompress"] = frozenset(
             k for k, i in insts.items() if not hardening_of(i)["compress"])
+        _MODE_CACHE["noheaders"] = frozenset(
+            k for k, i in insts.items() if not hardening_of(i)["headers"])
         _MODE_CACHE["stamp"] = stamp
     return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
 
@@ -26952,15 +27012,24 @@ def cmd_ai_fetchers(args):
 
 
 def cmd_hardening(args):
-    """`oaap app hardening <instance> [--compress on|off]` (RFC-0140)."""
-    if args.compress is None:
+    """`oaap app hardening <instance> [--compress on|off] [--headers on|off]`
+    (RFC-0140)."""
+    headers = getattr(args, "headers", None)
+    if args.compress is not None and headers is not None:
+        die("one switch at a time: --compress or --headers")
+    if args.compress is None and headers is None:
         inst = (load_registry().get("instances") or {}).get(args.name)
         if not inst:
             die(f"unknown instance '{args.name}'")
         h = hardening_of(inst)
         print(f"{args.name}:")
         print(f"  compression  {'on' if h['compress'] else 'off'} (encode zstd gzip at the gateway)")
+        print(f"  headers      {'on' if h['headers'] else 'off'} (HSTS on https, nosniff, "
+              "Referrer-Policy; only where the app sets none)")
         print(f"  methods      {', '.join(REFUSED_METHODS)} refused with 405 (always)")
+        return
+    if headers is not None:
+        _mode_cli(args, lambda n, i, who: hardening_set(n, i, headers=headers == "on", who=who))
         return
     _mode_cli(args, lambda n, i, who: hardening_set(n, i, args.compress == "on", who=who))
 
@@ -45121,10 +45190,13 @@ def build_parser():
     plr.set_defaults(fn=cmd_login_required)
     phd = sub.add_parser("hardening",
                          help="base hardening at the gateway: compression, "
-                              "refused methods (RFC-0140, gateway 0.2.28)")
+                              "base headers, refused methods (RFC-0140, gateway 0.2.29)")
     phd.add_argument("name")
     phd.add_argument("--compress", choices=["on", "off"], default=None,
                      help="encode zstd gzip at the gateway (default on)")
+    phd.add_argument("--headers", choices=["on", "off"], default=None,
+                     help="HSTS (https only), nosniff, Referrer-Policy where the app "
+                          "sets none (default on)")
     phd.set_defaults(fn=cmd_hardening)
     pai = sub.add_parser("ai-fetchers",
                          help="shut AI fetchers out: robots.txt from the "
