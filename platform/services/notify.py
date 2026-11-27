@@ -54,6 +54,10 @@ CATALOGUE = {
                      "remind": 24,
                      "title": "Updates für den Server warten",
                      "subject": "[{knoten}] {kurz} Updates für den Server warten"},
+    # RFC-0139 §4 step 6: once, after a run on the administrator's word
+    "host.upgraded": {"category": "operations", "scope": "node", "matter": False,
+                      "title": "Updates des Servers eingespielt",
+                      "subject": "[{knoten}] Updates eingespielt: {kurz}"},
     "advisory.image": {"category": "security", "scope": "tenant", "matter": True,
                        "title": "Sicherheitskorrekturen im Abbild einer Instanz offen",
                        "subject": "[{mandant}] Abbild von {instanz}: Sicherheitskorrekturen offen"},

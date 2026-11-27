@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Die wartenden Pakete des Servers (RFC-0139 Stufe 1).
+"""Die wartenden Pakete des Servers (RFC-0139 Stufen 1 und 2).
 
 Sicherheitsupdates spielt der Knoten selbst ein (unattended-upgrades). Was
 sonst wartet -- auf unseren Knoten fast nur Docker --, sagte bisher niemand.
@@ -157,9 +157,186 @@ A.upgrade_docker = True
 out, _ = run_cli(A())
 ok("mit --docker alle acht", "take 8 package(s)" in out, out)
 A.space_dry = False
+started = []
+real_start, real_follow = m.upgrade_start, m._upgrade_follow
+m.upgrade_start = lambda with_docker=False, who="root": (started.append(with_docker) or (True, "Update gestartet (Unit oaap-upgrade)."))
+m._upgrade_follow = lambda poll=2.0: {"result": "ok"}
 out, code = run_cli(A())
-ok("ohne --dry-run: noch nicht (Stufe 2)", code != 0 and "stage 2" in out, (code, out))
+ok("ohne --dry-run: startet die Unit (Stufe 2), mit Docker wie angehakt",
+   code == 0 and started == [True] and "gestartet" in out, (code, out, started))
+A.upgrade_docker = False
+host_care.apt_upgradable = lambda run=None: "\n".join(l for l in APT.splitlines()
+                                                       if l.startswith(("Listing", "containerd", "docker")))
+started.clear()
+out, code = run_cli(A())
+ok("nur Docker wartet, ohne --docker: nichts gestartet, Hinweis auf --docker",
+   not started and "add --docker" in out, (out, started))
+m.upgrade_start, m._upgrade_follow = real_start, real_follow
 host_care.apt_upgradable = real
+
+print("\nDer Plan und der apt-Aufruf (Stufe 2)")
+rows = host_care.upgradable(APT)
+p0 = host_care.upgrade_plan(rows)
+ok("ohne Haken: kein Docker-Paket im Plan (D4)",
+   p0 == ["libssl3t64", "raspi-firmware"], p0)
+ok("mit Haken: alle acht", len(host_care.upgrade_plan(rows, True)) == 8)
+argv = host_care.upgrade_argv(p0)
+ok("nur Upgrades, nie Entfernen, alte Konfiguration bleibt",
+   argv[:3] == ["apt-get", "install", "--only-upgrade"] and "--no-remove" in argv
+   and "Dpkg::Options::=--force-confold" in argv and "remove" not in argv[1:2]
+   and "autoremove" not in argv and "purge" not in argv, argv)
+ok("ohne Rückfrage", host_care.upgrade_env()["DEBIAN_FRONTEND"] == "noninteractive")
+ok("fehlende Container", host_care.missing_containers(["a", "b", "c"], ["a", "c", "d"]) == ["b"])
+
+print("\nEin Lauf (Stufe 2, mit Attrappen)")
+
+
+class R:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+audits, notes, apts = [], [], []
+real_audit, real_note, real_fresh = m.audit_tenant, m.notify_event, m._care_fresh
+real_kf = host_care.kernel_facts
+m.audit_tenant = lambda *a, **k: audits.append((a, k))
+m.notify_event = lambda *a, **k: notes.append((a, k)) or "x"
+m._care_fresh = lambda *a, **k: {}
+host_care.kernel_facts = lambda *a, **k: {"reboot_required": True}
+waiting = {"text": APT}
+host_care.apt_upgradable = lambda run=None: waiting["text"]
+
+
+def fake_apt(argv, timeout):
+    apts.append(argv)
+    if argv[:2] == ["apt-get", "install"]:
+        waiting["text"] = "\n".join(l for l in APT.splitlines()
+                                    if l.startswith(("Listing", "containerd", "docker")))
+    return R(0, "6 upgraded, 0 newly installed, 0 to remove")
+
+
+res = m.upgrade_run(False, who="joerg", backup=lambda: R(1, "", "disk full"), apt=fake_apt,
+                    containers=lambda: ["a"], settle=0, sleep=lambda s: None)
+ok("Sicherung schlägt fehl -> nichts eingespielt (D5)",
+   res["result"] == "backup-failed" and not any(x[:2] == ["apt-get", "install"] for x in apts),
+   (res, apts))
+ok("... und gesagt", "nichts eingespielt" in res["text"] and "disk full" in res["text"], res)
+ok("... mit Audit und Meldung", audits and audits[-1][0][0] == "host.upgraded"
+   and audits[-1][0][3] == "failed" and notes and notes[-1][0][0] == "host.upgraded", (audits, notes))
+
+apts.clear(); audits.clear(); notes.clear()
+waiting["text"] = APT
+seq = iter([["a", "b", "c"], None, ["a"], ["a", "b", "c"]])
+naps = []
+res = m.upgrade_run(False, who="joerg", backup=lambda: R(0), apt=fake_apt,
+                    containers=lambda: next(seq), settle=60, sleep=naps.append)
+inst = [x for x in apts if x[:2] == ["apt-get", "install"]]
+ok("zuerst apt-get update, dann genau ein install", apts[0][:2] == ["apt-get", "update"]
+   and len(inst) == 1, apts)
+ok("install ohne Docker-Pakete", not any(host_care.is_docker_package(x) for x in inst[0][9:]), inst)
+ok("wartet, bis alle Container wieder laufen (Docker antwortet zwischendurch nicht)",
+   res["result"] == "ok" and res["missing"] == [] and len(naps) == 2, (res, naps))
+ok("Text: Zahl, alle Container, Docker wartet weiter, Neustart",
+   "2 Paket(e) eingespielt" in res["text"] and "Alle 3 Container" in res["text"]
+   and "nur mit dem Haken" in res["text"] and "Neustart wartet" in res["text"], res["text"])
+ok("Audit ok und eine Meldung", audits[-1][0][3] == "ok" and len(notes) == 1, (audits, notes))
+st = m.upgrade_state()
+ok("Zustandsdatei: fertig mit Ergebnis", st.get("state") == "finished"
+   and st["result"]["packages"] == 2, st)
+log = open(m.UPGRADE_LOG, encoding="utf-8").read()
+ok("Protokoll nennt die Pakete und das Ergebnis", "libssl3t64" in log and "eingespielt" in log, log)
+
+apts.clear(); notes.clear()
+waiting["text"] = APT
+res = m.upgrade_run(True, backup=lambda: R(0), apt=fake_apt, containers=lambda: ["a", "b"],
+                    settle=10, sleep=lambda s: None)
+inst = [x for x in apts if x[:2] == ["apt-get", "install"]][0]
+ok("mit Haken: Docker im install", "docker-ce" in inst and "containerd.io" in inst, inst)
+ok("Docker gezählt", res["docker"] == 6 and res["packages"] == 8, res)
+
+waiting["text"] = APT
+seq2 = iter([["a", "b"]] + [["a"]] * 10)
+res = m.upgrade_run(False, backup=lambda: R(0), apt=fake_apt, containers=lambda: next(seq2),
+                    settle=10, sleep=lambda s: None)
+ok("ein Container kommt nicht zurück -> genannt, Audit failed",
+   res["missing"] == ["b"] and "Nicht wieder gestartet: b" in res["text"]
+   and audits[-1][0][3] == "failed", (res, audits[-1]))
+
+waiting["text"] = APT
+res = m.upgrade_run(False, backup=lambda: R(0), apt=lambda a, t: (apts.append(a) or R(100, "", "E: dpkg was interrupted")),
+                    containers=lambda: ["a"], settle=0, sleep=lambda s: None)
+ok("apt schlägt fehl -> gesagt, Code und Zeile", res["result"] == "apt-failed"
+   and "dpkg was interrupted" in res["text"], res)
+
+waiting["text"] = "Listing...\n"
+notes.clear()
+res = m.upgrade_run(False, backup=lambda: (_ for _ in ()).throw(AssertionError("no backup")),
+                    apt=fake_apt, containers=lambda: [], settle=0, sleep=lambda s: None)
+ok("nichts wartet -> keine Sicherung, keine Meldung", res["result"] == "nothing" and not notes, res)
+
+c2 = notify.CATALOGUE.get("host.upgraded") or {}
+ok("host.upgraded im Katalog: Betrieb, Knoten, einmalig",
+   c2.get("category") == "operations" and c2.get("scope") == "node" and c2.get("matter") is False, c2)
+
+m.audit_tenant, m.notify_event, m._care_fresh = real_audit, real_note, real_fresh
+host_care.kernel_facts = real_kf
+host_care.apt_upgradable = real
+
+print("\nWährend apt läuft (gemessen 27.11.: eine Messung mitten in dpkg sagte 0)")
+fake_proc = tempfile.mkdtemp(prefix="oaap-proc-")
+for pid, comm in (("1", "systemd"), ("77", "python3"), ("self", "x")):
+    os.makedirs(os.path.join(fake_proc, pid))
+    open(os.path.join(fake_proc, pid, "comm"), "w").write(comm + "\n")
+os.makedirs(os.path.join(fake_proc, "696"))
+open(os.path.join(fake_proc, "696", "comm"), "w").write("unattended-upgr\n")
+open(os.path.join(fake_proc, "696", "cmdline"), "wb").write(
+    b"/usr/bin/python3\0/usr/share/unattended-upgrades/unattended-upgrade-shutdown\0--wait-for-signal\0")
+ok("kein apt -> nicht beschäftigt (der Wächter unattended-upgrade-shutdown zählt nicht)",
+   host_care.apt_busy(fake_proc) is False)
+os.makedirs(os.path.join(fake_proc, "697"))
+open(os.path.join(fake_proc, "697", "comm"), "w").write("unattended-upgr\n")
+open(os.path.join(fake_proc, "697", "cmdline"), "wb").write(b"/usr/bin/python3\0/usr/bin/unattended-upgrade\0")
+ok("unattended-upgrade selbst läuft -> beschäftigt", host_care.apt_busy(fake_proc) is True)
+import shutil as _sh  # noqa: E402
+_sh.rmtree(os.path.join(fake_proc, "697"))
+os.makedirs(os.path.join(fake_proc, "4242"))
+open(os.path.join(fake_proc, "4242", "comm"), "w").write("dpkg\n")
+ok("dpkg läuft -> beschäftigt", host_care.apt_busy(fake_proc) is True)
+prev = {"waiting": 5, "security": 1, "docker": 4, "other": 0}
+ok("beschäftigt: die vorige Zahl bleibt stehen (nicht 0, Lage bleibt offen)",
+   host_care.updates_facts(lambda *a, **k: "Listing...\n", before=prev, busy=True) == prev)
+ok("beschäftigt ohne vorige Zahl: keine Zahl",
+   host_care.updates_facts(lambda *a, **k: "Listing...\n", before=None, busy=True) is None)
+ok("nicht beschäftigt: gemessen",
+   host_care.updates_facts(lambda *a, **k: "Listing...\n", before=prev, busy=False)["waiting"] == 0)
+
+print("\nDie Unit fragen (gemessen 27.11.: die CLI hörte mitten in der Sicherung auf)")
+ok("Code 0 -> läuft", m.upgrade_unit_active(lambda *a, **k: R(0)) is True)
+ok("Code 3 -> beendet", m.upgrade_unit_active(lambda *a, **k: R(3)) is False)
+ok("Code 4 (keine solche Unit, nach dem Lauf aufgeräumt) -> beendet",
+   m.upgrade_unit_active(lambda *a, **k: R(4)) is False)
+ok("anderer Code -> unklar, nicht beendet", m.upgrade_unit_active(lambda *a, **k: R(1)) is None)
+
+
+def slow(*a, **k):
+    raise m.subprocess.TimeoutExpired("systemctl", 20)
+
+
+ok("Zeitüberschreitung -> unklar", m.upgrade_unit_active(slow) is None)
+answers = iter([None, True, None, False, None, False, False])
+real_active = m.upgrade_unit_active
+m.upgrade_unit_active = lambda run=None: next(answers)
+m._upgrade_write({"state": "running"})
+open(m.UPGRADE_LOG, "w").close()
+buf = io.StringIO()
+real_sleep = m.time.sleep
+m.time.sleep = lambda s: None
+with contextlib.redirect_stdout(buf):
+    r = m._upgrade_follow(poll=0)
+m.time.sleep = real_sleep
+m.upgrade_unit_active = real_active
+ok("Mitlesen hört erst nach zweimal klar beendet auf", r == {} and "beendet" in buf.getvalue()
+   and next(answers, "leer") == "leer", (r, buf.getvalue()))
 
 print("")
 print("OK" if not fails else f"{fails} FAIL")

@@ -392,10 +392,49 @@ def apt_upgradable(run=sh):
                env={"LC_ALL": "C", "PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")})
 
 
-def updates_facts(run=sh):
+APT_PROCESSES = frozenset({"apt", "apt-get", "dpkg", "aptitude", "unattended-upgr",
+                           "apt.systemd.dai", "apt-check"})
+
+
+def apt_busy(proc="/proc"):
+    """True while apt or dpkg runs. Their lists and the package database
+    are half-written then, and `apt list --upgradable` says 0 -- measured
+    2026-11-27 on oaap-test: a reading during a dpkg run closed the matter
+    with "0 waiting" while five waited. Read from /proc, no lock taken
+    (taking apt's lock even briefly could make a starting apt fail)."""
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return False
+    for pid in names:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, pid, "comm"), encoding="utf-8") as f:
+                comm = f.read().strip()
+            if comm not in APT_PROCESSES:
+                continue
+            if comm == "unattended-upgr":
+                # The same name has the guard that waits all day for the
+                # shutdown (`unattended-upgrade-shutdown --wait-for-signal`,
+                # on every node) -- measured 2026-11-27 on oaap-test: with
+                # the name alone the count never changed again.
+                with open(os.path.join(proc, pid, "cmdline"), "rb") as f:
+                    if b"unattended-upgrade-shutdown" in f.read():
+                        continue
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def updates_facts(run=sh, before=None, busy=None):
     """{waiting, security, docker, other} -- counts only; the names are the
     operator's and come from `oaap node care upgrade --dry-run`. None when
-    apt cannot be asked (an absent reading, never 0)."""
+    apt cannot be asked (an absent reading, never 0). While apt or dpkg
+    runs, the reading `before` stands (see apt_busy)."""
+    if (busy if busy is not None else apt_busy()):
+        return before
     text = apt_upgradable(run)
     if not text.strip():
         return None
@@ -424,6 +463,67 @@ def updates_line(upd, kernel=None, de=False):
     return ("warn" if s else "ok", text)
 
 
+# --- installing on the administrator's word (RFC-0139 stage 2) -------------
+
+UPGRADE_UNIT = "oaap-upgrade"
+UPGRADE_SETTLE = 300          # seconds the check waits for every container
+UPGRADE_APT_TIMEOUT = 1800
+
+
+def upgrade_plan(rows, with_docker=False):
+    """The packages a run takes (§4 step 3): security and other always,
+    Docker's only when ticked (D4). Names only, sorted, no duplicates."""
+    return sorted({r["package"] for r in rows if with_docker or r["kind"] != "docker"})
+
+
+def upgrade_argv(packages):
+    """The one apt call: only upgrades of the named packages, the existing
+    configuration files kept, and `--no-remove` -- apt aborts instead of
+    removing anything (§4: never a removal)."""
+    return (["apt-get", "install", "--only-upgrade", "--no-remove", "-y", "-q",
+             "-o", "Dpkg::Options::=--force-confold",
+             "-o", "Dpkg::Options::=--force-confdef"] + list(packages))
+
+
+def upgrade_env(path=None):
+    return {"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l",
+            "APT_LISTCHANGES_FRONTEND": "none", "LC_ALL": "C",
+            "PATH": path or os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")}
+
+
+def missing_containers(before, after):
+    """Containers that ran before the update and do not run now (§4 step 4)."""
+    return sorted(set(before or ()) - set(after or ()))
+
+
+def upgrade_text(res):
+    """German sentence for the log, the mail and the portal."""
+    if res.get("result") == "nothing":
+        return "Kein Paket wartete auf ein Update."
+    if res.get("result") == "backup-failed":
+        return ("Die Sicherung ist fehlgeschlagen -- es wurde nichts eingespielt. "
+                + (res.get("detail") or ""))
+    if res.get("result") == "apt-failed":
+        return ("apt ist fehlgeschlagen (" + (res.get("detail") or "?") + "). "
+                "Die Sicherung von vorher liegt bereit; `oaap status` zeigt den Stand.")
+    n = res.get("packages") or 0
+    s = (f"{n} Paket(e) eingespielt in {res.get('seconds', 0)} s"
+         + (f", davon {res.get('docker', 0)} von Docker" if res.get("docker") else "") + ". ")
+    miss = res.get("missing") or []
+    if miss:
+        s += ("Nicht wieder gestartet: " + ", ".join(miss[:10])
+              + (" …" if len(miss) > 10 else "") + ". ")
+    else:
+        s += f"Alle {res.get('containers', 0)} Container laufen wieder. "
+    if res.get("left"):
+        s += f"{res['left']} Paket(e) warten weiter"
+        s += " (Docker: nur mit dem Haken)." if res.get("left_docker") else "."
+        s += " "
+    if res.get("reboot_required"):
+        s += "Ein Neustart wartet; die Neustartplanung des Knotens übernimmt."
+    return s.strip()
+
+
 def measure(run=sh, os_release="/etc/os-release", external="", advisories=None,
             images=None, **probes):
     """The facts of 2.6.1 plus, for 2.7.3, whether the node is exposed:
@@ -448,7 +548,8 @@ def measure(run=sh, os_release="/etc/os-release", external="", advisories=None,
         "reboot_window": auto["window"],
         "gateway": gateway_facts(run),
         # RFC-0139 stage 1: the packages that wait, counted
-        "updates": updates_facts(run),
+        "updates": updates_facts(run, before=probes.get("updates_before"),
+                                 busy=probes.get("apt_busy")),
         "external_name": external or "",
         # 2.8: the reading the caller made (advisories.care_block) --
         # None when the node never had a list, which is not "0 open".

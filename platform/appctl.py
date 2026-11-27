@@ -3608,7 +3608,9 @@ def host_updates_conditions(facts):
             + ("Ein Neustart wartet (neuer Kernel). " if reboot else "Ein Neustart ist nicht nötig. ")
             + ("Docker-Updates starten alle Apps des Servers einmal neu (etwa eine Minute). "
                if d else "")
-            + "Ansehen: sudo oaap node care upgrade --dry-run")
+            + "Ansehen: sudo oaap node care upgrade --dry-run -- einspielen: "
+            + "sudo oaap node care upgrade" + (" [--docker]" if d else "")
+            + " (erst Sicherung, dann Prüfung, ob alle Apps wieder laufen)")
     return {"host.updates": {"type": "host.updates", "kurz": str(n), "text": text}}
 
 
@@ -15529,7 +15531,9 @@ def _care_fresh(who="root", role="root", read_images=False):
     host_care.migrate_conf()
     facts = host_care.measure(external=load_external() or "",
                               advisories=_care_advisories(),
-                              images=_care_images(read_images))
+                              images=_care_images(read_images),
+                              # RFC-0139: while apt runs, the last count stands
+                              updates_before=(host_care.read(APPS_DIR) or {}).get("updates"))
     facts = _care_evaluate(facts, who=who, role=role)
     host_care.write(facts, APPS_DIR)
     return facts
@@ -15883,6 +15887,277 @@ def cmd_care_space(args, rest, root, who):
     print(text)
 
 
+# --- RFC-0139 stage 2: installing on the administrator's word -------------
+
+UPGRADE_DIR = os.path.join(DATA_DIR, "data", "upgrade")
+UPGRADE_STATE = os.path.join(UPGRADE_DIR, "state.json")
+UPGRADE_LOG = os.path.join(UPGRADE_DIR, "upgrade.log")
+
+
+def upgrade_state():
+    try:
+        with open(UPGRADE_STATE, encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _upgrade_write(state):
+    os.makedirs(UPGRADE_DIR, mode=0o700, exist_ok=True)
+    tmp = UPGRADE_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=1)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, UPGRADE_STATE)
+
+
+def _upgrade_say(line):
+    os.makedirs(UPGRADE_DIR, mode=0o700, exist_ok=True)
+    with open(UPGRADE_LOG, "a", encoding="utf-8") as f:
+        f.write(line.rstrip("\n") + "\n")
+
+
+def _upgrade_log_clear():
+    try:
+        os.remove(UPGRADE_LOG)
+    except OSError:
+        pass
+
+
+def _running_containers():
+    """Names of the running containers, or None while Docker does not answer."""
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True,
+                           text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return sorted(x.strip() for x in r.stdout.splitlines() if x.strip())
+
+
+def upgrade_unit_active(run=subprocess.run):
+    """True (active), False (systemd says inactive or failed: code 3, or
+    no such unit -- the unit is collected after its run: code 4) or
+    None (no clear answer). Measured 2026-11-27: during the backup the CLI
+    once read "not active" and stopped following a running unit."""
+    try:
+        r = run(["systemctl", "is-active", "--quiet", host_care.UPGRADE_UNIT + ".service"],
+                timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return True if r.returncode == 0 else False if r.returncode in (3, 4) else None
+
+
+def upgrade_run(with_docker=False, who="root", role="root", cause="hand",
+                backup=None, apt=None, containers=None, settle=None, sleep=time.sleep,
+                fresh_log=True):
+    """One run (§4 steps 2-6), meant to run in its own unit. Returns the
+    result dict; also written into the state file and the log. The hooks
+    (backup, apt, containers) exist for the tests."""
+    started = time.time()
+    backup = backup or (lambda: subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "backup", "create"],
+        capture_output=True, text=True, timeout=7200))
+    apt = apt or (lambda argv, timeout: subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, env=host_care.upgrade_env()))
+    containers = containers or _running_containers
+    settle = host_care.UPGRADE_SETTLE if settle is None else settle
+    state = {"state": "running", "started": _iso_now(), "who": who, "cause": cause,
+             "docker": bool(with_docker)}
+    _upgrade_write(state)
+    if fresh_log:
+        # In the unit the starter emptied the log already, before the CLI
+        # began to follow it (measured 2026-11-27: the CLI printed the last
+        # run's log, then a fragment of the new one at the old offset).
+        _upgrade_log_clear()
+    _upgrade_say(f"{_iso_now()} Updates einspielen (RFC-0139), von {who}"
+                 + (", mit Docker" if with_docker else ", ohne Docker"))
+
+    def finish(res):
+        res["seconds"] = int(time.time() - started)
+        res["text"] = host_care.upgrade_text(res)
+        state.update({"state": "finished", "finished": _iso_now(), "result": res})
+        _upgrade_write(state)
+        _upgrade_say(f"{_iso_now()} {res['text']}")
+        if res["result"] != "nothing":
+            audit_tenant("host.upgraded", default_tenant_id(), cause,
+                         "ok" if res["result"] == "ok" and not res.get("missing") else "failed",
+                         who=who, role=role, detail=res["text"],
+                         extra={k: res.get(k) for k in ("packages", "docker", "seconds",
+                                                        "missing", "result")})
+            notify_event("host.upgraded", default_tenant_id(),
+                         kurz=(f"{res.get('packages', 0)} Paket(e)" if res["result"] == "ok"
+                               else "fehlgeschlagen"),
+                         text=res["text"])
+        try:
+            _care_fresh(read_images=False)
+        except Exception as e:                      # noqa: BLE001
+            _upgrade_say(f"host care: {type(e).__name__}: {e}")
+        return res
+
+    # apt's own list first, so the names below are today's (the dry run
+    # read the list of apt's daily timer).
+    apt(["apt-get", "update", "-q"], 600)
+    rows = host_care.upgradable(host_care.apt_upgradable())
+    pkgs = host_care.upgrade_plan(rows, with_docker)
+    if not pkgs:
+        return finish({"result": "nothing", "packages": 0,
+                       "left": len(rows), "left_docker": bool(rows)})
+    kinds = {r["package"]: r["kind"] for r in rows}
+    _upgrade_say(f"{_iso_now()} {len(pkgs)} Paket(e): " + " ".join(pkgs))
+
+    # Step 2 (D5): backup first; no update when it fails.
+    _upgrade_say(f"{_iso_now()} Sicherung ...")
+    b = backup()
+    if b.returncode != 0:
+        tail = ((b.stderr or b.stdout or "").strip().splitlines() or [""])[-1][:300]
+        return finish({"result": "backup-failed", "packages": 0, "detail": tail})
+    _upgrade_say(f"{_iso_now()} Sicherung fertig.")
+
+    before = containers() or []
+    _upgrade_say(f"{_iso_now()} apt ({len(before)} Container laufen) ...")
+    try:
+        a = apt(host_care.upgrade_argv(pkgs), host_care.UPGRADE_APT_TIMEOUT)
+        rc, out = a.returncode, (a.stdout or "") + (a.stderr or "")
+    except subprocess.TimeoutExpired:
+        rc, out = 124, "timeout"
+    # dpkg's progress ("(Reading database ... 5%") is no news for the log
+    lines = [x for x in out.strip().splitlines()
+             if not (x.startswith("(Reading database") and "files and directories" not in x)]
+    for line in lines[-40:]:
+        _upgrade_say("  " + line)
+    if rc != 0:
+        tail = (out.strip().splitlines() or ["?"])[-1][:300]
+        return finish({"result": "apt-failed", "packages": 0, "detail": f"Code {rc}: {tail}"})
+
+    # Step 4: every container that ran before runs again (Docker's update
+    # restarts the daemon; they come back by themselves, §9 -- we wait).
+    waited, after = 0, containers()
+    while host_care.missing_containers(before, after or []) and waited < settle:
+        sleep(5)
+        waited += 5
+        after = containers()
+    rows2 = host_care.upgradable(host_care.apt_upgradable())
+    return finish({"result": "ok", "packages": len(pkgs),
+                   "docker": sum(1 for p in pkgs if kinds.get(p) == "docker"),
+                   "containers": len(before),
+                   "missing": host_care.missing_containers(before, after or []),
+                   "left": len(rows2),
+                   "left_docker": any(r["kind"] == "docker" for r in rows2),
+                   "reboot_required": bool(host_care.kernel_facts().get("reboot_required"))})
+
+
+def upgrade_start(with_docker=False, who="root"):
+    """Start the run in its own unit (RFC-0128 F13: the minute job and an
+    ssh session may die, apt must not). (ok, sentence)."""
+    if upgrade_unit_active() is not False:
+        return False, ("Ein Update läuft bereits (Unit oaap-upgrade)."
+                       if upgrade_unit_active() else
+                       "systemd antwortet nicht klar, ob ein Update läuft -- später noch einmal.")
+    if backup_running_now():
+        return False, "Eine Sicherung läuft gerade -- später noch einmal."
+    if not shutil.which("systemd-run"):
+        return False, "systemd-run fehlt -- ohne eigene Unit spielt der Knoten nichts ein."
+    argv = [sys.executable, os.path.abspath(__file__), "node", "care", "upgrade", "--in-unit",
+            "--by", who] + (["--docker"] if with_docker else [])
+    _upgrade_log_clear()
+    r = subprocess.run(["systemd-run", f"--unit={host_care.UPGRADE_UNIT}", "--collect",
+                        f"--setenv=OAAP_DATA_DIR={DATA_DIR}"] + argv,
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return False, "systemd-run: " + ((r.stderr or "").strip()[:200] or "?")
+    _upgrade_write({"state": "starting", "started": _iso_now(), "who": who,
+                    "docker": bool(with_docker)})
+    return True, "Update gestartet (Unit oaap-upgrade)."
+
+
+def _upgrade_follow(poll=2.0):
+    """Print the log while the unit runs; Ctrl-C leaves the unit running."""
+    seen, gone = 0, 0
+    try:
+        while True:
+            try:
+                with open(UPGRADE_LOG, encoding="utf-8") as f:
+                    f.seek(seen)
+                    chunk = f.read()
+                    seen = f.tell()
+            except OSError:
+                chunk = ""
+            if chunk:
+                print(chunk, end="", flush=True)
+            st = upgrade_state()
+            if st.get("state") == "finished" and not chunk:
+                return st.get("result") or {}
+            if not chunk and st.get("state") != "starting":
+                # Only a clear "inactive", twice: the unit ended without
+                # writing its end (killed). Anything unclear: keep following.
+                gone = gone + 1 if upgrade_unit_active() is False else 0
+                if gone >= 2:
+                    print("Die Unit oaap-upgrade ist beendet, ohne ein Ergebnis zu schreiben "
+                          "-- journalctl -u oaap-upgrade")
+                    return st.get("result") or {}
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print("\n(weiter im Hintergrund: journalctl -u oaap-upgrade, "
+              "oaap node care upgrade --status)")
+        return None
+
+
+def cmd_care_upgrade(args, root, who):
+    """`oaap node care upgrade [--dry-run] [--docker] [--status]`."""
+    if not root:
+        die("oaap node care upgrade needs root (sudo): it names and installs packages")
+    with_docker = bool(getattr(args, "upgrade_docker", False))
+    if getattr(args, "upgrade_in_unit", False):
+        upgrade_run(with_docker, who=getattr(args, "upgrade_by", "") or "root",
+                    role="server_admin", cause="hand", fresh_log=False)
+        return
+    if getattr(args, "upgrade_status", False):
+        st = upgrade_state()
+        if not st:
+            print("Noch kein Update über OAAP eingespielt.")
+            return
+        print(f"{st.get('state')}: {st.get('started', '')[:16]} von {st.get('who', '?')}"
+              + (" (mit Docker)" if st.get("docker") else ""))
+        if st.get("result"):
+            print(st["result"].get("text", ""))
+        return
+    rows = host_care.upgradable(host_care.apt_upgradable())
+    if getattr(args, "space_dry", False):
+        # RFC-0139 §4 step 1: show first. The names are the operator's.
+        words = {"security": "Security", "docker": "Docker", "other": "Other"}
+        if not rows:
+            print("No package waits for an update.")
+        for kind in ("security", "docker", "other"):
+            part = [r for r in rows if r["kind"] == kind]
+            if not part:
+                continue
+            print(f"{words[kind]} ({len(part)}):")
+            for r in part:
+                print(f"  {r['package']:<28} {r['installed']} -> {r['version']}  ({r['archive']})")
+        take = [r for r in rows if with_docker or r["kind"] != "docker"]
+        skipped = len(rows) - len(take)
+        print("")
+        print(f"An upgrade now would take {len(take)} package(s)"
+              + (f"; {skipped} of Docker only with --docker (every app restarts, about a minute)"
+                 if skipped else "")
+              + ". Nothing was changed (dry run).")
+        return
+    if not host_care.upgrade_plan(rows, with_docker):
+        print("Nothing to install"
+              + (" -- only Docker's packages wait; add --docker (every app restarts, "
+                 "about a minute)." if rows else "."))
+        return
+    ok, text = upgrade_start(with_docker, who=who)
+    print(text)
+    if not ok:
+        sys.exit(1)
+    res = _upgrade_follow()
+    if res is not None and res.get("result") not in ("ok", "nothing"):
+        sys.exit(1)
+
+
 def cmd_node_care(args):
     """`oaap node care [measure | sample | auto-updates on |
     reboot-window HH:MM|off | reboot at <time>|cancel | protect <inst> |
@@ -15938,32 +16213,7 @@ def cmd_node_care(args):
     if verb == "space":
         return cmd_care_space(args, rest, root, who)
     if verb == "upgrade":
-        # RFC-0139 §4 step 1: show first. The names are the operator's.
-        if not root:
-            die("oaap node care upgrade needs root (sudo): it names the packages")
-        if not getattr(args, "space_dry", False):
-            die("oaap node care upgrade: only --dry-run so far (RFC-0139 stage 1); "
-                "updating comes with stage 2")
-        rows = host_care.upgradable(host_care.apt_upgradable())
-        with_docker = bool(getattr(args, "upgrade_docker", False))
-        words = {"security": "Security", "docker": "Docker", "other": "Other"}
-        if not rows:
-            print("No package waits for an update.")
-        for kind in ("security", "docker", "other"):
-            part = [r for r in rows if r["kind"] == kind]
-            if not part:
-                continue
-            print(f"{words[kind]} ({len(part)}):")
-            for r in part:
-                print(f"  {r['package']:<28} {r['installed']} -> {r['version']}  ({r['archive']})")
-        take = [r for r in rows if with_docker or r["kind"] != "docker"]
-        skipped = len(rows) - len(take)
-        print("")
-        print(f"An upgrade now would take {len(take)} package(s)"
-              + (f"; {skipped} of Docker only with --docker (every app restarts, about a minute)"
-                 if skipped else "")
-              + ". Nothing was changed (dry run).")
-        return
+        return cmd_care_upgrade(args, root, who)
     if verb == "advisories":
         # 2.8.2: the names are the server_admin's, on the node.
         if not root:
@@ -16127,7 +16377,7 @@ def cmd_node_care(args):
             "reboot-window HH:MM|off | reboot at <time>|cancel | "
             "protect <instance> | release <instance> | advisories [--read] | images [--read] | "
             "space [--dry-run] [--class A,B,C] | space rmi <image> | "
-            "upgrade --dry-run [--docker]]")
+            "upgrade [--dry-run] [--docker] [--status]]")
     print("")
     host_care.print_status(_care_fresh(who=who, role="server_admin"))
 
@@ -45287,6 +45537,11 @@ def build_parser():
                     help=argparse.SUPPRESS)
     pn.add_argument("--docker", dest="upgrade_docker", action="store_true",
                     help="for care upgrade: Docker's packages too (RFC-0139)")
+    pn.add_argument("--status", dest="upgrade_status", action="store_true",
+                    help="for care upgrade: the last run (RFC-0139)")
+    pn.add_argument("--in-unit", dest="upgrade_in_unit", action="store_true",
+                    help=argparse.SUPPRESS)
+    pn.add_argument("--by", dest="upgrade_by", default="", help=argparse.SUPPRESS)
     pn.set_defaults(fn=cmd_node)
     pdt = sub.add_parser("data",
                          help="managed Postgres, type registry and other "
