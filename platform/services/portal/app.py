@@ -4425,6 +4425,32 @@ INSTANCE_EDIT_BODY = """
   <div class="st-axis"><span>{{ s.days[0][0] }}</span><span>{{ s.days[-1][0] }}</span></div>
   {% endif %}
 </div>
+{% set ai = i.mode.ai %}
+<div class="card" id="ki-abrufer">
+  <h2>KI-Abrufer</h2>
+  {# gateway 0.2.27 (Jörg 27.11.: „Ok 2“ -- robots.txt-Schalter für KI-Bots) #}
+  <p style="margin:.2rem 0 .5rem">Jetzt: <strong>{{ ai.title }}</strong>{% if ai.level %}{% if ai.since %},
+     seit {{ ai.since }} UTC{% endif %}{% if ai.by %} (gesetzt von <strong>{{ ai.by }}</strong>){% endif %}.{% if ai.reason %}
+     Grund: {{ ai.reason }}{% endif %}{% else %} — die Plattform greift nicht ein; eine
+     eigene <code>robots.txt</code> der App geht unverändert hinaus.{% endif %}</p>
+  {% if ai.level %}<p class="muted" style="margin:0 0 .5rem">Die Plattform beantwortet
+     <code>/robots.txt</code> selbst und weist diese Kennungen mit 403 ab:
+     {{ ai.names|join(", ") }}. Suchmaschinen (Google, Bing, …) sind nie betroffen.</p>{% endif %}
+  <form method="post" action="/instances/{{ i.key }}/ai-fetchers">
+    <input type="hidden" name="tab" value="statistik">
+    {% for lv, title, text in ai.choices %}
+    <label style="display:block;margin:.2rem 0"><input type="radio" name="level" value="{{ lv }}"
+      {{ 'checked' if lv == ai.level }}> <strong>{{ title }}</strong> — <span class="muted">{{ text }}</span></label>
+    {% endfor %}
+    <label>Grund (steht im Mandantenlog)
+      <input type="text" name="reason" maxlength="300"></label>
+    <button class="secondary">Übernehmen</button>
+  </form>
+  <p class="muted" style="margin:.5rem 0 0">Eine <code>robots.txt</code> ist eine Bitte;
+     die 403 gilt auch für Abrufer, die sie nicht lesen. Wer sich mit falscher Kennung
+     ausgibt, kommt durch — erkannt wird nur, was der Abrufer selbst angibt. Ob die
+     Sperre wirkt, zeigt die Tabelle „Suchmaschinen und KI“ in der Spalte „abgewiesen“.</p>
+</div>
 {% if s %}
 <div class="st-grid">
   <div class="card"><h2>Seiten</h2>
@@ -4440,9 +4466,9 @@ INSTANCE_EDIT_BODY = """
       <td class="n">{{ n }} <span class="muted">({{ (n * 100 / s.views)|round|int if s.views else 0 }} %)</span></td></tr>{% endfor %}</table>
     {% else %}<p class="muted">—</p>{% endif %}</div>
   <div class="card"><h2>Suchmaschinen und KI</h2>
-    {% if s.bots %}<table><tr><th>Wer</th><th>Art</th><th class="n">Anfragen</th><th>zuletzt</th></tr>
+    {% if s.bots %}<table><tr><th>Wer</th><th>Art</th><th class="n">Anfragen</th><th class="n">abgewiesen</th><th>zuletzt</th></tr>
     {% for name, kind, n, last in s.bots %}<tr><td>{{ name }}</td><td class="muted">{{ kind_titles.get(kind, kind) }}</td>
-      <td class="n">{{ n }}</td><td class="muted">{{ last or "—" }}</td></tr>{% endfor %}</table>
+      <td class="n">{{ n }}</td><td class="n">{{ s.denied.get(name, 0) or "—" }}</td><td class="muted">{{ last or "—" }}</td></tr>{% endfor %}</table>
     {% else %}<p class="muted">Noch keine Suchmaschine und kein KI-Abrufer.</p>{% endif %}
     <p class="muted" style="margin:.5rem 0 0">Erkannt an der Kennung (User-Agent), die
       jeder Abrufer selbst angibt — ungeprüft. „Zuletzt“ gilt über alle gespeicherten Tage.</p></div>
@@ -12866,6 +12892,8 @@ def _mode_view(inst):
     m = inst.get("maintenance") or None
     lr = inst.get("login_required") or None
     sb = inst.get("standby") or {}
+    ai = inst.get("ai_fetchers") if isinstance(inst.get("ai_fetchers"), dict) else {}
+    ai_lv = site_stats.ai_level(ai.get("block"))
     return {
         "state": state if state in ("standby", "waking") else "",
         "since": str(sb.get("since", ""))[:19].replace("T", " "),
@@ -12874,6 +12902,13 @@ def _mode_view(inst):
         "m_since": str((m or {}).get("since", ""))[:19].replace("T", " "),
         "m_by": (m or {}).get("by", ""),
         "m_message": (m or {}).get("message", ""),
+        # gateway 0.2.27: the switch "KI-Abrufer"
+        "ai": {"level": ai_lv, "title": site_stats.AI_LEVEL_TITLES[ai_lv],
+               "since": str(ai.get("since", ""))[:19].replace("T", " ") if ai_lv else "",
+               "by": ai.get("by", "") if ai_lv else "",
+               "reason": ai.get("reason", "") if ai_lv else "",
+               "names": site_stats.ai_blocked(ai_lv)[2],
+               "choices": AI_CHOICES},
         # RFC-0092: login on every route
         "strict": bool(lr),
         "s_since": str((lr or {}).get("since", ""))[:19].replace("T", " "),
@@ -12935,6 +12970,34 @@ def instance_maintenance_button(name):
         "Wartungsmodus ist an — nur Verwalter kommen noch hinein." if on
         else "Wartungsmodus ist aus.",
         "Wartungsmodus konnte nicht umgeschaltet werden.",
+        "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
+
+
+AI_CHOICES = (
+    ("", site_stats.AI_LEVEL_TITLES[""],
+     "keine Vorgabe der Plattform (Standard)"),
+    ("training", site_stats.AI_LEVEL_TITLES["training"],
+     "Crawler, die für das Training von Modellen sammeln: "
+     + ", ".join(site_stats.ai_blocked("training")[0]) + ". KI-Suchen und Fragen "
+     "aus einem Chat dürfen weiter abrufen."),
+    ("all", site_stats.AI_LEVEL_TITLES["all"],
+     "zusätzlich KI-Suchen und Abrufe für eine Frage im Chat (ChatGPT, Claude, "
+     "Perplexity, Mistral) — die Seite taucht dann in KI-Antworten nicht mehr auf."),
+)
+
+
+@app.post("/instances/<name>/ai-fetchers")
+def instance_ai_fetchers_button(name):
+    """gateway 0.2.27: KI-Abrufer zulassen, Training sperren oder alle sperren."""
+    level = request.form.get("level") or ""
+    if level and not site_stats.ai_level(level):
+        return _inst_back(name, err="Unbekannte Stufe.")
+    reason = (request.form.get("reason") or "").strip()[:300] if level else ""
+    return _mode_action(
+        name, {"action": "ai-fetchers", "level": level, "reason": reason},
+        MAINTENANCE_WAIT_SECONDS,
+        "KI-Abrufer: " + site_stats.AI_LEVEL_TITLES[site_stats.ai_level(level)] + ".",
+        "Der Schalter konnte nicht umgeschaltet werden.",
         "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
 
 

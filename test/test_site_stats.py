@@ -184,13 +184,13 @@ try:
     a = src.index("<section class=\"panel {{ 'active' if tab == 'statistik' }}\">")
     b = src.index("</section>", a) + len("</section>")
     t = Environment(autoescape=True).from_string(src[a:b])
-    html = t.render(i={"key": "web-site", "site": s, "site_days": 7}, tab="statistik",
+    html = t.render(i={"key": "web-site", "site": s, "site_days": 7, "mode": portal._mode_view({})}, tab="statistik",
                     device_titles=ss.DEVICE_TITLES, kind_titles=ss.KIND_TITLES, site_keep_days=ss.DAYS)
     ok("Reiter zeigt Aufrufe, Seiten, Herkunft, Bots",
        "Seitenaufrufe" in html and "<code>/kontakt</code>" in html and "www.google.com" in html
        and "Googlebot" in html and "Suchmaschine" in html and "active" in html, html[:400])
     ok("Balken je Tag (7)", html.count('title="2026-') == 7, html.count('title="2026-'))
-    html0 = t.render(i={"key": "x", "site": None, "site_days": 30}, tab="diagnose",
+    html0 = t.render(i={"key": "x", "site": None, "site_days": 30, "mode": portal._mode_view({})}, tab="diagnose",
                      device_titles=ss.DEVICE_TITLES, kind_titles=ss.KIND_TITLES, site_keep_days=ss.DAYS)
     ok("leer: Hinweis statt Zahlen, Reiter nicht aktiv",
        "Noch nichts gezählt" in html0 and "panel active" not in html0, html0[:300])

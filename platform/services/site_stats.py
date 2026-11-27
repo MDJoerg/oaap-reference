@@ -80,6 +80,72 @@ BOTS = (
     ("Cohere", "ai", "cohere-ai"),
 )
 BOT_KIND = {b[0]: b[1] for b in BOTS}
+
+# The operator's switch "KI-Abrufer" (oaap.core.gateway 0.2.27): which AI
+# fetchers a level shuts out. Per AI row of BOTS its robots.txt token and
+# its purpose -- "training" collects for a model, "answers" fetches for a
+# search answer or for a person asking a chat right now. Search engines
+# are never touched. One table: the gateway's 403, the robots.txt it
+# writes and the portal's list all read it, so they cannot disagree.
+AI_LEVELS = ("training", "all")
+AI_LEVEL_TITLES = {"": "zulassen", "training": "Training sperren",
+                   "all": "alle KI-Abrufer sperren"}
+AI_ROBOTS = {
+    "GPTBot": ("GPTBot", "training"),
+    "ClaudeBot": ("ClaudeBot", "training"),
+    "anthropic-ai": ("anthropic-ai", "training"),
+    "CCBot": ("CCBot", "training"),
+    "Bytespider": ("Bytespider", "training"),
+    "Amazonbot": ("Amazonbot", "training"),
+    "Meta": ("meta-externalagent", "training"),
+    "Google-Extended": ("Google-Extended", "training"),
+    "Cohere": ("cohere-ai", "training"),
+    "OAI-SearchBot": ("OAI-SearchBot", "answers"),
+    "ChatGPT-User": ("ChatGPT-User", "answers"),
+    "Claude-User": ("Claude-User", "answers"),
+    "Claude-SearchBot": ("Claude-SearchBot", "answers"),
+    "PerplexityBot": ("PerplexityBot", "answers"),
+    "Perplexity-User": ("Perplexity-User", "answers"),
+    "Mistral": ("MistralAI-User", "answers"),
+}
+# Tokens that only ever appear in robots.txt -- read by a search engine's
+# own crawler (Applebot) to decide on training; no request carries them.
+AI_ROBOTS_ONLY = (("Applebot-Extended", "training"),)
+
+
+def ai_level(value):
+    """The level a record's value names, or "" (allow)."""
+    return value if value in AI_LEVELS else ""
+
+
+def ai_blocked(level):
+    """(robots.txt tokens, User-Agent needles, display names) a level
+    shuts out; all empty for "" (allow)."""
+    level = ai_level(level)
+    if not level:
+        return [], [], []
+    want = ("training",) if level == "training" else ("training", "answers")
+    tokens, needles, names = [], [], []
+    for name, _kind, needle in BOTS:
+        tok = AI_ROBOTS.get(name)
+        if tok and tok[1] in want:
+            tokens.append(tok[0])
+            needles.append(needle)
+            names.append(name)
+    tokens += [t for t, purpose in AI_ROBOTS_ONLY if purpose in want]
+    return tokens, needles, names
+
+
+def robots_txt(level):
+    """The robots.txt the gateway answers while the switch is on: one group
+    for the shut-out tokens, everybody else allowed."""
+    tokens = ai_blocked(level)[0]
+    if not tokens:
+        return ""
+    lines = ["# OAAP: KI-Abrufer gesperrt (" + AI_LEVEL_TITLES[ai_level(level)] + ")"]
+    lines += ["User-agent: " + t for t in tokens]
+    lines += ["Disallow: /", "", "User-agent: *", "Allow: /", ""]
+    return "\n".join(lines)
 GENERIC = ("bot", "crawler", "spider", "slurp", "curl/", "wget/", "python-",
            "go-http-client", "httpclient", "okhttp", "java/", "libwww",
            "headless", "scrapy", "uptime", "monitor", "facebookexternalhit",
@@ -178,6 +244,8 @@ def classify(d, hostmap):
     method = req.get("method")
     if rec["bot"]:
         rec["what"] = "bot"
+        if status == 403:
+            rec["denied"] = True
         if method == "GET" and status == 404 and rec["path"]:
             rec["nf"] = True
         return key, rec
@@ -244,6 +312,11 @@ def fold(stats_by_key, lines, hostmap, now=None):
             _bump(day["nf"], rec["path"])
         if rec["what"] == "bot":
             _bump(day["bots"], rec["bot"], cap=len(BOT_KIND) + 1)
+            if rec.get("denied"):
+                # the gateway's 403 of the switch "KI-Abrufer" (and any
+                # other refusal) -- so the page shows whether it works
+                _bump(day.setdefault("denied", {}), rec["bot"],
+                      cap=len(BOT_KIND) + 1)
             last = stats["bot_last"].get(rec["bot"], 0)
             if rec["ts"] > (last if isinstance(last, (int, float)) else 0):
                 stats["bot_last"][rec["bot"]] = int(rec["ts"])
@@ -349,7 +422,7 @@ def sample(base, now, lines, targets, instance_dir):
 def read(base_dir, days=30, now=None):
     """The summary the portal shows, from one instance's directory:
     {"days": [(day, views)], "views", "pages", "ref", "nf", "dev", "bots":
-    [(name, kind, n, last ts)], "hours"} over the last `days` UTC days,
+    [(name, kind, n, last ts)], "denied": {name: refused}, "hours"} over the last `days` UTC days,
     or None when nothing was ever counted."""
     s = _load(os.path.join(base_dir, FILE))
     if not s.get("days") and not s.get("bot_last"):
@@ -358,13 +431,13 @@ def read(base_dir, days=30, now=None):
     want = [time.strftime("%Y-%m-%d", time.gmtime(now - i * 86400))
             for i in range(days - 1, -1, -1)]
     out = {"days": [], "views": 0, "pages": {}, "ref": {}, "nf": {}, "dev": {},
-           "bots": {}, "hours": [0] * 24}
+           "bots": {}, "denied": {}, "hours": [0] * 24}
     for day in want:
         d = s["days"].get(day) or {}
         v = d.get("views") or 0
         out["days"].append((day, v))
         out["views"] += v
-        for k in ("pages", "ref", "nf", "dev", "bots"):
+        for k in ("pages", "ref", "nf", "dev", "bots", "denied"):
             for name, n in (d.get(k) or {}).items():
                 if isinstance(n, int):
                     out[k][name] = out[k].get(name, 0) + n

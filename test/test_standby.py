@@ -25,6 +25,7 @@ import importlib
 import io
 import json
 import os
+import re
 import subprocess as _sp
 import sys
 import tempfile
@@ -448,7 +449,7 @@ new Promise(r => setImmediate(() => setImmediate(() => setImmediate(() => r())))
     pa.caller_roles = lambda: {"server_admin"}
     page = c.get("/instances").get_data(as_text=True)
     ok("Liste: Spalte Status, Standby mit Urheber, geweckt, Wartung",
-       "<th>Status</th>" in page and "Standby" in page and "auto-standby" in page
+       re.search(r"<th[^>]*>(<a[^>]*>)?Status<", page) and "Standby" in page and "auto-standby" in page
        and "Wird geweckt" in page and "Wartung" in page and "Gesund" in page, page[:300])
     ok("Schlafende werden nicht abgefragt (die Weckseite ist kein Fehler)",
        PROBED == ["wach"], PROBED)

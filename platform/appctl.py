@@ -94,6 +94,9 @@ import authorization  # noqa: E402
 # yet: nothing inside a container needs it, and an admin credential is
 # not a thing to put within reach of one that does not.
 import idp_admin  # noqa: E402
+# The switch "KI-Abrufer" (gateway 0.2.27): which AI fetchers a level
+# shuts out is the same table the page statistics count with.
+import site_stats  # noqa: E402
 # RFC-0094: the documentation an app brings -- pure rules, tested on paper.
 import docs_publish  # noqa: E402
 # RFC-0119: the assistant templates an app brings -- pure rules, tested on paper.
@@ -22855,6 +22858,10 @@ def site_body(routes, container, svc_port, groups=None, scope="", throttle=None,
     # is looking for one. Nothing at all while no window is open: this
     # RFC does not turn on permanent per-instance logging.
     lines = list(diagnose_site_lines(scope))
+    # gateway 0.2.27: the operator's switch "KI-Abrufer" -- before the
+    # guard (of two rewrites in one block only the first that matches
+    # runs), so a shut-out fetcher meets its 403 and nothing else.
+    lines += ai_site_lines(scope)
     lines += guard_site_lines(scope, edge)
     # I-81: a test instance and a rehearsal stay out of search engines, on
     # every entry point -- asked here like the rehearsal, from the scope.
@@ -26178,7 +26185,7 @@ def maintenance_of(inst):
 
 
 _MODE_CACHE = {"stamp": None, "standby": frozenset(), "maintained": frozenset(),
-               "strict": frozenset(), "noindex": frozenset()}
+               "strict": frozenset(), "noindex": frozenset(), "ai": {}}
 
 
 def noindex_of(inst):
@@ -26210,6 +26217,66 @@ def noindex_site_lines(scope):
     if not (scope and scope in noindex_keys()):
         return []
     return ["	header {", f'		X-Robots-Tag "{NOINDEX_VALUE}"', "		defer", "	}"]
+
+
+AI_RESERVED = "/.oaap-ai-refused"
+AI_REFUSED_TEXT = ("Der Betreiber dieser Seite hat KI-Abrufer ausgeschlossen. "
+                   "This site's operator does not admit AI fetchers.")
+
+
+def ai_fetchers_of(inst):
+    """The operator's switch "KI-Abrufer" on the record, or None."""
+    m = (inst or {}).get("ai_fetchers")
+    return m if isinstance(m, dict) and site_stats.ai_level(m.get("block")) else None
+
+
+def ai_fetchers_level(inst):
+    """"training", "all" or "" (allow, the default)."""
+    return (ai_fetchers_of(inst) or {}).get("block") or ""
+
+
+def ai_keys():
+    """{instance key: level} of the instances that shut AI fetchers out,
+    from the same cached reading of the registry as mode_keys()."""
+    mode_keys()
+    return _MODE_CACHE["ai"]
+
+
+def ai_site_lines(scope):
+    """gateway 0.2.27: the switch "KI-Abrufer". Two things, because a
+    robots.txt is a request a fetcher may ignore: the gateway answers
+    /robots.txt itself (one group for the shut-out tokens, everybody else
+    allowed), and every other request whose User-Agent names a shut-out
+    fetcher gets 403. /robots.txt itself is never refused -- a 4xx there
+    reads as "everything allowed" (RFC 9309 2.3.1.3). Rewritten to a
+    reserved path, like the guard, so the refusal runs before every
+    handle block of the site, /platform/* and /auth/* included."""
+    level = ai_keys().get(scope) if scope else ""
+    if not level:
+        return []
+    _tokens, needles, _names = site_stats.ai_blocked(level)
+    # needles are lower-case letters, digits and '-' -- nothing to escape
+    # for RE2, nothing the Caddyfile's double quotes could end on
+    assert needles and all(re.fullmatch(r"[a-z0-9-]+", n) for n in needles)
+    body = site_stats.robots_txt(level)
+    assert "`" not in body and "`" not in AI_REFUSED_TEXT
+    rx = "(?i)(" + "|".join(needles) + ")"
+    return [
+        "\t@oaap_ai {",
+        f'\t\theader_regexp oaap_ai User-Agent "{rx}"',
+        "\t\tnot path /robots.txt",
+        "\t}",
+        f"\trewrite @oaap_ai {AI_RESERVED}",
+        f"\thandle {AI_RESERVED} {{",
+        '\t\theader Content-Type "text/plain; charset=utf-8"',
+        f"\t\trespond `{AI_REFUSED_TEXT}` 403",
+        "\t}",
+        "\thandle /robots.txt {",
+        '\t\theader Content-Type "text/plain; charset=utf-8"',
+        '\t\theader Cache-Control "max-age=3600"',
+        f"\t\trespond `{body}` 200",
+        "\t}",
+    ]
 
 
 def login_required_of(inst):
@@ -26249,6 +26316,9 @@ def mode_keys():
             k for k, i in insts.items() if login_required_of(i))
         _MODE_CACHE["noindex"] = frozenset(
             k for k, i in insts.items() if noindex_of(i))
+        _MODE_CACHE["ai"] = {k: lv for k, lv in
+                             ((k, ai_fetchers_level(i)) for k, i in insts.items())
+                             if lv}
         _MODE_CACHE["stamp"] = stamp
     return _MODE_CACHE["standby"], _MODE_CACHE["maintained"]
 
@@ -26621,6 +26691,38 @@ def login_required_set(name, inst, on, reason="", who="root", role="root"):
     return "is back to the routes its package declares"
 
 
+def ai_fetchers_set(name, inst, level, reason="", who="root", role="root"):
+    """gateway 0.2.27: shut AI fetchers out of this instance -- "training"
+    (crawlers that collect for a model), "all" (also search answers and a
+    person's chat fetching right now) -- or "" / "allow" (the default)."""
+    level = "" if level in ("", "allow", None) else level
+    if level and not site_stats.ai_level(level):
+        raise DiagnoseRefused("level is one of: allow, training, all")
+    reg = load_registry()
+    cur = reg["instances"][name]
+    if ai_fetchers_level(cur) == level:
+        return ("already " + ("admits AI fetchers" if not level
+                              else f"shuts AI fetchers out ({level})"))
+    if level:
+        cur["ai_fetchers"] = {"block": level, "since": _iso_now(), "by": who,
+                              "reason": (reason or "").strip()[:300]}
+    else:
+        cur.pop("ai_fetchers", None)
+    save_registry(reg)
+    _republish_sites(name, cur)
+    state_view_write()
+    audit_tenant("instance.ai-fetchers", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail=(level or "allow")
+                 + (f" · Grund: {reason.strip()[:300]}" if level and reason
+                    and reason.strip() else ""))
+    if not level:
+        return "admits AI fetchers again; its own robots.txt (if any) is served"
+    names = site_stats.ai_blocked(level)[2]
+    return (f"shuts AI fetchers out ({level}): robots.txt from the platform, "
+            f"403 for {', '.join(names)}")
+
+
 def _mode_cli(args, fn):
     reg = load_registry()
     inst = (reg.get("instances") or {}).get(args.name)
@@ -26650,6 +26752,12 @@ def cmd_login_required(args):
     """`oaap app login-required <instance> on|off [--reason TEXT]`."""
     _mode_cli(args, lambda n, i, who: login_required_set(
         n, i, args.switch == "on", args.reason, who=who))
+
+
+def cmd_ai_fetchers(args):
+    """`oaap app ai-fetchers <instance> allow|training|all [--reason TEXT]`."""
+    _mode_cli(args, lambda n, i, who: ai_fetchers_set(
+        n, i, args.level, args.reason, who=who))
 
 
 def cmd_maintenance(args):
@@ -29443,6 +29551,9 @@ def _install_from_dir(pkg, args, source):
     # this instance -- a package update must not reopen its public routes.
     if inst and login_required_of(inst):
         reg["instances"][name]["login_required"] = dict(inst["login_required"])
+    # gateway 0.2.27: so is "KI-Abrufer" -- an update must not let them in.
+    if inst and ai_fetchers_of(inst):
+        reg["instances"][name]["ai_fetchers"] = dict(inst["ai_fetchers"])
     # RFC-0068: an exception is the operator's decision, never the app's.
     if inst and egress_exception(inst):
         reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
@@ -41432,7 +41543,8 @@ def cmd_process_deploys(_args):
                              or ensure_default_tenant(), subject=name,
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
-        elif action in ("standby", "wake", "maintenance", "login-required"):
+        elif action in ("standby", "wake", "maintenance", "login-required",
+                        "ai-fetchers"):
             # RFC-0059: the portal's own doors (the waking page, later the
             # buttons) -- the same functions the CLI runs.
             if not inst:
@@ -41446,6 +41558,11 @@ def cmd_process_deploys(_args):
                     elif action == "wake":
                         msg = wake_instance(name, inst, who=_who,
                                             role=act_role or "-")
+                    elif action == "ai-fetchers":
+                        msg = ai_fetchers_set(
+                            name, inst, str(req.get("level") or ""),
+                            str(req.get("reason") or ""), who=_who,
+                            role=act_role or "-")
                     elif action == "login-required":
                         msg = login_required_set(
                             name, inst, bool(req.get("on")),
@@ -44782,6 +44899,15 @@ def build_parser():
     plr.add_argument("--reason", default="",
                      help="why; goes into the tenant's log")
     plr.set_defaults(fn=cmd_login_required)
+    pai = sub.add_parser("ai-fetchers",
+                         help="shut AI fetchers out: robots.txt from the "
+                              "platform and 403 for their User-Agent "
+                              "(gateway 0.2.27)")
+    pai.add_argument("name")
+    pai.add_argument("level", choices=["allow", "training", "all"])
+    pai.add_argument("--reason", default="",
+                     help="why; goes into the tenant's log")
+    pai.set_defaults(fn=cmd_ai_fetchers)
     pdg = sub.add_parser("diagnose",
                          help="the portal's diagnosis window, from the "
                               "machine (RFC-0038 D2)")
