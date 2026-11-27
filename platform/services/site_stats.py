@@ -310,6 +310,10 @@ def fold(stats_by_key, lines, hostmap, now=None):
                 _bump(day["ref"], rec["ref"])
         elif rec["what"] == "notfound" or rec.get("nf"):
             _bump(day["nf"], rec["path"])
+            if rec["what"] == "notfound":
+                # I-81 idea 5: a person's 404 -- a scanner's flood of
+                # /wp-login.php is no reason to mail anybody
+                day["nfp"] = (day.get("nfp") or 0) + 1
         if rec["what"] == "bot":
             _bump(day["bots"], rec["bot"], cap=len(BOT_KIND) + 1)
             if rec.get("denied"):
@@ -322,7 +326,13 @@ def fold(stats_by_key, lines, hostmap, now=None):
                 stats["bot_last"][rec["bot"]] = int(rec["ts"])
         changed.add(key)
     cut = time.strftime("%Y-%m-%d", time.gmtime((now or time.time()) - DAYS * 86400))
+    today = time.strftime("%Y-%m-%d", time.gmtime(now or time.time()))
     for key, stats in stats_by_key.items():
+        if isinstance(stats, dict) and not stats.get("nfp_from"):
+            # the first day whose people's 404 (`nfp`) are counted: before
+            # it a missing `nfp` means "not counted", after it "none"
+            stats["nfp_from"] = today
+            changed.add(key)
         days = stats.get("days") if isinstance(stats, dict) else None
         if isinstance(days, dict):
             old = [k for k in days if k <= cut]
@@ -431,11 +441,18 @@ def read(base_dir, days=30, now=None):
     want = [time.strftime("%Y-%m-%d", time.gmtime(now - i * 86400))
             for i in range(days - 1, -1, -1)]
     out = {"days": [], "views": 0, "pages": {}, "ref": {}, "nf": {}, "dev": {},
-           "bots": {}, "denied": {}, "hours": [0] * 24}
+           "bots": {}, "denied": {}, "hours": [0] * 24,
+           # I-81 idea 5: two more numbers per day for the portal's bars
+           "series": {"search": [], "nf": []}}
     for day in want:
         d = s["days"].get(day) or {}
         v = d.get("views") or 0
         out["days"].append((day, v))
+        out["series"]["search"].append(
+            (day, sum(n for b, n in (d.get("bots") or {}).items()
+                      if isinstance(n, int) and BOT_KIND.get(b) == "search")))
+        out["series"]["nf"].append(
+            (day, sum(n for n in (d.get("nf") or {}).values() if isinstance(n, int))))
         out["views"] += v
         for k in ("pages", "ref", "nf", "dev", "bots", "denied"):
             for name, n in (d.get(k) or {}).items():
@@ -452,6 +469,108 @@ def read(base_dir, days=30, now=None):
     for k in ("pages", "ref", "nf", "dev"):
         out[k] = sorted(out[k].items(), key=lambda kv: (-kv[1], kv[0]))
     return out
+
+
+# --- watching (I-81 idea 5: notifications) -----------------------------
+#
+# Two conditions an operator can ask to hear about, per instance (the switch
+# "Hinweise zur Webseite" on the record). Pure: the stats, when the switch
+# was turned on, now -- and whether the matter is open already (hysteresis).
+# appctl turns them into the matters `site.google` and `site.notfound`
+# (oaap.core.notifications 0.17).
+
+GOOGLE = "Googlebot"
+GOOGLE_DAYS = 14          # "Google war seit 14 Tagen nicht da"
+NF_WINDOW = 7             # the last seven full UTC days ...
+NF_BASE_DAYS = 28         # ... against up to four weeks before them
+NF_BASE_MIN = 7           # a baseline needs at least a week of counting
+NF_MIN = 20               # opens at 20 people's 404 in a week ...
+NF_FACTOR = 2.0           # ... and twice the weekly mean before
+NF_KEEP_MIN = 10          # stays open while >= 10 ...
+NF_KEEP_FACTOR = 1.5      # ... and >= 1.5 x the mean
+
+
+def _day_str(ts):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def google_absent(stats, since_ts, now, is_open=False):
+    """(days, text) when Googlebot has not fetched for GOOGLE_DAYS -- counted
+    from its last visit, or from when the switch was turned on, whichever
+    is later (a new site was never visited; that is no 14 days' absence on
+    the first minute). None otherwise. `is_open` is accepted for symmetry:
+    a visit closes it at once."""
+    s = stats if isinstance(stats, dict) else {}
+    last = (s.get("bot_last") or {}).get(GOOGLE)
+    last = last if isinstance(last, (int, float)) and not isinstance(last, bool) else 0
+    since_ts = since_ts if isinstance(since_ts, (int, float)) else 0
+    ref = max(last, since_ts)
+    if not ref:
+        return None
+    days = int((now - ref) // 86400)
+    if days < GOOGLE_DAYS:
+        return None
+    if last and last >= since_ts:
+        text = (f"Google (Googlebot) hat die Seite seit {days} Tagen nicht abgerufen — "
+                f"zuletzt am {_when(last)}.")
+    elif last:
+        text = (f"Google (Googlebot) hat die Seite nicht abgerufen, seit die Hinweise "
+                f"eingeschaltet sind ({days} Tage); zuletzt davor am {_when(last)}.")
+    else:
+        text = (f"Google (Googlebot) hat die Seite in den {days} Tagen, seit die "
+                "Hinweise eingeschaltet sind, nicht abgerufen — und davor auch nicht, "
+                "soweit die Statistik zurückreicht.")
+    text += (" Mögliche Gründe: die Seite ist neu und nirgends verlinkt, sie sendet "
+             "noindex, oder robots.txt sperrt Google aus. Die Google Search Console "
+             "sagt, was Google sieht.")
+    return days, text
+
+
+def notfound_rising(stats, now, is_open=False):
+    """(n, text) when people's 404 rose: the last NF_WINDOW full UTC days
+    against the weekly mean of up to NF_BASE_DAYS before them. Only days
+    from `nfp_from` on count; without a week of baseline there is no
+    judgment. Today does not count -- a half day would make the matter
+    flicker. Hysteresis: an open matter stays while the lower bar holds."""
+    s = stats if isinstance(stats, dict) else {}
+    start = s.get("nfp_from")
+    if not isinstance(start, str):
+        return None
+    days = s.get("days") if isinstance(s.get("days"), dict) else {}
+    today = int(now // 86400) * 86400
+
+    def count(i):                      # i = 1 is yesterday
+        d = days.get(_day_str(today - i * 86400)) or {}
+        n = d.get("nfp")
+        return n if isinstance(n, int) and not isinstance(n, bool) else 0
+
+    first_window = _day_str(today - NF_WINDOW * 86400)
+    if first_window < start:
+        return None
+    base = [i for i in range(NF_WINDOW + 1, NF_WINDOW + NF_BASE_DAYS + 1)
+            if _day_str(today - i * 86400) >= start]
+    if len(base) < NF_BASE_MIN:
+        return None
+    n = sum(count(i) for i in range(1, NF_WINDOW + 1))
+    mean = sum(count(i) for i in base) * NF_WINDOW / len(base)
+    lo, fac = (NF_KEEP_MIN, NF_KEEP_FACTOR) if is_open else (NF_MIN, NF_FACTOR)
+    if n < lo or n < fac * mean:
+        return None
+    paths = {}
+    for i in range(1, NF_WINDOW + 1):
+        for p, k in ((days.get(_day_str(today - i * 86400)) or {}).get("nf") or {}).items():
+            if isinstance(k, int):
+                paths[p] = paths.get(p, 0) + k
+    top = sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    text = (f"In den letzten {NF_WINDOW} Tagen riefen Besucher {n}-mal eine Seite auf, "
+            f"die es nicht gibt (404); in den {len(base)} Tagen davor waren es im Mittel "
+            f"{mean:.0f} je Woche.")
+    if top:
+        text += ("\nAm häufigsten (alle Abrufer, auch Automaten):\n"
+                 + "\n".join(f"  - {p} ({k})" for p, k in top))
+    text += ("\nOft ist es ein geänderter oder gelöschter Link, auf den noch "
+             "verwiesen wird — eine Weiterleitung oder die Seite zurück hilft.")
+    return n, text
 
 
 def _when(ts):

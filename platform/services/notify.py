@@ -79,6 +79,15 @@ CATALOGUE = {
     "confirm.pending": {"category": "operations", "scope": "tenant", "matter": False,
                         "title": "Eine Auslieferung wartet auf Bestätigung",
                         "subject": "[{mandant}] Bestätigung nötig: {instanz}"},
+    # I-81 idea 5 (0.17): a public web site's people asked to hear it --
+    # only for an instance whose switch "Hinweise zur Webseite" is on, one
+    # matter per instance, no reminder (a page, not a fire).
+    "site.google": {"category": "operations", "scope": "tenant", "matter": True,
+                    "title": "Google war lange nicht auf einer Webseite",
+                    "subject": "[{mandant}] {instanz}: Google seit {kurz} Tagen nicht da"},
+    "site.notfound": {"category": "operations", "scope": "tenant", "matter": True,
+                      "title": "Auf einer Webseite steigen die Fehler „nicht gefunden“ (404)",
+                      "subject": "[{mandant}] {instanz}: mehr 404-Fehler ({kurz} in 7 Tagen)"},
     # Stage 2 (RFC-0080 §4.2)
     "instance.down": {"category": "health", "scope": "tenant", "matter": True,
                       "title": "Eine Produktiv-Instanz ist ausgefallen",

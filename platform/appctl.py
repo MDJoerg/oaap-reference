@@ -2997,7 +2997,9 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "login.locked": "/users", "node.silent": "/health",
                 "bridge.down": "/health", "broker.queue": "/health",
                 "node.loss": "/health", "hub.unreachable": "/health",
-                "link.down": "/health", "disk.trend": "/health", "disk.soon": "/health"}
+                "link.down": "/health", "disk.trend": "/health", "disk.soon": "/health",
+                "site.google": "/instances/{instanz}?tab=statistik",
+                "site.notfound": "/instances/{instanz}?tab=statistik"}
 
 
 def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False,
@@ -3713,12 +3715,51 @@ def notify_conditions(facts=None, now=None):
     # RFC-0084: an instance that hands out a secret file
     for tid, conds in guard_conditions().items():
         cur.setdefault(tid, {}).update(conds)
+    # I-81 idea 5: the web sites whose people asked to hear about them
+    try:
+        for tid, conds in site_watch_conditions(now).items():
+            cur.setdefault(tid, {}).update(conds)
+    except Exception as e:                          # noqa: BLE001
+        print(f"notify: site watch: {type(e).__name__}: {e}", file=sys.stderr)
     # RFC-0085 stage 2: the fleet (on a hub) and the hub (on an entry)
     try:
         cur.setdefault(dflt, {}).update(fleet_conditions(now))
     except Exception as e:                          # noqa: BLE001
         print(f"notify: fleet: {type(e).__name__}: {e}", file=sys.stderr)
     return cur
+
+
+def site_watch_conditions(now):
+    """I-81 idea 5 -> {tid: {key: condition}}: `site.google` and
+    `site.notfound` for the production instances whose switch "Hinweise zur
+    Webseite" is on, from their page statistics (site_stats). An open matter
+    keeps the lower bar (hysteresis); a test instance or a rehearsal never
+    -- it sends noindex, Google is right to stay away."""
+    production = _notify_production()
+    reg = load_registry().get("instances") or {}
+    opened = _notify_state_rw().get("matters") or {}
+    epoch = now.timestamp()
+    out = {}
+    for name, tid in sorted(production.items()):
+        w = site_watch_of(reg.get(name))
+        if not w:
+            continue
+        since = notify._parse(w.get("since"))
+        since_ts = since.replace(tzinfo=since.tzinfo or datetime.timezone.utc).timestamp() \
+            if since else epoch
+        stats = site_stats._load(os.path.join(
+            instance_metrics.instance_dir(METRICS_DIR, tid, name), site_stats.FILE))
+        mine = opened.get(tid) or {}
+        g = site_stats.google_absent(stats, since_ts, epoch)
+        if g:
+            out.setdefault(tid, {})["site.google/" + name] = {
+                "type": "site.google", "instanz": name, "kurz": str(g[0]), "text": g[1]}
+        nf = site_stats.notfound_rising(stats, epoch,
+                                        is_open=("site.notfound/" + name) in mine)
+        if nf:
+            out.setdefault(tid, {})["site.notfound/" + name] = {
+                "type": "site.notfound", "instanz": name, "kurz": str(nf[0]), "text": nf[1]}
+    return out
 
 
 def notify_matters(facts=None, now=None):
@@ -3737,6 +3778,9 @@ def notify_matters(facts=None, now=None):
                 if (op == "close" and rec.get("type") == "instance.down"
                         and rec.get("instanz") not in reg):
                     continue      # removed while down: nothing came back, nothing to mail
+                if (op == "close" and rec.get("type") in ("site.google", "site.notfound")
+                        and not site_watch_of(reg.get(rec.get("instanz")))):
+                    continue      # switched off (or removed): nobody wants to hear "Behoben"
                 dauer = ""
                 if op == "close":
                     lasted = notify.matter_duration(rec, now)
@@ -6843,6 +6887,7 @@ def resolve_instance_ref(reg, ref, tenant_label=""):
 # that guessed which would be a second opinion about what was typed.
 INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
                   "standby", "wake", "maintenance", "login-required",
+                  "ai-fetchers", "site-watch",
                   "diagnose", "endpoint", "tile", "resources", "config",
                   "address", "throttle", "artifact", "promote", "catalog-put", "rehearse",
                   "rehearsal")
@@ -26235,6 +26280,13 @@ def ai_fetchers_level(inst):
     return (ai_fetchers_of(inst) or {}).get("block") or ""
 
 
+def site_watch_of(inst):
+    """I-81 idea 5: the switch "Hinweise zur Webseite" on the record, or
+    None. On, the tenant's lists hear `site.google` and `site.notfound`."""
+    w = (inst or {}).get("site_watch")
+    return w if isinstance(w, dict) and w.get("on") is True else None
+
+
 def ai_keys():
     """{instance key: level} of the instances that shut AI fetchers out,
     from the same cached reading of the registry as mode_keys()."""
@@ -26723,6 +26775,31 @@ def ai_fetchers_set(name, inst, level, reason="", who="root", role="root"):
             f"403 for {', '.join(names)}")
 
 
+def site_watch_set(name, inst, on, who="root", role="root"):
+    """I-81 idea 5: notifications about this web site on or off. Nothing in
+    the gateway changes -- the minute job reads the switch."""
+    reg = load_registry()
+    cur = reg["instances"][name]
+    if bool(site_watch_of(cur)) == bool(on):
+        return "already " + ("watched as a web site" if on else "not watched as a web site")
+    if on:
+        cur["site_watch"] = {"on": True, "since": _iso_now(), "by": who}
+    else:
+        cur.pop("site_watch", None)
+    save_registry(reg)
+    audit_tenant("instance.site-watch", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail="on" if on else "off")
+    if not on:
+        return "is no longer watched as a web site; open notices close without a mail"
+    prod = (cur.get("channel") or "production") != "test" and not cur.get("rehearsal")
+    return ("is watched as a web site: the tenant's lists hear site.google "
+            f"(no Googlebot for {site_stats.GOOGLE_DAYS} days) and site.notfound "
+            "(people's 404 rise)" + ("" if prod else
+                                     " -- once it is a production instance; a test "
+                                     "instance sends noindex"))
+
+
 def _mode_cli(args, fn):
     reg = load_registry()
     inst = (reg.get("instances") or {}).get(args.name)
@@ -26758,6 +26835,11 @@ def cmd_ai_fetchers(args):
     """`oaap app ai-fetchers <instance> allow|training|all [--reason TEXT]`."""
     _mode_cli(args, lambda n, i, who: ai_fetchers_set(
         n, i, args.level, args.reason, who=who))
+
+
+def cmd_site_watch(args):
+    """`oaap app site-watch <instance> on|off`."""
+    _mode_cli(args, lambda n, i, who: site_watch_set(n, i, args.switch == "on", who=who))
 
 
 def cmd_maintenance(args):
@@ -29554,6 +29636,9 @@ def _install_from_dir(pkg, args, source):
     # gateway 0.2.27: so is "KI-Abrufer" -- an update must not let them in.
     if inst and ai_fetchers_of(inst):
         reg["instances"][name]["ai_fetchers"] = dict(inst["ai_fetchers"])
+    # I-81 idea 5: and whether its people hear about the web site
+    if inst and site_watch_of(inst):
+        reg["instances"][name]["site_watch"] = dict(inst["site_watch"])
     # RFC-0068: an exception is the operator's decision, never the app's.
     if inst and egress_exception(inst):
         reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
@@ -41544,7 +41629,7 @@ def cmd_process_deploys(_args):
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
         elif action in ("standby", "wake", "maintenance", "login-required",
-                        "ai-fetchers"):
+                        "ai-fetchers", "site-watch"):
             # RFC-0059: the portal's own doors (the waking page, later the
             # buttons) -- the same functions the CLI runs.
             if not inst:
@@ -41563,6 +41648,9 @@ def cmd_process_deploys(_args):
                             name, inst, str(req.get("level") or ""),
                             str(req.get("reason") or ""), who=_who,
                             role=act_role or "-")
+                    elif action == "site-watch":
+                        msg = site_watch_set(name, inst, req.get("on") is True,
+                                             who=_who, role=act_role or "-")
                     elif action == "login-required":
                         msg = login_required_set(
                             name, inst, bool(req.get("on")),
@@ -41611,7 +41699,8 @@ def cmd_process_deploys(_args):
                "diagnose-open": "portal", "diagnose-close": "portal",
                "diagnose-logs": "portal", "restart": "portal",
                "standby": "portal", "wake": "portal", "maintenance": "portal",
-               "login-required": "portal",
+               "login-required": "portal", "ai-fetchers": "portal",
+               "site-watch": "portal",
                "config": "portal", "token": "portal", "resources": "portal",
                "address": "portal", "throttle": "portal", "cohort": "api",
                "remove": "portal", "create": "portal",
@@ -44908,6 +44997,12 @@ def build_parser():
     pai.add_argument("--reason", default="",
                      help="why; goes into the tenant's log")
     pai.set_defaults(fn=cmd_ai_fetchers)
+    psw = sub.add_parser("site-watch",
+                         help="notifications about a public web site: Google "
+                              "absent for 14 days, people's 404 rising (I-81)")
+    psw.add_argument("name")
+    psw.add_argument("switch", choices=["on", "off"])
+    psw.set_defaults(fn=cmd_site_watch)
     pdg = sub.add_parser("diagnose",
                          help="the portal's diagnosis window, from the "
                               "machine (RFC-0038 D2)")

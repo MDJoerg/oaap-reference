@@ -164,7 +164,7 @@ ok("zulassen: Satz ohne Schalter, Site ohne Regel",
 SRC = open(os.path.join(PLATFORM, "appctl.py"), encoding="utf-8").read()
 ok("Update übernimmt den Schalter (wie login_required)",
    'reg["instances"][name]["ai_fetchers"] = dict(inst["ai_fetchers"])' in SRC)
-ok("Spool-Tür des Portals", '"ai-fetchers"):' in SRC and 'action == "ai-fetchers"' in SRC)
+ok("Spool-Tür des Portals", '"ai-fetchers", "site-watch"):' in SRC and 'action == "ai-fetchers"' in SRC)
 ok("CLI: oaap app ai-fetchers", 'sub.add_parser("ai-fetchers"' in SRC)
 
 print("\nStatistik: abgewiesen")

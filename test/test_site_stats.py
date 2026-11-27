@@ -189,7 +189,8 @@ try:
     ok("Reiter zeigt Aufrufe, Seiten, Herkunft, Bots",
        "Seitenaufrufe" in html and "<code>/kontakt</code>" in html and "www.google.com" in html
        and "Googlebot" in html and "Suchmaschine" in html and "active" in html, html[:400])
-    ok("Balken je Tag (7)", html.count('title="2026-') == 7, html.count('title="2026-'))
+    # I-81 Idee 5: dazu je Tag Suchmaschinen und 404 -- drei Reihen
+    ok("Balken je Tag (3 Reihen x 7)", html.count('title="2026-') == 21, html.count('title="2026-'))
     html0 = t.render(i={"key": "x", "site": None, "site_days": 30, "mode": portal._mode_view({})}, tab="diagnose",
                      device_titles=ss.DEVICE_TITLES, kind_titles=ss.KIND_TITLES, site_keep_days=ss.DAYS)
     ok("leer: Hinweis statt Zahlen, Reiter nicht aktiv",

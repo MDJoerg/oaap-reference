@@ -4393,6 +4393,7 @@ INSTANCE_EDIT_BODY = """
   .st-bars{display:flex;align-items:flex-end;gap:2px;height:7rem;margin:.6rem 0 .2rem}
   .st-bars span{flex:1;background:var(--oaap-accent, #3b6fd8);min-height:1px;border-radius:2px 2px 0 0;opacity:.85}
   .st-bars span.zero{background:var(--oaap-border, #ddd)}
+  .st-bars.st-small{height:3rem;margin-top:.2rem}
   .st-axis{display:flex;justify-content:space-between;font-size:.75rem;color:var(--oaap-muted)}
   .st-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:.8rem}
   .st-grid td.n{text-align:right;white-space:nowrap}
@@ -4423,6 +4424,16 @@ INSTANCE_EDIT_BODY = """
       style="height:{{ ((v / peak * 100) if peak else 0)|round(1) }}%"></span>{% endfor %}
   </div>
   <div class="st-axis"><span>{{ s.days[0][0] }}</span><span>{{ s.days[-1][0] }}</span></div>
+  {# I-81 Idee 5: zwei weitere Zeitreihen je Tag #}
+  {% for key, label, unit in (("search", "Anfragen von Suchmaschinen je Tag", "Anfrage"),
+                               ("nf", "Seite nicht gefunden (404) je Tag", "404")) %}
+  {% set row = s.series[key] %}{% set top = row|map(attribute=1)|max %}
+  <p class="muted" style="margin:.7rem 0 0">{{ label }}{% if top %} — höchstens {{ top }}{% endif %}</p>
+  <div class="st-bars st-small" role="img" aria-label="{{ label }}">
+    {% for day, v in row %}<span class="{{ 'zero' if not v }}" title="{{ day }}: {{ v }} {{ unit }}{{ 'n' if unit == 'Anfrage' and v != 1 }}"
+      style="height:{{ ((v / top * 100) if top else 0)|round(1) }}%"></span>{% endfor %}
+  </div>
+  {% endfor %}
   {% endif %}
 </div>
 {% set ai = i.mode.ai %}
@@ -4450,6 +4461,34 @@ INSTANCE_EDIT_BODY = """
      die 403 gilt auch für Abrufer, die sie nicht lesen. Wer sich mit falscher Kennung
      ausgibt, kommt durch — erkannt wird nur, was der Abrufer selbst angibt. Ob die
      Sperre wirkt, zeigt die Tabelle „Suchmaschinen und KI“ in der Spalte „abgewiesen“.</p>
+</div>
+{% set sw = i.mode.watch %}
+<div class="card" id="hinweise">
+  <h2>Hinweise zur Webseite</h2>
+  {# I-81 Idee 5 (Jörg 27.11.: „Idee 5“) -- oaap.core.notifications 0.17 #}
+  <p style="margin:.2rem 0 .5rem">{% if sw.on %}<strong>An</strong>{% if sw.since %}, seit
+     {{ sw.since }} UTC{% endif %}{% if sw.by %} (gesetzt von <strong>{{ sw.by }}</strong>){% endif %}.
+     {% else %}<strong>Aus.</strong>{% endif %} Ist es an, schickt die Plattform über die
+     Verteiler des Mandanten (Nachrichten → Verteiler, Kategorie „Betrieb“) eine Mail, wenn</p>
+  <ul style="margin:0 0 .5rem">
+    <li><strong>Google lange nicht da war:</strong> Googlebot hat die Seite
+        {{ sw.google_days }} Tage nicht abgerufen — gezählt ab dem letzten Besuch, frühestens ab
+        dem Einschalten;</li>
+    <li><strong>die 404-Fehler steigen:</strong> Besucher (keine Automaten) riefen in den
+        letzten 7 Tagen mindestens 20-mal eine Seite auf, die es nicht gibt, und doppelt so oft
+        wie sonst je Woche (Vergleich mit bis zu vier Wochen davor; geurteilt wird erst nach
+        zwei Wochen Zählung).</li>
+  </ul>
+  <p class="muted" style="margin:0 0 .5rem">Je Lage eine Mail, wenn sie beginnt, und eine,
+     wenn sie vorbei ist — keine tägliche Erinnerung. Wer sie lieber nur im Wochenbericht
+     liest, stellt das am Verteiler ein.{% if not sw.production %} <strong>Diese Instanz ist
+     eine Test-Instanz</strong> — sie sendet <code>noindex</code>, Google bleibt zu Recht
+     weg; gemeldet wird erst, wenn sie produktiv ist.{% endif %}</p>
+  <form method="post" action="/instances/{{ i.key }}/site-watch">
+    <input type="hidden" name="tab" value="statistik">
+    <input type="hidden" name="op" value="{{ 'off' if sw.on else 'on' }}">
+    <button class="secondary">{{ 'Hinweise ausschalten' if sw.on else 'Hinweise einschalten' }}</button>
+  </form>
 </div>
 {% if s %}
 <div class="st-grid">
@@ -12894,6 +12933,8 @@ def _mode_view(inst):
     sb = inst.get("standby") or {}
     ai = inst.get("ai_fetchers") if isinstance(inst.get("ai_fetchers"), dict) else {}
     ai_lv = site_stats.ai_level(ai.get("block"))
+    sw = inst.get("site_watch") if isinstance(inst.get("site_watch"), dict) else {}
+    sw = sw if sw.get("on") is True else {}
     return {
         "state": state if state in ("standby", "waking") else "",
         "since": str(sb.get("since", ""))[:19].replace("T", " "),
@@ -12909,6 +12950,12 @@ def _mode_view(inst):
                "reason": ai.get("reason", "") if ai_lv else "",
                "names": site_stats.ai_blocked(ai_lv)[2],
                "choices": AI_CHOICES},
+        # I-81 idea 5: "Hinweise zur Webseite"
+        "watch": {"on": bool(sw), "since": str(sw.get("since", ""))[:19].replace("T", " "),
+                  "by": sw.get("by", ""),
+                  "production": (inst.get("channel") or "production") != "test"
+                  and not inst.get("rehearsal"),
+                  "google_days": site_stats.GOOGLE_DAYS},
         # RFC-0092: login on every route
         "strict": bool(lr),
         "s_since": str((lr or {}).get("since", ""))[:19].replace("T", " "),
@@ -12998,6 +13045,18 @@ def instance_ai_fetchers_button(name):
         MAINTENANCE_WAIT_SECONDS,
         "KI-Abrufer: " + site_stats.AI_LEVEL_TITLES[site_stats.ai_level(level)] + ".",
         "Der Schalter konnte nicht umgeschaltet werden.",
+        "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
+
+
+@app.post("/instances/<name>/site-watch")
+def instance_site_watch_button(name):
+    """I-81 Idee 5: Hinweise zur Webseite per Verteiler ein/aus."""
+    on = request.form.get("op") == "on"
+    return _mode_action(
+        name, {"action": "site-watch", "on": on}, MAINTENANCE_WAIT_SECONDS,
+        "Hinweise zur Webseite sind an — die Verteiler des Mandanten hören davon."
+        if on else "Hinweise zur Webseite sind aus.",
+        "Die Hinweise konnten nicht umgeschaltet werden.",
         "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
 
 

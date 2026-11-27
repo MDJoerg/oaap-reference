@@ -17,6 +17,7 @@ test_store_view.py; hier wird geprüft, dass die beiden Seiten sie zeigen:
 Aufruf (im Portal-Abbild): python3 test/test_care_lists_portal.py
 """
 import json
+import re
 import os
 import sys
 import tempfile
@@ -129,7 +130,8 @@ portal.store_catalogue = counting
 st, body = get("/instances")
 flat = " ".join(body.split())
 ok("Liste antwortet", st == 200, body[:500])
-ok("Spalte „Pflege“", "<th>Pflege</th>" in body)
+# seit 0.1.396 sind die Spaltenköpfe sortierbare Links
+ok("Spalte „Pflege“", bool(re.search(r"<th[^>]*>(<a[^>]*>)?Pflege<", body)))
 ok("Update-Abzeichen verlinkt die Store-Seite",
    'href="/store/katalog/ai-gateway"' in body and "Update v0.5.3" in flat, flat[:3000])
 ok("Sicherheitsmeldungen verlinken die Karte „Abbild“",
