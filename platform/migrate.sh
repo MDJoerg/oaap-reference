@@ -384,27 +384,6 @@ OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" migrate-retained \
 OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" scrub-access-log \
   2>&1 | sed 's/^/  /' || say "  WARNING: the old access-log lines could not be filtered."
 
-# --- the one thing the platform may not decide itself (RFC-0039, 0.1.105) ---
-# identity's own migration already gave `support` to every `partner`
-# holder, so nobody who looks after this node lost the health page. What
-# it CANNOT do is tell a service provider from a genuine external
-# company, and only one of those should keep which role. So it asks --
-# here, where a human is watching an update, not in a container log
-# nobody reads. Silent unless somebody actually holds both, and silent
-# again as soon as that is sorted out.
-# It gets no heading of its own, because a heading would have to be
-# printed before we know whether there is anything to say, and that
-# would break the silence. So the blank line is added here instead,
-# and only when the note actually has content -- without it the note
-# runs straight on under the previous step's heading and reads like
-# that step's output (seen on oaap-test, 0.1.105).
-_support_note="$(OAAP_DATA_DIR="$OAAP_DATA_DIR" python3 "$APP_DIR/appctl.py" \
-  support-cleanup-note 2>&1 || true)"
-if [ -n "$_support_note" ]; then
-  say ""
-  printf '%s\n' "$_support_note" | sed 's/^/  /'
-fi
-
 # --- the rehearsal sweep timer (RFC-0030 D4) ---
 # A rehearsal holds a COPY OF LIVE CUSTOMER DATA and disappears on a
 # date. On a node updated rather than freshly installed there is no
