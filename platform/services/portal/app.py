@@ -3553,6 +3553,75 @@ INSTANCE_EDIT_BODY = """
 </section>
 
 <section class="panel {{ 'active' if tab == 'zugang' }}">
+{% if i.people is defined %}{% set pp = i.people %}
+<div class="card" id="zustaendige">
+  <h2>Zuständige</h2>
+  {# RFC-0143 Stufe 1 (Jörg 28.11.: D1–D7 wie empfohlen) #}
+  <p class="muted" style="margin:.2rem 0 .5rem">Personen des Mandanten, die sich um
+     <strong>{{ i.name }}</strong> kümmern, ohne Mandanten-Admin zu sein.
+     <strong>Beobachter</strong> sehen nur. <strong>Betreuer</strong> schalten zusätzlich
+     Wartung, Anmeldepflicht und KI-Abrufer, starten neu und lösen „Jetzt prüfen“ aus.
+     <strong>Verantwortliche</strong> setzen außerdem die Test-Instanz produktiv, gehen
+     zur vorigen Version zurück und schalten Seiten-Check und Hinweise.
+     Löschen, Konfiguration, Adressen und Zugang bleiben beim Mandanten-Admin.
+     Eine Bindung an die Produktivinstanz gilt auch für ihre Test-Instanz.</p>
+  {% if pp.rows %}
+  <table class="mini">
+    <tr><th>Person</th><th>Rolle</th><th>Seit</th><th>Von</th><th></th></tr>
+    {% for p in pp.rows %}
+    <tr>
+      <td>{{ p.person }}{% if p.dead %} <span class="badge todo"
+          title="kein aktives Konto des Mandanten">wirkt nicht</span>{% endif %}</td>
+      <td>
+        <form method="post" action="/instances/{{ i.key }}/people" style="display:flex;gap:.3rem;margin:0">
+          <input type="hidden" name="tab" value="zugang">
+          <input type="hidden" name="op" value="set">
+          <input type="hidden" name="person" value="{{ p.person }}">
+          <select name="role" aria-label="Rolle von {{ p.person }}">
+            {% for r, t in pp.roles %}<option value="{{ r }}" {{ 'selected' if r == p.role }}>{{ t }}</option>{% endfor %}
+          </select>
+          <button class="secondary">Ändern</button>
+        </form>
+      </td>
+      <td style="white-space:nowrap">{{ p.since }}</td>
+      <td>{{ p.by }}</td>
+      <td>
+        <form method="post" action="/instances/{{ i.key }}/people" style="margin:0">
+          <input type="hidden" name="tab" value="zugang">
+          <input type="hidden" name="op" value="remove">
+          <input type="hidden" name="person" value="{{ p.person }}">
+          <button class="secondary">Beenden</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p><strong>Niemand gebunden.</strong></p>
+  {% endif %}
+  {% for p in pp.through %}
+  <p class="muted" style="margin:.3rem 0 0">{{ p.person }} ist <strong>{{ p.title }}</strong>
+     über die Produktivinstanz <a href="/instances/{{ p.via }}?tab=zugang">{{ p.via_name }}</a>.</p>
+  {% endfor %}
+  {% if pp.candidates %}
+  <form method="post" action="/instances/{{ i.key }}/people"
+        style="display:flex;flex-wrap:wrap;gap:.4rem;align-items:end;margin-top:.6rem">
+    <input type="hidden" name="tab" value="zugang">
+    <input type="hidden" name="op" value="add">
+    <label>Person <select name="person">
+      {% for c in pp.candidates %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+    </select></label>
+    <label>Rolle <select name="role">
+      {% for r, t in pp.roles %}<option value="{{ r }}" {{ 'selected' if r == 'caretaker' }}>{{ t }}</option>{% endfor %}
+    </select></label>
+    <button>Binden</button>
+  </form>
+  {% elif not pp.rows %}
+  <p class="muted">Der Mandant hat noch keine weiteren Personen — erst unter
+     Benutzer anlegen, dann hier binden.</p>
+  {% endif %}
+</div>
+{% endif %}
 <div class="card">
   <h2>API-Schlüssel</h2>
   <p class="muted">Ein Schlüssel für ein Skript, ein Terminal oder eine
@@ -11251,6 +11320,9 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
          # Instanz-Eintrag; die Karte zeigt ihn und bietet nur den Schritt an,
          # der jetzt möglich ist.
          "mode": _mode_view(inst),
+         # Zuständige (RFC-0143 Stufe 1): wer sich um die Instanz kümmert;
+         # die Tür ist der Spool (instance-people), der Knoten urteilt.
+         "people": _people_view(name, inst),
          # Neustart-Schutz (RFC-0069 Stufe 5): der Plan des Knotens und der
          # Schutz dieser Instanz, aus der Pflegedatei; die Tür ist der Spool.
          "care": _care_view(name),
@@ -13205,6 +13277,75 @@ def instance_ai_fetchers_button(name):
         "KI-Abrufer: " + site_stats.AI_LEVEL_TITLES[site_stats.ai_level(level)] + ".",
         "Der Schalter konnte nicht umgeschaltet werden.",
         "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
+
+
+# --- RFC-0143: Zuständige einer Instanz ------------------------------------
+
+PEOPLE_ROLES = (("observer", "Beobachter"), ("caretaker", "Betreuer"),
+                ("owner", "Verantwortlich"))
+_PEOPLE_TITLE = dict(PEOPLE_ROLES)
+
+
+def _people_of(inst):
+    return [p for p in ((inst or {}).get("people") or [])
+            if isinstance(p, dict) and p.get("person") and p.get("role") in _PEOPLE_TITLE]
+
+
+def _people_view(name, inst):
+    """Die Karte „Zuständige“: Bindungen der Instanz, die der
+    Produktivinstanz, zu der sie gehört (D2), und wen der Mandant noch
+    binden könnte. Nur Anzeige -- urteilen tut der Knoten (`may()`)."""
+    tid = resolve_tenant(inst.get("tenant")) or ""
+    users = [u for u in identity_users()
+             if (resolve_tenant(u.get("tenant")) or "") == tid]
+    alive = {u.get("username") for u in users if u.get("active", True)}
+    rows = [{"person": p["person"], "role": p["role"],
+             "title": _PEOPLE_TITLE[p["role"]],
+             "since": str(p.get("since", ""))[:10], "by": p.get("by", ""),
+             "dead": p["person"] not in alive}
+            for p in _people_of(inst)]
+    through = []
+    insts = load_instances()
+    reh = inst.get("rehearsal") if isinstance(inst.get("rehearsal"), dict) else {}
+    pkey = reh.get("of") or ""
+    if not pkey and (inst.get("channel") or "production") == "test":
+        pkey = next((k for k, i in sorted(insts.items())
+                     if k != name and (i.get("source") or {}).get("promoted_from") == name
+                     and (resolve_tenant(i.get("tenant")) or "") == tid), "")
+    pinst = insts.get(pkey) if pkey else None
+    if pinst is not None and (resolve_tenant(pinst.get("tenant")) or "") == tid:
+        through = [{"person": p["person"], "title": _PEOPLE_TITLE[p["role"]], "via": pkey,
+                    "via_name": pinst.get("name") or pkey} for p in _people_of(pinst)]
+    bound = {r["person"] for r in rows}
+    candidates = sorted(u.get("username") for u in users
+                        if u.get("active", True) and u.get("username")
+                        and u.get("username") not in bound
+                        and not str(u.get("username")).startswith("instance:")
+                        and "server_admin" not in (u.get("roles") or []))
+    return {"rows": rows, "through": through, "candidates": candidates,
+            "roles": PEOPLE_ROLES}
+
+
+@app.post("/instances/<name>/people")
+def instance_people_button(name):
+    """RFC-0143 §3: eine Person binden, die Rolle ändern, die Bindung
+    beenden. Nur Mandanten- und Server-Admin (D3); der Knoten prüft Person,
+    Mandant und Rolle noch einmal."""
+    op = request.form.get("op") or ""
+    person = (request.form.get("person") or "").strip()
+    role = request.form.get("role") or ""
+    if op not in ("add", "set", "remove") or not person:
+        denied = require_instance_admin(name)
+        return denied or _inst_back(name, err="Unvollständige Angabe.")
+    title = _PEOPLE_TITLE.get(role, "")
+    ok_text = {"add": f"{person} ist jetzt {title}.",
+               "set": f"{person} ist jetzt {title}.",
+               "remove": f"Die Bindung von {person} ist beendet."}[op]
+    return _mode_action(
+        name, {"action": "instance-people", "op": op, "person": person, "role": role},
+        MAINTENANCE_WAIT_SECONDS, ok_text,
+        "Die Zuständigen konnten nicht geändert werden.",
+        "Die Änderung läuft noch — bitte gleich erneut prüfen.")
 
 
 @app.post("/instances/<name>/site-watch")

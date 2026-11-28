@@ -241,7 +241,7 @@ INSTANCE_ADMIN_ACTIONS = frozenset({
     "envelope", "link", "promote", "rebuild", "rehearsal-extend", "rehearse",
     "remove", "rename", "restart", "rollback", "throttle", "tile", "token",
     "visibility", "maintenance", "login-required", "standby", "ai-fetchers",
-    "site-watch", "site-check"})
+    "site-watch", "site-check", "instance-people"})
 # How long one deploy request may take before it is called off. A build
 # that hangs used to block every later deployment for every instance,
 # with nothing anywhere saying so (RFC-0024). A recorded failure is
@@ -6947,7 +6947,7 @@ def resolve_instance_ref(reg, ref, tenant_label=""):
 # that guessed which would be a second opinion about what was typed.
 INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
                   "standby", "wake", "maintenance", "login-required",
-                  "ai-fetchers", "site-watch", "site-check",
+                  "ai-fetchers", "site-watch", "site-check", "people",
                   "diagnose", "endpoint", "tile", "resources", "config",
                   "address", "throttle", "artifact", "promote", "catalog-put", "rehearse",
                   "rehearsal")
@@ -27114,6 +27114,224 @@ def site_watch_set(name, inst, on, who="root", role="root"):
                                      "instance sends noindex"))
 
 
+# --- RFC-0143: people bound to an instance ------------------------------
+#
+# A tenant_admin (or the server_admin) binds one of the tenant's people to
+# an instance with a role of a short fixed list (D1, D7). The node judges
+# every request about the instance with ONE function, `may()`: platform
+# role first, as before, then the binding. Operating roles only -- what a
+# person may do TO an instance; business rights inside the app stay
+# `oaap.core.authorization` (RFC-0045 §1).
+
+BINDING_ROLES = ("observer", "caretaker", "owner")
+BINDING_TITLES = {"observer": "Beobachter", "caretaker": "Betreuer",
+                  "owner": "Verantwortlich"}
+# The portal and the CLI accept the German names as well
+BINDING_ALIASES = {"beobachter": "observer", "betreuer": "caretaker",
+                   "verantwortlich": "owner"}
+# What each role may do, as spool actions (§1). `site-check:run` is
+# "Jetzt prüfen"; `site-check` without it switches the check on or off.
+# Never by a binding: remove, install, rename, configuration, secrets,
+# routes, visibility, addresses, domains -- and binding others (D3).
+BINDING_ACTIONS = {"observer": frozenset()}
+BINDING_ACTIONS["caretaker"] = frozenset({
+    "maintenance", "login-required", "restart", "wake", "ai-fetchers",
+    "site-check:run"})
+BINDING_ACTIONS["owner"] = BINDING_ACTIONS["caretaker"] | frozenset({
+    "promote", "rollback", "site-check", "site-watch"})
+
+
+class PeopleRefused(Exception):
+    """A binding change the node will not make, in one sentence."""
+
+
+def binding_role(word):
+    """`observer`/`caretaker`/`owner` from either language, or ''."""
+    w = (word or "").strip().lower()
+    w = BINDING_ALIASES.get(w, w)
+    return w if w in BINDING_ROLES else ""
+
+
+def binding_action(action, req=None):
+    """The name `BINDING_ACTIONS` judges: the site check's "Jetzt prüfen"
+    is a caretaker's, switching it is an owner's (§1)."""
+    if action == "site-check" and (req or {}).get("op") == "run":
+        return "site-check:run"
+    return action
+
+
+def people_of(inst):
+    """The instance's bindings `{person, role, since, by}`; anything else
+    in the list is ignored, never guessed at."""
+    return [p for p in ((inst or {}).get("people") or [])
+            if isinstance(p, dict) and p.get("person")
+            and p.get("role") in BINDING_ROLES]
+
+
+def _binding_rank(role):
+    return BINDING_ROLES.index(role) if role in BINDING_ROLES else -1
+
+
+def production_of(reg, key):
+    """The production instance a test instance or a rehearsal belongs to
+    (D2, stage 0 M2): a rehearsal names it (`rehearsal.of`), a test
+    instance is named by the production instance it was promoted into
+    (`source.promoted_from`). Same tenant only. (None, None) otherwise."""
+    insts = reg.get("instances") or {}
+    inst = insts.get(key) or {}
+    tid = resolve_tenant(inst.get("tenant"))
+    reh = inst.get("rehearsal") if isinstance(inst.get("rehearsal"), dict) else {}
+    if reh.get("of"):
+        p = insts.get(reh["of"])
+        if p is not None and resolve_tenant(p.get("tenant")) == tid:
+            return reh["of"], p
+        return None, None
+    if (inst.get("channel") or "production") != "test":
+        return None, None
+    for k, i in sorted(insts.items()):
+        if (k != key and ((i.get("source") or {}).get("promoted_from") == key)
+                and resolve_tenant(i.get("tenant")) == tid):
+            return k, i
+    return None, None
+
+
+def binding_of(reg, key, person):
+    """(role, via): the person's strongest binding on the instance -- its
+    own, or the production instance's it belongs to (D2). ('', '') if
+    none."""
+    best, via = "", ""
+    pkey, pinst = production_of(reg, key)
+    for k, i in ((key, (reg.get("instances") or {}).get(key)), (pkey, pinst)):
+        for p in people_of(i):
+            if p["person"] == person and _binding_rank(p["role"]) > _binding_rank(best):
+                best, via = p["role"], k
+    return best, via
+
+
+def may(actor, key, action, reg=None, users=None):
+    """RFC-0143 §4: may `actor` do `action` (a spool action, see
+    `binding_action`) to the instance `key`? Returns (yes, why).
+
+    `why` is what the audit says: `role: server_admin`, `role:
+    tenant_admin`, `bound: caretaker` -- or, for a no, the sentence.
+    Judged from identity's own store and the registry, never from a
+    request: a disabled person, or one moved to another tenant, loses
+    every binding at once, whatever the record still lists (§2)."""
+    reg = reg if reg is not None else load_registry()
+    inst = (reg.get("instances") or {}).get(key)
+    if inst is None:
+        return False, "unknown instance"
+    users = users if users is not None else (_read_identity_users() or [])
+    u = next((x for x in users if x.get("username") == (actor or "")), None)
+    if not u or not u.get("active", True):
+        return False, "no active account of this node"
+    roles = set(u.get("roles") or [])
+    if "server_admin" in roles:
+        return True, "role: server_admin"
+    if resolve_tenant(u.get("tenant")) != resolve_tenant(inst.get("tenant")):
+        return False, "not a person of the instance's tenant"
+    if "tenant_admin" in roles:
+        return True, "role: tenant_admin"
+    role, _via = binding_of(reg, key, actor)
+    if not role:
+        return False, "no binding on this instance"
+    if action in BINDING_ACTIONS[role]:
+        return True, f"bound: {role}"
+    return False, f"a binding as {BINDING_TITLES[role]} does not allow '{action}'"
+
+
+def people_set(name, op, person, role="", who="root", by_role="root"):
+    """Add, change or end one binding on the instance (§3). The person
+    must be an active account of the instance's tenant (D6: `partner`
+    too). Kept by an update, a rebuild and a promotion (`_install_from_dir`
+    carries `people` like `site_watch`). Returns the sentence."""
+    reg = load_registry()
+    cur = (reg.get("instances") or {}).get(name)
+    if cur is None:
+        raise PeopleRefused("unknown instance")
+    person = (person or "").strip()
+    if op not in ("add", "set", "remove"):
+        raise PeopleRefused("op must be add, set or remove")
+    if not person:
+        raise PeopleRefused("no person named")
+    role = binding_role(role)
+    if op != "remove" and not role:
+        raise PeopleRefused("role must be one of " + ", ".join(
+            f"{r} ({BINDING_TITLES[r]})" for r in BINDING_ROLES))
+    people = people_of(cur)
+    old = next((p for p in people if p["person"] == person), None)
+    if op == "remove":
+        if old is None:
+            raise PeopleRefused(f"'{person}' is not bound to this instance")
+        people = [p for p in people if p["person"] != person]
+    else:
+        if op == "add" and old is not None:
+            raise PeopleRefused(f"'{person}' is already bound as "
+                                f"{BINDING_TITLES[old['role']]} -- change it with set")
+        if op == "set" and old is None:
+            raise PeopleRefused(f"'{person}' is not bound to this instance -- add it")
+        users = _read_identity_users()
+        if users is None:
+            raise PeopleRefused("the user store cannot be read (run as root)")
+        u = next((x for x in users if x.get("username") == person), None)
+        if not u or not u.get("active", True):
+            raise PeopleRefused(f"'{person}' is no active account of this node")
+        if resolve_tenant(u.get("tenant")) != resolve_tenant(cur.get("tenant")):
+            raise PeopleRefused(f"'{person}' is not a person of the instance's tenant")
+        if old is not None and old["role"] == role:
+            return f"'{person}' is already bound as {BINDING_TITLES[role]}"
+        entry = {"person": person, "role": role,
+                 "since": (old or {}).get("since") or _iso_now(), "by": who}
+        people = [p for p in people if p["person"] != person] + [entry]
+    if people:
+        cur["people"] = people
+    else:
+        cur.pop("people", None)
+    save_registry(reg)
+    audit_tenant("instance.people", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=by_role,
+                 detail=f"{person}: {(old or {}).get('role') or '-'} -> "
+                        f"{role if op != 'remove' else '-'}")
+    if op == "remove":
+        return f"'{person}' is no longer bound to it"
+    return f"'{person}' is bound to it as {BINDING_TITLES[role]} ({role})"
+
+
+def cmd_people(args):
+    """`oaap app people <instance> [add|set <person> <role> | remove <person>]`."""
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"unknown instance '{args.name}'")
+    if not args.op:
+        users = {u.get("username"): u for u in (_read_identity_users() or [])}
+        rows = people_of(inst)
+        pkey, pinst = production_of(reg, args.name)
+        print(f"{args.name}:")
+        if not rows:
+            print("  no one bound")
+        for p in rows:
+            u = users.get(p["person"])
+            note = ("" if u and u.get("active", True)
+                    and resolve_tenant(u.get("tenant")) == resolve_tenant(inst.get("tenant"))
+                    else "  (no active account of the tenant -- the binding does nothing)")
+            print(f"  {p['person']:<24} {BINDING_TITLES[p['role']]:<15} since "
+                  f"{str(p.get('since', ''))[:10]} by {p.get('by', '?')}{note}")
+        if pkey:
+            for p in people_of(pinst):
+                print(f"  {p['person']:<24} {BINDING_TITLES[p['role']]:<15} "
+                      f"through the production instance '{pkey}'")
+        return
+    if args.op != "remove" and not args.role:
+        die("name the role: observer|caretaker|owner (Beobachter|Betreuer|Verantwortlich)")
+    who = os.environ.get("SUDO_USER") or "root"
+    try:
+        msg = people_set(args.name, args.op, args.person or "", args.role or "", who=who)
+    except PeopleRefused as e:
+        die(str(e))
+    print(f"'{args.name}': {msg}.")
+
+
 # --- RFC-0141: the site check -------------------------------------------
 
 SITE_CHECK_UNIT = "oaap-site-check"
@@ -30181,6 +30399,9 @@ def _install_from_dir(pkg, args, source):
     # RFC-0141: and whether the node reads it once a week
     if inst and site_check_of(inst):
         reg["instances"][name]["site_check"] = dict(inst["site_check"])
+    # RFC-0143: and who looks after it
+    if inst and people_of(inst):
+        reg["instances"][name]["people"] = [dict(p) for p in people_of(inst)]
     # RFC-0068: an exception is the operator's decision, never the app's.
     if inst and egress_exception(inst):
         reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
@@ -40232,6 +40453,26 @@ def cmd_process_deploys(_args):
             except Exception as e:  # a broken deploy must never kill the worker
                 return False, str(e)
 
+        # RFC-0143 §4: a person who is not an administrator may still be
+        # allowed by a binding on the instance -- `may()`, the one
+        # function. Then the audit names the binding as the role
+        # (`bound:caretaker`); a promotion must also come from the test
+        # instance the production instance was promoted from (a bound
+        # owner never creates or redirects a production instance).
+        bound_why = ""
+        if (action in INSTANCE_ADMIN_ACTIONS and actor and not actor_refusal
+                and act_role not in ("server_admin", "tenant_admin")
+                and inst is not None):
+            _yes, bound_why = may(actor, name, binding_action(action, req), reg)
+            if (_yes and action == "promote"
+                    and str(req.get("from") or "")
+                    != (inst.get("source") or {}).get("promoted_from")):
+                _yes, bound_why = False, ("a bound owner promotes only the test "
+                                          "instance this one was promoted from")
+            if _yes:
+                act_role = "bound:" + bound_why.split(": ", 1)[1]
+                bound_why = ""
+
         # Re-validate on the host — the spool is data, not trust.
         store_src = None
         if actor_refusal:
@@ -40240,14 +40481,17 @@ def cmd_process_deploys(_args):
             msg = update_refusal
         elif cross_tenant:
             msg = cross_tenant_refusal(action, name)
-        elif action in INSTANCE_ADMIN_ACTIONS and act_role not in ("server_admin",
-                                                                   "tenant_admin"):
+        elif (action in INSTANCE_ADMIN_ACTIONS
+              and act_role not in ("server_admin", "tenant_admin")
+              and not act_role.startswith("bound:")):
             msg = (f"'{action}' requires server_admin or the tenant_admin of the "
-                   "instance's tenant")
+                   "instance's tenant" + (f" ({bound_why})" if bound_why.startswith(
+                       ("a binding", "a bound")) else ""))
             audit_tenant("instance.refused", resolve_tenant((inst or {}).get("tenant"))
                          or ensure_default_tenant(), subject=name, result="denied",
                          who=actor or "-", role=act_role or "-",
-                         detail=f"{action}: no administrator")
+                         detail=f"{action}: no administrator"
+                         + (f"; {bound_why}" if bound_why else ""))
         elif action == "install" and req.get("new") and inst is not None:
             # A NEW instance under a name that is taken is a refusal,
             # never a silent update of whoever holds the name.
@@ -42232,6 +42476,17 @@ def cmd_process_deploys(_args):
                     msg = str(e)
                 except subprocess.CalledProcessError as e:
                     msg = (e.stderr or str(e)).strip().splitlines()[-1]
+        elif action == "instance-people":
+            # RFC-0143 §3: the card *Zuständige*; administrators only
+            # (INSTANCE_ADMIN_ACTIONS, never a binding -- D3)
+            try:
+                msg = people_set(name, str(req.get("op") or ""),
+                                 str(req.get("person") or ""),
+                                 str(req.get("role") or ""),
+                                 who=actor or "portal", by_role=act_role or "-")
+                ok = True
+            except PeopleRefused as e:
+                msg = str(e)
         elif action == "rehearsal-extend":
             try:
                 new_date = rehearsal_extend(
@@ -42267,6 +42522,7 @@ def cmd_process_deploys(_args):
                "standby": "portal", "wake": "portal", "maintenance": "portal",
                "login-required": "portal", "ai-fetchers": "portal",
                "site-watch": "portal", "site-check": "portal",
+               "instance-people": "portal",
                "config": "portal", "token": "portal", "resources": "portal",
                "address": "portal", "throttle": "portal", "cohort": "api",
                "remove": "portal", "create": "portal",
@@ -45579,6 +45835,15 @@ def build_parser():
     psw.add_argument("name")
     psw.add_argument("switch", choices=["on", "off"])
     psw.set_defaults(fn=cmd_site_watch)
+    ppl = sub.add_parser("people",
+                         help="who looks after an instance: bind a person of the "
+                              "tenant as observer, caretaker or owner (RFC-0143)")
+    ppl.add_argument("name")
+    ppl.add_argument("op", nargs="?", choices=["add", "set", "remove"])
+    ppl.add_argument("person", nargs="?")
+    ppl.add_argument("role", nargs="?",
+                     help="observer|caretaker|owner (Beobachter|Betreuer|Verantwortlich)")
+    ppl.set_defaults(fn=cmd_people)
     psc = sub.add_parser("site-check",
                          help="the weekly site check of a production instance: "
                               "Sicherheit, Auffindbarkeit, Tempo, read from outside "
