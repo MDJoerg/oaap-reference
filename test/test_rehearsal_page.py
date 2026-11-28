@@ -162,6 +162,20 @@ ok("ein unlesbarer Stempel erfindet kein Alter",
    "lieber nichts sagen als etwas Falsches")
 
 print("")
+# page() setzt diese immer (_mode_view, _care_view, _image_view); ohne sie
+# bricht die Vorlage ab, bevor die Karte geprüft wird (seit 0.1.397 rot).
+PAGE_ALWAYS = dict(
+    mode={"state": "", "maintenance": False,
+          "ai": {"level": 0, "title": "", "since": "", "by": "", "reason": "",
+                 "names": [], "choices": []},
+          "watch": {"on": False, "since": "", "by": "", "production": True,
+                    "google_days": 14},
+          "check": {"on": False, "since": "", "by": ""}},
+    care={"known": False, "held": None, "plan_text": "", "overridden": False,
+          "default_days": 7, "max_days": 30, "today": "2026-11-28",
+          "max_day": "2026-12-28"},
+    imgcare={"known": False, "services": [], "state": ""})
+
 print("Die Karte auf der Seite")
 
 html = BODY.render(
@@ -178,7 +192,7 @@ html = BODY.render(
            endpoints=[], node_exposed=False, can_export=True,
            throttle=None, throttle_limit=300, throttle_window=60,
            throttle_on=True, rehearsal=None, rehearsal_note="",
-           rehearse=offer),
+           rehearse=offer, **PAGE_ALWAYS),
     tabs=iv.TABS, tab="deployment", purge_wanted=False, rename_wanted="",
     msg=None, error=None)
 
@@ -223,7 +237,7 @@ html2 = BODY.render(
            endpoints=[], node_exposed=False, can_export=True,
            throttle=None, throttle_limit=300, throttle_window=60,
            throttle_on=True, rehearsal=None, rehearsal_note="",
-           rehearse=ohne_code),
+           rehearse=ohne_code, **PAGE_ALWAYS),
     tabs=iv.TABS, tab="deployment", purge_wanted=False, rename_wanted="",
     msg=None, error=None)
 ok("ohne Testinstanz kein Formular",
@@ -246,7 +260,7 @@ html3 = BODY.render(
            endpoints=[], node_exposed=False, can_export=True,
            throttle=None, throttle_limit=300, throttle_window=60,
            throttle_on=True, rehearsal=None, rehearsal_note="",
-           rehearse=ohne_archiv),
+           rehearse=ohne_archiv, **PAGE_ALWAYS),
     tabs=iv.TABS, tab="deployment", purge_wanted=False, rename_wanted="",
     msg=None, error=None)
 ok("ohne Sicherung kein Formular",
@@ -279,7 +293,7 @@ html4 = BODY.render(
            can_export=True, throttle=None, throttle_limit=300,
            throttle_window=60, throttle_on=True,
            rehearsal=rv, rehearsal_note=iv.rehearsal_note(rv),
-           rehearse=None),
+           rehearse=None, **PAGE_ALWAYS),
     tabs=iv.TABS, tab="deployment", purge_wanted=False, rename_wanted="",
     msg=None, error=None)
 
