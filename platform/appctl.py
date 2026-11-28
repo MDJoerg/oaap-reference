@@ -224,6 +224,24 @@ SPOOL_CLAIMS = os.path.join(SPOOL_DIR, "claims")
 SPOOL_ACTIONS_WITHOUT_ACTOR = frozenset({"redeploy", "announce", "artifact",
                                          "node", "tenant-request-submit",
                                          "fleet-pair-public"})
+# The requests that change an existing instance and that the portal sends
+# only behind `require_instance_admin` (the node's server_admin, or the
+# tenant_admin of THIS instance). Judged here again: RFC-0143 stage 0
+# measured on oaap-test 2026-11-28 that the worker carried out
+# `maintenance on` for an active user with the role `user` -- the
+# portal's check was the only one. A tenant_admin of another tenant is
+# refused by `cross_tenant`; this is the role itself. Not here: `wake`
+# (the waking page lets any visitor wake a sleeping instance) and the
+# requests with their own checks (install, bulk, tenant, ...), among them
+# `access`, `care` and `destination`, which judge the role themselves and
+# file the refusal under their own name (their tests say so).
+INSTANCE_ADMIN_ACTIONS = frozenset({
+    "address", "artifact-export", "artifact-remove", "config",
+    "diagnose-close", "diagnose-logs", "diagnose-open", "endpoint",
+    "envelope", "link", "promote", "rebuild", "rehearsal-extend", "rehearse",
+    "remove", "rename", "restart", "rollback", "throttle", "tile", "token",
+    "visibility", "maintenance", "login-required", "standby", "ai-fetchers",
+    "site-watch", "site-check"})
 # How long one deploy request may take before it is called off. A build
 # that hangs used to block every later deployment for every instance,
 # with nothing anywhere saying so (RFC-0024). A recorded failure is
@@ -40222,6 +40240,14 @@ def cmd_process_deploys(_args):
             msg = update_refusal
         elif cross_tenant:
             msg = cross_tenant_refusal(action, name)
+        elif action in INSTANCE_ADMIN_ACTIONS and act_role not in ("server_admin",
+                                                                   "tenant_admin"):
+            msg = (f"'{action}' requires server_admin or the tenant_admin of the "
+                   "instance's tenant")
+            audit_tenant("instance.refused", resolve_tenant((inst or {}).get("tenant"))
+                         or ensure_default_tenant(), subject=name, result="denied",
+                         who=actor or "-", role=act_role or "-",
+                         detail=f"{action}: no administrator")
         elif action == "install" and req.get("new") and inst is not None:
             # A NEW instance under a name that is taken is a refusal,
             # never a silent update of whoever holds the name.
