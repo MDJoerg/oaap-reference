@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seiten-Check (RFC-0141 Stufe 1, Jörg 28.11.: „Ok i-83“, D1–D7 wie empfohlen).
+"""Seiten-Check (RFC-0141 Stufen 1–3, Jörg 28.11.: „Ok i-83“, D1–D7 wie empfohlen).
 
     Regeln     §3.1 Sicherheit, §3.2 Auffindbarkeit, §3.3 Tempo -- grün, gelb,
                rot und wer behebt (Plattform/Seite), an Beobachtungen ohne Netz
@@ -10,6 +10,11 @@
     Schalter   `site_check` am Satz, nur Produktion, Update übernimmt ihn;
                CLI, Spool, Wochentag aus dem Namen, Knopf höchstens stündlich
     Portal     Karte „Seiten-Check“ im Reiter Seitenstatistik
+    Stufe 2    §3.4 Recht (Impressum, Datenschutz, fremde Server, Cookies),
+               „neu“/„behoben“, Meldung `site.check` nur über „Hinweise zur
+               Webseite“ (öffnet bei neuem Rot, schließt ohne Rot), Wochenbericht
+    Stufe 3    bis zu zehn Unterseiten aus Sitemap und Links: Verweise ins
+               Leere, fehlende Titel, noindex in der Sitemap; Verlauf der Läufe
 
 Aufruf: python3 test/test_site_check.py
 """
@@ -55,8 +60,12 @@ GOOD_PAGE = (b'<!doctype html><html lang="de"><head><title>Verein</title>'
              b'<script type="application/ld+json">{}</script>'
              b'<link rel="stylesheet" href="/app.3f9a1c2e.css">'
              b'<script src="/app.7b2d9e41.js"></script>'
-             b'<script src="https://fonts.googleapis.com/x.js"></script>'
-             b'</head><body><img src="/logo.png"></body></html>')
+             b'</head><body><img src="/logo.png">'
+             b'<footer><a href="/impressum">Impressum</a> <a href="/datenschutz">Datenschutz</a>'
+             b'<a href="#oben">nach oben</a><a href="mailto:x@example.org">Mail</a></footer>'
+             b'</body></html>')
+SUB_PAGE = b'<html lang="de"><head><title>Unterseite</title></head><body>x</body></html>'
+
 GOOD_HDR = {"content-type": "text/html; charset=utf-8", "content-encoding": "gzip",
             "strict-transport-security": "max-age=31536000",
             "x-content-type-options": "nosniff", "referrer-policy": "strict-origin",
@@ -68,8 +77,9 @@ CACHED = {"cache-control": "public, max-age=31536000, immutable", "content-encod
 class FakeProbe:
     """Answers from a table; counts and records what was asked."""
 
-    def __init__(self, table, cert=(60, "TLSv1.3", ""), old="refused", v6="none"):
+    def __init__(self, table, cert=(60, "TLSv1.3", ""), old="refused", v6="none", cookies=()):
         self.table, self._cert, self._old, self._v6 = table, cert, old, v6
+        self._cookies = list(cookies)
         self.requests, self.bytes, self.asked = 0, 0, []
 
     def get(self, url, limit=sc.MAX_BYTES, method="GET"):
@@ -79,7 +89,7 @@ class FakeProbe:
         raw = len(body)
         self.bytes += raw
         return {"status": status, "h": dict(h), "raw": raw, "body": body, "ttfb": 0.1,
-                "big": False, "cookies": []}
+                "big": False, "cookies": self._cookies if url == f"https://{HOST}/" else []}
 
     def cert(self, host):
         return self._cert
@@ -104,6 +114,8 @@ def good_table():
         b + "app.7b2d9e41.js": (200, dict(CACHED, **{"content-type": "text/javascript"}), b"x" * 2000),
         b + "logo.png": (200, {"content-type": "image/png", "cache-control": "max-age=3600"},
                          b"p" * 1000),
+        b + "impressum": (200, {"content-type": "text/html"}, SUB_PAGE),
+        b + "datenschutz": (200, {"content-type": "text/html"}, SUB_PAGE),
     }
 
 
@@ -113,8 +125,8 @@ obs = sc.collect(HOST, [], probe=fp)
 res = sc.result_of(obs, {"instance": "web", "compress": True, "headers": True})
 ok("keine Punkte, alles grün", not res["findings"]
    and set(res["lights"].values()) == {"green"}, res["findings"])
-ok("fremder Host wird nie gelesen",
-   not any("googleapis" in u for _m, u in fp.asked), fp.asked)
+ok("Anker, Mail-Links und Sprungmarken werden nicht als Unterseite gelesen",
+   not any("#" in u or "mailto" in u for _m, u in fp.asked), fp.asked)
 ok("Zahlen behalten, kein Text der Seite", res["n"]["requests"] == fp.requests
    and "Verein" not in json.dumps(res) and "body" not in json.dumps(obs), res["n"])
 ok("Ziel steht im Ergebnis", res["host"] == HOST)
@@ -225,8 +237,12 @@ f, _o, _p = run(t)
 ok("Startseite 404: ein Punkt dafür, keine Seitenregeln auf der Fehlerseite",
    "start.status" in f and not any(k in f for k in ("seo.title", "seo.canonical", "seo.desc")), sorted(f))
 t[f"https://{HOST}/"] = (404, dict(GOOD_HDR, server="oaap-wegweiser/0.6.2"), b"<html></html>")
-f, _o, _p = run(t)
+f, o404, _p = run(t)
 ok("Header zählen auch auf der Fehlerseite (Server mit Version)", "hdr.version" in f, sorted(f))
+r404 = sc.result_of(o404)
+ok("Startseite 404: Recht grau mit Hinweis, nie grün (wegweiser auf oaap-test)",
+   r404["lights"]["Recht"] == "grey" and any("Recht nicht geprüft" in n for n in r404["notes"]),
+   (r404["lights"], r404["notes"]))
 t = good_table()
 t["https://www.verein.example.org/"] = (200, GOOD_HDR, GOOD_PAGE)
 f, _o, _p = run(t, aliases=["www.verein.example.org"])
@@ -261,6 +277,36 @@ ok("Umleitung auf fremden Namen: nicht verfolgt, gelber Punkt",
    and not any("login.example.net" in u for _m, u in p.asked))
 
 print("\nTempo (§3.3)")
+
+
+class SlowFirst(FakeProbe):
+    """The first answer of the start page slow, every later one fast
+    (oaap-test: a new name, the gateway still fetching its certificate)."""
+
+    def __init__(self, table, slow=8.2, second=0.03, **kw):
+        super().__init__(table, **kw)
+        self.slow, self.second, self.n_start = slow, second, 0
+
+    def get(self, url, limit=sc.MAX_BYTES, method="GET"):
+        r = super().get(url, limit, method)
+        if url == f"https://{HOST}/":
+            self.n_start += 1
+            r["ttfb"] = self.slow if self.n_start == 1 else self.second
+        return r
+
+
+sp = SlowFirst(good_table())
+o = sc.collect(HOST, [], probe=sp)
+f = ids(sc.evaluate(o, {"instance": "web"}))
+ok("langsames erstes Byte: einmal nachgemessen, der bessere Wert zählt (kein Fehlalarm)",
+   "speed.ttfb" not in f and o["ttfb"] == 0.03 and o["ttfb_first"] == 8.2 and sp.n_start == 2, o)
+sp = SlowFirst(good_table(), slow=4.0, second=3.5)
+o = sc.collect(HOST, [], probe=sp)
+f = ids(sc.evaluate(o, {"instance": "web"}))
+ok("bleibt langsam: rot", f.get("speed.ttfb", {}).get("level") == "red", f.get("speed.ttfb"))
+fp_ = FakeProbe(good_table())
+sc.collect(HOST, [], probe=fp_)
+ok("schnelle Seite: keine zweite Anfrage", [u for _m, u in fp_.asked].count(f"https://{HOST}/") == 1)
 many = (b'<html lang="de"><head><title>x</title></head><body>'
         + b"".join(b'<img src="/b%d.png">' % i for i in range(45)) + b"</body></html>")
 t = good_table()
@@ -314,7 +360,8 @@ ok("nicht erreichbar: grau, nicht rot", r0["grey"] and not r0["findings"]
    and set(r0["lights"].values()) == {"grey"}, r0)
 lt = sc.lights([{"area": "Tempo", "level": "yellow"}, {"area": "Tempo", "level": "red"},
                 {"area": "Sicherheit", "level": "yellow"}])
-ok("Ampel: rot schlägt gelb", lt == {"Sicherheit": "yellow", "Auffindbarkeit": "green", "Tempo": "red"}, lt)
+ok("Ampel: rot schlägt gelb", lt == {"Sicherheit": "yellow", "Auffindbarkeit": "green", "Tempo": "red",
+                                    "Recht": "green"}, lt)
 
 print("\nF1: Gruppen")
 t = good_table()
@@ -358,6 +405,149 @@ ok("site_stats: Automat „Seiten-Check (OAAP)“, Art other",
    ss.bot_of(ua) == "Seiten-Check (OAAP)" and ss.BOT_KIND["Seiten-Check (OAAP)"] == "other")
 FF = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
 ok("ein Browser bleibt ein Besuch", ss.bot_of(FF) == "")
+
+print("\nRecht (§3.4, Stufe 2)")
+t = good_table()
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(
+    b"</head>", b'<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto">'
+                b'<script src="https://www.googletagmanager.com/gtag/js"></script>'
+                b'<link rel="icon" href="https://cdn.verein.example.org/i.png"></head>'))
+f, o, p = run(t)
+ok("fremde Server: gelb, Seite, Google Fonts vorn, Abmahnsatz",
+   f.get("law.foreign", {}).get("level") == "yellow" and f["law.foreign"]["fix"] == "seite"
+   and f["law.foreign"]["found"].index("fonts.googleapis.com")
+   < f["law.foreign"]["found"].index("googletagmanager") and "2022" in f["law.foreign"]["why"],
+   f.get("law.foreign"))
+ok("eigene Unterdomain zählt nicht als fremd", "cdn.verein" not in f["law.foreign"]["found"])
+ok("fremde Server werden nie gelesen",
+   not any(h in u for _m, u in p.asked for h in ("googleapis", "googletagmanager", "cdn.verein")),
+   p.asked)
+t = good_table()
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(b"</head>",
+                         b"<style>@import url(https://fonts.googleapis.com/css?family=X);</style></head>"))
+f, _o, _p = run(t)
+ok("Google Fonts per @import im Style erkannt", "fonts.googleapis.com" in f.get("law.foreign", {})
+   .get("found", ""), f.get("law.foreign"))
+t = good_table()
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(b'<a href="/impressum">Impressum</a>', b"")
+                         .replace(b'<a href="/datenschutz">Datenschutz</a>', b""))
+f, _o, _p = run(t)
+ok("ohne Impressum und Datenschutz: zwei gelbe, Seite",
+   f.get("law.imprint", {}).get("level") == "yellow" and f.get("law.privacy", {}).get("fix") == "seite")
+t = good_table()
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(
+    b'<a href="/impressum">Impressum</a>', b'<a href="/kontakt/legal-notice"><span>Kontakt</span></a>')
+    .replace(b'<a href="/datenschutz">Datenschutz</a>', b'<a href="/p">Privacy <b>Policy</b></a>'))
+f, _o, _p = run(t)
+ok("Impressum am Pfad, Datenschutz am verschachtelten Text erkannt",
+   "law.imprint" not in f and "law.privacy" not in f, sorted(f))
+f, o, _p = run(cookies=["PHPSESSID", "_ga", "_fbp", "XSRF-TOKEN"])
+ok("Cookies: nur nicht-technische als Punkt", "_ga" in f.get("law.cookies", {}).get("found", "")
+   and "_fbp" in f["law.cookies"]["found"] and "PHPSESSID" not in f["law.cookies"]["found"]
+   and "XSRF" not in f["law.cookies"]["found"], f.get("law.cookies"))
+ok("technische Cookies als Hinweis, nie als Punkt",
+   any("PHPSESSID" in n for n in sc.result_of(o)["notes"]))
+f, _o, _p = run(cookies=["session_id", "csrftoken"])
+ok("nur technische Cookies: kein Punkt", "law.cookies" not in f)
+r_ok = sc.result_of(sc.collect(HOST, [], probe=FakeProbe(good_table())))
+ok("gepflegte Seite: Recht grün, vier Ampeln", r_ok["lights"].get("Recht") == "green"
+   and len(r_ok["lights"]) == 4, r_ok["lights"])
+
+print("\nUnterseiten (Stufe 3)")
+t = good_table()
+t[f"https://{HOST}/sitemap.xml"] = (200, {}, (
+    "<urlset>" + "".join(f"<url><loc>https://{HOST}/{x}</loc></url>"
+                         for x in ("", "verein", "termine", "versteckt")) + "</urlset>").encode())
+t[f"https://{HOST}/verein"] = (200, {"content-type": "text/html"}, SUB_PAGE)
+t[f"https://{HOST}/termine"] = (200, {"content-type": "text/html"},
+                                 b"<html><head></head><body>ohne Titel</body></html>")
+t[f"https://{HOST}/versteckt"] = (200, {"content-type": "text/html", "x-robots-tag": "noindex"},
+                                   SUB_PAGE)
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(
+    b"<footer>", b'<nav><a href="/alte-seite">Alt</a><a href="https://verein.example.org/verein#x">V</a>'
+                 b'<a href="https://anderswo.example.net/">fremd</a></nav><footer>'))
+f, o, p = run(t)
+ok("der gepflanzte tote Link wird gefunden: gelb, mit Pfad und Herkunft",
+   f.get("pages.broken", {}).get("level") == "yellow"
+   and "/alte-seite (404, Link der Startseite)" in f["pages.broken"]["found"], f.get("pages.broken"))
+ok("Unterseite ohne Titel: gelb", "/termine" in f.get("pages.title", {}).get("found", ""))
+ok("Sitemap nennt noindex-Seite: gelb", "/versteckt" in f.get("pages.noindex", {}).get("found", ""))
+ok("jede Seite einmal, Sitemap zuerst, fremde Namen nie",
+   [u for _m, u in p.asked].count(f"https://{HOST}/verein") == 1
+   and not any("anderswo" in u for _m, u in p.asked)
+   and o["pages"]["checked"][0]["from"] == "sitemap", o["pages"])
+ok("Startseite nicht doppelt gelesen", [u for _m, u in p.asked].count(f"https://{HOST}/") == 1)
+t[f"https://{HOST}/alte-seite"] = (502, {}, b"")
+f, _o, _p = run(t)
+ok("Unterseite 5xx: rot", f.get("pages.broken", {}).get("level") == "red")
+t = good_table()
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(
+    b"<footer>", b"".join(b'<a href="/s%d">s</a>' % i for i in range(25)) + b"<footer>"))
+for i in range(25):
+    t[f"https://{HOST}/s{i}"] = (200, {"content-type": "text/html"}, SUB_PAGE)
+f, o, p = run(t)
+ok("höchstens zehn Unterseiten, Rest gezählt", len(o["pages"]["checked"]) == sc.MAX_PAGES
+   and o["pages"]["more"] == 27 - sc.MAX_PAGES
+   and sum(1 for _m, u in p.asked if re.search(r"/s\d+$", u)) == sc.MAX_PAGES, o["pages"])
+ok("Hinweis nennt gelesene und übrige Seiten",
+   any("10 weitere Seiten gelesen, 17 nicht" in n for n in sc.result_of(o)["notes"]),
+   sc.result_of(o)["notes"])
+t = good_table()
+t[f"https://{HOST}/"] = (200, GOOD_HDR, GOOD_PAGE.replace(b"<footer>", b'<a href="/weiter">w</a><footer>'))
+t[f"https://{HOST}/weiter"] = (301, {"location": "/neu"}, b"")
+f, o, p = run(t)
+ok("Umleitung einer Unterseite ist kein toter Link, wird nicht verfolgt",
+   "pages.broken" not in f and not any(u.endswith("/neu") for _m, u in p.asked))
+
+print("\nNeu und behoben, Verlauf (§6, Stufe 3)")
+A = {"findings": [{"id": "x", "level": "yellow"}, {"id": "y", "level": "yellow"}], "grey": ""}
+B = {"findings": [{"id": "y", "level": "red"}, {"id": "z", "level": "yellow"}], "grey": ""}
+new, gone = sc.diff(A, B)
+ok("neu: neuer Punkt und Aufstieg zu Rot; behoben: verschwundener", new == {"y", "z"}
+   and [g["id"] for g in gone] == ["x"], (new, gone))
+ok("grauer Lauf vergleicht nichts", sc.diff(A, {"grey": "weg", "findings": []}) == (set(), []))
+ok("ohne Vorlauf nichts neu", sc.diff(None, B) == (set(), []))
+d3 = tempfile.mkdtemp()
+t = good_table()
+r1 = sc.result_of(sc.collect(HOST, [], probe=FakeProbe(t)), now=time.time() - 9000)
+sc.record(d3, r1)
+t[f"https://{HOST}/robots.txt"] = (200, {}, b"User-agent: *\nDisallow: /\n")
+del t[f"https://{HOST}/impressum"]
+r2 = sc.result_of(sc.collect(HOST, [], probe=FakeProbe(t)), now=time.time() - 5000)
+sc.record(d3, r2)
+v3 = sc.view(d3, "web")
+ok("Ansicht: verglichen, Zahl neu", v3["compared"] and v3["new"] == 2, (v3.get("new"), v3.get("rows")))
+ok("Ansicht: Zeilen tragen „neu“", any(not r["group"] and r["f"]["new"]
+                                        and r["f"]["id"] == "seo.robots_block" for r in v3["rows"]))
+sc.record(d3, r1)
+v3 = sc.view(d3, "web")
+ok("Ansicht: behoben nennt die verschwundenen", {f["area"] for f in v3["fixed"]} == {"Auffindbarkeit"}
+   and len(v3["fixed"]) == 2, v3["fixed"])
+h3 = v3["history"]
+ok("Verlauf: ein Balken je Lauf, Rot unten", len(h3) == 3 and h3[1]["red"] == 1
+   and h3[1]["yr"] + h3[1]["hr"] == 40 and h3[1]["yy"] + h3[1]["hy"] == h3[1]["yr"], h3)
+old = dict(r1, lights={a: "green" for a in ("Sicherheit", "Auffindbarkeit", "Tempo")})
+d4 = tempfile.mkdtemp()
+sc.record(d4, old)
+ok("Lauf aus Stufe 1: Recht leer, nicht grün", sc.view(d4, "x")["lights"]["Recht"] == "")
+
+print("\nMeldung site.check (Stufe 2)")
+G = {"findings": [{"id": "a", "level": "yellow", "area": "Tempo", "found": "x"}], "grey": "",
+     "at": "2026-11-28 10:00", "host": HOST}
+R = {"findings": [{"id": "seo.noindex", "level": "red", "area": "Auffindbarkeit",
+                   "found": "Die Startseite sagt `noindex`."}], "grey": "",
+     "at": "2026-11-28 11:00", "host": HOST}
+GREY = {"findings": [], "grey": "nicht erreichbar"}
+ok("neues Rot öffnet", sc.matter([G, R]) is not None and sc.matter([G, R])[0] == "1")
+ok("Text nennt Punkt ohne Backticks und den Reiter", "noindex" in sc.matter([G, R])[1]
+   and "`" not in sc.matter([G, R])[1] and "Seitenstatistik" in sc.matter([G, R])[1])
+ok("erster Lauf schon rot: öffnet", sc.matter([R]) is not None)
+ok("Rot wie im Vorlauf, nicht offen: öffnet nicht", sc.matter([R, R]) is None)
+ok("Rot bleibt, offen: hält", sc.matter([R, R], is_open=True) is not None)
+ok("Lauf ohne Rot: schließt", sc.matter([R, G], is_open=True) is None)
+ok("grauer Lauf hält und öffnet nichts", sc.matter([G, R, GREY], is_open=True) is not None
+   and sc.matter([R, GREY, R]) is None and sc.matter([G, R, GREY]) is not None)
+ok("gelb meldet nie", sc.matter([GREY, G]) is None and sc.matter([]) is None)
 
 print("\nSchalter, CLI, Spool")
 import appctl as m                                            # noqa: E402
@@ -426,6 +616,56 @@ ok("aus: Satz ohne Schalter, Ergebnisse bleiben",
    "site_check" not in m.load_registry()["instances"]["web"]
    and sc.load(m.site_check_dir("web", rec))["runs"])
 
+print("\nMeldung über die Hinweise, Wochenbericht (Stufe 2)")
+import notify                                                 # noqa: E402
+import report                                                 # noqa: E402
+ok("Katalog: site.check, Betrieb, Mandant, Lage", notify.CATALOGUE.get("site.check", {}).get("matter") is True
+   and notify.CATALOGUE["site.check"]["scope"] == "tenant"
+   and notify.CATALOGUE["site.check"]["category"] == "operations", notify.CATALOGUE.get("site.check"))
+ok("Mail führt in den Reiter Seitenstatistik",
+   m.NOTIFY_PAGES.get("site.check") == "/instances/{instanz}?tab=statistik")
+scd = m.site_check_dir("web", rec)
+os.remove(os.path.join(scd, sc.FILE))
+sc.record(scd, dict(G, ts=int(time.time()) - 7200))
+sc.record(scd, dict(R, ts=int(time.time()) - 3600))
+now_dt = notify.now_utc()
+ok("Check aus: keine Lage", "site.check/web" not in (
+   m.site_watch_conditions(now_dt).get(tid) or {}))
+reg = m.load_registry()
+reg["instances"]["web"]["site_check"] = {"on": True, "since": "2026-11-28T10:00:00Z", "by": "joerg"}
+m.save_registry(reg)
+ok("Check an, Hinweise aus: keine Lage", "site.check/web" not in (
+   m.site_watch_conditions(now_dt).get(tid) or {}))
+m.site_watch_set("web", m.load_registry()["instances"]["web"], True, who="joerg")
+cond = (m.site_watch_conditions(now_dt).get(tid) or {}).get("site.check/web")
+ok("beide an: Lage site.check mit Zahl", cond and cond["type"] == "site.check" and cond["kurz"] == "1",
+   cond)
+q1 = m.notify_matters({}, now_dt)
+open1 = (m._notify_state_rw().get("matters") or {}).get(tid) or {}
+ok("Lage geöffnet, eine Mail", "site.check/web" in open1 and q1 >= 1, (q1, list(open1)))
+sc.record(scd, dict(R, ts=int(time.time()) - 60))
+m.notify_matters({}, now_dt)
+ok("Rot bleibt: Lage bleibt offen", "site.check/web" in (
+   (m._notify_state_rw().get("matters") or {}).get(tid) or {}))
+sc.record(scd, dict(G, ts=int(time.time())))
+q2 = m.notify_matters({}, now_dt)
+open2 = (m._notify_state_rw().get("matters") or {}).get(tid) or {}
+ok("Lauf ohne Rot: Lage geschlossen, mit Mail", "site.check/web" not in open2 and q2 >= 1, (q2, list(open2)))
+ok("Check aus: Schließen ohne „Behoben“", 'rec.get("type") == "site.check"' in SRC
+   and "not site_check_of(reg.get(rec.get(\"instanz\")))" in SRC)
+sc.record(scd, dict(R, ts=int(time.time())))
+rep_sc = m._report_sitecheck(m.load_registry())
+ok("Wochenbericht: letzter Lauf je geprüfter Instanz", rep_sc.get("web", {}).get("red") == 1
+   and "probe" not in rep_sc, rep_sc)
+md = report.build([{"day": "2026-11-27", "sitecheck": rep_sc}], ["2026-11-27"], "Test",
+                  scope_is_node=False)
+ok("Wochenbericht: Abschnitt mit vier Ampeln und Zusammenfassung", "## Seiten-Check" in md
+   and "| web |" in md and "Recht" in md and "Seiten-Check: rote Punkte bei web" in md, md)
+md0 = report.build([{"day": "2026-11-27"}], ["2026-11-27"], "Test", scope_is_node=False)
+ok("ohne geprüfte Instanz: kein Abschnitt", "Seiten-Check" not in md0)
+ok("Tageszeile trägt sitecheck nur für den gemessenen Tag",
+   'parts["sitecheck"]' in SRC and "sitecheck_all = _report_sitecheck(reg) if measured_now else {}" in SRC)
+
 print("\nPortal")
 sys.path.insert(0, os.path.join(PLATFORM, "services", "portal"))
 try:
@@ -449,12 +689,34 @@ try:
     html = tpl.render(i={"key": "web", "site": None, "site_days": 7, "mode": mode,
                          "check": sc.view(pd, "web")}, **kw)
     ok("Karte: an, wer, Wochentag, Ampeln", "Seiten-Check" in html and "joerg" in html
-       and "Geprüft wird jeden" in html and "Auffindbarkeit: <strong>rot</strong>" in html, html[-3000:])
+       and "Geprüft wird jeden" in html and "Auffindbarkeit: <strong>rot</strong>" in html
+       and "Recht: <strong>" in html, html[-3000:])
     ok("rot einzeln, gelb gefaltet", "noindex" in html and "<details>" in html
        and "Für Suchmaschinen kaum vorbereitet" in html)
     ok("Knöpfe: Jetzt prüfen, Ausschalten", 'value="run"' in html
        and "Seiten-Check ausschalten" in html and 'action="/instances/web/site-check"' in html)
-    ok("Recht folgt", "Recht: <span class=\"muted\">folgt</span>" in html)
+    ok("Recht: keine Rechtsberatung", "keine Rechtsberatung" in html and "folgt" not in html)
+    ok("Mail-Satz von Stufe 2", "nur bei einem neuen roten Punkt" in html)
+    sc.record(pd, sc.result_of(sc.collect(HOST, [], probe=FakeProbe(good_table())),
+                               {"instance": "web"}, now=time.time() - 3700))
+    t[f"https://{HOST}/robots.txt"] = (200, {}, b"User-agent: *\nDisallow: /\n")
+    sc.record(pd, sc.result_of(sc.collect(HOST, [], probe=FakeProbe(t)), {"instance": "web"},
+                               now=time.time() - 3650))
+    html2 = tpl.render(i={"key": "web", "site": None, "site_days": 7, "mode": mode,
+                          "check": sc.view(pd, "web")}, **kw)
+    ok("Karte: neu markiert, Verlauf als SVG", 'class="sc-new"' in html2 and "<svg" in html2
+       and "Verlauf der letzten 3 Läufe" in html2, html2[-4000:])
+    sc.record(pd, sc.result_of(sc.collect(HOST, [], probe=FakeProbe(good_table())),
+                               {"instance": "web"}, now=time.time() - 3600))
+    html3 = tpl.render(i={"key": "web", "site": None, "site_days": 7, "mode": mode,
+                          "check": sc.view(pd, "web")}, **kw)
+    ok("Karte: behoben", "Seit dem letzten Lauf behoben" in html3 and "alles grün" in html3)
+    dold = tempfile.mkdtemp()
+    sc.record(dold, dict(sc.result_of(sc.collect(HOST, [], probe=FakeProbe(good_table()))),
+                         lights={"Sicherheit": "green", "Auffindbarkeit": "green", "Tempo": "green"}))
+    html4 = tpl.render(i={"key": "web", "site": None, "site_days": 7, "mode": mode,
+                          "check": sc.view(dold, "web")}, **kw)
+    ok("Lauf aus Stufe 1: Recht beim nächsten Lauf", "beim nächsten Lauf" in html4)
     ok("Code als <code>, keine rohen Backticks", "`" not in html[html.index("seiten-check"):])
     html0 = tpl.render(i={"key": "web", "site": None, "site_days": 30,
                           "mode": portal._mode_view({"channel": "production"}),

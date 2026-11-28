@@ -3001,7 +3001,8 @@ NOTIFY_PAGES = {"backup.failed": "/health", "backup.missing": "/health",
                 "node.loss": "/health", "hub.unreachable": "/health",
                 "link.down": "/health", "disk.trend": "/health", "disk.soon": "/health",
                 "site.google": "/instances/{instanz}?tab=statistik",
-                "site.notfound": "/instances/{instanz}?tab=statistik"}
+                "site.notfound": "/instances/{instanz}?tab=statistik",
+                "site.check": "/instances/{instanz}?tab=statistik"}
 
 
 def notify_event(ntype, tid, instanz="", kurz="", text="", op="event", key="", own=False,
@@ -3761,6 +3762,14 @@ def site_watch_conditions(now):
         if nf:
             out.setdefault(tid, {})["site.notfound/" + name] = {
                 "type": "site.notfound", "instanz": name, "kurz": str(nf[0]), "text": nf[1]}
+        # RFC-0141 stage 2: a new red point of the site check -- only where
+        # the check is on too; it closes with the first run without red
+        if site_check_of(reg.get(name)):
+            sc_ = site_check.matter(site_check.load(site_check_dir(name, reg.get(name)))["runs"],
+                                    is_open=("site.check/" + name) in mine)
+            if sc_:
+                out.setdefault(tid, {})["site.check/" + name] = {
+                    "type": "site.check", "instanz": name, "kurz": sc_[0], "text": sc_[1]}
     return out
 
 
@@ -3780,9 +3789,13 @@ def notify_matters(facts=None, now=None):
                 if (op == "close" and rec.get("type") == "instance.down"
                         and rec.get("instanz") not in reg):
                     continue      # removed while down: nothing came back, nothing to mail
-                if (op == "close" and rec.get("type") in ("site.google", "site.notfound")
+                if (op == "close" and rec.get("type") in ("site.google", "site.notfound",
+                                                          "site.check")
                         and not site_watch_of(reg.get(rec.get("instanz")))):
                     continue      # switched off (or removed): nobody wants to hear "Behoben"
+                if (op == "close" and rec.get("type") == "site.check"
+                        and not site_check_of(reg.get(rec.get("instanz")))):
+                    continue      # the check switched off: nothing was fixed
                 dauer = ""
                 if op == "close":
                     lasted = notify.matter_duration(rec, now)
@@ -4020,6 +4033,7 @@ def ledger_lines_for_day(day, measured_now):
                  if measured_now else None)
     scan = (_report_json(GUARD_SCAN_FILE) or {}).get("instances") or {} if measured_now else {}
     bytes_t = _tenant_bytes(list(tenants)) if measured_now else None
+    sitecheck_all = _report_sitecheck(reg) if measured_now else {}
     node_run = last_backup_run() or {}
     run_t = report._epoch(node_run.get("finished"))
     node_backup = ({k: node_run.get(k) for k in ("state", "finished", "bytes", "total_seconds",
@@ -4041,6 +4055,10 @@ def ledger_lines_for_day(day, measured_now):
                                 for i, r in scan.items()
                                 if (is_node or inst_tenant.get(i) == tid)
                                 and any(not f.get("allowed") for f in r.get("findings") or [])}
+        if measured_now:
+            # RFC-0141 stage 2: the last site check of each checked instance
+            parts["sitecheck"] = {i: v for i, v in sitecheck_all.items()
+                                  if is_node or inst_tenant.get(i) == tid}
         if is_node:
             parts["metrics"] = report.day_metrics(metric_rows, start, end, metrics._aggregate)
             parts["backup"] = node_backup
@@ -4083,6 +4101,28 @@ def ledger_lines_for_day(day, measured_now):
 
 def _ledger_path(scope):
     return os.path.join(REPORT_LEDGER_DIR, scope + ".jsonl")
+
+
+def _report_sitecheck(reg):
+    """RFC-0141 stage 2: {instance: {at, lights, red, yellow}} of the
+    switched-on production instances' last run -- the weekly report's line."""
+    out = {}
+    for name, inst in sorted((reg.get("instances") or {}).items()):
+        if not site_check_of(inst) or not _site_check_production(inst):
+            continue
+        try:
+            runs = site_check.load(site_check_dir(name, inst))["runs"]
+        except Exception:                           # noqa: BLE001  (a report must not fail on one site)
+            continue
+        if not runs:
+            continue
+        r = runs[-1]
+        fs = r.get("findings") or []
+        out[name] = {"at": r.get("at", ""), "host": r.get("host", ""),
+                     "lights": r.get("lights") or {}, "grey": bool(r.get("grey")),
+                     "red": sum(1 for f in fs if f["level"] == "red"),
+                     "yellow": sum(1 for f in fs if f["level"] != "red")}
+    return out
 
 
 def ledger_write_day(day, measured_now):
@@ -15879,6 +15919,11 @@ def space_print(rows, cache, dk, state):
     for r in rows:
         if r["cls"] in ("B", "C"):
             print(f"    {r['cls']} {r['ref']:<60} {space.fmt_bytes(r['size']):>9}  {r['why']}")
+    w = space.waiting(rows)
+    if w["count"]:
+        print(f"  Warten auf die Frist von {space.GRACE_DAYS} Tagen (ohne Instanz): {w['count']} "
+              f"Image(s), bis {space.fmt_bytes(w['bytes'])} -- in C frühestens ab "
+              f"{space.now_iso(w['from'])[:10]}")
     fr = [r for r in rows if r["cls"] == "D"]
     if fr:
         print("  Fremde Images -- nur einzeln: sudo oaap node care space rmi <image>")

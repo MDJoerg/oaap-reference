@@ -143,12 +143,18 @@ ok("die Uhr läuft ab dem ersten Lauf", seen.get("oaap-inst/gone:5") == NOW
    and seen.get("oaap-prev/gone:prev") == NOW)
 ok("ein junges Image ohne Instanz: jünger als ein Tag, nicht einmal in der Uhr",
    cls["oaap-inst/fresh-try:1"] == "keep" and "oaap-inst/fresh-try:1" not in seen)
+w0 = space.waiting(rows)
+ok("wartende Images werden gezählt, mit dem Tag, ab dem sie C sind (oaap-test 28.11.: "
+   "118 Images, Summe sagte nur „C 0“)",
+   w0["count"] >= 2 and w0["bytes"] > 0 and w0["from"] == NOW + space.GRACE_DAYS * DAY, w0)
 rows6, seen6 = space.plan(IMAGES, USED, REG, platform_refs={"caddy:2"}, seen=seen, now=NOW + 6 * DAY)
 c6 = {r["ref"]: r["cls"] for r in rows6}
 ok("nach 6 Tagen: noch da", c6["oaap-inst/gone:5"] == "keep" and seen6["oaap-inst/gone:5"] == NOW)
 rows8, seen8 = space.plan(IMAGES, USED, REG, platform_refs={"caddy:2"}, seen=seen6, now=NOW + 8 * DAY)
 c8 = {r["ref"]: r["cls"] for r in rows8}
 ok("nach 8 Tagen: C", c8["oaap-inst/gone:5"] == "C" and c8["oaap-prev/gone:prev"] == "C")
+ok("nach 8 Tagen wartet nichts mehr aus dem ersten Lauf",
+   not any(r["ref"] == "oaap-inst/gone:5" and r.get("grace") for r in rows8))
 ok("nach 8 Tagen: die damals gebaute 0.2.1 (nie in Betrieb gegangen) ist neuer als die laufende "
    "-- kein Rückweg, B; die vorige 0.1.9 bleibt",
    c8["oaap-inst/wt:0.2.1"] == "B" and c8["oaap-inst/wt:0.1.9"] == "keep", c8)
@@ -356,6 +362,7 @@ TMP = tempfile.mkdtemp(prefix="oaap-space-page-")
 VF = os.path.join(TMP, "space.json")
 portal.SPACE_VIEW_FILE = VF
 v["last"] = {"when": "2026-11-26T03:10:00Z", "cause": "nightly", "text": "12,0 GB freigegeben"}
+v["waiting"] = {"count": 118, "bytes": 25e9, "from": "2026-12-03"}
 v["disk"] = {"percent": 58.3, "free": 80e9, "total": 200e9}
 _json.dump(v, open(VF, "w"))
 mg = portal.management_api
@@ -376,6 +383,8 @@ ok("der Betreiber am Knoten: Platte, Klassen, fremde Images mit Knopf, letzter L
    r.status_code == 200 and "58 %" in t and "Ältere Versionen" in t
    and "sapse/abap-cloud-developer-trial:2023" in t and 'action="/platz/rmi"' in t
    and "nachts" in t and "12,0 GB freigegeben" in t and 'href="/platz"' in t, t[-1500:])
+ok("wartende Images stehen auf der Seite, mit dem Tag",
+   "118 Image(s) ohne Instanz" in t and "frühestens ab 2026-12-03" in t, t[-2500:])
 ok("ein Image der Plattform oder in Benutzung hat keinen Knopf",
    'value="caddy:2"' not in t and 'value="open-webui:main"' not in t
    and 'value="oaap-inst/wt:0.2.0"' not in t)

@@ -88,6 +88,12 @@ CATALOGUE = {
     "site.notfound": {"category": "operations", "scope": "tenant", "matter": True,
                       "title": "Auf einer Webseite steigen die Fehler „nicht gefunden“ (404)",
                       "subject": "[{mandant}] {instanz}: mehr 404-Fehler ({kurz} in 7 Tagen)"},
+    # RFC-0141 stage 2: the site check found a red point that was not red
+    # the run before -- only where both "Seiten-Check" and "Hinweise zur
+    # Webseite" are on; closes with the first run without red.
+    "site.check": {"category": "operations", "scope": "tenant", "matter": True,
+                   "title": "Der Seiten-Check fand einen roten Punkt",
+                   "subject": "[{mandant}] {instanz}: Seiten-Check rot ({kurz})"},
     # Stage 2 (RFC-0080 §4.2)
     "instance.down": {"category": "health", "scope": "tenant", "matter": True,
                       "title": "Eine Produktiv-Instanz ist ausgefallen",

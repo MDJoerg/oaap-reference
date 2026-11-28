@@ -4526,7 +4526,7 @@ INSTANCE_EDIT_BODY = """
 {% set scm = i.mode.check or {} %}{% set ck = i.check or {} %}
 <div class="card" id="seiten-check">
   <h2>Seiten-Check</h2>
-  {# RFC-0141 Stufe 1 (Jörg 28.11.: „Ok i-83“, D1–D7 wie empfohlen) #}
+  {# RFC-0141 Stufen 1–3 (Jörg 28.11.: „Ok i-83“, D1–D7 wie empfohlen) #}
   <style>.sc-lights{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}
     .sc-light{display:flex;align-items:center;gap:.4rem;border:1px solid var(--oaap-border, #ddd);border-radius:999px;padding:.2rem .7rem;font-size:.9rem}
     .sc-dot{width:.8rem;height:.8rem;border-radius:50%;display:inline-block}
@@ -4536,14 +4536,18 @@ INSTANCE_EDIT_BODY = """
     .sc-rows .sc-why,.sc-rows .sc-todo{display:block;font-size:.88rem}
     .sc-rows .sc-why{color:var(--oaap-muted)}
     .sc-tag{font-size:.75rem;border:1px solid var(--oaap-border, #ddd);border-radius:4px;padding:0 .3rem;margin-left:.3rem;white-space:nowrap}
-    .sc-rows details ul{margin:.3rem 0 0 .2rem;padding-left:1rem}</style>
+    .sc-rows details ul{margin:.3rem 0 0 .2rem;padding-left:1rem}
+    .sc-new{font-size:.75rem;background:#1565c0;color:#fff;border-radius:4px;padding:0 .3rem;margin-left:.3rem}
+    .sc-hist{display:block;margin:.5rem 0 .2rem}
+    .sc-hist .r{fill:#c62828}.sc-hist .y{fill:#f2b600}.sc-hist .g{fill:#9e9e9e}</style>
   <p style="margin:.2rem 0 .5rem">{% if scm.on %}<strong>An</strong>{% if scm.since %}, seit
      {{ scm.since }} UTC{% endif %}{% if scm.by %} (gesetzt von <strong>{{ scm.by }}</strong>){% endif %}.
      Geprüft wird jeden <strong>{{ ck.weekday }}</strong>.{% else %}<strong>Aus.</strong>{% endif %}
      Ist es an, liest dieser Knoten einmal pro Woche die öffentliche Startseite so, wie ein
      Browser sie liest — die Seite, ihre eigenen Skripte, Styles und Bilder, <code>robots.txt</code>
-     und Sitemap, ein paar Dutzend Anfragen nacheinander. Er probiert nichts aus, ruft keine
-     geheimen Pfade auf und speichert keinen Text der Seite.</p>
+     und Sitemap, dazu bis zu zehn Unterseiten aus Sitemap und Links, ein paar Dutzend Anfragen
+     nacheinander. Er probiert nichts aus, ruft keine geheimen Pfade auf und speichert keinen
+     Text der Seite.</p>
   {% if not sw.production %}<p class="muted" style="margin:0 0 .5rem"><strong>Diese Instanz
      ist eine Test-Instanz</strong> — geprüft werden nur Produktivinstanzen.</p>{% endif %}
   {% set last = ck.last %}
@@ -4553,33 +4557,48 @@ INSTANCE_EDIT_BODY = """
      <code>{{ last.host }}</code> — {{ last.n.requests }} Anfragen, {{ last.n.seconds }} s,
      {{ last.n.kb }} KB.</p>
   <div class="sc-lights">
-    {% for area, lv in last.lights.items() %}<span class="sc-light"><span class="sc-dot sc-{{ lv }}"
-      aria-hidden="true"></span>{{ area }}: <strong>{{ {'red': 'rot', 'yellow': 'gelb', 'green': 'grün', 'grey': 'grau'}[lv] }}</strong></span>{% endfor %}
-    <span class="sc-light"><span class="sc-dot sc-grey" aria-hidden="true"></span>Recht: <span class="muted">folgt</span></span>
+    {% for area, lv in (ck.lights or last.lights).items() %}{% if lv %}<span class="sc-light"><span class="sc-dot sc-{{ lv }}"
+      aria-hidden="true"></span>{{ area }}: <strong>{{ {'red': 'rot', 'yellow': 'gelb', 'green': 'grün', 'grey': 'grau'}[lv] }}</strong></span>{% else %}<span class="sc-light"><span class="sc-dot sc-grey"
+      aria-hidden="true"></span>{{ area }}: <span class="muted">beim nächsten Lauf</span></span>{% endif %}{% endfor %}
   </div>
+  {% if ck.history and ck.history|length > 1 %}
+  <svg class="sc-hist" width="{{ ck.history|length * 14 }}" height="44" role="img"
+       aria-label="Verlauf der letzten {{ ck.history|length }} Läufe: rote und gelbe Punkte je Lauf">
+    {% for h in ck.history %}<g><title>{{ h.at }} UTC: {% if h.grey %}nicht erreichbar{% else %}{{ h.red }} rot, {{ h.yellow }} gelb{% endif %}</title>
+      {% if h.grey %}<rect class="g" x="{{ h.x }}" y="36" width="10" height="4"></rect>{% else %}
+      {% if h.hy %}<rect class="y" x="{{ h.x }}" y="{{ h.yy }}" width="10" height="{{ h.hy }}"></rect>{% endif %}
+      {% if h.hr %}<rect class="r" x="{{ h.x }}" y="{{ h.yr }}" width="10" height="{{ h.hr }}"></rect>{% endif %}
+      {% if not h.hr and not h.hy %}<rect class="g" x="{{ h.x }}" y="39" width="10" height="1"></rect>{% endif %}{% endif %}</g>{% endfor %}
+  </svg>
+  <p class="muted" style="margin:0 0 .4rem;font-size:.85rem">Verlauf der letzten {{ ck.history|length }} Läufe — je Lauf ein Balken, rot unten, gelb darüber.</p>
+  {% endif %}
   {% if last.grey %}<p><strong>{{ last.grey }}</strong> Das ist kein Fehler der Seite: Der Weg
      von diesem Knoten zum öffentlichen Namen und zurück ist versperrt (Rückschleife am Router).</p>
-  {% elif not ck.rows %}<p>Keine Punkte — in den drei Bereichen ist alles grün.</p>
+  {% elif not ck.rows %}<p>Keine Punkte — in allen Bereichen ist alles grün.</p>
   {% else %}
   <p style="margin:.2rem 0 .3rem">{% if ck.red %}<strong>{{ ck.red }} roter Punkt{{ 'e' if ck.red != 1 }}</strong> — das schadet
      jetzt. {% endif %}{{ ck.yellow }} gelbe{{ 'r' if ck.yellow == 1 }} Punkt{{ 'e' if ck.yellow != 1 }} — lohnt sich.
-     <span class="muted">„Plattform“ heißt: ein Schalter hier im Portal; „Seite“: die Autorin oder der Autor der Seite.</span></p>
+     {% if ck.compared and ck.new %}<strong>{{ ck.new }} neu</strong> seit dem letzten Lauf. {% endif %}
+     <span class="muted">„Plattform“ heißt: ein Schalter hier im Portal; „Seite“: die Autorin oder der Autor der Seite.
+     Recht: Hinweise, keine Rechtsberatung.</span></p>
   <ul class="sc-rows">
     {% for row in ck.rows %}
     {% if row.group %}
     <li><details><summary><span class="sc-dot sc-yellow" aria-hidden="true"></span>
-      <strong>{{ row.title }}</strong> <span class="sc-tag">{{ row.area }}</span><span class="sc-tag">{{ {'plattform': 'Plattform', 'seite': 'Seite'}.get(row.fix, '—') }}</span></summary>
-      <ul>{% for f in row.points %}<li>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %} <span class="muted">— {% for t, c in f.todo_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}</span></li>{% endfor %}</ul>
+      <strong>{{ row.title }}</strong> <span class="sc-tag">{{ row.area }}</span><span class="sc-tag">{{ {'plattform': 'Plattform', 'seite': 'Seite'}.get(row.fix, '—') }}</span>{% if ck.compared and row.new %}<span class="sc-new">{{ row.new }} neu</span>{% endif %}</summary>
+      <ul>{% for f in row.points %}<li>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}{% if ck.compared and f.new %}<span class="sc-new">neu</span>{% endif %} <span class="muted">— {% for t, c in f.todo_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}</span></li>{% endfor %}</ul>
     </details></li>
     {% else %}{% set f = row.f %}
     <li><span class="sc-dot sc-{{ f.level }}" aria-hidden="true"></span>
-      <strong>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}</strong> <span class="sc-tag">{{ f.area }}</span><span class="sc-tag">{{ {'plattform': 'Plattform', 'seite': 'Seite'}.get(f.fix, '—') }}</span>
+      <strong>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}</strong> <span class="sc-tag">{{ f.area }}</span><span class="sc-tag">{{ {'plattform': 'Plattform', 'seite': 'Seite'}.get(f.fix, '—') }}</span>{% if ck.compared and f.new %}<span class="sc-new">neu</span>{% endif %}
       <span class="sc-why">{{ f.why }}</span>
       <span class="sc-todo">Was tun: {% for t, c in f.todo_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}{% if f.link %} <a href="/instances/{{ i.key }}?tab={{ f.link }}">Zum Reiter</a>{% endif %}</span></li>
     {% endif %}
     {% endfor %}
   </ul>
   {% endif %}
+  {% if ck.compared and ck.fixed %}<p style="margin:.5rem 0 .2rem"><strong>Seit dem letzten Lauf behoben:</strong></p>
+  <ul style="margin:0 0 .3rem">{% for f in ck.fixed %}<li>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %} <span class="muted">({{ f.area }})</span></li>{% endfor %}</ul>{% endif %}
   {% if last.notes %}<p class="muted" style="margin:.4rem 0 0">{{ last.notes|join(" ") }}</p>{% endif %}
   {% elif scm.on %}<p class="muted">Noch kein Ergebnis — der erste Lauf dauert etwa eine Minute.</p>
   {% endif %}
@@ -4600,9 +4619,10 @@ INSTANCE_EDIT_BODY = """
   </div>
   {% if scm.on and ck.button_wait %}<p class="muted" style="margin:.3rem 0 0">„Jetzt prüfen“ geht
      wieder in {{ ck.button_wait }} Minute{{ 'n' if ck.button_wait != 1 }} — höchstens einmal pro Stunde.</p>{% endif %}
-  <p class="muted" style="margin:.5rem 0 0">Mails gibt es keine von hier; rote Punkte melden später
-     die „Hinweise zur Webseite“ (RFC-0141 Stufe 2). In der Seitenstatistik zählt der Check als
-     Automat „Seiten-Check (OAAP)“, nie als Besuch.</p>
+  <p class="muted" style="margin:.5rem 0 0">Eine Mail gibt es nur, wenn auch die „Hinweise zur
+     Webseite“ an sind, und nur bei einem neuen roten Punkt — eine, wenn er auftaucht, eine, wenn
+     ein Lauf ohne Rot ihn beendet. Gelbe Punkte stehen hier und im Wochenbericht. In der
+     Seitenstatistik zählt der Check als Automat „Seiten-Check (OAAP)“, nie als Besuch.</p>
 </div>
 {% if s %}
 <div class="st-grid">
@@ -16876,6 +16896,8 @@ diese Seite nie an.{% if measured %} Stand: {{ measured }}.{% endif %}</p>
 eine Obergrenze. Was wirklich frei wurde, sagt die Platte vorher und nachher.
 Es bleiben je Instanz das laufende Image, der Vorgänger eines Neubaus und die vorige
 Version; ein Image ohne Instanz geht erst nach 7 Tagen.</p>
+{% if waiting and waiting.count %}<p><b>{{ waiting.count }} Image(s) ohne Instanz</b> (bis {{ waiting.size }})
+warten noch auf diese Frist — in Klasse C frühestens ab {{ waiting.from }}.</p>{% endif %}
 {% if candidates %}<details><summary>{{ candidates|length }} Image(s) der Klassen B und C</summary>
 <table><tr><th>Klasse</th><th>Image</th><th>Größe</th><th>Warum</th></tr>
 {% for r in candidates %}<tr><td>{{ r.cls }}</td><td><code>{{ r.ref }}</code></td><td>{{ r.size }}</td><td>{{ r.why }}</td></tr>{% endfor %}
@@ -16921,6 +16943,8 @@ def space_page():
                           "size": ("bis " if k != "A" and (cls.get(k) or {}).get("count") else "")
                           + _fmt_gb((cls.get(k) or {}).get("bytes"))} for k in "ABCD"],
                 candidates=[dict(r, size=_fmt_gb(r.get("size"))) for r in v.get("candidates") or []],
+                waiting=dict(v["waiting"], size=_fmt_gb(v["waiting"].get("bytes")))
+                if isinstance(v.get("waiting"), dict) else None,
                 foreign=[dict(r, size=_fmt_gb(r.get("size"))) for r in v.get("foreign") or []],
                 job=_build_job_note(sc[0], sc[1], request.args.get("job", "")),
                 error=request.args.get("err"))

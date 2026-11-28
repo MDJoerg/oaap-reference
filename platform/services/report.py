@@ -207,7 +207,7 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     week = {e["day"]: e for e in lines}
     have = [d for d in week_days if d in week]
     events, mails, brake, backups = [], [], {}, []
-    guarded, exposed = {}, {}
+    guarded, exposed, sitecheck = {}, {}, {}
     foreign = {"locks": 0, "n": 0, "c": set(), "full": False, "names": {}, "days": 0}
     for d in have:
         e = week[d]
@@ -232,6 +232,8 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
             g["days"] += 1
         for inst, paths in (e.get("exposed") or {}).items():
             exposed[inst] = paths
+        for inst, v in (e.get("sitecheck") or {}).items():
+            sitecheck[inst] = v          # the week's last state wins
         fl = e.get("foreign") or {}
         if fl.get("locks"):
             foreign["locks"] += fl["locks"]
@@ -295,6 +297,9 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
     if guarded:
         total = sum(g["count"] for g in guarded.values())
         summary.append(f"{total} Anfragen nach Geheimnisdateien abgewiesen")
+    reds = sorted(i for i, v in sitecheck.items() if v.get("red"))
+    if reds:
+        summary.append("Seiten-Check: rote Punkte bei " + ", ".join(reds) + " (siehe unten)")
     if foreign["locks"]:
         summary.append(f"{foreign['locks']} Sperre" + ("" if foreign["locks"] == 1 else "n")
                        + " nach Anmeldeversuchen auf unbekannte Namen von " + _foreign_clients(foreign)
@@ -376,6 +381,23 @@ def build(lines, week_days, title, scope_is_node=True, history=None, tenant_name
                 out.append(f"| {inst} | {g['count']} | {_clients(g) if g['clients'] else '–'} | {g['days']} |")
             out += ["", "Das Gateway beantwortet Anfragen nach .env, .git/, Schlüsseln, Abzügen u. a. "
                         "selbst mit 404 — die App sieht sie nie.", ""]
+
+    # --- site check (RFC-0141 stage 2)
+    if sitecheck:
+        words = {"red": "rot", "yellow": "gelb", "green": "grün", "grey": "grau", "": "–"}
+        areas = ("Sicherheit", "Auffindbarkeit", "Tempo", "Recht")
+        out += ["## Seiten-Check", "",
+                "| Instanz | geprüft | " + " | ".join(areas) + " | Punkte |",
+                "|---|---|" + "---|" * len(areas) + "---|"]
+        for inst, v in sorted(sitecheck.items()):
+            lt = v.get("lights") or {}
+            pts = ("nicht erreichbar" if v.get("grey") else
+                   (f"{v.get('red', 0)} rot, " if v.get("red") else "") + f"{v.get('yellow', 0)} gelb")
+            out.append(f"| {_cell(inst)} | {_cell(str(v.get('at', ''))[:10])} | "
+                       + " | ".join(words.get(lt.get(a, ""), "–") for a in areas)
+                       + f" | {pts} |")
+        out += ["", "Was zu tun ist, steht im Reiter Seitenstatistik der Instanz. "
+                    "Recht: Hinweise, keine Rechtsberatung.", ""]
 
     # --- measurements
     if scope_is_node:

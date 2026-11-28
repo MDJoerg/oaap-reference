@@ -1,13 +1,17 @@
-"""Site check per production instance (RFC-0141, stage 1).
+"""Site check per production instance (RFC-0141, stages 1-3).
 
 Once a week and on a button the node reads an instance's public start page
 the way a visitor's browser does and compares what it finds with a short
-list of rules: Sicherheit, Auffindbarkeit, Tempo (Recht follows in stage 2).
+list of rules: Sicherheit, Auffindbarkeit, Tempo and -- hints, not legal
+advice -- Recht (stage 2). Stage 3 reads up to ten more pages, from the
+sitemap and the start page's own links, for links that lead nowhere and
+pages without a title; the last twelve runs make a small history.
 
 Reading only (RFC-0141 §2): GET / on the canonical name, following at most
 five redirects on the same host; at most 30 same-origin scripts, styles and
 images it names, each at most 5 MB; /robots.txt; the sitemap's head;
-`http://<canonical>/` and each alias without following. One request at a
+`http://<canonical>/` and each alias without following; up to ten pages
+on the same name (stage 3). One request at a
 time, 200 ms apart, 15 s timeout, an honest User-Agent. No secret paths, no
 forms, no login. What is kept: findings and a few numbers -- never the
 page's text, never a cookie.
@@ -47,13 +51,15 @@ MAX_ASSETS = 30
 MAX_BYTES = 5 * 1024 * 1024
 MAX_SMALL = 64 * 1024             # robots.txt, the sitemap's head
 MAX_REDIRECTS = 5
+MAX_PAGES = 10                    # stage 3: pages beside the start page
 GAP = 0.2                         # seconds between two requests
 TIMEOUT = 15
 RUN_EVERY = 6 * 86400             # the weekly run: not again within six days
 LATE = 8 * 86400                  # ... and on any day once this late
 BUTTON_EVERY = 3600               # "Jetzt prüfen" at most once an hour
 
-AREAS = ("Sicherheit", "Auffindbarkeit", "Tempo")
+AREAS = ("Sicherheit", "Auffindbarkeit", "Tempo", "Recht")
+LAW_NOTE = "Hinweise, keine Rechtsberatung."
 LEVELS = ("red", "yellow")
 LIGHT_TITLES = {"red": "rot", "yellow": "gelb", "green": "grün", "grey": "grau"}
 FIX_TITLES = {"plattform": "Plattform", "seite": "Seite", "": "—"}
@@ -66,7 +72,16 @@ GROUP_TITLES = {
     ("Auffindbarkeit", "seite"): "Für Suchmaschinen kaum vorbereitet",
     ("Sicherheit", "seite"): "Schutzangaben der Seite fehlen",
     ("Tempo", "seite"): "Ladezeit: mehrere Punkte der Seite",
+    ("Recht", "seite"): "Rechtliche Hinweise zur Seite",
 }
+# Stage 2 (§3.4): words in a link's text or path that mean the imprint or
+# the privacy statement; cookie names that look technical.
+IMPRINT_WORDS = ("impressum", "imprint", "legal-notice", "legal notice", "anbieterkennzeichnung")
+PRIVACY_WORDS = ("datenschutz", "privacy", "data-protection", "data protection", "dsgvo")
+TECH_COOKIE = re.compile(r"sess|csrf|xsrf|token|lang|locale|consent|cookie_?notice|cookieyes|"
+                         r"borlabs|cmplz|^__host-|^__secure-|load.?balanc|^route$|^awsalb|^srv",
+                         re.I)
+GOOGLE_FONTS = ("fonts.googleapis.com", "fonts.gstatic.com")
 
 
 def user_agent(ext_host=""):
@@ -252,6 +267,7 @@ class Page(html.parser.HTMLParser):
         self.meta, self.links, self.scripts, self.styles = {}, [], [], []
         self.imgs, self.iframes = [], []
         self.lang, self.canonical, self.ld, self.picture = None, None, 0, 0
+        self.anchors, self._a = [], None      # [(href, text)] -- text only to match words
 
     def handle_starttag(self, tag, attrs):
         a = {k: (v or "") for k, v in attrs}
@@ -284,16 +300,50 @@ class Page(html.parser.HTMLParser):
             self.imgs.append((a.get("src") or "", self.picture > 0))
         elif tag == "iframe":
             self.iframes.append(a.get("src", ""))
+        elif tag == "a" and a.get("href"):
+            if self._a is not None:
+                self.anchors.append(tuple(self._a))
+            self._a = [a["href"], (a.get("title") or a.get("aria-label") or "")]
 
     def handle_endtag(self, tag):
         if tag == "title":
             self.in_title = False
         elif tag == "picture":
             self.picture = max(0, self.picture - 1)
+        elif tag == "a" and self._a is not None:
+            self.anchors.append((self._a[0], self._a[1][:200]))
+            self._a = None
 
     def handle_data(self, data):
         if self.in_title:
             self.title += data
+        if self._a is not None and len(self._a[1]) < 200:
+            self._a[1] += " " + data
+
+    def close(self):
+        super().close()
+        if self._a is not None:
+            self.anchors.append((self._a[0], self._a[1][:200]))
+            self._a = None
+
+
+def _site(host):
+    """The name a host belongs to, roughly: its last two labels
+    (www.verein.de and cdn.verein.de are the site's own; fonts.googleapis.com
+    is not). Good enough for a hint."""
+    parts = (host or "").lower().rstrip(".").split(".")
+    return ".".join(parts[-2:])
+
+
+def _matches(words, href, text):
+    h, t = (href or "").lower(), " ".join((text or "").lower().split())
+    return any(w in h or w in t for w in words)
+
+
+def tech_cookie(name):
+    """Does a cookie's name look technical (session, CSRF, language,
+    consent), so it needs no consent? A hint, not a verdict."""
+    return bool(TECH_COOKIE.search(name or ""))
 
 
 def _host_of(base, ref):
@@ -347,9 +397,18 @@ def collect(canon, aliases=(), ua=None, edge=False, probe=None):
             url, hops = nxt, hops + 1
             continue
         break
+    ttfb = r["ttfb"]
+    if r["status"] and ttfb > 1:
+        # Measured on oaap-test: the very first request to a new name took
+        # 8.2 s (the gateway was still getting its certificate), the next
+        # 0.03 s. One more look before calling it slow -- the better wins.
+        again = p.get(url, limit=0, method="HEAD")
+        if again["status"]:
+            obs["ttfb_first"] = round(ttfb, 3)
+            ttfb = min(ttfb, again["ttfb"])
     obs.update({"final": urllib.parse.urlsplit(url).path or "/", "hops": hops,
                 "status": r["status"], "err": r.get("err", ""),
-                "ttfb": round(r["ttfb"], 3)})
+                "ttfb": round(ttfb, 3)})
     if r["status"] == 0:
         obs.update({"requests": p.requests, "seconds": round(time.time() - t0, 1),
                     "kb": round(p.bytes / 1024)})
@@ -367,6 +426,7 @@ def collect(canon, aliases=(), ua=None, edge=False, probe=None):
     if obs["html"]:
         try:
             page.feed(r["body"].decode("utf-8", "replace"))
+            page.close()
         except Exception:                           # noqa: BLE001  (a broken page is still a page)
             pass
         title = " ".join(page.title.split())
@@ -414,12 +474,14 @@ def collect(canon, aliases=(), ua=None, edge=False, probe=None):
     sm_url = robots["sitemap"] or base + "sitemap.xml"
     sm_host = _host_of(base, sm_url)
     sitemap = {"named": bool(robots["sitemap"]), "host": sm_host if sm_host != canon else ""}
+    sm_locs = []
     if sm_host == canon:
         sm = p.get(sm_url, limit=MAX_SMALL)
         sitemap["status"] = sm["status"]
         if sm["status"] == 200:
             s = sm["body"].decode("utf-8", "replace")
             locs = [x.split("</loc>")[0].strip() for x in s.split("<loc>")[1:]]
+            sm_locs = locs
             sitemap["count"] = len(locs)
             sitemap["hosts"] = sorted({(urllib.parse.urlsplit(x).hostname or "").lower()
                                        for x in locs} - {"", canon})[:5]
@@ -464,6 +526,66 @@ def collect(canon, aliases=(), ua=None, edge=False, probe=None):
                      "kb": round(total / 1024), "plain": plain[:8],
                      "notransform": notransform, "big": big[:8], "modern": modern[:8],
                      "hashed": hashed, "uncached": uncached}
+    # Recht (§3.4, stage 2): only what the start page itself says and does
+    if obs["html"]:
+        own = _site(canon)
+        foreign = set()
+        for src in (page.scripts + page.styles + page.links + [s for s, _ in page.imgs]
+                    + page.iframes):
+            if not src or src.startswith("data:"):
+                continue
+            hst = _host_of(url, src)
+            if hst and _site(hst) != own:
+                foreign.add(hst)
+        text = r["body"][:MAX_BYTES].decode("utf-8", "replace").lower()
+        gfonts = any(g in text for g in GOOGLE_FONTS)
+        if gfonts:
+            foreign.update(g for g in GOOGLE_FONTS if g in text)
+        obs["legal"] = {
+            "imprint": any(_matches(IMPRINT_WORDS, hr, tx) for hr, tx in page.anchors),
+            "privacy": any(_matches(PRIVACY_WORDS, hr, tx) for hr, tx in page.anchors),
+            "foreign": sorted(foreign)[:12], "gfonts": gfonts,
+            "iframes": sorted({_host_of(url, f) for f in page.iframes if f
+                               and _site(_host_of(url, f)) != own} - {""})[:6],
+        }
+    obs["cookies"] = [c[:60] for c in (r.get("cookies") or [])][:12]
+    # Stage 3: up to ten more pages on the same name -- the sitemap's first,
+    # then the start page's own links. A redirect is an answer, not followed.
+    if obs["html"]:
+        start = urllib.parse.urlsplit(url)._replace(fragment="").geturl()
+        cands, seen_p = [], {start, base}
+        for src, origin in ([(x, "sitemap") for x in sm_locs]
+                            + [(hr, "link") for hr, _t in page.anchors]):
+            if not src or src.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
+                continue
+            u = urllib.parse.urljoin(url, src)
+            sp = urllib.parse.urlsplit(u)
+            if sp.scheme not in ("http", "https") or (sp.hostname or "").lower() != canon:
+                continue
+            u = sp._replace(fragment="", scheme="https").geturl()
+            if u in seen_p:
+                continue
+            seen_p.add(u)
+            cands.append((u, origin))
+        pages = []
+        for u, origin in cands[:MAX_PAGES]:
+            pr = p.get(u)
+            ent = {"path": (urllib.parse.urlsplit(u).path or "/")[:80], "from": origin,
+                   "status": pr["status"]}
+            pct = (pr["h"].get("content-type") or "").lower()
+            if pr["status"] == 200 and "html" in pct:
+                pp = Page()
+                try:
+                    pp.feed(pr["body"].decode("utf-8", "replace"))
+                    pp.close()
+                except Exception:                   # noqa: BLE001
+                    pass
+                ent["html"] = True
+                ent["title"] = bool(" ".join(pp.title.split()))
+                ent["noindex"] = "noindex" in ((pp.meta.get("robots") or "") + " "
+                                               + (pr["h"].get("x-robots-tag") or "")).lower()
+            pages.append(ent)
+        obs["pages"] = {"checked": pages, "more": max(0, len(cands) - MAX_PAGES)}
     obs.update({"requests": p.requests, "seconds": round(time.time() - t0, 1),
                 "kb": round(p.bytes / 1024)})
     return obs
@@ -716,6 +838,69 @@ def evaluate(obs, ctx=None):
                "haben keine Cache-Angabe.",
                "Der Browser lädt sie bei jedem Besuch neu, obwohl sie sich nie ändern.",
                "`Cache-Control: public, max-age=31536000, immutable` für diese Dateien."))
+    # 3.2 continued, stage 3: the pages beside the start page
+    pc = (obs.get("pages") or {}).get("checked") or []
+    broken = [x for x in pc if x.get("status") == 0 or x.get("status", 0) >= 400]
+    if broken:
+        words = {"sitemap": "Sitemap", "link": "Link der Startseite"}
+        add(_f("pages.broken", "red" if any(x.get("status", 0) >= 500 for x in broken)
+               else "yellow", "Auffindbarkeit", "seite",
+               "Verweise ins Leere: " + ", ".join(
+                   f"{x['path']} ({x['status'] or 'keine Antwort'}, {words.get(x['from'], x['from'])})"
+                   for x in broken[:5]) + ".",
+               "Besucher landen auf einer Fehlerseite; Suchmaschinen werten das ab.",
+               "Den Link korrigieren oder die Seite wiederherstellen; aus der Sitemap "
+               "streichen, was es nicht mehr gibt."))
+    untitled = [x["path"] for x in pc if x.get("html") and not x.get("title")]
+    if untitled:
+        add(_f("pages.title", "yellow", "Auffindbarkeit", "seite",
+               "Unterseiten ohne Titel: " + ", ".join(untitled[:5]) + ".",
+               "Im Suchergebnis steht dann nur die Adresse.",
+               "Jeder Seite einen eigenen `<title>` geben."))
+    hidden = [x["path"] for x in pc if x.get("noindex") and x.get("from") == "sitemap"]
+    if hidden:
+        add(_f("pages.noindex", "yellow", "Auffindbarkeit", "seite",
+               "Die Sitemap nennt Seiten, die „noindex“ sagen: " + ", ".join(hidden[:5]) + ".",
+               "Die Sitemap bittet um Aufnahme, die Seite lehnt sie ab -- Suchmaschinen "
+               "werten das als Fehler.",
+               "Die Seiten aus der Sitemap nehmen oder „noindex“ streichen."))
+    # 3.4 Recht -- hints, not legal advice (stage 2)
+    lg = obs.get("legal")
+    if lg is not None:
+        if not lg.get("imprint"):
+            add(_f("law.imprint", "yellow", "Recht", "seite",
+                   "Auf der Startseite kein Link zum Impressum.",
+                   "Geschäftsmäßige Seiten in Deutschland brauchen ein leicht erreichbares "
+                   "Impressum -- Vereine meist auch.",
+                   "Einen Link „Impressum“ auf jeder Seite, üblich im Fuß."))
+        if not lg.get("privacy"):
+            add(_f("law.privacy", "yellow", "Recht", "seite",
+                   "Auf der Startseite kein Link zur Datenschutzerklärung.",
+                   "Wer Daten von Besuchern verarbeitet -- schon das Protokoll des Servers --, "
+                   "muss darüber informieren.",
+                   "Einen Link „Datenschutz“ auf jeder Seite, üblich im Fuß."))
+        if lg.get("foreign"):
+            hosts = list(lg["foreign"])
+            if lg.get("gfonts"):
+                hosts = [h for h in GOOGLE_FONTS if h in hosts] + [h for h in hosts
+                                                                    if h not in GOOGLE_FONTS]
+            add(_f("law.foreign", "yellow", "Recht", "seite",
+                   "Die Startseite lädt Inhalte von fremden Servern: " + ", ".join(hosts[:6])
+                   + (f" und {len(hosts) - 6} weitere" if len(hosts) > 6 else "") + ".",
+                   "Beim Laden erfährt der fremde Server die Adresse des Besuchers; ohne "
+                   "Einwilligung ist das oft unzulässig"
+                   + (" -- wegen Google Fonts gab es 2022 viele Abmahnungen." if lg.get("gfonts")
+                      else "."),
+                   "Schriften und Skripte selbst ausliefern; Karten und Videos erst nach einem "
+                   "Klick laden -- oder vorher um Einwilligung bitten."))
+    odd = [c for c in obs.get("cookies") or [] if not tech_cookie(c)]
+    if odd and st and st < 400:
+        add(_f("law.cookies", "yellow", "Recht", "seite",
+               "Die erste Antwort setzt Cookies, die nicht nach Technik aussehen: "
+               + ", ".join(odd[:6]) + ".",
+               "Cookies, die nicht technisch nötig sind (Statistik, Werbung), brauchen vorher "
+               "eine Einwilligung.",
+               "Erst nach Zustimmung setzen -- oder weglassen."))
     return out
 
 
@@ -730,6 +915,52 @@ def lights(findings, grey=False):
         if a in out and rank[f["level"]] > rank[out[a]]:
             out[a] = f["level"]
     return out
+
+
+def diff(prev, cur):
+    """"neu" and "behoben" against the previous run (§6): -> (ids new or
+    risen to red, findings of the previous run that are gone). A grey run
+    on either side compares nothing."""
+    if not prev or not cur or prev.get("grey") or cur.get("grey"):
+        return set(), []
+    before = {f["id"]: f for f in prev.get("findings") or []}
+    now_ = {f["id"]: f for f in cur.get("findings") or []}
+    new = {i for i, f in now_.items()
+           if i not in before or (f["level"] == "red" and before[i]["level"] != "red")}
+    gone = [f for i, f in before.items() if i not in now_]
+    return new, gone
+
+
+def _judged(runs):
+    """The runs that judged something -- a grey run (unreachable) says
+    nothing about the site."""
+    return [r for r in runs if not r.get("grey")]
+
+
+def matter(runs, is_open=False):
+    """§6, stage 2: the notification `site.check`. -> None or (kurz, text).
+    Opens when the last judged run has a red point that was not red in
+    the run before it; stays open while a run finds red; closes with the
+    first run without red. Yellow never mails."""
+    judged = _judged(runs or [])
+    if not judged:
+        return None
+    last = judged[-1]
+    reds = [f for f in last.get("findings") or [] if f["level"] == "red"]
+    if not reds:
+        return None
+    if not is_open:
+        prev = judged[-2] if len(judged) > 1 else None
+        was = {f["id"] for f in (prev or {}).get("findings") or [] if f["level"] == "red"}
+        if not [f for f in reds if f["id"] not in was]:
+            return None
+    text = ("Der Seiten-Check vom " + str(last.get("at", "")) + " UTC fand auf "
+            + str(last.get("host", "")) + " "
+            + ("einen roten Punkt" if len(reds) == 1 else f"{len(reds)} rote Punkte")
+            + " -- das schadet jetzt:\n"
+            + "\n".join(f"  - {f['area']}: {f['found'].replace('`', '')}" for f in reds)
+            + "\nWas zu tun ist und wer es behebt, steht im Reiter Seitenstatistik.")
+    return str(len(reds)), text
 
 
 def result_of(obs, ctx=None, now=None, by="wochenlauf"):
@@ -747,14 +978,29 @@ def result_of(obs, ctx=None, now=None, by="wochenlauf"):
         notes.append("IPv6 von hier nicht prüfbar (Knoten hinter einem Edge).")
     if obs.get("offsite"):
         notes.append(f"Startseite leitet auf {obs['offsite']} um.")
+    pg3 = obs.get("pages") or {}
+    if pg3.get("checked") and not grey:
+        notes.append(f"{len(pg3['checked'])} weitere Seiten gelesen"
+                     + (f", {pg3['more']} nicht (höchstens {MAX_PAGES})" if pg3.get("more") else "")
+                     + ".")
+    tech = [c for c in obs.get("cookies") or [] if tech_cookie(c)]
+    if tech and not grey:
+        notes.append("Technische Cookies (ohne Einwilligung erlaubt): " + ", ".join(tech[:6]) + ".")
+    lt = lights(findings, bool(grey))
+    # Recht reads the start page itself: no page (an error, a redirect
+    # elsewhere) is "not checked", never green (wegweiser on oaap-test)
+    if not grey and "legal" not in obs and lt.get("Recht") == "green":
+        lt["Recht"] = "grey"
+        notes.append("Recht nicht geprüft: Die Startseite liefert keine lesbare Seite.")
     return {"at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
                      .strftime("%Y-%m-%d %H:%M"),
             "ts": int(now), "by": by, "host": obs.get("canon", ""), "grey": grey,
-            "findings": findings, "lights": lights(findings, bool(grey)), "notes": notes,
+            "findings": findings, "lights": lt, "notes": notes,
             "n": {"requests": obs.get("requests", 0), "seconds": obs.get("seconds", 0),
                   "kb": obs.get("kb", 0),
                   "cert_days": (obs.get("cert") or {}).get("days"),
-                  "tls": (obs.get("cert") or {}).get("tls")}}
+                  "tls": (obs.get("cert") or {}).get("tls"),
+                  "pages": len((obs.get("pages") or {}).get("checked") or [])}}
 
 
 # --- the store ----------------------------------------------------------
@@ -797,10 +1043,11 @@ def _parts(text):
     return [(t, i % 2 == 1) for i, t in enumerate((text or "").split("`")) if t]
 
 
-def _rows(findings):
+def _rows(findings, new=()):
     """F1: red always alone; three or more yellow points of one area and
-    one fixer fold into one line."""
-    findings = [dict(f, found_parts=_parts(f.get("found")), todo_parts=_parts(f.get("todo")))
+    one fixer fold into one line. `new`: ids marked „neu“ (§6)."""
+    findings = [dict(f, found_parts=_parts(f.get("found")), todo_parts=_parts(f.get("todo")),
+                     new=f["id"] in new)
                 for f in findings]
     rows = []
     for area in AREAS:
@@ -815,7 +1062,8 @@ def _rows(findings):
             if len(fs) >= GROUP_MIN:
                 title = GROUP_TITLES.get((area, fix)) or f"{area}: mehrere Punkte"
                 rows.append({"group": True, "area": area, "fix": fix, "points": fs,
-                             "title": f"{title}: {len(fs)} Punkte"})
+                             "title": f"{title}: {len(fs)} Punkte",
+                             "new": sum(1 for f in fs if f["new"])})
             else:
                 rows += [{"group": False, "f": f} for f in fs]
     return rows
@@ -829,9 +1077,36 @@ def view(instance_dir, name=""):
            "weekday": WEEKDAYS[weekday_of(name)] if name else "",
            "button_wait": 0}
     if last:
-        out["rows"] = _rows(last.get("findings") or [])
+        prev = runs[-2] if len(runs) > 1 else None
+        new, gone = diff(prev, last)
+        out["rows"] = _rows(last.get("findings") or [], new)
         out["red"] = sum(1 for f in last.get("findings") or [] if f["level"] == "red")
         out["yellow"] = sum(1 for f in last.get("findings") or [] if f["level"] != "red")
+        out["new"] = len(new)
+        out["fixed"] = [{"found_parts": _parts(f.get("found")), "area": f["area"],
+                         "level": f["level"]} for f in gone]
+        out["compared"] = bool(prev) and not prev.get("grey") and not last.get("grey")
+        # a run of stage 1 knows no Recht: "" = not checked in that run
+        out["lights"] = {a: (last.get("lights") or {}).get(a, "") for a in AREAS}
         wait = BUTTON_EVERY - (time.time() - (last.get("ts") or 0))
         out["button_wait"] = max(0, int(wait // 60) + 1) if wait > 0 else 0
+        out["history"] = history(runs)
+    return out
+
+
+def history(runs, height=40):
+    """Stage 3: the kept runs as bars -- red below, yellow above, a grey
+    run as a short grey bar. Heights in pixels for the card's SVG."""
+    counts = []
+    for r in runs:
+        fs = r.get("findings") or []
+        counts.append((r.get("at", ""), sum(1 for f in fs if f["level"] == "red"),
+                       sum(1 for f in fs if f["level"] != "red"), bool(r.get("grey"))))
+    top = max([red + yel for _a, red, yel, _g in counts] + [1])
+    out = []
+    for i, (at, red, yel, grey) in enumerate(counts):
+        hr = round(red * height / top)
+        hy = round(yel * height / top)
+        out.append({"at": at, "red": red, "yellow": yel, "grey": grey, "x": i * 14,
+                    "hr": hr, "hy": hy, "yr": height - hr, "yy": height - hr - hy})
     return out

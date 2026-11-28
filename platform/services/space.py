@@ -237,7 +237,8 @@ def plan(images, used_ids, instances, platform_refs=(), seen=None, now=None,
             left = grace_days * 86400 - (now - first)
             if left > 0:
                 row.update(cls="keep", why=f"ohne Instanz seit {now_iso(first)[:10]}, "
-                                           f"Frist noch {max(1, -int(-left // 86400))} Tag(e)")
+                                           f"Frist noch {max(1, -int(-left // 86400))} Tag(e)",
+                           grace=first + grace_days * 86400)
             else:
                 row.update(cls="C", why=f"ohne Instanz seit {now_iso(first)[:10]}")
         rows.append(row)
@@ -263,6 +264,21 @@ def summary(rows, cache=None):
     if cache:
         out["A"] = {"count": int(cache.get("count") or 0), "bytes": int(cache.get("bytes") or 0)}
     return out
+
+
+def waiting(rows):
+    """Images without an instance still inside the grace of D6 -- kept now,
+    class C once it ends. Found on oaap-test 2026-11-28: 118 old images
+    were "C 0" in the summary because the first run had seen them only two
+    days before; the tool said nothing about them. -> {count, bytes, from}
+    with `from` the epoch the first of them turns C (0 if none)."""
+    w = [r for r in rows if r.get("cls") == "keep" and r.get("grace")]
+    ids, size = set(), 0
+    for r in w:
+        if r["id"] not in ids:
+            ids.add(r["id"])
+            size += int(r.get("size") or 0)
+    return {"count": len(w), "bytes": size, "from": min((r["grace"] for r in w), default=0)}
 
 
 # --- when the nightly run is due --------------------------------------------
@@ -405,6 +421,7 @@ def remove_one(ref, rows):
 
 def view(rows, cache, disk_now, last=None, now=None):
     s = summary(rows, cache)
+    w = waiting(rows)
     return {
         "schema": SCHEMA, "measured": now_iso(now),
         "disk": disk_now or {},
@@ -417,6 +434,7 @@ def view(rows, cache, disk_now, last=None, now=None):
         "candidates": [{"ref": r["ref"], "cls": r["cls"], "size": r["size"], "why": r["why"]}
                        for r in rows if r["cls"] in ("B", "C")],
         "kept": [{"ref": r["ref"], "why": r["why"]} for r in rows if r["cls"] == "keep"],
+        "waiting": dict(w, **{"from": now_iso(w["from"])[:10] if w["from"] else ""}),
         "last": last or {},
     }
 
