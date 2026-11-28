@@ -97,6 +97,8 @@ import idp_admin  # noqa: E402
 # The switch "KI-Abrufer" (gateway 0.2.27): which AI fetchers a level
 # shuts out is the same table the page statistics count with.
 import site_stats  # noqa: E402
+# RFC-0141: the site check -- rules and store, shared with the portal.
+import site_check  # noqa: E402
 # RFC-0094: the documentation an app brings -- pure rules, tested on paper.
 import docs_publish  # noqa: E402
 # RFC-0119: the assistant templates an app brings -- pure rules, tested on paper.
@@ -6887,7 +6889,7 @@ def resolve_instance_ref(reg, ref, tenant_label=""):
 # that guessed which would be a second opinion about what was typed.
 INSTANCE_VERBS = ("rename", "remove", "visibility", "logs", "restart",
                   "standby", "wake", "maintenance", "login-required",
-                  "ai-fetchers", "site-watch",
+                  "ai-fetchers", "site-watch", "site-check",
                   "diagnose", "endpoint", "tile", "resources", "config",
                   "address", "throttle", "artifact", "promote", "catalog-put", "rehearse",
                   "rehearsal")
@@ -27049,6 +27051,186 @@ def site_watch_set(name, inst, on, who="root", role="root"):
                                      "instance sends noindex"))
 
 
+# --- RFC-0141: the site check -------------------------------------------
+
+SITE_CHECK_UNIT = "oaap-site-check"
+
+
+def site_check_of(inst):
+    """RFC-0141 §4: the switch "Seiten-Check" on the record, or None."""
+    w = (inst or {}).get("site_check")
+    return w if isinstance(w, dict) and w.get("on") is True else None
+
+
+def _site_check_production(inst):
+    return (inst.get("channel") or "production") != "test" and not inst.get("rehearsal")
+
+
+def site_check_dir(name, inst):
+    tid = resolve_tenant((inst or {}).get("tenant")) or default_tenant_id()
+    return instance_metrics.instance_dir(METRICS_DIR, tid, name)
+
+
+def site_check_target(name, inst):
+    """(canonical name, aliases): the own name and its aliases (RFC-0018),
+    else the automatic address. ("", []) without an external name."""
+    names = instance_names(inst)
+    if names:
+        return names[0], names[1:]
+    auto = instance_auto_hosts(name, inst)
+    return (auto[0], []) if auto else ("", [])
+
+
+def site_check_run(name, inst, by="cli"):
+    """One run (§2): read, judge, keep. -> the result."""
+    canon, aliases = site_check_target(name, inst)
+    if not canon:
+        raise DiagnoseRefused("this node has no external name -- nothing to check from outside")
+    tid = resolve_tenant(inst.get("tenant")) or default_tenant_id()
+    opened = (_notify_state_rw().get("matters") or {}).get(tid) or {}
+    h = hardening_of(inst)
+    ctx = {"instance": name, "compress": h.get("compress"), "headers": h.get("headers"),
+           "alias_mode": alias_mode(inst),
+           "google_absent": ("site.google/" + name) in opened}
+    direct = site_check.direct_here(canon)
+    obs = site_check.collect(canon, aliases, ua=site_check.user_agent(load_external()),
+                             edge=not direct)
+    res = site_check.result_of(obs, ctx, by=by)
+    site_check.record(site_check_dir(name, inst), res)
+    return res
+
+
+def site_check_spawn(name):
+    """"Jetzt prüfen" and the first run after switching on: a unit of its
+    own, so the minute job is not held for the seconds a run takes (the
+    reason space_minute gives). The unit name keeps a second start for
+    the same instance out while one runs."""
+    argv = [sys.executable, os.path.abspath(__file__), "site-check", name, "run",
+            "--by", "knopf"]
+    unit = f"{SITE_CHECK_UNIT}-{hashlib.sha256(name.encode()).hexdigest()[:10]}"
+    if shutil.which("systemd-run"):
+        r = subprocess.run(["systemd-run", f"--unit={unit}", "--collect", "--nice=10",
+                            f"--setenv=OAAP_DATA_DIR={DATA_DIR}"] + argv,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE, text=True, timeout=30, check=False)
+        return r.returncode == 0
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True,
+                     env=dict(os.environ, OAAP_DATA_DIR=DATA_DIR))
+    return True
+
+
+def site_check_set(name, inst, on, who="root", role="root"):
+    """RFC-0141 §4: the check on or off. On starts a first run at once."""
+    reg = load_registry()
+    cur = reg["instances"][name]
+    if bool(site_check_of(cur)) == bool(on):
+        return "already " + ("checked weekly" if on else "not checked")
+    if on and not _site_check_production(cur):
+        raise DiagnoseRefused("only a production instance is checked -- a test instance "
+                              "sends noindex and is not finished (RFC-0141 §2.4)")
+    if on:
+        cur["site_check"] = {"on": True, "since": _iso_now(), "by": who}
+    else:
+        cur.pop("site_check", None)
+    save_registry(reg)
+    audit_tenant("instance.site-check", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail="on" if on else "off")
+    if not on:
+        return "is no longer checked; the last results stay visible"
+    started = site_check_spawn(name)
+    wd = site_check.WEEKDAYS[site_check.weekday_of(name)]
+    return (f"is checked every {wd} from this node"
+            + ("; the first run has started" if started else ""))
+
+
+def site_check_button(name, inst, who="portal", role="-"):
+    """"Jetzt prüfen": at most once an hour per instance (§4)."""
+    if not site_check_of(inst):
+        raise DiagnoseRefused("the site check is off for this instance")
+    last = site_check.last_ts(site_check_dir(name, inst))
+    wait = site_check.BUTTON_EVERY - (time.time() - last)
+    if last and wait > 0:
+        raise DiagnoseRefused(f"checked {int((time.time() - last) // 60)} minutes ago -- "
+                              f"again in {int(wait // 60) + 1} minutes")
+    if not site_check_spawn(name):
+        raise DiagnoseRefused("a check of this instance is already running")
+    return "check started -- the result appears in about a minute"
+
+
+def site_check_due(now=None):
+    """The daily timer (§4): every switched-on production instance whose
+    weekday it is. -> [(name, result or error)]."""
+    now = now or time.time()
+    out = []
+    for name, inst in sorted((load_registry().get("instances") or {}).items()):
+        if not site_check_of(inst) or not _site_check_production(inst):
+            continue
+        if not site_check.due(name, site_check.last_ts(site_check_dir(name, inst)), now):
+            continue
+        try:
+            out.append((name, site_check_run(name, inst, by="wochenlauf")))
+        except Exception as e:                      # noqa: BLE001  (one site must not stop the next)
+            out.append((name, f"{type(e).__name__}: {e}"))
+    return out
+
+
+def _site_check_print(name, res):
+    if not res:
+        print(f"{name}: not checked yet.")
+        return
+    n = res.get("n") or {}
+    print(f"{name}: {res.get('host')} checked {res.get('at')} UTC ({res.get('by')}), "
+          f"{n.get('requests')} requests, {n.get('seconds')} s, {n.get('kb')} KB")
+    if res.get("grey"):
+        print("  " + res["grey"])
+    print("  " + "  ".join(f"{a}: {site_check.LIGHT_TITLES[v]}"
+                           for a, v in (res.get("lights") or {}).items()))
+    for f in sorted(res.get("findings") or [], key=lambda f: (f["level"] != "red", f["area"])):
+        print(f"  [{'ROT ' if f['level'] == 'red' else 'gelb'}] {f['area']:<14} "
+              f"{site_check.FIX_TITLES.get(f['fix'], f['fix']):<9} {f['found']}")
+    for note in res.get("notes") or []:
+        print("  (" + note + ")")
+
+
+def cmd_site_check(args):
+    """`oaap app site-check <instance> [on|off|run|show]`, and
+    `oaap app site-check --due` (the daily timer)."""
+    if args.due:
+        for name, res in site_check_due():
+            if isinstance(res, dict):
+                print(f"{name}: " + ", ".join(f"{a} {site_check.LIGHT_TITLES[v]}"
+                                              for a, v in (res.get("lights") or {}).items()))
+            else:
+                print(f"{name}: {res}", file=sys.stderr)
+        return
+    if not args.name:
+        die("which instance? (or --due)")
+    action = args.action or "show"
+    if action in ("on", "off"):
+        _mode_cli(args, lambda n, i, who: site_check_set(n, i, action == "on", who=who))
+        return
+    inst = (load_registry().get("instances") or {}).get(args.name)
+    if not inst:
+        die(f"unknown instance '{args.name}'")
+    if action == "run":
+        if not _site_check_production(inst):
+            die("only a production instance is checked (RFC-0141 §2.4)")
+        try:
+            res = site_check_run(args.name, inst, by=args.by or "cli")
+        except DiagnoseRefused as e:
+            die(str(e))
+        _site_check_print(args.name, res)
+        return
+    runs = site_check.load(site_check_dir(args.name, inst))["runs"]
+    sw = site_check_of(inst)
+    state = (f"on since {str(sw.get('since', ''))[:16]} by {sw.get('by', '')}" if sw else "off")
+    print(f"switch: {state}; weekday "
+          f"{site_check.WEEKDAYS[site_check.weekday_of(args.name)]}")
+    _site_check_print(args.name, runs[-1] if runs else None)
+
+
 def _mode_cli(args, fn):
     reg = load_registry()
     inst = (reg.get("instances") or {}).get(args.name)
@@ -29933,6 +30115,9 @@ def _install_from_dir(pkg, args, source):
     # I-81 idea 5: and whether its people hear about the web site
     if inst and site_watch_of(inst):
         reg["instances"][name]["site_watch"] = dict(inst["site_watch"])
+    # RFC-0141: and whether the node reads it once a week
+    if inst and site_check_of(inst):
+        reg["instances"][name]["site_check"] = dict(inst["site_check"])
     # RFC-0068: an exception is the operator's decision, never the app's.
     if inst and egress_exception(inst):
         reg["instances"][name]["egress_exception"] = dict(inst["egress_exception"])
@@ -41931,7 +42116,7 @@ def cmd_process_deploys(_args):
                              result="denied", who=actor or "portal",
                              role=act_role or "-", detail=msg)
         elif action in ("standby", "wake", "maintenance", "login-required",
-                        "ai-fetchers", "site-watch"):
+                        "ai-fetchers", "site-watch", "site-check"):
             # RFC-0059: the portal's own doors (the waking page, later the
             # buttons) -- the same functions the CLI runs.
             if not inst:
@@ -41953,6 +42138,14 @@ def cmd_process_deploys(_args):
                     elif action == "site-watch":
                         msg = site_watch_set(name, inst, req.get("on") is True,
                                              who=_who, role=act_role or "-")
+                    elif action == "site-check":
+                        # RFC-0141 §4: on, off, or "Jetzt prüfen"
+                        if req.get("op") == "run":
+                            msg = site_check_button(name, inst, who=_who,
+                                                    role=act_role or "-")
+                        else:
+                            msg = site_check_set(name, inst, req.get("on") is True,
+                                                 who=_who, role=act_role or "-")
                     elif action == "login-required":
                         msg = login_required_set(
                             name, inst, bool(req.get("on")),
@@ -42002,7 +42195,7 @@ def cmd_process_deploys(_args):
                "diagnose-logs": "portal", "restart": "portal",
                "standby": "portal", "wake": "portal", "maintenance": "portal",
                "login-required": "portal", "ai-fetchers": "portal",
-               "site-watch": "portal",
+               "site-watch": "portal", "site-check": "portal",
                "config": "portal", "token": "portal", "resources": "portal",
                "address": "portal", "throttle": "portal", "cohort": "api",
                "remove": "portal", "create": "portal",
@@ -45315,6 +45508,16 @@ def build_parser():
     psw.add_argument("name")
     psw.add_argument("switch", choices=["on", "off"])
     psw.set_defaults(fn=cmd_site_watch)
+    psc = sub.add_parser("site-check",
+                         help="the weekly site check of a production instance: "
+                              "Sicherheit, Auffindbarkeit, Tempo, read from outside "
+                              "(RFC-0141)")
+    psc.add_argument("name", nargs="?", default="")
+    psc.add_argument("action", nargs="?", choices=["on", "off", "run", "show"], default="show")
+    psc.add_argument("--due", action="store_true",
+                     help="run every switched-on instance whose weekday it is (the daily timer)")
+    psc.add_argument("--by", default="", help=argparse.SUPPRESS)
+    psc.set_defaults(fn=cmd_site_check)
     pdg = sub.add_parser("diagnose",
                          help="the portal's diagnosis window, from the "
                               "machine (RFC-0038 D2)")

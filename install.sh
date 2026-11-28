@@ -850,6 +850,31 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  # Site check (RFC-0141 §4): every switched-on production instance once a
+  # week, on a weekday derived from its name -- the timer runs daily and
+  # the command picks whose day it is.
+  cat > /etc/systemd/system/oaap-site-check.service <<EOF
+[Unit]
+Description=OAAP site check (RFC-0141: reads the start pages whose weekday it is)
+
+[Service]
+Type=oneshot
+Nice=10
+Environment=OAAP_DATA_DIR=$OAAP_DATA_DIR
+ExecStart=$PYTHON3 $OAAP_DATA_DIR/app/appctl.py site-check --due
+EOF
+  cat > /etc/systemd/system/oaap-site-check.timer <<'EOF'
+[Unit]
+Description=OAAP site check, daily
+
+[Timer]
+OnCalendar=*-*-* 05:10:00
+RandomizedDelaySec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
   cat > /etc/systemd/system/oaap-cohort-sweep.timer <<'EOF'
 [Unit]
 Description=OAAP cohort sweep, daily
@@ -969,6 +994,7 @@ EOF
   systemctl enable --now oaap-rehearsal-sweep.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-cohort-sweep.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-domain-check.timer >/dev/null 2>&1 || true
+  systemctl enable --now oaap-site-check.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-keys.timer >/dev/null 2>&1 || true
   systemctl enable --now oaap-instance-watch.timer >/dev/null 2>&1 || true
   systemctl enable oaap-disks.service >/dev/null 2>&1 || true

@@ -107,6 +107,9 @@ BOTS = (
     ("Google-Extended", "ai", "google-extended"),
     ("Mistral", "ai", "mistralai-user"),
     ("Cohere", "ai", "cohere-ai"),
+    # RFC-0141 F3: the platform's own site check -- an automaton, never a
+    # visit (stage 0 counted 63 of its requests as page views)
+    ("Seiten-Check (OAAP)", "other", "oaap-seiten-check"),
 )
 BOT_KIND = {b[0]: b[1] for b in BOTS}
 

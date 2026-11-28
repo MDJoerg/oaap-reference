@@ -56,6 +56,7 @@ import tenant_health_view as thv
 import traffic  # noqa: E402  (the hour per host, for the tenant health page)
 import instance_metrics  # noqa: E402  (RFC-0108: the history per instance)
 import site_stats  # noqa: E402  (I-81: page statistics per instance)
+import site_check  # noqa: E402  (RFC-0141: the weekly site check)
 # The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
@@ -4521,6 +4522,87 @@ INSTANCE_EDIT_BODY = """
     <input type="hidden" name="op" value="{{ 'off' if sw.on else 'on' }}">
     <button class="secondary">{{ 'Hinweise ausschalten' if sw.on else 'Hinweise einschalten' }}</button>
   </form>
+</div>
+{% set scm = i.mode.check or {} %}{% set ck = i.check or {} %}
+<div class="card" id="seiten-check">
+  <h2>Seiten-Check</h2>
+  {# RFC-0141 Stufe 1 (Jörg 28.11.: „Ok i-83“, D1–D7 wie empfohlen) #}
+  <style>.sc-lights{display:flex;flex-wrap:wrap;gap:.5rem;margin:.4rem 0 .7rem}
+    .sc-light{display:flex;align-items:center;gap:.4rem;border:1px solid var(--oaap-border, #ddd);border-radius:999px;padding:.2rem .7rem;font-size:.9rem}
+    .sc-dot{width:.8rem;height:.8rem;border-radius:50%;display:inline-block}
+    .sc-red{background:#c62828}.sc-yellow{background:#f2b600}.sc-green{background:#2e7d32}.sc-grey{background:#9e9e9e}
+    .sc-rows{list-style:none;padding:0;margin:0}
+    .sc-rows>li{border-top:1px solid var(--oaap-border, #eee);padding:.45rem 0}
+    .sc-rows .sc-why,.sc-rows .sc-todo{display:block;font-size:.88rem}
+    .sc-rows .sc-why{color:var(--oaap-muted)}
+    .sc-tag{font-size:.75rem;border:1px solid var(--oaap-border, #ddd);border-radius:4px;padding:0 .3rem;margin-left:.3rem;white-space:nowrap}
+    .sc-rows details ul{margin:.3rem 0 0 .2rem;padding-left:1rem}</style>
+  <p style="margin:.2rem 0 .5rem">{% if scm.on %}<strong>An</strong>{% if scm.since %}, seit
+     {{ scm.since }} UTC{% endif %}{% if scm.by %} (gesetzt von <strong>{{ scm.by }}</strong>){% endif %}.
+     Geprüft wird jeden <strong>{{ ck.weekday }}</strong>.{% else %}<strong>Aus.</strong>{% endif %}
+     Ist es an, liest dieser Knoten einmal pro Woche die öffentliche Startseite so, wie ein
+     Browser sie liest — die Seite, ihre eigenen Skripte, Styles und Bilder, <code>robots.txt</code>
+     und Sitemap, ein paar Dutzend Anfragen nacheinander. Er probiert nichts aus, ruft keine
+     geheimen Pfade auf und speichert keinen Text der Seite.</p>
+  {% if not sw.production %}<p class="muted" style="margin:0 0 .5rem"><strong>Diese Instanz
+     ist eine Test-Instanz</strong> — geprüft werden nur Produktivinstanzen.</p>{% endif %}
+  {% set last = ck.last %}
+  {% if last %}
+  <p class="muted" style="margin:0 0 .2rem">Zuletzt geprüft: {{ last.at }} UTC
+     ({{ 'Wochenlauf' if last.by == 'wochenlauf' else ('Knopf' if last.by == 'knopf' else last.by) }}),
+     <code>{{ last.host }}</code> — {{ last.n.requests }} Anfragen, {{ last.n.seconds }} s,
+     {{ last.n.kb }} KB.</p>
+  <div class="sc-lights">
+    {% for area, lv in last.lights.items() %}<span class="sc-light"><span class="sc-dot sc-{{ lv }}"
+      aria-hidden="true"></span>{{ area }}: <strong>{{ {'red': 'rot', 'yellow': 'gelb', 'green': 'grün', 'grey': 'grau'}[lv] }}</strong></span>{% endfor %}
+    <span class="sc-light"><span class="sc-dot sc-grey" aria-hidden="true"></span>Recht: <span class="muted">folgt</span></span>
+  </div>
+  {% if last.grey %}<p><strong>{{ last.grey }}</strong> Das ist kein Fehler der Seite: Der Weg
+     von diesem Knoten zum öffentlichen Namen und zurück ist versperrt (Rückschleife am Router).</p>
+  {% elif not ck.rows %}<p>Keine Punkte — in den drei Bereichen ist alles grün.</p>
+  {% else %}
+  <p style="margin:.2rem 0 .3rem">{% if ck.red %}<strong>{{ ck.red }} roter Punkt{{ 'e' if ck.red != 1 }}</strong> — das schadet
+     jetzt. {% endif %}{{ ck.yellow }} gelbe{{ 'r' if ck.yellow == 1 }} Punkt{{ 'e' if ck.yellow != 1 }} — lohnt sich.
+     <span class="muted">„Plattform“ heißt: ein Schalter hier im Portal; „Seite“: die Autorin oder der Autor der Seite.</span></p>
+  <ul class="sc-rows">
+    {% for row in ck.rows %}
+    {% if row.group %}
+    <li><details><summary><span class="sc-dot sc-yellow" aria-hidden="true"></span>
+      <strong>{{ row.title }}</strong> <span class="sc-tag">{{ row.area }}</span><span class="sc-tag">{{ {'plattform': 'Plattform', 'seite': 'Seite'}.get(row.fix, '—') }}</span></summary>
+      <ul>{% for f in row.points %}<li>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %} <span class="muted">— {% for t, c in f.todo_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}</span></li>{% endfor %}</ul>
+    </details></li>
+    {% else %}{% set f = row.f %}
+    <li><span class="sc-dot sc-{{ f.level }}" aria-hidden="true"></span>
+      <strong>{% for t, c in f.found_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}</strong> <span class="sc-tag">{{ f.area }}</span><span class="sc-tag">{{ {'plattform': 'Plattform', 'seite': 'Seite'}.get(f.fix, '—') }}</span>
+      <span class="sc-why">{{ f.why }}</span>
+      <span class="sc-todo">Was tun: {% for t, c in f.todo_parts %}{% if c %}<code>{{ t }}</code>{% else %}{{ t }}{% endif %}{% endfor %}{% if f.link %} <a href="/instances/{{ i.key }}?tab={{ f.link }}">Zum Reiter</a>{% endif %}</span></li>
+    {% endif %}
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if last.notes %}<p class="muted" style="margin:.4rem 0 0">{{ last.notes|join(" ") }}</p>{% endif %}
+  {% elif scm.on %}<p class="muted">Noch kein Ergebnis — der erste Lauf dauert etwa eine Minute.</p>
+  {% endif %}
+  <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.6rem">
+  {% if scm.on %}
+  <form method="post" action="/instances/{{ i.key }}/site-check">
+    <input type="hidden" name="tab" value="statistik"><input type="hidden" name="op" value="run">
+    <button {{ 'disabled' if ck.button_wait }}>Jetzt prüfen</button>
+  </form>
+  {% endif %}
+  {% if scm.on or sw.production %}
+  <form method="post" action="/instances/{{ i.key }}/site-check">
+    <input type="hidden" name="tab" value="statistik">
+    <input type="hidden" name="op" value="{{ 'off' if scm.on else 'on' }}">
+    <button class="secondary">{{ 'Seiten-Check ausschalten' if scm.on else 'Seiten-Check einschalten' }}</button>
+  </form>
+  {% endif %}
+  </div>
+  {% if scm.on and ck.button_wait %}<p class="muted" style="margin:.3rem 0 0">„Jetzt prüfen“ geht
+     wieder in {{ ck.button_wait }} Minute{{ 'n' if ck.button_wait != 1 }} — höchstens einmal pro Stunde.</p>{% endif %}
+  <p class="muted" style="margin:.5rem 0 0">Mails gibt es keine von hier; rote Punkte melden später
+     die „Hinweise zur Webseite“ (RFC-0141 Stufe 2). In der Seitenstatistik zählt der Check als
+     Automat „Seiten-Check (OAAP)“, nie als Besuch.</p>
 </div>
 {% if s %}
 <div class="st-grid">
@@ -11202,6 +11284,9 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
     i["site_days"] = sd if sd in (7, 30, 90) else 30
     i["site"] = (site_stats.read(instance_metrics.instance_dir(METRICS_DIR, tid, name),
                                  i["site_days"]) if tid else None)
+    # RFC-0141: the last site check, its lights and points
+    i["check"] = site_check.view(instance_metrics.instance_dir(METRICS_DIR, tid, name)
+                                 if tid else "", name)
     # RFC-0109 §7 (stage 3): "Einrichten…" -- the recipes that need this
     # app, for whoever may run them in this instance's tenant
     sc = _recipe_scope()
@@ -12984,6 +13069,8 @@ def _mode_view(inst):
     ai_lv = site_stats.ai_level(ai.get("block"))
     sw = inst.get("site_watch") if isinstance(inst.get("site_watch"), dict) else {}
     sw = sw if sw.get("on") is True else {}
+    sc = inst.get("site_check") if isinstance(inst.get("site_check"), dict) else {}
+    sc = sc if sc.get("on") is True else {}
     return {
         "state": state if state in ("standby", "waking") else "",
         "since": str(sb.get("since", ""))[:19].replace("T", " "),
@@ -13005,6 +13092,9 @@ def _mode_view(inst):
                   "production": (inst.get("channel") or "production") != "test"
                   and not inst.get("rehearsal"),
                   "google_days": site_stats.GOOGLE_DAYS},
+        # RFC-0141: "Seiten-Check"
+        "check": {"on": bool(sc), "since": str(sc.get("since", ""))[:19].replace("T", " "),
+                  "by": sc.get("by", "")},
         # RFC-0092: login on every route
         "strict": bool(lr),
         "s_since": str((lr or {}).get("since", ""))[:19].replace("T", " "),
@@ -13106,6 +13196,29 @@ def instance_site_watch_button(name):
         "Hinweise zur Webseite sind an — die Verteiler des Mandanten hören davon."
         if on else "Hinweise zur Webseite sind aus.",
         "Die Hinweise konnten nicht umgeschaltet werden.",
+        "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
+
+
+@app.post("/instances/<name>/site-check")
+def instance_site_check_button(name):
+    """RFC-0141 §4: Seiten-Check ein/aus, oder „Jetzt prüfen“ (höchstens einmal
+    pro Stunde -- der Knoten urteilt, nicht diese Anfrage)."""
+    op = request.form.get("op")
+    if op == "run":
+        return _mode_action(
+            name, {"action": "site-check", "op": "run"}, MAINTENANCE_WAIT_SECONDS,
+            "Die Prüfung läuft — das Ergebnis steht nach etwa einer Minute hier "
+            "(Seite neu laden).",
+            "Die Prüfung konnte nicht gestartet werden.",
+            "Der Auftrag liegt beim Knoten — das Ergebnis steht nach dem nächsten "
+            "Minutenlauf hier.")
+    on = op == "on"
+    return _mode_action(
+        name, {"action": "site-check", "on": on}, MAINTENANCE_WAIT_SECONDS,
+        "Der Seiten-Check ist an — der erste Lauf hat begonnen, das Ergebnis steht "
+        "nach etwa einer Minute hier." if on else "Der Seiten-Check ist aus; die "
+        "letzten Ergebnisse bleiben sichtbar.",
+        "Der Seiten-Check konnte nicht umgeschaltet werden.",
         "Die Umschaltung läuft noch — bitte gleich erneut prüfen.")
 
 
