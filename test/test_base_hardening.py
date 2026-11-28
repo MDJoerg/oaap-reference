@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Grundhärtung am Gateway, Stufe 1 (RFC-0140, gateway 0.2.28) und die
-gemeinsame Bremse (RFC-0140 F1/D9).
+gemeinsame Bremse (RFC-0140 F1/D9); Grund-Header (Stufe 2) und der
+Alias, der auf den Hauptnamen umleitet (Stufe 3).
 
     Kompression   jede Instanzseite trägt `encode zstd gzip`, je Instanz
                   abschaltbar (`oaap app hardening <i> --compress off`);
@@ -215,6 +216,119 @@ with redirect_stdout(buf):
 ok("ausgeschaltete Kompression wird vom Umzug nicht zurückgeholt",
    buf.getvalue() == "" and m.ENCODE_LINE not in open(os.path.join(m.CADDY_APPS_DIR, "shop.caddy"),
                                                       encoding="utf-8").read(), buf.getvalue())
+
+print("\nAlias leitet um (Stufe 3)")
+m.sync_instance_names = lambda reg, only=None: ([], [])
+AP = os.path.join(m.CADDY_APPS_DIR, "instance-addresses.caddy")
+
+
+def addr(action, name, hostname=None):
+    ns = type("A", (), {"action": action, "name": name, "hostname": hostname})()
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        m.cmd_address(ns)
+    return buf.getvalue()
+
+
+def blocks(text):
+    """{site address: block text} of instance-addresses.caddy."""
+    out, cur, name = {}, [], None
+    for ln in text.splitlines():
+        if ln.endswith(" {") and not ln.startswith("\t"):
+            name, cur = ln[:-2], [ln]
+        elif ln == "}" and name:
+            cur.append(ln)
+            out[name] = "\n".join(cur)
+            name = None
+        elif name:
+            cur.append(ln)
+    return out
+
+
+def aps():
+    return blocks(open(AP, encoding="utf-8").read())
+
+
+# Bestand: eine Instanz mit Alias aus der Zeit vor Stufe 3 (kein alias_mode)
+reg = m.load_registry()
+reg["instances"]["web"]["address"] = "sglok-sbk.example"
+reg["instances"]["web"]["aliases"] = ["www.sglok-sbk.example"]
+m.save_registry(reg)
+m.write_instance_address_caddy()
+b = aps()
+ok("Bestand (D3): ein alter Alias liefert weiter selbst aus",
+   m.alias_mode(m.load_registry()["instances"]["web"]) == "serve"
+   and m.ENCODE_LINE in b.get("https://www.sglok-sbk.example", ""), list(b))
+canon_before = b.get("https://sglok-sbk.example")
+out = addr("show", "web")
+ok("show nennt, was die Aliasse tun", "Aliases: serve the instance" in out, out)
+
+out = addr("aliases", "web", "redirect")
+b = aps()
+al = b.get("https://www.sglok-sbk.example", "")
+ok("umgeschaltet: der Alias trägt nur die 301 auf den Hauptnamen",
+   "redir https://sglok-sbk.example{uri} permanent" in al and "reverse_proxy" not in al
+   and m.ENCODE_LINE not in al, al)
+ok("auch http:// des Alias geht in einem Sprung zum Hauptnamen",
+   "redir https://sglok-sbk.example{uri} permanent" in b.get("http://www.sglok-sbk.example", ""),
+   b.get("http://www.sglok-sbk.example"))
+ok("der Hauptname bleibt Byte für Byte gleich",
+   canon_before and b.get("https://sglok-sbk.example") == canon_before)
+ok("der Alias wird weiter protokolliert (Statistik zählt ihn als Umleitung)",
+   m._LOG_BLOCK[0] in al, al)
+ok("die App kennt weiter alle Namen (OAAP_INSTANCE_NAMES)",
+   "www.sglok-sbk.example" in m.instance_names_env("web", m.load_registry()["instances"]["web"]))
+out = addr("show", "web")
+ok("show sagt: leitet um", "Aliases: redirect (301)" in out, out)
+out = addr("aliases", "web", "redirect")
+ok("zweimal umleiten: sagt 'already'", "already" in out, out)
+addr("aliases", "web", "serve")
+b = aps()
+ok("zurück auf serve: Alias liefert wieder aus",
+   m.ENCODE_LINE in b.get("https://www.sglok-sbk.example", ""), b.get("https://www.sglok-sbk.example"))
+try:
+    addr("aliases", "web", "sometimes")
+    refused = False
+except SystemExit:
+    refused = True
+ok("unbekannter Wert: abgelehnt", refused)
+
+# Neu: erster Alias einer Instanz ab Stufe 3 -> redirect (D3)
+reg = m.load_registry()
+reg["instances"]["shop"]["address"] = "shop.example"
+m.save_registry(reg)
+out = addr("alias-add", "shop", "www.shop.example")
+rec = m.load_registry()["instances"]["shop"]
+b = aps()
+ok("erster Alias ab jetzt (D3): leitet um, und die Ausgabe sagt es",
+   rec.get("alias_mode") == "redirect" and "redirects 301" in out
+   and "redir https://shop.example{uri}" in b.get("https://www.shop.example", ""), out)
+addr("aliases", "shop", "serve")
+addr("alias-remove", "shop", "www.shop.example")
+addr("alias-add", "shop", "www2.shop.example")
+ok("gewähltes serve bleibt beim nächsten ersten Alias",
+   m.alias_mode(m.load_registry()["instances"]["shop"]) == "serve")
+
+lines_ = m.alias_redirect_site("http", "www.x.example", "x.example", "10.0.0.1")
+ok("hinter dem Edge: Wächter + Umleitung auf https, keine zweite http-Site",
+   lines_[0] == "http://www.x.example {" and any("10.0.0.1" in ln for ln in lines_)
+   and "\t\tredir https://x.example{uri} permanent" in lines_
+   and sum(1 for ln in lines_ if ln.endswith(" {") and not ln.startswith("\t")) == 1, lines_)
+# Caddy ordnet ein nacktes redir VOR handle -- der Wächter käme zu spät
+# (gemessen auf oaap-test 28.11.: Aufruf nicht vom Edge bekam 301 statt 403)
+ok("die Umleitung steht in einem handle, damit der Edge-Wächter zuerst greift",
+   "\tredir https://x.example{uri} permanent" not in lines_
+   and lines_.index("\thandle {") > max(i for i, ln in enumerate(lines_) if "10.0.0.1" in ln), lines_)
+
+src = open(os.path.join(HERE, "..", "platform", "appctl.py"), encoding="utf-8").read()
+ok("ein Update behält alias_mode", 'reg["instances"][name]["alias_mode"] = inst["alias_mode"]' in src)
+ok("das Portal fragt über den Spool (op alias-mode)", 'elif op == "alias-mode":' in src)
+ok("die Umstellung steht im Mandantenprotokoll", '"instance.aliases"' in src)
+reg = m.load_registry()
+for k in ("web", "shop"):
+    for f_ in ("address", "aliases", "alias_mode"):
+        reg["instances"][k].pop(f_, None)
+m.save_registry(reg)
 
 print("\nGemeinsame Bremse (F1)")
 try:

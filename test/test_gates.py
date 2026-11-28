@@ -282,6 +282,9 @@ ok("die Kopfzeilen des Tors und die der Identitaet werden zuerst gestrichen",
 ok("Lieferung: identity fragt mit gate=Mandant/Name, kopiert Zugang und Bezeichnung",
    "uri /verify?gate=T-bec/sap-support" in site
    and m._COPY_IDENTITY + " X-OAAP-Gate-Access X-OAAP-Gate-Label" in site, site)
+ok("die Migration der Identitaets-Kopfzeilen haelt den Torblock nicht fuer veraltet",
+   not m._site_identity_stale(site),
+   "sonst schrieb jedes Update seit 0.1.383 external.caddy neu (gefunden 28.11.)")
 ok("... dann an /platform/cases/gate der Produktions-Instanz desselben Mandanten",
    "rewrite * /platform/cases/gate{uri}" in site and "reverse_proxy oaap-vorgaenge:8000" in site
    and "oaap-vorgaenge-test" not in site and "oaap-fremd" not in site, site)

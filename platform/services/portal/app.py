@@ -3673,6 +3673,24 @@ INSTANCE_EDIT_BODY = """
     </li>
     {% endfor %}
   </ul>
+  <form method="post" action="/instances/{{ i.key }}/address">
+    <input type="hidden" name="tab" value="netz">
+    <input type="hidden" name="op" value="alias-mode">
+    {% if i.alias_redirect %}
+    <p class="muted"><strong>Aliasse leiten um:</strong> wer einen Alias aufruft,
+       landet mit einer dauerhaften Umleitung (301) auf <code>{{ i.address }}</code>.
+       So sieht eine Suchmaschine nur eine Adresse statt derselben Seite zweimal.</p>
+    <input type="hidden" name="mode" value="serve">
+    <button class="secondary">Aliasse selbst ausliefern lassen</button>
+    {% else %}
+    <p class="muted"><strong>Aliasse liefern selbst aus:</strong> jeder Alias zeigt
+       dieselbe Seite wie <code>{{ i.address }}</code>. Für eine Webseite ist eine
+       Umleitung auf den Hauptnamen meist besser — eine Suchmaschine wertet
+       dieselbe Seite unter zwei Namen sonst doppelt.</p>
+    <input type="hidden" name="mode" value="redirect">
+    <button class="secondary">Aliasse auf den Hauptnamen umleiten</button>
+    {% endif %}
+  </form>
   {% else %}
   <p class="muted">Noch keine Aliasse.</p>
   {% endif %}
@@ -11094,6 +11112,8 @@ def _instance_page(name, inst, fresh=None, typed=None, msg=None, error=None,
          "hook_url": _hook_url(name),
          "address": address,
          "aliases": inst.get("aliases") or [],
+         # RFC-0140 stage 3: absent = serve (existing), a first alias since 0.1.402 redirects
+         "alias_redirect": inst.get("alias_mode") == "redirect",
          "auto_address": auto,
          "has_public_route": any("public" in (r.get("roles") or [])
                                  for r in inst.get("routes") or []),
@@ -11547,6 +11567,12 @@ def instance_address(name):
     if op == "remove" or (not op and not hostname):
         return _queue_and_redirect(name, {"action": "address", "op": "remove"},
                                    ADDRESS_WAIT_SECONDS)
+    if op == "alias-mode":
+        mode = (request.form.get("mode") or "").strip()
+        if mode not in ("serve", "redirect"):
+            return _inst_back(name, err="Unbekannte Einstellung für die Aliasse.")
+        return _queue_and_redirect(name, {"action": "address", "op": "alias-mode",
+                                          "mode": mode}, ADDRESS_WAIT_SECONDS)
     if op in ("alias-add", "alias-remove"):
         if not hostname:
             return _inst_back(name, err="Kein Aliasname angegeben.")

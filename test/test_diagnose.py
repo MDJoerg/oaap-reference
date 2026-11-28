@@ -482,7 +482,12 @@ def render(diag, tab="diagnose"):
            "route_rows": [], "source_lines": [], "aliases": [],
            "artifacts": [], "diag": diag,
            # page() setzt "mode" immer (_mode_view, RFC-0059).
-           "mode": {"state": "", "maintenance": False},
+           "mode": {"state": "", "maintenance": False,
+                 # KI-Abrufer (0.1.397) und Hinweise (0.1.398): _mode_view setzt beide immer.
+                 "ai": {"level": 0, "title": "", "since": "", "by": "", "reason": "",
+                        "names": [], "choices": []},
+                 "watch": {"on": False, "since": "", "by": "", "production": True,
+                           "google_days": 28}},
            # Neustart-Schutz und Abbild ohne Pflegedatei (0.1.227/0.1.228).
            "care": {"known": False, "held": None, "plan_text": "", "overridden": False,
                     "default_days": 7, "max_days": 30, "today": "2026-11-07",

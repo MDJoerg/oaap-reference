@@ -126,7 +126,12 @@ def render(tab, inst=None, **over):
         "throttle_default": "300 Anfragen pro 60 Sekunden",
         # Standby/Wartung (RFC-0059): page() setzt "mode" immer
         # (_mode_view); leer = wach und offen.
-        "mode": {"state": "", "maintenance": False},
+        "mode": {"state": "", "maintenance": False,
+                 # KI-Abrufer (0.1.397) und Hinweise (0.1.398): _mode_view setzt beide immer.
+                 "ai": {"level": 0, "title": "", "since": "", "by": "", "reason": "",
+                        "names": [], "choices": []},
+                 "watch": {"on": False, "since": "", "by": "", "production": True,
+                           "google_days": 28}},
         # Neustart-Schutz und Abbild (0.1.227/0.1.228): so sehen _care_view
         # und _image_view aus, solange der Knoten keine Pflegedatei hat.
         "care": {"known": False, "held": None, "plan_text": "", "overridden": False,

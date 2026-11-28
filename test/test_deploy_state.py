@@ -279,7 +279,17 @@ try:
                "config": [], "endpoints": [], "links": [],
                "link_candidates": [], "groups": [], "roles": [],
                "storage": [], "services": [], "route_rows": [],
-               "source_lines": [], "aliases": []},
+               "source_lines": [], "aliases": [],
+               # page() setzt diese immer (_mode_view, Pflege, Abbild).
+               "mode": {"state": "", "maintenance": False,
+                        "ai": {"level": 0, "title": "", "since": "", "by": "",
+                               "reason": "", "names": [], "choices": []},
+                        "watch": {"on": False, "since": "", "by": "",
+                                  "production": True, "google_days": 28}},
+               "care": {"known": False, "held": None, "plan_text": "",
+                        "overridden": False, "default_days": 7, "max_days": 30,
+                        "today": "2026-11-07", "max_day": "2026-12-07"},
+               "imgcare": {"known": False, "services": [], "state": ""}},
             tabs=[("deployment", "Deployment")], tab="deployment",
             msg=None, error=None)
 

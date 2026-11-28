@@ -22150,6 +22150,10 @@ IDENTITY_HEADERS = ("X-OAAP-User", "X-OAAP-Roles", "X-OAAP-User-Id",
 ASSERTION_HEADER = "X-OAAP-User-Assertion"
 
 _COPY_IDENTITY = "copy_headers " + " ".join(IDENTITY_HEADERS)
+# RFC-0135: the gate block copies two gate headers on top. One writer, and
+# _site_identity_stale knows this line -- without it every update since
+# 0.1.383 called external.caddy stale and rewrote it (found 2026-11-28).
+_COPY_GATE = _COPY_IDENTITY + " X-OAAP-Gate-Access X-OAAP-Gate-Label"
 
 # Names in the platform's namespace that the platform NEVER sets on a
 # request to an app (oaap.core.identity 2.6: no X-OAAP-Groups exists or
@@ -22225,6 +22229,8 @@ def _site_identity_stale(body):
     strips = {ln for ln in lines if ln.startswith("request_header -X-OAAP-")
               and not ln.startswith("request_header -X-OAAP-Source-")
               and not ln.startswith("request_header -X-OAAP-Gate-")
+              # RFC-0136: the coupling door strips its own two (found 2026-11-28)
+              and ln not in {f"request_header -{h}" for h in COUPLE_HEADERS}
               and ln not in ("request_header -X-OAAP-Act-Token",
                              "request_header -X-OAAP-Act-Assertion",
                              f"request_header -{MCP_DISCOVER_HEADER}")
@@ -22238,7 +22244,7 @@ def _site_identity_stale(body):
     bodies = sum(1 for ln in lines if ln.startswith(CASES_MARKER))
     if any(lines.count(s) < bodies for s in not_platform):
         return True
-    return any(ln.startswith("copy_headers ") and ln != _COPY_IDENTITY
+    return any(ln.startswith("copy_headers ") and ln not in (_COPY_IDENTITY, _COPY_GATE)
                for ln in lines)
 
 
@@ -23547,6 +23553,69 @@ def instance_names(inst):
     return [canon] + [a for a in (inst.get("aliases") or []) if a and a != canon]
 
 
+ALIAS_MODES = ("serve", "redirect")
+
+
+def alias_mode(inst):
+    """RFC-0140 stage 3: "redirect" -- every alias answers 301 to the
+    canonical name -- or "serve" (RFC-0018, every alias a front door).
+    Stored on the record as `alias_mode` only while "redirect"; absent is
+    "serve", so no existing site changes on an update (D3)."""
+    return "redirect" if (inst or {}).get("alias_mode") == "redirect" else "serve"
+
+
+def note_first_alias(inst):
+    """D3: an instance that gets its FIRST alias from this version on
+    redirects. Called by both doors (CLI, portal spool) right before the
+    alias is appended. An instance that already has serving aliases keeps
+    serving -- one switch per instance, nobody's site changes unasked."""
+    if not inst.get("aliases") and "alias_mode" not in inst:
+        inst["alias_mode"] = "redirect"
+
+
+def alias_redirect_site(scheme, host, canon, edge):
+    """An alias that redirects: nothing but the 301 to the canonical name
+    (RFC-0140 §4, §8). Its own site keeps its own certificate (Caddy
+    answers ACME before any route); the log block stays, so the visit is
+    seen -- and counted as a redirect, not a page view (I-81)."""
+    lines = [f"{scheme}://{host} {{"]
+    if edge:
+        lines += _edge_guard(edge)
+    lines += _LOG_BLOCK
+    # Inside a handle: Caddy orders a bare `redir` before `handle`, so the
+    # edge guard's 403 never came first (measured on oaap-test 2026-11-28).
+    lines += ["\thandle {", f"\t\tredir https://{canon}{{uri}} permanent", "\t}"]
+    lines.append("}")
+    if not edge:
+        lines += [f"http://{host} {{", f"\tredir https://{canon}{{uri}} permanent", "}"]
+    return lines
+
+
+def alias_mode_set(name, mode, who="root", role="root"):
+    """`oaap app address aliases <instance> serve|redirect` and the
+    portal's switch: one door, registry + sites + reload + audit."""
+    if mode not in ALIAS_MODES:
+        raise ValueError(f"alias mode: one of {', '.join(ALIAS_MODES)}")
+    reg = load_registry()
+    cur = reg["instances"][name]
+    already = alias_mode(cur) == mode
+    # The choice is stored even when it changes nothing today: an explicit
+    # "serve" keeps a later first alias from redirecting (note_first_alias).
+    if cur.get("alias_mode") != mode:
+        cur["alias_mode"] = mode
+        save_registry(reg)
+    if already:
+        return ("aliases already " + ("redirect to the canonical name"
+                                      if mode == "redirect" else "serve the instance"))
+    write_instance_address_caddy()
+    reload_gateway()
+    audit_tenant("instance.aliases", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=role,
+                 detail=mode)
+    return ("aliases now redirect (301) to " + (cur.get("address") or "the canonical name")
+            if mode == "redirect" else "aliases now serve the instance themselves")
+
+
 def foreign_own_names(reg, tenants, only=None):
     """[(host, instance key, domain tenant id, domain)] for every own name
     (RFC-0009/0018) that lies at or below a pending or active tenant domain
@@ -23731,10 +23800,16 @@ def write_instance_address_caddy():
     # refused when set; one written before that rule gets no site here.
     foreign = {(h, k): d for h, k, _t, d in foreign_own_names(reg, load_tenants())}
     for name, inst in entries:
+        canon = inst["address"]
+        redirect = alias_mode(inst) == "redirect"
         for host in instance_names(inst):
             if (host, name) in foreign:
                 lines.append(f"# {host} -> instance {name}: NOT served -- it lies under "
                              f"{foreign[(host, name)]}, another tenant's own domain (RFC-0115 §17)")
+                continue
+            if redirect and host != canon:
+                lines.append(f"# {host} -> 301 to {canon} (alias of {name}, RFC-0140 stage 3)")
+                lines += alias_redirect_site(scheme, host, canon, edge)
                 continue
             lines.append(f"# {host} -> instance {name}")
             lines.append(f"{scheme}://{host} {{")
@@ -28471,6 +28546,14 @@ def cmd_address(args):
         if refusal:
             die(refusal)
 
+    if args.action == "aliases":
+        mode = (args.hostname or "").strip().lower()
+        if mode not in ALIAS_MODES:
+            die(f"usage: oaap app address aliases {name} serve|redirect")
+        print(f"'{name}' " + alias_mode_set(name, mode, who=os.environ.get("SUDO_USER") or "root")
+              + ".")
+        return
+
     if args.action in ("domain-hide", "domain-show"):
         ok_, said = instance_set_domain_hidden(name, args.action == "domain-hide")
         if not ok_:
@@ -28485,6 +28568,9 @@ def cmd_address(args):
             print("Hidden under the tenant's own domain: answers under the node's names only")
         for a in aliases:
             print(f"  alias: {a}")
+        if aliases:
+            print("Aliases: " + ("redirect (301) to the canonical name"
+                                 if alias_mode(inst) == "redirect" else "serve the instance"))
         autos = instance_auto_hosts(name, inst, ext_host=ext_host)
         for auto in autos:
             print(f"Automatic node address: {auto}")
@@ -28533,9 +28619,14 @@ def cmd_address(args):
             die(f"{host} is already the canonical name of '{name}'")
         if host in aliases:
             die(f"{host} is already an alias of '{name}'")
+        note_first_alias(inst)
         inst.setdefault("aliases", []).append(host)
         commit_instance_names(reg, name)
-        print(f"'{name}' now also answers for {host} (alias).")
+        if alias_mode(inst) == "redirect":
+            print(f"'{name}' now also answers for {host} (alias, redirects 301 to "
+                  f"{inst['address']}; 'oaap app address aliases {name} serve' to serve).")
+        else:
+            print(f"'{name}' now also answers for {host} (alias).")
         _address_setup_hint(host, edge)
         return
 
@@ -29791,6 +29882,9 @@ def _install_from_dir(pkg, args, source):
         # oaapx01 twice, each time right after a Wegweiser redeploy.
         if inst.get("aliases"):
             reg["instances"][name]["aliases"] = list(inst["aliases"])
+        # RFC-0140 stage 3: and whether they redirect
+        if inst.get("alias_mode") in ALIAS_MODES:
+            reg["instances"][name]["alias_mode"] = inst["alias_mode"]
     # same for a throttle override (RFC-0010): a deployment must not
     # silently reset an operator's rate decision to the default
     if inst and inst.get("throttle") is not None:
@@ -31334,7 +31428,7 @@ def gate_site_lines(tid, insts=None, doc=None):
                     f"\t\t\t\tlog_append {gate_stats.FIELD} {tid}/{n}",
                     "\t\t\t\tforward_auth identity:8000 {",
                     f"\t\t\t\t\turi /verify?gate={tid}/{n}",
-                    "\t\t\t\t\t" + _COPY_IDENTITY + " X-OAAP-Gate-Access X-OAAP-Gate-Label"]
+                    "\t\t\t\t\t" + _COPY_GATE]
             out += ["\t\t" + x for x in _AUTH_NO_UPGRADE] + ["\t\t\t\t}"]
             out += [f"\t\t\t\turi strip_prefix /gate/{n}",
                     "\t\t\t\trewrite * /platform/cases/gate{uri}"]
@@ -41309,6 +41403,13 @@ def cmd_process_deploys(_args):
                     commit_instance_names(reg, name)
                     ok = True
                     msg = f"address {old} removed" if old else "no address was set"
+            elif op == "alias-mode":
+                try:
+                    msg = alias_mode_set(name, str(req.get("mode") or ""),
+                                         who=req.get("by", "root"), role="tenant_admin")
+                    ok = True
+                except ValueError as e:
+                    msg = str(e)
             elif op == "alias-remove":
                 host = (req.get("hostname") or "").lower().strip().rstrip(".")
                 if host not in aliases:
@@ -41331,6 +41432,7 @@ def cmd_process_deploys(_args):
                         elif host in aliases:
                             msg = f"{host} is already an alias"
                         else:
+                            note_first_alias(inst)
                             inst.setdefault("aliases", []).append(host)
                             commit_instance_names(reg, name)
                             ok, msg = True, f"alias {host} added"
@@ -45717,12 +45819,13 @@ def build_parser():
     pa = sub.add_parser("address",
                         help="an instance's own public hostname and its aliases (RFC-0009, RFC-0018)")
     pa.add_argument("action", choices=["show", "set", "remove",
-                                       "alias-add", "alias-remove",
+                                       "alias-add", "alias-remove", "aliases",
                                        "domain-hide", "domain-show"])
     pa.add_argument("name")
     pa.add_argument("hostname", nargs="?",
                     help="public hostname of its own, e.g. hub.example.org; "
-                         "with alias-add/alias-remove, the alias name")
+                         "with alias-add/alias-remove, the alias name; "
+                         "with aliases, serve|redirect (RFC-0140 stage 3)")
     pa.set_defaults(fn=cmd_address)
     pth = sub.add_parser("throttle",
                          help="request limit per client address of an instance (RFC-0010)")
