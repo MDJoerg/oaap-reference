@@ -57,6 +57,7 @@ import traffic  # noqa: E402  (the hour per host, for the tenant health page)
 import instance_metrics  # noqa: E402  (RFC-0108: the history per instance)
 import site_stats  # noqa: E402  (I-81: page statistics per instance)
 import site_check  # noqa: E402  (RFC-0141: the weekly site check)
+import bindings  # noqa: E402  (RFC-0143: people bound to an instance, shared with the host)
 # The host's care state (oaap.core.updates 2.6): kernel, auto-updates,
 # gateway listeners -- measured on the machine, read here. The module
 # renders the same facts for the CLI, so the two can never disagree.
@@ -5461,6 +5462,8 @@ def page(body_template, title, active, status=200, **ctx):
         "can_assets": bool(caller & {"server_admin", "tenant_admin"}),
         # The page "Ereignisse" (oaap.events.bus 0.6): who grants events
         "can_events": bool(caller & {"server_admin", "tenant_admin"}),
+        # RFC-0143 stage 2: "Meine Instanzen" for whoever is bound to one
+        "has_bindings": _has_bindings(),
     }
     groups = nav_view.nav_groups(flags, active)
     # Long pages without tabs: jump marks from what THIS caller sees (6.2.3).
@@ -6063,6 +6066,22 @@ def dashboard():
 # operations to identity's internal API — which checks the tenant
 # boundary again, on its own store, because that is where the actor's
 # record is and a rule kept in two places eventually disagrees.
+
+def require_instance_may(name, act):
+    """RFC-0143 §4: an administrator (require_instance_admin), or a person
+    whose binding allows `act` (a spool action, see `bindings.action`).
+    The same rule the host's `may()` applies -- one file, services/
+    bindings.py; the host judges the request again. A no is answered
+    exactly as require_instance_admin answers it."""
+    denied = require_instance_admin(name)
+    if not denied:
+        return None
+    me = caller_name()
+    if me and bindings.judge(me, name, act, load_instances(), identity_users(),
+                             resolve_tenant)[0]:
+        return None
+    return denied
+
 
 def require_instance_admin(name):
     """The node's administrator, or the tenant_admin of THIS instance.
@@ -11204,6 +11223,10 @@ def _inst_back(name, msg="", err="", keep=(), extra=()):
             q.append(f"{field}=" + quote(value))
     for field, value in extra:
         q.append(f"{field}=" + quote(value))
+    if request.form.get("back") == "mine":
+        # RFC-0143 stage 2: a bound person acted from "Meine Instanzen"
+        return redirect("/meine-instanzen" + ("?" + "&".join(q) if q else "")
+                        + f"#i-{quote(name, safe='')}", code=303)
     tab = _tab()
     if tab:
         q.append("tab=" + tab)
@@ -13200,7 +13223,8 @@ def _mode_view(inst):
 
 
 def _mode_action(name, payload, wait, ok_text, fail_text, pending_text):
-    denied = require_instance_admin(name)
+    denied = require_instance_may(
+        name, bindings.action(payload.get("action", ""), payload, caller_name()))
     if denied:
         return denied
     if not load_instances().get(name):
@@ -13281,14 +13305,12 @@ def instance_ai_fetchers_button(name):
 
 # --- RFC-0143: Zuständige einer Instanz ------------------------------------
 
-PEOPLE_ROLES = (("observer", "Beobachter"), ("caretaker", "Betreuer"),
-                ("owner", "Verantwortlich"))
+PEOPLE_ROLES = tuple((r, bindings.TITLES[r]) for r in bindings.ROLES)
 _PEOPLE_TITLE = dict(PEOPLE_ROLES)
 
 
 def _people_of(inst):
-    return [p for p in ((inst or {}).get("people") or [])
-            if isinstance(p, dict) and p.get("person") and p.get("role") in _PEOPLE_TITLE]
+    return bindings.people_of(inst)
 
 
 def _people_view(name, inst):
@@ -13345,6 +13367,181 @@ def instance_people_button(name):
         name, {"action": "instance-people", "op": op, "person": person, "role": role},
         MAINTENANCE_WAIT_SECONDS, ok_text,
         "Die Zuständigen konnten nicht geändert werden.",
+        "Die Änderung läuft noch — bitte gleich erneut prüfen.")
+
+
+MINE_BODY = """
+<h1>Meine Instanzen</h1>
+{% if msg %}<p class="ok">{{ msg }}</p>{% endif %}
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+<p class="muted">Die Instanzen, für die du zuständig bist. Was du hier tun darfst, hängt von
+   deiner Rolle ab: <strong>Beobachter</strong> sehen, <strong>Betreuer</strong> schalten die
+   Wartung, starten neu und lösen „Jetzt prüfen“ aus, <strong>Verantwortliche</strong>
+   schalten außerdem den Seiten-Check ein und aus. Gebunden hat dich die
+   Mandantenverwaltung; sie ändert auch deine Rolle.</p>
+{% if not rows %}
+<div class="card"><p><strong>Du bist an keine Instanz gebunden.</strong></p></div>
+{% endif %}
+{% for r in rows %}
+<div class="card" id="i-{{ r.key }}">
+  <h2>{{ r.name }} <span class="badge">{{ r.title }}</span>
+      {% if r.channel_label %}<span class="muted" style="font-size:.8em">{{ r.channel_label }}</span>{% endif %}</h2>
+  {% if r.via %}<p class="muted" style="margin-top:0">Zuständig über die Produktivinstanz
+     <strong>{{ r.via_name }}</strong>.</p>{% endif %}
+  {% if not r.works %}<p class="err">Dein Konto gehört nicht (mehr) zum Mandanten dieser
+     Instanz — die Bindung wirkt nicht.</p>{% endif %}
+  <table class="mini">
+    <tr><th>Zustand</th><td title="{{ r.status.detail }}"><span class="dot {{ r.status.state }}"></span>{{ r.status.label }}
+        {% if r.maintenance %} <span class="badge todo">Wartung an</span>{% endif %}
+        {% if r.url %} · <a href="{{ r.url }}" target="_blank" rel="noopener">öffnen</a>{% endif %}</td></tr>
+    <tr><th>Heute</th><td>{% if r.views is none %}<span class="muted">keine Seitenstatistik</span>
+        {% else %}{{ r.views }} Seitenaufrufe, {{ r.visits }} Besuche{% endif %}</td></tr>
+    <tr><th>Seiten-Check</th><td>{% if not r.check %}<span class="muted">noch nicht gelaufen</span>
+        {% elif r.check.grey %}{{ r.check.at }} UTC — nicht erreichbar
+        {% else %}{{ r.check.at }} UTC — {{ r.check.red }} rot, {{ r.check.yellow }} gelb{% endif %}</td></tr>
+  </table>
+  {% if r.can['maintenance'] or r.can['restart'] or r.can['site-check:run'] or r.can['site-check'] %}
+  <div style="display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.6rem">
+    {% if r.can['maintenance'] %}
+    <form method="post" action="/instances/{{ r.key }}/maintenance" style="margin:0">
+      <input type="hidden" name="back" value="mine">
+      <input type="hidden" name="op" value="{{ 'off' if r.maintenance else 'on' }}">
+      <button class="secondary">{{ 'Wartung aus' if r.maintenance else 'Wartung an' }}</button>
+    </form>
+    {% endif %}
+    {% if r.can['restart'] %}
+    <form method="post" action="/instances/{{ r.key }}/restart" style="margin:0">
+      <input type="hidden" name="back" value="mine">
+      <button class="secondary">Neu starten</button>
+    </form>
+    {% endif %}
+    {% if r.can['site-check:run'] %}
+    <form method="post" action="/instances/{{ r.key }}/site-check" style="margin:0">
+      <input type="hidden" name="back" value="mine">
+      <input type="hidden" name="op" value="run">
+      <button class="secondary">Jetzt prüfen</button>
+    </form>
+    {% endif %}
+    {% if r.can['site-check'] %}
+    <form method="post" action="/instances/{{ r.key }}/site-check" style="margin:0">
+      <input type="hidden" name="back" value="mine">
+      <input type="hidden" name="op" value="{{ 'off' if r.check_on else 'on' }}">
+      <button class="secondary">{{ 'Seiten-Check aus' if r.check_on else 'Seiten-Check an' }}</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+  <h3 style="margin:.9rem 0 .3rem;font-size:1rem">Per E-Mail an mich</h3>
+  {% if not has_mail %}<p class="muted">Dein Konto hat keine E-Mail-Adresse — die
+     Mandantenverwaltung kann sie unter Benutzer eintragen.</p>{% endif %}
+  <table class="mini">
+    {% for h in r.hears %}
+    <tr><td>{{ h.title }}</td>
+        <td>{{ 'an' if h.on else 'aus' }}</td>
+        <td>{% if r.works %}
+          <form method="post" action="/meine-instanzen/{{ r.key }}/notify" style="margin:0">
+            <input type="hidden" name="back" value="mine">
+            <input type="hidden" name="type" value="{{ h.type }}">
+            <input type="hidden" name="op" value="{{ 'off' if h.on else 'on' }}">
+            <button class="secondary">{{ 'Abschalten' if h.on else 'Einschalten' }}</button>
+          </form>{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+"""
+
+
+# --- RFC-0143 Stufe 2: Meine Instanzen ---------------------------------------
+
+def _has_bindings():
+    """Ist der Aufrufer an mindestens eine Instanz gebunden? (Menüeintrag)"""
+    me = caller_name()
+    if not me:
+        return False
+    try:
+        return bool(bindings.mine(load_instances(), me, resolve_tenant))
+    except Exception:                               # noqa: BLE001
+        return False
+
+
+# Die Knöpfe einer Bindung: (Aktion, die bindings.ACTIONS prüft, Beschriftung)
+MINE_BUTTONS = (("maintenance", "Wartung"), ("restart", "Neu starten"),
+                ("site-check:run", "Jetzt prüfen"), ("site-check", "Seiten-Check schalten"))
+
+
+def _mine_rows(me):
+    insts = load_instances()
+    users = identity_users()
+    acct = next((u for u in users if u.get("username") == me), None) or {}
+    alive = bool(acct) and acct.get("active", True)
+    my_tid = resolve_tenant(acct.get("tenant")) if acct else None
+    chosen = [(k, b, via) for k, b, via in bindings.mine(insts, me, resolve_tenant)]
+    asleep = {k: _sleep_status(insts[k]) for k, _b, _v in chosen}
+    probed = fleet_view.probe_all([(k, insts[k]) for k, _b, _v in chosen if not asleep[k]],
+                                  _instance_probe)
+    rows = []
+    for k, b, via in chosen:
+        inst = insts[k]
+        tid = resolve_tenant(inst.get("tenant"))
+        st = asleep[k] or probed.get(k) or ("unknown", "Unbekannt", "")
+        works = alive and tid == my_tid
+        idir = instance_metrics.instance_dir(METRICS_DIR, tid, k) if tid else ""
+        today = site_stats.read(idir, 1) if idir else None
+        chk = site_check.view(idir, k) if idir else {}
+        last = chk.get("last") or {}
+        acts = bindings.ACTIONS[b["role"]] if works else frozenset()
+        rows.append({
+            "key": k, "name": local_name(k, inst), "url": _site_url(k, inst),
+            "role": b["role"], "title": bindings.TITLES[b["role"]],
+            "via": via if via != k else "",
+            "via_name": local_name(via, insts.get(via) or {}) if via and via != k else "",
+            "channel_label": CHANNEL_LABELS.get(inst.get("channel", "production"),
+                                                inst.get("channel", "")),
+            "status": {"state": st[0], "label": st[1], "detail": st[2]},
+            "maintenance": bool(inst.get("maintenance")),
+            "check_on": bool((inst.get("site_check") or {}).get("on")),
+            "views": (today or {}).get("views", 0) if today else None,
+            "visits": ((today or {}).get("visits") or {}).get("n", 0) if today else None,
+            "check": ({"at": str(last.get("at", ""))[:16].replace("T", " "),
+                       "red": chk.get("red", 0), "yellow": chk.get("yellow", 0),
+                       "grey": bool(last.get("grey"))} if last else None),
+            "can": {a: a in acts for a, _t in MINE_BUTTONS},
+            "works": works,
+            "hears": [{"type": t, "title": bindings.NOTIFY_TITLES[t],
+                       "on": bindings.hears(b, t)} for t in bindings.NOTIFY_TYPES],
+        })
+    return rows, bool(acct.get("email"))
+
+
+@app.get("/meine-instanzen")
+def my_instances():
+    """RFC-0143 §5: die Instanzen, an die der Aufrufer gebunden ist -- mit
+    Zustand, Tageszahlen, letztem Seiten-Check, den Knöpfen seiner Rolle und
+    seinen eigenen Benachrichtigungen. Nur Anzeige: jeder Knopf geht durch
+    den Spool, der Knoten urteilt (`may()`)."""
+    me = caller_name()
+    if not me:
+        return "Nicht angemeldet.", 401
+    rows, has_mail = _mine_rows(me)
+    return page(MINE_BODY, "Meine Instanzen", "mine", rows=rows, has_mail=has_mail,
+                msg=request.args.get("msg"), error=request.args.get("err"))
+
+
+@app.post("/meine-instanzen/<name>/notify")
+def my_instance_notify(name):
+    """D4: eine Meldungsart für sich selbst an- oder abschalten. Der Knoten
+    lässt das jede gebundene Person nur für sich selbst zu (`people:self`)."""
+    ntype = request.form.get("type") or ""
+    on = request.form.get("op") == "on"
+    if ntype not in bindings.NOTIFY_TYPES:
+        return _inst_back(name, err="Unbekannte Meldungsart.")
+    title = bindings.NOTIFY_TITLES[ntype]
+    return _mode_action(
+        name, {"action": "instance-people", "op": "notify", "person": caller_name(),
+               "type": ntype, "on": on}, MAINTENANCE_WAIT_SECONDS,
+        f"„{title}“ kommt jetzt per E-Mail." if on else f"„{title}“ kommt nicht mehr per E-Mail.",
+        "Die Einstellung konnte nicht geändert werden.",
         "Die Änderung läuft noch — bitte gleich erneut prüfen.")
 
 
@@ -13405,7 +13602,7 @@ def instance_restart(name):
     ein einziger Weg für Installation, Wiederherstellung, Konfiguration
     und Neustart. Ein zweiter, leichterer wäre der, der auseinanderläuft.
     """
-    denied = require_instance_admin(name)
+    denied = require_instance_may(name, "restart")
     if denied:
         return denied
     if not load_instances().get(name):

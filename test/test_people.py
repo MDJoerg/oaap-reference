@@ -254,10 +254,10 @@ saved = dict(m.BINDING_ACTIONS)
 ok("ohne `maintenance` beim Betreuer fällt die Prüfung", bites(
     lambda: m.BINDING_ACTIONS.__setitem__("caretaker", saved["caretaker"] - {"maintenance"}),
     lambda: m.BINDING_ACTIONS.update(saved)))
-saved_prod = m.production_of
+saved_prod = m.bindings.production_of
 ok("ohne den Weg über die Produktivinstanz fällt die Prüfung", bites(
-    lambda: setattr(m, "production_of", lambda reg, key: (None, None)),
-    lambda: setattr(m, "production_of", saved_prod)))
+    lambda: setattr(m.bindings, "production_of", lambda insts, key, resolve: (None, None)),
+    lambda: setattr(m.bindings, "production_of", saved_prod)))
 
 print("=== Portal: Karte „Zuständige“ ===")
 sys.path.insert(0, os.path.join(HERE, "..", "platform", "services", "portal"))

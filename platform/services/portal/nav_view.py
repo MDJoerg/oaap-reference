@@ -23,6 +23,8 @@ MIN_SECTIONS = 4
 GROUPS = (
     ("Betrieb", (
         ("apps", "/", "Apps", None),
+        # RFC-0143 stage 2: the instances a person is bound to
+        ("mine", "/meine-instanzen", "Meine Instanzen", "has_bindings"),
         ("instances", "/instances", "Instanzen", "is_user_admin"),
         ("setup", "/einrichten", "Einrichten", "can_setup"),
         # RFC-0117: new assistants from templates, same people as Einrichten

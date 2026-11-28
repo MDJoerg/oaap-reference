@@ -99,6 +99,8 @@ import idp_admin  # noqa: E402
 import site_stats  # noqa: E402
 # RFC-0141: the site check -- rules and store, shared with the portal.
 import site_check  # noqa: E402
+# RFC-0143: people bound to an instance -- the rule, shared with the portal.
+import bindings  # noqa: E402
 # RFC-0094: the documentation an app brings -- pure rules, tested on paper.
 import docs_publish  # noqa: E402
 # RFC-0119: the assistant templates an app brings -- pure rules, tested on paper.
@@ -3341,6 +3343,82 @@ def _notify_one(item, tid, from_tenant, state, now, lists=None):
     return "retry"
 
 
+def _notify_bound(item, state, now):
+    """RFC-0143 §5 / D4: the recipient *Zuständige der Instanz* -- the
+    people bound to the instance the matter is about hear it by mail, one
+    mail each (their addresses are nobody else's business), whatever the
+    tenant's lists say; the lists keep getting what they get. -> "sent" |
+    "retry" | "failed" | "limited" | "" (nothing to do: not an instance
+    matter, a test, nobody bound who hears it)."""
+    ntype, op = item.get("type"), item.get("op", "event")
+    name = item.get("instanz") or ""
+    if op == "test" or ntype not in bindings.NOTIFY_TYPES or not name:
+        return ""
+    reg = load_registry()
+    inst = (reg.get("instances") or {}).get(name)
+    if inst is None:
+        return ""
+    tid = resolve_tenant(inst.get("tenant")) or default_tenant_id()
+    who = bindings.listeners(reg.get("instances") or {}, name, ntype,
+                             _read_identity_users() or [], resolve_tenant)
+    sent_to = set(item.get("people_sent") or [])
+    who = [w for w in who if w[0] not in sent_to]
+    if not who:
+        return ""
+    log = {"tenant": tid, "type": ntype, "op": op, "lists": [bindings.RECIPIENT],
+           "about": "", "to": len(who), "cc": 0, "bcc": 0}
+    bucket = "people:" + tid
+    stamps = (state.setdefault("stamps", {})).get(bucket) or []
+    allowed, kept = notify.within_limit(stamps, now, notify.TENANT_PER_HOUR)
+    if not allowed:
+        state["stamps"][bucket] = kept
+        _notify_log(dict(log, result="limited",
+                         said=f"more than {notify.TENANT_PER_HOUR} in one hour -- not sent"))
+        return "limited"
+    mail, sender = notify_mailbox(tid)
+    if not mail:
+        _notify_log(dict(log, result="failed", said=sender))
+        return "failed"
+    values = _notify_values(item, tid)
+    tpl = notify.CATALOGUE[ntype]["subject"]
+    if not values["mandant"]:
+        tpl = tpl.replace("{mandant}", "{knoten}")
+    subject = notify.marked_subject(ntype, op, notify.subject_for(op, notify.expand(tpl, values)))
+    page = NOTIFY_PAGES.get(ntype, "/").replace("{instanz}", urllib.parse.quote(name, safe=""))
+    body = notify.body(ntype, op, values, item.get("text", ""),
+                       notify_link(item["tenant"], page))
+    # why this person gets it, before the footer (which speaks of the
+    # tenant's lists this person is not on)
+    link = notify_link(item["tenant"], "/meine-instanzen")
+    why = ("Du bekommst diese Nachricht, weil du für diese Instanz zuständig bist. "
+           "Abschalten kannst du sie im Portal unter „Meine Instanzen“"
+           + (f": {link}" if link else ".") + "\n")
+    cut = body.find("\n--\n")
+    body = (body[:cut] + "\n" + why + body[cut:]) if cut >= 0 else body + "\n" + why
+    ok_all, saids, again = True, [], False
+    for person, addr, _role in who:
+        ok, said, final = notify_smtp(mail, sender, {"to": [addr], "cc": [], "bcc": []},
+                                      subject, body, headers=notify.importance_headers(ntype, op))
+        saids.append(said)
+        if ok:
+            sent_to.add(person)
+        else:
+            ok_all = False
+            again = again or not final
+    item["people_sent"] = sorted(sent_to)
+    if ok_all:
+        state["stamps"][bucket] = kept + [now.isoformat()]
+        _notify_log(dict(log, result="sent", said="; ".join(saids)[:300]))
+        return "sent"
+    if again:
+        if not item.get("attempts"):
+            _notify_log(dict(log, result="retry", said="; ".join(saids)[:300]
+                             + " -- tried again for an hour"))
+        return "retry"
+    _notify_log(dict(log, result="failed", said="; ".join(saids)[:300]))
+    return "failed"
+
+
 def notify_deliver(now=None):
     """Send what waits in the outbox, oldest first -> {outcome: count}.
     A notification the mail server did not take stays for an hour, then
@@ -3390,6 +3468,16 @@ def notify_deliver(now=None):
                     retry = True
                 else:
                     done.add(k)
+            # RFC-0143 §5: the instance's own people, beside the lists --
+            # one mail each, once per notification
+            if "people" not in done:
+                res = _notify_bound(item, state, now)
+                if res:
+                    counts[res] = counts.get(res, 0) + 1
+                if res == "retry":
+                    retry = True
+                else:
+                    done.add("people")
             created = notify._parse(item.get("created")) or now
             if retry and (now - created).total_seconds() < notify.RETRY_SECONDS:
                 item["done"] = sorted(done)
@@ -27123,22 +27211,13 @@ def site_watch_set(name, inst, on, who="root", role="root"):
 # person may do TO an instance; business rights inside the app stay
 # `oaap.core.authorization` (RFC-0045 §1).
 
-BINDING_ROLES = ("observer", "caretaker", "owner")
-BINDING_TITLES = {"observer": "Beobachter", "caretaker": "Betreuer",
-                  "owner": "Verantwortlich"}
-# The portal and the CLI accept the German names as well
-BINDING_ALIASES = {"beobachter": "observer", "betreuer": "caretaker",
-                   "verantwortlich": "owner"}
-# What each role may do, as spool actions (§1). `site-check:run` is
-# "Jetzt prüfen"; `site-check` without it switches the check on or off.
-# Never by a binding: remove, install, rename, configuration, secrets,
-# routes, visibility, addresses, domains -- and binding others (D3).
-BINDING_ACTIONS = {"observer": frozenset()}
-BINDING_ACTIONS["caretaker"] = frozenset({
-    "maintenance", "login-required", "restart", "wake", "ai-fetchers",
-    "site-check:run"})
-BINDING_ACTIONS["owner"] = BINDING_ACTIONS["caretaker"] | frozenset({
-    "promote", "rollback", "site-check", "site-watch"})
+# The rule itself lives in services/bindings.py, shared with the portal
+# (which buttons it offers, "Meine Instanzen"); the names below are the
+# host's handles on it.
+BINDING_ROLES = bindings.ROLES
+BINDING_TITLES = bindings.TITLES
+BINDING_ALIASES = bindings.ALIASES
+BINDING_ACTIONS = bindings.ACTIONS
 
 
 class PeopleRefused(Exception):
@@ -27147,100 +27226,43 @@ class PeopleRefused(Exception):
 
 def binding_role(word):
     """`observer`/`caretaker`/`owner` from either language, or ''."""
-    w = (word or "").strip().lower()
-    w = BINDING_ALIASES.get(w, w)
-    return w if w in BINDING_ROLES else ""
+    return bindings.role(word)
 
 
-def binding_action(action, req=None):
-    """The name `BINDING_ACTIONS` judges: the site check's "Jetzt prüfen"
-    is a caretaker's, switching it is an owner's (§1)."""
-    if action == "site-check" and (req or {}).get("op") == "run":
-        return "site-check:run"
-    return action
+def binding_action(action, req=None, actor=""):
+    """The name `BINDING_ACTIONS` judges (see `bindings.action`)."""
+    return bindings.action(action, req, actor)
 
 
 def people_of(inst):
-    """The instance's bindings `{person, role, since, by}`; anything else
-    in the list is ignored, never guessed at."""
-    return [p for p in ((inst or {}).get("people") or [])
-            if isinstance(p, dict) and p.get("person")
-            and p.get("role") in BINDING_ROLES]
-
-
-def _binding_rank(role):
-    return BINDING_ROLES.index(role) if role in BINDING_ROLES else -1
+    return bindings.people_of(inst)
 
 
 def production_of(reg, key):
     """The production instance a test instance or a rehearsal belongs to
-    (D2, stage 0 M2): a rehearsal names it (`rehearsal.of`), a test
-    instance is named by the production instance it was promoted into
-    (`source.promoted_from`). Same tenant only. (None, None) otherwise."""
-    insts = reg.get("instances") or {}
-    inst = insts.get(key) or {}
-    tid = resolve_tenant(inst.get("tenant"))
-    reh = inst.get("rehearsal") if isinstance(inst.get("rehearsal"), dict) else {}
-    if reh.get("of"):
-        p = insts.get(reh["of"])
-        if p is not None and resolve_tenant(p.get("tenant")) == tid:
-            return reh["of"], p
-        return None, None
-    if (inst.get("channel") or "production") != "test":
-        return None, None
-    for k, i in sorted(insts.items()):
-        if (k != key and ((i.get("source") or {}).get("promoted_from") == key)
-                and resolve_tenant(i.get("tenant")) == tid):
-            return k, i
-    return None, None
+    (D2) -> (key, record) or (None, None)."""
+    return bindings.production_of(reg.get("instances") or {}, key, resolve_tenant)
 
 
 def binding_of(reg, key, person):
     """(role, via): the person's strongest binding on the instance -- its
     own, or the production instance's it belongs to (D2). ('', '') if
     none."""
-    best, via = "", ""
-    pkey, pinst = production_of(reg, key)
-    for k, i in ((key, (reg.get("instances") or {}).get(key)), (pkey, pinst)):
-        for p in people_of(i):
-            if p["person"] == person and _binding_rank(p["role"]) > _binding_rank(best):
-                best, via = p["role"], k
-    return best, via
+    b, via = bindings.binding_of(reg.get("instances") or {}, key, person, resolve_tenant)
+    return b.get("role", ""), via
 
 
 def may(actor, key, action, reg=None, users=None):
     """RFC-0143 §4: may `actor` do `action` (a spool action, see
-    `binding_action`) to the instance `key`? Returns (yes, why).
-
-    `why` is what the audit says: `role: server_admin`, `role:
-    tenant_admin`, `bound: caretaker` -- or, for a no, the sentence.
-    Judged from identity's own store and the registry, never from a
-    request: a disabled person, or one moved to another tenant, loses
-    every binding at once, whatever the record still lists (§2)."""
+    `binding_action`) to the instance `key`? Returns (yes, why) --
+    `bindings.judge`, fed from identity's own store and the registry."""
     reg = reg if reg is not None else load_registry()
-    inst = (reg.get("instances") or {}).get(key)
-    if inst is None:
-        return False, "unknown instance"
     users = users if users is not None else (_read_identity_users() or [])
-    u = next((x for x in users if x.get("username") == (actor or "")), None)
-    if not u or not u.get("active", True):
-        return False, "no active account of this node"
-    roles = set(u.get("roles") or [])
-    if "server_admin" in roles:
-        return True, "role: server_admin"
-    if resolve_tenant(u.get("tenant")) != resolve_tenant(inst.get("tenant")):
-        return False, "not a person of the instance's tenant"
-    if "tenant_admin" in roles:
-        return True, "role: tenant_admin"
-    role, _via = binding_of(reg, key, actor)
-    if not role:
-        return False, "no binding on this instance"
-    if action in BINDING_ACTIONS[role]:
-        return True, f"bound: {role}"
-    return False, f"a binding as {BINDING_TITLES[role]} does not allow '{action}'"
+    return bindings.judge(actor, key, action, reg.get("instances") or {}, users,
+                          resolve_tenant)
 
 
-def people_set(name, op, person, role="", who="root", by_role="root"):
+def people_set(name, op, person, role="", who="root", by_role="root", ntype="", on=None):
     """Add, change or end one binding on the instance (§3). The person
     must be an active account of the instance's tenant (D6: `partner`
     too). Kept by an update, a rebuild and a promotion (`_install_from_dir`
@@ -27250,10 +27272,12 @@ def people_set(name, op, person, role="", who="root", by_role="root"):
     if cur is None:
         raise PeopleRefused("unknown instance")
     person = (person or "").strip()
-    if op not in ("add", "set", "remove"):
-        raise PeopleRefused("op must be add, set or remove")
+    if op not in ("add", "set", "remove", "notify"):
+        raise PeopleRefused("op must be add, set, remove or notify")
     if not person:
         raise PeopleRefused("no person named")
+    if op == "notify":
+        return _people_notify(reg, name, cur, person, ntype, on, who, by_role)
     role = binding_role(role)
     if op != "remove" and not role:
         raise PeopleRefused("role must be one of " + ", ".join(
@@ -27282,6 +27306,8 @@ def people_set(name, op, person, role="", who="root", by_role="root"):
             return f"'{person}' is already bound as {BINDING_TITLES[role]}"
         entry = {"person": person, "role": role,
                  "since": (old or {}).get("since") or _iso_now(), "by": who}
+        if isinstance((old or {}).get("notify"), dict) and old["notify"]:
+            entry["notify"] = old["notify"]     # the person's own switches stay
         people = [p for p in people if p["person"] != person] + [entry]
     if people:
         cur["people"] = people
@@ -27295,6 +27321,38 @@ def people_set(name, op, person, role="", who="root", by_role="root"):
     if op == "remove":
         return f"'{person}' is no longer bound to it"
     return f"'{person}' is bound to it as {BINDING_TITLES[role]} ({role})"
+
+
+def _people_notify(reg, name, cur, person, ntype, on, who, by_role):
+    """§5 / D4: switch one matter on or off for one binding -- the
+    person's own choice (the spool lets a bound person do it for
+    themselves only, `people:self`). Kept on the binding, by role default
+    when unset (`bindings.hears`)."""
+    if ntype not in bindings.NOTIFY_TYPES:
+        raise PeopleRefused("type must be one of " + ", ".join(bindings.NOTIFY_TYPES))
+    if not isinstance(on, bool):
+        raise PeopleRefused("say on or off")
+    people = people_of(cur)
+    b = next((p for p in people if p["person"] == person), None)
+    if b is None:
+        # bound only through the production instance (D2): the switch
+        # lives on the binding that carries it
+        pkey, pinst = production_of(reg, name)
+        b = next((p for p in people_of(pinst) if p["person"] == person), None)
+        if b is None:
+            raise PeopleRefused(f"'{person}' is not bound to this instance")
+        name, cur = pkey, pinst
+    sw = dict(b.get("notify") or {}) if isinstance(b.get("notify"), dict) else {}
+    was = bindings.hears(b, ntype)
+    sw[ntype] = on
+    b["notify"] = sw
+    save_registry(reg)
+    audit_tenant("instance.people", resolve_tenant(cur.get("tenant"))
+                 or ensure_default_tenant(), subject=name, who=who, role=by_role,
+                 detail=f"{person}: {ntype} {'on' if was else 'off'} -> "
+                        f"{'on' if on else 'off'}")
+    return (f"'{person}' hears {ntype} about '{name}'" if on
+            else f"'{person}' no longer hears {ntype} about '{name}'")
 
 
 def cmd_people(args):
@@ -27317,16 +27375,25 @@ def cmd_people(args):
                     else "  (no active account of the tenant -- the binding does nothing)")
             print(f"  {p['person']:<24} {BINDING_TITLES[p['role']]:<15} since "
                   f"{str(p.get('since', ''))[:10]} by {p.get('by', '?')}{note}")
+            heard = [t for t in bindings.NOTIFY_TYPES if bindings.hears(p, t)]
+            print(f"  {'':<24} hears: {', '.join(heard) or 'nothing'}")
         if pkey:
             for p in people_of(pinst):
                 print(f"  {p['person']:<24} {BINDING_TITLES[p['role']]:<15} "
                       f"through the production instance '{pkey}'")
         return
-    if args.op != "remove" and not args.role:
+    if args.op == "notify":
+        if not args.role or not args.switch:
+            die("name the type and on|off: " + ", ".join(bindings.NOTIFY_TYPES))
+    elif args.op != "remove" and not args.role:
         die("name the role: observer|caretaker|owner (Beobachter|Betreuer|Verantwortlich)")
     who = os.environ.get("SUDO_USER") or "root"
     try:
-        msg = people_set(args.name, args.op, args.person or "", args.role or "", who=who)
+        if args.op == "notify":
+            msg = people_set(args.name, "notify", args.person or "", who=who,
+                             ntype=args.role, on=args.switch == "on")
+        else:
+            msg = people_set(args.name, args.op, args.person or "", args.role or "", who=who)
     except PeopleRefused as e:
         die(str(e))
     print(f"'{args.name}': {msg}.")
@@ -40463,7 +40530,7 @@ def cmd_process_deploys(_args):
         if (action in INSTANCE_ADMIN_ACTIONS and actor and not actor_refusal
                 and act_role not in ("server_admin", "tenant_admin")
                 and inst is not None):
-            _yes, bound_why = may(actor, name, binding_action(action, req), reg)
+            _yes, bound_why = may(actor, name, binding_action(action, req, actor), reg)
             if (_yes and action == "promote"
                     and str(req.get("from") or "")
                     != (inst.get("source") or {}).get("promoted_from")):
@@ -42478,12 +42545,16 @@ def cmd_process_deploys(_args):
                     msg = (e.stderr or str(e)).strip().splitlines()[-1]
         elif action == "instance-people":
             # RFC-0143 §3: the card *Zuständige*; administrators only
-            # (INSTANCE_ADMIN_ACTIONS, never a binding -- D3)
+            # (INSTANCE_ADMIN_ACTIONS, never a binding -- D3) -- except a
+            # bound person switching their own notifications (§5,
+            # `people:self`, judged above)
             try:
                 msg = people_set(name, str(req.get("op") or ""),
                                  str(req.get("person") or ""),
                                  str(req.get("role") or ""),
-                                 who=actor or "portal", by_role=act_role or "-")
+                                 who=actor or "portal", by_role=act_role or "-",
+                                 ntype=str(req.get("type") or ""),
+                                 on=req.get("on") if isinstance(req.get("on"), bool) else None)
                 ok = True
             except PeopleRefused as e:
                 msg = str(e)
@@ -45839,10 +45910,13 @@ def build_parser():
                          help="who looks after an instance: bind a person of the "
                               "tenant as observer, caretaker or owner (RFC-0143)")
     ppl.add_argument("name")
-    ppl.add_argument("op", nargs="?", choices=["add", "set", "remove"])
+    ppl.add_argument("op", nargs="?", choices=["add", "set", "remove", "notify"])
     ppl.add_argument("person", nargs="?")
     ppl.add_argument("role", nargs="?",
-                     help="observer|caretaker|owner (Beobachter|Betreuer|Verantwortlich)")
+                     help="observer|caretaker|owner (Beobachter|Betreuer|Verantwortlich); "
+                          "for notify: the type (" + ", ".join(bindings.NOTIFY_TYPES) + ")")
+    ppl.add_argument("switch", nargs="?", choices=["on", "off"],
+                     help="for notify: the person hears the type by mail, or not")
     ppl.set_defaults(fn=cmd_people)
     psc = sub.add_parser("site-check",
                          help="the weekly site check of a production instance: "
